@@ -74,6 +74,7 @@ artifact names unless the study needs a clearer domain-specific name:
 
 ```text
 agents_outputs/<agent>_<study_slug>_<YYYYMMDDTHHMMSSZ>/
+  prompt.md
   pipeline.py
   manifest.json
   results.json
@@ -81,6 +82,12 @@ agents_outputs/<agent>_<study_slug>_<YYYYMMDDTHHMMSSZ>/
   summary.csv
   plots/
 ```
+
+`prompt.md` must contain the user's request verbatim, exactly as received (no
+paraphrase, no agent commentary). Write it once at the start of the run so a
+reader can compare the raw ask against the parameters the pipeline ended up using.
+For autonomous runs with no user prompt, write a one-line note identifying the
+trigger instead (cron, schedule, etc.).
 
 `manifest.json` must list the agent identifier, study slug, timestamp, request
 parameters, API endpoint(s), generated files, task metrics, software/library
