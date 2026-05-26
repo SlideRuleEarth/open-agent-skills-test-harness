@@ -52,9 +52,9 @@ produced their results.
 
 The mechanism is the same in any agent that can write and execute files:
 
-1. Create a run directory under `outputs/` named from the agent name, a stable
+1. Create a run directory under `agents_outputs/` named from the agent name, a stable
    study slug, and a UTC timestamp, e.g.
-   `outputs/codex_lake_tahoe_atl13_20260526T154211Z/`.
+   `agents_outputs/codex_lake_tahoe_atl13_20260526T154211Z/`.
    Use lowercase ASCII slugs with words separated by underscores. Start with the
    agent identifier (`codex`, `claude`, etc.) so runs can be compared across
    agents. Include enough study detail in the study slug to compare related runs
@@ -63,7 +63,7 @@ The mechanism is the same in any agent that can write and execute files:
    from the run must go in the same run directory, with plots under `plots/` when
    there is more than one image.
 3. **Execute that same file** (e.g.
-   `python outputs/codex_lake_tahoe_atl13_20260526T154211Z/pipeline.py`),
+   `python agents_outputs/codex_lake_tahoe_atl13_20260526T154211Z/pipeline.py`),
    not a separate heredoc or inline string. Running the saved file is what
    guarantees the surfaced script matches what actually ran, with no drift.
 4. Surface that file to the user alongside the task summary and any visualization,
@@ -73,7 +73,7 @@ Run directories should be self-contained and comparison-friendly. Use these
 artifact names unless the study needs a clearer domain-specific name:
 
 ```text
-outputs/<agent>_<study_slug>_<YYYYMMDDTHHMMSSZ>/
+agents_outputs/<agent>_<study_slug>_<YYYYMMDDTHHMMSSZ>/
   pipeline.py
   manifest.json
   results.json
