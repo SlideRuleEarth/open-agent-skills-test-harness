@@ -17,7 +17,7 @@ compatibility: >
   Platform-neutral — works with any agent that can execute Python scripts.
 metadata:
   author: cugarteblair
-  version: "1.4"
+  version: "1.5"
 ---
 
 # SlideRule Pipeline Orchestration
@@ -52,13 +52,45 @@ produced their results.
 
 The mechanism is the same in any agent that can write and execute files:
 
-1. Write the pipeline to a study-named file in your environment's persistent
-   output location, e.g. a file named `sliderule_pipeline_lake_tahoe.py`.
-2. **Execute that same file** (e.g. `python sliderule_pipeline_lake_tahoe.py`),
+1. Create a run directory under `outputs/` named from the agent name, a stable
+   study slug, and a UTC timestamp, e.g.
+   `outputs/codex_lake_tahoe_atl13_20260526T154211Z/`.
+   Use lowercase ASCII slugs with words separated by underscores. Start with the
+   agent identifier (`codex`, `claude`, etc.) so runs can be compared across
+   agents. Include enough study detail in the study slug to compare related runs
+   later (`dickson_fjord_atl06`, `tahoe_atl13_summer_2024`, etc.).
+2. Write the pipeline to that run directory as `pipeline.py`. All other artifacts
+   from the run must go in the same run directory, with plots under `plots/` when
+   there is more than one image.
+3. **Execute that same file** (e.g.
+   `python outputs/codex_lake_tahoe_atl13_20260526T154211Z/pipeline.py`),
    not a separate heredoc or inline string. Running the saved file is what
    guarantees the surfaced script matches what actually ran, with no drift.
-3. Surface that file to the user alongside the task summary and any visualization,
+4. Surface that file to the user alongside the task summary and any visualization,
    using whatever file-presentation mechanism the host environment provides.
+
+Run directories should be self-contained and comparison-friendly. Use these
+artifact names unless the study needs a clearer domain-specific name:
+
+```text
+outputs/<agent>_<study_slug>_<YYYYMMDDTHHMMSSZ>/
+  pipeline.py
+  manifest.json
+  results.json
+  raw.parquet
+  summary.csv
+  plots/
+```
+
+`manifest.json` must list the agent identifier, study slug, timestamp, request
+parameters, API endpoint(s), generated files, task metrics, software/library
+versions when available, and any cache/retry behavior. If a run does not produce a
+given artifact type, omit it from the directory and manifest rather than creating
+placeholders.
+
+Prefer run-local paths over shared filenames. Do not overwrite artifacts from a
+previous run. If rerunning the same study in the same second would collide, append
+`_01`, `_02`, etc. to the run directory name.
 
 This matters because SlideRule requests are parameter-heavy (polygon, time window,
 algorithm block, filters) and can take minutes. A user who can open the script can
@@ -66,7 +98,7 @@ change one coordinate or date and rerun, instead of reconstructing the whole
 request from the chat transcript — reproducibility is part of the deliverable, not
 just the chart.
 
-Keep the surfaced file self-contained: imports, the `parms` dict, the POST,
+Keep the surfaced `pipeline.py` self-contained: imports, the `parms` dict, the POST,
 parsing, filtering, aggregation, export, and the stdout summary all in the one file.
 For multi-request workflows (e.g. comparing two time windows), keep all requests in
 that single script so the one file reproduces the entire comparison.
