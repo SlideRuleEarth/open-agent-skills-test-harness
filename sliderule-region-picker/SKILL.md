@@ -13,14 +13,15 @@ description: >
   and hasn't specified coordinates. This skill can also be triggered when
   the agent asks the user if they'd like to draw their region and they
   say yes.
-compatibility: >
-  No dependencies. Requires only the ability to present a URL to the user.
-metadata:
-  author: cugarteblair
-  version: "2.0"
 ---
 
 # SlideRule Region Picker — Helper Map Workflow
+
+## Requirements
+
+No dependencies. Requires only the ability to present a URL to the user.
+
+See `CHANGELOG.md` for version history.
 
 ## Overview
 

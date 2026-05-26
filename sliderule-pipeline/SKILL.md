@@ -12,15 +12,19 @@ description: >
   trigger when the user asks about pipeline patterns, execution efficiency, task
   reporting format, or wants to see, save, or reproduce the exact script that was
   run.
-compatibility: >
-  No additional dependencies beyond those required by sliderule-api.
-  Platform-neutral — works with any agent that can execute Python scripts.
-metadata:
-  author: cugarteblair
-  version: "1.5"
 ---
 
 # SlideRule Pipeline Orchestration
+
+## Requirements
+
+- Python 3.8+
+- Packages: `pyarrow`, `requests`, plus `pandas` if the pipeline aggregates
+  (and `duckdb` if it does in-script SQL)
+- Network access to `https://sliderule.slideruleearth.io`
+- Platform-neutral — works with any agent that can execute Python scripts
+
+See `CHANGELOG.md` for version history.
 
 ## Pipeline Approach — Single-Script Execution
 

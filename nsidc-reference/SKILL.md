@@ -20,38 +20,22 @@ instrument operates, how products are structured, what flags and
 geophysical corrections actually do. Search when the question hinges on
 the *underlying science* of the ICESat-2 / GEDI data products.
 
-### Skip the search — use sliderule-docsearch instead
+**Skip nsidc-reference and route elsewhere when:**
 
-SlideRule-specific narrative belongs in
-[`sliderule-docsearch`](../sliderule-docsearch): API usage, parameter
-behavior in the SlideRule context, Python client workflows,
-configuration, examples, version history. NSIDC docs describe the
-underlying science; SlideRule's docsearch describes how the client
-exposes that science.
-
-### Skip the search — use sliderule-openapi instead
-
-Structured lookups about SlideRule's API surface (parameter
-signatures, default values, output column schemas, valid values,
-ancillary field-name enumeration) belong in
-[`sliderule-openapi`](../sliderule-openapi). NSIDC docs describe what
-something *means* scientifically; sliderule-openapi describes how
-SlideRule *exposes* it as an API.
-
-### Skip the search — answer from training or web search
-
-For general concepts that merely show up in NSIDC's orbit but aren't
-NSIDC-specific, answer from training (or web search if recency
-matters):
-
-- File formats (HDF5 internals, NetCDF, GeoTIFF, COG)
-- Geospatial primitives (WGS84, geoid models like EGM2008, UTM, CRS)
-- Python tooling (h5py, xarray, geopandas internals)
-- CS / signal-processing fundamentals (FFTs, filtering, statistical
-  estimators)
-
-NSIDC docs reference these in passing without defining them, so a
-search returns chunks that mention the concept tangentially.
+- **SlideRule-specific narrative** (API usage, parameter behavior in the
+  SlideRule context, Python client workflows, configuration, examples,
+  version history) → `sliderule-docsearch`. NSIDC docs describe the
+  underlying science; SlideRule's docsearch describes how the client
+  exposes that science.
+- **Structured lookup about SlideRule's API surface** (parameter
+  signatures, default values, output column schemas, valid values,
+  ancillary field-name enumeration) → `sliderule-openapi`.
+- **General concept** that merely shows up in NSIDC's orbit but isn't
+  NSIDC-specific (HDF5/NetCDF/GeoTIFF/COG internals, geospatial
+  primitives like WGS84/EGM2008/UTM, Python tooling like h5py/xarray,
+  signal-processing fundamentals) → answer from training, or web search
+  if recency matters. NSIDC docs reference these in passing without
+  defining them.
 
 ### The boundary, by example
 

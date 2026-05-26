@@ -1,13 +1,6 @@
 ---
 name: sliderule-openapi
 description: Structured lookups against the SlideRule OpenAPI 3.1 specification, plus authoritative curated supplements for parameter couplings and elevation/datum routes the spec cannot express. Use for questions like "what does `cnf` do?", "what columns does atl06x return?", "which parameters must be paired with `atl08_class`?", "what routes exist for orthometric / MSL output?", "what does `use_abs_h` do?", "what fields can I request via `atl08_fields`?". Slices the bundled spec; also consults `references/parameter_couplings.md` and `references/elevation_datums.md` for content the spec cannot carry. Use `sliderule-docsearch` for narrative ("how do I...", "what is..."); `nsidc-reference` for ICESat-2/GEDI science theory and HDF5-variable meaning; `sliderule-params` for the planning sequence (study-type-to-endpoint mapping, phase-by-phase reasoning), not for parameter or coupling lookups.
-compatibility: >
-  Requires Python 3.8+ and the `requests` package. Loads the spec from
-  either an HTTPS URL or a local file path; both transports work
-  offline-first if the spec has been fetched once.
-metadata:
-  author: cugarteblair
-  version: "0.5"
 ---
 
 # sliderule-openapi
@@ -16,6 +9,14 @@ Loads a bundled SlideRule OpenAPI 3.1 specification and slices it to the
 fragment relevant to a single endpoint, parameter, or schema. Companion to
 `sliderule-docsearch` (narrative search) and `nsidc-reference` (NASA science
 docs).
+
+## Requirements
+
+Requires Python 3.8+ and the `requests` package. Loads the spec from
+either an HTTPS URL or a local file path; both transports work
+offline-first if the spec has been fetched once.
+
+See `CHANGELOG.md` for version history.
 
 ## Architecture
 
@@ -28,8 +29,8 @@ do their own load. The helper handles three concerns:
 1. **Loading.** From an HTTPS URL (production) or a local file (development),
    selected via `--spec-path` or `--base-url`.
 2. **Normalization.** A small set of in-spec inconsistencies are smoothed
-   over before slicing (see "Spec quirks" below) so the model sees
-   clean fragments.
+   over before slicing (see `scripts/README.md` for the catalog of
+   transforms) so the model sees clean fragments.
 3. **Slicing.** Most queries need only one endpoint plus its
    transitively-referenced component schemas. The full spec is ~150K
    tokens; a typical slice is 3-10K. The helper walks `$ref`s starting
@@ -75,49 +76,6 @@ There's also a modular form available at the same host under
 per-component files). This skill does **not** use the modular form —
 some path files are known to have JSON validation issues, and the
 bundled form has everything inline at a single fetch cost.
-
-## Spec quirks the helper smooths over
-
-A handful of known issues in the upstream spec are normalized at load
-time before the model sees the slice. The transforms are
-deterministic, version-stable, and stop being no-ops once upstream
-fixes the issue.
-
-- **`format: "binary"` on string fields is stripped.** ~430 occurrences
-  across the spec apply this format to textual identifiers (`asset`,
-  `resource`, `resources`, all ancillary field-name arrays, etc.).
-  These are ASCII strings, not binary payloads; the format annotation
-  misleads code-generation tooling. The helper drops the format and
-  leaves the field as plain `type: string`.
-- **`format: "x-object"` is normalized case-by-case.** In the upstream
-  spec this annotation is a catch-all "shape not expressible here"
-  marker that gets applied to structurally distinct defects. The
-  helper unwinds them into three arms:
-  - **Wrong-type or under-specified parameters** — `datum`, `proj`,
-    `aoi_bbox`, `coord`, and polygon vertices via `poly[items]` are
-    replaced inline with their actual schemas. `datum` and `proj`
-    become string enums; `aoi_bbox` becomes a 4-element array of
-    numbers `[lon_min, lat_min, lon_max, lat_max]`; `coord` becomes
-    an object with `lon`/`lat` properties; polygon vertices become
-    `{lat, lon}` objects. The corrected schemas are sourced from
-    the server's `convertFromLua` definitions in `RequestFields.cpp`
-    and `GeoFields.cpp`. Notable: the upstream `datum` description
-    advertises `ITRF2020`, but the server's string-input parser does
-    not accept it — the corrected enum drops it.
-  - **Inner-record sub-fields** — output-side fields like
-    `atl06rec.elevation`, `gedi01brec.footprint`, `atl03rec.photons`,
-    `swotl2geo.scan`, etc. encode the name of the target schema in
-    their `description`. The helper detects this and rewrites the
-    node as a `$ref`, after which the slicer follows it like any
-    other ref and the actual sub-record schema appears in the output.
-  - **Fallback** — anything that doesn't match the two arms above gets
-    its `format` stripped and an `x-shape: "see-references"` marker
-    added. This branch should be empty in practice; if anything lands
-    here it's an unhandled upstream defect that should be added to
-    the inline table or surfaced via `references/`.
-
-A consumer who wants the unmodified spec can pass `--no-normalize` to
-disable both transforms.
 
 ## Output
 

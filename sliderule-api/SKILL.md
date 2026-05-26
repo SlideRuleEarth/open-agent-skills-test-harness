@@ -7,16 +7,17 @@ description: >
   Covers the request envelope, endpoint catalog, required output block,
   polygon format, operational failure modes (HTTP 429/503, timeouts), and
   when to fall back between APIs.
-compatibility: >
-  Requires Python 3.8+, network access to sliderule.slideruleearth.io
-  (Processing API), and the pyarrow and requests packages. Schema
-  lookups delegate to the `sliderule-openapi` skill.
-metadata:
-  author: cugarteblair
-  version: "3.2"
 ---
 
 # SlideRule HTTP API
+
+## Requirements
+
+Requires Python 3.8+, network access to `sliderule.slideruleearth.io`
+(Processing API), and the `pyarrow` and `requests` packages. Schema
+lookups delegate to the `sliderule-openapi` skill.
+
+See `CHANGELOG.md` for version history.
 
 This skill handles request mechanics only. Request *content* (which
 parameters to set, which algorithm block to include, how to configure

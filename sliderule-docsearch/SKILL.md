@@ -18,53 +18,27 @@ how parameters interact, why you'd use one endpoint over another, conceptual
 workflows, version history, examples. Search when the question hinges on
 *how SlideRule does something* and the answer needs synthesis, not lookup.
 
-### Skip the search — use sliderule-openapi instead
+**Skip docsearch and route elsewhere when:**
 
-Structured lookups (signatures, defaults, types, valid values, output
-columns, ancillary field-name enumeration) belong in
-[`sliderule-openapi`](../sliderule-openapi), not here. The OpenAPI spec
-is the authoritative source for current values; docsearch returns prose
-that *describes* parameters without committing to current state. Examples
-that should route to sliderule-openapi:
+- **Structured lookup** (parameter signature, default, type, valid values,
+  output columns, ancillary field-name enumeration) → `sliderule-openapi`.
+  Default-value questions look retrievable here because release-note chunks
+  mention historical defaults — but those chunks document *changes*, not
+  current state. The OpenAPI spec is authoritative.
+- **ICESat-2 / GEDI science theory** (photon classification, ATBD content,
+  geophysical corrections, beam geometry, HDF5 product structure, physical
+  meaning of confidence values or quality flags) → `nsidc-reference`.
+- **General concept** that merely shows up in SlideRule's orbit (file
+  formats like GeoParquet/HDF5/Arrow, geospatial primitives like WGS84/UTM,
+  Python tooling, CS fundamentals) → answer from training, or web search
+  if recency matters. A docsearch query on these returns chunks that
+  mention the term in passing without defining it.
 
-- *"What's the default for `cnf`?"*
-- *"What columns does `atl06x` return?"*
-- *"What fields does `atl08_fields` include?"*
-- *"Is `srt` required for `atl03x`?"*
-- *"What type is `samples`?"*
-
-Default-value questions in particular look retrievable here because
-release-note chunks mention historical defaults — but those chunks document
-*changes*, not current state. The sliderule-openapi skill loads the live spec.
-
-### Skip the search — use nsidc-reference instead
-
-ICESat-2 / GEDI **science theory** belongs in
-[`nsidc-reference`](../nsidc-reference): photon classification algorithms,
-ATBD chapter content, geophysical corrections, beam geometry, HDF5 product
-structure, the physical meaning of confidence values or quality flags.
-Docsearch is the SlideRule client's view of those concepts; nsidc-reference
-is NASA's authoritative description.
-
-### Skip the search — answer from training or web search
-
-For **general concepts** that merely show up in SlideRule's orbit, neither
-search nor schema is the right path. Answer from training (or web search if
-recency matters):
-
-- File formats (GeoParquet, HDF5, Parquet, Arrow internals)
-- Geospatial primitives (WGS84, geoid models, UTM, CRS)
-- Python tooling (pandas indices, asyncio, HTTPS, virtualenvs)
-- CS fundamentals (caching, latency, distributed systems)
-
-A docsearch query on these tends to return chunks that mention the term in
-passing without defining it. Worse than no search.
-
-For SlideRule-adjacent **how-to** questions where Claude's training plus a
-web fetch of the live docs would be comparable to docsearch (e.g.,
-"how do I install the SlideRule Python client"), either path works. Default
-to docsearch for authoritative versioned content; fall back to web fetch
-only if docsearch returns weak results.
+For SlideRule-adjacent how-to questions where training plus a web fetch of
+the live docs would be comparable to docsearch (e.g., "how do I install the
+SlideRule Python client"), either path works. Default to docsearch for
+authoritative versioned content; fall back to web fetch only if docsearch
+returns weak results.
 
 ### The boundary, by example
 
