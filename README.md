@@ -6,6 +6,7 @@ A set of open-standard Agent Skills for working with [SlideRule Earth](https://s
 
 - [sliderule-api](sliderule-api/) — Query NASA ICESat-2 and GEDI data via the SlideRule HTTP API
 - [sliderule-docsearch](sliderule-docsearch/) — Semantic search of the SlideRule documentation
+- [sliderule-examples](sliderule-examples/) — Worked examples from the SlideRule Python client notebooks
 - [sliderule-openapi](sliderule-openapi/) — OpenAPI specs for the SlideRule endpoints
 - [sliderule-params](sliderule-params/) — Reference for SlideRule request parameters
 - [sliderule-pipeline](sliderule-pipeline/) — Directives for orchestrating SlideRule analyses as single-script pipelines
@@ -28,7 +29,7 @@ From inside this repo:
 
 ```bash
 REPO="$(pwd)"
-for skill in sliderule-api sliderule-docsearch sliderule-openapi sliderule-params sliderule-pipeline sliderule-region-picker nsidc-reference; do
+for skill in sliderule-api sliderule-docsearch sliderule-examples sliderule-openapi sliderule-params sliderule-pipeline sliderule-region-picker nsidc-reference; do
   ln -sfn "$REPO/$skill" "$HOME/.claude/skills/$skill"
   ln -sfn "$REPO/$skill" "$HOME/.agents/skills/$skill"
 done
