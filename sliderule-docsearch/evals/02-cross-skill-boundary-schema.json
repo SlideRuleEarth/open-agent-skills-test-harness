@@ -1,0 +1,13 @@
+{
+  "skills": ["sliderule-docsearch", "sliderule-openapi"],
+  "query": "What's the default value of the `cnf` parameter, and what valid values does it accept?",
+  "files": [],
+  "expected_behavior": [
+    "Recognizes this is a structured-lookup question (default value + valid values), not a narrative question.",
+    "Routes to sliderule-openapi as the primary tool — the OpenAPI spec is authoritative for current parameter defaults and valid values; docsearch returns prose that may describe historical defaults from release-notes chunks.",
+    "Does NOT primarily use sliderule-docsearch — the SKILL.md routing table explicitly lists 'What's the default value of `cnf`?' as a sliderule-openapi query.",
+    "If sliderule-docsearch is consulted at all, it's secondary — e.g. for narrative context on what cnf does, after the OpenAPI spec gives the canonical default.",
+    "Answer cites the OpenAPI spec URL (machine-readable JSON), not a docsearch URL.",
+    "Does NOT pick a default value from a release-notes chunk that describes a past change to the default — those chunks document changes, not current state."
+  ]
+}

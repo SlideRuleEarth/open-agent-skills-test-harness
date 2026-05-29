@@ -1,0 +1,13 @@
+{
+  "skills": ["nsidc-reference", "sliderule-docsearch"],
+  "query": "How do I call the SlideRule atl03x endpoint from Python to get photon-level data?",
+  "files": [],
+  "expected_behavior": [
+    "Recognizes this is a SlideRule API / how-to question, not a science question.",
+    "Routes to sliderule-docsearch as the primary tool — SlideRule's Python client and endpoint usage are documented at docs.slideruleearth.io, not in NSIDC's docs.",
+    "Does NOT primarily use nsidc-reference — the SKILL.md `Skip the search — use sliderule-docsearch instead` section explicitly redirects API/usage questions away from this skill.",
+    "If nsidc-reference is consulted at all, it's secondary — e.g. for context on what ATL03 data looks like, after docsearch answers the 'how do I call atl03x' part.",
+    "Answer cites a slideruleearth.io URL (the docsearch result), not an NSIDC PDF.",
+    "Does NOT invent SlideRule client code by reading NSIDC science docs alone — the NSIDC user guide describes ATL03 file structure, not the SlideRule client's calling convention."
+  ]
+}
