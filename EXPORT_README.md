@@ -65,8 +65,8 @@ Output goes to `exports/` by default (override with `-o <dir>`).
 
 ## Notes
 
-- Three skills include Python scripts that the agent executes when it has a local runtime (e.g. Claude Code, Cursor, Windsurf) but can only read as reference on chat-only interfaces:
+- Several skills include Python scripts that the agent runs wherever it has a code sandbox with network access — that includes local runtimes (Claude Code, Cursor, Windsurf) **and** hosted ones like claude.ai, which executes skills in a container. The scripts become read-only reference only when a session has no code sandbox, no network grant, or a sandbox whose egress allowlist excludes the target host (e.g. the search endpoint or `docs.slideruleearth.io`); in that case the agent can read the script text but not run it. The scripts:
   - `nsidc-reference` — `scripts/search.py` (semantic search over NSIDC/ORNL DAAC docs)
-  - `sliderule-docsearch` — `scripts/search.py` (semantic search over SlideRule docs)
+  - `sliderule-docsearch` — `scripts/search.py` (semantic search over SlideRule docs), `scripts/fetch_doc.py` (fetch a full docs page as fallback)
   - `sliderule-openapi` — `scripts/openapi.py` (loads and slices the OpenAPI spec by endpoint, parameter, or schema)
 - The `SKILL.md` file in each zip is the main instruction set. The `references/` and `scripts/` directories contain supplementary material that the instructions reference.
