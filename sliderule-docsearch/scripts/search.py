@@ -39,10 +39,9 @@ except ModuleNotFoundError as e:
     _missing_deps_exit(e)
 
 
-# Points at the test/staging environment by design — we're still
-# iterating on the skill against testsliderule.org. Flip to
-# https://search.slideruleearth.io once we cut over to production.
-DEFAULT_BASE_URL = "https://search.testsliderule.org"
+# Production search endpoint. Override per-invocation with --search-url
+# or the SLIDERULE_SEARCH_BASE env var.
+DEFAULT_BASE_URL = "https://search.slideruleearth.io"
 DEFAULT_SEARCH_PATH = "/docsearch/search"
 
 
