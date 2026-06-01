@@ -4,9 +4,10 @@ PYTHON     ?= python3
 OUTPUT_DIR ?= exports
 
 # Skill directories (any dir containing a SKILL.md)
-SKILLS := $(patsubst %/SKILL.md,%,$(wildcard */SKILL.md))
+SKILLS         := $(patsubst %/SKILL.md,%,$(wildcard */SKILL.md))
+EXPORT_TARGETS := $(addprefix export-,$(SKILLS))
 
-.PHONY: help export export-% list clean
+.PHONY: help export list clean $(EXPORT_TARGETS)
 
 help: ## Show this help
 	@echo "Targets:"
@@ -18,7 +19,8 @@ help: ## Show this help
 export: ## Export all skills as zips into $(OUTPUT_DIR)/
 	$(PYTHON) export.py -o $(OUTPUT_DIR)
 
-export-%: ## Export a single skill by name (e.g. export-sliderule-api)
+# Per-skill export: make export-<skill> (e.g. make export-sliderule-api)
+$(EXPORT_TARGETS): export-%:
 	$(PYTHON) export.py -o $(OUTPUT_DIR) $*
 
 list: ## List the discovered skills

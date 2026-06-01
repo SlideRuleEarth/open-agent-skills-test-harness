@@ -87,6 +87,24 @@ Flags:
 `SLIDERULE_SEARCH_BASE` env var picks a different base URL — the skill
 appends `/docsearch/search`.
 
+### Direct-fetch fallback
+
+Every search result carries a fully-qualified, directly-fetchable `url`
+on the docs host. When a result is clearly on-topic but its `text` chunk
+is too thin or truncated to fully answer, fetch the whole page:
+
+```bash
+python scripts/fetch_doc.py "<url-from-a-result>"      # or a bare /path
+```
+
+It prints the page's readable text (strip `--raw` off for HTML). The
+host is allowlisted to `docs.slideruleearth.io` (override with the
+`SLIDERULE_DOCS_HOST` env var), so it only reaches the docs site. Use it
+to read the full page behind a promising-but-shallow chunk, or — when no
+result URL is usable — fetch `/` and navigate from the docs root. This
+is a *content-depth* fallback, not a recovery path for a failed search
+call (that's the retry in step 1).
+
 ## Output
 
 The skill prints JSON to stdout, byte-for-byte the server response:
@@ -218,6 +236,15 @@ The skill prints JSON to stdout, byte-for-byte the server response:
    specific doc section. Two failed searches look the same whether
    the corpus is missing the content or the query is hopeless —
    either way, more attempts won't resolve it.
+
+   **Before giving up, distinguish "wrong page" from "right page,
+   thin chunk."** If a reformulation surfaces a result that is clearly
+   the right *page* (relevant `title`/`url`, exact `matched_tokens`)
+   but the returned `text` is too shallow to answer, don't report the
+   docs as lacking — fetch the full page with `scripts/fetch_doc.py`
+   (see "Direct-fetch fallback") and answer from the complete content.
+   The fallback only helps when retrieval found the right page; it
+   won't rescue a query the corpus genuinely doesn't cover.
 
 ## Not covered
 
