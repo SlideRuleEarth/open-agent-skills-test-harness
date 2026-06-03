@@ -15,12 +15,22 @@ A set of open-standard Agent Skills for working with [SlideRule Earth](https://s
 
 ## Installing the skills (one source of truth)
 
-To make this repo the single source of truth, symlink each skill folder into the directories that Claude Code (`~/.claude/skills/`) and the Claude Agent SDK (`~/.agents/skills/`) scan at startup. Updating the repo then updates every consumer.
+These are runtime-level skills, not editor plugins — the agent runtime (Claude Code, the Claude Agent SDK, Codex) scans a skills directory at startup regardless of whether you launch it from a terminal, an IDE extension, or over SSH. VSCode is irrelevant; "not using VSCode" changes nothing about installation.
+
+To make this repo the single source of truth, symlink each skill folder into the directory that the runtime scans. Updating the repo then updates every consumer:
+
+| Runtime | Global skills directory |
+| --- | --- |
+| Claude Code | `~/.claude/skills/` |
+| Claude Agent SDK | `~/.claude/skills/` (same as Claude Code — see note) |
+| Codex | `~/.codex/skills/` |
+
+> **Note:** The Claude Agent SDK does **not** use a separate `~/.agents/skills/` directory. It reads the same personal `~/.claude/skills/` and project-level `.claude/skills/` locations as the Claude Code CLI (controlled by the SDK's `settingSources`), so installing into `~/.claude/skills/` covers both. Symlink-following into these directories works in practice but is not officially documented — treat it as best-effort rather than a guarantee.
 
 ### 1. Create the target directories
 
 ```bash
-mkdir -p ~/.claude/skills ~/.agents/skills
+mkdir -p ~/.claude/skills ~/.codex/skills
 ```
 
 ### 2. Symlink each skill
@@ -31,7 +41,7 @@ From inside this repo:
 REPO="$(pwd)"
 for skill in sliderule-api sliderule-docsearch sliderule-examples sliderule-openapi sliderule-params sliderule-pipeline sliderule-region-picker nsidc-reference; do
   ln -sfn "$REPO/$skill" "$HOME/.claude/skills/$skill"
-  ln -sfn "$REPO/$skill" "$HOME/.agents/skills/$skill"
+  ln -sfn "$REPO/$skill" "$HOME/.codex/skills/$skill"
 done
 ```
 
@@ -40,7 +50,7 @@ done
 ### 3. Verify
 
 ```bash
-ls -l ~/.claude/skills ~/.agents/skills
+ls -l ~/.claude/skills ~/.codex/skills
 ```
 
 Each entry should show an arrow pointing back to this repo, e.g. `sliderule-api -> /path/to/sliderule-skills/sliderule-api`.
@@ -51,7 +61,7 @@ If you only want one skill:
 
 ```bash
 ln -sfn "$(pwd)/sliderule-api" ~/.claude/skills/sliderule-api
-ln -sfn "$(pwd)/sliderule-api" ~/.agents/skills/sliderule-api
+ln -sfn "$(pwd)/sliderule-api" ~/.codex/skills/sliderule-api
 ```
 
 ### Uninstalling
@@ -59,5 +69,70 @@ ln -sfn "$(pwd)/sliderule-api" ~/.agents/skills/sliderule-api
 Symlinks can be removed without affecting the repo:
 
 ```bash
-rm ~/.claude/skills/sliderule-api ~/.agents/skills/sliderule-api
+rm ~/.claude/skills/sliderule-api ~/.codex/skills/sliderule-api
 ```
+
+### Without a global install (project-level)
+
+You don't have to install globally. Claude Code (and the Agent SDK) also discover skills from a project-level `.claude/skills/` directory — in the working directory, every parent up to the repository root, and nested subdirectories on demand. Two ways to use this:
+
+- Run Claude Code from a directory that has the repo's skills under `.claude/skills/`, or
+- Point Claude Code at this repo with `--add-dir /path/to/sliderule-skills` — a `.claude/skills/` inside an added directory is loaded automatically.
+
+Precedence is enterprise > personal (`~/.claude`) > project (`.claude`) > plugins.
+
+## Non-macOS users
+
+The skills are plain text and Python and run anywhere; only the install mechanics differ.
+
+### Linux
+
+Identical to macOS. The `mkdir`/`ln -sfn` instructions above work verbatim.
+
+### Windows
+
+The skills directories live under your user profile — `%USERPROFILE%\.claude\skills\` and `%USERPROFILE%\.codex\skills\` — but the Bash `ln` loop won't run in `cmd`/PowerShell. Pick one:
+
+- **Directory junctions (recommended — no admin needed).** The closest equivalent to the symlink "single source of truth" model. In `cmd`:
+
+  ```cmd
+  mklink /J "%USERPROFILE%\.claude\skills\sliderule-api" "C:\path\to\sliderule-skills\sliderule-api"
+  ```
+
+  Junctions work for directories without elevation, and a `git pull` in the repo updates every consumer.
+
+- **PowerShell symlinks (need admin or Developer Mode).**
+
+  ```powershell
+  $repo = "C:\path\to\sliderule-skills"
+  foreach ($s in "sliderule-api","sliderule-docsearch","sliderule-examples","sliderule-openapi","sliderule-params","sliderule-pipeline","sliderule-region-picker","nsidc-reference") {
+    New-Item -ItemType SymbolicLink -Path "$env:USERPROFILE\.claude\skills\$s" -Target "$repo\$s" -Force
+  }
+  ```
+
+- **Plain copy (works anywhere, loses auto-update).** Copy the folders, or use Codex's `skill-installer` (below) — you then re-copy to update.
+
+> Symlink/junction following in the skills directory works in practice but is undocumented; on Windows, prefer junctions.
+
+### WSL
+
+If you run Claude Code or Codex *inside* WSL, treat it as Linux and use the macOS/Linux instructions — but note WSL has its own `$HOME`, separate from your Windows user profile, so install into the WSL home.
+
+## Using the skills with Codex
+
+Codex supports the same open Agent Skills standard and discovers these skills in **two** ways.
+
+### Per-project (no install)
+
+When Codex runs with its working directory at or under a **trusted** project, it scans that project tree for `*/SKILL.md` and registers each skill for the session — so simply running `codex` inside a clone of this repo exposes all the `sliderule-*` skills with no install step. Mark the repo trusted in `~/.codex/config.toml`:
+
+```toml
+[projects."/path/to/sliderule-skills"]
+trust_level = "trusted"
+```
+
+These skills are then visible only while working in that repo.
+
+### Global (every project)
+
+To make the skills available from any working directory, get them into `~/.codex/skills/` — either with the symlink loop above, or by asking Codex to use its built-in **`skill-installer`** skill to install from this repo's path. User skills sit alongside the built-in `.system/` skills in that directory.
