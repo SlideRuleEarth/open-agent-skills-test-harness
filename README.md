@@ -136,3 +136,37 @@ These skills are then visible only while working in that repo.
 ### Global (every project)
 
 To make the skills available from any working directory, get them into `~/.codex/skills/` — either with the symlink loop above, or by asking Codex to use its built-in **`skill-installer`** skill to install from this repo's path. User skills sit alongside the built-in `.system/` skills in that directory.
+
+## Using the skills in a hosted agent app (e.g. Claude.ai)
+
+Hosted agent apps don't scan a local skills directory — there's no filesystem to symlink into. Instead they typically take each skill as an uploaded zip through a skills/capabilities setting. This repo ships the tooling to produce those zips.
+
+### 1. Build the zips
+
+From inside this repo:
+
+```bash
+make export
+```
+
+This writes one `<skill>.zip` per skill into `exports/`, each containing the skill's top-level folder and its `SKILL.md` — the layout these apps expect. To build a single skill:
+
+```bash
+make export-sliderule-api
+```
+
+(`make export` just runs `export.py`; see `python export.py -h` for its options, including a custom output directory.)
+
+### 2. Upload the zips
+
+Upload each zip from `exports/` through the app's skill-management settings, then repeat for the skills you want. Exact navigation varies by app — e.g. on [Claude.ai](https://claude.ai) the skills live under **Settings → Capabilities**: open the **Skills** section, choose **Upload skill**, and pick a zip. Custom uploads generally require a paid plan with skills enabled (and may be admin-gated on team/enterprise tiers).
+
+Uploaded skills are then offered to the agent across your chats, the same way the runtime-installed skills work locally.
+
+### Code execution
+
+Several of these skills (e.g. `sliderule-docsearch`, `sliderule-openapi`) run Python helper scripts, so a skill only works end-to-end where the agent can execute code in a sandbox — e.g. Claude.ai runs skill scripts in its hosted sandbox when code execution is enabled. Without that, only the prose in each `SKILL.md` is available, not the script-backed lookups.
+
+### Updating
+
+A zip is a point-in-time snapshot, not a live link — there's no auto-update equivalent to the symlink model used by the CLI runtimes. After changing a skill, re-run `make export` and re-upload the new zip to pick up the changes.
