@@ -15,8 +15,7 @@ after a SlideRule server release that changes the available fields.
 The generation scripts in `sliderule-openapi/scripts/` were salvaged
 from the now-archived `LuaSchemaEndpoint` branch of the SlideRule repo
 (commits prior to its archival). They are the canonical generator the
-legacy schema-server distribution at `schema.testsliderule.org` was
-built from.
+legacy schema server was built from.
 
 Files copied verbatim, no local modifications:
 - `download_h5_granules.py`

@@ -124,13 +124,13 @@ The skill prints JSON to stdout, byte-for-byte the server response:
     }
   ],
   "corpus_meta": {
-    "chunk_count": 754,
+    "chunk_count": 756,
     "embedder": "sentence-transformers/all-MiniLM-L6-v2",
     "embedding_dim": 384,
-    "corpus_sha256": "1163f9a9d3c550fe3ea84336bcac285e897bddd0485b97190d3403f1606694c3",
-    "built_at": "2026-04-28T19:55:12Z",
-    "pages_crawled": 92,
-    "source_host": "docs.testsliderule.org"
+    "corpus_sha256": "6e2f2bb52980484e6f384c70923b5c0d680a598824140c3d9959db5972075717",
+    "built_at": "2026-05-29T19:08:51Z",
+    "pages_crawled": 94,
+    "source_host": "docs.slideruleearth.io"
   }
 }
 ```
