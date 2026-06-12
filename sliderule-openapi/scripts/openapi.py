@@ -81,6 +81,18 @@ def load_from_file(path: str) -> dict:
         sys.exit(2)
 
 
+def _build_retry() -> "Retry":
+    # urllib3 1.26 renamed the Retry method-filter kwarg from
+    # `method_whitelist` to `allowed_methods` (the old name was removed
+    # in urllib3 2.0). Try the modern name first, fall back for old
+    # urllib3 so the loader works regardless of the installed version.
+    common = dict(total=4, backoff_factor=1.0, status_forcelist=(502, 503, 504))
+    try:
+        return Retry(allowed_methods=("GET",), **common)
+    except TypeError:
+        return Retry(method_whitelist=("GET",), **common)
+
+
 def load_from_url(url: str, timeout: float) -> dict:
     if not _HAS_REQUESTS:
         _missing_deps_exit(ModuleNotFoundError("No module named 'requests'", name="requests"))
@@ -97,15 +109,7 @@ def load_from_url(url: str, timeout: float) -> dict:
     # Retry pattern: absorbs server cold-start 503s without
     # leaking them to the agent.
     session = requests.Session()
-    session.mount(
-        "https://",
-        HTTPAdapter(max_retries=Retry(
-            total=4,
-            backoff_factor=1.0,
-            status_forcelist=(502, 503, 504),
-            allowed_methods=("GET",),
-        )),
-    )
+    session.mount("https://", HTTPAdapter(max_retries=_build_retry()))
 
     try:
         resp = session.get(url, timeout=timeout)
