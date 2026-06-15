@@ -24,7 +24,7 @@ print("Hello World")
 return "Nice to meet you", true
 """
 
-rsps = session.runner.submit(name="hello_world", script=lua_script, args_list=[" "])
+rsps = session.runner.submit(name="hello_world", script=lua_script, args=[" "])
 rsps
 
 # --- Display status for *SlideRule Runner* ---
