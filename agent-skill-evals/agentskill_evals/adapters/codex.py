@@ -1,0 +1,153 @@
+"""Codex (OpenAI) adapter.
+
+Invocation:
+    codex exec --json [--full-auto] [-m MODEL] "<prompt>"
+
+Output is JSONL of "item" events:
+
+    {"type":"thread.started","thread_id":"..."}
+    {"type":"item.started","item":{"id":"...","type":"command_execution",
+                                   "command":"npm install"}}
+    {"type":"item.completed","item":{"id":"...","type":"command_execution",
+                                     "exit_code":0,"aggregated_output":"..."}}
+    {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+    {"type":"turn.completed","usage":{...}}
+
+We dedupe by (item id, kind) so a command that appears in both item.started and
+item.completed is only counted once as a TOOL_CALL.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ..schema import EventKind, NormalizedEvent
+from .base import Adapter, ParseOutput, RunOptions, extract_command, extract_path, iter_jsonl, try_load_json
+
+
+class CodexAdapter(Adapter):
+    name = "codex"
+    binary = "codex"
+    skills_subdir = ".agents/skills"  # Codex reads $REPO_ROOT/.agents/skills (cross-agent convention)
+
+    def format_skill(self, skill: str) -> str:
+        # Mirrors the OpenAI example which referenced skills as "$skill-name".
+        return f"${skill}"
+
+    def build_argv(self, prompt: str, opts: RunOptions) -> list[str]:
+        argv = [self.binary, "exec", "--json"]
+        if opts.auto_approve:
+            argv += ["--full-auto"]
+        if opts.model:
+            argv += ["-m", opts.model]
+        argv += opts.extra_args
+        argv += [prompt]  # prompt is positional and must come last
+        return argv
+
+    def parse(self, stdout: str, stderr: str, exit_code: int) -> ParseOutput:
+        events: list[NormalizedEvent] = []
+        final_text = ""
+        structured: Any = None
+        seen: set[tuple] = set()
+
+        for obj in iter_jsonl(stdout):
+            etype = obj.get("type", "")
+
+            if etype in ("thread.started", "session.created"):
+                events.append(NormalizedEvent(EventKind.SESSION_START, raw=obj))
+                continue
+
+            if etype.startswith("item."):
+                item = obj.get("item") or {}
+                itype = item.get("type") or item.get("item_type")
+                item_id = item.get("id")
+
+                if itype == "command_execution":
+                    cmd = item.get("command") or extract_command(item)
+                    key = ("cmd", item_id, cmd)
+                    if etype == "item.started" or (etype == "item.completed" and key not in seen):
+                        if ("cmd", item_id, cmd) not in seen:
+                            seen.add(("cmd", item_id, cmd))
+                            events.append(
+                                NormalizedEvent(
+                                    EventKind.TOOL_CALL, raw=item, tool_name="shell", command=cmd
+                                )
+                            )
+                    if etype == "item.completed":
+                        events.append(
+                            NormalizedEvent(
+                                EventKind.TOOL_RESULT,
+                                raw=item,
+                                is_error=bool(item.get("exit_code")),
+                            )
+                        )
+
+                elif itype == "file_change":
+                    for path in _codex_changed_paths(item):
+                        events.append(
+                            NormalizedEvent(EventKind.FILE_CHANGE, raw=item, path=path)
+                        )
+
+                elif itype in ("agent_message", "assistant_message"):
+                    if etype == "item.completed":
+                        txt = item.get("text") or item.get("content") or ""
+                        if isinstance(txt, str) and txt:
+                            final_text = txt
+                            events.append(
+                                NormalizedEvent(EventKind.AGENT_MESSAGE, raw=item, text=txt)
+                            )
+
+                elif itype == "reasoning":
+                    if etype == "item.completed":
+                        events.append(
+                            NormalizedEvent(
+                                EventKind.REASONING, raw=item, text=item.get("text")
+                            )
+                        )
+
+                elif itype in ("mcp_tool_call", "tool_call"):
+                    if ("tool", item_id) not in seen:
+                        seen.add(("tool", item_id))
+                        events.append(
+                            NormalizedEvent(
+                                EventKind.TOOL_CALL,
+                                raw=item,
+                                tool_name=item.get("tool") or item.get("server") or "tool",
+                                command=extract_command(item.get("arguments") or item),
+                                path=extract_path(item.get("arguments") or item),
+                            )
+                        )
+                continue
+
+            if etype == "turn.completed":
+                events.append(NormalizedEvent(EventKind.RESULT, raw=obj, text=final_text))
+
+            if etype == "error":
+                events.append(
+                    NormalizedEvent(EventKind.ERROR, raw=obj, text=str(obj), is_error=True)
+                )
+
+        if final_text:
+            structured = try_load_json(final_text)
+
+        return ParseOutput(events=events, final_text=final_text, structured_output=structured)
+
+
+def _codex_changed_paths(item: dict) -> list[str]:
+    """Codex file_change items vary in shape; pull paths defensively."""
+    paths: list[str] = []
+    changes = item.get("changes")
+    if isinstance(changes, list):
+        for c in changes:
+            if isinstance(c, dict):
+                p = c.get("path") or c.get("file") or c.get("file_path")
+                if p:
+                    paths.append(p)
+            elif isinstance(c, str):
+                paths.append(c)
+    elif isinstance(changes, dict):
+        paths.extend([k for k in changes.keys()])
+    single = item.get("path") or item.get("file_path")
+    if single:
+        paths.append(single)
+    return paths
