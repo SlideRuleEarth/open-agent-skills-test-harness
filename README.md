@@ -17,69 +17,54 @@ A set of open-standard Agent Skills for working with [SlideRule Earth](https://s
 
 These are runtime-level skills, not editor plugins — the agent runtime (Claude Code, the Claude Agent SDK, Codex) scans a skills directory at startup regardless of whether you launch it from a terminal, an IDE extension, or over SSH. VSCode is irrelevant; "not using VSCode" changes nothing about installation.
 
-To make this repo the single source of truth, symlink each skill folder into the directory that the runtime scans. Updating the repo then updates every consumer:
+This repo is the single source of truth. Each agent runtime scans a **different** skills directory, so we point them all at the real skill folders here via symlinks — managed by the Makefile. Updating the repo then updates every consumer.
 
-| Runtime | Global skills directory |
-| --- | --- |
-| Claude Code | `~/.claude/skills/` |
-| Claude Agent SDK | `~/.claude/skills/` (same as Claude Code — see note) |
-| Codex | `~/.codex/skills/` |
+| Runtime | Project-level (committed, in-repo) | Global (per-user) |
+| --- | --- | --- |
+| Claude Code / Agent SDK | `.claude/skills/` | `~/.claude/skills/` |
+| Codex | `.agents/skills/` | `~/.agents/skills/` |
+| AntiGravity CLI (`agy`) | `.antigravity/skills/` | `~/.gemini/config/skills/` |
+| AntiGravity IDE | `.antigravity/skills/` | `~/.gemini/antigravity-ide/skills/` |
 
-> **Note:** The Claude Agent SDK does **not** use a separate `~/.agents/skills/` directory. It reads the same personal `~/.claude/skills/` and project-level `.claude/skills/` locations as the Claude Code CLI (controlled by the SDK's `settingSources`), so installing into `~/.claude/skills/` covers both. Symlink-following into these directories works in practice but is not officially documented — treat it as best-effort rather than a guarantee.
+> **Note:** Claude Code (and the Agent SDK) read skills **only** from `.claude/skills/` — never `.agents/skills/`. Codex uses the cross-agent `.agents/skills/` convention (`$REPO_ROOT/.agents/skills/`, then `~/.agents/skills/`). AntiGravity keeps its skills under `~/.gemini/`. Symlink-following into these directories works in practice but isn't officially documented — treat it as best-effort.
 
-### 1. Create the target directories
+### Project-level (committed — the recommended default)
 
-```bash
-mkdir -p ~/.claude/skills ~/.codex/skills
-```
-
-### 2. Symlink each skill
-
-From inside this repo:
+`make link-project` creates **relative** symlinks under `.claude/skills/`, `.agents/skills/`, and `.antigravity/skills/`, each pointing at a skill folder in this repo. Git stores them as symlinks (mode `120000`), so they're committed once and **every clone gets all skills wired up for every agent automatically** — no per-user install.
 
 ```bash
-REPO="$(pwd)"
-for skill in sliderule-api sliderule-docsearch sliderule-examples sliderule-openapi sliderule-params sliderule-pipeline sliderule-region-picker nsidc-reference; do
-  ln -sfn "$REPO/$skill" "$HOME/.claude/skills/$skill"
-  ln -sfn "$REPO/$skill" "$HOME/.codex/skills/$skill"
-done
+make link-project      # create / refresh the in-repo symlinks
+make relink-project    # rebuild after adding or removing a skill
+make unlink-project    # remove them
 ```
 
-`ln -sfn` replaces any existing symlink at the target path, so this is safe to re-run after adding new skills. It will refuse to overwrite a real directory — if you already have a non-symlink copy of a skill installed, remove or rename it first.
+Running any supported agent from the repo root (or pointing it here) then exposes every skill with zero global setup.
 
-### 3. Verify
+### Global (per-user — available from any directory)
+
+To use the skills outside this repo, symlink them into your per-user agent dirs:
 
 ```bash
-ls -l ~/.claude/skills ~/.codex/skills
+make link-global       # ~/.claude/skills, ~/.agents/skills, ~/.gemini/config/skills, ~/.gemini/antigravity-ide/skills
+make unlink-global     # remove them
 ```
 
-Each entry should show an arrow pointing back to this repo, e.g. `sliderule-api -> /path/to/sliderule-skills/sliderule-api`.
-
-### Installing a single skill
-
-If you only want one skill:
+These are **absolute** symlinks into this checkout and are *not* committed; a `git pull` here then updates every consumer. Verify with:
 
 ```bash
-ln -sfn "$(pwd)/sliderule-api" ~/.claude/skills/sliderule-api
-ln -sfn "$(pwd)/sliderule-api" ~/.codex/skills/sliderule-api
+ls -l ~/.claude/skills ~/.agents/skills
+# each entry: sliderule-api -> /path/to/sliderule-skills/sliderule-api
 ```
 
-### Uninstalling
+`ln -sfn` (used by the targets) replaces existing symlinks, so the targets are safe to re-run after adding skills. They won't overwrite a real directory — if you have a non-symlink copy of a skill installed, remove it first.
 
-Symlinks can be removed without affecting the repo:
+### Adding another agent
 
-```bash
-rm ~/.claude/skills/sliderule-api ~/.codex/skills/sliderule-api
-```
+The linking is data-driven. Add the agent's `<platform>/skills` directory to `PROJECT_SKILL_DIRS` (and its per-user dir to `GLOBAL_SKILL_DIRS`) in the `Makefile`, then re-run the link target — nothing else to change.
 
-### Without a global install (project-level)
+### How discovery works
 
-You don't have to install globally. Claude Code (and the Agent SDK) also discover skills from a project-level `.claude/skills/` directory — in the working directory, every parent up to the repository root, and nested subdirectories on demand. Two ways to use this:
-
-- Run Claude Code from a directory that has the repo's skills under `.claude/skills/`, or
-- Point Claude Code at this repo with `--add-dir /path/to/sliderule-skills` — a `.claude/skills/` inside an added directory is loaded automatically.
-
-Precedence is enterprise > personal (`~/.claude`) > project (`.claude`) > plugins.
+Claude Code (and the Agent SDK) discover project-level skills from `.claude/skills/` in the working directory, every parent up to the repo root, and nested subdirectories on demand — so the committed `.claude/skills/` is found automatically when you work in this repo. You can also point an external Claude session at the repo with `--add-dir /path/to/sliderule-skills` (a `.claude/skills/` inside an added directory is loaded automatically). Precedence: enterprise > personal (`~/.claude`) > project (`.claude`) > plugins.
 
 ## Non-macOS users
 
@@ -87,11 +72,11 @@ The skills are plain text and Python and run anywhere; only the install mechanic
 
 ### Linux
 
-Identical to macOS. The `mkdir`/`ln -sfn` instructions above work verbatim.
+Identical to macOS. The `make link-project` / `make link-global` targets work verbatim.
 
 ### Windows
 
-The skills directories live under your user profile — `%USERPROFILE%\.claude\skills\` and `%USERPROFILE%\.codex\skills\` — but the Bash `ln` loop won't run in `cmd`/PowerShell. Pick one:
+The `make` targets need a Unix shell (Git Bash or WSL) — run them there. In plain `cmd`/PowerShell, replicate the links manually into each agent's profile dir (`%USERPROFILE%\.claude\skills\`, `%USERPROFILE%\.agents\skills\`, `%USERPROFILE%\.gemini\config\skills\`, `%USERPROFILE%\.gemini\antigravity-ide\skills\`). The example below uses `.claude`; repeat for the others. Pick one:
 
 - **Directory junctions (recommended — no admin needed).** The closest equivalent to the symlink "single source of truth" model. In `cmd`:
 
@@ -120,22 +105,24 @@ If you run Claude Code or Codex *inside* WSL, treat it as Linux and use the macO
 
 ## Using the skills with Codex
 
-Codex supports the same open Agent Skills standard and discovers these skills in **two** ways.
+Codex uses the cross-agent `.agents/skills/` convention — `$REPO_ROOT/.agents/skills/` for a project and `~/.agents/skills/` globally — and discovers these skills in **three** ways.
 
-### Per-project (no install)
+### Project-level (committed)
 
-When Codex runs with its working directory at or under a **trusted** project, it scans that project tree for `*/SKILL.md` and registers each skill for the session — so simply running `codex` inside a clone of this repo exposes all the `sliderule-*` skills with no install step. Mark the repo trusted in `~/.codex/config.toml`:
+`make link-project` populates `.agents/skills/` in this repo, and those symlinks are committed — so a fresh clone already exposes every `sliderule-*` skill to Codex with no setup.
+
+### Per-project trusted scan (no symlinks)
+
+When Codex runs with its working directory at or under a **trusted** project, it also scans the tree for `*/SKILL.md` and registers each skill for the session. Mark the repo trusted in `~/.codex/config.toml`:
 
 ```toml
 [projects."/path/to/sliderule-skills"]
 trust_level = "trusted"
 ```
 
-These skills are then visible only while working in that repo.
-
 ### Global (every project)
 
-To make the skills available from any working directory, get them into `~/.codex/skills/` — either with the symlink loop above, or by asking Codex to use its built-in **`skill-installer`** skill to install from this repo's path. User skills sit alongside the built-in `.system/` skills in that directory.
+`make link-global` symlinks the skills into `~/.agents/skills/`. Alternatively, ask Codex to use its built-in **`skill-installer`** skill to install from this repo's path. (Codex's built-in `.system/` skills live separately under `~/.codex/skills/.system/`.)
 
 ## Using the skills in a hosted agent app (e.g. Claude.ai)
 
