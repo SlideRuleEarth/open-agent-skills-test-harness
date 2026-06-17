@@ -1,0 +1,27 @@
+name: 03-task-metrics-reporting
+description: >
+  Reports a compact SlideRule Task Summary of task metrics (API, region, time
+  window, request duration, response size, rows, columns, granules) after the
+  request, capturing timing and data stats during execution — and still reports
+  duration and a reason even when a request returns zero rows or fails.
+skills:
+- sliderule-pipeline
+prompt: |
+  Run an atl06p request over this tiny polygon for January 2019. Heads up — it
+  might come back empty. Either way, tell me how the request went.
+files: []
+rubric:
+- After the request, reports a compact task-metrics summary in the format the skill specifies — a "SlideRule
+  Task Summary" covering the API, region, time window, request duration, response size, row count, column
+  count, and granules processed.
+- Captures the metrics DURING execution by timing the `requests.post()` call (e.g. `start = time.time()`
+  ... `elapsed = time.time() - start`) and reading row/column counts and `granules_processed` from the
+  parsed response and `meta`/`srctbl`, rather than estimating them after the fact.
+- Reports the request duration AND a reason even when the request returns zero rows or fails — does not
+  silently omit metrics or skip the summary on an empty/failed result.
+- On a zero-row result, exports the metadata and the zero-row finding rather than padding, mocking, or interpolating
+  a placeholder series to fill the empty result.
+- Wraps the pipeline in try/except with informative error messages so a mid-script failure still reports
+  what succeeded (including the timing captured before the failure).
+- Casts numpy scalars with explicit `float()` (e.g. `round(float(val), 4)`) when assembling reported/exported
+  values to avoid float32 JSON serialization errors.

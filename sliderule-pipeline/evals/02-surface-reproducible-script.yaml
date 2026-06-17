@@ -1,0 +1,28 @@
+name: 02-surface-reproducible-script
+description: >
+  Saves the consolidated pipeline as a named pipeline.py file in a run directory,
+  executes THAT EXACT FILE (not an inline string or heredoc), and surfaces the
+  reproducible script to the user — so the user can change a coordinate or date
+  and rerun without reconstructing the request from the chat transcript.
+skills:
+- sliderule-pipeline
+prompt: |
+  Pull atl13p lake surface heights for Lake Powell for summer 2023 and export
+  the results. Make sure I can rerun exactly what you ran later — I'll probably
+  want to tweak the date range.
+files: []
+rubric:
+- Writes the consolidated pipeline to a named file `pipeline.py` rather than running code that lives only
+  inside an ephemeral inline string or heredoc.
+- Places the script in a run directory under `agents_outputs/` named from the agent identifier, a stable
+  study slug, and a UTC timestamp (e.g. `agents_outputs/<agent>_lake_powell_atl13_<YYYYMMDDTHHMMSSZ>/`),
+  using lowercase ASCII underscore-separated slugs.
+- Executes that same saved file (e.g. `python agents_outputs/.../pipeline.py`), NOT a separate heredoc or
+  inline string, so the surfaced script provably matches what actually ran with no drift.
+- Surfaces the `pipeline.py` file to the user alongside the task summary and any results, and frames it as
+  reproducible — the user can change the date range and rerun without rebuilding the request from chat.
+- Keeps `pipeline.py` self-contained (imports, the `parms` dict, the POST, parsing, filtering/aggregation,
+  export, and the stdout summary all in the one file).
+- "Applies the defensive-coding directives: calls `df = df.reset_index()` immediately after `table.to_pandas()`
+  (so `time_ns` is not silently dropped on `to_parquet`), sets `timeout=300` on the POST, and prints the
+  column schema inline after reset_index."

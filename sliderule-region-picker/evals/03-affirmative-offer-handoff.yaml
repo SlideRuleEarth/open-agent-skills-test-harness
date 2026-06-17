@@ -1,0 +1,28 @@
+name: 03-affirmative-offer-handoff
+description: >
+  After offering to let the user draw their region, when the user accepts
+  ("yes, the map"), hands off the helper-map link and is prepared to parse
+  the pasted region — including the rasterize-enabled poly + raster format.
+skills:
+- sliderule-region-picker
+prompt: |
+  Earlier you asked whether I'd like to enter coordinates or draw my region
+  on a map. Yes — let me draw it on the map. My polygon is going to be a
+  fairly complex coastline, so I care about precise boundaries.
+files: []
+rubric:
+- Treats the user's "yes, the map" as accepting the offered draw-a-region
+  option and responds by providing the helper map at the exact URL
+  `https://client.slideruleearth.io/helpermap`.
+- Tells the user to draw their shape, click "Copy to Clipboard", and paste
+  the JSON result back into the conversation.
+- Because the user has a complex/concave coastline where precise boundaries
+  matter, suggests enabling the "rasterize" checkbox on the helper map.
+- Shows awareness that the pasted result may come in two forms — the
+  simplified convex-hull `poly` (rasterize off), or `poly` plus a `raster`
+  object (rasterize on) — and that the `raster` object is passed as the
+  `region_mask` parameter in the SlideRule request.
+- Does NOT try to render a map inline or fabricate coordinates for the
+  user's coastline.
+assertions:
+- {type: final_contains, contains: "https://client.slideruleearth.io/helpermap"}

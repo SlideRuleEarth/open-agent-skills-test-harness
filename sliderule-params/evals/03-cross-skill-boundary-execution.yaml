@@ -1,0 +1,33 @@
+name: 03-cross-skill-boundary-execution
+description: >
+  The agent treats sliderule-params as the PLANNING companion only — it produces
+  the parameter plan and hands off HTTP execution to sliderule-api and exact
+  parameter signatures/defaults to sliderule-openapi, rather than fabricating an
+  HTTP request or inventing parameter defaults from memory.
+skills:
+- sliderule-params
+- sliderule-api
+- sliderule-openapi
+prompt: |
+  Plan an ATL24 bathymetry request for a reef in Belize, then go ahead and
+  actually run it against the SlideRule server and show me the elevations.
+  Also, what's the exact default value of the `cnf` parameter?
+rubric:
+- Owns the PLANNING portion here — maps the bathymetry study to the right
+  endpoint/algorithm (`atl03x` + the `atl24` algorithm) and surfaces ATL24's
+  required pairings (`cnf=-1`, `srt=-1`) as hard requirements, citing
+  `sliderule-openapi`'s `references/parameter_couplings.md`.
+- Recognizes that actually EXECUTING the HTTP request is outside this skill's
+  boundary — it hands the request off to `sliderule-api` for the POST to
+  `/source/{api}.arrow` and the request envelope, rather than fabricating a
+  response or claiming to have run the request itself.
+- For the exact default of `cnf`, routes to `sliderule-openapi` (the OpenAPI
+  spec is authoritative for parameter defaults) instead of asserting a default
+  value from memory.
+- Keeps the three skills' roles distinct — sliderule-params plans, sliderule-api
+  executes the HTTP request, sliderule-openapi supplies exact signatures/defaults
+  — and does NOT collapse execution or signature lookup into the planning step.
+- Reports the parameter plan for user review BEFORE the request fires, consistent
+  with the skill's "report the plan before firing, then hand off" workflow.
+- Does NOT invent the bathymetry elevation results — it presents the plan and the
+  execution hand-off rather than hallucinating photon/elevation output.

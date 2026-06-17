@@ -1,0 +1,29 @@
+name: 03-cross-skill-boundary-param-planning
+description: >
+  A pure parameter-PLANNING / defaults question is out of this skill's lane (HTTP
+  mechanics); correct behavior redirects parameter selection to sliderule-params and
+  parameter signatures/defaults/columns to sliderule-openapi, instead of inventing
+  parameter values inside an HTTP-execution skill.
+skills:
+- sliderule-api
+- sliderule-params
+- sliderule-openapi
+prompt: |
+  I want to run atl06x for a land-ice study. Which parameters should I set, and what
+  does the `cnf` parameter default to if I leave it out?
+files: []
+rubric:
+- Recognizes this is a parameter-PLANNING and schema-lookup question, NOT an HTTP-mechanics
+  question — so it is outside the sliderule-api skill's responsibility.
+- Routes the "which parameters should I set" half to `sliderule-params`, the planning
+  skill that systematically reasons about study type and parameter interactions before a
+  request is built.
+- Routes the "what does `cnf` default to" half to `sliderule-openapi` (the authoritative
+  source for parameter signatures, defaults, and valid values from the OpenAPI spec) —
+  not to sliderule-api and not from memory.
+- Does NOT fabricate a concrete `cnf` default value or a parameter list on its own; the
+  sliderule-api skill handles request mechanics only and explicitly defers request
+  CONTENT to sliderule-params.
+- Frames sliderule-api's own role correctly — building/executing the POST to
+  /source/{api}.arrow AFTER the request has been planned — rather than presenting it as
+  the place to decide parameters or defaults.

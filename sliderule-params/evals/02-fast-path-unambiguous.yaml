@@ -1,0 +1,28 @@
+name: 02-fast-path-unambiguous
+description: >
+  For an unambiguous request with no coupling/datum landmine, the agent takes
+  the fast-path triage — maps intent to the endpoint, sets region/time/beams,
+  adds the output block, and stops — rather than walking all seven planning
+  phases or reading the whole reference shelf.
+skills:
+- sliderule-params
+prompt: |
+  Give me a basic ATL06 land-ice elevation request over Greenland for
+  2023 using SlideRule defaults — nothing fancy, just standard elevations.
+rubric:
+- Recognizes this is an unambiguous request that hits NONE of the fast-path
+  triage triggers — no `atl08_class`/`atl24`/`atl13` coupling, no
+  orthometric/MSL/datum requirement, no off-default `res`/`len`/`cnt` tuning,
+  no algorithm-block configuration.
+- Takes the fast path — maps intent to the elevation endpoint (`atl06x`),
+  sets region/time from the request, and adds the required `output` block —
+  WITHOUT walking all seven planning phases.
+- Does NOT over-read references — it does not open `parameter_couplings.md`,
+  `elevation_datums.md`, `algorithms.md`, or other reference files for this
+  trivial ask, since no trigger fires for them.
+- Does NOT load up extraneous `openapi.py` lookups beyond, at most, a single
+  default the agent genuinely doesn't know — it relies on documented defaults
+  rather than re-deriving every parameter.
+- Produces a compact, fire-ready plan rather than an exhaustive phase-by-phase
+  walkthrough, demonstrating that the triage gate correctly short-circuited
+  full planning.
