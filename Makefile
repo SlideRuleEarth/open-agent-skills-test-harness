@@ -32,12 +32,19 @@ GLOBAL_SKILL_DIRS := \
 	link-project link-global unlink-project unlink-global relink-project \
 	$(EXPORT_TARGETS)
 
-help: ## Show this help
-	@echo "Targets:"
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  %-18s %s\n", $$1, $$2}'
+help: ## That's me!
+	@printf "\033[37m%-30s\033[0m %s\n" "#-----------------------------------------------------------------------------------------"
+	@printf "\033[37m%-30s\033[0m %s\n" "# Makefile Help       "
+	@printf "\033[37m%-30s\033[0m %s\n" "#-----------------------------------------------------------------------------------------"
+	@printf "\033[37m%-30s\033[0m %s\n" "#----target--------------------description------------------------------------------------"
+	@grep -E '^[a-zA-Z_-].+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
 	@echo
 	@echo "Per-skill export: make export-<skill>   (e.g. make export-sliderule-api)"
+	@echo
+	@echo SKILLS: $(SKILLS)
+	@echo OUTPUT_DIR: $(OUTPUT_DIR)
+	@echo PROJECT_SKILL_DIRS: $(PROJECT_SKILL_DIRS)
+	@echo GLOBAL_SKILL_DIRS: $(GLOBAL_SKILL_DIRS)
 
 export: ## Export all skills as zips into $(OUTPUT_DIR)/
 	$(PYTHON) export.py -o $(OUTPUT_DIR)
