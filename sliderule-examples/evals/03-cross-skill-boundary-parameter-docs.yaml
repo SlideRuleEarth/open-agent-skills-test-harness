@@ -1,0 +1,24 @@
+name: 03-cross-skill-boundary-parameter-docs
+description: >
+  A question about what a parameter means or its authoritative default is a
+  documentation/parameter-lookup question that must route to sliderule-openapi
+  (or sliderule-params), not be answered by dumping notebook example code from
+  sliderule-examples.
+skills:
+- sliderule-examples
+- sliderule-openapi
+prompt: |
+  What does the cnf parameter control and what is its default value?
+files: []
+rubric:
+- Recognizes this is a parameter-documentation / structured-lookup question
+  about what cnf means and its default value — NOT a request for example code.
+- Routes to sliderule-openapi (the authoritative source for parameter meaning
+  and defaults) rather than answering primarily from sliderule-examples.
+- Does NOT answer by dumping a notebook example or by reading the cnf value out
+  of an example .py file and presenting that as the parameter's definition.
+- If an example happens to set cnf, treats that value as illustrative only —
+  per the SKILL.md note that example code is not authoritative for parameter
+  defaults — and defers to the OpenAPI spec for the canonical default.
+- Cites the parameter definition/default from sliderule-openapi, not a
+  fabricated value or an example-file value presented as authoritative.

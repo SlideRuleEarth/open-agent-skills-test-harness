@@ -1,0 +1,29 @@
+name: 01-draw-region-present-map
+description: >
+  When the user asks to draw or pick their region on a map (and gives no
+  coordinates), presents the hosted SlideRule helper-map link and the
+  copy-paste round-trip rather than trying to render a tile map inline or
+  inventing a region.
+skills:
+- sliderule-region-picker
+prompt: |
+  I want to run an ATL08 canopy analysis but I don't have coordinates yet.
+  Let me draw my study area on a map.
+files: []
+rubric:
+- Presents the hosted helper map at the exact URL
+  `https://client.slideruleearth.io/helpermap` so the user can draw their
+  region interactively.
+- Explains the round-trip the user must perform — draw a rectangle/polygon
+  on the helper map, click "Copy to Clipboard", then paste the result back
+  into the conversation.
+- Does NOT attempt to render a tile-based map (Leaflet/OpenLayers, folium,
+  etc.) inline — the skill says external tile servers are blocked in
+  sandboxed environments, so it directs the user to the hosted page instead.
+- Does NOT invent or guess coordinates / a polygon for the user, since the
+  user explicitly chose to draw their own region.
+- Keeps the instructions concise rather than over-explaining the
+  self-explanatory helper-map UI, and indicates it will run the ATL08
+  analysis once the region is pasted back.
+assertions:
+- {type: final_contains, contains: "https://client.slideruleearth.io/helpermap"}

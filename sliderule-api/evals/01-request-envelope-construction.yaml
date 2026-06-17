@@ -1,0 +1,32 @@
+name: 01-request-envelope-construction
+description: >
+  Given an already-planned parameter set, builds a correct POST to the Processing
+  API — the right endpoint with the `.arrow` suffix, a `{"parms": {...}}` body
+  carrying the required `output` block and a properly closed counter-clockwise
+  polygon — rather than hitting the wrong path or omitting the output block.
+skills:
+- sliderule-api
+prompt: |
+  I've already planned my request with sliderule-params. I want land-ice surface
+  elevation segments over a small box near Grand Mesa, Colorado, and I have the
+  parameter dict ready. Show me the exact HTTP request to send to SlideRule and
+  the Python to execute it and read the result.
+files: []
+rubric:
+- POSTs to the Processing API base `https://sliderule.slideruleearth.io` at the
+  `/source/{api}.arrow` path — NOT the suffix-less `/source/{api}` streaming path,
+  which the skill explicitly says to avoid in sandboxed/proxied environments.
+- Selects the `atl06x` endpoint for land-ice surface elevation segments (the
+  X-Series land-ice API), not atl03x or a legacy `atl06p`-style endpoint.
+- Wraps the parameters in a request body keyed under `parms` and includes the
+  required `output` block (format parquet, as_geo false, with_checksum false)
+  inside `parms`.
+- If it shows a polygon, the polygon is an array of `{lon, lat}` objects that is
+  closed (first point equals last point); does not invent a different region format.
+- Reads the Parquet response into a DataFrame (e.g. via pyarrow) and recovers the
+  time index as a column (reset_index), rather than treating the response as JSON.
+- Defers the actual parameter VALUES to the user's already-planned dict / the
+  sliderule-params output — it does not re-plan parameters here.
+assertions:
+- {type: final_contains, contains: ".arrow"}
+- {type: final_contains, contains: "output"}

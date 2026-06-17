@@ -1,0 +1,27 @@
+name: 02-cross-skill-boundary-narrative
+description: A narrative "how do I / why would I" question routes to sliderule-docsearch, and the physical-meaning sub-question routes to nsidc-reference, instead of being answered as a structured spec lookup.
+skills:
+- sliderule-openapi
+- sliderule-docsearch
+prompt: |
+  How do I decide between using atl06x and atl08x for a vegetation study, and why would I pick one
+  over the other? Also, what does the ground-vs-canopy photon classification actually represent physically?
+files: []
+rubric:
+- Recognizes this is NOT a structured-lookup question — "how do I decide", "why would I pick", and "what
+  does it represent physically" are narrative / conceptual / science questions, not parameter-signature,
+  default-value, or output-column lookups.
+- Routes the "how do I decide / why pick one over the other" part to `sliderule-docsearch` — per this
+  skill's SKILL.md, narrative "how do I..." / "why use X" questions belong to docsearch, not to slicing
+  the OpenAPI spec.
+- Routes the "what does the classification represent physically" part to `nsidc-reference` — the physical
+  meaning of ground vs. canopy photon classification is ICESat-2 science (ATBD / product theory), which
+  SKILL.md explicitly hands off to nsidc-reference, not to this skill.
+- Does NOT try to answer the decision/why question by running scripts/openapi.py and quoting endpoint
+  or parameter slices as if a spec fragment were a recommendation — the spec carries no rationale, examples,
+  or comparative narrative.
+- May still use sliderule-openapi in a supporting role to confirm a concrete structured fact (e.g. that
+  atl08x accepts top-level `use_abs_h` or that an endpoint accepts a given parameter), but only as secondary
+  context, not as the primary answer to the narrative question.
+- Names the correct routing target(s) explicitly rather than silently answering everything itself from
+  the spec.

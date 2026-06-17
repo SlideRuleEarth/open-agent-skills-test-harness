@@ -1,0 +1,26 @@
+name: 03-datum-orthometric-route
+description: For an orthometric/MSL output request, consult elevation_datums.md and do not mislabel use_abs_h output as orthometric — use_abs_h is ellipsoidal (Axis 1 only); a geoid/datum route is also required.
+skills:
+- sliderule-openapi
+prompt: |
+  For an atl08x canopy-height request, I want orthometric (mean-sea-level) elevations instead of
+  ellipsoidal ones. Does setting use_abs_h get me that?
+files: []
+rubric:
+- Consults `references/elevation_datums.md` — orthometric / MSL / geoid routing is not expressible in
+  the OpenAPI spec, so the answer must come from this curated supplement, not just a `param use_abs_h`
+  slice.
+- Answers NO — `use_abs_h` alone does NOT produce orthometric output. It is the Axis 1 (relief-vs-absolute)
+  switch and returns ELLIPSOIDAL (WGS84) elevations, not orthometric — treating its output as orthometric
+  is wrong by the full geoid undulation (tens of meters).
+- Identifies that orthometric output needs BOTH axes resolved — absolute heights (Axis 1, via `use_abs_h`)
+  AND a geoid/datum conversion (Axis 2, via the `datum` parameter or a `geoid` entry in `atl03_corr_fields`)
+  — not a single parameter.
+- Gives the endpoint-correct Axis 2 route for the atl08x endpoint — the `datum` parameter is accepted
+  on atl08x (server-side conversion), whereas `atl03_corr_fields` is NOT available on atl08x (it is an
+  atl03x / ATL03-dispatch route) — so does not recommend an incompatible route for this endpoint.
+- May surface the "accepts vs applies" caveat for `datum` (the spec records endpoint acceptance, not whether
+  the conversion is applied to a given algorithm's columns) and suggest validating on a first request,
+  but does not present this as a reason to skip the geoid step.
+- Cites `references/elevation_datums.md` (and the use_abs_h signature from the OpenAPI `Atl08Parameters`
+  schema) as the sources, so the user can verify the ellipsoidal-vs-orthometric distinction.

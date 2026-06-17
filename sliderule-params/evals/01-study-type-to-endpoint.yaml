@@ -1,0 +1,30 @@
+name: 01-study-type-to-endpoint
+description: >
+  For an ambiguous study-type request (canopy height), the agent maps the
+  study to the right endpoint/algorithm in Phase 1 and surfaces the required
+  parameter couplings before recommending a configuration — rather than naming
+  a classifier parameter without its mandatory pairing.
+skills:
+- sliderule-params
+prompt: |
+  I want to measure forest canopy height over a study site in Oregon using
+  ICESat-2. How should I set up the SlideRule request — which API and what
+  parameters do I need for the vegetation photons?
+rubric:
+- Treats this as a study-type-to-endpoint mapping problem (Phase 1), not a bare
+  parameter dump — names a concrete endpoint/algorithm appropriate to canopy
+  height (e.g. `atl03x` with the `phoreal` algorithm, or `atl08x`) rather than
+  jumping straight to filtering flags.
+- Recognizes that getting vegetation photons requires ATL08 classification
+  (`atl08_class` / `phoreal`) and does NOT recommend `atl08_class` in isolation
+  — it surfaces the required pairing (`cnf` ≤ 0 and `srt=0`) as a hard
+  requirement, not optional tuning.
+- Justifies the coupling as a silent-failure guard — setting `atl08_class`
+  without the `cnf`/`srt` pairing produces wrong or empty output, not just a
+  suboptimal result.
+- Attributes the coupling to `sliderule-openapi`'s `references/parameter_couplings.md`
+  (the OpenAPI spec cannot encode couplings) rather than asserting the pairing
+  from memory as a definitive fact.
+- Frames the answer as a parameter PLAN (intent → endpoint → photon filtering)
+  that can be reviewed before the request fires, consistent with the skill's
+  "report the plan before firing" workflow.

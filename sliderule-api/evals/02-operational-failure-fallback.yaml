@@ -1,0 +1,27 @@
+name: 02-operational-failure-fallback
+description: >
+  Diagnoses an operational failure (HTTP 429/503, timeout) per the skill's failure-mode
+  guidance — backing off and reducing region size, distinguishing a true error from
+  a valid zero-row response, and falling back to atl03x when an algorithm returns no
+  data — instead of giving up or misreporting the cause.
+skills:
+- sliderule-api
+prompt: |
+  My SlideRule POST to /source/atl06x.arrow keeps coming back with HTTP 429, and
+  when it does succeed it returns zero rows. What's going on and what should I do?
+files: []
+rubric:
+- Identifies HTTP 429 as rate limiting / throttling by the server, not as a bug in
+  the request body or a parameter error.
+- Recommends checking the response body for a wait-time hint and, if present, surfacing
+  it to the user and asking whether to wait or stop; if absent, waiting ~30–60 seconds
+  before retrying.
+- On retry, recommends reducing the REGION size (smaller polygon / bounding box)
+  rather than narrowing the time filter, consistent with the skill's "favor reducing
+  region size" guidance.
+- Explains that zero rows with a valid schema is NOT a failure — the algorithm ran but
+  no data qualified — and is a separate issue from the 429.
+- Suggests falling back to `atl03x` with no algorithm block (or relaxing quality
+  filters) to inspect raw photons when a higher-level API like atl06x returns zero rows.
+- Does NOT conflate the 429 (throttling) with the zero-row result (no qualifying data) —
+  treats them as two distinct conditions.

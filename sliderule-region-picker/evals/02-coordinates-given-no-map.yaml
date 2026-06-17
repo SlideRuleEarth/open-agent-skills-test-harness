@@ -1,0 +1,22 @@
+name: 02-coordinates-given-no-map
+description: >
+  When the user already supplies an explicit bounding box / coordinates,
+  uses them directly to define the region and does NOT push the helper map,
+  since the region is already specified.
+skills:
+- sliderule-region-picker
+prompt: |
+  Run an ATL06 land-ice elevation study over this box: lon -108.3 to -108.1,
+  lat 38.8 to 39.0 (around Grand Mesa, Colorado).
+files: []
+rubric:
+- Recognizes the user has ALREADY specified the region as an explicit
+  bounding box, so no interactive region-picking is needed.
+- Does NOT present, offer, or push the helper-map link
+  (https://client.slideruleearth.io/helpermap) — the helper map is for users
+  who have NOT supplied coordinates and want to draw a region.
+- Uses the given lon/lat extents directly to build the polygon for the
+  request (a closed ring of {lon, lat} corner points covering the box).
+- Does not ask the user to re-draw or re-specify a region that was already
+  given, and proceeds toward setting up the ATL06 land-ice analysis.
+assertions: []

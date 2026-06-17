@@ -1,0 +1,21 @@
+name: 02-no-example-no-fabrication
+description: >
+  When asked for an example of a feature that has no matching notebook in the
+  index, the skill reports that no example was found (optionally suggesting the
+  closest real notebooks) rather than inventing a notebook name, path, or
+  example code.
+skills:
+- sliderule-examples
+prompt: Is there an example notebook that shows the atl08p endpoint being called?
+files: []
+rubric:
+- Reads references/index.md to check whether any example covers the atl08p
+  endpoint, instead of assuming one exists.
+- Determines from the index that no example file is listed under an atl08p API
+  entry (the By API section has no atl08p row).
+- States clearly that there is no matching atl08p example, rather than presenting
+  a fabricated notebook name or path as if it were real.
+- Does NOT invent example code attributed to a non-existent atl08p notebook.
+- If it suggests alternatives, it names only real entries from the index (e.g.
+  the atl06p examples, or atl03/photon-data examples) and cites their actual
+  filenames or notebook links.
