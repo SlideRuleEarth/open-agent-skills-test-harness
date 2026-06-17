@@ -1,0 +1,45 @@
+# models.yaml — the models the agent-skill-evals harness tests.
+# This is the SINGLE SOURCE OF TRUTH for model ids; nothing in the code hardcodes them.
+#
+# EDIT THIS FILE as models change:
+#   • add a model          -> add a line under that runner's `models:`
+#   • roll a model off      -> delete its line (and repoint `default:` if it was the default)
+#   • change the cheap default -> set `default:` to any id present in that runner's `models:`
+#
+# Per-run model selection (per runner, in priority order):
+#   CLI --model  >  (--all-models ? the full `models:` list)  >  `default:` (a plain run)
+#   >  the runner's own built-in default.
+#
+# A "runner" is the harness used to reach a model (Claude Code, Codex, AntiGravity).
+# Each model is listed under exactly ONE runner — see "test per model, not per surface"
+# in agent-skill-evals/README.md. Validate edits with `agentskill-evals list-agents`.
+#
+# Find current ids:  Claude -> Anthropic model docs / the claude-api skill
+#                    Codex  -> `codex --help`, OpenAI Codex docs/changelog
+#                    AntiGravity -> `agy models` (map the display name to its --model token)
+#
+# The ids below were verified against the installed CLIs (claude / codex 0.140.0 / agy 1.0.9)
+# on 2026-06-17. Re-verify when a model is added or rolled off — a mistyped/retired id
+# surfaces as a run error pointing back to this file.
+
+agents:
+  claude:
+    default: claude-haiku-4-5        # cheapest — used by a plain `run`
+    models:                          # the full set, run only with --all-models
+      - claude-opus-4-8
+      - claude-sonnet-4-6
+      - claude-haiku-4-5
+  codex:
+    default: gpt-5.4-mini
+    models:
+      - gpt-5.5
+      - gpt-5.4-mini
+  antigravity:
+    default: gemini-3.5-flash
+    models:
+      - gemini-3.1-pro
+      - gemini-3.5-flash
+
+judge:                               # the (cheap) model used to grade rubrics
+  agent: claude
+  model: claude-haiku-4-5

@@ -87,4 +87,17 @@ def execute(
     except Exception as exc:  # parsing must never crash a run
         rr.error = (rr.error + "; " if rr.error else "") + f"parse failed: {exc}"
 
+    # A nonzero exit is a failed run — surface it so the cell is marked failed and
+    # the model-rejection annotation (runner) can fire on bad model ids.
+    if code != 0 and not rr.error and not rr.timed_out:
+        tail = _tail(stderr) or _tail(stdout) or "(no stderr)"
+        rr.error = f"{adapter.binary} exited with code {code}: {tail}"
+
     return ExecResult(rr, stdout, stderr)
+
+
+def _tail(text: str | None, limit: int = 400) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    return text[-limit:].replace("\n", " ⏎ ")

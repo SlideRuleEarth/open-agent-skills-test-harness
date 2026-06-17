@@ -1,5 +1,6 @@
 agents_outputs/
 exports/
+artifacts/
 .DS_Store
 
 # Python bytecode caches
