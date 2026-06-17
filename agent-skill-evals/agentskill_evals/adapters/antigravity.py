@@ -1,25 +1,20 @@
 """AntiGravity (Google) adapter.
 
-Invocation:
-    agy -p "<prompt>" [--output-format json] [-m MODEL]
+Verified against agy 1.0.9:
+    agy -p "<prompt>" [--dangerously-skip-permissions] [--model MODEL]
 
-Notes / caveats (AntiGravity's headless interface is young and under-documented
-as of this writing):
-  * The binary is `agy`, not `antigravity`.
-  * `--output-format json` exists but is version-dependent — some builds don't
-    recognize it. We request it by default but parse defensively: JSONL first,
-    then a single JSON object, then fall back to treating stdout as the final
-    answer text.
-  * `/goal <prompt>` runs a task to completion without pausing for plan
-    approval; we prepend it when auto_approve is set. There is no documented
-    `--yolo` equivalent.
-  * The structured event schema is undocumented, so tool-trace extraction is
-    BEST-EFFORT: we map common field names (type/tool/tool_use/command/...).
-    If your build doesn't emit structured tool events, prefer filesystem and
-    llm_judge assertions over tool-trace assertions for AntiGravity.
-
-Everything here is intentionally forgiving; tighten it once a build's real
-schema is known.
+  * Binary is `agy`, not `antigravity`. `-p` / `--print` / `--prompt` run a
+    single prompt non-interactively.
+  * Auto-approve tool/file actions: `--dangerously-skip-permissions` (set when
+    opts.auto_approve). Older docs' `/goal` prefix is NOT used by this build.
+  * Model flag is `--model` (not `-m`).
+  * agy 1.0.9 has NO `--output-format` flag — output is plain text, so we don't
+    request one by default and parse() falls back to treating stdout as the
+    final answer. There is no structured event/tool trace, so prefer filesystem
+    and llm_judge assertions over tool-trace ones for AntiGravity. (parse() still
+    handles JSONL / single-JSON defensively in case a future build emits them,
+    and you can opt in via opts.output_format if a build adds the flag.)
+  * First run triggers an interactive Google Sign-In (OAuth) in the browser.
 """
 
 from __future__ import annotations
@@ -47,15 +42,15 @@ class AntigravityAdapter(Adapter):
         return f"/{skill}"
 
     def build_argv(self, prompt: str, opts: RunOptions) -> list[str]:
-        # /goal runs to completion without approval pauses.
-        effective_prompt = f"/goal {prompt}" if opts.auto_approve else prompt
-        argv = [self.binary, "-p", effective_prompt]
-        # output_format default "json"; pass "" / None to omit (some builds reject it)
-        fmt = opts.output_format if opts.output_format is not None else "json"
-        if fmt:
-            argv += ["--output-format", fmt]
+        argv = [self.binary, "-p", prompt]
+        if opts.auto_approve:
+            argv += ["--dangerously-skip-permissions"]
         if opts.model:
-            argv += ["-m", opts.model]
+            argv += ["--model", opts.model]
+        # agy 1.0.9 has no --output-format (output is plain text); only pass it
+        # if a caller explicitly opts in for a build that supports it.
+        if opts.output_format:
+            argv += ["--output-format", opts.output_format]
         argv += opts.extra_args
         return argv
 
