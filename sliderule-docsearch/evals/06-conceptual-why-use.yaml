@@ -1,0 +1,19 @@
+name: 06-conceptual-why-use
+skills:
+- sliderule-docsearch
+prompt: Why would I use atl06x over atl06p for processing ATL06 elevations?
+rubric:
+- Recognizes this is a comparative narrative question — the answer requires synthesis across multiple
+  chunks, not a single retrieved fact.
+- Invokes scripts/search.py with a concise query covering both endpoints (e.g. `atl06x atl06p X-Series
+  differences` or similar).
+- 'Reads multiple chunks and synthesizes an answer covering: what atl06x is (the X-Series API), what atl06p
+  is (legacy), and what''s different (capabilities, output, future-direction).'
+- Verifies via matched_tokens that retrieved chunks distinguish the two endpoints, not just one. If only
+  atl06p chunks come back, re-runs with a more specific query that names atl06x explicitly.
+- Does NOT silently pick a single chunk's framing as the answer — comparative questions need multi-chunk
+  synthesis.
+- Cites both atl06x-specific and atl06p-specific chunks (or the X-Series overview page if covered) so
+  the user can verify the comparison.
+- Does NOT fabricate API differences not supported by retrieved chunks — if the corpus doesn't cover a
+  specific difference, the answer reflects that uncertainty rather than inventing one.

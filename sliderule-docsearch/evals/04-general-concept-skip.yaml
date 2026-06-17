@@ -1,0 +1,16 @@
+name: 04-general-concept-skip
+skills:
+- sliderule-docsearch
+prompt: What is GeoParquet?
+rubric:
+- Recognizes this is a general-concept question — GeoParquet is a public file-format spec, not a SlideRule-specific
+  concept.
+- Answers from training without invoking sliderule-docsearch. The SKILL.md 'Skip the search — answer from
+  training or web search' section explicitly lists 'What is GeoParquet?' as a do-not-search example.
+- If sliderule-docsearch IS invoked, the agent recognizes the returned chunks merely mention GeoParquet
+  in passing (without defining it) and either falls back to training-data definition or supplements rather
+  than relying solely on retrieval.
+- Does NOT cite a docsearch chunk as the authoritative definition of GeoParquet — at most, it might cite
+  the SlideRule-specific GeoParquet output chunk as supplementary, after defining the concept generically.
+- Recognizes that 'Does SlideRule's GeoParquet output include a CRS column?' WOULD warrant a docsearch
+  search (per the SKILL.md boundary table), but the bare 'What is GeoParquet?' does not.

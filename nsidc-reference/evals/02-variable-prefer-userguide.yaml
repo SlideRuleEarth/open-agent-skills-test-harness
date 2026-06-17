@@ -1,0 +1,20 @@
+name: 02-variable-prefer-userguide
+skills:
+- nsidc-reference
+prompt: What does the `signal_conf_ph` variable in ATL03 represent, and what units / valid values does
+  it have?
+rubric:
+- Invokes scripts/search.py with the literal variable name in the query (e.g. `signal_conf_ph atl03 confidence`).
+- Recognizes this is a variable-definition question — the canonical source is the ATL03 user guide, not
+  the ATL03 ATBD.
+- 'Among the returned chunks, prefers chunks with `category: user_guide` and `source_product: ATL03` —
+  the SKILL.md routing table assigns user_guide to ''what''s in this dataset / variable names / units
+  / quality flags''.'
+- Verifies via matched_tokens that the chosen chunk literally contains `signal_conf_ph`.
+- Reports the variable's purpose, valid value range (typically -2 to 4 for ATL03 photon confidence levels),
+  and which surface types each value applies to.
+- Cites in the form 'ATL03 v006 user guide, page N' plus the PDF URL.
+- If an ATBD chunk shows up at a higher rank than user-guide chunks, surfaces both rather than blindly
+  using the ATBD — but the primary cite for variable definitions should be the user guide.
+- Does NOT confuse `signal_conf_ph` (ATL03's per-photon confidence vector) with `classed_pc_flag` (ATL08's
+  photon classification) — they're different variables in different products.

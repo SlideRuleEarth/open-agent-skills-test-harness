@@ -1,0 +1,18 @@
+name: 04-cross-skill-boundary-schema
+skills:
+- nsidc-reference
+- sliderule-openapi
+prompt: What columns does the SlideRule atl06x endpoint return?
+rubric:
+- Recognizes this is a SlideRule API output-schema question, not a science question.
+- Routes to sliderule-openapi as the primary tool — the OpenAPI spec is authoritative for SlideRule endpoint
+  output columns; NSIDC docs describe the underlying ICESat-2 product variables, which are NOT the same
+  as SlideRule's emitted columns.
+- Does NOT use nsidc-reference as the primary source — the SKILL.md routing table explicitly lists 'What
+  columns does atl06x return?' as a sliderule-openapi query.
+- If nsidc-reference is consulted at all, it's secondary — e.g. to explain what specific columns mean
+  physically, after the OpenAPI spec lists them.
+- Answer cites the OpenAPI spec URL (machine-readable JSON), not an NSIDC PDF.
+- Does NOT enumerate ATL06 HDF5 dataset variables (h_li, h_li_sigma, n_fit_photons, etc.) as SlideRule
+  output columns — SlideRule renames, derives, or filters columns; the underlying HDF5 names aren't necessarily
+  what comes out of atl06x.

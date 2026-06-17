@@ -1,0 +1,17 @@
+name: 03-cross-skill-boundary-science
+skills:
+- sliderule-docsearch
+- nsidc-reference
+prompt: What does photon confidence level 4 actually mean physically? What's the underlying science?
+rubric:
+- Recognizes this is a science / physical-meaning question, not a SlideRule API question.
+- Routes to nsidc-reference as the primary tool — the underlying science of photon confidence is in NSIDC's
+  ATL03 documentation (ATBD + user guide), not in SlideRule's docs.
+- Does NOT primarily use sliderule-docsearch — the SKILL.md routing table explicitly lists 'What does
+  cnf=4 mean physically?' as a nsidc-reference query.
+- If sliderule-docsearch is consulted at all, it's secondary — e.g. for context on how SlideRule exposes
+  the cnf parameter, after the science is established.
+- Answer cites the NSIDC source PDF URL with page number (the standard nsidc-reference citation form),
+  not a slideruleearth.io URL.
+- Does NOT conflate SlideRule's `cnf` parameter (which selects on confidence) with the physical meaning
+  of the confidence values themselves (which is what the user is asking about).
