@@ -15,6 +15,7 @@ Results stream to artifacts/<run_id>/ and a summary table is returned for the CL
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -34,6 +35,7 @@ from .spec import EvalSpec
 @dataclass
 class CellResult:
     agent: str
+    model: Optional[str]      # the model id this cell ran (None == the runner's own default)
     eval_name: str
     skill: Optional[str]
     passed: bool
@@ -49,6 +51,10 @@ class CellResult:
     def n_total(self) -> int:
         return len(self.assertions)
 
+    @property
+    def model_label(self) -> str:
+        return _model_seg(self.model)
+
 
 class Runner:
     def __init__(
@@ -62,7 +68,7 @@ class Runner:
         provision: bool = True,
         auto_approve: bool = True,
         jobs: int = 1,
-        model_map: Optional[dict[str, str]] = None,
+        model_map: Optional[dict[str, list[Optional[str]]]] = None,
     ):
         self.agents = agents
         self.adapters: dict[str, Adapter] = {a: get_adapter(a) for a in agents}
@@ -81,23 +87,24 @@ class Runner:
     def run(self, specs: list[EvalSpec]) -> list[CellResult]:
         os.makedirs(self.run_dir, exist_ok=True)
         cells = [
-            (agent, spec)
+            (agent, model, spec)
             for spec in specs
             for agent in self.agents
             if self._eligible(agent, spec)
+            for model in (self.model_map.get(agent) or [None])
         ]
 
         results: list[CellResult] = []
         if self.jobs == 1:
-            for agent, spec in cells:
-                results.append(self._run_cell(agent, spec))
+            for agent, model, spec in cells:
+                results.append(self._run_cell(agent, model, spec))
         else:
             with ThreadPoolExecutor(max_workers=self.jobs) as pool:
-                futs = {pool.submit(self._run_cell, a, s): (a, s) for a, s in cells}
+                futs = {pool.submit(self._run_cell, a, m, s): (a, m, s) for a, m, s in cells}
                 for fut in as_completed(futs):
                     results.append(fut.result())
 
-        results.sort(key=lambda c: (c.eval_name, c.agent))
+        results.sort(key=lambda c: (c.eval_name, c.agent, c.model or ""))
         self._write_summary(results, specs)
         return results
 
@@ -106,9 +113,12 @@ class Runner:
     def _eligible(self, agent: str, spec: EvalSpec) -> bool:
         return spec.agents is None or agent in spec.agents
 
-    def _run_cell(self, agent: str, spec: EvalSpec) -> CellResult:
+    def _run_cell(self, agent: str, model: Optional[str], spec: EvalSpec) -> CellResult:
         adapter = self.adapters[agent]
-        cell_dir = os.path.join(self.run_dir, agent, _safe(spec.skill_name or "_"), _safe(spec.name))
+        cell_dir = os.path.join(
+            self.run_dir, agent, _model_seg(model),
+            _safe(spec.skill_name or "_"), _safe(spec.name)
+        )
         workspace = os.path.join(cell_dir, "workspace")
         os.makedirs(workspace, exist_ok=True)
 
@@ -122,7 +132,7 @@ class Runner:
 
         # 4) run
         opts = RunOptions(
-            model=self.model_map.get(agent),
+            model=model,
             auto_approve=self.auto_approve,
             output_schema=spec.output_schema,
         )
@@ -132,6 +142,11 @@ class Runner:
             env_overrides=spec.env, agent_name=agent, eval_name=spec.name,
         )
         rr = ex.result
+
+        # A rolled-off / mistyped model id surfaces as a run error; point the
+        # maintainer back to the config rather than leaving a raw CLI stderr.
+        if model and rr.error and _looks_like_model_error(rr.error, ex.stderr):
+            rr.error = f"model {model!r} rejected by {agent} — check models.yaml: {rr.error}"
 
         # 5) artifacts
         self._write_artifacts(cell_dir, ex.stdout, ex.stderr, rr)
@@ -148,7 +163,7 @@ class Runner:
         passed = (clean and all(c.passed for c in checks)) if checks else clean
 
         cell = CellResult(
-            agent=agent, eval_name=spec.name, skill=spec.skill_name,
+            agent=agent, model=model, eval_name=spec.name, skill=spec.skill_name,
             passed=passed, run_result=rr, assertions=checks, artifacts_dir=cell_dir,
         )
         self._write_cell_json(cell_dir, cell)
@@ -199,6 +214,7 @@ class Runner:
             os.path.join(cell_dir, "assertions.json"),
             {
                 "agent": cell.agent,
+                "model": cell.model,
                 "eval": cell.eval_name,
                 "skill": cell.skill,
                 "passed": cell.passed,
@@ -211,16 +227,23 @@ class Runner:
         )
 
     def _write_summary(self, results: list[CellResult], specs: list[EvalSpec]) -> None:
+        targets = [
+            {"agent": a, "model": m}
+            for a in self.agents
+            for m in (self.model_map.get(a) or [None])
+        ]
         summary = {
             "run_id": self.run_id,
             "agents": self.agents,
+            "targets": targets,
             "n_evals": len(specs),
             "n_cells": len(results),
             "n_passed": sum(1 for c in results if c.passed),
             "judge_agent": self.judge.agent if self.judge else None,
+            "judge_model": self.judge.model if self.judge else None,
             "cells": [
                 {
-                    "agent": c.agent, "eval": c.eval_name, "skill": c.skill,
+                    "agent": c.agent, "model": c.model, "eval": c.eval_name, "skill": c.skill,
                     "passed": c.passed, "n_pass": c.n_pass, "n_total": c.n_total,
                     "error": c.run_result.error, "timed_out": c.run_result.timed_out,
                     "cost_usd": c.run_result.cost_usd,
@@ -230,56 +253,104 @@ class Runner:
             ],
         }
         _write_json(os.path.join(self.run_dir, "summary.json"), summary)
-        _write(os.path.join(self.run_dir, "summary.md"), render_markdown(results, self.agents))
+        _write(os.path.join(self.run_dir, "summary.md"),
+               render_markdown(results, self.agents, self.model_map))
 
 
 # ---------------------------------------------------------------------------
 # Reporting helpers (also used by the CLI for stdout)
 # ---------------------------------------------------------------------------
 
-def render_matrix(results: list[CellResult], agents: list[str]) -> str:
-    """A compact eval × agent pass/fail grid for the terminal."""
-    by_eval: dict[str, dict[str, CellResult]] = {}
-    for c in results:
-        by_eval.setdefault(c.eval_name, {})[c.agent] = c
-    eval_w = max([len("EVAL")] + [len(e) for e in by_eval]) + 2
-    header = "EVAL".ljust(eval_w) + "".join(a[:10].center(12) for a in agents)
+ModelMap = dict[str, list[Optional[str]]]
+
+
+def _targets(agents: list[str], model_map: Optional[ModelMap],
+             results: list[CellResult]) -> list[tuple[str, Optional[str]]]:
+    """Ordered (agent, model) columns. Prefer the declared map; fall back to
+    whatever models actually appear in the results (for callers without a map)."""
+    out: list[tuple[str, Optional[str]]] = []
+    for a in agents:
+        models = (model_map or {}).get(a)
+        if not models:
+            models = []
+            for c in results:
+                if c.agent == a and c.model not in models:
+                    models.append(c.model)
+            if not models:
+                models = [None]
+        for m in models:
+            out.append((a, m))
+    return out
+
+
+def _target_label(agent: str, model: Optional[str]) -> str:
+    return f"{agent}:{model if model else 'default'}"
+
+
+def _cell_text(c: Optional[CellResult]) -> str:
+    if c is None:
+        return "-"
+    if c.run_result.error:
+        return "ERR"
+    return f"{'PASS' if c.passed else 'FAIL'} {c.n_pass}/{c.n_total}"
+
+
+def _cell_mark(c: Optional[CellResult]) -> str:
+    if c is None:
+        return "–"
+    if c.run_result.error:
+        return f"⚠️ {c.run_result.error}"
+    return f"{'✅' if c.passed else '❌'} {c.n_pass}/{c.n_total}"
+
+
+def render_matrix(results: list[CellResult], agents: list[str],
+                  model_map: Optional[ModelMap] = None) -> str:
+    """A single wide eval × (runner:model) pass/fail grid for the terminal,
+    followed by a pass-rate-by-target footer."""
+    by_key = {(c.eval_name, c.agent, c.model): c for c in results}
+    evals = sorted({c.eval_name for c in results})
+    targets = _targets(agents, model_map, results)
+    labels = [_target_label(a, m) for a, m in targets]
+
+    eval_w = max([len("EVAL")] + [len(e) for e in evals]) + 2
+    col_w = max([14] + [len(l) + 2 for l in labels]) if labels else 14
+    header = "EVAL".ljust(eval_w) + "".join(l.center(col_w) for l in labels)
     lines = [header, "-" * len(header)]
-    for ev in sorted(by_eval):
+    for ev in evals:
         row = ev.ljust(eval_w)
-        for a in agents:
-            c = by_eval[ev].get(a)
-            if c is None:
-                cell = "-"
-            elif c.run_result.error:
-                cell = "ERR"
-            elif c.passed:
-                cell = f"PASS {c.n_pass}/{c.n_total}"
-            else:
-                cell = f"FAIL {c.n_pass}/{c.n_total}"
-            row += cell.center(12)
+        for a, m in targets:
+            row += _cell_text(by_key.get((ev, a, m))).center(col_w)
         lines.append(row)
+
+    lines += ["", "pass rate by target:"]
+    for a, m in targets:
+        cells = [by_key.get((ev, a, m)) for ev in evals]
+        cells = [c for c in cells if c is not None]
+        npass = sum(1 for c in cells if c.passed)
+        lines.append(f"  {_target_label(a, m):<28} {npass}/{len(cells)}")
     return "\n".join(lines)
 
 
-def render_markdown(results: list[CellResult], agents: list[str]) -> str:
-    by_eval: dict[str, dict[str, CellResult]] = {}
-    for c in results:
-        by_eval.setdefault(c.eval_name, {})[c.agent] = c
-    lines = ["# Eval results", "", "| eval | " + " | ".join(agents) + " |",
-             "|" + "---|" * (len(agents) + 1)]
-    for ev in sorted(by_eval):
-        cells = []
-        for a in agents:
-            c = by_eval[ev].get(a)
-            if c is None:
-                cells.append("–")
-            elif c.run_result.error:
-                cells.append(f"⚠️ {c.run_result.error}")
-            else:
-                mark = "✅" if c.passed else "❌"
-                cells.append(f"{mark} {c.n_pass}/{c.n_total}")
+def render_markdown(results: list[CellResult], agents: list[str],
+                    model_map: Optional[ModelMap] = None) -> str:
+    by_key = {(c.eval_name, c.agent, c.model): c for c in results}
+    evals = sorted({c.eval_name for c in results})
+    targets = _targets(agents, model_map, results)
+    labels = [_target_label(a, m) for a, m in targets]
+
+    lines = ["# Eval results", "",
+             "| eval | " + " | ".join(labels) + " |",
+             "|" + "---|" * (len(labels) + 1)]
+    for ev in evals:
+        cells = [_cell_mark(by_key.get((ev, a, m))) for a, m in targets]
         lines.append(f"| {ev} | " + " | ".join(cells) + " |")
+
+    lines += ["", "## Pass rate by target", "", "| target | pass rate |", "|---|---|"]
+    for a, m in targets:
+        cells = [by_key.get((ev, a, m)) for ev in evals]
+        cells = [c for c in cells if c is not None]
+        npass = sum(1 for c in cells if c.passed)
+        lines.append(f"| {_target_label(a, m)} | {npass}/{len(cells)} |")
     return "\n".join(lines) + "\n"
 
 
@@ -289,6 +360,26 @@ def render_markdown(results: list[CellResult], agents: list[str]) -> str:
 
 def _safe(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
+
+
+def _model_seg(model: Optional[str]) -> str:
+    """Collision-free filesystem segment for a model id.
+
+    `_safe` collapses '/', ':', and spaces to '_', so distinct ids (e.g. `a/b`,
+    `a:b`) could map to the same dir. Append a short hash of the raw id whenever
+    sanitizing changed it, so distinct ids never share a directory."""
+    if not model:
+        return "_default"
+    safe = _safe(model)
+    if safe != model:
+        return f"{safe}-{hashlib.sha1(model.encode('utf-8')).hexdigest()[:6]}"
+    return safe
+
+
+def _looks_like_model_error(error: Optional[str], stderr: Optional[str]) -> bool:
+    """Heuristic: did the CLI reject the model id (rolled off / mistyped)?"""
+    blob = f"{error or ''} {stderr or ''}".lower()
+    return any(k in blob for k in ("model", "not found", "unknown", "invalid", "unsupported"))
 
 
 def _write(path: str, text: str) -> None:

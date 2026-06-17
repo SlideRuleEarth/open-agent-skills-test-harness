@@ -18,33 +18,199 @@ from . import __version__
 from .adapters import adapter_names, all_adapters, get_adapter
 from .judge import Judge
 from .runner import Runner, render_matrix
-from .spec import discover_specs, load_spec
+from .spec import _load_raw, discover_specs, load_spec
 
 
 def _default_skills_root() -> str:
     return os.getcwd()
 
 
-def _parse_models(pairs: list[str], agents: list[str]) -> dict[str, str]:
-    """--model accepts `agent=model` (repeatable) or a bare `model` for all."""
-    out: dict[str, str] = {}
+def _default_config_path(skills_root: str) -> str:
+    return os.path.join(skills_root, "models.yaml")
+
+
+def _canonical_agent(name: str) -> str:
+    try:
+        return get_adapter(name).name
+    except KeyError:
+        return name.strip().lower()
+
+
+def _split_models(s: str) -> list[str]:
+    return [m.strip() for m in s.split(",") if m.strip()]
+
+
+def _dedup(seq) -> list:
+    """Order-preserving de-duplication (a duplicate target is a duplicate paid cell)."""
+    return list(dict.fromkeys(seq))
+
+
+def _parse_models(pairs: list[str], agents: list[str]) -> dict[str, list[str]]:
+    """--model accepts `agent=m1,m2` (repeatable) or a bare `m1,m2` for all agents.
+    Returns a per-agent list; repeated flags accumulate."""
+    out: dict[str, list[str]] = {}
     for p in pairs or []:
         if "=" in p:
             a, m = p.split("=", 1)
-            out[a.strip()] = m.strip()
+            out.setdefault(_canonical_agent(a), []).extend(_split_models(m))
         else:
             for a in agents:
-                out[a] = p.strip()
+                out.setdefault(a, []).extend(_split_models(p))
     return out
+
+
+# ---------------------------------------------------------------------------
+# models.yaml — the single source of truth for which models the harness tests
+# ---------------------------------------------------------------------------
+
+class ModelsConfig:
+    """Parsed `models.yaml`. Accessors are by canonical agent name."""
+
+    def __init__(self, models: dict[str, list[str]], defaults: dict[str, str],
+                 judge: dict, warnings: list[str], load_error: str | None = None):
+        self._models = models
+        self._defaults = defaults
+        self.judge = judge          # {"agent": ..., "model": ...} (either key optional)
+        self.warnings = warnings
+        # set when a config file was present but could not be read/parsed — fatal for
+        # `run` (would silently fall back to each CLI's own, possibly pricier, default),
+        # warning-only for `list-agents`. A genuinely absent file leaves this None.
+        self.load_error = load_error
+
+    def models(self, agent: str) -> list[str]:
+        return list(self._models.get(agent, []))
+
+    def default(self, agent: str):
+        return self._defaults.get(agent)
+
+
+def _load_models_config(path) -> ModelsConfig:
+    """Read the grouped `agents:` schema; validate without crashing.
+
+        agents:
+          <runner>:
+            default: <cheapest id>
+            models: [<id>, ...]
+        judge:
+          agent: <runner>
+          model: <id>
+    """
+    if not path or not os.path.isfile(path):
+        return ModelsConfig({}, {}, {}, [])
+    warnings: list[str] = []
+    try:
+        raw = _load_raw(path)            # may raise (no PyYAML, or not a mapping)
+    except Exception as exc:
+        return ModelsConfig({}, {}, {}, [], load_error=f"{path}: {exc}")
+
+    models: dict[str, list[str]] = {}
+    defaults: dict[str, str] = {}
+
+    agents_blk = raw.get("agents") or {}
+    if not isinstance(agents_blk, dict):
+        warnings.append("`agents:` must be a mapping — ignored")
+        agents_blk = {}
+    for name, blk in agents_blk.items():
+        try:
+            agent = get_adapter(str(name)).name
+        except KeyError:
+            warnings.append(f"agent {name!r} has no registered adapter — ignored")
+            continue
+        if not isinstance(blk, dict):
+            warnings.append(f"agent {agent!r}: block must be a mapping — ignored")
+            continue
+        raw_models = blk.get("models") or []
+        if isinstance(raw_models, str):
+            raw_models = [raw_models]
+        if not isinstance(raw_models, list):
+            warnings.append(f"agent {agent!r}: `models:` must be a list — ignored")
+            raw_models = []
+        seen: list[str] = []
+        for m in raw_models:
+            m = str(m)
+            if m in seen:
+                warnings.append(f"agent {agent!r}: model {m!r} listed more than once")
+            else:
+                seen.append(m)
+        if not seen:
+            warnings.append(f"agent {agent!r}: no models listed")
+        models[agent] = seen
+        dflt = blk.get("default")
+        if dflt is not None:
+            dflt = str(dflt)
+            if seen and dflt not in seen:
+                warnings.append(
+                    f"agent {agent!r}: default {dflt!r} is not in its models {seen}")
+            defaults[agent] = dflt
+        elif seen:
+            warnings.append(
+                f"agent {agent!r}: no `default:` — plain runs use the CLI's own default")
+
+    for key in raw:
+        if key not in ("agents", "judge"):
+            warnings.append(f"unknown top-level key {key!r} ignored")
+
+    judge: dict = {}
+    jblk = raw.get("judge") or {}
+    if not isinstance(jblk, dict):
+        warnings.append("`judge:` must be a mapping — ignored")
+        jblk = {}
+    jagent = jblk.get("agent")
+    if jagent:
+        try:
+            judge["agent"] = get_adapter(str(jagent)).name
+        except KeyError:
+            warnings.append(f"judge.agent {jagent!r} has no registered adapter — ignored")
+    if jblk.get("model"):
+        judge["model"] = str(jblk["model"])
+    return ModelsConfig(models, defaults, judge, warnings)
+
+
+def _resolve_models(agents: list[str], cli_map: dict[str, list[str]],
+                    cfg: ModelsConfig, all_models: bool) -> dict[str, list]:
+    """Per-agent precedence: CLI --model > (--all-models ? full list) > default > [None]."""
+    out: dict[str, list] = {}
+    for a in agents:
+        if cli_map.get(a):
+            vals = list(cli_map[a])
+        elif all_models and cfg.models(a):
+            vals = cfg.models(a)
+        elif cfg.default(a):
+            vals = [cfg.default(a)]
+        else:
+            vals = [None]
+        out[a] = _dedup(vals)   # a repeated model id would schedule the same cell twice
+    return out
+
+
+def _target_labels(agents: list[str], model_map: dict[str, list]) -> list[str]:
+    return [f"{a}:{m or 'default'}" for a in agents for m in model_map[a]]
+
+
+def _cost_line(n_cells: int, has_judge: bool) -> str:
+    if has_judge:
+        return (f"~{n_cells} agent runs + ~{n_cells} judge calls"
+                f"        (≈{2 * n_cells} paid LLM calls)")
+    return f"~{n_cells} agent runs        (≈{n_cells} paid LLM calls)"
 
 
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
 
+def _discover(args, skills_root: str):
+    """discover_specs, but turn a missing-PyYAML RuntimeError into a clean message
+    and exit 2 instead of dumping a traceback."""
+    try:
+        return discover_specs(skills_root=skills_root, skill=args.skill, paths=args.evals)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+
+
 def cmd_run(args) -> int:
     skills_root = os.path.abspath(args.skills_root)
-    specs = discover_specs(skills_root=skills_root, skill=args.skill, paths=args.evals)
+    specs = _discover(args, skills_root)
     if args.tag:
         specs = [s for s in specs if set(args.tag) & set(s.tags)]
     if not specs:
@@ -52,9 +218,14 @@ def cmd_run(args) -> int:
               f"{skills_root!r} (use --skill / --evals to target).", file=sys.stderr)
         return 2
 
-    # agents: explicit, else all installed
+    # agents: explicit, else all installed (dedup aliases so a runner isn't run twice)
     if args.agents:
-        agents = args.agents
+        agents = _dedup(_canonical_agent(a) for a in args.agents)
+        unknown_agents = [a for a in agents if a not in adapter_names()]
+        if unknown_agents:
+            print(f"error: unknown runner(s): {', '.join(sorted(set(unknown_agents)))}. "
+                  f"Known runners: {', '.join(adapter_names())}.", file=sys.stderr)
+            return 2
     else:
         agents = [a.name for a in all_adapters() if a.is_available()]
         if not agents:
@@ -64,23 +235,110 @@ def cmd_run(args) -> int:
     # warn about unavailable agents
     for a in agents:
         if not get_adapter(a).is_available():
-            print(f"warning: agent {a!r} not on PATH — its cells will be marked ERR.",
+            print(f"warning: runner {a!r} not on PATH — its cells will be marked ERR.",
                   file=sys.stderr)
 
-    # judge
+    # models.yaml (single source of truth) → per-agent model lists.
+    # A present-but-unparseable config is fatal: silently falling back to each CLI's
+    # own default would break the "plain run uses the cheapest model" cost guarantee.
+    cfg = _load_models_config(args.models_config or _default_config_path(skills_root))
+    if cfg.load_error:
+        print(f"error: could not load models.yaml ({cfg.load_error}).\n"
+              "  It is the source of truth for which models run; a plain run uses the\n"
+              "  cheapest model from it. Fix the file, pass --models-config PATH, or set\n"
+              "  the model explicitly with --model <runner>=<id>.", file=sys.stderr)
+        return 2
+    for w in cfg.warnings:
+        print(f"warning: models.yaml: {w}", file=sys.stderr)
+    # --model is repeatable AND space-separated → flatten the list-of-lists.
+    model_pairs = [p for group in (args.model or []) for p in group]
+    cli_map = _parse_models(model_pairs, agents)
+    unknown = [a for a in cli_map if a not in agents]
+    if unknown:
+        print(f"error: --model names unknown or unselected runner(s): "
+              f"{', '.join(sorted(unknown))}. Selected runners: {', '.join(agents)}.",
+              file=sys.stderr)
+        return 2
+    model_map = _resolve_models(agents, cli_map, cfg, args.all_models)
+
+    # judge: --judge-agent > models.yaml judge.agent > claude;
+    #        --judge-model > models.yaml judge.model > the judge agent's cheapest default
     judge = None
     if not args.no_judge:
-        judge_agent = args.judge_agent or ("claude" if get_adapter("claude").is_available() else None)
+        judge_agent = (args.judge_agent or cfg.judge.get("agent")
+                       or ("claude" if get_adapter("claude").is_available() else None))
         if judge_agent:
-            judge = Judge(agent=judge_agent, model=args.judge_model)
+            try:
+                judge_agent = get_adapter(judge_agent).name
+            except KeyError:
+                print(f"warning: judge agent {judge_agent!r} unknown "
+                      f"(known: {', '.join(adapter_names())}) — disabling judge.",
+                      file=sys.stderr)
+                judge_agent = None
+        if judge_agent:
+            judge_model = args.judge_model or cfg.judge.get("model") or cfg.default(judge_agent)
+            judge = Judge(agent=judge_agent, model=judge_model)
             if not judge.available():
-                print(f"warning: judge agent {judge_agent!r} not on PATH — "
+                print(f"warning: judge runner {judge_agent!r} not on PATH — "
                       "llm_judge checks will fail.", file=sys.stderr)
         elif any(s.rubric for s in specs):
             print("note: evals have rubrics but no judge available; "
                   "pass --judge-agent or install claude.", file=sys.stderr)
 
+    # ---- plan + cost guardrails (before building the Runner) ----------------
+    n_cells = sum(len(model_map[a]) for s in specs for a in agents
+                  if (s.agents is None or a in s.agents))
+    labels = _target_labels(agents, model_map)
+    judge_label = f"{judge.agent}/{judge.model or 'default'}" if judge else "off"
+    n_llm = n_cells * (2 if judge else 1)
+
     run_id = args.run_id or _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = os.path.join(os.path.abspath(args.artifacts), run_id)
+
+    print(f"Plan: {n_cells} cell(s) — {len(specs)} eval(s) × {len(labels)} target(s) "
+          f"[{', '.join(labels)}]")
+    print(f"      judge: {judge_label}   ≈{n_llm} LLM calls   artifacts: {run_dir}\n")
+
+    if args.dry_run:
+        print("(dry run — nothing executed)")
+        return 0
+
+    if n_cells > args.max_cells:
+        scope = f"{len(specs)} evals × {len(labels)} runner/model targets"
+        print(
+            f"✗ Refusing to run: {n_cells} cells exceeds the --max-cells ceiling of "
+            f"{args.max_cells}.\n"
+            f"  Scope:  {scope}        (judge: {judge_label})\n"
+            f"  Cost:   {_cost_line(n_cells, bool(judge))}\n\n"
+            "  Narrow the run (recommended):\n"
+            "    --skill <name> | --evals <file>     fewer evals\n"
+            "    --agents claude                     fewer runners\n"
+            "    --model claude=claude-haiku-4-5     specific model(s); drop --all-models\n"
+            "    --no-judge                          skip rubric grading\n"
+            "    --dry-run                           preview, run nothing\n\n"
+            "  Or raise the ceiling deliberately:\n"
+            f"    --max-cells {max(n_cells, args.max_cells * 4)}"
+            "                     (you will still be asked to confirm)",
+            file=sys.stderr,
+        )
+        return 2
+
+    if n_cells > 1 and not args.yes:
+        if not sys.stdin.isatty():
+            print(
+                f"✗ Refusing to run {n_cells} cells without confirmation (no TTY to prompt).\n"
+                f"  Re-run with -y/--yes to confirm (still capped at --max-cells {args.max_cells}),\n"
+                "  or narrow scope (--skill/--evals/--agents/--model, --no-judge). "
+                "--dry-run to preview.",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"⚠ This spends real API/usage budget: ≈{n_llm} paid LLM calls across "
+              f"{n_cells} cells.")
+        if input("Proceed? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("aborted.")
+            return 1
+
     runner = Runner(
         agents,
         artifacts_root=os.path.abspath(args.artifacts),
@@ -90,24 +348,19 @@ def cmd_run(args) -> int:
         provision=not args.no_provision,
         auto_approve=not args.no_auto_approve,
         jobs=args.jobs,
-        model_map=_parse_models(args.model, agents),
+        model_map=model_map,
     )
-
-    print(f"running {len(specs)} eval(s) × {len(agents)} agent(s) = "
-          f"{sum(1 for s in specs for a in agents if s.agents is None or a in s.agents)} cells")
-    print(f"agents: {', '.join(agents)}    judge: {judge.agent if judge else 'off'}")
-    print(f"artifacts: {runner.run_dir}\n")
 
     results = runner.run(specs)
 
-    print(render_matrix(results, agents))
+    print(render_matrix(results, agents, model_map))
     n_pass = sum(1 for c in results if c.passed)
     print(f"\n{n_pass}/{len(results)} cells passed   (details: {runner.run_dir}/summary.md)")
 
     if args.verbose:
         for c in results:
             if not c.passed:
-                print(f"\n✗ {c.eval_name} [{c.agent}]"
+                print(f"\n✗ {c.eval_name} [{c.agent}/{c.model or 'default'}]"
                       + (f"  ERROR: {c.run_result.error}" if c.run_result.error else ""))
                 for a in c.assertions:
                     if not a.passed:
@@ -117,15 +370,31 @@ def cmd_run(args) -> int:
 
 
 def cmd_list_agents(args) -> int:
-    print(f"{'AGENT':<14}{'BINARY':<12}{'AVAILABLE':<10}SKILLS DIR")
+    skills_root = os.path.abspath(getattr(args, "skills_root", None) or _default_skills_root())
+    cfg = _load_models_config(getattr(args, "models_config", None)
+                              or _default_config_path(skills_root))
+    if cfg.load_error:   # warning-only here (read-only listing); fatal only for `run`
+        print(f"warning: models.yaml could not be loaded ({cfg.load_error}); "
+              "showing each runner's CLI default.", file=sys.stderr)
+    for w in cfg.warnings:
+        print(f"warning: models.yaml: {w}", file=sys.stderr)
+
+    # a runner is the harness used to reach a model; models come from models.yaml
+    print(f"{'RUNNER':<14}{'BINARY':<10}{'AVAILABLE':<11}{'DEFAULT MODEL':<20}MODELS")
     for a in all_adapters():
-        print(f"{a.name:<14}{a.binary:<12}{'yes' if a.is_available() else 'no':<10}{a.skills_subdir}")
+        models = cfg.models(a.name)
+        dflt = cfg.default(a.name) or "(cli default)"
+        models_str = ", ".join(models) if models else "(cli default)"
+        avail = "yes" if a.is_available() else "no"
+        print(f"{a.name:<14}{a.binary:<10}{avail:<11}{dflt:<20}{models_str}")
+    print("\nmodels come from models.yaml (the single source of truth). "
+          "A runner is the harness used to reach a model — see the README.")
     return 0
 
 
 def cmd_list_evals(args) -> int:
     skills_root = os.path.abspath(args.skills_root)
-    specs = discover_specs(skills_root=skills_root, skill=args.skill, paths=args.evals)
+    specs = _discover(args, skills_root)
     if not specs:
         print("no evals found.", file=sys.stderr)
         return 2
@@ -140,7 +409,7 @@ def cmd_list_evals(args) -> int:
 
 def cmd_migrate(args) -> int:
     skills_root = os.path.abspath(args.skills_root)
-    specs = discover_specs(skills_root=skills_root, skill=args.skill, paths=args.evals)
+    specs = _discover(args, skills_root)
     if not specs:
         print("no evals found to migrate.", file=sys.stderr)
         return 2
@@ -218,13 +487,26 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-provision", action="store_true", help="don't copy skills into workspaces")
     sp.add_argument("--no-auto-approve", action="store_true",
                     help="don't auto-approve tool/file actions")
-    sp.add_argument("--model", nargs="*", default=[],
-                    help="model override: `agent=model` (repeatable) or bare `model` for all")
+    sp.add_argument("--model", nargs="*", action="append", default=None,
+                    help="model override: `runner=m1,m2` (repeatable, and/or space-separated) "
+                         "or bare `m1,m2` for all; overrides models.yaml")
+    sp.add_argument("--models-config", help="models.yaml path (default: <skills-root>/models.yaml)")
+    sp.add_argument("--all-models", action="store_true",
+                    help="run each runner's full models.yaml list (default: just the cheapest)")
+    sp.add_argument("--max-cells", type=int, default=25,
+                    help="hard ceiling: refuse runs larger than this (default 25; -y can't lift it)")
+    sp.add_argument("-y", "--yes", action="store_true",
+                    help="skip the multi-cell confirmation (still bounded by --max-cells)")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="print the resolved plan + cell count and exit without running")
     sp.add_argument("--tag", nargs="*", help="only evals with one of these tags")
     sp.add_argument("-v", "--verbose", action="store_true", help="print failing assertions")
     sp.set_defaults(func=cmd_run)
 
-    sp = sub.add_parser("list-agents", help="show adapters and availability")
+    sp = sub.add_parser("list-agents", help="show runners, availability, and configured models")
+    sp.add_argument("--skills-root", default=_default_skills_root(),
+                    help="dir to look for models.yaml (default: cwd)")
+    sp.add_argument("--models-config", help="models.yaml path (default: <skills-root>/models.yaml)")
     sp.set_defaults(func=cmd_list_agents)
 
     sp = sub.add_parser("list-evals", help="discover and list evals")

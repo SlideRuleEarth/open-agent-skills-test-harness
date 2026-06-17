@@ -22,14 +22,14 @@ and assertion reference.
 
 ## Running
 
-From the repo root:
+From the repo root (install the `agentskill-evals` CLI first — see the [runner README](../../agent-skill-evals/README.md#install)):
 
 ```bash
 # this skill, on every installed agent, graded by the default judge (claude)
-python3 -m agentskill_evals run --skill nsidc-reference
+agentskill-evals run --skill nsidc-reference
 
 # specific agents, parallel, show failing checks
-python3 -m agentskill_evals run --skill nsidc-reference \
+agentskill-evals run --skill nsidc-reference \
     --agents claude codex antigravity --jobs 4 -v
 ```
 
@@ -40,15 +40,28 @@ land in `agent-skill-evals/artifacts/<run_id>/`.
 To measure the skill's *value*, re-run with `--no-provision` (skill absent) and
 compare — per the best-practices doc, the with/without delta is the real signal.
 
-## Test with weaker models
+## Compare across models
 
-The best-practices doc recommends testing with Haiku in particular — it's the
-most likely to skip SKILL.md guidance and answer from training data. A skill that
-works on Haiku usually works everywhere:
+How well a skill works is determined mostly by the model, so the harness tests across
+**models** (not across every surface — see the
+[harness README](../../agent-skill-evals/README.md#what-we-test-models-not-surfaces)).
+Models live in the repo-root [`models.yaml`](../../models.yaml); a plain run uses the
+cheapest model per runner, `--all-models` runs the full set.
 
 ```bash
-python3 -m agentskill_evals run --skill nsidc-reference --model claude=claude-haiku-4-5
+# cheapest model per runner (safe default)
+agentskill-evals run --skill nsidc-reference
+
+# compare specific models — Haiku is the canonical weak-model probe (most likely to skip
+# SKILL.md and answer from training; if it works on Haiku it usually works everywhere)
+agentskill-evals run --skill nsidc-reference --model claude=claude-opus-4-8,claude-haiku-4-5
+
+# the full models.yaml grid (opt-in; prompts to confirm, bounded by --max-cells)
+agentskill-evals run --skill nsidc-reference --all-models
 ```
+
+See the [harness README](../../agent-skill-evals/README.md#cross-model-testing) for cost
+guardrails and how the model list is maintained.
 
 ## The evals
 

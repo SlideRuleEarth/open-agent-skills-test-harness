@@ -58,13 +58,25 @@ ls -l ~/.claude/skills ~/.agents/skills
 
 `ln -sfn` (used by the targets) replaces existing symlinks, so the targets are safe to re-run after adding skills. They won't overwrite a real directory — if you have a non-symlink copy of a skill installed, remove it first.
 
-### Adding another agent
+### Adding a new surface
 
-The linking is data-driven. Add the agent's `<platform>/skills` directory to `PROJECT_SKILL_DIRS` (and its per-user dir to `GLOBAL_SKILL_DIRS`) in the `Makefile`, then re-run the link target — nothing else to change.
+A "surface" is any tool that consumes the skills (Claude Code, Codex, AntiGravity, CoPilot, other aggregators…). Adding one has up to two parts, and most surfaces only need the first:
+
+1. **Install support — always.** The linking is data-driven: add the surface's `<platform>/skills` directory to `PROJECT_SKILL_DIRS` (and its per-user dir to `GLOBAL_SKILL_DIRS`) in the `Makefile`, re-run `make link-project` / `make link-global`, and **add a row to the install table above** with that surface's specific install instructions. New surfaces always get installation instructions.
+2. **Test-runner support — only if it adds model coverage.** A surface becomes a *test runner* in the eval harness only when it reaches a model no existing runner covers (see [Testing the skills across models](#testing-the-skills-across-models)). That needs an adapter — see [Adding a new runner](agent-skill-evals/README.md#adding-a-new-runner). Aggregators that only re-run already-covered models (e.g. CoPilot) stop at step 1.
 
 ### How discovery works
 
 Claude Code (and the Agent SDK) discover project-level skills from `.claude/skills/` in the working directory, every parent up to the repo root, and nested subdirectories on demand — so the committed `.claude/skills/` is found automatically when you work in this repo. You can also point an external Claude session at the repo with `--add-dir /path/to/sliderule-skills` (a `.claude/skills/` inside an added directory is loaded automatically). Precedence: enterprise > personal (`~/.claude`) > project (`.claude`) > plugins.
+
+## Testing the skills across models
+
+Installation and testing are two different concerns:
+
+- **Installation is per *surface*** (Claude Code, Codex, AntiGravity, CoPilot, other aggregators…) — covered above; every surface gets its own install instructions.
+- **Test coverage is per *model*.** How well a skill works is determined by the LLM, not by which tool drives it, so the eval harness tests each skill across **models**, not across every surface. Running an already-covered model through another surface (e.g. CoPilot, or any aggregator) adds no coverage — those are install targets, not test targets.
+
+The harness, the model matrix (`models.yaml`), the cost guardrails, and how to add/retire models live in **[agent-skill-evals/](agent-skill-evals/README.md)**.
 
 ## Non-macOS users
 
