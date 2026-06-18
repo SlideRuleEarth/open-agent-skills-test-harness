@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from .adapters import get_adapter
 from .adapters.base import RunOptions
+from .spec import EvalSpec
 
 # --- captured sample outputs (one per agent format) ------------------------
 
@@ -139,6 +140,12 @@ def run_selftest(verbose: bool = False) -> int:
            and "--sandbox" in pre and "workspace-write" in pre
            and "--full-auto" not in cargv and cargv[-1] == "do the task",
            f"non-interactive approval+sandbox before exec, prompt last: {cargv}", failures, verbose)
+    sf = EvalSpec(name="t", prompt="p", source_path="/r/skill/evals/e.yaml",
+                  files=["a.json", "fixtures/in.json", {"x/a.json": "data/a.json"}, "../esc.json"])
+    dests = [d for _, d in sf.resolved_files()]
+    _check("spec.resolved_files",
+           dests == ["a.json", "fixtures/in.json", "data/a.json", "esc.json"],
+           f"seed dests (subdirs kept, traversal guarded): {dests}", failures, verbose)
 
     # AntiGravity (3 shapes)
     print("antigravity adapter:")

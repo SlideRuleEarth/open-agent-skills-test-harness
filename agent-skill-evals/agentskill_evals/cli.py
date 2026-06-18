@@ -504,11 +504,14 @@ def cmd_list_evals(args) -> int:
     if not specs:
         print("no evals found.", file=sys.stderr)
         return 2
-    print(f"{'SKILL':<26}{'EVAL':<34}{'CHECKS':<8}AGENTS")
+    # size the columns to the data so long eval names don't collide with CHECKS
+    skill_w = max([len("SKILL")] + [len(s.skill_name or "-") for s in specs]) + 2
+    eval_w = max([len("EVAL")] + [len(s.name) for s in specs]) + 2
+    print(f"{'SKILL':<{skill_w}}{'EVAL':<{eval_w}}{'CHECKS':<8}AGENTS")
     for s in specs:
         n = len(s.effective_assertions())
         agents = ",".join(s.agents) if s.agents else "all"
-        print(f"{(s.skill_name or '-'):<26}{s.name:<34}{n:<8}{agents}")
+        print(f"{(s.skill_name or '-'):<{skill_w}}{s.name:<{eval_w}}{n:<8}{agents}")
     print(f"\n{len(specs)} eval(s)")
     return 0
 

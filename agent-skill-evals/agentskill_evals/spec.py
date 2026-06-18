@@ -80,11 +80,25 @@ class EvalSpec:
         return os.path.dirname(self.source_path) if self.source_path else os.getcwd()
 
     def resolved_files(self) -> list[tuple[str, str]]:
-        """(absolute source, workspace-relative dest) for each seed file."""
+        """(absolute source, workspace-relative dest) for each seed file.
+
+        A relative entry keeps its path, so `fixtures/input.json` is seeded at
+        `fixtures/input.json` in the workspace (matching "paths relative to the eval
+        file"), not flattened to `input.json`. A `{src: dest}` mapping sets an explicit
+        destination. An absolute path, or a dest that would escape the workspace, is
+        placed by basename.
+        """
         out = []
-        for f in self.files:
-            src = f if os.path.isabs(f) else os.path.join(self.base_dir(), f)
-            out.append((src, os.path.basename(f)))
+        for entry in self.files:
+            if isinstance(entry, dict) and len(entry) == 1:
+                src_rel, dest = next(iter(entry.items()))
+            else:
+                src_rel = dest = entry
+            src = src_rel if os.path.isabs(src_rel) else os.path.join(self.base_dir(), src_rel)
+            norm = os.path.normpath(str(dest))
+            # never let a seed write outside the workspace
+            dest = os.path.basename(norm) if os.path.isabs(norm) or norm.startswith("..") else norm
+            out.append((src, dest))
         return out
 
     def resolved_fixture(self) -> Optional[str]:

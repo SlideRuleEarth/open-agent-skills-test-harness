@@ -131,7 +131,7 @@ for AntiGravity) so the run is hermetic.
 | `description` | what correct behavior looks like (given to the judge) |
 | `prompt` | the user message (legacy `query` also accepted) |
 | `skills` | skills provisioned into the workspace (legacy `skill` accepted) |
-| `files` | files seeded into the workspace (paths relative to the eval file) |
+| `files` | files seeded into the workspace; sources are relative to the eval file and keep that relative path (`fixtures/in.json` → `fixtures/in.json`). Use a `{src: dest}` mapping for a different destination |
 | `fixture` | a directory copied in as the starting workspace |
 | `agents` | restrict to specific agents (default: all selected on the CLI) |
 | `timeout_sec` | per-cell timeout (default 600) |
