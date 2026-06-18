@@ -33,9 +33,12 @@ def execute(
     eval_name: str = "",
 ) -> ExecResult:
     argv = adapter.build_argv(prompt, opts)
-    env = adapter.env(dict(os.environ), opts)
+    # Apply the eval/scenario env first, then let adapter.env() layer isolation on top — so an
+    # isolated run's HOME / XDG / config-home vars can't be overridden by an eval's `env:`.
+    base = dict(os.environ)
     if env_overrides:
-        env.update(env_overrides)
+        base.update(env_overrides)
+    env = adapter.env(base, opts)
 
     rr = RunResult(
         agent=agent_name or adapter.name,

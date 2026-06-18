@@ -242,10 +242,10 @@ def _print_skill_visibility(specs, agents, model_map, isolated, skills_root, pro
             vis = resolve_visible_skills(adapter, declared, repo, isolated, real_home)
             tag = "isolated" if isolated else "NOT isolated"
             print(f"  {a}:{m or 'default'} ({tag}):")
-            if not single:
-                prov = "(varies per eval)"
-            elif not provision:
+            if not provision:
                 prov = "(none — provisioning off)"
+            elif not single:
+                prov = "(varies per eval)"
             else:
                 prov = ", ".join(vis["provisioned"]) or "(none)"
             print(f"      provisioned:  {prov}")
@@ -391,6 +391,20 @@ def cmd_run(args) -> int:
     # resolve run knobs: CLI flag > scenario override > built-in default
     isolated = (not args.no_isolated) and (ov.get("isolated") is not False)
     provision = not args.no_provision
+
+    # an isolated run manages HOME/XDG and each runner's config-home vars, so an eval's `env:`
+    # entry for one is overridden — warn rather than silently ignore it.
+    if isolated:
+        managed = {"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                   "XDG_CACHE_HOME", "XDG_STATE_HOME"}
+        for a in agents:
+            managed.update(v for v, _ in getattr(get_adapter(a), "isolation_config_homes", []))
+        for s in specs:
+            clash = sorted(set(s.env) & managed)
+            if clash:
+                print(f"warning: eval {s.name!r} sets env {', '.join(clash)} — managed by "
+                      "isolation and ignored; pass --no-isolated to honor them.",
+                      file=sys.stderr)
     max_cells = args.max_cells if args.max_cells is not None else int(ov.get("max_cells", DEFAULT_MAX_CELLS))
     jobs = args.jobs if args.jobs is not None else int(ov.get("jobs", DEFAULT_JOBS))
     n_cells = sum(len(model_map[a]) for s in specs for a in agents
