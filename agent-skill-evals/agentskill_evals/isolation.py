@@ -10,20 +10,22 @@ overlay** of the real one:
     single wholesale symlink to the real one, so logins/settings/toolchains keep working;
   * only each *global skills directory* is rebuilt as a real dir that symlinks through every
     entry **except** this repo's skills (preserving vendor skills such as codex's `.system`),
-    then symlinks in the cell's *declared* skills.
+    then *copies* in the cell's *declared* skills.
 
 Net effect inside a skills dir: ``vendor/other ∪ declared`` — undeclared repo skills are gone.
 Placing the declared skills here (in addition to the workspace) makes discovery work whether a
 surface reads project-local skills, user-global skills, or merges them at any precedence.
 
-The overlay is built from cheap symlinks (no copying), so a 35 MB codex log dir costs nothing.
-``shutil.rmtree`` removes the overlay by unlinking the symlinks — it never recurses into the
-real HOME.
+The overlay is built from cheap symlinks — only the small *declared* skills are copied — so a
+35 MB codex log dir costs nothing, and an agent writing inside a declared skill mutates the copy,
+never its source. ``shutil.rmtree`` removes the overlay by unlinking the symlinks (and deleting
+the copies) — it never recurses into the real HOME.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 from typing import Any, Iterable, Optional
 
 # Sentinel marking a node in the path tree as a *skills directory* leaf (built specially)
@@ -153,5 +155,7 @@ def _build_skills_dir(real_skills: str, dst_skills: str,
         name = os.path.basename(os.path.normpath(src))
         if name in placed:
             continue
-        os.symlink(src, os.path.join(dst_skills, name))
+        # copy (not symlink) declared skills: a write inside one mutates the throwaway copy,
+        # never the repo's skill source.
+        shutil.copytree(src, os.path.join(dst_skills, name), dirs_exist_ok=True)
         placed.add(name)

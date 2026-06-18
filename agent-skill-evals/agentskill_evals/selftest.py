@@ -71,6 +71,7 @@ def _check_isolation(failures, verbose):
         os.makedirs(os.path.join(real, ".codex", "skills", "sliderule-api"))
         os.makedirs(os.path.join(real, ".codex", "skills", "sliderule-params"))
         os.makedirs(os.path.join(real, ".codex", "skills", ".system", "imagegen"))
+        os.makedirs(os.path.join(real, "_cfg"))  # reproduce the config-mirror escape hazard
         open(os.path.join(real, ".codex", "auth.json"), "w").close()
         open(os.path.join(real, ".gitconfig"), "w").close()
         # the cell declares only sliderule-api (its source lives outside HOME, like skills_root)
@@ -88,6 +89,10 @@ def _check_isolation(failures, verbose):
         names = set(os.listdir(skills)) if os.path.isdir(skills) else set()
         _check("isolation.declared_present", "sliderule-api" in names,
                f"declared sliderule-api present (got {sorted(names)})", failures, verbose)
+        _check("isolation.declared_is_copy",
+               os.path.isdir(os.path.join(skills, "sliderule-api"))
+               and not os.path.islink(os.path.join(skills, "sliderule-api")),
+               "declared skill is a copy (writes can't reach the source)", failures, verbose)
         _check("isolation.undeclared_masked", "sliderule-params" not in names,
                "undeclared sliderule-params removed", failures, verbose)
         _check("isolation.vendor_kept", ".system" in names,
@@ -103,9 +108,45 @@ def _check_isolation(failures, verbose):
         _check("isolation.missing_ancestor_built", gem_names == ["sliderule-api"],
                f"missing nested skills dir built with declared only (got {gem_names})",
                failures, verbose)
+
+        # config mirrors must use a fresh temp dir, not dest/_cfg — which is a symlink to the
+        # real HOME's _cfg here, so writing through it would escape the temp tree.
+        hazard = os.path.islink(os.path.join(dest, "_cfg"))
+        cfg_root = tempfile.mkdtemp(prefix="cfg-", dir=dest)
+        open(os.path.join(cfg_root, "mirror-marker"), "w").close()
+        escaped = os.path.exists(os.path.join(real, "_cfg", "mirror-marker"))
+        _check("isolation.cfg_mirror_no_escape", hazard and not escaped,
+               f"config mirror stays in temp even when ~/_cfg exists "
+               f"(hazard_present={hazard}, escaped={escaped})", failures, verbose)
     finally:
         for d in (real, declared_root, dest):
             shutil.rmtree(d, ignore_errors=True)
+
+
+def _check_provision(failures, verbose):
+    """Provisioned skills are copies, not symlinks, so a write inside one can't mutate the
+    repo's skill source. Pure filesystem — no CLIs."""
+    import os
+    import shutil
+    import tempfile
+
+    print("skill provisioning:")
+    src = tempfile.mkdtemp(prefix="ase-skillsrc-")
+    ws = tempfile.mkdtemp(prefix="ase-ws-")
+    try:
+        open(os.path.join(src, "SKILL.md"), "w").close()
+        get_adapter("claude").provision_skills(ws, [src])
+        placed = os.path.join(ws, ".claude", "skills", os.path.basename(src))
+        is_copy = os.path.isdir(placed) and not os.path.islink(placed)
+        if is_copy:
+            open(os.path.join(placed, "scratch.txt"), "w").close()
+        source_clean = not os.path.exists(os.path.join(src, "scratch.txt"))
+        _check("provision.copy_not_symlink", is_copy and source_clean,
+               f"workspace skill is a copy; source unchanged (copy={is_copy}, clean={source_clean})",
+               failures, verbose)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+        shutil.rmtree(src, ignore_errors=True)
 
 
 def run_selftest(verbose: bool = False) -> int:
@@ -181,8 +222,9 @@ def run_selftest(verbose: bool = False) -> int:
                                {"type": "object", "required": ["name", "port"]})
     _check("schema.invalid", not bad, f"missing-required caught: {err}", failures, verbose)
 
-    # HOME isolation overlay
+    # HOME isolation overlay + side-effect-free provisioning
     _check_isolation(failures, verbose)
+    _check_provision(failures, verbose)
 
     print()
     if failures:

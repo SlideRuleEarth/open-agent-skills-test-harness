@@ -158,10 +158,16 @@ class Runner:
                 # A custom config home (e.g. $CODEX_HOME) lives outside HOME, so the HOME
                 # mirror doesn't cover it: mirror it separately (skills masked) and repoint
                 # the var, so custom-config users keep auth/config without leaking skills.
+                cfg_root = None
                 for var, skills_sub in getattr(adapter, "isolation_config_homes", []):
                     custom = os.environ.get(var)
                     if custom and os.path.isdir(custom):
-                        mirror = os.path.join(iso_home, "_cfg", _safe(var))
+                        if cfg_root is None:
+                            # A *fresh* real dir — not iso_home/_cfg, which would be a symlink
+                            # to the real HOME if it has a `_cfg` entry, leaking the mirror
+                            # outside the temp tree (it would survive cleanup).
+                            cfg_root = tempfile.mkdtemp(prefix="cfg-", dir=iso_home)
+                        mirror = os.path.join(cfg_root, _safe(var))
                         build_isolated_home(mirror, [skills_sub], self._repo_skill_names,
                                             seed_dirs, custom)
                         iso_env[var] = mirror

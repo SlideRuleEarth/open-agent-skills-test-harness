@@ -81,9 +81,10 @@ class Adapter(ABC):
     def provision_skills(self, workspace: str, skill_dirs: list[str]) -> list[str]:
         """Copy skill directories into the workspace so this agent discovers them.
 
-        Returns the destination paths created. Keeping skills inside the
-        per-run workspace makes runs hermetic and side-effect free. Override
-        per adapter if an agent only supports a global skills location.
+        Returns the destination paths created. A *copy* (not a symlink) keeps a run
+        side-effect-free: if the agent writes inside a provisioned skill dir, it mutates the
+        throwaway workspace copy, never the original skill source. Override per adapter if an
+        agent only supports a global skills location.
         """
         installed: list[str] = []
         if not skill_dirs:
@@ -97,12 +98,7 @@ class Adapter(ABC):
             dest = os.path.join(dest_root, os.path.basename(os.path.normpath(src)))
             if os.path.lexists(dest):
                 continue
-            # Symlink keeps the workspace small and the skill read-only; fall
-            # back to a copy where symlinks aren't available (e.g. Windows).
-            try:
-                os.symlink(src, dest, target_is_directory=True)
-            except (OSError, NotImplementedError):
-                shutil.copytree(src, dest, dirs_exist_ok=True)
+            shutil.copytree(src, dest, dirs_exist_ok=True)
             installed.append(dest)
         return installed
 
