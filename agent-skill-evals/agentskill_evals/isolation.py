@@ -24,7 +24,7 @@ real HOME.
 from __future__ import annotations
 
 import os
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 # Sentinel marking a node in the path tree as a *skills directory* leaf (built specially)
 # rather than an ancestor directory to recurse into.
@@ -89,6 +89,46 @@ def _overlay(real_dir: str, dst_dir: str, tree: dict,
             _build_skills_dir(real_child, dst_child, repo_skills, declared)
         else:
             _overlay(real_child, dst_child, node, repo_skills, declared)
+
+
+def resolve_visible_skills(
+    adapter: Any,
+    declared_names: Iterable[str],
+    repo_skill_names: Iterable[str],
+    isolated: bool,
+    real_home: Optional[str] = None,
+) -> dict:
+    """What skills the model would see, computed from the filesystem (no agent run).
+
+    Reads the adapter's global skills dirs and classifies their entries against this repo's
+    skills. Returns sorted lists:
+      provisioned   — the declared skills (always visible, from the workspace);
+      vendor        — non-repo entries in the global dirs (kept even under isolation);
+      masked        — repo skills present globally but not declared (hidden when isolated);
+      also_visible  — same set, shown when NOT isolated (they leak in).
+    Skills bundled inside a CLI package or plugins live outside these dirs and aren't listed.
+    """
+    real_home = os.path.abspath(real_home or os.path.expanduser("~"))
+    declared = set(declared_names or ())
+    repo = set(repo_skill_names or ())
+    vendor: set = set()
+    leaked_repo: set = set()   # repo skills found globally but not declared
+    for sub in getattr(adapter, "global_skills_subpaths", []) or []:
+        d = os.path.join(real_home, sub)
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            if name in repo:
+                if name not in declared:
+                    leaked_repo.add(name)
+            else:
+                vendor.add(name)
+    return {
+        "provisioned": sorted(declared),
+        "vendor": sorted(vendor),
+        "masked": sorted(leaked_repo) if isolated else [],
+        "also_visible": [] if isolated else sorted(leaked_repo),
+    }
 
 
 def _build_skills_dir(real_skills: str, dst_skills: str,

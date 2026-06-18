@@ -16,6 +16,7 @@ import sys
 
 from . import __version__
 from .adapters import adapter_names, all_adapters, get_adapter
+from .isolation import resolve_visible_skills
 from .judge import Judge
 from .runner import Runner, render_matrix
 from .spec import _load_raw, discover_specs, load_scenario, load_spec, skill_names
@@ -223,6 +224,31 @@ def _load_scenario(path: str):
         raise SystemExit(2)
 
 
+def _print_skill_visibility(specs, agents, model_map, isolated, skills_root) -> None:
+    """Print, per target, which skills the model will see — computed from the filesystem,
+    no agent run. Detailed for a single eval/scenario; a summary for the matrix."""
+    repo = set(skill_names(skills_root))
+    real_home = os.path.expanduser("~")
+    single = specs[0] if len(specs) == 1 else None
+    print("Skills visible to the model" + (f" — eval '{single.name}'" if single else "") + ":")
+    for a in agents:
+        adapter = get_adapter(a)
+        declared = set(single.skills) if single else set()
+        for m in model_map[a]:
+            vis = resolve_visible_skills(adapter, declared, repo, isolated, real_home)
+            tag = "isolated" if isolated else "NOT isolated"
+            print(f"  {a}:{m or 'default'} ({tag}):")
+            prov = (", ".join(vis["provisioned"]) or "(none)") if single else "(varies per eval)"
+            print(f"      provisioned:  {prov}")
+            vend = ", ".join(vis["vendor"]) or "(none in global dirs)"
+            print(f"      vendor kept:  {vend}  + the agent's built-in/plugin skills (not listed)")
+            if isolated:
+                print(f"      masked:       {', '.join(vis['masked']) or '(none)'}")
+            else:
+                print(f"      also visible: {', '.join(vis['also_visible']) or '(none)'}")
+    print()
+
+
 def cmd_run(args) -> int:
     skills_root = os.path.abspath(args.skills_root)
 
@@ -348,6 +374,7 @@ def cmd_run(args) -> int:
           f"≈{n_llm} LLM calls   artifacts: {run_dir}\n")
 
     if args.dry_run:
+        _print_skill_visibility(specs, agents, model_map, isolated, skills_root)
         print("(dry run — nothing executed)")
         return 0
 
@@ -453,6 +480,39 @@ def cmd_list_evals(args) -> int:
         agents = ",".join(s.agents) if s.agents else "all"
         print(f"{(s.skill_name or '-'):<26}{s.name:<34}{n:<8}{agents}")
     print(f"\n{len(specs)} eval(s)")
+    return 0
+
+
+def cmd_list_skills(args) -> int:
+    """Audit skill visibility: the provisionable superset, plus per-runner global skills split
+    into repo (masked under isolation) vs vendor (kept), with drift warnings."""
+    skills_root = os.path.abspath(args.skills_root)
+    superset = skill_names(skills_root)
+    repo = set(superset)
+    real_home = os.path.expanduser("~")
+
+    print(f"provisionable skills (superset) under {skills_root}  ({len(superset)}):")
+    print("  " + (", ".join(superset) if superset else "(none)"))
+
+    print("\nper-runner global skills — what an un-isolated run also sees:")
+    for a in all_adapters():
+        # nothing declared → every repo skill found globally is in `masked`
+        vis = resolve_visible_skills(a, (), repo, isolated=True, real_home=real_home)
+        masked, vendor = vis["masked"], vis["vendor"]
+        dirs = a.global_skills_subpaths or []
+        print(f"\n{a.name}:")
+        print("  dirs: " + (", ".join("~/" + d for d in dirs) if dirs else "(none)"))
+        print(f"  repo skills (masked under isolation): {', '.join(masked) or '(none)'}")
+        print(f"  vendor/other (kept):                  {', '.join(vendor) or '(none)'}")
+        present = set(masked)
+        missing = sorted(repo - present)
+        if present and missing:   # partial install → likely a stale `make link-global`
+            print(f"  ⚠ drift: global is missing {', '.join(missing)} "
+                  "(run `make link-global` to refresh)")
+
+    print("\nWith isolation ON (default) a run sees only the skills it provisions + vendor "
+          "skills; with --no-isolated it also sees the repo skills above.")
+    print("Note: skills bundled inside a CLI's package or plugins aren't listed here.")
     return 0
 
 
@@ -566,6 +626,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("list-evals", help="discover and list evals")
     add_discovery(sp)
     sp.set_defaults(func=cmd_list_evals)
+
+    sp = sub.add_parser("list-skills",
+                        help="audit skill visibility (superset + per-runner masked/kept + drift)")
+    sp.add_argument("--skills-root", default=_default_skills_root(),
+                    help="dir containing skill folders (default: cwd)")
+    sp.set_defaults(func=cmd_list_skills)
 
     sp = sub.add_parser("migrate", help="rewrite evals into the canonical format")
     add_discovery(sp)
