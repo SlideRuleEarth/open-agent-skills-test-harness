@@ -149,6 +149,72 @@ def _check_provision(failures, verbose):
         shutil.rmtree(src, ignore_errors=True)
 
 
+def _check_report(failures, verbose):
+    """The per-cell report.md renders the prompt, the full transcript, every produced file,
+    and the judge verdict — and degrades gracefully when the judge is off. Pure — no CLIs."""
+    import os
+    import shutil
+    import tempfile
+
+    from .assertions import AssertionResult
+    from .runner import CellResult, render_report
+    from .schema import EventKind, NormalizedEvent, RunResult
+
+    print("per-cell report:")
+    root = tempfile.mkdtemp(prefix="ase-report-")
+    try:
+        cell_dir = os.path.join(root, "cell")
+        ws = os.path.join(cell_dir, "workspace")
+        os.makedirs(ws)
+        with open(os.path.join(ws, "run.py"), "w") as fh:
+            fh.write("print('hello from run.py')\n")
+
+        rr = RunResult(
+            agent="claude", eval_name="demo", prompt="Write run.py that prints hello.",
+            workdir=ws, final_text="Done — created run.py.",
+            events=[
+                NormalizedEvent(EventKind.AGENT_MESSAGE, text="I'll create run.py."),
+                NormalizedEvent(EventKind.TOOL_CALL, tool_name="Bash", command="python run.py"),
+                NormalizedEvent(EventKind.FILE_CHANGE, path="run.py"),
+            ],
+            cost_usd=0.01, duration_ms=1234,
+        )
+        verdict = {"items": [
+            {"behavior": "creates run.py", "pass": True, "reason": "file present"},
+            {"behavior": "prints hello", "pass": False, "reason": "not verified"},
+        ], "summary": "partially correct"}
+        ja = AssertionResult("llm_judge", False, "1/2 rubric items", kind="judge", details=verdict)
+        fa = AssertionResult("file_exists", True, "run.py exists")
+
+        cell = CellResult(agent="claude", model="claude-haiku-4-5", eval_name="demo",
+                          skill="scenario", passed=False, run_result=rr,
+                          assertions=[fa, ja], artifacts_dir=cell_dir)
+        md = render_report(cell)
+        _check("report.prompt", "Write run.py that prints hello." in md,
+               "prompt present", failures, verbose)
+        _check("report.transcript", "python run.py" in md and "I'll create run.py." in md,
+               "transcript shows assistant text + shell command", failures, verbose)
+        _check("report.final", "Done — created run.py." in md,
+               "final answer present", failures, verbose)
+        _check("report.files", "run.py" in md and "hello from run.py" in md,
+               "produced file inlined in full", failures, verbose)
+        _check("report.judge", "partially correct" in md and "creates run.py" in md,
+               "judge verdict + per-item reasons present", failures, verbose)
+
+        # judge off → no llm_judge assertion: graceful note, but prompt + response stay.
+        cell_off = CellResult(agent="claude", model=None, eval_name="demo",
+                              skill="scenario", passed=True, run_result=rr,
+                              assertions=[fa], artifacts_dir=cell_dir)
+        md_off = render_report(cell_off)
+        _check("report.judge_off_note", "judge for yourself" in md_off.lower(),
+               "judge-off shows reviewer note", failures, verbose)
+        _check("report.judge_off_keeps_evidence",
+               "Write run.py that prints hello." in md_off and "hello from run.py" in md_off,
+               "judge-off still shows prompt + produced files", failures, verbose)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def run_selftest(verbose: bool = False) -> int:
     failures: list[str] = []
 
@@ -225,6 +291,9 @@ def run_selftest(verbose: bool = False) -> int:
     # HOME isolation overlay + side-effect-free provisioning
     _check_isolation(failures, verbose)
     _check_provision(failures, verbose)
+
+    # per-cell readable report
+    _check_report(failures, verbose)
 
     print()
     if failures:

@@ -31,8 +31,9 @@ from .assertions import AssertionContext, AssertionResult, run_assertion
 from .exec import execute
 from .isolation import build_isolated_home
 from .judge import Judge
-from .schema import RunResult
+from .schema import EventKind, RunResult
 from .spec import EvalSpec, skill_names
+from .workspace_view import file_tree, inline_files, writes_outside_workspace
 
 
 @dataclass
@@ -231,6 +232,9 @@ class Runner:
             isolated=isolated, ungraded=ungraded,
         )
         self._write_cell_json(cell_dir, cell)
+        # readable, self-contained dossier per cell (judge-independent: written for every cell,
+        # pass or fail, with or without a judge) — prompt + full transcript + everything produced.
+        _write(os.path.join(cell_dir, "report.md"), render_report(cell))
         return cell
 
     def _skill_dirs(self, spec: EvalSpec) -> list[str]:
@@ -323,7 +327,7 @@ class Runner:
         }
         _write_json(os.path.join(self.run_dir, "summary.json"), summary)
         _write(os.path.join(self.run_dir, "summary.md"),
-               render_markdown(results, self.agents, self.model_map))
+               render_markdown(results, self.agents, self.model_map, run_dir=self.run_dir))
 
 
 # ---------------------------------------------------------------------------
@@ -407,17 +411,29 @@ def render_matrix(results: list[CellResult], agents: list[str],
 
 
 def render_markdown(results: list[CellResult], agents: list[str],
-                    model_map: Optional[ModelMap] = None) -> str:
+                    model_map: Optional[ModelMap] = None,
+                    run_dir: Optional[str] = None) -> str:
     by_key = {(c.eval_name, c.agent, c.model): c for c in results}
     evals = sorted({c.eval_name for c in results})
     targets = _targets(agents, model_map, results)
     labels = [_target_label(a, m) for a, m in targets]
 
+    def _linked_mark(c: Optional[CellResult]) -> str:
+        """Each cell links to its per-cell report.md (prompt + full transcript + produced
+        files) so the table is a jumping-off point, not a dead end."""
+        mark = _cell_mark(c)
+        if run_dir and c is not None and c.artifacts_dir:
+            rel = os.path.relpath(os.path.join(c.artifacts_dir, "report.md"), run_dir)
+            return f"[{mark}]({rel})"
+        return mark
+
     lines = ["# Eval results", "",
+             "Each cell links to a per-cell `report.md` — the prompt the model was given, "
+             "its complete response (full transcript), and every file it produced.", "",
              "| eval | " + " | ".join(labels) + " |",
              "|" + "---|" * (len(labels) + 1)]
     for ev in evals:
-        cells = [_cell_mark(by_key.get((ev, a, m))) for a, m in targets]
+        cells = [_linked_mark(by_key.get((ev, a, m))) for a, m in targets]
         lines.append(f"| {ev} | " + " | ".join(cells) + " |")
 
     lines += ["", "## Pass rate by target", "", "| target | pass rate |", "|---|---|"]
@@ -429,6 +445,131 @@ def render_markdown(results: list[CellResult], agents: list[str],
         rate = f"{npass}/{len(graded)}" + (f" ({ung} ungraded)" if ung else "")
         lines.append(f"| {_target_label(a, m)} | {rate} |")
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Per-cell readable report — the prompt the model was given + its complete
+# response (full transcript) + everything it produced, so a human can look at
+# the same evidence the judge did and judge for themselves. Written for every
+# cell (pass/fail, judge on/off) by Runner._run_cell.
+# ---------------------------------------------------------------------------
+
+# Noisy intermediate tool output is the one thing we clip (with a pointer to the
+# raw artifacts); the prompt, the answer, and produced files are shown in full.
+_TOOL_RESULT_CLIP = 4000
+
+
+def _clip(text: str, limit: int) -> str:
+    if text is None:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n… [clipped {len(text) - limit} chars — full output in events.json / stdout.jsonl]"
+
+
+def _render_transcript(rr: RunResult) -> str:
+    """The model's complete response as an ordered transcript: assistant messages,
+    reasoning, tool calls, shell commands, tool results, and file changes."""
+    out: list[str] = []
+    for e in rr.events:
+        k = e.kind
+        if k == EventKind.AGENT_MESSAGE:
+            if e.text:
+                out.append(f"**assistant:**\n\n{e.text}")
+        elif k == EventKind.REASONING:
+            if e.text:
+                out.append(f"**reasoning:**\n\n{e.text}")
+        elif k == EventKind.TOOL_CALL:
+            label = e.tool_name or "tool"
+            if e.command:
+                out.append(f"**tool · {label}**\n\n```sh\n{e.command}\n```")
+            elif e.path:
+                out.append(f"**tool · {label}** → `{e.path}`")
+            else:
+                out.append(f"**tool · {label}**")
+        elif k == EventKind.TOOL_RESULT:
+            if e.text:
+                out.append(f"**tool result:**\n\n```\n{_clip(e.text, _TOOL_RESULT_CLIP)}\n```")
+        elif k == EventKind.FILE_CHANGE:
+            if e.path:
+                out.append(f"**file changed:** `{e.path}`")
+        elif k == EventKind.ERROR:
+            if e.text:
+                out.append(f"**error:** {e.text}")
+        # SESSION_START / RESULT / OTHER: skipped (RESULT is shown under "Final answer").
+    return "\n\n".join(out)
+
+
+def render_report(cell: CellResult) -> str:
+    """A self-contained Markdown dossier for one cell."""
+    rr = cell.run_result
+    out: list[str] = [f"# {cell.eval_name} — {_target_label(cell.agent, cell.model)}", ""]
+
+    # header / verdict
+    out.append(f"- **verdict:** {_cell_mark(cell)}")
+    if cell.skill:
+        out.append(f"- **skill(s):** {cell.skill}")
+    meta = []
+    if rr.cost_usd is not None:
+        meta.append(f"cost ${rr.cost_usd:.4f}")
+    if rr.duration_ms is not None:
+        meta.append(f"{rr.duration_ms / 1000:.1f}s")
+    meta.append(f"isolated: {'yes' if cell.isolated else 'no'}")
+    if rr.timed_out:
+        meta.append("TIMED OUT")
+    out.append(f"- **run:** {', '.join(meta)}")
+    if rr.error:
+        out.append(f"- **error:** {rr.error}")
+
+    # prompt
+    out += ["", "## Prompt given to the model", "", "```", rr.prompt or "(empty)", "```"]
+
+    # complete response (transcript)
+    transcript = _render_transcript(rr)
+    out += ["", "## Complete response (transcript)", ""]
+    out.append(transcript if transcript.strip()
+               else "_(This adapter captured no event trace — see the final answer below.)_")
+
+    # final answer
+    out += ["", "## Final answer", "", rr.final_text or "_(empty)_"]
+    if rr.structured_output is not None:
+        out += ["", "**Structured output:**", "", "```json",
+                json.dumps(rr.structured_output, indent=2, default=str), "```"]
+
+    # everything the model produced
+    workspace = os.path.join(cell.artifacts_dir, "workspace")
+    extra = writes_outside_workspace(rr, workspace)
+    out += ["", "## Files the model produced", "",
+            "```", file_tree(workspace, extra), "```"]
+    inline = inline_files(workspace, extra)   # no caps: full contents of every text file
+    if inline.strip():
+        out += ["", inline]
+    out += ["", "_(Non-text files are listed above but not inlined.)_"]
+
+    # judge verdict (or a graceful note when the judge was off)
+    out += ["", "## Judge verdict", ""]
+    judge_a = next((a for a in cell.assertions if a.type == "llm_judge"), None)
+    if judge_a is None:
+        out.append("_Judge disabled for this run — the rubric was not graded. Read the prompt "
+                   "and complete response above and judge for yourself._")
+    else:
+        det = judge_a.details or {}
+        for i, it in enumerate(det.get("items", []), 1):
+            out.append(f"{i}. {'✅' if it.get('pass') else '❌'} **{it.get('behavior', '')}**")
+            out.append(f"   - {it.get('reason', '')}")
+        if det.get("summary"):
+            out += ["", f"**Summary:** {det['summary']}"]
+        if det.get("judge_error"):
+            out += ["", "> ⚠ the judge failed to return a parseable verdict."]
+
+    # deterministic assertions
+    others = [a for a in cell.assertions if a.type != "llm_judge"]
+    if others:
+        out += ["", "## Deterministic assertions", ""]
+        for a in others:
+            out.append(f"- {'✅' if a.passed else '❌'} `{a.type}` — {a.message}")
+
+    return "\n".join(out).rstrip() + "\n"
 
 
 # ---------------------------------------------------------------------------
