@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from .schema import RunResult
+from .workspace_view import resolve_trace_path
 
 
 @dataclass
@@ -104,13 +105,18 @@ def _resolve_artifact(result, workdir: str, rel: str) -> tuple[Optional[str], Op
 
     Order of resolution, returning (abs_path, where):
       1. "workspace"   — the expected location, ``workdir/rel``.
-      2. "write-trace" — a file the run itself created (Write/Edit/… tool calls, via
-                         ``result.file_paths_touched()``) whose basename matches and that exists
-                         on disk. This catches absolute-path mistakes — e.g. a model mangling the
-                         run-id/date in the path — without trusting it to land in the workspace.
-      3. "subtree"     — anywhere under the workspace (a misplaced *relative* subdir), skipping the
-                         provisioned-skill mirrors (dot-dirs like ``.claude/``).
+      2. "write-trace" — a file the run is proven to have created (Write/Edit/… tool calls, via
+                         ``result.file_paths_touched()``) whose basename matches and that exists on
+                         disk. This catches a misplaced destination — e.g. a model mangling the
+                         run-id/date in an absolute path — without trusting it to land in the
+                         workspace. Trace paths resolve against the WORKSPACE (the agent's cwd), so
+                         a relative path is never matched against the harness process cwd.
     Returns (None, None) if not found.
+
+    There is deliberately no "any file with this basename anywhere under the workspace" fallback: a
+    seeded fixture or a provisioned-skill file sharing the basename would otherwise satisfy the
+    assertion for work the agent never did (a false pass). Only the exact path, or a file the run is
+    proven to have produced, counts.
     """
     exact = os.path.join(workdir, rel)
     if os.path.isfile(exact):
@@ -119,12 +125,11 @@ def _resolve_artifact(result, workdir: str, rel: str) -> tuple[Optional[str], Op
     if base:
         # latest matching write wins (the agent's final state for that filename)
         for p in reversed(result.file_paths_touched()):
-            if p and os.path.basename(p) == base and os.path.isfile(p):
-                return os.path.abspath(p), "write-trace"
-        for root, dirs, files in os.walk(workdir):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            if base in files and os.path.isfile(os.path.join(root, base)):
-                return os.path.join(root, base), "subtree"
+            if not p:
+                continue
+            ap = os.path.abspath(resolve_trace_path(p, workdir))
+            if os.path.basename(ap) == base and os.path.isfile(ap):
+                return ap, "write-trace"
     return None, None
 
 

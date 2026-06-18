@@ -39,6 +39,17 @@ def _iter_files(workdir: str) -> Iterator[tuple[str, str]]:
             yield path, os.path.relpath(path, workdir)
 
 
+def resolve_trace_path(path: str, workdir: str) -> str:
+    """Resolve a tool-trace path to an absolute path. The agent ran with cwd == the workspace, so a
+    RELATIVE trace path is relative to the WORKSPACE — never the harness process cwd (resolving it
+    against the process cwd is how an agent's relative ``README.md`` was wrongly matched to the
+    repo's ``harness/README.md``). An ABSOLUTE trace path is kept as-is, so an agent that wrote to a
+    mangled absolute path outside the workspace is still detected."""
+    if os.path.isabs(path):
+        return path
+    return os.path.join(workdir, path)
+
+
 def writes_outside_workspace(result: Any, workdir: str) -> list[str]:
     """Absolute paths the run created that landed OUTSIDE the workspace (e.g. the model wrote to an
     absolute path with a mangled run-id). Surfacing them lets the judge grade — and the report show —
@@ -49,7 +60,7 @@ def writes_outside_workspace(result: Any, workdir: str) -> list[str]:
     for p in result.file_paths_touched():
         if not p:
             continue
-        ap = os.path.abspath(p)
+        ap = os.path.abspath(resolve_trace_path(p, workdir))
         if ap in seen:
             continue
         try:

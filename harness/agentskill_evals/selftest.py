@@ -215,6 +215,59 @@ def _check_report(failures, verbose):
         shutil.rmtree(root, ignore_errors=True)
 
 
+def _check_path_resolution(failures, verbose):
+    """file_exists must not pass on a seeded fixture the agent never produced, and tool-trace
+    paths must resolve against the workspace (the agent's cwd), not the harness process cwd."""
+    import os
+    import shutil
+    import tempfile
+
+    from .assertions import _resolve_artifact
+    from .schema import EventKind, NormalizedEvent, RunResult
+    from .workspace_view import writes_outside_workspace
+
+    print("path resolution:")
+    ws = tempfile.mkdtemp(prefix="ase-paths-")
+    outside = tempfile.mkdtemp(prefix="ase-outside-")
+    try:
+        # a seeded fixture lives in the workspace, but NOT at the path the assertion expects
+        os.makedirs(os.path.join(ws, "fixtures"))
+        open(os.path.join(ws, "fixtures", "report.md"), "w").close()
+
+        def _rr(paths):
+            return RunResult(agent="x", eval_name="e", prompt="", workdir=ws,
+                             events=[NormalizedEvent(EventKind.FILE_CHANGE, path=p) for p in paths])
+
+        # 1. a seeded fixture with a matching basename must NOT satisfy a different path (no false pass)
+        path, where = _resolve_artifact(_rr([]), ws, "output/report.md")
+        _check("paths.no_fixture_falsepass", path is None,
+               f"seeded fixtures/report.md does not satisfy output/report.md (got {where})",
+               failures, verbose)
+
+        # 2. a RELATIVE trace path resolves under the workspace → found via write-trace
+        os.makedirs(os.path.join(ws, "out"))
+        open(os.path.join(ws, "out", "x.md"), "w").close()
+        path, where = _resolve_artifact(_rr(["out/x.md"]), ws, "x.md")
+        _check("paths.rel_trace_in_workspace",
+               path == os.path.abspath(os.path.join(ws, "out", "x.md")) and where == "write-trace",
+               f"relative trace resolved under the workspace (got {path}, {where})", failures, verbose)
+
+        # 3. a relative trace path is NOT mis-reported as 'written outside the workspace'
+        out = writes_outside_workspace(_rr(["out/x.md"]), ws)
+        _check("paths.rel_not_outside", out == [],
+               f"relative trace path not flagged outside the workspace (got {out})", failures, verbose)
+
+        # 4. a genuinely-outside ABSOLUTE write IS surfaced
+        abs_out = os.path.join(outside, "evil.md")
+        open(abs_out, "w").close()
+        out = writes_outside_workspace(_rr([abs_out]), ws)
+        _check("paths.abs_outside_surfaced", out == [os.path.abspath(abs_out)],
+               f"absolute outside write surfaced (got {out})", failures, verbose)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+        shutil.rmtree(outside, ignore_errors=True)
+
+
 def run_selftest(verbose: bool = False) -> int:
     failures: list[str] = []
 
@@ -294,6 +347,9 @@ def run_selftest(verbose: bool = False) -> int:
 
     # per-cell readable report
     _check_report(failures, verbose)
+
+    # artifact / trace path resolution (no false passes on seeded fixtures; workspace-relative)
+    _check_path_resolution(failures, verbose)
 
     print()
     if failures:
