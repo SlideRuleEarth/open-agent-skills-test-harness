@@ -210,6 +210,67 @@ artifacts/<run_id>/
 
 `run` exits non-zero if any cell fails — drop it straight into CI.
 
+## Skill isolation
+
+By default every run is **isolated**: each cell runs against a private HOME that mirrors your
+real one (so logins, settings, and the agent's own vendor skills keep working) but **hides this
+repo's globally-installed skills**. So the model sees only the skills the eval/scenario
+provisions — plus the agent's built-in/vendor skills — never other repo skills you happen to
+have installed (e.g. via `make link-global`). This is what makes "test skill X (or this
+*combination*) in isolation" actually true.
+
+- **Surgical, not a blank sandbox.** Only the global skills dirs are masked (per-runner
+  `global_skills_subpaths`), and only *this repo's* skills are removed from them — vendor
+  bundles like codex's `~/.codex/skills/.system` and Claude Code plugins are kept. The declared
+  skills are also placed in the harness-owned global dir, so discovery works whatever path or
+  precedence a surface uses.
+- **Opt out** with `--no-isolated` to test against your real, globally-installed setup.
+- **Audit / preview** with `agentskill-evals list-skills` (the provisionable superset, the
+  per-runner masked/kept split, and drift warnings such as a stale `make link-global`) or with
+  `run … --dry-run`, which prints a per-target *"Skills visible to the model"* block — no API cost.
+- **Caveats:** skills bundled inside a CLI's package or plugins live outside these dirs and are
+  *not* masked (that's intentional — the platform baseline). On a platform without symlink
+  privileges the cell falls back to a non-isolated run with a warning. Config-dir *writes* still
+  pass through to the real dirs (only skill *visibility* is isolated).
+
+See [FAQ.md](FAQ.md) for the plain-language version.
+
+## Scenarios — ad-hoc combination evals
+
+A per-skill eval tests one skill. A **scenario** tests a *combination* of skills working
+together against a chosen target (`runner:model`), from one self-describing file. Scenarios are
+**ad-hoc** — not auto-discovered; you run one by path:
+
+```bash
+# preview what runs + exactly which skills are visible (no API cost)
+agentskill-evals run --config scenarios/example_api+params_on_claude-haiku.yaml --dry-run
+
+# run it
+agentskill-evals run --config scenarios/example_api+params_on_claude-haiku.yaml
+```
+
+A scenario file is an eval spec plus a `target:` block:
+
+```yaml
+name: api+params combination
+target:
+  runner: claude
+  model: claude-haiku-4-5      # optional; omit → models.yaml's cheapest default
+skills: [sliderule-api, sliderule-params]   # provisioned together; the only repo skills visible
+prompt: |
+  Using {skills}, write run.py that ...
+rubric: [ ... ]
+assertions: [{type: file_exists, path: run.py}]
+judge: true        # optional run knobs (CLI flags override): judge / isolated / max_cells / jobs
+isolated: true
+```
+
+Precedence for a run is **CLI flag > scenario file > built-in default**, so `--agents`,
+`--model`, `--no-isolated`, etc. override the file without editing it. Scenario artifacts land
+under `artifacts/<run_id>/<runner>/<model>/scenario/<name>/`. Files live in
+[`../scenarios/`](../scenarios/) with the convention `<what>_on_<runner>-<model>.yaml`; see
+[scenarios/README.md](../scenarios/README.md).
+
 ## Cross-model testing
 
 The same skill can behave very differently on different **models**, so model is a
