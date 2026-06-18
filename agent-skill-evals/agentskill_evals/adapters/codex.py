@@ -1,7 +1,7 @@
 """Codex (OpenAI) adapter.
 
-Invocation:
-    codex exec --json [--full-auto] [-m MODEL] "<prompt>"
+Invocation (auto-approve: approval/sandbox flags are top-level, before `exec`):
+    codex --ask-for-approval never --sandbox workspace-write exec --json [-m MODEL] "<prompt>"
 
 Output is JSONL of "item" events:
 
@@ -29,15 +29,24 @@ class CodexAdapter(Adapter):
     name = "codex"
     binary = "codex"
     skills_subdir = ".agents/skills"  # Codex reads $REPO_ROOT/.agents/skills (cross-agent convention)
+    # Global skills dirs codex discovers (the .system vendor bundle in ~/.codex/skills is kept).
+    global_skills_subpaths = [".codex/skills", ".agents/skills"]
+    # CODEX_HOME overrides ~/.codex (skills under $CODEX_HOME/skills). Under isolation it's
+    # mirrored + repointed (custom home kept, skills masked), else cleared to the isolated home.
+    isolation_config_homes = [("CODEX_HOME", "skills")]
 
     def format_skill(self, skill: str) -> str:
         # Mirrors the OpenAI example which referenced skills as "$skill-name".
         return f"${skill}"
 
     def build_argv(self, prompt: str, opts: RunOptions) -> list[str]:
-        argv = [self.binary, "exec", "--json"]
+        argv = [self.binary]
         if opts.auto_approve:
-            argv += ["--full-auto"]
+            # Non-interactive parity with the deprecated `--full-auto`: never prompt for
+            # approval AND allow workspace writes. `-a/--ask-for-approval` and
+            # `-s/--sandbox` are top-level options, so they precede the `exec` subcommand.
+            argv += ["--ask-for-approval", "never", "--sandbox", "workspace-write"]
+        argv += ["exec", "--json"]
         if opts.model:
             argv += ["-m", opts.model]
         argv += opts.extra_args

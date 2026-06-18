@@ -33,9 +33,12 @@ def execute(
     eval_name: str = "",
 ) -> ExecResult:
     argv = adapter.build_argv(prompt, opts)
-    env = adapter.env(dict(os.environ), opts)
+    # Apply the eval/scenario env first, then let adapter.env() layer isolation on top — so an
+    # isolated run's HOME / XDG / config-home vars can't be overridden by an eval's `env:`.
+    base = dict(os.environ)
     if env_overrides:
-        env.update(env_overrides)
+        base.update(env_overrides)
+    env = adapter.env(base, opts)
 
     rr = RunResult(
         agent=agent_name or adapter.name,
@@ -57,15 +60,20 @@ def execute(
             capture_output=True,
             text=True,
             timeout=timeout,
+            stdin=subprocess.DEVNULL,  # non-interactive: agents that probe stdin (e.g. codex
+                                       # exec) get immediate EOF instead of blocking forever
         )
         stdout, stderr, code = proc.stdout, proc.stderr, proc.returncode
     except subprocess.TimeoutExpired as exc:
+        # On TimeoutExpired the partial stdout/stderr can come back as bytes even with
+        # text=True, so decode BEFORE appending the timeout note (else: can't concat str+bytes).
         stdout = exc.stdout or ""
-        stderr = (exc.stderr or "") + f"\n[timeout after {timeout}s]"
+        stderr = exc.stderr or ""
         if isinstance(stdout, bytes):
             stdout = stdout.decode("utf-8", "replace")
         if isinstance(stderr, bytes):
             stderr = stderr.decode("utf-8", "replace")
+        stderr += f"\n[timeout after {timeout}s]"
         rr.timed_out = True
         rr.error = f"timed out after {timeout}s"
         code = -9

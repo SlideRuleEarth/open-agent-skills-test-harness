@@ -31,12 +31,23 @@ Per skill, in `<skill>/evals/*.yaml` (auto-discovered). Each eval
 - `assertions` — deterministic checks
 - optional `tags` / `vars` / `env` / `output_schema` / `timeout`
 
+## Scenarios — the first-class higher-level eval
+
+Per-skill evals test one skill at a time. A **scenario** is a higher-level, ad-hoc eval: one
+self-describing file ([scenarios/](scenarios/)) that provisions a **combination of skills
+together** and pins a **target** (`runner:model`), run with `agentskill-evals run --config
+<file>`. Because runs are isolated by default, a scenario tests exactly its declared skill set
+(plus the agent's vendor skills) — nothing else from this repo leaks in. CLI flags override the
+file (`CLI > scenario > default`). See [scenarios/README.md](scenarios/README.md).
+
 ## How one cell runs
 
 [runner.py](agent-skill-evals/agentskill_evals/runner.py) →
 [exec.py](agent-skill-evals/agentskill_evals/exec.py):
 
-1. Build a hermetic workspace and provision the skill (symlink, fallback copy).
+1. Build a hermetic workspace, provision the eval's skill(s) (symlink, fallback copy), and —
+   by default — an **isolated HOME** that masks globally-installed repo skills so the model sees
+   only what's provisioned plus the agent's own vendor skills (`--no-isolated` opts out).
 2. Run the agent CLI through its adapter with the eval prompt.
 3. Adapter `parse()` normalizes that CLI's output into a common
    [`NormalizedEvent`](agent-skill-evals/agentskill_evals/schema.py) stream + `RunResult`
@@ -59,7 +70,9 @@ Per skill, in `<skill>/evals/*.yaml` (auto-discovered). Each eval
 ## CLI
 
 Entry point `agentskill-evals` ([cli.py](agent-skill-evals/agentskill_evals/cli.py)):
-`run`, `list-agents`, `list-evals`, `migrate`, `selftest`.
+`run`, `list-agents`, `list-evals`, `list-skills`, `migrate`, `selftest`. `run --config <file>`
+runs a scenario (below); `list-skills` audits skill visibility (superset vs per-runner
+masked/kept, with drift warnings).
 
 ## Cost guardrails
 
@@ -84,4 +97,6 @@ third-party dependencies.
 ---
 
 See [agent-skill-evals/README.md](agent-skill-evals/README.md) for install, the full eval
-field/assertion reference, cross-model testing, and the `models.yaml` maintenance workflow.
+field/assertion reference, isolation, scenarios, cross-model testing, and the `models.yaml`
+maintenance workflow; [agent-skill-evals/FAQ.md](agent-skill-evals/FAQ.md) for "which skills can
+the model see during a test?"; and [scenarios/README.md](scenarios/README.md) for combination scenarios.

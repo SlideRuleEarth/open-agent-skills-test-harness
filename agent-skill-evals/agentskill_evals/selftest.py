@@ -9,6 +9,8 @@ agent changes its output schema).
 from __future__ import annotations
 
 from .adapters import get_adapter
+from .adapters.base import RunOptions
+from .spec import EvalSpec
 
 # --- captured sample outputs (one per agent format) ------------------------
 
@@ -49,6 +51,104 @@ def _check(name, cond, msg, failures, verbose):
         failures.append(name)
 
 
+def _check_isolation(failures, verbose):
+    """Validate the HOME overlay: declared skills present, undeclared masked, vendor kept,
+    auth/config passed through, missing ancestors built. Pure filesystem — no CLIs."""
+    import os
+    import shutil
+    import tempfile
+
+    from .isolation import build_isolated_home
+
+    print("isolation overlay:")
+    real = tempfile.mkdtemp(prefix="ase-realhome-")
+    declared_root = tempfile.mkdtemp(prefix="ase-skills-")
+    dest = tempfile.mkdtemp(prefix="ase-isohome-")
+    shutil.rmtree(dest)  # build_isolated_home (re)creates it
+    try:
+        # a fake real HOME: a global skills dir with two repo skills + a vendor bundle,
+        # plus auth + an unrelated dotfile.
+        os.makedirs(os.path.join(real, ".codex", "skills", "sliderule-api"))
+        os.makedirs(os.path.join(real, ".codex", "skills", "sliderule-params"))
+        os.makedirs(os.path.join(real, ".codex", "skills", ".system", "imagegen"))
+        os.makedirs(os.path.join(real, "_cfg"))  # reproduce the config-mirror escape hazard
+        open(os.path.join(real, ".codex", "auth.json"), "w").close()
+        open(os.path.join(real, ".gitconfig"), "w").close()
+        # the cell declares only sliderule-api (its source lives outside HOME, like skills_root)
+        os.makedirs(os.path.join(declared_root, "sliderule-api"))
+
+        build_isolated_home(
+            dest,
+            [".codex/skills", ".gemini/config/skills"],   # one present, one missing (nested)
+            {"sliderule-api", "sliderule-params"},        # repo superset to mask
+            [os.path.join(declared_root, "sliderule-api")],
+            real,
+        )
+
+        skills = os.path.join(dest, ".codex", "skills")
+        names = set(os.listdir(skills)) if os.path.isdir(skills) else set()
+        _check("isolation.declared_present", "sliderule-api" in names,
+               f"declared sliderule-api present (got {sorted(names)})", failures, verbose)
+        _check("isolation.declared_is_copy",
+               os.path.isdir(os.path.join(skills, "sliderule-api"))
+               and not os.path.islink(os.path.join(skills, "sliderule-api")),
+               "declared skill is a copy (writes can't reach the source)", failures, verbose)
+        _check("isolation.undeclared_masked", "sliderule-params" not in names,
+               "undeclared sliderule-params removed", failures, verbose)
+        _check("isolation.vendor_kept", ".system" in names,
+               "vendor .system bundle preserved", failures, verbose)
+        _check("isolation.auth_passthrough",
+               os.path.islink(os.path.join(dest, ".codex", "auth.json")),
+               "auth.json passed through as a symlink", failures, verbose)
+        _check("isolation.dotfile_passthrough",
+               os.path.islink(os.path.join(dest, ".gitconfig")),
+               ".gitconfig passed through as a symlink", failures, verbose)
+        gem = os.path.join(dest, ".gemini", "config", "skills")
+        gem_names = sorted(os.listdir(gem)) if os.path.isdir(gem) else ["<MISSING>"]
+        _check("isolation.missing_ancestor_built", gem_names == ["sliderule-api"],
+               f"missing nested skills dir built with declared only (got {gem_names})",
+               failures, verbose)
+
+        # config mirrors must use a fresh temp dir, not dest/_cfg — which is a symlink to the
+        # real HOME's _cfg here, so writing through it would escape the temp tree.
+        hazard = os.path.islink(os.path.join(dest, "_cfg"))
+        cfg_root = tempfile.mkdtemp(prefix="cfg-", dir=dest)
+        open(os.path.join(cfg_root, "mirror-marker"), "w").close()
+        escaped = os.path.exists(os.path.join(real, "_cfg", "mirror-marker"))
+        _check("isolation.cfg_mirror_no_escape", hazard and not escaped,
+               f"config mirror stays in temp even when ~/_cfg exists "
+               f"(hazard_present={hazard}, escaped={escaped})", failures, verbose)
+    finally:
+        for d in (real, declared_root, dest):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def _check_provision(failures, verbose):
+    """Provisioned skills are copies, not symlinks, so a write inside one can't mutate the
+    repo's skill source. Pure filesystem — no CLIs."""
+    import os
+    import shutil
+    import tempfile
+
+    print("skill provisioning:")
+    src = tempfile.mkdtemp(prefix="ase-skillsrc-")
+    ws = tempfile.mkdtemp(prefix="ase-ws-")
+    try:
+        open(os.path.join(src, "SKILL.md"), "w").close()
+        get_adapter("claude").provision_skills(ws, [src])
+        placed = os.path.join(ws, ".claude", "skills", os.path.basename(src))
+        is_copy = os.path.isdir(placed) and not os.path.islink(placed)
+        if is_copy:
+            open(os.path.join(placed, "scratch.txt"), "w").close()
+        source_clean = not os.path.exists(os.path.join(src, "scratch.txt"))
+        _check("provision.copy_not_symlink", is_copy and source_clean,
+               f"workspace skill is a copy; source unchanged (copy={is_copy}, clean={source_clean})",
+               failures, verbose)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+        shutil.rmtree(src, ignore_errors=True)
+
+
 def run_selftest(verbose: bool = False) -> int:
     failures: list[str] = []
 
@@ -74,6 +174,29 @@ def run_selftest(verbose: bool = False) -> int:
     _check("codex.command", cmds == ["npm install"], f"commands={cmds}", failures, verbose)
     _check("codex.file", "package.json" in paths, f"paths={paths}", failures, verbose)
     _check("codex.final", out.final_text == "Created demo-app.", repr(out.final_text), failures, verbose)
+    cargv = get_adapter("codex").build_argv("do the task", RunOptions(model="gpt-5.4-mini"))
+    pre = cargv[:cargv.index("exec")]  # top-level flags precede the exec subcommand
+    _check("codex.argv",
+           "--ask-for-approval" in pre and "never" in pre
+           and "--sandbox" in pre and "workspace-write" in pre
+           and "--full-auto" not in cargv and cargv[-1] == "do the task",
+           f"non-interactive approval+sandbox before exec, prompt last: {cargv}", failures, verbose)
+    sf = EvalSpec(name="t", prompt="p", source_path="/r/skill/evals/e.yaml",
+                  files=["a.json", "fixtures/in.json", {"x/a.json": "data/a.json"}, "../esc.json"])
+    dests = [d for _, d in sf.resolved_files()]
+    _check("spec.resolved_files",
+           dests == ["a.json", "fixtures/in.json", "data/a.json", "esc.json"],
+           f"seed dests (subdirs kept, traversal guarded): {dests}", failures, verbose)
+    e1 = get_adapter("codex").env({"CODEX_HOME": "/real", "HOME": "/old"}, RunOptions(home="/iso"))
+    _check("codex.iso_env.clear",
+           e1.get("HOME") == "/iso" and "CODEX_HOME" not in e1,
+           f"unmirrored config-home cleared, HOME set: {e1}", failures, verbose)
+    e2 = get_adapter("codex").env(
+        {"CODEX_HOME": "/real"},
+        RunOptions(home="/iso", isolation_env={"CODEX_HOME": "/iso/_cfg/CODEX_HOME"}))
+    _check("codex.iso_env.repoint",
+           e2.get("CODEX_HOME") == "/iso/_cfg/CODEX_HOME",
+           f"mirrored config-home repointed: {e2}", failures, verbose)
 
     # AntiGravity (3 shapes)
     print("antigravity adapter:")
@@ -98,6 +221,10 @@ def run_selftest(verbose: bool = False) -> int:
     bad, err = validate_schema({"name": "x"},
                                {"type": "object", "required": ["name", "port"]})
     _check("schema.invalid", not bad, f"missing-required caught: {err}", failures, verbose)
+
+    # HOME isolation overlay + side-effect-free provisioning
+    _check_isolation(failures, verbose)
+    _check_provision(failures, verbose)
 
     print()
     if failures:

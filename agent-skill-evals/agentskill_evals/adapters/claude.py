@@ -32,6 +32,10 @@ _SHELL_TOOLS = {"Bash", "BashOutput"}
 class ClaudeAdapter(Adapter):
     name = "claude"
     binary = "claude"
+    global_skills_subpaths = [".claude/skills"]
+    # CLAUDE_CONFIG_DIR overrides ~/.claude (skills under it). Under isolation it's mirrored +
+    # repointed (custom config dir kept, skills masked), else cleared to the isolated home.
+    isolation_config_homes = [("CLAUDE_CONFIG_DIR", "skills")]
 
     def format_skill(self, skill: str) -> str:
         return f"/{skill}"

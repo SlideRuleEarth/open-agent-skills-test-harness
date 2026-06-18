@@ -19,6 +19,8 @@ import hashlib
 import json
 import os
 import shutil
+import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
@@ -27,9 +29,10 @@ from .adapters import get_adapter
 from .adapters.base import Adapter, RunOptions
 from .assertions import AssertionContext, AssertionResult, run_assertion
 from .exec import execute
+from .isolation import build_isolated_home
 from .judge import Judge
 from .schema import RunResult
-from .spec import EvalSpec
+from .spec import EvalSpec, skill_names
 
 
 @dataclass
@@ -42,6 +45,8 @@ class CellResult:
     run_result: RunResult
     assertions: list[AssertionResult] = field(default_factory=list)
     artifacts_dir: str = ""
+    isolated: bool = False     # ran against an isolated HOME (only provisioned + vendor skills visible)
+    ungraded: bool = False     # ran clean but nothing graded it (rubric-only eval, judge off)
 
     @property
     def n_pass(self) -> int:
@@ -69,6 +74,7 @@ class Runner:
         auto_approve: bool = True,
         jobs: int = 1,
         model_map: Optional[dict[str, list[Optional[str]]]] = None,
+        isolated: bool = True,
     ):
         self.agents = agents
         self.adapters: dict[str, Adapter] = {a: get_adapter(a) for a in agents}
@@ -80,6 +86,10 @@ class Runner:
         self.auto_approve = auto_approve
         self.jobs = max(1, jobs)
         self.model_map = model_map or {}
+        self.isolated = isolated
+        # the repo's provisionable skills — masked from each runner's global skills dirs
+        # under isolation so a cell sees only what it provisions (+ the surface's vendor skills).
+        self._repo_skill_names = set(skill_names(skills_root))
         self.run_dir = os.path.join(artifacts_root, run_id)
 
     # --- public -------------------------------------------------------------
@@ -123,24 +133,69 @@ class Runner:
         os.makedirs(workspace, exist_ok=True)
 
         # 1) provision skills + 2) seed files
-        if self.provision:
-            self._provision(adapter, workspace, spec)
+        declared_dirs = self._skill_dirs(spec)
+        if self.provision and declared_dirs:
+            adapter.provision_skills(workspace, declared_dirs)
         self._seed_files(workspace, spec)
 
         # 3) render prompt (fill {skill}/{skills} for this adapter)
         prompt = self._render_prompt(adapter, spec)
 
-        # 4) run
+        # 4) isolate HOME so the model sees only the provisioned skills (+ the surface's
+        #    vendor skills), not this repo's globally-installed skills. Mirror the real HOME;
+        #    mask only the global skills dirs. On failure, fall back to a non-isolated run.
+        iso_home = None
+        iso_env: dict[str, str] = {}
+        isolated = False
+        if self.isolated and adapter.global_skills_subpaths:
+            iso_home = tempfile.mkdtemp(prefix="ase-home-")
+            seed_dirs = declared_dirs if self.provision else []
+            try:
+                build_isolated_home(
+                    iso_home, adapter.global_skills_subpaths, self._repo_skill_names,
+                    seed_dirs, os.path.expanduser("~"),
+                )
+                # A custom config home (e.g. $CODEX_HOME) lives outside HOME, so the HOME
+                # mirror doesn't cover it: mirror it separately (skills masked) and repoint
+                # the var, so custom-config users keep auth/config without leaking skills.
+                cfg_root = None
+                for var, skills_sub in getattr(adapter, "isolation_config_homes", []):
+                    custom = os.environ.get(var)
+                    if custom and os.path.isdir(custom):
+                        if cfg_root is None:
+                            # A *fresh* real dir — not iso_home/_cfg, which would be a symlink
+                            # to the real HOME if it has a `_cfg` entry, leaking the mirror
+                            # outside the temp tree (it would survive cleanup).
+                            cfg_root = tempfile.mkdtemp(prefix="cfg-", dir=iso_home)
+                        mirror = os.path.join(cfg_root, _safe(var))
+                        build_isolated_home(mirror, [skills_sub], self._repo_skill_names,
+                                            seed_dirs, custom)
+                        iso_env[var] = mirror
+                isolated = True
+            except OSError as exc:
+                print(f"warning: [{agent}] skill isolation unavailable ({exc}); "
+                      "running non-isolated.", file=sys.stderr)
+                shutil.rmtree(iso_home, ignore_errors=True)
+                iso_home = None
+                iso_env = {}
+
+        # 5) run
         opts = RunOptions(
             model=model,
             auto_approve=self.auto_approve,
             output_schema=spec.output_schema,
+            home=iso_home,
+            isolation_env=iso_env,
         )
-        ex = execute(
-            adapter, prompt, opts,
-            cwd=workspace, timeout=spec.timeout_sec,
-            env_overrides=spec.env, agent_name=agent, eval_name=spec.name,
-        )
+        try:
+            ex = execute(
+                adapter, prompt, opts,
+                cwd=workspace, timeout=spec.timeout_sec,
+                env_overrides=spec.env, agent_name=agent, eval_name=spec.name,
+            )
+        finally:
+            if iso_home:
+                shutil.rmtree(iso_home, ignore_errors=True)
         rr = ex.result
 
         # A rolled-off / mistyped model id surfaces as a run error; point the
@@ -148,35 +203,45 @@ class Runner:
         if model and rr.error and _looks_like_model_error(rr.error, ex.stderr):
             rr.error = f"model {model!r} rejected by {agent} — check models.yaml: {rr.error}"
 
-        # 5) artifacts
+        # 6) artifacts
         self._write_artifacts(cell_dir, ex.stdout, ex.stderr, rr)
 
-        # 6) assertions
+        # 7) assertions. With no judge active, skip llm_judge checks rather than failing
+        #    them — a --no-judge run is graded on its deterministic assertions only.
+        effective = spec.effective_assertions()
+        skipped_judge = self.judge is None and any(
+            c.get("type") == "llm_judge" for c in effective)
         ctx = AssertionContext(spec=spec, judge=self.judge)
         checks = [
             run_assertion(cfg, rr, workspace, spec, ctx)
-            for cfg in spec.effective_assertions()
+            for cfg in effective
+            if not (self.judge is None and cfg.get("type") == "llm_judge")
         ]
         clean = rr.error is None and not rr.timed_out
-        # With assertions: clean run AND every check passes. Without any
-        # assertions: pass == the agent ran cleanly.
-        passed = (clean and all(c.passed for c in checks)) if checks else clean
+        # "ungraded": ran clean but the only checks were judge checks we skipped — nothing
+        # actually graded the behavior, so it's neither a pass nor a fail. A genuinely
+        # assertion-less eval (no rubric either) stays a clean-run smoke-test pass.
+        ungraded = clean and not checks and skipped_judge
+        passed = False if ungraded else (
+            (clean and all(c.passed for c in checks)) if checks else clean)
 
         cell = CellResult(
             agent=agent, model=model, eval_name=spec.name, skill=spec.skill_name,
             passed=passed, run_result=rr, assertions=checks, artifacts_dir=cell_dir,
+            isolated=isolated, ungraded=ungraded,
         )
         self._write_cell_json(cell_dir, cell)
         return cell
 
-    def _provision(self, adapter: Adapter, workspace: str, spec: EvalSpec) -> None:
-        skill_dirs = []
+    def _skill_dirs(self, spec: EvalSpec) -> list[str]:
+        """Source dirs for the eval's declared skills — real skill dirs (with a SKILL.md)
+        under skills_root, so a non-skill folder is never provisioned."""
+        dirs = []
         for name in spec.skills:
             d = os.path.join(self.skills_root, name)
-            if os.path.isdir(d):
-                skill_dirs.append(d)
-        if skill_dirs:
-            adapter.provision_skills(workspace, skill_dirs)
+            if os.path.isfile(os.path.join(d, "SKILL.md")):
+                dirs.append(d)
+        return dirs
 
     def _seed_files(self, workspace: str, spec: EvalSpec) -> None:
         fixture = spec.resolved_fixture()
@@ -217,6 +282,8 @@ class Runner:
                 "model": cell.model,
                 "eval": cell.eval_name,
                 "skill": cell.skill,
+                "isolated": cell.isolated,
+                "ungraded": cell.ungraded,
                 "passed": cell.passed,
                 "assertions": [
                     {"type": a.type, "passed": a.passed, "kind": a.kind,
@@ -236,6 +303,7 @@ class Runner:
             "run_id": self.run_id,
             "agents": self.agents,
             "targets": targets,
+            "isolated": self.isolated,
             "n_evals": len(specs),
             "n_cells": len(results),
             "n_passed": sum(1 for c in results if c.passed),
@@ -244,6 +312,7 @@ class Runner:
             "cells": [
                 {
                     "agent": c.agent, "model": c.model, "eval": c.eval_name, "skill": c.skill,
+                    "isolated": c.isolated, "ungraded": c.ungraded,
                     "passed": c.passed, "n_pass": c.n_pass, "n_total": c.n_total,
                     "error": c.run_result.error, "timed_out": c.run_result.timed_out,
                     "cost_usd": c.run_result.cost_usd,
@@ -292,6 +361,8 @@ def _cell_text(c: Optional[CellResult]) -> str:
         return "-"
     if c.run_result.error:
         return "ERR"
+    if c.ungraded:
+        return "SKIP"
     return f"{'PASS' if c.passed else 'FAIL'} {c.n_pass}/{c.n_total}"
 
 
@@ -300,6 +371,8 @@ def _cell_mark(c: Optional[CellResult]) -> str:
         return "–"
     if c.run_result.error:
         return f"⚠️ {c.run_result.error}"
+    if c.ungraded:
+        return "⚪ ungraded"
     return f"{'✅' if c.passed else '❌'} {c.n_pass}/{c.n_total}"
 
 
@@ -324,10 +397,12 @@ def render_matrix(results: list[CellResult], agents: list[str],
 
     lines += ["", "pass rate by target:"]
     for a, m in targets:
-        cells = [by_key.get((ev, a, m)) for ev in evals]
-        cells = [c for c in cells if c is not None]
-        npass = sum(1 for c in cells if c.passed)
-        lines.append(f"  {_target_label(a, m):<28} {npass}/{len(cells)}")
+        cells = [c for c in (by_key.get((ev, a, m)) for ev in evals) if c is not None]
+        graded = [c for c in cells if not c.ungraded]
+        npass = sum(1 for c in graded if c.passed)
+        ung = len(cells) - len(graded)
+        extra = f"   ({ung} ungraded)" if ung else ""
+        lines.append(f"  {_target_label(a, m):<28} {npass}/{len(graded)}{extra}")
     return "\n".join(lines)
 
 
@@ -347,10 +422,12 @@ def render_markdown(results: list[CellResult], agents: list[str],
 
     lines += ["", "## Pass rate by target", "", "| target | pass rate |", "|---|---|"]
     for a, m in targets:
-        cells = [by_key.get((ev, a, m)) for ev in evals]
-        cells = [c for c in cells if c is not None]
-        npass = sum(1 for c in cells if c.passed)
-        lines.append(f"| {_target_label(a, m)} | {npass}/{len(cells)} |")
+        cells = [c for c in (by_key.get((ev, a, m)) for ev in evals) if c is not None]
+        graded = [c for c in cells if not c.ungraded]
+        npass = sum(1 for c in graded if c.passed)
+        ung = len(cells) - len(graded)
+        rate = f"{npass}/{len(graded)}" + (f" ({ung} ungraded)" if ung else "")
+        lines.append(f"| {_target_label(a, m)} | {rate} |")
     return "\n".join(lines) + "\n"
 
 

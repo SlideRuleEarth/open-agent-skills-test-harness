@@ -37,6 +37,12 @@ class AntigravityAdapter(Adapter):
     name = "antigravity"
     binary = "agy"
     skills_subdir = ".antigravity/skills"  # best-effort guess; verify per build
+    # Global skills dirs agy/gemini discovers (mirrors the root Makefile's GLOBAL_SKILL_DIRS).
+    global_skills_subpaths = [
+        ".gemini/config/skills",
+        ".gemini/antigravity-ide/skills",
+        ".antigravity/skills",
+    ]
 
     def format_skill(self, skill: str) -> str:
         return f"/{skill}"

@@ -80,11 +80,25 @@ class EvalSpec:
         return os.path.dirname(self.source_path) if self.source_path else os.getcwd()
 
     def resolved_files(self) -> list[tuple[str, str]]:
-        """(absolute source, workspace-relative dest) for each seed file."""
+        """(absolute source, workspace-relative dest) for each seed file.
+
+        A relative entry keeps its path, so `fixtures/input.json` is seeded at
+        `fixtures/input.json` in the workspace (matching "paths relative to the eval
+        file"), not flattened to `input.json`. A `{src: dest}` mapping sets an explicit
+        destination. An absolute path, or a dest that would escape the workspace, is
+        placed by basename.
+        """
         out = []
-        for f in self.files:
-            src = f if os.path.isabs(f) else os.path.join(self.base_dir(), f)
-            out.append((src, os.path.basename(f)))
+        for entry in self.files:
+            if isinstance(entry, dict) and len(entry) == 1:
+                src_rel, dest = next(iter(entry.items()))
+            else:
+                src_rel = dest = entry
+            src = src_rel if os.path.isabs(src_rel) else os.path.join(self.base_dir(), src_rel)
+            norm = os.path.normpath(str(dest))
+            # never let a seed write outside the workspace
+            dest = os.path.basename(norm) if os.path.isabs(norm) or norm.startswith("..") else norm
+            out.append((src, dest))
         return out
 
     def resolved_fixture(self) -> Optional[str]:
@@ -166,8 +180,10 @@ def _infer_skill_name(path: str) -> Optional[str]:
 
 
 def load_spec(path: str) -> EvalSpec:
-    raw = _load_raw(path)
+    return _spec_from_raw(_load_raw(path), path)
 
+
+def _spec_from_raw(raw: dict, path: str) -> EvalSpec:
     # canonical + accepted aliases
     prompt = raw.get("prompt") or raw.get("query") or raw.get("input")
     if not prompt:
@@ -176,10 +192,24 @@ def load_spec(path: str) -> EvalSpec:
     if isinstance(rubric, str):
         rubric = [rubric]
 
+    # Normalize skills to list[str]. A scalar `skills: sliderule-api` must become a
+    # one-element list, not be iterated character-by-character downstream.
     skills = raw.get("skills")
-    if skills is None and raw.get("skill"):
-        skills = [raw["skill"]]
-    skills = skills or []
+    if skills is None:
+        skills = raw.get("skill")          # singular alias
+    if skills is None:
+        skills = []
+    elif isinstance(skills, str):
+        skills = [skills]
+    elif isinstance(skills, (list, tuple)):
+        bad = [s for s in skills if not isinstance(s, str)]
+        if bad:
+            raise ValueError(f"{path}: `skills` entries must be strings; got {bad!r}")
+        skills = [str(s) for s in skills]
+    else:
+        raise ValueError(
+            f"{path}: `skills` must be a string or a list of strings, "
+            f"got {type(skills).__name__}")
 
     name = raw.get("name") or os.path.splitext(os.path.basename(path))[0]
     skill_name = _infer_skill_name(path) or (skills[0] if skills else None)
@@ -202,6 +232,70 @@ def load_spec(path: str) -> EvalSpec:
         source_path=os.path.abspath(path),
         skill_name=skill_name,
     )
+
+
+# ---------------------------------------------------------------------------
+# Scenarios — a higher-level, ad-hoc eval that provisions a combination of skills
+# together and pins a target (runner:model). Run with `run --config <file>`.
+# ---------------------------------------------------------------------------
+
+_SCENARIO_OVERRIDE_KEYS = ("max_cells", "jobs", "judge", "isolated")
+
+
+@dataclass
+class Scenario:
+    """A combination eval: an EvalSpec plus a pinned target and optional run-knob overrides."""
+    spec: EvalSpec
+    runner: str
+    model: Optional[str]
+    overrides: dict          # subset of {max_cells, jobs, judge, isolated}
+    source_path: str
+
+
+def load_scenario(path: str) -> Scenario:
+    """Load a scenario file (an eval spec + a `target:` block). The runner is validated by
+    the CLI (spec.py must not import adapters)."""
+    raw = _load_raw(path)
+
+    target = raw.get("target")
+    if not isinstance(target, dict):
+        raise ValueError(
+            f"{path}: a scenario needs a `target:` mapping with a `runner:` (and optional "
+            "`model:`), e.g.\n  target:\n    runner: claude\n    model: claude-haiku-4-5")
+    runner = target.get("runner")
+    if not runner or not isinstance(runner, str):
+        raise ValueError(f"{path}: target.runner is required (a runner name, e.g. claude).")
+    model = target.get("model")
+    model = str(model) if model else None
+
+    spec = _spec_from_raw(raw, path)     # reuses prompt/skills parsing + the prompt-required check
+    if not spec.skills:
+        raise ValueError(
+            f"{path}: a scenario needs a non-empty `skills:` list — the combination to "
+            "provision together.")
+    spec.agents = None                   # the target governs the runner; ignore any eval `agents:`
+    spec.skill_name = "scenario"         # artifacts: .../<runner>/<model>/scenario/<name>/
+
+    overrides = {k: raw[k] for k in _SCENARIO_OVERRIDE_KEYS if k in raw}
+    return Scenario(spec=spec, runner=runner.strip(), model=model,
+                    overrides=overrides, source_path=os.path.abspath(path))
+
+
+def skill_names(skills_root: str) -> list[str]:
+    """Provisionable skills: immediate subdirectories of skills_root containing a SKILL.md.
+
+    This is the repo's "superset" — what an eval/scenario may declare, and the set isolation
+    masks from the global skills dirs.
+    """
+    out: list[str] = []
+    try:
+        entries = sorted(os.listdir(skills_root))
+    except OSError:
+        return out
+    for name in entries:
+        if os.path.isfile(os.path.join(skills_root, name, "SKILL.md")):
+            out.append(name)
+    return out
 
 
 def discover_specs(

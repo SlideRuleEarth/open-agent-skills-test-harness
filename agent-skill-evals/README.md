@@ -32,7 +32,7 @@ Each agent CLI speaks a different dialect of "structured output":
 | Agent | Invocation | Output |
 |-------|-----------|--------|
 | Claude Code | `claude -p … --output-format stream-json --verbose` | JSONL: `system`/`assistant`/`user`/`result`; tool calls in `tool_use` blocks; `--json-schema` → `structured_output` on the result event |
-| Codex | `codex exec --json --full-auto` | JSONL: `item.started`/`item.completed` with `item.type` = `command_execution`/`file_change`/`agent_message` |
+| Codex | `codex --ask-for-approval never --sandbox workspace-write exec --json` | JSONL: `item.started`/`item.completed` with `item.type` = `command_execution`/`file_change`/`agent_message` |
 | AntiGravity | `agy -p "<prompt>" --dangerously-skip-permissions` | plain text by default (`agy` 1.0.9 has no `--output-format`) → parsed defensively: JSONL → single JSON → raw text |
 
 Every adapter maps its CLI's events onto one [`NormalizedEvent`](agentskill_evals/schema.py)
@@ -131,7 +131,7 @@ for AntiGravity) so the run is hermetic.
 | `description` | what correct behavior looks like (given to the judge) |
 | `prompt` | the user message (legacy `query` also accepted) |
 | `skills` | skills provisioned into the workspace (legacy `skill` accepted) |
-| `files` | files seeded into the workspace (paths relative to the eval file) |
+| `files` | files seeded into the workspace; sources are relative to the eval file and keep that relative path (`fixtures/in.json` → `fixtures/in.json`). Use a `{src: dest}` mapping for a different destination |
 | `fixture` | a directory copied in as the starting workspace |
 | `agents` | restrict to specific agents (default: all selected on the CLI) |
 | `timeout_sec` | per-cell timeout (default 600) |
@@ -158,7 +158,9 @@ for AntiGravity) so the run is hermetic.
 | `llm_judge` | `rubric` items graded by the judge; `threshold` = fraction that must pass (default 1.0) |
 
 `rubric:` at the top level is auto-compiled into one `llm_judge` assertion, and
-`output_schema:` into one `output_matches_schema` assertion.
+`output_schema:` into one `output_matches_schema` assertion. With `--no-judge` (or no judge
+available), `llm_judge` checks are **skipped**, not failed — the cell is graded on its
+deterministic assertions only.
 
 ## Usage
 
@@ -209,6 +211,70 @@ artifacts/<run_id>/
 ```
 
 `run` exits non-zero if any cell fails — drop it straight into CI.
+
+## Skill isolation
+
+By default every run is **isolated**: each cell runs against a private HOME that mirrors your
+real one (so logins, settings, and the agent's own vendor skills keep working) but **hides this
+repo's globally-installed skills**. So the model sees only the skills the eval/scenario
+provisions — plus the agent's built-in/vendor skills — never other repo skills you happen to
+have installed (e.g. via `make link-global`). This is what makes "test skill X (or this
+*combination*) in isolation" actually true.
+
+- **Surgical, not a blank sandbox.** Only the global skills dirs are masked (per-runner
+  `global_skills_subpaths`), and only *this repo's* skills are removed from them — vendor
+  bundles like codex's `~/.codex/skills/.system` and Claude Code plugins are kept. The declared
+  skills are also placed in the harness-owned global dir, so discovery works whatever path or
+  precedence a surface uses.
+- **Custom config homes are honored.** If you point a runner at a non-default config home
+  (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`), it's mirrored into the isolated home — auth/config keep
+  working — with its skills masked the same way, and the variable is repointed at the mirror.
+- **Opt out** with `--no-isolated` to test against your real, globally-installed setup.
+- **Audit / preview** with `agentskill-evals list-skills` (the provisionable superset, the
+  per-runner masked/kept split, and drift warnings such as a stale `make link-global`) or with
+  `run … --dry-run`, which prints a per-target *"Skills visible to the model"* block — no API cost.
+- **Caveats:** skills bundled inside a CLI's package or plugins live outside these dirs and are
+  *not* masked (that's intentional — the platform baseline). On a platform without symlink
+  privileges the cell falls back to a non-isolated run with a warning. Config-dir *writes* still
+  pass through to the real dirs (only skill *visibility* is isolated).
+
+See [FAQ.md](FAQ.md) for the plain-language version.
+
+## Scenarios — ad-hoc combination evals
+
+A per-skill eval tests one skill. A **scenario** tests a *combination* of skills working
+together against a chosen target (`runner:model`), from one self-describing file. Scenarios are
+**ad-hoc** — not auto-discovered; you run one by path:
+
+```bash
+# preview what runs + exactly which skills are visible (no API cost)
+agentskill-evals run --config scenarios/example_api+params_on_claude-haiku.yaml --dry-run
+
+# run it
+agentskill-evals run --config scenarios/example_api+params_on_claude-haiku.yaml
+```
+
+A scenario file is an eval spec plus a `target:` block:
+
+```yaml
+name: api+params combination
+target:
+  runner: claude
+  model: claude-haiku-4-5      # optional; omit → models.yaml's cheapest default
+skills: [sliderule-api, sliderule-params]   # provisioned together; the only repo skills visible
+prompt: |
+  Using {skills}, write run.py that ...
+rubric: [ ... ]
+assertions: [{type: file_exists, path: run.py}]
+judge: true        # optional run knobs (CLI flags override): judge / isolated / max_cells / jobs
+isolated: true
+```
+
+Precedence for a run is **CLI flag > scenario file > built-in default**, so `--agents`,
+`--model`, `--no-isolated`, etc. override the file without editing it. Scenario artifacts land
+under `artifacts/<run_id>/<runner>/<model>/scenario/<name>/`. Files live in
+[`../scenarios/`](../scenarios/) with the convention `<what>_on_<runner>-<model>.yaml`; see
+[scenarios/README.md](../scenarios/README.md).
 
 ## Cross-model testing
 
@@ -358,5 +424,6 @@ its schema.
   your build exposes a structured schema.
 - Skills are provisioned by **symlink** when possible (small, read-only),
   falling back to a copy on platforms without symlinks.
-- `--no-auto-approve` disables the per-agent "run without prompts" flag
-  (`--dangerously-skip-permissions` for Claude/AntiGravity, `--full-auto` for Codex).
+- `--no-auto-approve` disables the per-agent "run without prompts" flags
+  (`--dangerously-skip-permissions` for Claude/AntiGravity; `--ask-for-approval never
+  --sandbox workspace-write` for Codex).
