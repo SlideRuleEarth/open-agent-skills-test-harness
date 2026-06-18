@@ -166,8 +166,10 @@ def _infer_skill_name(path: str) -> Optional[str]:
 
 
 def load_spec(path: str) -> EvalSpec:
-    raw = _load_raw(path)
+    return _spec_from_raw(_load_raw(path), path)
 
+
+def _spec_from_raw(raw: dict, path: str) -> EvalSpec:
     # canonical + accepted aliases
     prompt = raw.get("prompt") or raw.get("query") or raw.get("input")
     if not prompt:
@@ -202,6 +204,53 @@ def load_spec(path: str) -> EvalSpec:
         source_path=os.path.abspath(path),
         skill_name=skill_name,
     )
+
+
+# ---------------------------------------------------------------------------
+# Scenarios — a higher-level, ad-hoc eval that provisions a combination of skills
+# together and pins a target (runner:model). Run with `run --config <file>`.
+# ---------------------------------------------------------------------------
+
+_SCENARIO_OVERRIDE_KEYS = ("max_cells", "jobs", "judge", "isolated")
+
+
+@dataclass
+class Scenario:
+    """A combination eval: an EvalSpec plus a pinned target and optional run-knob overrides."""
+    spec: EvalSpec
+    runner: str
+    model: Optional[str]
+    overrides: dict          # subset of {max_cells, jobs, judge, isolated}
+    source_path: str
+
+
+def load_scenario(path: str) -> Scenario:
+    """Load a scenario file (an eval spec + a `target:` block). The runner is validated by
+    the CLI (spec.py must not import adapters)."""
+    raw = _load_raw(path)
+
+    target = raw.get("target")
+    if not isinstance(target, dict):
+        raise ValueError(
+            f"{path}: a scenario needs a `target:` mapping with a `runner:` (and optional "
+            "`model:`), e.g.\n  target:\n    runner: claude\n    model: claude-haiku-4-5")
+    runner = target.get("runner")
+    if not runner or not isinstance(runner, str):
+        raise ValueError(f"{path}: target.runner is required (a runner name, e.g. claude).")
+    model = target.get("model")
+    model = str(model) if model else None
+
+    spec = _spec_from_raw(raw, path)     # reuses prompt/skills parsing + the prompt-required check
+    if not spec.skills:
+        raise ValueError(
+            f"{path}: a scenario needs a non-empty `skills:` list — the combination to "
+            "provision together.")
+    spec.agents = None                   # the target governs the runner; ignore any eval `agents:`
+    spec.skill_name = "scenario"         # artifacts: .../<runner>/<model>/scenario/<name>/
+
+    overrides = {k: raw[k] for k in _SCENARIO_OVERRIDE_KEYS if k in raw}
+    return Scenario(spec=spec, runner=runner.strip(), model=model,
+                    overrides=overrides, source_path=os.path.abspath(path))
 
 
 def skill_names(skills_root: str) -> list[str]:

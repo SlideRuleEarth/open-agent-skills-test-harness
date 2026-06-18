@@ -18,7 +18,12 @@ from . import __version__
 from .adapters import adapter_names, all_adapters, get_adapter
 from .judge import Judge
 from .runner import Runner, render_matrix
-from .spec import _load_raw, discover_specs, load_spec
+from .spec import _load_raw, discover_specs, load_scenario, load_spec, skill_names
+
+# Built-in run defaults. The CLI flags default to None (sentinel) so a scenario file's
+# value can win when no flag is given; these constants are the final fallback.
+DEFAULT_MAX_CELLS = 25
+DEFAULT_JOBS = 1
 
 
 def _default_skills_root() -> str:
@@ -208,17 +213,47 @@ def _discover(args, skills_root: str):
         raise SystemExit(2)
 
 
+def _load_scenario(path: str):
+    """load_scenario, but turn loader errors (missing PyYAML, bad target/skills, missing
+    file) into a clean message + exit 2 instead of a traceback."""
+    try:
+        return load_scenario(path)
+    except (RuntimeError, ValueError, FileNotFoundError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+
+
 def cmd_run(args) -> int:
     skills_root = os.path.abspath(args.skills_root)
-    specs = _discover(args, skills_root)
-    if args.tag:
-        specs = [s for s in specs if set(args.tag) & set(s.tags)]
-    if not specs:
-        print("no evals found. Looked under per-skill evals/ dirs in "
-              f"{skills_root!r} (use --skill / --evals to target).", file=sys.stderr)
-        return 2
 
-    # agents: explicit, else all installed (dedup aliases so a runner isn't run twice)
+    # spec source: a scenario file (--config) OR per-skill discovery
+    scenario = None
+    scenario_runner = None
+    if args.config:
+        if args.skill or args.evals:
+            print("error: --config can't be combined with --skill/--evals — a scenario "
+                  "defines its own eval.", file=sys.stderr)
+            return 2
+        scenario = _load_scenario(args.config)
+        try:
+            scenario_runner = get_adapter(scenario.runner).name
+        except KeyError:
+            print(f"error: unknown runner {scenario.runner!r} in {args.config} target. "
+                  f"Known runners: {', '.join(adapter_names())}.", file=sys.stderr)
+            return 2
+        specs = [scenario.spec]
+    else:
+        specs = _discover(args, skills_root)
+        if args.tag:
+            specs = [s for s in specs if set(args.tag) & set(s.tags)]
+        if not specs:
+            print("no evals found. Looked under per-skill evals/ dirs in "
+                  f"{skills_root!r} (use --skill / --evals to target).", file=sys.stderr)
+            return 2
+    ov = scenario.overrides if scenario else {}
+
+    # agents: explicit, else the scenario's target runner, else all installed
+    # (dedup aliases so a runner isn't run twice)
     if args.agents:
         agents = _dedup(_canonical_agent(a) for a in args.agents)
         unknown_agents = [a for a in agents if a not in adapter_names()]
@@ -226,6 +261,8 @@ def cmd_run(args) -> int:
             print(f"error: unknown runner(s): {', '.join(sorted(set(unknown_agents)))}. "
                   f"Known runners: {', '.join(adapter_names())}.", file=sys.stderr)
             return 2
+    elif scenario:
+        agents = [scenario_runner]
     else:
         agents = [a.name for a in all_adapters() if a.is_available()]
         if not agents:
@@ -259,12 +296,18 @@ def cmd_run(args) -> int:
               f"{', '.join(sorted(unknown))}. Selected runners: {', '.join(agents)}.",
               file=sys.stderr)
         return 2
+    # a scenario's target.model behaves like `--model runner=model` (overridable by an
+    # explicit --model / --all-models).
+    if scenario and scenario.model and scenario_runner not in cli_map and not args.all_models:
+        cli_map[scenario_runner] = [scenario.model]
     model_map = _resolve_models(agents, cli_map, cfg, args.all_models)
 
     # judge: --judge-agent > models.yaml judge.agent > claude;
     #        --judge-model > models.yaml judge.model > the judge agent's cheapest default
+    #        (a scenario's `judge: false` disables it; --no-judge always disables)
+    do_judge = (not args.no_judge) and (ov.get("judge") is not False)
     judge = None
-    if not args.no_judge:
+    if do_judge:
         judge_agent = (args.judge_agent or cfg.judge.get("agent")
                        or ("claude" if get_adapter("claude").is_available() else None))
         if judge_agent:
@@ -286,7 +329,10 @@ def cmd_run(args) -> int:
                   "pass --judge-agent or install claude.", file=sys.stderr)
 
     # ---- plan + cost guardrails (before building the Runner) ----------------
-    isolated = not args.no_isolated
+    # resolve run knobs: CLI flag > scenario override > built-in default
+    isolated = (not args.no_isolated) and (ov.get("isolated") is not False)
+    max_cells = args.max_cells if args.max_cells is not None else int(ov.get("max_cells", DEFAULT_MAX_CELLS))
+    jobs = args.jobs if args.jobs is not None else int(ov.get("jobs", DEFAULT_JOBS))
     n_cells = sum(len(model_map[a]) for s in specs for a in agents
                   if (s.agents is None or a in s.agents))
     labels = _target_labels(agents, model_map)
@@ -305,11 +351,11 @@ def cmd_run(args) -> int:
         print("(dry run — nothing executed)")
         return 0
 
-    if n_cells > args.max_cells:
+    if n_cells > max_cells:
         scope = f"{len(specs)} evals × {len(labels)} runner/model targets"
         print(
             f"✗ Refusing to run: {n_cells} cells exceeds the --max-cells ceiling of "
-            f"{args.max_cells}.\n"
+            f"{max_cells}.\n"
             f"  Scope:  {scope}        (judge: {judge_label})\n"
             f"  Cost:   {_cost_line(n_cells, bool(judge))}\n\n"
             "  Narrow the run (recommended):\n"
@@ -319,7 +365,7 @@ def cmd_run(args) -> int:
             "    --no-judge                          skip rubric grading\n"
             "    --dry-run                           preview, run nothing\n\n"
             "  Or raise the ceiling deliberately:\n"
-            f"    --max-cells {max(n_cells, args.max_cells * 4)}"
+            f"    --max-cells {max(n_cells, max_cells * 4)}"
             "                     (you will still be asked to confirm)",
             file=sys.stderr,
         )
@@ -329,7 +375,7 @@ def cmd_run(args) -> int:
         if not sys.stdin.isatty():
             print(
                 f"✗ Refusing to run {n_cells} cells without confirmation (no TTY to prompt).\n"
-                f"  Re-run with -y/--yes to confirm (still capped at --max-cells {args.max_cells}),\n"
+                f"  Re-run with -y/--yes to confirm (still capped at --max-cells {max_cells}),\n"
                 "  or narrow scope (--skill/--evals/--agents/--model, --no-judge). "
                 "--dry-run to preview.",
                 file=sys.stderr,
@@ -349,7 +395,7 @@ def cmd_run(args) -> int:
         judge=judge,
         provision=not args.no_provision,
         auto_approve=not args.no_auto_approve,
-        jobs=args.jobs,
+        jobs=jobs,
         model_map=model_map,
         isolated=isolated,
     )
@@ -477,13 +523,15 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--skill", help="only this skill's evals/")
         sp.add_argument("--evals", nargs="*", help="explicit eval files or directories")
 
-    sp = sub.add_parser("run", help="run the agent × eval matrix")
+    sp = sub.add_parser("run", help="run the agent × eval matrix (or a scenario via --config)")
     add_discovery(sp)
+    sp.add_argument("--config", help="run a scenario file: a combination eval (skills provisioned "
+                    "together + a target). See scenarios/. CLI flags override file values.")
     sp.add_argument("--agents", nargs="*", help=f"agents to test (default: all installed). "
                     f"Known: {', '.join(adapter_names())}")
     sp.add_argument("--artifacts", default="artifacts", help="artifacts root dir")
     sp.add_argument("--run-id", help="name this run (default: timestamp)")
-    sp.add_argument("--jobs", type=int, default=1, help="parallel cells (default 1)")
+    sp.add_argument("--jobs", type=int, default=None, help="parallel cells (default 1)")
     sp.add_argument("--judge-agent", help="agent to grade rubrics (default: claude if installed)")
     sp.add_argument("--judge-model", help="model override for the judge")
     sp.add_argument("--no-judge", action="store_true", help="disable LLM-judge rubric grading")
@@ -499,7 +547,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--models-config", help="models.yaml path (default: <skills-root>/models.yaml)")
     sp.add_argument("--all-models", action="store_true",
                     help="run each runner's full models.yaml list (default: just the cheapest)")
-    sp.add_argument("--max-cells", type=int, default=25,
+    sp.add_argument("--max-cells", type=int, default=None,
                     help="hard ceiling: refuse runs larger than this (default 25; -y can't lift it)")
     sp.add_argument("-y", "--yes", action="store_true",
                     help="skip the multi-cell confirmation (still bounded by --max-cells)")
