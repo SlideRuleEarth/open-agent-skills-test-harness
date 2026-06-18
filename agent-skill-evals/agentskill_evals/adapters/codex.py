@@ -31,8 +31,9 @@ class CodexAdapter(Adapter):
     skills_subdir = ".agents/skills"  # Codex reads $REPO_ROOT/.agents/skills (cross-agent convention)
     # Global skills dirs codex discovers (the .system vendor bundle in ~/.codex/skills is kept).
     global_skills_subpaths = [".codex/skills", ".agents/skills"]
-    # CODEX_HOME overrides ~/.codex; clear it under isolation so codex reads the isolated home.
-    isolation_clear_env = ["CODEX_HOME"]
+    # CODEX_HOME overrides ~/.codex (skills under $CODEX_HOME/skills). Under isolation it's
+    # mirrored + repointed (custom home kept, skills masked), else cleared to the isolated home.
+    isolation_config_homes = [("CODEX_HOME", "skills")]
 
     def format_skill(self, skill: str) -> str:
         # Mirrors the OpenAI example which referenced skills as "$skill-name".

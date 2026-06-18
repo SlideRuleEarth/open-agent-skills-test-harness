@@ -145,20 +145,33 @@ class Runner:
         #    vendor skills), not this repo's globally-installed skills. Mirror the real HOME;
         #    mask only the global skills dirs. On failure, fall back to a non-isolated run.
         iso_home = None
+        iso_env: dict[str, str] = {}
         isolated = False
         if self.isolated and adapter.global_skills_subpaths:
             iso_home = tempfile.mkdtemp(prefix="ase-home-")
+            seed_dirs = declared_dirs if self.provision else []
             try:
                 build_isolated_home(
                     iso_home, adapter.global_skills_subpaths, self._repo_skill_names,
-                    declared_dirs if self.provision else [], os.path.expanduser("~"),
+                    seed_dirs, os.path.expanduser("~"),
                 )
+                # A custom config home (e.g. $CODEX_HOME) lives outside HOME, so the HOME
+                # mirror doesn't cover it: mirror it separately (skills masked) and repoint
+                # the var, so custom-config users keep auth/config without leaking skills.
+                for var, skills_sub in getattr(adapter, "isolation_config_homes", []):
+                    custom = os.environ.get(var)
+                    if custom and os.path.isdir(custom):
+                        mirror = os.path.join(iso_home, "_cfg", _safe(var))
+                        build_isolated_home(mirror, [skills_sub], self._repo_skill_names,
+                                            seed_dirs, custom)
+                        iso_env[var] = mirror
                 isolated = True
             except OSError as exc:
                 print(f"warning: [{agent}] skill isolation unavailable ({exc}); "
                       "running non-isolated.", file=sys.stderr)
                 shutil.rmtree(iso_home, ignore_errors=True)
                 iso_home = None
+                iso_env = {}
 
         # 5) run
         opts = RunOptions(
@@ -166,6 +179,7 @@ class Runner:
             auto_approve=self.auto_approve,
             output_schema=spec.output_schema,
             home=iso_home,
+            isolation_env=iso_env,
         )
         try:
             ex = execute(

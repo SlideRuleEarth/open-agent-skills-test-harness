@@ -38,6 +38,7 @@ class RunOptions:
     extra_args: list[str] = field(default_factory=list)  # raw flags appended verbatim
     output_format: Optional[str] = None  # adapter-specific override (e.g. "json"/"stream-json")
     home: Optional[str] = None           # isolated HOME for this run (see isolation.py); None = real HOME
+    isolation_env: dict = field(default_factory=dict)  # config-home vars repointed at isolated mirrors
 
 
 @dataclass
@@ -59,10 +60,12 @@ class Adapter(ABC):
     # HOME-relative global skills dirs this agent discovers (masked under isolation so a
     # run sees only the skills it provisions). Empty = isolation has nothing to mask.
     global_skills_subpaths: list[str] = []
-    # Env vars that redirect this agent's config/home away from $HOME (e.g. CODEX_HOME).
-    # Cleared under isolation so the agent can't read the real config — and its skills —
-    # and bypass the isolated home.
-    isolation_clear_env: list[str] = []
+    # Env vars that redirect this agent's config/home away from $HOME, as
+    # (env var, skills-subdir within that home) — e.g. ("CODEX_HOME", "skills"). Under
+    # isolation a *set* one is mirrored into the isolated home (skills masked) and repointed,
+    # so custom config homes keep their auth/config; if it can't be mirrored it is cleared so
+    # it can't read the real skills and bypass isolation.
+    isolation_config_homes: list[tuple[str, str]] = []
 
     # --- discovery ----------------------------------------------------------
 
@@ -120,10 +123,12 @@ class Adapter(ABC):
         """Mutate/extend the subprocess environment.
 
         Default: pass through, except when ``opts.home`` is set (isolated run) — then point
-        HOME (and Windows' USERPROFILE) at the isolated home, drop XDG overrides so they
-        re-derive under it, and clear any config-home overrides (``isolation_clear_env``, e.g.
-        CODEX_HOME) that would otherwise let the agent read the real config and bypass the
-        isolated home. The isolated home mirrors the real one, so auth/config still work.
+        HOME (and Windows' USERPROFILE) at the isolated home and drop XDG overrides so they
+        re-derive under it. Config-home vars (``isolation_config_homes``, e.g. CODEX_HOME) are
+        repointed at their isolated mirror when ``opts.isolation_env`` provides one (so a custom
+        config home keeps its auth/config with skills masked), otherwise cleared so they can't
+        read the real config — and its skills — and bypass the isolated home. The isolated home
+        mirrors the real one, so auth/config still work.
         """
         if not opts.home:
             return base_env
@@ -132,8 +137,11 @@ class Adapter(ABC):
         env["USERPROFILE"] = opts.home
         for k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
             env.pop(k, None)
-        for k in self.isolation_clear_env:
-            env.pop(k, None)
+        for var, _skills_sub in self.isolation_config_homes:
+            if var in (opts.isolation_env or {}):
+                env[var] = opts.isolation_env[var]   # repoint at the isolated mirror
+            else:
+                env.pop(var, None)                   # unmirrored → fall back to the isolated HOME
         return env
 
     # --- output normalization ----------------------------------------------

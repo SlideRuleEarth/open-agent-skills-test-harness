@@ -146,11 +146,16 @@ def run_selftest(verbose: bool = False) -> int:
     _check("spec.resolved_files",
            dests == ["a.json", "fixtures/in.json", "data/a.json", "esc.json"],
            f"seed dests (subdirs kept, traversal guarded): {dests}", failures, verbose)
-    isoenv = get_adapter("codex").env({"CODEX_HOME": "/real", "HOME": "/old"},
-                                      RunOptions(home="/iso"))
-    _check("codex.isolation_env",
-           isoenv.get("HOME") == "/iso" and "CODEX_HOME" not in isoenv,
-           f"isolated env sets HOME and clears CODEX_HOME: {isoenv}", failures, verbose)
+    e1 = get_adapter("codex").env({"CODEX_HOME": "/real", "HOME": "/old"}, RunOptions(home="/iso"))
+    _check("codex.iso_env.clear",
+           e1.get("HOME") == "/iso" and "CODEX_HOME" not in e1,
+           f"unmirrored config-home cleared, HOME set: {e1}", failures, verbose)
+    e2 = get_adapter("codex").env(
+        {"CODEX_HOME": "/real"},
+        RunOptions(home="/iso", isolation_env={"CODEX_HOME": "/iso/_cfg/CODEX_HOME"}))
+    _check("codex.iso_env.repoint",
+           e2.get("CODEX_HOME") == "/iso/_cfg/CODEX_HOME",
+           f"mirrored config-home repointed: {e2}", failures, verbose)
 
     # AntiGravity (3 shapes)
     print("antigravity adapter:")

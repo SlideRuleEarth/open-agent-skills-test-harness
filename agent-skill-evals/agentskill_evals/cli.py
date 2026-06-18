@@ -224,21 +224,30 @@ def _load_scenario(path: str):
         raise SystemExit(2)
 
 
-def _print_skill_visibility(specs, agents, model_map, isolated, skills_root) -> None:
+def _print_skill_visibility(specs, agents, model_map, isolated, skills_root, provision) -> None:
     """Print, per target, which skills the model will see — computed from the filesystem,
     no agent run. Detailed for a single eval/scenario; a summary for the matrix."""
     repo = set(skill_names(skills_root))
     real_home = os.path.expanduser("~")
     single = specs[0] if len(specs) == 1 else None
     print("Skills visible to the model" + (f" — eval '{single.name}'" if single else "") + ":")
+    if not provision:
+        print("  (--no-provision: declared skills are NOT seeded — the model sees only "
+              "what's already installed)")
     for a in agents:
         adapter = get_adapter(a)
-        declared = set(single.skills) if single else set()
+        # with provisioning off, no declared skills are seeded into the workspace or home
+        declared = set(single.skills) if (single and provision) else set()
         for m in model_map[a]:
             vis = resolve_visible_skills(adapter, declared, repo, isolated, real_home)
             tag = "isolated" if isolated else "NOT isolated"
             print(f"  {a}:{m or 'default'} ({tag}):")
-            prov = (", ".join(vis["provisioned"]) or "(none)") if single else "(varies per eval)"
+            if not single:
+                prov = "(varies per eval)"
+            elif not provision:
+                prov = "(none — provisioning off)"
+            else:
+                prov = ", ".join(vis["provisioned"]) or "(none)"
             print(f"      provisioned:  {prov}")
             vend = ", ".join(vis["vendor"]) or "(none in global dirs)"
             print(f"      vendor kept:  {vend}  + the agent's built-in/plugin skills (not listed)")
@@ -381,6 +390,7 @@ def cmd_run(args) -> int:
     # ---- plan + cost guardrails (before building the Runner) ----------------
     # resolve run knobs: CLI flag > scenario override > built-in default
     isolated = (not args.no_isolated) and (ov.get("isolated") is not False)
+    provision = not args.no_provision
     max_cells = args.max_cells if args.max_cells is not None else int(ov.get("max_cells", DEFAULT_MAX_CELLS))
     jobs = args.jobs if args.jobs is not None else int(ov.get("jobs", DEFAULT_JOBS))
     n_cells = sum(len(model_map[a]) for s in specs for a in agents
@@ -398,7 +408,7 @@ def cmd_run(args) -> int:
           f"≈{n_llm} LLM calls   artifacts: {run_dir}\n")
 
     if args.dry_run:
-        _print_skill_visibility(specs, agents, model_map, isolated, skills_root)
+        _print_skill_visibility(specs, agents, model_map, isolated, skills_root, provision)
         print("(dry run — nothing executed)")
         return 0
 
@@ -444,7 +454,7 @@ def cmd_run(args) -> int:
         run_id=run_id,
         skills_root=skills_root,
         judge=judge,
-        provision=not args.no_provision,
+        provision=provision,
         auto_approve=not args.no_auto_approve,
         jobs=jobs,
         model_map=model_map,

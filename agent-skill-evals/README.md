@@ -226,6 +226,9 @@ have installed (e.g. via `make link-global`). This is what makes "test skill X (
   bundles like codex's `~/.codex/skills/.system` and Claude Code plugins are kept. The declared
   skills are also placed in the harness-owned global dir, so discovery works whatever path or
   precedence a surface uses.
+- **Custom config homes are honored.** If you point a runner at a non-default config home
+  (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`), it's mirrored into the isolated home — auth/config keep
+  working — with its skills masked the same way, and the variable is repointed at the mirror.
 - **Opt out** with `--no-isolated` to test against your real, globally-installed setup.
 - **Audit / preview** with `agentskill-evals list-skills` (the provisionable superset, the
   per-runner masked/kept split, and drift warnings such as a stale `make link-global`) or with

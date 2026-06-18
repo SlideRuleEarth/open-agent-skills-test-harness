@@ -113,8 +113,14 @@ def resolve_visible_skills(
     repo = set(repo_skill_names or ())
     vendor: set = set()
     leaked_repo: set = set()   # repo skills found globally but not declared
-    for sub in getattr(adapter, "global_skills_subpaths", []) or []:
-        d = os.path.join(real_home, sub)
+    scan_dirs = [os.path.join(real_home, sub)
+                 for sub in getattr(adapter, "global_skills_subpaths", []) or []]
+    # a custom config home (e.g. $CODEX_HOME) holds skills outside the HOME-relative dirs
+    for var, skills_sub in getattr(adapter, "isolation_config_homes", []) or []:
+        custom = os.environ.get(var)
+        if custom:
+            scan_dirs.append(os.path.join(custom, skills_sub))
+    for d in scan_dirs:
         if not os.path.isdir(d):
             continue
         for name in os.listdir(d):
