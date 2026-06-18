@@ -37,11 +37,13 @@ class CodexAdapter(Adapter):
         return f"${skill}"
 
     def build_argv(self, prompt: str, opts: RunOptions) -> list[str]:
-        argv = [self.binary, "exec", "--json"]
+        argv = [self.binary]
         if opts.auto_approve:
-            # `--sandbox workspace-write` is the current non-interactive auto mode
-            # (the old `--full-auto` is deprecated and maps to exactly this).
-            argv += ["--sandbox", "workspace-write"]
+            # Non-interactive parity with the deprecated `--full-auto`: never prompt for
+            # approval AND allow workspace writes. `-a/--ask-for-approval` and
+            # `-s/--sandbox` are top-level options, so they precede the `exec` subcommand.
+            argv += ["--ask-for-approval", "never", "--sandbox", "workspace-write"]
+        argv += ["exec", "--json"]
         if opts.model:
             argv += ["-m", opts.model]
         argv += opts.extra_args

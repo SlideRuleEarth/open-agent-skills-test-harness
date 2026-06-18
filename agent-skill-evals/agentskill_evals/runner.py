@@ -46,6 +46,7 @@ class CellResult:
     assertions: list[AssertionResult] = field(default_factory=list)
     artifacts_dir: str = ""
     isolated: bool = False     # ran against an isolated HOME (only provisioned + vendor skills visible)
+    ungraded: bool = False     # ran clean but nothing graded it (rubric-only eval, judge off)
 
     @property
     def n_pass(self) -> int:
@@ -186,22 +187,28 @@ class Runner:
         self._write_artifacts(cell_dir, ex.stdout, ex.stderr, rr)
 
         # 7) assertions. With no judge active, skip llm_judge checks rather than failing
-        #    them — a --no-judge run is then graded on its deterministic assertions only.
+        #    them — a --no-judge run is graded on its deterministic assertions only.
+        effective = spec.effective_assertions()
+        skipped_judge = self.judge is None and any(
+            c.get("type") == "llm_judge" for c in effective)
         ctx = AssertionContext(spec=spec, judge=self.judge)
         checks = [
             run_assertion(cfg, rr, workspace, spec, ctx)
-            for cfg in spec.effective_assertions()
+            for cfg in effective
             if not (self.judge is None and cfg.get("type") == "llm_judge")
         ]
         clean = rr.error is None and not rr.timed_out
-        # With assertions: clean run AND every check passes. Without any
-        # assertions: pass == the agent ran cleanly.
-        passed = (clean and all(c.passed for c in checks)) if checks else clean
+        # "ungraded": ran clean but the only checks were judge checks we skipped — nothing
+        # actually graded the behavior, so it's neither a pass nor a fail. A genuinely
+        # assertion-less eval (no rubric either) stays a clean-run smoke-test pass.
+        ungraded = clean and not checks and skipped_judge
+        passed = False if ungraded else (
+            (clean and all(c.passed for c in checks)) if checks else clean)
 
         cell = CellResult(
             agent=agent, model=model, eval_name=spec.name, skill=spec.skill_name,
             passed=passed, run_result=rr, assertions=checks, artifacts_dir=cell_dir,
-            isolated=isolated,
+            isolated=isolated, ungraded=ungraded,
         )
         self._write_cell_json(cell_dir, cell)
         return cell
@@ -255,6 +262,7 @@ class Runner:
                 "eval": cell.eval_name,
                 "skill": cell.skill,
                 "isolated": cell.isolated,
+                "ungraded": cell.ungraded,
                 "passed": cell.passed,
                 "assertions": [
                     {"type": a.type, "passed": a.passed, "kind": a.kind,
@@ -283,7 +291,7 @@ class Runner:
             "cells": [
                 {
                     "agent": c.agent, "model": c.model, "eval": c.eval_name, "skill": c.skill,
-                    "isolated": c.isolated,
+                    "isolated": c.isolated, "ungraded": c.ungraded,
                     "passed": c.passed, "n_pass": c.n_pass, "n_total": c.n_total,
                     "error": c.run_result.error, "timed_out": c.run_result.timed_out,
                     "cost_usd": c.run_result.cost_usd,
@@ -332,6 +340,8 @@ def _cell_text(c: Optional[CellResult]) -> str:
         return "-"
     if c.run_result.error:
         return "ERR"
+    if c.ungraded:
+        return "SKIP"
     return f"{'PASS' if c.passed else 'FAIL'} {c.n_pass}/{c.n_total}"
 
 
@@ -340,6 +350,8 @@ def _cell_mark(c: Optional[CellResult]) -> str:
         return "–"
     if c.run_result.error:
         return f"⚠️ {c.run_result.error}"
+    if c.ungraded:
+        return "⚪ ungraded"
     return f"{'✅' if c.passed else '❌'} {c.n_pass}/{c.n_total}"
 
 
@@ -364,10 +376,12 @@ def render_matrix(results: list[CellResult], agents: list[str],
 
     lines += ["", "pass rate by target:"]
     for a, m in targets:
-        cells = [by_key.get((ev, a, m)) for ev in evals]
-        cells = [c for c in cells if c is not None]
-        npass = sum(1 for c in cells if c.passed)
-        lines.append(f"  {_target_label(a, m):<28} {npass}/{len(cells)}")
+        cells = [c for c in (by_key.get((ev, a, m)) for ev in evals) if c is not None]
+        graded = [c for c in cells if not c.ungraded]
+        npass = sum(1 for c in graded if c.passed)
+        ung = len(cells) - len(graded)
+        extra = f"   ({ung} ungraded)" if ung else ""
+        lines.append(f"  {_target_label(a, m):<28} {npass}/{len(graded)}{extra}")
     return "\n".join(lines)
 
 
@@ -387,10 +401,12 @@ def render_markdown(results: list[CellResult], agents: list[str],
 
     lines += ["", "## Pass rate by target", "", "| target | pass rate |", "|---|---|"]
     for a, m in targets:
-        cells = [by_key.get((ev, a, m)) for ev in evals]
-        cells = [c for c in cells if c is not None]
-        npass = sum(1 for c in cells if c.passed)
-        lines.append(f"| {_target_label(a, m)} | {npass}/{len(cells)} |")
+        cells = [c for c in (by_key.get((ev, a, m)) for ev in evals) if c is not None]
+        graded = [c for c in cells if not c.ungraded]
+        npass = sum(1 for c in graded if c.passed)
+        ung = len(cells) - len(graded)
+        rate = f"{npass}/{len(graded)}" + (f" ({ung} ungraded)" if ung else "")
+        lines.append(f"| {_target_label(a, m)} | {rate} |")
     return "\n".join(lines) + "\n"
 
 

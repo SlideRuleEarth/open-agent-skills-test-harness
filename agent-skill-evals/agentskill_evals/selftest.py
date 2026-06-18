@@ -133,10 +133,12 @@ def run_selftest(verbose: bool = False) -> int:
     _check("codex.file", "package.json" in paths, f"paths={paths}", failures, verbose)
     _check("codex.final", out.final_text == "Created demo-app.", repr(out.final_text), failures, verbose)
     cargv = get_adapter("codex").build_argv("do the task", RunOptions(model="gpt-5.4-mini"))
+    pre = cargv[:cargv.index("exec")]  # top-level flags precede the exec subcommand
     _check("codex.argv",
-           "--sandbox" in cargv and "workspace-write" in cargv
+           "--ask-for-approval" in pre and "never" in pre
+           and "--sandbox" in pre and "workspace-write" in pre
            and "--full-auto" not in cargv and cargv[-1] == "do the task",
-           f"non-interactive sandbox argv, prompt last: {cargv}", failures, verbose)
+           f"non-interactive approval+sandbox before exec, prompt last: {cargv}", failures, verbose)
 
     # AntiGravity (3 shapes)
     print("antigravity adapter:")

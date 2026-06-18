@@ -32,7 +32,7 @@ Each agent CLI speaks a different dialect of "structured output":
 | Agent | Invocation | Output |
 |-------|-----------|--------|
 | Claude Code | `claude -p … --output-format stream-json --verbose` | JSONL: `system`/`assistant`/`user`/`result`; tool calls in `tool_use` blocks; `--json-schema` → `structured_output` on the result event |
-| Codex | `codex exec --json --full-auto` | JSONL: `item.started`/`item.completed` with `item.type` = `command_execution`/`file_change`/`agent_message` |
+| Codex | `codex --ask-for-approval never --sandbox workspace-write exec --json` | JSONL: `item.started`/`item.completed` with `item.type` = `command_execution`/`file_change`/`agent_message` |
 | AntiGravity | `agy -p "<prompt>" --dangerously-skip-permissions` | plain text by default (`agy` 1.0.9 has no `--output-format`) → parsed defensively: JSONL → single JSON → raw text |
 
 Every adapter maps its CLI's events onto one [`NormalizedEvent`](agentskill_evals/schema.py)
@@ -421,5 +421,6 @@ its schema.
   your build exposes a structured schema.
 - Skills are provisioned by **symlink** when possible (small, read-only),
   falling back to a copy on platforms without symlinks.
-- `--no-auto-approve` disables the per-agent "run without prompts" flag
-  (`--dangerously-skip-permissions` for Claude/AntiGravity, `--full-auto` for Codex).
+- `--no-auto-approve` disables the per-agent "run without prompts" flags
+  (`--dangerously-skip-permissions` for Claude/AntiGravity; `--ask-for-approval never
+  --sandbox workspace-write` for Codex).

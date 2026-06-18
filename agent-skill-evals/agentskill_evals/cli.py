@@ -278,6 +278,25 @@ def cmd_run(args) -> int:
             return 2
     ov = scenario.overrides if scenario else {}
 
+    # fail early if a declared skill is missing under --skills-root. Otherwise a typo or
+    # the wrong --skills-root is silently dropped at provision time, so the model runs with
+    # fewer skills than the plan / visibility preview claims.
+    missing: dict[str, list[str]] = {}
+    for s in specs:
+        for name in s.skills:
+            if not os.path.isdir(os.path.join(skills_root, name)):
+                missing.setdefault(s.name, []).append(name)
+    if missing:
+        print(f"error: declared skill(s) not found under --skills-root {skills_root!r}:",
+              file=sys.stderr)
+        for ev, names in missing.items():
+            print(f"    {ev}: {', '.join(names)}", file=sys.stderr)
+        avail = ", ".join(skill_names(skills_root)) or "(none found)"
+        print(f"  available skills: {avail}\n"
+              "  fix the `skills:` list, or point --skills-root at the repo root.",
+              file=sys.stderr)
+        return 2
+
     # agents: explicit, else the scenario's target runner, else all installed
     # (dedup aliases so a runner isn't run twice)
     if args.agents:
@@ -433,19 +452,27 @@ def cmd_run(args) -> int:
     results = runner.run(specs)
 
     print(render_matrix(results, agents, model_map))
-    n_pass = sum(1 for c in results if c.passed)
-    print(f"\n{n_pass}/{len(results)} cells passed   (details: {runner.run_dir}/summary.md)")
+    graded = [c for c in results if not c.ungraded]
+    n_pass = sum(1 for c in graded if c.passed)
+    ung = len(results) - len(graded)
+    line = f"\n{n_pass}/{len(graded)} cells passed"
+    if ung:
+        line += f"   ({ung} ungraded — rubric-only evals with no judge)"
+    print(f"{line}   (details: {runner.run_dir}/summary.md)")
 
     if args.verbose:
         for c in results:
-            if not c.passed:
+            if not c.passed and not c.ungraded:
                 print(f"\n✗ {c.eval_name} [{c.agent}/{c.model or 'default'}]"
                       + (f"  ERROR: {c.run_result.error}" if c.run_result.error else ""))
                 for a in c.assertions:
                     if not a.passed:
                         print(f"    - {a.type}: {a.message}")
 
-    return 0 if n_pass == len(results) else 1
+    # success only if something was graded and nothing failed (an all-ungraded run
+    # verified nothing, so it is not a pass).
+    failed = [c for c in graded if not c.passed]
+    return 0 if graded and not failed else 1
 
 
 def cmd_list_agents(args) -> int:

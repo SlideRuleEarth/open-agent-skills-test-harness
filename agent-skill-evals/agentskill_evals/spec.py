@@ -178,10 +178,24 @@ def _spec_from_raw(raw: dict, path: str) -> EvalSpec:
     if isinstance(rubric, str):
         rubric = [rubric]
 
+    # Normalize skills to list[str]. A scalar `skills: sliderule-api` must become a
+    # one-element list, not be iterated character-by-character downstream.
     skills = raw.get("skills")
-    if skills is None and raw.get("skill"):
-        skills = [raw["skill"]]
-    skills = skills or []
+    if skills is None:
+        skills = raw.get("skill")          # singular alias
+    if skills is None:
+        skills = []
+    elif isinstance(skills, str):
+        skills = [skills]
+    elif isinstance(skills, (list, tuple)):
+        bad = [s for s in skills if not isinstance(s, str)]
+        if bad:
+            raise ValueError(f"{path}: `skills` entries must be strings; got {bad!r}")
+        skills = [str(s) for s in skills]
+    else:
+        raise ValueError(
+            f"{path}: `skills` must be a string or a list of strings, "
+            f"got {type(skills).__name__}")
 
     name = raw.get("name") or os.path.splitext(os.path.basename(path))[0]
     skill_name = _infer_skill_name(path) or (skills[0] if skills else None)
