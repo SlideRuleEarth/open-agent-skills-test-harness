@@ -29,7 +29,7 @@ Per skill, in `<skill>/evals/*.yaml` (auto-discovered). Each eval
 - `files` — files the agent starts with
 - `rubric` — behaviors graded by an LLM judge
 - `assertions` — deterministic checks
-- optional `tags` / `vars` / `env` / `output_schema` / `timeout`
+- optional `tags` / `vars` / `env` / `output_schema` / `timeout_sec`
 
 ## Scenarios — the first-class higher-level eval
 
@@ -61,7 +61,7 @@ file (`CLI > scenario > default`). See [scenarios/README.md](scenarios/README.md
 [judge.py](agent-skill-evals/agentskill_evals/judge.py):
 
 - **Deterministic assertions:** filesystem (`file_exists` / `file_absent` / `dir_exists`),
-  tool trace (`ran_command` / `used_tool` / `tools_seen` / `tool_count`), `exit_code`,
+  tool trace (`ran_command` / `used_tool` / `tool_count`), `exit_code`, `no_error`,
   `final_contains`, `output_matches_schema` — with `contains` / `matches` / `equals` match
   modes.
 - **LLM judge:** each `rubric` item graded by a fixed (cheap) judge model; `--no-judge` skips
