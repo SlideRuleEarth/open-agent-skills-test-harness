@@ -13,7 +13,6 @@ agent (`--judge-agent codex`), not just Claude.
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 from typing import Any, Optional
 
@@ -21,6 +20,14 @@ from .adapters import get_adapter
 from .adapters.base import RunOptions
 from .exec import execute
 from .schema import RunResult
+from .workspace_view import (
+    JUDGE_MAX_FILES,
+    JUDGE_MAX_INLINE_BYTES,
+    JUDGE_MAX_INLINE_FILES,
+    file_tree,
+    inline_files,
+    writes_outside_workspace,
+)
 
 VERDICT_SCHEMA = {
     "type": "object",
@@ -41,12 +48,6 @@ VERDICT_SCHEMA = {
     },
     "required": ["items", "summary"],
 }
-
-_MAX_FILES = 60
-_MAX_INLINE_BYTES = 1500
-_TEXT_EXT = {".md", ".txt", ".py", ".json", ".yaml", ".yml", ".toml", ".cfg",
-             ".ini", ".js", ".ts", ".html", ".css", ".sh", ".csv"}
-
 
 class Judge:
     def __init__(self, agent: str = "claude", model: Optional[str] = None, timeout: int = 240):
@@ -81,9 +82,10 @@ def _build_prompt(spec: Any, result: RunResult, workdir: str, rubric: list[str])
     user_prompt = getattr(spec, "prompt", "")
     commands = result.commands()
     tools = result.tool_names()
-    extra = _writes_outside_workspace(result, workdir)
-    tree = _file_tree(workdir, extra)
-    inline = _inline_new_files(workdir, extra)
+    extra = writes_outside_workspace(result, workdir)
+    tree = file_tree(workdir, extra, max_files=JUDGE_MAX_FILES)
+    inline = inline_files(workdir, extra, max_files=JUDGE_MAX_INLINE_FILES,
+                          max_bytes=JUDGE_MAX_INLINE_BYTES)
     rubric_block = "\n".join(f"  {i+1}. {b}" for i, b in enumerate(rubric)) or "  (none)"
 
     parts = [
@@ -112,92 +114,6 @@ def _build_prompt(spec: Any, result: RunResult, workdir: str, rubric: list[str])
                 "may not expose one). Grade trace-dependent rubric items from the final "
                 "answer and file artifacts instead.")
     return "\n".join(parts) + note
-
-
-def _writes_outside_workspace(result: RunResult, workdir: str) -> list[str]:
-    """Absolute paths the run created that landed OUTSIDE the workspace (e.g. the model wrote to an
-    absolute path with a mangled run-id). Surfacing them lets the judge grade the artifact the run
-    actually produced, not just whatever happened to land in the workspace."""
-    wd = os.path.abspath(workdir)
-    out: list[str] = []
-    seen: set[str] = set()
-    for p in result.file_paths_touched():
-        if not p:
-            continue
-        ap = os.path.abspath(p)
-        if ap in seen:
-            continue
-        try:
-            inside = os.path.commonpath([wd, ap]) == wd
-        except ValueError:        # different drives, etc. → treat as outside
-            inside = False
-        if not inside and os.path.isfile(ap):
-            seen.add(ap)
-            out.append(ap)
-    return out
-
-
-def _file_tree(workdir: str, extra: list[str] = ()) -> str:
-    lines: list[str] = []
-    count = 0
-    truncated = False
-    for root, dirs, files in os.walk(workdir):
-        dirs[:] = [d for d in sorted(dirs) if d not in (".git", "node_modules", "__pycache__")]
-        # don't expose the provisioned skills as "agent output"
-        rel_root = os.path.relpath(root, workdir)
-        if rel_root.startswith((".claude", ".agents", ".antigravity", ".codex")):
-            continue
-        for f in sorted(files):
-            if count >= _MAX_FILES:
-                truncated = True
-                break
-            rel = os.path.relpath(os.path.join(root, f), workdir)
-            lines.append(f"  {rel}")
-            count += 1
-        if truncated:
-            break
-    if truncated:
-        lines.append(f"  ... (+ more, truncated at {_MAX_FILES})")
-    for ap in extra:
-        lines.append(f"  {ap}   [written OUTSIDE the workspace by this run]")
-    return "\n".join(lines) if lines else "  (workspace empty)"
-
-
-def _inline_new_files(workdir: str, extra: list[str] = ()) -> str:
-    chunks: list[str] = []
-    budget = 5
-
-    def _maybe(path: str, label: str) -> None:
-        nonlocal budget
-        if budget <= 0:
-            return
-        if os.path.splitext(path)[1].lower() not in _TEXT_EXT:
-            return
-        try:
-            if os.path.getsize(path) > _MAX_INLINE_BYTES:
-                return
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                body = fh.read()
-        except OSError:
-            return
-        chunks.append(f"--- {label} ---\n{body}")
-        budget -= 1
-
-    for root, dirs, files in os.walk(workdir):
-        dirs[:] = [d for d in sorted(dirs) if d not in (".git", "node_modules", "__pycache__")]
-        rel_root = os.path.relpath(root, workdir)
-        if rel_root.startswith((".claude", ".agents", ".antigravity", ".codex")):
-            continue
-        for f in sorted(files):
-            if budget <= 0:
-                return "\n\n".join(chunks)
-            path = os.path.join(root, f)
-            _maybe(path, os.path.relpath(path, workdir))
-    for ap in extra:
-        if budget <= 0:
-            break
-        _maybe(ap, f"{ap}  [outside workspace]")
-    return "\n\n".join(chunks)
 
 
 def _coerce_verdict(rr: RunResult, rubric: list[str]) -> dict:

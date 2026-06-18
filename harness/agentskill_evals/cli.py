@@ -18,7 +18,7 @@ from . import __version__
 from .adapters import adapter_names, all_adapters, get_adapter
 from .isolation import resolve_visible_skills
 from .judge import Judge
-from .runner import Runner, render_matrix
+from .runner import Runner, _cell_text, render_matrix
 from .spec import _load_raw, discover_specs, load_scenario, load_spec, skill_names
 
 # Built-in run defaults. The CLI flags default to None (sentinel) so a scenario file's
@@ -495,6 +495,20 @@ def cmd_run(args) -> int:
                     if not a.passed:
                         print(f"    - {a.type}: {a.message}")
 
+    # point the user at the per-cell readable reports (prompt + full transcript + produced
+    # files). With the judge off, the user IS the reviewer, so surface every report by default.
+    reports_mode = getattr(args, "reports", "fail")
+    if judge is None and reports_mode == "fail":
+        reports_mode = "all"
+    if reports_mode != "none":
+        shown = [c for c in results
+                 if reports_mode == "all" or not c.passed or c.run_result.error]
+        if shown:
+            print("\nreports (prompt + complete response + produced files):")
+            for c in shown:
+                print(f"  {_cell_text(c):<10} {c.eval_name} [{c.agent}/{c.model or 'default'}]")
+                print(f"    → {os.path.join(c.artifacts_dir, 'report.md')}")
+
     # success only if something was graded and nothing failed (an all-ungraded run
     # verified nothing, so it is not a pass).
     failed = [c for c in graded if not c.passed]
@@ -674,6 +688,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="print the resolved plan + cell count and exit without running")
     sp.add_argument("--tag", nargs="*", help="only evals with one of these tags")
     sp.add_argument("-v", "--verbose", action="store_true", help="print failing assertions")
+    sp.add_argument("--reports", choices=["fail", "all", "none"], default="fail",
+                    help="after the run, print paths to the per-cell report.md "
+                         "(prompt + full response + produced files): fail (default) = "
+                         "failed/errored cells; all = every cell incl. passes (sanity-check "
+                         "the judge); none = silent. Implicitly 'all' when --no-judge is set.")
     sp.set_defaults(func=cmd_run)
 
     sp = sub.add_parser("list-agents", help="show runners, availability, and configured models")

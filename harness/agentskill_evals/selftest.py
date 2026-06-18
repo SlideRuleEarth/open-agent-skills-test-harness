@@ -149,6 +149,125 @@ def _check_provision(failures, verbose):
         shutil.rmtree(src, ignore_errors=True)
 
 
+def _check_report(failures, verbose):
+    """The per-cell report.md renders the prompt, the full transcript, every produced file,
+    and the judge verdict — and degrades gracefully when the judge is off. Pure — no CLIs."""
+    import os
+    import shutil
+    import tempfile
+
+    from .assertions import AssertionResult
+    from .runner import CellResult, render_report
+    from .schema import EventKind, NormalizedEvent, RunResult
+
+    print("per-cell report:")
+    root = tempfile.mkdtemp(prefix="ase-report-")
+    try:
+        cell_dir = os.path.join(root, "cell")
+        ws = os.path.join(cell_dir, "workspace")
+        os.makedirs(ws)
+        with open(os.path.join(ws, "run.py"), "w") as fh:
+            fh.write("print('hello from run.py')\n")
+
+        rr = RunResult(
+            agent="claude", eval_name="demo", prompt="Write run.py that prints hello.",
+            workdir=ws, final_text="Done — created run.py.",
+            events=[
+                NormalizedEvent(EventKind.AGENT_MESSAGE, text="I'll create run.py."),
+                NormalizedEvent(EventKind.TOOL_CALL, tool_name="Bash", command="python run.py"),
+                NormalizedEvent(EventKind.FILE_CHANGE, path="run.py"),
+            ],
+            cost_usd=0.01, duration_ms=1234,
+        )
+        verdict = {"items": [
+            {"behavior": "creates run.py", "pass": True, "reason": "file present"},
+            {"behavior": "prints hello", "pass": False, "reason": "not verified"},
+        ], "summary": "partially correct"}
+        ja = AssertionResult("llm_judge", False, "1/2 rubric items", kind="judge", details=verdict)
+        fa = AssertionResult("file_exists", True, "run.py exists")
+
+        cell = CellResult(agent="claude", model="claude-haiku-4-5", eval_name="demo",
+                          skill="scenario", passed=False, run_result=rr,
+                          assertions=[fa, ja], artifacts_dir=cell_dir)
+        md = render_report(cell)
+        _check("report.prompt", "Write run.py that prints hello." in md,
+               "prompt present", failures, verbose)
+        _check("report.transcript", "python run.py" in md and "I'll create run.py." in md,
+               "transcript shows assistant text + shell command", failures, verbose)
+        _check("report.final", "Done — created run.py." in md,
+               "final answer present", failures, verbose)
+        _check("report.files", "run.py" in md and "hello from run.py" in md,
+               "produced file inlined in full", failures, verbose)
+        _check("report.judge", "partially correct" in md and "creates run.py" in md,
+               "judge verdict + per-item reasons present", failures, verbose)
+
+        # judge off → no llm_judge assertion: graceful note, but prompt + response stay.
+        cell_off = CellResult(agent="claude", model=None, eval_name="demo",
+                              skill="scenario", passed=True, run_result=rr,
+                              assertions=[fa], artifacts_dir=cell_dir)
+        md_off = render_report(cell_off)
+        _check("report.judge_off_note", "judge for yourself" in md_off.lower(),
+               "judge-off shows reviewer note", failures, verbose)
+        _check("report.judge_off_keeps_evidence",
+               "Write run.py that prints hello." in md_off and "hello from run.py" in md_off,
+               "judge-off still shows prompt + produced files", failures, verbose)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _check_path_resolution(failures, verbose):
+    """file_exists must not pass on a seeded fixture the agent never produced, and tool-trace
+    paths must resolve against the workspace (the agent's cwd), not the harness process cwd."""
+    import os
+    import shutil
+    import tempfile
+
+    from .assertions import _resolve_artifact
+    from .schema import EventKind, NormalizedEvent, RunResult
+    from .workspace_view import writes_outside_workspace
+
+    print("path resolution:")
+    ws = tempfile.mkdtemp(prefix="ase-paths-")
+    outside = tempfile.mkdtemp(prefix="ase-outside-")
+    try:
+        # a seeded fixture lives in the workspace, but NOT at the path the assertion expects
+        os.makedirs(os.path.join(ws, "fixtures"))
+        open(os.path.join(ws, "fixtures", "report.md"), "w").close()
+
+        def _rr(paths):
+            return RunResult(agent="x", eval_name="e", prompt="", workdir=ws,
+                             events=[NormalizedEvent(EventKind.FILE_CHANGE, path=p) for p in paths])
+
+        # 1. a seeded fixture with a matching basename must NOT satisfy a different path (no false pass)
+        path, where = _resolve_artifact(_rr([]), ws, "output/report.md")
+        _check("paths.no_fixture_falsepass", path is None,
+               f"seeded fixtures/report.md does not satisfy output/report.md (got {where})",
+               failures, verbose)
+
+        # 2. a RELATIVE trace path resolves under the workspace → found via write-trace
+        os.makedirs(os.path.join(ws, "out"))
+        open(os.path.join(ws, "out", "x.md"), "w").close()
+        path, where = _resolve_artifact(_rr(["out/x.md"]), ws, "x.md")
+        _check("paths.rel_trace_in_workspace",
+               path == os.path.abspath(os.path.join(ws, "out", "x.md")) and where == "write-trace",
+               f"relative trace resolved under the workspace (got {path}, {where})", failures, verbose)
+
+        # 3. a relative trace path is NOT mis-reported as 'written outside the workspace'
+        out = writes_outside_workspace(_rr(["out/x.md"]), ws)
+        _check("paths.rel_not_outside", out == [],
+               f"relative trace path not flagged outside the workspace (got {out})", failures, verbose)
+
+        # 4. a genuinely-outside ABSOLUTE write IS surfaced
+        abs_out = os.path.join(outside, "evil.md")
+        open(abs_out, "w").close()
+        out = writes_outside_workspace(_rr([abs_out]), ws)
+        _check("paths.abs_outside_surfaced", out == [os.path.abspath(abs_out)],
+               f"absolute outside write surfaced (got {out})", failures, verbose)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+        shutil.rmtree(outside, ignore_errors=True)
+
+
 def run_selftest(verbose: bool = False) -> int:
     failures: list[str] = []
 
@@ -225,6 +344,12 @@ def run_selftest(verbose: bool = False) -> int:
     # HOME isolation overlay + side-effect-free provisioning
     _check_isolation(failures, verbose)
     _check_provision(failures, verbose)
+
+    # per-cell readable report
+    _check_report(failures, verbose)
+
+    # artifact / trace path resolution (no false passes on seeded fixtures; workspace-relative)
+    _check_path_resolution(failures, verbose)
 
     print()
     if failures:
