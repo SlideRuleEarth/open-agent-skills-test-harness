@@ -158,7 +158,7 @@ make export-sliderule-api
 
 ### 2. Upload the zips
 
-Upload each zip from `exports/` through the app's skill-management settings, then repeat for the skills you want. Exact navigation varies by app — e.g. on [Claude.ai](https://claude.ai) the skills live under **Settings → Capabilities**: open the **Skills** section, choose **Upload skill**, and pick a zip. Custom uploads generally require a paid plan with skills enabled (and may be admin-gated on team/enterprise tiers).
+Upload each zip from `exports/` through the app's skill-management settings, then repeat for the skills you want. Exact navigation varies by app — e.g. on [Claude.ai](https://claude.ai) the skills live under **Customize → Skills**: click **+** → **+ Create skill** and upload a zip (use the entry's **⋮** menu → **Replace** to update an existing skill). Custom uploads generally require a paid plan with skills enabled (and may be admin-gated on team/enterprise tiers).
 
 Uploaded skills are then offered to the agent across your chats, the same way the runtime-installed skills work locally.
 
