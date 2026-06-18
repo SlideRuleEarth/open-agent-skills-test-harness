@@ -353,6 +353,9 @@ def cmd_run(args) -> int:
         elif any(s.rubric for s in specs):
             print("note: evals have rubrics but no judge available; "
                   "pass --judge-agent or install claude.", file=sys.stderr)
+    if not do_judge and any(s.rubric for s in specs):
+        print("note: rubric grading is off — only deterministic assertions are graded "
+              "(llm_judge checks are skipped).", file=sys.stderr)
 
     # ---- plan + cost guardrails (before building the Runner) ----------------
     # resolve run knobs: CLI flag > scenario override > built-in default

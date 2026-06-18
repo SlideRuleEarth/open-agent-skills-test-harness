@@ -158,7 +158,9 @@ for AntiGravity) so the run is hermetic.
 | `llm_judge` | `rubric` items graded by the judge; `threshold` = fraction that must pass (default 1.0) |
 
 `rubric:` at the top level is auto-compiled into one `llm_judge` assertion, and
-`output_schema:` into one `output_matches_schema` assertion.
+`output_schema:` into one `output_matches_schema` assertion. With `--no-judge` (or no judge
+available), `llm_judge` checks are **skipped**, not failed — the cell is graded on its
+deterministic assertions only.
 
 ## Usage
 

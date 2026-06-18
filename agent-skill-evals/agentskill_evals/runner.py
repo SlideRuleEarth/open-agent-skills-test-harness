@@ -185,11 +185,13 @@ class Runner:
         # 6) artifacts
         self._write_artifacts(cell_dir, ex.stdout, ex.stderr, rr)
 
-        # 7) assertions
+        # 7) assertions. With no judge active, skip llm_judge checks rather than failing
+        #    them — a --no-judge run is then graded on its deterministic assertions only.
         ctx = AssertionContext(spec=spec, judge=self.judge)
         checks = [
             run_assertion(cfg, rr, workspace, spec, ctx)
             for cfg in spec.effective_assertions()
+            if not (self.judge is None and cfg.get("type") == "llm_judge")
         ]
         clean = rr.error is None and not rr.timed_out
         # With assertions: clean run AND every check passes. Without any
