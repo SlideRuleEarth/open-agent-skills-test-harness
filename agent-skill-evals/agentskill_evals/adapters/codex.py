@@ -1,7 +1,7 @@
 """Codex (OpenAI) adapter.
 
-Invocation:
-    codex exec --json [--full-auto] [-m MODEL] "<prompt>"
+Invocation (auto-approve: approval/sandbox flags are top-level, before `exec`):
+    codex --ask-for-approval never --sandbox workspace-write exec --json [-m MODEL] "<prompt>"
 
 Output is JSONL of "item" events:
 
@@ -31,6 +31,8 @@ class CodexAdapter(Adapter):
     skills_subdir = ".agents/skills"  # Codex reads $REPO_ROOT/.agents/skills (cross-agent convention)
     # Global skills dirs codex discovers (the .system vendor bundle in ~/.codex/skills is kept).
     global_skills_subpaths = [".codex/skills", ".agents/skills"]
+    # CODEX_HOME overrides ~/.codex; clear it under isolation so codex reads the isolated home.
+    isolation_clear_env = ["CODEX_HOME"]
 
     def format_skill(self, skill: str) -> str:
         # Mirrors the OpenAI example which referenced skills as "$skill-name".

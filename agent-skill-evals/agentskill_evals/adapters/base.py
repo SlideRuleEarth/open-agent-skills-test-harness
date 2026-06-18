@@ -59,6 +59,10 @@ class Adapter(ABC):
     # HOME-relative global skills dirs this agent discovers (masked under isolation so a
     # run sees only the skills it provisions). Empty = isolation has nothing to mask.
     global_skills_subpaths: list[str] = []
+    # Env vars that redirect this agent's config/home away from $HOME (e.g. CODEX_HOME).
+    # Cleared under isolation so the agent can't read the real config — and its skills —
+    # and bypass the isolated home.
+    isolation_clear_env: list[str] = []
 
     # --- discovery ----------------------------------------------------------
 
@@ -116,8 +120,10 @@ class Adapter(ABC):
         """Mutate/extend the subprocess environment.
 
         Default: pass through, except when ``opts.home`` is set (isolated run) — then point
-        HOME (and Windows' USERPROFILE) at the isolated home and drop XDG overrides so they
-        re-derive under it. The isolated home mirrors the real one, so auth/config still work.
+        HOME (and Windows' USERPROFILE) at the isolated home, drop XDG overrides so they
+        re-derive under it, and clear any config-home overrides (``isolation_clear_env``, e.g.
+        CODEX_HOME) that would otherwise let the agent read the real config and bypass the
+        isolated home. The isolated home mirrors the real one, so auth/config still work.
         """
         if not opts.home:
             return base_env
@@ -125,6 +131,8 @@ class Adapter(ABC):
         env["HOME"] = opts.home
         env["USERPROFILE"] = opts.home
         for k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+            env.pop(k, None)
+        for k in self.isolation_clear_env:
             env.pop(k, None)
         return env
 

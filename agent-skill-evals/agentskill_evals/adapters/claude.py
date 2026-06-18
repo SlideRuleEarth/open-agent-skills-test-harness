@@ -33,6 +33,9 @@ class ClaudeAdapter(Adapter):
     name = "claude"
     binary = "claude"
     global_skills_subpaths = [".claude/skills"]
+    # CLAUDE_CONFIG_DIR overrides ~/.claude; clear it under isolation so Claude Code reads
+    # the isolated home (and its masked skills) rather than the real config dir.
+    isolation_clear_env = ["CLAUDE_CONFIG_DIR"]
 
     def format_skill(self, skill: str) -> str:
         return f"/{skill}"

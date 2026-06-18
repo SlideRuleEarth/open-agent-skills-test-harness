@@ -214,11 +214,12 @@ class Runner:
         return cell
 
     def _skill_dirs(self, spec: EvalSpec) -> list[str]:
-        """Existing source dirs for the eval's declared skills (under skills_root)."""
+        """Source dirs for the eval's declared skills — real skill dirs (with a SKILL.md)
+        under skills_root, so a non-skill folder is never provisioned."""
         dirs = []
         for name in spec.skills:
             d = os.path.join(self.skills_root, name)
-            if os.path.isdir(d):
+            if os.path.isfile(os.path.join(d, "SKILL.md")):
                 dirs.append(d)
         return dirs
 

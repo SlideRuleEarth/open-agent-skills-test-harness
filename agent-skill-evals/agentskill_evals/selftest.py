@@ -146,6 +146,11 @@ def run_selftest(verbose: bool = False) -> int:
     _check("spec.resolved_files",
            dests == ["a.json", "fixtures/in.json", "data/a.json", "esc.json"],
            f"seed dests (subdirs kept, traversal guarded): {dests}", failures, verbose)
+    isoenv = get_adapter("codex").env({"CODEX_HOME": "/real", "HOME": "/old"},
+                                      RunOptions(home="/iso"))
+    _check("codex.isolation_env",
+           isoenv.get("HOME") == "/iso" and "CODEX_HOME" not in isoenv,
+           f"isolated env sets HOME and clears CODEX_HOME: {isoenv}", failures, verbose)
 
     # AntiGravity (3 shapes)
     print("antigravity adapter:")

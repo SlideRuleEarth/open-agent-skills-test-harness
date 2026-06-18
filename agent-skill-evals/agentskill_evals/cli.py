@@ -278,17 +278,19 @@ def cmd_run(args) -> int:
             return 2
     ov = scenario.overrides if scenario else {}
 
-    # fail early if a declared skill is missing under --skills-root. Otherwise a typo or
-    # the wrong --skills-root is silently dropped at provision time, so the model runs with
-    # fewer skills than the plan / visibility preview claims.
+    # fail early if a declared skill isn't a real skill (a dir with a SKILL.md) under
+    # --skills-root. A bare directory check would accept non-skill folders (e.g.
+    # agent-skill-evals); a typo or wrong --skills-root would otherwise be silently dropped
+    # at provision time, so the model runs with fewer skills than the plan/preview claims.
+    valid_skills = set(skill_names(skills_root))
     missing: dict[str, list[str]] = {}
     for s in specs:
         for name in s.skills:
-            if not os.path.isdir(os.path.join(skills_root, name)):
+            if name not in valid_skills:
                 missing.setdefault(s.name, []).append(name)
     if missing:
-        print(f"error: declared skill(s) not found under --skills-root {skills_root!r}:",
-              file=sys.stderr)
+        print(f"error: declared skill(s) not found (no SKILL.md) under --skills-root "
+              f"{skills_root!r}:", file=sys.stderr)
         for ev, names in missing.items():
             print(f"    {ev}: {', '.join(names)}", file=sys.stderr)
         avail = ", ".join(skill_names(skills_root)) or "(none found)"
