@@ -1,4 +1,4 @@
-# models.yaml — the models the agent-skill-evals harness tests.
+# models.yaml — the models the harness harness tests.
 # This is the SINGLE SOURCE OF TRUTH for model ids; nothing in the code hardcodes them.
 #
 # EDIT THIS FILE as models change:
@@ -12,7 +12,7 @@
 #
 # A "runner" is the harness used to reach a model (Claude Code, Codex, AntiGravity).
 # Each model is listed under exactly ONE runner — see "test per model, not per surface"
-# in agent-skill-evals/README.md. Validate edits with `agentskill-evals list-agents`.
+# in harness/README.md. Validate edits with `agentskill-evals list-agents`.
 #
 # Find current ids:  Claude -> Anthropic model docs / the claude-api skill
 #                    Codex  -> `codex --help`, OpenAI Codex docs/changelog

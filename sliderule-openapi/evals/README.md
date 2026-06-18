@@ -3,7 +3,7 @@
 Evaluations for the `sliderule-openapi` skill. Each `*.yaml` file is one eval,
 loosely following the schema in Anthropic's
 [Agent Skills best practices](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices)
-and extended for the [`agent-skill-evals`](../../agent-skill-evals/) runner.
+and extended for the [`harness`](../../harness/) runner.
 
 ## Format
 
@@ -17,12 +17,12 @@ Each eval has:
 - `rubric` — behaviors a correct answer must exhibit, graded by an LLM judge
 - `assertions` — optional deterministic checks (filesystem, tool-call trace, …)
 
-See the [runner README](../../agent-skill-evals/README.md) for the full field
+See the [runner README](../../harness/README.md) for the full field
 and assertion reference.
 
 ## Running
 
-From the repo root (install the `agentskill-evals` CLI first — see the [runner README](../../agent-skill-evals/README.md#install)):
+From the repo root (install the `agentskill-evals` CLI first — see the [runner README](../../harness/README.md#install)):
 
 ```bash
 # this skill, on every installed agent, graded by the default judge (claude)
@@ -35,7 +35,7 @@ agentskill-evals run --skill sliderule-openapi \
 
 The runner provisions the skill into a hermetic per-agent workspace, captures the
 tool trace + final answer, and grades each `rubric` item with the judge. Results
-land in `agent-skill-evals/artifacts/<run_id>/`.
+land in `harness/artifacts/<run_id>/`.
 
 To measure the skill's *value*, re-run with `--no-provision` (skill absent) and
 compare — per the best-practices doc, the with/without delta is the real signal.
@@ -44,7 +44,7 @@ compare — per the best-practices doc, the with/without delta is the real signa
 
 How well a skill works is determined mostly by the model, so the harness tests across
 **models** (not across every surface — see the
-[harness README](../../agent-skill-evals/README.md#what-we-test-models-not-surfaces)).
+[harness README](../../harness/README.md#what-we-test-models-not-surfaces)).
 Models live in the repo-root [`models.yaml`](../../models.yaml); a plain run uses the
 cheapest model per runner, `--all-models` runs the full set.
 
@@ -60,7 +60,7 @@ agentskill-evals run --skill sliderule-openapi --model claude=claude-opus-4-8,cl
 agentskill-evals run --skill sliderule-openapi --all-models
 ```
 
-See the [harness README](../../agent-skill-evals/README.md#cross-model-testing) for cost
+See the [harness README](../../harness/README.md#cross-model-testing) for cost
 guardrails and how the model list is maintained.
 
 ## The evals
