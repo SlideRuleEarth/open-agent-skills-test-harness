@@ -75,21 +75,57 @@ def _label(cfg: dict, default: str) -> str:
 @register("file_exists")
 def _file_exists(result, workdir, spec, cfg, ctx):
     rel = cfg["path"]
-    path = os.path.join(workdir, rel)
-    if not os.path.isfile(path):
+    path, where = _resolve_artifact(result, workdir, rel)
+    if path is None:
         return AssertionResult("file_exists", False, _label(cfg, f"missing file: {rel}"))
+    # An artifact produced *anywhere* still counts as produced: the harness grades whether the
+    # run created it, not whether the model typed the destination correctly (e.g. an absolute
+    # path with a mangled run-id). Flag a non-workspace hit so it's visible, never silent.
+    note = "" if where == "workspace" else f"  [produced at {path} via {where}, not at {rel}]"
     size = os.path.getsize(path)
     if "min_size" in cfg and size < int(cfg["min_size"]):
         return AssertionResult(
-            "file_exists", False, f"{rel} too small ({size} < {cfg['min_size']} bytes)"
+            "file_exists", False, f"{rel} too small ({size} < {cfg['min_size']} bytes){note}"
         )
     if "contains" in cfg or "matches" in cfg:
         text = _read_text(path)
         if "contains" in cfg and cfg["contains"] not in text:
-            return AssertionResult("file_exists", False, f"{rel} missing text {cfg['contains']!r}")
+            return AssertionResult("file_exists", False, f"{rel} missing text {cfg['contains']!r}{note}")
         if "matches" in cfg and not re.search(cfg["matches"], text):
-            return AssertionResult("file_exists", False, f"{rel} no regex match /{cfg['matches']}/")
-    return AssertionResult("file_exists", True, _label(cfg, f"{rel} exists ({size} bytes)"))
+            return AssertionResult("file_exists", False, f"{rel} no regex match /{cfg['matches']}/{note}")
+    return AssertionResult(
+        "file_exists", True, _label(cfg, f"{rel} exists ({size} bytes){note}"),
+        details={"resolved_path": path, "resolved_via": where},
+    )
+
+
+def _resolve_artifact(result, workdir: str, rel: str) -> tuple[Optional[str], Optional[str]]:
+    """Locate the artifact `rel`, tolerant of an agent that wrote it to the wrong path.
+
+    Order of resolution, returning (abs_path, where):
+      1. "workspace"   — the expected location, ``workdir/rel``.
+      2. "write-trace" — a file the run itself created (Write/Edit/… tool calls, via
+                         ``result.file_paths_touched()``) whose basename matches and that exists
+                         on disk. This catches absolute-path mistakes — e.g. a model mangling the
+                         run-id/date in the path — without trusting it to land in the workspace.
+      3. "subtree"     — anywhere under the workspace (a misplaced *relative* subdir), skipping the
+                         provisioned-skill mirrors (dot-dirs like ``.claude/``).
+    Returns (None, None) if not found.
+    """
+    exact = os.path.join(workdir, rel)
+    if os.path.isfile(exact):
+        return exact, "workspace"
+    base = os.path.basename(rel.rstrip("/"))
+    if base:
+        # latest matching write wins (the agent's final state for that filename)
+        for p in reversed(result.file_paths_touched()):
+            if p and os.path.basename(p) == base and os.path.isfile(p):
+                return os.path.abspath(p), "write-trace"
+        for root, dirs, files in os.walk(workdir):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            if base in files and os.path.isfile(os.path.join(root, base)):
+                return os.path.join(root, base), "subtree"
+    return None, None
 
 
 @register("file_absent")

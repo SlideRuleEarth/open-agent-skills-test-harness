@@ -81,8 +81,9 @@ def _build_prompt(spec: Any, result: RunResult, workdir: str, rubric: list[str])
     user_prompt = getattr(spec, "prompt", "")
     commands = result.commands()
     tools = result.tool_names()
-    tree = _file_tree(workdir)
-    inline = _inline_new_files(workdir)
+    extra = _writes_outside_workspace(result, workdir)
+    tree = _file_tree(workdir, extra)
+    inline = _inline_new_files(workdir, extra)
     rubric_block = "\n".join(f"  {i+1}. {b}" for i, b in enumerate(rubric)) or "  (none)"
 
     parts = [
@@ -113,9 +114,33 @@ def _build_prompt(spec: Any, result: RunResult, workdir: str, rubric: list[str])
     return "\n".join(parts) + note
 
 
-def _file_tree(workdir: str) -> str:
+def _writes_outside_workspace(result: RunResult, workdir: str) -> list[str]:
+    """Absolute paths the run created that landed OUTSIDE the workspace (e.g. the model wrote to an
+    absolute path with a mangled run-id). Surfacing them lets the judge grade the artifact the run
+    actually produced, not just whatever happened to land in the workspace."""
+    wd = os.path.abspath(workdir)
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in result.file_paths_touched():
+        if not p:
+            continue
+        ap = os.path.abspath(p)
+        if ap in seen:
+            continue
+        try:
+            inside = os.path.commonpath([wd, ap]) == wd
+        except ValueError:        # different drives, etc. → treat as outside
+            inside = False
+        if not inside and os.path.isfile(ap):
+            seen.add(ap)
+            out.append(ap)
+    return out
+
+
+def _file_tree(workdir: str, extra: list[str] = ()) -> str:
     lines: list[str] = []
     count = 0
+    truncated = False
     for root, dirs, files in os.walk(workdir):
         dirs[:] = [d for d in sorted(dirs) if d not in (".git", "node_modules", "__pycache__")]
         # don't expose the provisioned skills as "agent output"
@@ -123,18 +148,41 @@ def _file_tree(workdir: str) -> str:
         if rel_root.startswith((".claude", ".agents", ".antigravity", ".codex")):
             continue
         for f in sorted(files):
+            if count >= _MAX_FILES:
+                truncated = True
+                break
             rel = os.path.relpath(os.path.join(root, f), workdir)
             lines.append(f"  {rel}")
             count += 1
-            if count >= _MAX_FILES:
-                lines.append(f"  ... (+ more, truncated at {_MAX_FILES})")
-                return "\n".join(lines)
+        if truncated:
+            break
+    if truncated:
+        lines.append(f"  ... (+ more, truncated at {_MAX_FILES})")
+    for ap in extra:
+        lines.append(f"  {ap}   [written OUTSIDE the workspace by this run]")
     return "\n".join(lines) if lines else "  (workspace empty)"
 
 
-def _inline_new_files(workdir: str) -> str:
+def _inline_new_files(workdir: str, extra: list[str] = ()) -> str:
     chunks: list[str] = []
     budget = 5
+
+    def _maybe(path: str, label: str) -> None:
+        nonlocal budget
+        if budget <= 0:
+            return
+        if os.path.splitext(path)[1].lower() not in _TEXT_EXT:
+            return
+        try:
+            if os.path.getsize(path) > _MAX_INLINE_BYTES:
+                return
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                body = fh.read()
+        except OSError:
+            return
+        chunks.append(f"--- {label} ---\n{body}")
+        budget -= 1
+
     for root, dirs, files in os.walk(workdir):
         dirs[:] = [d for d in sorted(dirs) if d not in (".git", "node_modules", "__pycache__")]
         rel_root = os.path.relpath(root, workdir)
@@ -143,20 +191,12 @@ def _inline_new_files(workdir: str) -> str:
         for f in sorted(files):
             if budget <= 0:
                 return "\n\n".join(chunks)
-            ext = os.path.splitext(f)[1].lower()
-            if ext not in _TEXT_EXT:
-                continue
             path = os.path.join(root, f)
-            try:
-                if os.path.getsize(path) > _MAX_INLINE_BYTES:
-                    continue
-                with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                    body = fh.read()
-            except OSError:
-                continue
-            rel = os.path.relpath(path, workdir)
-            chunks.append(f"--- {rel} ---\n{body}")
-            budget -= 1
+            _maybe(path, os.path.relpath(path, workdir))
+    for ap in extra:
+        if budget <= 0:
+            break
+        _maybe(ap, f"{ap}  [outside workspace]")
     return "\n\n".join(chunks)
 
 

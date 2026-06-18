@@ -289,7 +289,7 @@ def cmd_run(args) -> int:
 
     # fail early if a declared skill isn't a real skill (a dir with a SKILL.md) under
     # --skills-root. A bare directory check would accept non-skill folders (e.g.
-    # agent-skill-evals); a typo or wrong --skills-root would otherwise be silently dropped
+    # harness); a typo or wrong --skills-root would otherwise be silently dropped
     # at provision time, so the model runs with fewer skills than the plan/preview claims.
     valid_skills = set(skill_names(skills_root))
     missing: dict[str, list[str]] = {}

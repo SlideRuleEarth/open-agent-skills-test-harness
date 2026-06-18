@@ -1,4 +1,4 @@
-# agent-skill-evals — FAQ
+# harness — FAQ
 
 A short, plain-language FAQ for the skill test harness.
 
@@ -11,6 +11,43 @@ variable.
 
 The step-by-step walkthrough — writing the scenario, the neutral-prompt gotcha, previewing with
 `--dry-run`, and reading the two result sets — is in **[Simple-A-B-Test.md](HowTos/Simple-A-B-Test.md)**.
+
+## Can I test a combination of skills?
+
+Yes. List several skills under a scenario's `skills:` block and they're provisioned **together**;
+with isolation on (the default) they're the *only* repo skills the model sees, so you're testing
+exactly that combination working in concert — nothing else from this repo leaks in.
+
+The walkthrough — writing the multi-skill scenario, rubrics that check the skills hand off to each
+other, and previewing with `--dry-run` — is in
+**[Test-Skill-Combinations.md](HowTos/Test-Skill-Combinations.md)**.
+
+## I just cloned this repo — how do I make the skills work with my install of AntiGravity (or another agentic app)?
+
+This repo is the single source of truth; each agent runtime scans a different skills directory, and
+the `Makefile` points them all there via symlinks. For a fresh clone the **project-level** links
+(including `.antigravity/skills/`) are already committed, so running your agent from the repo
+usually just works. To use the skills from **anywhere**, `make link-global` wires them into your
+per-user dirs — for AntiGravity that's `~/.gemini/config/skills` (the `agy` CLI) and
+`~/.gemini/antigravity-ide/skills` (the IDE). For an app that isn't wired up yet, add its skills
+dir to the `Makefile` and re-run.
+
+The full walkthrough — in-repo vs global install, AntiGravity's two homes, adding a brand-new app,
+and non-macOS notes — is in **[Install-For-Your-Agent.md](HowTos/Install-For-Your-Agent.md)**.
+
+## What are "scenarios"?
+
+Most evals in this repo are **per-skill** — one skill, auto-discovered from each skill's `evals/`
+folder. A **scenario** is the higher-level, *ad-hoc* kind: a single self-describing file that
+provisions a **combination of skills together** and pins a **target** (`runner:model`). You run one
+explicitly by path — `agentskill-evals run --config <file>` — because scenarios are *not*
+auto-discovered. Since runs are isolated by default, a scenario tests exactly the skills it lists
+(plus the agent's own vendor skills) and nothing else from this repo; CLI flags override the file
+(`CLI > scenario > default`).
+
+They live in [`../scenarios/`](../scenarios/) — see [scenarios/README.md](../scenarios/README.md) for
+the file format. For scenarios in action, see the
+[combination](HowTos/Test-Skill-Combinations.md) and [A/B](HowTos/Simple-A-B-Test.md) how-tos.
 
 ## Which skills can the model actually see during a test?
 

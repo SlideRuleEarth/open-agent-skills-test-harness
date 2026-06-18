@@ -63,6 +63,6 @@ For a single run: **CLI flag > scenario file > built-in default**. So
 `--agents codex` or `--model claude=claude-opus-4-8` or `--no-isolated` on the command line
 override what the file declares, without editing it.
 
-See [../agent-skill-evals/README.md](../agent-skill-evals/README.md) for the full harness
-reference and [../agent-skill-evals/FAQ.md](../agent-skill-evals/FAQ.md) for how skill
+See [../harness/README.md](../harness/README.md) for the full harness
+reference and [../harness/FAQ.md](../harness/FAQ.md) for how skill
 visibility works.

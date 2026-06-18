@@ -13,6 +13,12 @@ A set of open-standard Agent Skills for working with [SlideRule Earth](https://s
 - [sliderule-region-picker](sliderule-region-picker/) — Interactive map for defining geographic regions
 - [nsidc-reference](nsidc-reference/) — Reference for NASA NSIDC and ORNL DAAC data products
 
+> **Just want to use the skills?** Install them (below) and you're done — you can stop reading there.
+> The [`harness/`](harness/) folder is a separate **test harness** that
+> maintainers use to evaluate these skills across different models; it's entirely optional and plays
+> no part in using the skills. Ignore it unless you're contributing — see
+> [Testing the skills across models](#testing-the-skills-across-models) if you're curious.
+
 ## Installing the skills (one source of truth)
 
 These are runtime-level skills, not editor plugins — the agent runtime (Claude Code, the Claude Agent SDK, Codex) scans a skills directory at startup regardless of whether you launch it from a terminal, an IDE extension, or over SSH. VSCode is irrelevant; "not using VSCode" changes nothing about installation.
@@ -63,7 +69,7 @@ ls -l ~/.claude/skills ~/.agents/skills
 A "surface" is any tool that consumes the skills (Claude Code, Codex, AntiGravity, CoPilot, other aggregators…). Adding one has up to two parts, and most surfaces only need the first:
 
 1. **Install support — always.** The linking is data-driven: add the surface's `<platform>/skills` directory to `PROJECT_SKILL_DIRS` (and its per-user dir to `GLOBAL_SKILL_DIRS`) in the `Makefile`, re-run `make link-project` / `make link-global`, and **add a row to the install table above** with that surface's specific install instructions. New surfaces always get installation instructions.
-2. **Test-runner support — only if it adds model coverage.** A surface becomes a *test runner* in the eval harness only when it reaches a model no existing runner covers (see [Testing the skills across models](#testing-the-skills-across-models)). That needs an adapter — see [Adding a new runner](agent-skill-evals/README.md#adding-a-new-runner). Aggregators that only re-run already-covered models (e.g. CoPilot) stop at step 1.
+2. **Test-runner support — only if it adds model coverage.** A surface becomes a *test runner* in the eval harness only when it reaches a model no existing runner covers (see [Testing the skills across models](#testing-the-skills-across-models)). That needs an adapter — see [Adding a new runner](harness/README.md#adding-a-new-runner). Aggregators that only re-run already-covered models (e.g. CoPilot) stop at step 1.
 
 ### How discovery works
 
@@ -76,7 +82,7 @@ Installation and testing are two different concerns:
 - **Installation is per *surface*** (Claude Code, Codex, AntiGravity, CoPilot, other aggregators…) — covered above; every surface gets its own install instructions.
 - **Test coverage is per *model*.** How well a skill works is determined by the LLM, not by which tool drives it, so the eval harness tests each skill across **models**, not across every surface. Running an already-covered model through another surface (e.g. CoPilot, or any aggregator) adds no coverage — those are install targets, not test targets.
 
-The harness, the model matrix (`models.yaml`), the cost guardrails, and how to add/retire models live in **[agent-skill-evals/](agent-skill-evals/README.md)**.
+The harness, the model matrix (`models.yaml`), the cost guardrails, and how to add/retire models live in **[harness/](harness/README.md)**.
 
 ## Non-macOS users
 

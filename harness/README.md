@@ -1,4 +1,4 @@
-# agent-skill-evals
+# harness (`agentskill-evals`)
 
 A cross-agent harness for testing **Agent Skills** against multiple coding-agent
 CLIs. Write one eval; run it against **Claude Code**, **Codex**, and
@@ -41,44 +41,57 @@ common shape — so adding an agent is one small adapter, not a rewrite.
 
 ## Install
 
-The harness is a normal Python package (`pyproject.toml`, entry point
-`agentskill-evals`). **Install it in an isolated environment** — don't `pip install`
-into system Python: modern macOS/Linux block that under PEP 668, and it risks
-dependency clashes with other tools. Pick the path that matches what you're doing:
+The harness is a normal Python package (entry point `agentskill-evals`). **The `Makefile` in this
+folder is the way to install it.** Run a target from inside `harness/` (or, from the repo
+root, prefix it with `make -C harness`):
 
-**Users — run the evals** (isolated CLI, on your PATH):
+| Target | For | What it does |
+| --- | --- | --- |
+| `make install` | running the evals | Puts the `agentskill-evals` CLI on your PATH in an isolated env (pipx). |
+| `make dev` | editing the harness | Creates `.venv/` and editable-installs with the `[schema]` extra (adds `jsonschema`; a built-in fallback works without it). Activate with `. .venv/bin/activate`. |
+
+Both pull in `pyyaml` for you. After `make install`, sanity-check with `agentskill-evals list-agents
+--skills-root ..`; `make help` lists the other targets (`selftest`, `clean`, `uninstall`).
+
+> **`make install` requires [pipx](https://pipx.pypa.io).** Install it with `brew install pipx`
+> (macOS) or `python3 -m pip install --user pipx && python3 -m pipx ensurepath`, then re-run
+> `make install` (which otherwise stops and prints these options). **conda/mambaforge users:** avoid
+> `conda install pipx` in `base` — it can clash with conda's own pinned deps (`packaging`/`pluggy`);
+> use one of the above, or a dedicated env (`conda create -n pipx -c conda-forge pipx`). Don't want
+> pipx at all? `make dev` (a local venv) or the module form (below) need none.
+
+> **Why the Makefile and not a bare `pip install`?** The targets install into an **isolated
+> environment** for you — don't `pip install` into system Python: modern macOS/Linux block that
+> under PEP 668, and it risks dependency clashes. `make install` uses pipx, `make dev` a local venv,
+> so you don't have to manage that.
+
+### Installing without `make` (the exceptions)
+
+The targets just wrap standard tools; run these directly only if `make` doesn't fit your setup:
 
 ```bash
-pipx install ./agent-skill-evals          # from a clone
-# or straight from git — note the subdirectory (the package isn't at the repo root):
-pipx install "git+https://github.com/SlideRuleEarth/sliderule-skills.git#subdirectory=agent-skill-evals"
+# pipx / uv — e.g. straight from git (note the subdirectory; the package isn't at the repo root):
+pipx install ./harness
+pipx install "git+https://github.com/SlideRuleEarth/sliderule-skills.git#subdirectory=harness"
+uv tool install ./harness        # uv also manages the Python version
 
-uv tool install ./agent-skill-evals       # uv users (also manages the Python version)
+# the hand-rolled venv that `make dev` automates:
+cd harness && python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[schema]"
+
+# no install at all — run it as a module from inside harness/:
+python3 -m agentskill_evals selftest                                   # needs no dependencies
+python3 -m agentskill_evals run --skills-root .. --config ../scenarios/<file>.yaml
 ```
 
-This puts `agentskill-evals` on your PATH with `pyyaml` already pulled in. From the
-repo, `make install` (run in `agent-skill-evals/`) does the pipx install for you.
+### Notes
 
-**Contributors — edit the harness** (isolated venv + editable install):
-
-```bash
-cd agent-skill-evals
-make dev                                  # creates .venv and installs -e ".[schema]"
-# or by hand:
-python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[schema]"
-```
-
-The `[schema]` extra adds `jsonschema` for stricter `output_schema` checks (a
-built-in fallback works without it).
-
-`selftest` and `--help` need no dependencies; any command that reads YAML evals or
-`models.yaml` (`run`, `list-evals`, and full `list-agents` output) needs `pyyaml`,
-which every install above provides. To poke at it without installing, run from
-inside `agent-skill-evals/`: `python3 -m agentskill_evals selftest`.
-
-Install whichever agent CLIs you want to test (`claude`, `codex`, `agy`).
-Missing ones are simply marked `ERR` / skipped — `list-agents` shows what's
-available.
+- **Requires Python ≥ 3.10.** If pipx or `make dev` picks an older interpreter, install fails with a
+  `requires-python` error — select one explicitly: `pipx install . --python python3.12`, or
+  `make dev PYTHON=python3.12`.
+- `selftest` and `--help` need no dependencies; anything that reads YAML evals or `models.yaml`
+  (`run`, `list-evals`, full `list-agents`) needs `pyyaml` — every option above provides it.
+- Install whichever agent CLIs you want to test (`claude`, `codex`, `agy`). Missing ones are marked
+  `ERR` / skipped — `list-agents` shows what's available.
 
 ## Eval format
 
@@ -166,7 +179,7 @@ deterministic assertions only.
 
 Examples use the installed `agentskill-evals` CLI (see [Install](#install)). From a
 source checkout without installing, run them as `python3 -m agentskill_evals …` from
-inside `agent-skill-evals/`, adding `--skills-root ..` so the harness finds the sibling
+inside `harness/`, adding `--skills-root ..` so the harness finds the sibling
 skill evals and the repo-root `models.yaml` (the default skills-root is the current
 directory).
 
