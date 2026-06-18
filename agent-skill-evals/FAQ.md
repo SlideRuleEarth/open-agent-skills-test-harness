@@ -2,6 +2,16 @@
 
 A short, plain-language FAQ for the skill test harness.
 
+## How do I check whether a skill actually helps on a given prompt?
+
+Run a simple A/B test: take one prompt and run it twice on the same model — once with the skill
+provisioned and once without (`--no-provision`) — then compare the graded results. Because
+isolation is on by default, the "without" run sees no repo skills at all, so the skill is the only
+variable.
+
+The step-by-step walkthrough — writing the scenario, the neutral-prompt gotcha, previewing with
+`--dry-run`, and reading the two result sets — is in **[Simple-A-B-Test.md](HowTos/Simple-A-B-Test.md)**.
+
 ## Which skills can the model actually see during a test?
 
 **Short answer:** by default, only the skills that test provisions for itself — plus the
