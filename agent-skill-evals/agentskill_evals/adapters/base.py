@@ -37,6 +37,7 @@ class RunOptions:
     disable_tools: bool = False          # run reasoning-only (used by the judge)
     extra_args: list[str] = field(default_factory=list)  # raw flags appended verbatim
     output_format: Optional[str] = None  # adapter-specific override (e.g. "json"/"stream-json")
+    home: Optional[str] = None           # isolated HOME for this run (see isolation.py); None = real HOME
 
 
 @dataclass
@@ -55,6 +56,9 @@ class Adapter(ABC):
     binary: str = ""
     # Where this agent discovers project-local skills, relative to the workspace.
     skills_subdir: str = ".claude/skills"
+    # HOME-relative global skills dirs this agent discovers (masked under isolation so a
+    # run sees only the skills it provisions). Empty = isolation has nothing to mask.
+    global_skills_subpaths: list[str] = []
 
     # --- discovery ----------------------------------------------------------
 
@@ -109,8 +113,20 @@ class Adapter(ABC):
         raise NotImplementedError
 
     def env(self, base_env: dict[str, str], opts: RunOptions) -> dict[str, str]:
-        """Mutate/extend the subprocess environment. Default: pass through."""
-        return base_env
+        """Mutate/extend the subprocess environment.
+
+        Default: pass through, except when ``opts.home`` is set (isolated run) — then point
+        HOME (and Windows' USERPROFILE) at the isolated home and drop XDG overrides so they
+        re-derive under it. The isolated home mirrors the real one, so auth/config still work.
+        """
+        if not opts.home:
+            return base_env
+        env = dict(base_env)
+        env["HOME"] = opts.home
+        env["USERPROFILE"] = opts.home
+        for k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+            env.pop(k, None)
+        return env
 
     # --- output normalization ----------------------------------------------
 

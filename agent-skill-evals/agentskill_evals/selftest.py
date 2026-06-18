@@ -49,6 +49,63 @@ def _check(name, cond, msg, failures, verbose):
         failures.append(name)
 
 
+def _check_isolation(failures, verbose):
+    """Validate the HOME overlay: declared skills present, undeclared masked, vendor kept,
+    auth/config passed through, missing ancestors built. Pure filesystem — no CLIs."""
+    import os
+    import shutil
+    import tempfile
+
+    from .isolation import build_isolated_home
+
+    print("isolation overlay:")
+    real = tempfile.mkdtemp(prefix="ase-realhome-")
+    declared_root = tempfile.mkdtemp(prefix="ase-skills-")
+    dest = tempfile.mkdtemp(prefix="ase-isohome-")
+    shutil.rmtree(dest)  # build_isolated_home (re)creates it
+    try:
+        # a fake real HOME: a global skills dir with two repo skills + a vendor bundle,
+        # plus auth + an unrelated dotfile.
+        os.makedirs(os.path.join(real, ".codex", "skills", "sliderule-api"))
+        os.makedirs(os.path.join(real, ".codex", "skills", "sliderule-params"))
+        os.makedirs(os.path.join(real, ".codex", "skills", ".system", "imagegen"))
+        open(os.path.join(real, ".codex", "auth.json"), "w").close()
+        open(os.path.join(real, ".gitconfig"), "w").close()
+        # the cell declares only sliderule-api (its source lives outside HOME, like skills_root)
+        os.makedirs(os.path.join(declared_root, "sliderule-api"))
+
+        build_isolated_home(
+            dest,
+            [".codex/skills", ".gemini/config/skills"],   # one present, one missing (nested)
+            {"sliderule-api", "sliderule-params"},        # repo superset to mask
+            [os.path.join(declared_root, "sliderule-api")],
+            real,
+        )
+
+        skills = os.path.join(dest, ".codex", "skills")
+        names = set(os.listdir(skills)) if os.path.isdir(skills) else set()
+        _check("isolation.declared_present", "sliderule-api" in names,
+               f"declared sliderule-api present (got {sorted(names)})", failures, verbose)
+        _check("isolation.undeclared_masked", "sliderule-params" not in names,
+               "undeclared sliderule-params removed", failures, verbose)
+        _check("isolation.vendor_kept", ".system" in names,
+               "vendor .system bundle preserved", failures, verbose)
+        _check("isolation.auth_passthrough",
+               os.path.islink(os.path.join(dest, ".codex", "auth.json")),
+               "auth.json passed through as a symlink", failures, verbose)
+        _check("isolation.dotfile_passthrough",
+               os.path.islink(os.path.join(dest, ".gitconfig")),
+               ".gitconfig passed through as a symlink", failures, verbose)
+        gem = os.path.join(dest, ".gemini", "config", "skills")
+        gem_names = sorted(os.listdir(gem)) if os.path.isdir(gem) else ["<MISSING>"]
+        _check("isolation.missing_ancestor_built", gem_names == ["sliderule-api"],
+               f"missing nested skills dir built with declared only (got {gem_names})",
+               failures, verbose)
+    finally:
+        for d in (real, declared_root, dest):
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def run_selftest(verbose: bool = False) -> int:
     failures: list[str] = []
 
@@ -98,6 +155,9 @@ def run_selftest(verbose: bool = False) -> int:
     bad, err = validate_schema({"name": "x"},
                                {"type": "object", "required": ["name", "port"]})
     _check("schema.invalid", not bad, f"missing-required caught: {err}", failures, verbose)
+
+    # HOME isolation overlay
+    _check_isolation(failures, verbose)
 
     print()
     if failures:

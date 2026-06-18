@@ -286,6 +286,7 @@ def cmd_run(args) -> int:
                   "pass --judge-agent or install claude.", file=sys.stderr)
 
     # ---- plan + cost guardrails (before building the Runner) ----------------
+    isolated = not args.no_isolated
     n_cells = sum(len(model_map[a]) for s in specs for a in agents
                   if (s.agents is None or a in s.agents))
     labels = _target_labels(agents, model_map)
@@ -297,7 +298,8 @@ def cmd_run(args) -> int:
 
     print(f"Plan: {n_cells} cell(s) — {len(specs)} eval(s) × {len(labels)} target(s) "
           f"[{', '.join(labels)}]")
-    print(f"      judge: {judge_label}   ≈{n_llm} LLM calls   artifacts: {run_dir}\n")
+    print(f"      judge: {judge_label}   isolated: {'on' if isolated else 'off'}   "
+          f"≈{n_llm} LLM calls   artifacts: {run_dir}\n")
 
     if args.dry_run:
         print("(dry run — nothing executed)")
@@ -349,6 +351,7 @@ def cmd_run(args) -> int:
         auto_approve=not args.no_auto_approve,
         jobs=args.jobs,
         model_map=model_map,
+        isolated=isolated,
     )
 
     results = runner.run(specs)
@@ -485,6 +488,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--judge-model", help="model override for the judge")
     sp.add_argument("--no-judge", action="store_true", help="disable LLM-judge rubric grading")
     sp.add_argument("--no-provision", action="store_true", help="don't copy skills into workspaces")
+    sp.add_argument("--no-isolated", action="store_true",
+                    help="also expose your globally-installed repo skills (default: each run is "
+                         "isolated to only the skills it provisions + the agent's vendor skills)")
     sp.add_argument("--no-auto-approve", action="store_true",
                     help="don't auto-approve tool/file actions")
     sp.add_argument("--model", nargs="*", action="append", default=None,

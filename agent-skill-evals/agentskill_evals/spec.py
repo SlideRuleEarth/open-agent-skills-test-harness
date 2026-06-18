@@ -204,6 +204,23 @@ def load_spec(path: str) -> EvalSpec:
     )
 
 
+def skill_names(skills_root: str) -> list[str]:
+    """Provisionable skills: immediate subdirectories of skills_root containing a SKILL.md.
+
+    This is the repo's "superset" — what an eval/scenario may declare, and the set isolation
+    masks from the global skills dirs.
+    """
+    out: list[str] = []
+    try:
+        entries = sorted(os.listdir(skills_root))
+    except OSError:
+        return out
+    for name in entries:
+        if os.path.isfile(os.path.join(skills_root, name, "SKILL.md")):
+            out.append(name)
+    return out
+
+
 def discover_specs(
     *,
     skills_root: Optional[str] = None,

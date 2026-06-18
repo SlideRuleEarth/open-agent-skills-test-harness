@@ -32,6 +32,7 @@ _SHELL_TOOLS = {"Bash", "BashOutput"}
 class ClaudeAdapter(Adapter):
     name = "claude"
     binary = "claude"
+    global_skills_subpaths = [".claude/skills"]
 
     def format_skill(self, skill: str) -> str:
         return f"/{skill}"

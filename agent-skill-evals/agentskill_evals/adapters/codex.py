@@ -29,6 +29,8 @@ class CodexAdapter(Adapter):
     name = "codex"
     binary = "codex"
     skills_subdir = ".agents/skills"  # Codex reads $REPO_ROOT/.agents/skills (cross-agent convention)
+    # Global skills dirs codex discovers (the .system vendor bundle in ~/.codex/skills is kept).
+    global_skills_subpaths = [".codex/skills", ".agents/skills"]
 
     def format_skill(self, skill: str) -> str:
         # Mirrors the OpenAI example which referenced skills as "$skill-name".
