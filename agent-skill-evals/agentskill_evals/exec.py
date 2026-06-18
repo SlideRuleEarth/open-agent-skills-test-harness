@@ -57,6 +57,8 @@ def execute(
             capture_output=True,
             text=True,
             timeout=timeout,
+            stdin=subprocess.DEVNULL,  # non-interactive: agents that probe stdin (e.g. codex
+                                       # exec) get immediate EOF instead of blocking forever
         )
         stdout, stderr, code = proc.stdout, proc.stderr, proc.returncode
     except subprocess.TimeoutExpired as exc:

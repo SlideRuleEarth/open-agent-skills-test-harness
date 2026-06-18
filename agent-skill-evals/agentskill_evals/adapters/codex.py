@@ -39,7 +39,9 @@ class CodexAdapter(Adapter):
     def build_argv(self, prompt: str, opts: RunOptions) -> list[str]:
         argv = [self.binary, "exec", "--json"]
         if opts.auto_approve:
-            argv += ["--full-auto"]
+            # `--sandbox workspace-write` is the current non-interactive auto mode
+            # (the old `--full-auto` is deprecated and maps to exactly this).
+            argv += ["--sandbox", "workspace-write"]
         if opts.model:
             argv += ["-m", opts.model]
         argv += opts.extra_args

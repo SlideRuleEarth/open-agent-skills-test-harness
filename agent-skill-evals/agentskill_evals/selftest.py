@@ -9,6 +9,7 @@ agent changes its output schema).
 from __future__ import annotations
 
 from .adapters import get_adapter
+from .adapters.base import RunOptions
 
 # --- captured sample outputs (one per agent format) ------------------------
 
@@ -131,6 +132,11 @@ def run_selftest(verbose: bool = False) -> int:
     _check("codex.command", cmds == ["npm install"], f"commands={cmds}", failures, verbose)
     _check("codex.file", "package.json" in paths, f"paths={paths}", failures, verbose)
     _check("codex.final", out.final_text == "Created demo-app.", repr(out.final_text), failures, verbose)
+    cargv = get_adapter("codex").build_argv("do the task", RunOptions(model="gpt-5.4-mini"))
+    _check("codex.argv",
+           "--sandbox" in cargv and "workspace-write" in cargv
+           and "--full-auto" not in cargv and cargv[-1] == "do the task",
+           f"non-interactive sandbox argv, prompt last: {cargv}", failures, verbose)
 
     # AntiGravity (3 shapes)
     print("antigravity adapter:")
