@@ -60,12 +60,15 @@ def execute(
         )
         stdout, stderr, code = proc.stdout, proc.stderr, proc.returncode
     except subprocess.TimeoutExpired as exc:
+        # On TimeoutExpired the partial stdout/stderr can come back as bytes even with
+        # text=True, so decode BEFORE appending the timeout note (else: can't concat str+bytes).
         stdout = exc.stdout or ""
-        stderr = (exc.stderr or "") + f"\n[timeout after {timeout}s]"
+        stderr = exc.stderr or ""
         if isinstance(stdout, bytes):
             stdout = stdout.decode("utf-8", "replace")
         if isinstance(stderr, bytes):
             stderr = stderr.decode("utf-8", "replace")
+        stderr += f"\n[timeout after {timeout}s]"
         rr.timed_out = True
         rr.error = f"timed out after {timeout}s"
         code = -9
