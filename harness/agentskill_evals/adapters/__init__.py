@@ -9,9 +9,10 @@ from __future__ import annotations
 from typing import Optional
 
 from .antigravity import AntigravityAdapter
-from .base import Adapter, ParseOutput, RunOptions
+from .base import Adapter, ParseOutput, ProbeResult, RunOptions
 from .claude import ClaudeAdapter
 from .codex import CodexAdapter
+from .copilot import CopilotAdapter
 
 _ADAPTERS: dict[str, Adapter] = {
     a.name: a
@@ -19,6 +20,7 @@ _ADAPTERS: dict[str, Adapter] = {
         ClaudeAdapter(),
         CodexAdapter(),
         AntigravityAdapter(),
+        CopilotAdapter(),
     )
 }
 
@@ -29,6 +31,8 @@ _ALIASES = {
     "openai": "codex",
     "agy": "antigravity",
     "google": "antigravity",
+    "gh-copilot": "copilot",
+    "github": "copilot",
 }
 
 
@@ -58,6 +62,7 @@ def register(adapter: Adapter) -> None:
 __all__ = [
     "Adapter",
     "ParseOutput",
+    "ProbeResult",
     "RunOptions",
     "get_adapter",
     "all_adapters",

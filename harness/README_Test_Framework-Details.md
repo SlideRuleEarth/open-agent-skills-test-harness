@@ -13,10 +13,11 @@ A self-contained Python harness (this folder, [`harness/`](.)) that runs each
 - A **runner** is the CLI used to reach a model, via a pluggable *adapter*:
   [claude.py](agentskill_evals/adapters/claude.py),
   [codex.py](agentskill_evals/adapters/codex.py),
-  [antigravity.py](agentskill_evals/adapters/antigravity.py).
+  [antigravity.py](agentskill_evals/adapters/antigravity.py),
+  [copilot.py](agentskill_evals/adapters/copilot.py).
 - **Models** come from [models.yaml](../models.yaml) (the single source of truth; the cheapest
-  is each runner's default). Coverage is keyed to the *model*, not the surface — aggregators
-  are install targets, not runners.
+  is each runner's default). Each `run` targets one runner via `--agent`; multi-vendor runners
+  list all models they support (overlap across runners is expected).
 
 ## Where evals live
 
@@ -70,7 +71,7 @@ file (`CLI > scenario > default`). See [scenarios/README.md](../scenarios/README
 ## CLI
 
 Entry point `agentskill-evals` ([cli.py](agentskill_evals/cli.py)):
-`run`, `list-agents`, `list-evals`, `list-skills`, `migrate`, `selftest`. `run --config <file>`
+`run`, `list-agents-configured-models`, `list-agents-available-models`, `list-evals`, `list-skills`, `selftest`. `run --config <file>`
 runs a scenario (below); `list-skills` audits skill visibility (superset vs per-runner
 masked/kept, with drift warnings).
 
@@ -79,7 +80,7 @@ masked/kept, with drift warnings).
 Every cell is one agent run **plus** one judge call, and the axes multiply, so:
 cheapest-model default, a hard `--max-cells` ceiling, a multi-cell confirmation prompt
 (fail-closed without a TTY), `--dry-run`, a cheapest-by-default judge, and an unparseable
-`models.yaml` is fatal for `run` (warning-only for `list-agents`).
+`models.yaml` is fatal for `run` (warning-only for `list-agents-configured-models`).
 
 ## Output
 

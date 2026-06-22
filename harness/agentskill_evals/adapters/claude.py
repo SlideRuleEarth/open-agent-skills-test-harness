@@ -22,7 +22,7 @@ import json
 from typing import Any
 
 from ..schema import EventKind, NormalizedEvent
-from .base import Adapter, ParseOutput, RunOptions, extract_command, extract_path, iter_jsonl
+from .base import Adapter, ParseOutput, ProbeResult, RunOptions, extract_command, extract_path, iter_jsonl
 
 # Claude tool names that mutate files (so we can also tag them as file touches).
 _FILE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Create"}
@@ -36,6 +36,26 @@ class ClaudeAdapter(Adapter):
     # CLAUDE_CONFIG_DIR overrides ~/.claude (skills under it). Under isolation it's mirrored +
     # repointed (custom config dir kept, skills masked), else cleared to the isolated home.
     isolation_config_homes = [("CLAUDE_CONFIG_DIR", "skills")]
+
+    # TODO: Claude Code has no `list-models` command yet (feature request pending).
+    # When one ships, add has_model_list = True and a discover_models() override
+    # like Codex and AntiGravity have — then probing falls back to free discovery.
+
+    def _probe_argv(self, model: str):
+        return [self.binary, "-p", "say ok", "--output-format", "stream-json",
+                "--verbose", "--model", model, "--dangerously-skip-permissions"]
+
+    def _parse_probe_cost(self, output: str) -> ProbeResult:
+        for line in output.splitlines():
+            try:
+                obj = json.loads(line.strip())
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if obj.get("type") == "result":
+                cost = obj.get("total_cost_usd")
+                return ProbeResult(accepted=True,
+                                   cost_usd=float(cost) if cost is not None else None)
+        return ProbeResult(accepted=True)
 
     def format_skill(self, skill: str) -> str:
         return f"/{skill}"

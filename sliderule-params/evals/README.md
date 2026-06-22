@@ -30,7 +30,7 @@ agentskill-evals run --skill sliderule-params
 
 # specific agents, parallel, show failing checks
 agentskill-evals run --skill sliderule-params \
-    --agents claude codex antigravity --jobs 4 -v
+    --agent claude --jobs 4 -v
 ```
 
 The runner provisions the skill into a hermetic per-agent workspace, captures the

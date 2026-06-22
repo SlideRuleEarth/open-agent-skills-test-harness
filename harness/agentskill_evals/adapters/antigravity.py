@@ -19,7 +19,8 @@ Verified against agy 1.0.9:
 
 from __future__ import annotations
 
-from typing import Any
+import subprocess
+from typing import Any, Optional
 
 from ..schema import EventKind, NormalizedEvent
 from .base import (
@@ -32,6 +33,20 @@ from .base import (
     try_load_json,
 )
 
+import re
+
+_PAREN_RE = re.compile(r"\s*\(([^)]+)\)\s*$")
+
+
+def _display_to_model_id(display: str) -> str:
+    """'Gemini 3.5 Flash (Medium)' -> 'gemini-3.5-flash-medium'."""
+    m = _PAREN_RE.search(display)
+    tier = ""
+    if m:
+        tier = "-" + m.group(1).strip().lower()
+        display = display[: m.start()]
+    return display.strip().lower().replace(" ", "-") + tier
+
 
 class AntigravityAdapter(Adapter):
     name = "antigravity"
@@ -43,6 +58,33 @@ class AntigravityAdapter(Adapter):
         ".gemini/antigravity-ide/skills",
         ".antigravity/skills",
     ]
+
+    has_model_list = True
+
+    def discover_models(self) -> Optional[list[str]]:
+        """Return model IDs from ``agy models``.
+
+        ``agy models`` prints display names like "Gemini 3.5 Flash (Medium)".
+        We normalise to the kebab-case ``--model`` IDs the CLI also accepts:
+        ``gemini-3.5-flash-medium``.
+        """
+        try:
+            r = subprocess.run(
+                [self.binary, "models"], capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode != 0:
+                return None
+            return [
+                _display_to_model_id(line.strip())
+                for line in r.stdout.splitlines()
+                if line.strip()
+            ]
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return None
+
+    def _probe_argv(self, model: str):
+        return [self.binary, "-p", "say ok", "--dangerously-skip-permissions",
+                "--model", model]
 
     def format_skill(self, skill: str) -> str:
         return f"/{skill}"

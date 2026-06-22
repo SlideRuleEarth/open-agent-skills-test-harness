@@ -33,7 +33,7 @@ install: ## End users: install the CLI in an isolated env, on your PATH (needs p
 	}
 	@pipx uninstall $(DIST) >/dev/null 2>&1 || true
 	pipx install .
-	@echo "installed — try:  agentskill-evals list-agents --skills-root .."
+	@echo "installed — try:  agentskill-evals list-agents-configured-models --skills-root .."
 	@echo "(re-run 'make install' anytime to pick up source changes; or 'make dev' for a live editable install)"
 
 dev: ## Contributors: create $(VENV)/ and editable-install with extras

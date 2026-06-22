@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from .adapters import get_adapter
 from .adapters.base import RunOptions
+from .schema import EventKind
 from .spec import EvalSpec
 
 # --- captured sample outputs (one per agent format) ------------------------
@@ -41,6 +42,21 @@ ANTIGRAVITY_STREAM = """\
 
 ANTIGRAVITY_JSON = '{"result":"All done."}'
 ANTIGRAVITY_RAW = "just a plain text answer with no JSON"
+
+COPILOT = """\
+{"type":"session.skills_loaded","data":{"skills":[]},"id":"s1","timestamp":"2026-06-22T00:00:00Z","parentId":"p1","ephemeral":true}
+{"type":"session.tools_updated","data":{"model":"claude-sonnet-4.6"},"id":"s2","timestamp":"2026-06-22T00:00:00Z","parentId":"p1","ephemeral":true}
+{"type":"user.message","data":{"content":"list files"},"id":"u1","timestamp":"2026-06-22T00:00:00Z","parentId":"p1"}
+{"type":"assistant.turn_start","data":{"turnId":"0","interactionId":"i1"},"id":"t1","timestamp":"2026-06-22T00:00:01Z","parentId":"u1"}
+{"type":"assistant.message","data":{"messageId":"m1","model":"claude-sonnet-4.6","content":"","toolRequests":[{"toolCallId":"tc1","name":"report_intent","arguments":{"intent":"Listing files"},"type":"function"},{"toolCallId":"tc2","name":"shell","arguments":{"command":"ls -la"},"type":"function"},{"toolCallId":"tc3","name":"view","arguments":{"path":"/tmp/project"},"type":"function"}],"interactionId":"i1","turnId":"0","outputTokens":50},"id":"m1","timestamp":"2026-06-22T00:00:02Z","parentId":"t1"}
+{"type":"tool.execution_complete","data":{"toolCallId":"tc2","success":true,"result":{"content":"file1.txt\\nfile2.txt"}},"id":"r1","timestamp":"2026-06-22T00:00:02Z","parentId":"m1"}
+{"type":"tool.execution_complete","data":{"toolCallId":"tc3","success":true,"result":{"content":"file1.txt\\nfile2.txt"}},"id":"r2","timestamp":"2026-06-22T00:00:02Z","parentId":"m1"}
+{"type":"assistant.turn_end","data":{"turnId":"0"},"id":"e1","timestamp":"2026-06-22T00:00:03Z","parentId":"r2"}
+{"type":"assistant.turn_start","data":{"turnId":"1","interactionId":"i1"},"id":"t2","timestamp":"2026-06-22T00:00:03Z","parentId":"e1"}
+{"type":"assistant.message","data":{"messageId":"m2","model":"claude-sonnet-4.6","content":"Found 2 files: file1.txt and file2.txt","toolRequests":[],"interactionId":"i1","turnId":"1","outputTokens":20},"id":"m2","timestamp":"2026-06-22T00:00:04Z","parentId":"t2"}
+{"type":"assistant.turn_end","data":{"turnId":"1"},"id":"e2","timestamp":"2026-06-22T00:00:04Z","parentId":"m2"}
+{"type":"result","timestamp":"2026-06-22T00:00:04Z","sessionId":"sess1","exitCode":0,"usage":{"premiumRequests":1,"totalApiDurationMs":2000,"sessionDurationMs":4000}}
+"""
 
 
 def _check(name, cond, msg, failures, verbose):
@@ -316,6 +332,33 @@ def run_selftest(verbose: bool = False) -> int:
     _check("codex.iso_env.repoint",
            e2.get("CODEX_HOME") == "/iso/_cfg/CODEX_HOME",
            f"mirrored config-home repointed: {e2}", failures, verbose)
+
+    # Copilot
+    print("copilot adapter:")
+    out = get_adapter("copilot").parse(COPILOT, "", 0)
+    cmds = [e.command for e in out.events if e.command]
+    tools = [e.tool_name for e in out.events if e.tool_name]
+    _check("copilot.command", "ls -la" in cmds, f"commands={cmds}", failures, verbose)
+    _check("copilot.tools", "shell" in tools and "view" in tools,
+           f"tools={tools}", failures, verbose)
+    _check("copilot.no_report_intent", "report_intent" not in tools,
+           "report_intent is not traced as a real tool", failures, verbose)
+    _check("copilot.final", out.final_text == "Found 2 files: file1.txt and file2.txt",
+           repr(out.final_text), failures, verbose)
+    _check("copilot.duration", out.duration_ms == 4000,
+           f"duration={out.duration_ms}", failures, verbose)
+    _check("copilot.resolved_model", out.resolved_model == "claude-sonnet-4.6",
+           f"resolved_model={out.resolved_model}", failures, verbose)
+    _check("copilot.ephemeral_skipped",
+           not any(e.kind == EventKind.SESSION_START and "skills_loaded" in str(e.raw)
+                   for e in out.events),
+           "ephemeral session events skipped", failures, verbose)
+    cargv = get_adapter("copilot").build_argv("do the task", RunOptions(model="auto"))
+    _check("copilot.argv",
+           cargv[0] == "copilot" and "-p" in cargv and "--output-format" in cargv
+           and "json" in cargv and "--allow-all" in cargv and "--model" in cargv
+           and cargv[-1] != "do the task",
+           f"copilot argv: {cargv}", failures, verbose)
 
     # AntiGravity (3 shapes)
     print("antigravity adapter:")
