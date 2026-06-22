@@ -192,8 +192,7 @@ agentskill-evals list-agents
 # what evals exist?
 agentskill-evals list-evals --skills-root .
 
-# run everything on every installed agent (judge defaults to claude)
-agentskill-evals run --skills-root .
+# `run` always requires --skill, --evals, or --config (no unscoped broad runs)
 
 # one skill, specific agents, parallel, verbose failures
 agentskill-evals run --skill sliderule-docsearch \
@@ -301,10 +300,11 @@ hardcoded in the harness).
 > multiply (`evals × runners × models`). The whole suite across every model is
 > currently ~231 cells (33 evals × 7 runner/model targets, ≈462 paid LLM calls),
 > and it grows as evals and models are added. To keep that from happening by accident:
-> a plain `run` uses only the **cheapest** model per runner; the full grid needs
+> `run` **requires** `--skill`, `--evals`, or `--config` (no unscoped broad discovery);
+> a scoped run uses only the **cheapest** model per runner by default; the full grid needs
 > `--all-models`; there's a hard `--max-cells` ceiling (default 25) and a
-> confirmation prompt for any multi-cell run. Stay cheap with `--skill`/`--evals`,
-> `--agents`, `--no-judge`, and preview with `--dry-run`.
+> confirmation prompt for any multi-cell run. Further narrow with `--agents`,
+> `--no-judge`, and preview with `--dry-run`.
 
 `models.yaml` (grouped per runner so each model change is a one-block edit):
 
@@ -390,17 +390,6 @@ would silently fall back to each CLI's own, possibly pricier, default and break 
 "cheapest model by default" guarantee), while `list-agents` still degrades to a warning. A
 model that has been retired surfaces as a run error annotated `model 'x' rejected by
 <runner> — check models.yaml`, so the fix location is obvious.
-
-## Migrating existing evals
-
-The loader accepts the legacy `{skills, query, files, expected_behavior}` shape,
-so old evals run as-is. To upgrade them to the canonical format:
-
-```bash
-agentskill-evals migrate --skills-root .            # dry run (prints)
-agentskill-evals migrate --skills-root . --write --replace   # YAML, removes .json
-agentskill-evals migrate --skill foo --to json --write       # canonical JSON in place
-```
 
 ## Adding a new runner
 

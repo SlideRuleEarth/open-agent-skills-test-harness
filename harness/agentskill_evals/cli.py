@@ -3,7 +3,6 @@
     python -m agentskill_evals run        # run the matrix
     python -m agentskill_evals list-agents
     python -m agentskill_evals list-evals
-    python -m agentskill_evals migrate     # upgrade legacy evals to canonical format
     python -m agentskill_evals selftest    # parser tests, no CLIs required
 """
 
@@ -278,6 +277,16 @@ def cmd_run(args) -> int:
             return 2
         specs = [scenario.spec]
     else:
+        if not args.skill and not args.evals:
+            print("error: `run` requires --skill, --evals, or --config to scope what runs.\n"
+                  "  Broad discovery (all evals across all skills) is disabled to avoid\n"
+                  "  accidental spend. Narrow the run:\n"
+                  "    --skill <name>          one skill's evals/\n"
+                  "    --evals <file> ...      specific eval files\n"
+                  "    --config <scenario>     a scenario file\n"
+                  "  Use `list-evals --skills-root .` to see what's available.",
+                  file=sys.stderr)
+            return 2
         specs = _discover(args, skills_root)
         if args.tag:
             specs = [s for s in specs if set(args.tag) & set(s.tags)]
@@ -589,53 +598,6 @@ def cmd_list_skills(args) -> int:
     return 0
 
 
-def cmd_migrate(args) -> int:
-    skills_root = os.path.abspath(args.skills_root)
-    specs = _discover(args, skills_root)
-    if not specs:
-        print("no evals found to migrate.", file=sys.stderr)
-        return 2
-
-    try:
-        import yaml  # type: ignore
-        have_yaml = True
-    except ModuleNotFoundError:
-        have_yaml = False
-
-    fmt = args.to
-    if fmt == "yaml" and not have_yaml:
-        print("PyYAML not installed; falling back to --to json.", file=sys.stderr)
-        fmt = "json"
-
-    for s in specs:
-        canonical = s.to_canonical_dict()
-        src = s.source_path
-        base, _ = os.path.splitext(src)
-        dest = f"{base}.{ 'yaml' if fmt == 'yaml' else 'json' }"
-        if fmt == "yaml":
-            text = yaml.safe_dump(canonical, sort_keys=False, width=100, allow_unicode=True)
-        else:
-            import json
-            text = json.dumps(canonical, indent=2, ensure_ascii=False) + "\n"
-
-        if not args.write:
-            print(f"--- {os.path.relpath(dest, skills_root)} (dry run) ---")
-            print(text)
-            continue
-
-        with open(dest, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        action = f"wrote {os.path.relpath(dest, skills_root)}"
-        if args.replace and os.path.abspath(dest) != os.path.abspath(src):
-            os.remove(src)
-            action += f"  (removed {os.path.basename(src)})"
-        print(action)
-
-    if not args.write:
-        print("\n(dry run — re-run with --write to apply, --replace to delete originals)")
-    return 0
-
-
 def cmd_selftest(args) -> int:
     from .selftest import run_selftest
     return run_selftest(verbose=args.verbose)
@@ -710,14 +672,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--skills-root", default=_default_skills_root(),
                     help="dir containing skill folders (default: cwd)")
     sp.set_defaults(func=cmd_list_skills)
-
-    sp = sub.add_parser("migrate", help="rewrite evals into the canonical format")
-    add_discovery(sp)
-    sp.add_argument("--to", choices=["yaml", "json"], default="yaml", help="target format")
-    sp.add_argument("--write", action="store_true", help="apply changes (default: dry run)")
-    sp.add_argument("--replace", action="store_true",
-                    help="delete the original file when the extension changes")
-    sp.set_defaults(func=cmd_migrate)
 
     sp = sub.add_parser("selftest", help="test the adapter parsers against bundled fixtures")
     sp.add_argument("-v", "--verbose", action="store_true")

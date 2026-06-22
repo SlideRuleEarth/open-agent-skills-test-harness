@@ -33,8 +33,7 @@ Discovery is per-skill: each skill directory owns an `evals/` folder, e.g.
 directory that contains `evals/`.
 
 Legacy keys are accepted as aliases (`query`->`prompt`,
-`expected_behavior`->`rubric`) so existing files keep running; `migrate`
-rewrites them into the canonical shape.
+`expected_behavior`->`rubric`) so existing files keep running.
 """
 
 from __future__ import annotations
@@ -116,36 +115,6 @@ class EvalSpec:
         ):
             out.append({"type": "output_matches_schema"})
         return out
-
-    def to_canonical_dict(self) -> dict:
-        """The canonical on-disk representation (used by `migrate`)."""
-        d: dict[str, Any] = {"name": self.name}
-        if self.description:
-            d["description"] = self.description
-        if self.skills:
-            d["skills"] = self.skills
-        d["prompt"] = self.prompt
-        if self.files:
-            d["files"] = self.files
-        if self.fixture:
-            d["fixture"] = self.fixture
-        if self.agents:
-            d["agents"] = self.agents
-        if self.timeout_sec != 600:
-            d["timeout_sec"] = self.timeout_sec
-        if self.tags:
-            d["tags"] = self.tags
-        if self.vars:
-            d["vars"] = self.vars
-        if self.env:
-            d["env"] = self.env
-        if self.assertions:
-            d["assertions"] = self.assertions
-        if self.rubric:
-            d["rubric"] = self.rubric
-        if self.output_schema:
-            d["output_schema"] = self.output_schema
-        return d
 
 
 # ---------------------------------------------------------------------------
