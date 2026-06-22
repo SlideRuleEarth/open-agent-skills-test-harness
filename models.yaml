@@ -12,7 +12,9 @@
 #
 # A "runner" is the CLI used to reach a model (Claude Code, Codex, AntiGravity, Copilot).
 # Each runner lists the models it supports; overlap across runners is expected for
-# multi-vendor runners (e.g. Copilot can reach GPT and Gemini models).
+# multi-vendor runners (e.g. Copilot can reach Claude, GPT, and Gemini models).
+# NOTE: Copilot uses DOTS in Claude model ids (claude-sonnet-4.6) while Claude Code
+# uses DASHES (claude-sonnet-4-6). Always use the runner's own id format.
 # Validate edits with `agentskill-evals list-agents`.
 #
 # Find current ids:  Claude -> Anthropic model docs / the claude-api skill
@@ -42,8 +44,12 @@ agents:
       - gemini-3.1-pro
       - gemini-3.5-flash
   copilot:
-    default: gpt-5.4-mini
+    default: claude-haiku-4.5            # cheapest (0.33 premium requests)
     models:
+      - claude-opus-4.8
+      - claude-opus-4.6
+      - claude-sonnet-4.6
+      - claude-haiku-4.5
       - gpt-5.5
       - gpt-5.4-mini
       - gemini-3.5-flash
