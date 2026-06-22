@@ -4,7 +4,7 @@ description: Exercises the SlideRule API and params skills together.
 
 target:                       # the runner:model this scenario tests
   runner: copilot
-  model: claude-opus-4-8     # claude model; omit to use models.yaml's default
+  model: gpt-5.4-mini        # omit to use models.yaml's default
 
 skills:                       # provisioned together; the only repo skills visible (isolated)
   - sliderule-api
