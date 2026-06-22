@@ -1,4 +1,4 @@
-# models.yaml — the models the harness harness tests.
+# models.yaml — the models the harness tests.
 # This is the SINGLE SOURCE OF TRUTH for model ids; nothing in the code hardcodes them.
 #
 # EDIT THIS FILE as models change:
@@ -6,21 +6,23 @@
 #   • roll a model off      -> delete its line (and repoint `default:` if it was the default)
 #   • change the cheap default -> set `default:` to any id present in that runner's `models:`
 #
-# Per-run model selection (per runner, in priority order):
+# Per-run model selection (for the chosen --agent, in priority order):
 #   CLI --model  >  (--all-models ? the full `models:` list)  >  `default:` (a plain run)
 #   >  the runner's own built-in default.
 #
-# A "runner" is the harness used to reach a model (Claude Code, Codex, AntiGravity).
-# Each model is listed under exactly ONE runner — see "test per model, not per surface"
-# in harness/README.md. Validate edits with `agentskill-evals list-agents`.
+# A "runner" is the CLI used to reach a model (Claude Code, Codex, AntiGravity, Copilot).
+# Each runner lists the models it supports; overlap across runners is expected for
+# multi-vendor runners (e.g. Copilot can reach both Claude and GPT models).
+# Validate edits with `agentskill-evals list-agents`.
 #
 # Find current ids:  Claude -> Anthropic model docs / the claude-api skill
 #                    Codex  -> `codex --help`, OpenAI Codex docs/changelog
 #                    AntiGravity -> `agy models` (map the display name to its --model token)
+#                    Copilot -> `copilot --help` / GitHub Copilot docs
 #
-# The ids below were verified against the installed CLIs (claude / codex 0.140.0 / agy 1.0.9)
-# on 2026-06-17. Re-verify when a model is added or rolled off — a mistyped/retired id
-# surfaces as a run error pointing back to this file.
+# The ids below were verified against the installed CLIs (claude / codex 0.140.0 / agy 1.0.9
+# / copilot 1.0.63) on 2026-06-22. Re-verify when a model is added or rolled off — a
+# mistyped/retired id surfaces as a run error pointing back to this file.
 
 agents:
   claude:
@@ -39,6 +41,11 @@ agents:
     models:
       - gemini-3.1-pro
       - gemini-3.5-flash
+  copilot:
+    default: claude-sonnet-4-6
+    models:
+      - claude-sonnet-4-6
+      - gpt-5.4-mini
 
 judge:                               # the (cheap) model used to grade rubrics
   agent: claude

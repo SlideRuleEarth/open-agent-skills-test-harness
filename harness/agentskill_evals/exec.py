@@ -92,6 +92,7 @@ def execute(
         rr.structured_output = parsed.structured_output
         rr.cost_usd = parsed.cost_usd
         rr.duration_ms = parsed.duration_ms
+        rr.resolved_model = parsed.resolved_model
     except Exception as exc:  # parsing must never crash a run
         rr.error = (rr.error + "; " if rr.error else "") + f"parse failed: {exc}"
 

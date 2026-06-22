@@ -12,6 +12,7 @@ from .antigravity import AntigravityAdapter
 from .base import Adapter, ParseOutput, RunOptions
 from .claude import ClaudeAdapter
 from .codex import CodexAdapter
+from .copilot import CopilotAdapter
 
 _ADAPTERS: dict[str, Adapter] = {
     a.name: a
@@ -19,6 +20,7 @@ _ADAPTERS: dict[str, Adapter] = {
         ClaudeAdapter(),
         CodexAdapter(),
         AntigravityAdapter(),
+        CopilotAdapter(),
     )
 }
 
@@ -29,6 +31,8 @@ _ALIASES = {
     "openai": "codex",
     "agy": "antigravity",
     "google": "antigravity",
+    "gh-copilot": "copilot",
+    "github": "copilot",
 }
 
 

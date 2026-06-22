@@ -69,6 +69,7 @@ class RunResult:
     structured_output: Optional[Any] = None  # parsed final JSON, when a schema was requested
     cost_usd: Optional[float] = None
     duration_ms: Optional[int] = None
+    resolved_model: Optional[str] = None  # actual model used (when adapter can detect it)
     stdout_path: Optional[str] = None
     stderr_path: Optional[str] = None
     timed_out: bool = False
@@ -109,6 +110,7 @@ class RunResult:
             "structured_output": self.structured_output,
             "cost_usd": self.cost_usd,
             "duration_ms": self.duration_ms,
+            "resolved_model": self.resolved_model,
             "timed_out": self.timed_out,
             "error": self.error,
             "n_events": len(self.events),

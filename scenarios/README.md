@@ -60,7 +60,7 @@ inside the file; the filename just makes the directory self-describing at a glan
 ## Override precedence
 
 For a single run: **CLI flag > scenario file > built-in default**. So
-`--agents codex` or `--model claude=claude-opus-4-8` or `--no-isolated` on the command line
+`--agent codex` or `--model claude-opus-4-8` or `--no-isolated` on the command line
 override what the file declares, without editing it.
 
 See [../harness/README.md](../harness/README.md) for the full harness

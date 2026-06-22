@@ -1,4 +1,4 @@
-"""The runner: execute a matrix of (agent × eval), assert, and report.
+"""The runner: execute a matrix of (model × eval) for a single agent, assert, and report.
 
 For each cell it:
   1. builds a hermetic workspace (optionally from a fixture),
@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .adapters import get_adapter
-from .adapters.base import Adapter, RunOptions
+from .adapters.base import RunOptions
 from .assertions import AssertionContext, AssertionResult, run_assertion
 from .exec import execute
 from .isolation import build_isolated_home
@@ -39,15 +39,15 @@ from .workspace_view import file_tree, inline_files, writes_outside_workspace
 @dataclass
 class CellResult:
     agent: str
-    model: Optional[str]      # the model id this cell ran (None == the runner's own default)
+    model: Optional[str]
     eval_name: str
     skill: Optional[str]
     passed: bool
     run_result: RunResult
     assertions: list[AssertionResult] = field(default_factory=list)
     artifacts_dir: str = ""
-    isolated: bool = False     # ran against an isolated HOME (only provisioned + vendor skills visible)
-    ungraded: bool = False     # ran clean but nothing graded it (rubric-only eval, judge off)
+    isolated: bool = False
+    ungraded: bool = False
 
     @property
     def n_pass(self) -> int:
@@ -65,8 +65,9 @@ class CellResult:
 class Runner:
     def __init__(
         self,
-        agents: list[str],
+        agent: str,
         *,
+        models: list[Optional[str]],
         artifacts_root: str,
         run_id: str,
         skills_root: str,
@@ -74,11 +75,11 @@ class Runner:
         provision: bool = True,
         auto_approve: bool = True,
         jobs: int = 1,
-        model_map: Optional[dict[str, list[Optional[str]]]] = None,
         isolated: bool = True,
     ):
-        self.agents = agents
-        self.adapters: dict[str, Adapter] = {a: get_adapter(a) for a in agents}
+        self.agent = agent
+        self.adapter = get_adapter(agent)
+        self.models = models
         self.artifacts_root = artifacts_root
         self.run_id = run_id
         self.skills_root = skills_root
@@ -86,10 +87,7 @@ class Runner:
         self.provision = provision
         self.auto_approve = auto_approve
         self.jobs = max(1, jobs)
-        self.model_map = model_map or {}
         self.isolated = isolated
-        # the repo's provisionable skills — masked from each runner's global skills dirs
-        # under isolation so a cell sees only what it provisions (+ the surface's vendor skills).
         self._repo_skill_names = set(skill_names(skills_root))
         self.run_dir = os.path.join(artifacts_root, run_id)
 
@@ -98,36 +96,35 @@ class Runner:
     def run(self, specs: list[EvalSpec]) -> list[CellResult]:
         os.makedirs(self.run_dir, exist_ok=True)
         cells = [
-            (agent, model, spec)
+            (model, spec)
             for spec in specs
-            for agent in self.agents
-            if self._eligible(agent, spec)
-            for model in (self.model_map.get(agent) or [None])
+            if self._eligible(spec)
+            for model in self.models
         ]
 
         results: list[CellResult] = []
         if self.jobs == 1:
-            for agent, model, spec in cells:
-                results.append(self._run_cell(agent, model, spec))
+            for model, spec in cells:
+                results.append(self._run_cell(model, spec))
         else:
             with ThreadPoolExecutor(max_workers=self.jobs) as pool:
-                futs = {pool.submit(self._run_cell, a, m, s): (a, m, s) for a, m, s in cells}
+                futs = {pool.submit(self._run_cell, m, s): (m, s) for m, s in cells}
                 for fut in as_completed(futs):
                     results.append(fut.result())
 
-        results.sort(key=lambda c: (c.eval_name, c.agent, c.model or ""))
+        results.sort(key=lambda c: (c.eval_name, c.model or ""))
         self._write_summary(results, specs)
         return results
 
     # --- internals ----------------------------------------------------------
 
-    def _eligible(self, agent: str, spec: EvalSpec) -> bool:
-        return spec.agents is None or agent in spec.agents
+    def _eligible(self, spec: EvalSpec) -> bool:
+        return spec.agents is None or self.agent in spec.agents
 
-    def _run_cell(self, agent: str, model: Optional[str], spec: EvalSpec) -> CellResult:
-        adapter = self.adapters[agent]
+    def _run_cell(self, model: Optional[str], spec: EvalSpec) -> CellResult:
+        adapter = self.adapter
         cell_dir = os.path.join(
-            self.run_dir, agent, _model_seg(model),
+            self.run_dir, _model_seg(model),
             _safe(spec.skill_name or "_"), _safe(spec.name)
         )
         workspace = os.path.join(cell_dir, "workspace")
@@ -140,11 +137,10 @@ class Runner:
         self._seed_files(workspace, spec)
 
         # 3) render prompt (fill {skill}/{skills} for this adapter)
-        prompt = self._render_prompt(adapter, spec)
+        prompt = self._render_prompt(spec)
 
         # 4) isolate HOME so the model sees only the provisioned skills (+ the surface's
-        #    vendor skills), not this repo's globally-installed skills. Mirror the real HOME;
-        #    mask only the global skills dirs. On failure, fall back to a non-isolated run.
+        #    vendor skills), not this repo's globally-installed skills.
         iso_home = None
         iso_env: dict[str, str] = {}
         isolated = False
@@ -156,17 +152,11 @@ class Runner:
                     iso_home, adapter.global_skills_subpaths, self._repo_skill_names,
                     seed_dirs, os.path.expanduser("~"),
                 )
-                # A custom config home (e.g. $CODEX_HOME) lives outside HOME, so the HOME
-                # mirror doesn't cover it: mirror it separately (skills masked) and repoint
-                # the var, so custom-config users keep auth/config without leaking skills.
                 cfg_root = None
                 for var, skills_sub in getattr(adapter, "isolation_config_homes", []):
                     custom = os.environ.get(var)
                     if custom and os.path.isdir(custom):
                         if cfg_root is None:
-                            # A *fresh* real dir — not iso_home/_cfg, which would be a symlink
-                            # to the real HOME if it has a `_cfg` entry, leaking the mirror
-                            # outside the temp tree (it would survive cleanup).
                             cfg_root = tempfile.mkdtemp(prefix="cfg-", dir=iso_home)
                         mirror = os.path.join(cfg_root, _safe(var))
                         build_isolated_home(mirror, [skills_sub], self._repo_skill_names,
@@ -174,7 +164,7 @@ class Runner:
                         iso_env[var] = mirror
                 isolated = True
             except OSError as exc:
-                print(f"warning: [{agent}] skill isolation unavailable ({exc}); "
+                print(f"warning: [{self.agent}] skill isolation unavailable ({exc}); "
                       "running non-isolated.", file=sys.stderr)
                 shutil.rmtree(iso_home, ignore_errors=True)
                 iso_home = None
@@ -192,23 +182,20 @@ class Runner:
             ex = execute(
                 adapter, prompt, opts,
                 cwd=workspace, timeout=spec.timeout_sec,
-                env_overrides=spec.env, agent_name=agent, eval_name=spec.name,
+                env_overrides=spec.env, agent_name=self.agent, eval_name=spec.name,
             )
         finally:
             if iso_home:
                 shutil.rmtree(iso_home, ignore_errors=True)
         rr = ex.result
 
-        # A rolled-off / mistyped model id surfaces as a run error; point the
-        # maintainer back to the config rather than leaving a raw CLI stderr.
         if model and rr.error and _looks_like_model_error(rr.error, ex.stderr):
-            rr.error = f"model {model!r} rejected by {agent} — check models.yaml: {rr.error}"
+            rr.error = f"model {model!r} rejected by {self.agent} — check models.yaml: {rr.error}"
 
         # 6) artifacts
         self._write_artifacts(cell_dir, ex.stdout, ex.stderr, rr)
 
-        # 7) assertions. With no judge active, skip llm_judge checks rather than failing
-        #    them — a --no-judge run is graded on its deterministic assertions only.
+        # 7) assertions
         effective = spec.effective_assertions()
         skipped_judge = self.judge is None and any(
             c.get("type") == "llm_judge" for c in effective)
@@ -219,27 +206,20 @@ class Runner:
             if not (self.judge is None and cfg.get("type") == "llm_judge")
         ]
         clean = rr.error is None and not rr.timed_out
-        # "ungraded": ran clean but the only checks were judge checks we skipped — nothing
-        # actually graded the behavior, so it's neither a pass nor a fail. A genuinely
-        # assertion-less eval (no rubric either) stays a clean-run smoke-test pass.
         ungraded = clean and not checks and skipped_judge
         passed = False if ungraded else (
             (clean and all(c.passed for c in checks)) if checks else clean)
 
         cell = CellResult(
-            agent=agent, model=model, eval_name=spec.name, skill=spec.skill_name,
+            agent=self.agent, model=model, eval_name=spec.name, skill=spec.skill_name,
             passed=passed, run_result=rr, assertions=checks, artifacts_dir=cell_dir,
             isolated=isolated, ungraded=ungraded,
         )
         self._write_cell_json(cell_dir, cell)
-        # readable, self-contained dossier per cell (judge-independent: written for every cell,
-        # pass or fail, with or without a judge) — prompt + full transcript + everything produced.
         _write(os.path.join(cell_dir, "report.md"), render_report(cell))
         return cell
 
     def _skill_dirs(self, spec: EvalSpec) -> list[str]:
-        """Source dirs for the eval's declared skills — real skill dirs (with a SKILL.md)
-        under skills_root, so a non-skill folder is never provisioned."""
         dirs = []
         for name in spec.skills:
             d = os.path.join(self.skills_root, name)
@@ -257,13 +237,13 @@ class Runner:
                 os.makedirs(os.path.dirname(dest) or workspace, exist_ok=True)
                 shutil.copy2(src, dest)
 
-    def _render_prompt(self, adapter: Adapter, spec: EvalSpec) -> str:
+    def _render_prompt(self, spec: EvalSpec) -> str:
         prompt = spec.rendered_prompt()
         primary = spec.skills[0] if spec.skills else (spec.skill_name or "")
         if primary:
-            prompt = prompt.replace("{skill}", adapter.format_skill(primary))
+            prompt = prompt.replace("{skill}", self.adapter.format_skill(primary))
         if spec.skills:
-            joined = ", ".join(adapter.format_skill(s) for s in spec.skills)
+            joined = ", ".join(self.adapter.format_skill(s) for s in spec.skills)
             prompt = prompt.replace("{skills}", joined)
         return prompt
 
@@ -298,15 +278,10 @@ class Runner:
         )
 
     def _write_summary(self, results: list[CellResult], specs: list[EvalSpec]) -> None:
-        targets = [
-            {"agent": a, "model": m}
-            for a in self.agents
-            for m in (self.model_map.get(a) or [None])
-        ]
         summary = {
             "run_id": self.run_id,
-            "agents": self.agents,
-            "targets": targets,
+            "agent": self.agent,
+            "models": [m for m in self.models if m is not None] or ["default"],
             "isolated": self.isolated,
             "n_evals": len(specs),
             "n_cells": len(results),
@@ -327,37 +302,15 @@ class Runner:
         }
         _write_json(os.path.join(self.run_dir, "summary.json"), summary)
         _write(os.path.join(self.run_dir, "summary.md"),
-               render_markdown(results, self.agents, self.model_map, run_dir=self.run_dir))
+               render_markdown(results, self.agent, self.models, run_dir=self.run_dir))
 
 
 # ---------------------------------------------------------------------------
 # Reporting helpers (also used by the CLI for stdout)
 # ---------------------------------------------------------------------------
 
-ModelMap = dict[str, list[Optional[str]]]
-
-
-def _targets(agents: list[str], model_map: Optional[ModelMap],
-             results: list[CellResult]) -> list[tuple[str, Optional[str]]]:
-    """Ordered (agent, model) columns. Prefer the declared map; fall back to
-    whatever models actually appear in the results (for callers without a map)."""
-    out: list[tuple[str, Optional[str]]] = []
-    for a in agents:
-        models = (model_map or {}).get(a)
-        if not models:
-            models = []
-            for c in results:
-                if c.agent == a and c.model not in models:
-                    models.append(c.model)
-            if not models:
-                models = [None]
-        for m in models:
-            out.append((a, m))
-    return out
-
-
-def _target_label(agent: str, model: Optional[str]) -> str:
-    return f"{agent}:{model if model else 'default'}"
+def _model_label(model: Optional[str]) -> str:
+    return model if model else "default"
 
 
 def _cell_text(c: Optional[CellResult]) -> str:
@@ -380,82 +333,72 @@ def _cell_mark(c: Optional[CellResult]) -> str:
     return f"{'✅' if c.passed else '❌'} {c.n_pass}/{c.n_total}"
 
 
-def render_matrix(results: list[CellResult], agents: list[str],
-                  model_map: Optional[ModelMap] = None) -> str:
-    """A single wide eval × (runner:model) pass/fail grid for the terminal,
-    followed by a pass-rate-by-target footer."""
-    by_key = {(c.eval_name, c.agent, c.model): c for c in results}
+def render_matrix(results: list[CellResult], agent: str,
+                  models: list[Optional[str]]) -> str:
+    """Eval × model pass/fail grid for the terminal."""
+    by_key = {(c.eval_name, c.model): c for c in results}
     evals = sorted({c.eval_name for c in results})
-    targets = _targets(agents, model_map, results)
-    labels = [_target_label(a, m) for a, m in targets]
+    labels = [_model_label(m) for m in models]
 
     eval_w = max([len("EVAL")] + [len(e) for e in evals]) + 2
     col_w = max([14] + [len(l) + 2 for l in labels]) if labels else 14
     header = "EVAL".ljust(eval_w) + "".join(l.center(col_w) for l in labels)
-    lines = [header, "-" * len(header)]
+    lines = [f"agent: {agent}", header, "-" * len(header)]
     for ev in evals:
         row = ev.ljust(eval_w)
-        for a, m in targets:
-            row += _cell_text(by_key.get((ev, a, m))).center(col_w)
+        for m in models:
+            row += _cell_text(by_key.get((ev, m))).center(col_w)
         lines.append(row)
 
-    lines += ["", "pass rate by target:"]
-    for a, m in targets:
-        cells = [c for c in (by_key.get((ev, a, m)) for ev in evals) if c is not None]
+    lines += ["", "pass rate:"]
+    for m in models:
+        cells = [c for c in (by_key.get((ev, m)) for ev in evals) if c is not None]
         graded = [c for c in cells if not c.ungraded]
         npass = sum(1 for c in graded if c.passed)
         ung = len(cells) - len(graded)
         extra = f"   ({ung} ungraded)" if ung else ""
-        lines.append(f"  {_target_label(a, m):<28} {npass}/{len(graded)}{extra}")
+        lines.append(f"  {_model_label(m):<28} {npass}/{len(graded)}{extra}")
     return "\n".join(lines)
 
 
-def render_markdown(results: list[CellResult], agents: list[str],
-                    model_map: Optional[ModelMap] = None,
+def render_markdown(results: list[CellResult], agent: str,
+                    models: list[Optional[str]],
                     run_dir: Optional[str] = None) -> str:
-    by_key = {(c.eval_name, c.agent, c.model): c for c in results}
+    by_key = {(c.eval_name, c.model): c for c in results}
     evals = sorted({c.eval_name for c in results})
-    targets = _targets(agents, model_map, results)
-    labels = [_target_label(a, m) for a, m in targets]
+    labels = [_model_label(m) for m in models]
 
     def _linked_mark(c: Optional[CellResult]) -> str:
-        """Each cell links to its per-cell report.md (prompt + full transcript + produced
-        files) so the table is a jumping-off point, not a dead end."""
         mark = _cell_mark(c)
         if run_dir and c is not None and c.artifacts_dir:
             rel = os.path.relpath(os.path.join(c.artifacts_dir, "report.md"), run_dir)
             return f"[{mark}]({rel})"
         return mark
 
-    lines = ["# Eval results", "",
+    lines = [f"# Eval results — {agent}", "",
              "Each cell links to a per-cell `report.md` — the prompt the model was given, "
              "its complete response (full transcript), and every file it produced.", "",
              "| eval | " + " | ".join(labels) + " |",
              "|" + "---|" * (len(labels) + 1)]
     for ev in evals:
-        cells = [_linked_mark(by_key.get((ev, a, m))) for a, m in targets]
+        cells = [_linked_mark(by_key.get((ev, m))) for m in models]
         lines.append(f"| {ev} | " + " | ".join(cells) + " |")
 
-    lines += ["", "## Pass rate by target", "", "| target | pass rate |", "|---|---|"]
-    for a, m in targets:
-        cells = [c for c in (by_key.get((ev, a, m)) for ev in evals) if c is not None]
+    lines += ["", "## Pass rate", "", "| model | pass rate |", "|---|---|"]
+    for m in models:
+        cells = [c for c in (by_key.get((ev, m)) for ev in evals) if c is not None]
         graded = [c for c in cells if not c.ungraded]
         npass = sum(1 for c in graded if c.passed)
         ung = len(cells) - len(graded)
         rate = f"{npass}/{len(graded)}" + (f" ({ung} ungraded)" if ung else "")
-        lines.append(f"| {_target_label(a, m)} | {rate} |")
+        lines.append(f"| {_model_label(m)} | {rate} |")
     return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
-# Per-cell readable report — the prompt the model was given + its complete
-# response (full transcript) + everything it produced, so a human can look at
-# the same evidence the judge did and judge for themselves. Written for every
-# cell (pass/fail, judge on/off) by Runner._run_cell.
+# Per-cell readable report
 # ---------------------------------------------------------------------------
 
-# Noisy intermediate tool output is the one thing we clip (with a pointer to the
-# raw artifacts); the prompt, the answer, and produced files are shown in full.
 _TOOL_RESULT_CLIP = 4000
 
 
@@ -468,8 +411,6 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _render_transcript(rr: RunResult) -> str:
-    """The model's complete response as an ordered transcript: assistant messages,
-    reasoning, tool calls, shell commands, tool results, and file changes."""
     out: list[str] = []
     for e in rr.events:
         k = e.kind
@@ -496,16 +437,14 @@ def _render_transcript(rr: RunResult) -> str:
         elif k == EventKind.ERROR:
             if e.text:
                 out.append(f"**error:** {e.text}")
-        # SESSION_START / RESULT / OTHER: skipped (RESULT is shown under "Final answer").
     return "\n\n".join(out)
 
 
 def render_report(cell: CellResult) -> str:
-    """A self-contained Markdown dossier for one cell."""
     rr = cell.run_result
-    out: list[str] = [f"# {cell.eval_name} — {_target_label(cell.agent, cell.model)}", ""]
+    title = f"{cell.agent}:{cell.model or 'default'}"
+    out: list[str] = [f"# {cell.eval_name} — {title}", ""]
 
-    # header / verdict
     out.append(f"- **verdict:** {_cell_mark(cell)}")
     if cell.skill:
         out.append(f"- **skill(s):** {cell.skill}")
@@ -514,6 +453,8 @@ def render_report(cell: CellResult) -> str:
         meta.append(f"cost ${rr.cost_usd:.4f}")
     if rr.duration_ms is not None:
         meta.append(f"{rr.duration_ms / 1000:.1f}s")
+    if rr.resolved_model and rr.resolved_model != cell.model:
+        meta.append(f"resolved model: {rr.resolved_model}")
     meta.append(f"isolated: {'yes' if cell.isolated else 'no'}")
     if rr.timed_out:
         meta.append("TIMED OUT")
@@ -521,32 +462,27 @@ def render_report(cell: CellResult) -> str:
     if rr.error:
         out.append(f"- **error:** {rr.error}")
 
-    # prompt
     out += ["", "## Prompt given to the model", "", "```", rr.prompt or "(empty)", "```"]
 
-    # complete response (transcript)
     transcript = _render_transcript(rr)
     out += ["", "## Complete response (transcript)", ""]
     out.append(transcript if transcript.strip()
                else "_(This adapter captured no event trace — see the final answer below.)_")
 
-    # final answer
     out += ["", "## Final answer", "", rr.final_text or "_(empty)_"]
     if rr.structured_output is not None:
         out += ["", "**Structured output:**", "", "```json",
                 json.dumps(rr.structured_output, indent=2, default=str), "```"]
 
-    # everything the model produced
     workspace = os.path.join(cell.artifacts_dir, "workspace")
     extra = writes_outside_workspace(rr, workspace)
     out += ["", "## Files the model produced", "",
             "```", file_tree(workspace, extra), "```"]
-    inline = inline_files(workspace, extra)   # no caps: full contents of every text file
+    inline = inline_files(workspace, extra)
     if inline.strip():
         out += ["", inline]
     out += ["", "_(Non-text files are listed above but not inlined.)_"]
 
-    # judge verdict (or a graceful note when the judge was off)
     out += ["", "## Judge verdict", ""]
     judge_a = next((a for a in cell.assertions if a.type == "llm_judge"), None)
     if judge_a is None:
@@ -562,7 +498,6 @@ def render_report(cell: CellResult) -> str:
         if det.get("judge_error"):
             out += ["", "> ⚠ the judge failed to return a parseable verdict."]
 
-    # deterministic assertions
     others = [a for a in cell.assertions if a.type != "llm_judge"]
     if others:
         out += ["", "## Deterministic assertions", ""]
@@ -581,11 +516,6 @@ def _safe(name: str) -> str:
 
 
 def _model_seg(model: Optional[str]) -> str:
-    """Collision-free filesystem segment for a model id.
-
-    `_safe` collapses '/', ':', and spaces to '_', so distinct ids (e.g. `a/b`,
-    `a:b`) could map to the same dir. Append a short hash of the raw id whenever
-    sanitizing changed it, so distinct ids never share a directory."""
     if not model:
         return "_default"
     safe = _safe(model)
@@ -595,7 +525,6 @@ def _model_seg(model: Optional[str]) -> str:
 
 
 def _looks_like_model_error(error: Optional[str], stderr: Optional[str]) -> bool:
-    """Heuristic: did the CLI reject the model id (rolled off / mistyped)?"""
     blob = f"{error or ''} {stderr or ''}".lower()
     return any(k in blob for k in ("model", "not found", "unknown", "invalid", "unsupported"))
 

@@ -196,7 +196,7 @@ agentskill-evals list-evals --skills-root .
 
 # one skill, specific agents, parallel, verbose failures
 agentskill-evals run --skill sliderule-docsearch \
-    --agents claude codex antigravity --jobs 4 -v
+    --agent claude --jobs 4 -v
 
 # a single eval file, no judge, just deterministic checks
 agentskill-evals run --evals path/to/eval.yaml --no-judge
@@ -282,28 +282,26 @@ judge: true        # optional run knobs (CLI flags override): judge / isolated /
 isolated: true
 ```
 
-Precedence for a run is **CLI flag > scenario file > built-in default**, so `--agents`,
+Precedence for a run is **CLI flag > scenario file > built-in default**, so `--agent`,
 `--model`, `--no-isolated`, etc. override the file without editing it. Scenario artifacts land
-under `artifacts/<run_id>/<runner>/<model>/scenario/<name>/`. Files live in
+under `artifacts/<run_id>/<model>/scenario/<name>/`. Files live in
 [`../scenarios/`](../scenarios/) with the convention `<what>_on_<runner>-<model>.yaml`; see
 [scenarios/README.md](../scenarios/README.md).
 
 ## Cross-model testing
 
 The same skill can behave very differently on different **models**, so model is a
-first-class axis: a run is a matrix of `evals × (runner, model)`. A "runner" is the
-harness used to reach a model (Claude Code, Codex, AntiGravity); the models live in
-**`models.yaml`** at the repo root — the single source of truth (no model ids are
-hardcoded in the harness).
+first-class axis: a run is a matrix of `evals × models` for a single runner. A "runner"
+is the CLI used to reach a model (Claude Code, Codex, AntiGravity, Copilot); the models
+live in **`models.yaml`** at the repo root — the single source of truth (no model ids are
+hardcoded in the harness). Each `run` targets one runner via `--agent`.
 
 > ⚠️ **Cost.** Every cell is a full agent run **plus** a judge call, and the axes
-> multiply (`evals × runners × models`). The whole suite across every model is
-> currently ~231 cells (33 evals × 7 runner/model targets, ≈462 paid LLM calls),
-> and it grows as evals and models are added. To keep that from happening by accident:
-> `run` **requires** `--skill`, `--evals`, or `--config` (no unscoped broad discovery);
-> a scoped run uses only the **cheapest** model per runner by default; the full grid needs
-> `--all-models`; there's a hard `--max-cells` ceiling (default 25) and a
-> confirmation prompt for any multi-cell run. Further narrow with `--agents`,
+> multiply (`evals × models`). To keep that from happening by accident:
+> `run` **requires** `--agent` and `--skill`/`--evals`/`--config` (no unscoped broad
+> discovery); a scoped run uses only the **cheapest** model by default; the full model
+> list needs `--all-models`; there's a hard `--max-cells` ceiling (default 25) and a
+> confirmation prompt for any multi-cell run. Further narrow with `--model`,
 > `--no-judge`, and preview with `--dry-run`.
 
 `models.yaml` (grouped per runner so each model change is a one-block edit):
@@ -342,23 +340,15 @@ agentskill-evals run --skill sliderule-region-picker --all-models
 agentskill-evals run --skill sliderule-region-picker --all-models --dry-run
 ```
 
-The terminal shows a single wide grid (eval rows × `runner:model` columns) plus a
-pass-rate-by-target footer; `summary.json` records each cell's `model` and the
-top-level `targets`.
+The terminal shows a single wide grid (eval rows × model columns) plus a
+pass-rate footer; `summary.json` records each cell's `model` and the agent.
 
-### What we test: models, not surfaces
+### Single-runner invocations
 
-Behavioral coverage is keyed to the **model** — for these domain-knowledge skills, once
-the skill text reaches the model, the model determines whether the guidance is followed.
-A *surface* (Claude Code, Codex, AntiGravity, CoPilot, any aggregator) matters for
-**installation** (per surface — see the root README) and, second-order, for scaffolding;
-we test one representative runner per model and accept that minor effect.
-
-So **aggregators / passthrough surfaces (CoPilot, etc.) are install targets, not test
-runners** — running an already-covered model through another surface adds ~no coverage and
-multiplies cost. AntiGravity is itself an aggregator (`agy` can run Claude/Gemini/GPT-OSS),
-so to avoid duplication **each model is listed under exactly one runner** in `models.yaml`.
-A surface only becomes a test runner if it reaches a model no existing runner covers.
+Each `run` invocation targets exactly one runner via `--agent`. This keeps cost
+transparent — you know what runner you're paying for — and simplifies the output.
+Multi-vendor runners like Copilot and AntiGravity list all models they support;
+overlap with other runners is expected and fine, since runs are scoped to one runner.
 
 ### Maintaining the models tested
 
@@ -370,23 +360,22 @@ This is the framework's main upkeep over time. `models.yaml` is the only place t
 - **Add a new runner:** add a `<runner>:` block — the runner must also have an adapter
   (see "Adding a new runner").
 
-Find current ids: **claude** → Anthropic model docs (or the `claude-api` skill); **codex**
-→ `codex --help` / OpenAI Codex docs; **antigravity** → `agy models` (map the display name
-to its `--model` token).
+Find current ids: **claude** → Anthropic model docs; **codex** → `codex --help`;
+**antigravity** → `agy models`; **copilot** → `copilot --help`.
 
 Validate an edit (no guessing):
 
 ```bash
 agentskill-evals list-agents          # resolved models + default + any warnings
-agentskill-evals run … --dry-run      # confirm targets/cell count, spend nothing
+agentskill-evals run --agent claude --skill X --dry-run  # confirm cell count, spend nothing
 # optional cheap smoke for a new id (catches typos / rolled-off ids):
-agentskill-evals run --evals <one>.yaml --model <runner>=<new-id> --no-judge
+agentskill-evals run --agent copilot --evals <one>.yaml --model <new-id> --no-judge
 ```
 
 `list-agents` and the top of every `run` surface load-time validation warnings (a `default:`
 not in `models:`, duplicates, an unknown runner) without hard-blocking. The one exception is
 a `models.yaml` that exists but can't be parsed: `run` treats that as fatal (otherwise it
-would silently fall back to each CLI's own, possibly pricier, default and break the
+would silently fall back to the CLI's own, possibly pricier, default and break the
 "cheapest model by default" guarantee), while `list-agents` still degrades to a warning. A
 model that has been retired surfaces as a run error annotated `model 'x' rejected by
 <runner> — check models.yaml`, so the fix location is obvious.

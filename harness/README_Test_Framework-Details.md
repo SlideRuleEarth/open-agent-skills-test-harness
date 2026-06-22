@@ -13,10 +13,11 @@ A self-contained Python harness (this folder, [`harness/`](.)) that runs each
 - A **runner** is the CLI used to reach a model, via a pluggable *adapter*:
   [claude.py](agentskill_evals/adapters/claude.py),
   [codex.py](agentskill_evals/adapters/codex.py),
-  [antigravity.py](agentskill_evals/adapters/antigravity.py).
+  [antigravity.py](agentskill_evals/adapters/antigravity.py),
+  [copilot.py](agentskill_evals/adapters/copilot.py).
 - **Models** come from [models.yaml](../models.yaml) (the single source of truth; the cheapest
-  is each runner's default). Coverage is keyed to the *model*, not the surface — aggregators
-  are install targets, not runners.
+  is each runner's default). Each `run` targets one runner via `--agent`; multi-vendor runners
+  list all models they support (overlap across runners is expected).
 
 ## Where evals live
 
