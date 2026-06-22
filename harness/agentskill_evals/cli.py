@@ -443,13 +443,14 @@ def cmd_list_configured_agents(args) -> int:
         print(f"warning: models.yaml: {w}", file=sys.stderr)
 
     print(f"config: {config_path}\n")
-    print(f"{'RUNNER':<14}{'BINARY':<10}{'INSTALLED':<11}{'DEFAULT MODEL':<20}CONFIGURED MODELS")
-    for a in all_adapters():
+    all_defaults = [cfg.default(a.name) or "(cli default)" for a in all_adapters()]
+    dflt_w = max(len("DEFAULT MODEL"), max(len(d) for d in all_defaults)) + 2
+    print(f"{'RUNNER':<14}{'BINARY':<10}{'INSTALLED':<11}{'DEFAULT MODEL':<{dflt_w}}CONFIGURED MODELS")
+    for a, dflt in zip(all_adapters(), all_defaults):
         models = cfg.models(a.name)
-        dflt = cfg.default(a.name) or "(cli default)"
         models_str = ", ".join(models) if models else "(cli default)"
         avail = "yes" if a.is_available() else "no"
-        print(f"{a.name:<14}{a.binary:<10}{avail:<11}{dflt:<20}{models_str}")
+        print(f"{a.name:<14}{a.binary:<10}{avail:<11}{dflt:<{dflt_w}}{models_str}")
     print("\nThis shows what models.yaml declares. Use `list-agents-available-models` to probe the CLIs.")
     return 0
 
