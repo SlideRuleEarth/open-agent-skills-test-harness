@@ -19,10 +19,12 @@ item.completed is only counted once as a TOOL_CALL.
 
 from __future__ import annotations
 
-from typing import Any
+import json
+import subprocess
+from typing import Any, Optional
 
 from ..schema import EventKind, NormalizedEvent
-from .base import Adapter, ParseOutput, RunOptions, extract_command, extract_path, iter_jsonl, try_load_json
+from .base import Adapter, ParseOutput, ProbeResult, RunOptions, extract_command, extract_path, iter_jsonl, try_load_json
 
 
 class CodexAdapter(Adapter):
@@ -34,6 +36,38 @@ class CodexAdapter(Adapter):
     # CODEX_HOME overrides ~/.codex (skills under $CODEX_HOME/skills). Under isolation it's
     # mirrored + repointed (custom home kept, skills masked), else cleared to the isolated home.
     isolation_config_homes = [("CODEX_HOME", "skills")]
+    has_model_list = True
+
+    def discover_models(self) -> Optional[list[str]]:
+        try:
+            r = subprocess.run(
+                [self.binary, "debug", "models"], capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode != 0:
+                return None
+            data = json.loads(r.stdout)
+            return [m["slug"] for m in data.get("models", []) if m.get("slug")]
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError,
+                json.JSONDecodeError, KeyError):
+            return None
+
+    def _probe_argv(self, model: str):
+        return [self.binary, "--ask-for-approval", "never", "--sandbox", "read-only",
+                "exec", "--json", "-m", model, "say ok"]
+
+    def _parse_probe_cost(self, output: str) -> ProbeResult:
+        import json as _json
+        for line in output.splitlines():
+            try:
+                obj = _json.loads(line.strip())
+            except (ValueError, _json.JSONDecodeError):
+                continue
+            if obj.get("type") == "turn.completed":
+                usage = obj.get("usage") or {}
+                tokens = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+                if tokens:
+                    return ProbeResult(accepted=True, cost_usd=None)
+        return ProbeResult(accepted=True)
 
     def format_skill(self, skill: str) -> str:
         # Mirrors the OpenAI example which referenced skills as "$skill-name".

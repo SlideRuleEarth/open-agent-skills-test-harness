@@ -50,7 +50,7 @@ root, prefix it with `make -C harness`):
 | `make install` | running the evals | Puts the `agentskill-evals` CLI on your PATH in an isolated env (pipx). |
 | `make dev` | editing the harness | Creates `.venv/` and editable-installs with the `[schema]` extra (adds `jsonschema`; a built-in fallback works without it). Activate with `. .venv/bin/activate`. |
 
-Both pull in `pyyaml` for you. After `make install`, sanity-check with `agentskill-evals list-agents
+Both pull in `pyyaml` for you. After `make install`, sanity-check with `agentskill-evals list-agents-configured-models
 --skills-root ..`; `make help` lists the other targets (`selftest`, `clean`, `uninstall`).
 
 > **`make install` requires [pipx](https://pipx.pypa.io).** Install it with `brew install pipx`
@@ -89,9 +89,9 @@ python3 -m agentskill_evals run --skills-root .. --config ../scenarios/<file>.ya
   `requires-python` error — select one explicitly: `pipx install . --python python3.12`, or
   `make dev PYTHON=python3.12`.
 - `selftest` and `--help` need no dependencies; anything that reads YAML evals or `models.yaml`
-  (`run`, `list-evals`, full `list-agents`) needs `pyyaml` — every option above provides it.
+  (`run`, `list-evals`, `list-agents-configured-models`) needs `pyyaml` — every option above provides it.
 - Install whichever agent CLIs you want to test (`claude`, `codex`, `agy`). Missing ones are marked
-  `ERR` / skipped — `list-agents` shows what's available.
+  `ERR` / skipped — `list-agents-configured-models` shows what's available.
 
 ## Eval format
 
@@ -186,8 +186,11 @@ directory).
 ```bash
 # from the skills repo root (each <skill>/evals/ is discovered automatically)
 
-# what's installed?
-agentskill-evals list-agents
+# what's configured?
+agentskill-evals list-agents-configured-models
+
+# verify what's actually available (probes CLIs — has a small cost)?
+agentskill-evals list-agents-available-models
 
 # what evals exist?
 agentskill-evals list-evals --skills-root .
@@ -366,19 +369,20 @@ Find current ids: **claude** → Anthropic model docs; **codex** → `codex --he
 Validate an edit (no guessing):
 
 ```bash
-agentskill-evals list-agents          # resolved models + default + any warnings
+agentskill-evals list-agents-configured-models   # what models.yaml declares
+agentskill-evals list-agents-available-models     # probe CLIs to verify (has a small cost)
 agentskill-evals run --agent claude --skill X --dry-run  # confirm cell count, spend nothing
-# optional cheap smoke for a new id (catches typos / rolled-off ids):
-agentskill-evals run --agent copilot --evals <one>.yaml --model <new-id> --no-judge
 ```
 
-`list-agents` and the top of every `run` surface load-time validation warnings (a `default:`
-not in `models:`, duplicates, an unknown runner) without hard-blocking. The one exception is
-a `models.yaml` that exists but can't be parsed: `run` treats that as fatal (otherwise it
-would silently fall back to the CLI's own, possibly pricier, default and break the
-"cheapest model by default" guarantee), while `list-agents` still degrades to a warning. A
-model that has been retired surfaces as a run error annotated `model 'x' rejected by
-<runner> — check models.yaml`, so the fix location is obvious.
+`list-agents-configured-models` and the top of every `run` surface load-time validation
+warnings (a `default:` not in `models:`, duplicates, an unknown runner) without hard-blocking.
+`list-agents-available-models` goes further — it probes each CLI to verify configured models
+are accepted and discovers models not yet in the config. The one exception is a `models.yaml`
+that exists but can't be parsed: `run` treats that as fatal (otherwise it would silently fall
+back to the CLI's own, possibly pricier, default and break the "cheapest model by default"
+guarantee), while `list-agents-configured-models` still degrades to a warning. A model that
+has been retired surfaces as a run error annotated `model 'x' rejected by <runner> — check
+models.yaml`, so the fix location is obvious.
 
 ## Adding a new runner
 

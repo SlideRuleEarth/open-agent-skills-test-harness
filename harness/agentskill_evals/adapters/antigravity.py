@@ -19,7 +19,8 @@ Verified against agy 1.0.9:
 
 from __future__ import annotations
 
-from typing import Any
+import subprocess
+from typing import Any, Optional
 
 from ..schema import EventKind, NormalizedEvent
 from .base import (
@@ -43,6 +44,23 @@ class AntigravityAdapter(Adapter):
         ".gemini/antigravity-ide/skills",
         ".antigravity/skills",
     ]
+
+    has_model_list = True
+
+    def discover_models(self) -> Optional[list[str]]:
+        try:
+            r = subprocess.run(
+                [self.binary, "models"], capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode != 0:
+                return None
+            return [line.strip() for line in r.stdout.splitlines() if line.strip()]
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return None
+
+    def _probe_argv(self, model: str):
+        return [self.binary, "-p", "say ok", "--dangerously-skip-permissions",
+                "--model", model]
 
     def format_skill(self, skill: str) -> str:
         return f"/{skill}"

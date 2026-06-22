@@ -60,7 +60,7 @@ All `run` invocations **require** `--skill`, `--evals`, or `--config` — no uns
 
 ```bash
 # what's installed and available?
-agentskill-evals list-agents --skills-root .
+agentskill-evals list-agents-configured-models --skills-root .
 agentskill-evals list-evals  --skills-root .
 
 # run one skill's evals on one agent (cheapest model)
@@ -80,7 +80,7 @@ Run artifacts land in `artifacts/<run_id>/`.
 
 ## `models.yaml` — single source of truth for model IDs
 
-**Never hardcode model IDs anywhere in the harness code.** All models are declared in `models.yaml` at the repo root, grouped per runner. Edit only this file to add/retire models or change the cheap default. After editing, validate with `agentskill-evals list-agents`.
+**Never hardcode model IDs anywhere in the harness code.** All models are declared in `models.yaml` at the repo root, grouped per runner. Edit only this file to add/retire models or change the cheap default. After editing, validate with `agentskill-evals list-agents-configured-models`.
 
 ## Eval file conventions
 

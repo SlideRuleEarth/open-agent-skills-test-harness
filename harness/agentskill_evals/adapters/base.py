@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -39,6 +40,24 @@ class RunOptions:
     output_format: Optional[str] = None  # adapter-specific override (e.g. "json"/"stream-json")
     home: Optional[str] = None           # isolated HOME for this run (see isolation.py); None = real HOME
     isolation_env: dict = field(default_factory=dict)  # config-home vars repointed at isolated mirrors
+
+
+@dataclass
+class ProbeResult:
+    """Outcome of probing a single model."""
+
+    accepted: bool
+    cost_usd: Optional[float] = None
+    premium_requests: Optional[float] = None
+
+    @property
+    def cost_str(self) -> str:
+        parts = []
+        if self.cost_usd is not None:
+            parts.append(f"${self.cost_usd:.4f}")
+        if self.premium_requests is not None:
+            parts.append(f"{self.premium_requests}req")
+        return " / ".join(parts) if parts else ""
 
 
 @dataclass
@@ -76,6 +95,52 @@ class Adapter(ABC):
 
     def resolved_binary(self) -> Optional[str]:
         return shutil.which(self.binary) if self.binary else None
+
+    has_model_list: bool = False
+
+    def discover_models(self) -> Optional[list[str]]:
+        """Probe the CLI for its available models.
+
+        Returns a list of model id strings, or None if this adapter cannot
+        discover models (the default).  Subclasses override with CLI-specific
+        logic and set ``has_model_list = True``.
+        """
+        return None
+
+    def probe_model(self, model: str, timeout: int = 30) -> ProbeResult:
+        """Probe whether the CLI accepts *model*.
+
+        Returns a ProbeResult with acceptance status and cost information
+        extracted from the CLI's output.
+        """
+        argv = self._probe_argv(model)
+        if not argv:
+            return ProbeResult(accepted=True)
+        try:
+            r = subprocess.run(
+                argv, capture_output=True, text=True,
+                timeout=timeout, stdin=subprocess.DEVNULL,
+            )
+            combined = r.stderr + r.stdout
+            lower = combined.lower()
+            if "not available" in lower or "invalid model" in lower or "unknown model" in lower:
+                return ProbeResult(accepted=False)
+            if r.returncode != 0:
+                return ProbeResult(accepted=False)
+            return self._parse_probe_cost(combined)
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return ProbeResult(accepted=False)
+
+    def _parse_probe_cost(self, output: str) -> ProbeResult:
+        """Extract cost info from probe output. Override per adapter."""
+        return ProbeResult(accepted=True)
+
+    def _probe_argv(self, model: str) -> Optional[list[str]]:
+        """Return the argv to probe whether *model* is accepted.
+
+        Override per adapter.  Return None to skip probing.
+        """
+        return None
 
     # --- skill provisioning -------------------------------------------------
 

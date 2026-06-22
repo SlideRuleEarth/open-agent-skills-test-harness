@@ -1,7 +1,7 @@
 """Command-line interface.
 
     agentskill-evals run --agent claude --skill sliderule-docsearch
-    agentskill-evals list-agents
+    agentskill-evals list-agents-configured-models
     agentskill-evals list-evals
     agentskill-evals selftest    # parser tests, no CLIs required
 """
@@ -263,7 +263,7 @@ def cmd_run(args) -> int:
         agent = scenario_runner
     else:
         print(f"error: --agent is required. Known runners: {', '.join(adapter_names())}.\n"
-              "  Use `list-agents` to see availability and configured models.",
+              "  Use `list-agents-configured-models` to see availability and configured models.",
               file=sys.stderr)
         return 2
 
@@ -431,25 +431,130 @@ def cmd_run(args) -> int:
     return 0 if graded and not failed else 1
 
 
-def cmd_list_agents(args) -> int:
+def cmd_list_configured_agents(args) -> int:
     skills_root = os.path.abspath(getattr(args, "skills_root", None) or _default_skills_root())
-    cfg = _load_models_config(getattr(args, "models_config", None)
-                              or _default_config_path(skills_root))
+    config_path = os.path.abspath(
+        getattr(args, "models_config", None) or _default_config_path(skills_root))
+    cfg = _load_models_config(config_path)
     if cfg.load_error:
-        print(f"warning: models.yaml could not be loaded ({cfg.load_error}); "
+        print(f"warning: could not load {config_path} ({cfg.load_error}); "
               "showing each runner's CLI default.", file=sys.stderr)
     for w in cfg.warnings:
         print(f"warning: models.yaml: {w}", file=sys.stderr)
 
-    print(f"{'RUNNER':<14}{'BINARY':<10}{'AVAILABLE':<11}{'DEFAULT MODEL':<20}MODELS")
+    print(f"config: {config_path}\n")
+    print(f"{'RUNNER':<14}{'BINARY':<10}{'INSTALLED':<11}{'DEFAULT MODEL':<20}CONFIGURED MODELS")
     for a in all_adapters():
         models = cfg.models(a.name)
         dflt = cfg.default(a.name) or "(cli default)"
         models_str = ", ".join(models) if models else "(cli default)"
         avail = "yes" if a.is_available() else "no"
         print(f"{a.name:<14}{a.binary:<10}{avail:<11}{dflt:<20}{models_str}")
-    print("\nEach runner lists the models it supports (overlap across runners is expected).")
-    print("Use --agent <runner> with `run` to select one.")
+    print("\nThis shows what models.yaml declares. Use `list-agents-available-models` to probe the CLIs.")
+    return 0
+
+
+def cmd_list_available_agents(args) -> int:
+    skills_root = os.path.abspath(getattr(args, "skills_root", None) or _default_skills_root())
+    config_path = os.path.abspath(
+        getattr(args, "models_config", None) or _default_config_path(skills_root))
+    cfg = _load_models_config(config_path)
+
+    installed = [a for a in all_adapters() if a.is_available()]
+    if not installed:
+        print("No agent CLIs found on PATH.", file=sys.stderr)
+        return 2
+
+    configured_counts = {a.name: len(cfg.models(a.name)) for a in installed}
+    total_probes = sum(configured_counts.values())
+    runners_str = ", ".join(f"{a.name} ({configured_counts[a.name]})" for a in installed)
+
+    skip_confirm = getattr(args, "yes", False)
+    if not skip_confirm:
+        print("This will probe each installed CLI to verify which models are accepted.")
+        print(f"Each probe sends a trivial prompt ('say ok') to the model — this has a small cost.\n")
+        has_list_cmd = [a.name for a in installed if a.has_model_list]
+        print(f"Runners to probe: {runners_str}")
+        print(f"Total probes: {total_probes} configured model(s)")
+        print(f"Runners with a model-list command (free discovery): "
+              + (", ".join(has_list_cmd) if has_list_cmd else "(none)"))
+        print()
+        try:
+            answer = input("Proceed? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\naborted.", file=sys.stderr)
+            return 1
+        if answer not in ("y", "yes"):
+            print("aborted.")
+            return 1
+        print()
+
+    discrepancies: list[str] = []
+
+    for a in installed:
+        configured = cfg.models(a.name)
+        configured_set = set(configured) if configured else set()
+
+        # 1. discover_models() — free list from CLIs that support it
+        discovered = a.discover_models()
+
+        # 2. probe each configured model
+        ok, rejected = [], []
+        total_cost_usd = 0.0
+        total_premium_req = 0.0
+        if configured:
+            for m in configured:
+                print(f"  {a.name}: probing {m} ...", end="", flush=True)
+                result = a.probe_model(m)
+                if result.accepted:
+                    ok.append(m)
+                    cost_tag = f" ({result.cost_str})" if result.cost_str else ""
+                    print(f" ok{cost_tag}")
+                    if result.cost_usd:
+                        total_cost_usd += result.cost_usd
+                    if result.premium_requests:
+                        total_premium_req += result.premium_requests
+                else:
+                    rejected.append(m)
+                    print(" REJECTED")
+
+        if rejected:
+            discrepancies.append(
+                f"  {a.name}: configured but rejected by CLI: {', '.join(rejected)}")
+
+        # 3. report discovered models not in config
+        if discovered:
+            extra = [m for m in discovered if m not in configured_set]
+            if extra:
+                discrepancies.append(
+                    f"  {a.name}: available in CLI but not in models.yaml: {', '.join(extra)}")
+            print(f"\n  {a.name} — {len(discovered)} model(s) from `{a.binary} models`:")
+            for m in discovered:
+                tag = "  <- not in models.yaml" if m not in configured_set else ""
+                print(f"    {m}{tag}")
+        else:
+            n = len(ok) + len(rejected)
+            print(f"\n  {a.name} — no model-list command; probed {n} configured model(s)")
+
+        cost_parts = []
+        if total_cost_usd > 0:
+            cost_parts.append(f"${total_cost_usd:.4f}")
+        if total_premium_req > 0:
+            cost_parts.append(f"{total_premium_req:.2f} premium requests")
+        if cost_parts:
+            print(f"  probe cost for {a.name}: {' / '.join(cost_parts)}")
+        print()
+
+    # -- summary ------------------------------------------------------------
+    print(f"config: {config_path}")
+    if discrepancies:
+        print("\n=== discrepancies ===")
+        for d in discrepancies:
+            print(d)
+        print(f"\nUpdate {config_path} to match, then re-run.")
+    else:
+        print("\nNo discrepancies — models.yaml has complete coverage of all installed CLIs.")
+
     return 0
 
 
@@ -554,11 +659,21 @@ def build_parser() -> argparse.ArgumentParser:
                          "fail (default), all, none. Implicitly 'all' when --no-judge is set.")
     sp.set_defaults(func=cmd_run)
 
-    sp = sub.add_parser("list-agents", help="show runners, availability, and configured models")
+    sp = sub.add_parser("list-agents-configured-models",
+                        help="show runners and their configured models from models.yaml")
     sp.add_argument("--skills-root", default=_default_skills_root(),
                     help="dir to look for models.yaml (default: cwd)")
     sp.add_argument("--models-config", help="models.yaml path (default: <skills-root>/models.yaml)")
-    sp.set_defaults(func=cmd_list_agents)
+    sp.set_defaults(func=cmd_list_configured_agents)
+
+    sp = sub.add_parser("list-agents-available-models",
+                        help="probe installed CLIs to discover available models and check config")
+    sp.add_argument("--skills-root", default=_default_skills_root(),
+                    help="dir to look for models.yaml (default: cwd)")
+    sp.add_argument("--models-config", help="models.yaml path (default: <skills-root>/models.yaml)")
+    sp.add_argument("-y", "--yes", action="store_true",
+                    help="skip the confirmation prompt")
+    sp.set_defaults(func=cmd_list_available_agents)
 
     sp = sub.add_parser("list-evals", help="discover and list evals")
     add_discovery(sp)

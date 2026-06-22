@@ -71,7 +71,7 @@ file (`CLI > scenario > default`). See [scenarios/README.md](../scenarios/README
 ## CLI
 
 Entry point `agentskill-evals` ([cli.py](agentskill_evals/cli.py)):
-`run`, `list-agents`, `list-evals`, `list-skills`, `migrate`, `selftest`. `run --config <file>`
+`run`, `list-agents-configured-models`, `list-agents-available-models`, `list-evals`, `list-skills`, `selftest`. `run --config <file>`
 runs a scenario (below); `list-skills` audits skill visibility (superset vs per-runner
 masked/kept, with drift warnings).
 
@@ -80,7 +80,7 @@ masked/kept, with drift warnings).
 Every cell is one agent run **plus** one judge call, and the axes multiply, so:
 cheapest-model default, a hard `--max-cells` ceiling, a multi-cell confirmation prompt
 (fail-closed without a TTY), `--dry-run`, a cheapest-by-default judge, and an unparseable
-`models.yaml` is fatal for `run` (warning-only for `list-agents`).
+`models.yaml` is fatal for `run` (warning-only for `list-agents-configured-models`).
 
 ## Output
 

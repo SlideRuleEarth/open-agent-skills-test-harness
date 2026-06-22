@@ -39,6 +39,7 @@ from ..schema import EventKind, NormalizedEvent
 from .base import (
     Adapter,
     ParseOutput,
+    ProbeResult,
     RunOptions,
     extract_command,
     extract_path,
@@ -56,6 +57,24 @@ class CopilotAdapter(Adapter):
     binary = "copilot"
     skills_subdir = ".agents/skills"
     global_skills_subpaths = [".agents/skills"]
+
+    def _probe_argv(self, model: str):
+        return [self.binary, "-p", "say ok", "--model", model,
+                "--output-format", "json", "--allow-all"]
+
+    def _parse_probe_cost(self, output: str) -> ProbeResult:
+        import json as _json
+        for line in output.splitlines():
+            try:
+                obj = _json.loads(line.strip())
+            except (ValueError, _json.JSONDecodeError):
+                continue
+            if obj.get("type") == "result":
+                usage = obj.get("usage") or {}
+                pr = usage.get("premiumRequests")
+                return ProbeResult(accepted=True,
+                                   premium_requests=float(pr) if pr is not None else None)
+        return ProbeResult(accepted=True)
 
     def format_skill(self, skill: str) -> str:
         return f"/{skill}"
