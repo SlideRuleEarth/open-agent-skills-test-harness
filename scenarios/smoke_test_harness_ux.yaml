@@ -1,0 +1,33 @@
+# Minimal scenario for cheap, fast harness iteration.
+# Tests that the full pipeline works (run → assertions → judge) without
+# burning tokens on a real analysis. ~1 premium request for the run,
+# ~0.33 for the judge.
+name: smoke-test-harness-ux
+description: Cheap end-to-end harness smoke test — one skill, trivial prompt, fast judge.
+
+target:
+  runner: copilot
+  model: claude-haiku-4.5
+
+skills:
+  - sliderule-api
+
+prompt: |
+  Read the sliderule-api skill and list the three HTTP endpoints it documents.
+  Write your answer to a file called endpoints.txt, one endpoint per line.
+
+rubric:
+  - Lists at least two real SlideRule endpoints from the skill (not invented ones).
+  - Wrote the answer to endpoints.txt rather than only printing it.
+
+assertions:
+  - {type: file_exists, path: endpoints.txt}
+  - {type: skill_triggered, skill: sliderule-api}
+  - {type: no_error}
+
+judge:
+  agent: copilot
+  model: claude-haiku-4.5
+
+timeout_sec: 120
+isolated: true

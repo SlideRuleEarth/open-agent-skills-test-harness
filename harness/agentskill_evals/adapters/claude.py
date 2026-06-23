@@ -41,8 +41,19 @@ class ClaudeAdapter(Adapter):
     # When one ships, add has_model_list = True and a discover_models() override
     # like Codex and AntiGravity have — then probing falls back to free discovery.
 
+    # Hermetic flags — no memory, no hooks, no MCP, no saved sessions, no
+    # user/project settings leaking in.  Avoids --bare because it also blocks
+    # keychain/OAuth auth (requires ANTHROPIC_API_KEY).
+    _HERMETIC = [
+        "--no-session-persistence",
+        "--strict-mcp-config",
+        "--settings", '{"autoMemory": false, "hooks": {}}',
+        "--setting-sources", "",
+    ]
+
     def _probe_argv(self, model: str):
-        return [self.binary, "-p", "say ok", "--output-format", "stream-json",
+        return [self.binary, "-p", "say ok", *self._HERMETIC,
+                "--output-format", "stream-json",
                 "--verbose", "--model", model, "--dangerously-skip-permissions"]
 
     def _parse_probe_cost(self, output: str) -> ProbeResult:
@@ -65,6 +76,7 @@ class ClaudeAdapter(Adapter):
             self.binary,
             "-p",
             prompt,
+            *self._HERMETIC,
             "--output-format",
             "stream-json",
             "--verbose",  # mandatory with stream-json in -p

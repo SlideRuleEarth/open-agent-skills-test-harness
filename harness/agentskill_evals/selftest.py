@@ -165,6 +165,32 @@ def _check_provision(failures, verbose):
         shutil.rmtree(src, ignore_errors=True)
 
 
+def _check_workspace_reset(failures, verbose):
+    """A reused run-id must not let stale files survive into the next cell workspace."""
+    import os
+    import shutil
+    import tempfile
+
+    from .runner import _prepare_workspace
+
+    print("workspace reset:")
+    root = tempfile.mkdtemp(prefix="ase-cell-")
+    try:
+        ws = os.path.join(root, "workspace")
+        os.makedirs(ws)
+        with open(os.path.join(ws, "stale.txt"), "w") as fh:
+            fh.write("old run")
+
+        _prepare_workspace(ws)
+
+        clean = os.path.isdir(ws) and not os.listdir(ws)
+        _check("runner.workspace_reset", clean,
+               f"existing per-cell workspace is recreated empty (clean={clean})",
+               failures, verbose)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def _check_report(failures, verbose):
     """The per-cell report.md renders the prompt, the full transcript, every produced file,
     and the judge verdict — and degrades gracefully when the judge is off. Pure — no CLIs."""
@@ -387,6 +413,7 @@ def run_selftest(verbose: bool = False) -> int:
     # HOME isolation overlay + side-effect-free provisioning
     _check_isolation(failures, verbose)
     _check_provision(failures, verbose)
+    _check_workspace_reset(failures, verbose)
 
     # per-cell readable report
     _check_report(failures, verbose)
