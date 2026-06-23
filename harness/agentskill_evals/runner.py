@@ -128,7 +128,7 @@ class Runner:
             _safe(spec.skill_name or "_"), _safe(spec.name)
         )
         workspace = os.path.join(cell_dir, "workspace")
-        os.makedirs(workspace, exist_ok=True)
+        _prepare_workspace(workspace)
 
         # 1) provision skills + 2) seed files
         declared_dirs = self._skill_dirs(spec)
@@ -540,3 +540,13 @@ def _write_json(path: str, obj) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(obj, fh, indent=2, default=str)
+
+
+def _prepare_workspace(path: str) -> None:
+    """Create a clean per-cell workspace, even when a run_id is reused."""
+    if os.path.lexists(path):
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+    os.makedirs(path, exist_ok=False)

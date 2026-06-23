@@ -53,7 +53,10 @@ class CodexAdapter(Adapter):
 
     def _probe_argv(self, model: str):
         return [self.binary, "--ask-for-approval", "never", "--sandbox", "read-only",
-                "exec", "--json", "-m", model, "say ok"]
+                "exec", "--ephemeral", "--disable", "memories",
+                "-c", "memories.use_memories=false",
+                "-c", "memories.generate_memories=false",
+                "--json", "-m", model, "say ok"]
 
     def _parse_probe_cost(self, output: str) -> ProbeResult:
         import json as _json
@@ -80,7 +83,10 @@ class CodexAdapter(Adapter):
             # approval AND allow workspace writes. `-a/--ask-for-approval` and
             # `-s/--sandbox` are top-level options, so they precede the `exec` subcommand.
             argv += ["--ask-for-approval", "never", "--sandbox", "workspace-write"]
-        argv += ["exec", "--json"]
+        argv += ["exec", "--ephemeral", "--disable", "memories",
+                 "-c", "memories.use_memories=false",
+                 "-c", "memories.generate_memories=false",
+                 "--json"]
         if opts.model:
             argv += ["-m", opts.model]
         argv += opts.extra_args

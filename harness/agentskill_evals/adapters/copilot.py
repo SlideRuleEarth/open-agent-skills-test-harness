@@ -58,9 +58,19 @@ class CopilotAdapter(Adapter):
     skills_subdir = ".agents/skills"
     global_skills_subpaths = [".agents/skills"]
 
+    # Hermetic flags — memory is already off in -p mode; these block the
+    # remaining state channels (custom instructions / AGENTS.md, built-in
+    # MCP servers, remote control, auto-update downloads).
+    _HERMETIC = [
+        "--no-custom-instructions",
+        "--disable-builtin-mcps",
+        "--no-remote",
+        "--no-auto-update",
+    ]
+
     def _probe_argv(self, model: str):
-        return [self.binary, "-p", "say ok", "--model", model,
-                "--output-format", "json", "--allow-all"]
+        return [self.binary, "-p", "say ok", *self._HERMETIC,
+                "--model", model, "--output-format", "json", "--allow-all"]
 
     def _parse_probe_cost(self, output: str) -> ProbeResult:
         import json as _json
@@ -80,7 +90,7 @@ class CopilotAdapter(Adapter):
         return f"/{skill}"
 
     def build_argv(self, prompt: str, opts: RunOptions) -> list[str]:
-        argv = [self.binary, "-p", prompt, "--output-format", "json"]
+        argv = [self.binary, "-p", prompt, *self._HERMETIC, "--output-format", "json"]
         if opts.auto_approve:
             argv += ["--allow-all"]
         if opts.model:
