@@ -35,6 +35,7 @@ class AssertionContext:
 
     spec: Any  # EvalSpec (avoid import cycle)
     judge: Optional[Callable[..., dict]] = None  # set by the runner when judging is enabled
+    skills_subdir: str = ".claude/skills"  # adapter's skill provisioning path
 
 
 CheckFn = Callable[[RunResult, str, Any, dict, AssertionContext], AssertionResult]
@@ -182,6 +183,130 @@ def _tool_count(result, workdir, spec, cfg, ctx):
     hi = int(cfg.get("max", 10**9))
     ok = lo <= n <= hi
     return AssertionResult("tool_count", ok, _label(cfg, f"{n} tool calls (want {lo}..{hi})"))
+
+
+# ---------------------------------------------------------------------------
+# Skill interaction trace
+# ---------------------------------------------------------------------------
+
+def _in_skill_dir(path: str, skills_subdir: str, skill: str,
+                  subdir: str = "", filename: str = "") -> bool:
+    """Check whether *path* falls inside a skill's provisioned directory.
+
+    Works for both absolute and relative (to workspace) paths because it
+    does a substring match on the canonical ``<skills_subdir>/<skill>/…`` segment.
+    """
+    prefix = f"{skills_subdir}/{skill}"
+    if subdir:
+        prefix = f"{prefix}/{subdir}"
+    if filename:
+        return f"{prefix}/{filename}" in path
+    return f"{prefix}/" in path
+
+
+def _skill_trace_hits(result, ctx, skill: str,
+                      subdir: str = "", filename: str = "") -> list[str]:
+    """Return trace paths/commands that reference a skill (or sub-path within it)."""
+    sd = ctx.skills_subdir
+    hits: list[str] = []
+    for e in result.events:
+        if e.path and _in_skill_dir(e.path, sd, skill, subdir, filename):
+            hits.append(e.path)
+        if e.command and _in_skill_dir(e.command, sd, skill, subdir, filename):
+            hits.append(e.command)
+    return hits
+
+
+@register("skill_triggered")
+def _skill_triggered(result, workdir, spec, cfg, ctx):
+    skill = cfg["skill"]
+    hits = _skill_trace_hits(result, ctx, skill)
+    if hits:
+        return AssertionResult(
+            "skill_triggered", True,
+            _label(cfg, f"skill {skill} triggered ({len(hits)} access(es))"),
+            details={"hits": hits})
+    return AssertionResult(
+        "skill_triggered", False,
+        _label(cfg, f"skill {skill} was not triggered"))
+
+
+@register("skill_not_triggered")
+def _skill_not_triggered(result, workdir, spec, cfg, ctx):
+    skill = cfg["skill"]
+    hits = _skill_trace_hits(result, ctx, skill)
+    if not hits:
+        return AssertionResult(
+            "skill_not_triggered", True,
+            _label(cfg, f"skill {skill} correctly not triggered"))
+    return AssertionResult(
+        "skill_not_triggered", False,
+        _label(cfg, f"skill {skill} was triggered ({len(hits)} access(es))"),
+        details={"hits": hits})
+
+
+@register("skill_reference_read")
+def _skill_reference_read(result, workdir, spec, cfg, ctx):
+    skill = cfg["skill"]
+    filename = cfg.get("path", "")
+    hits = _skill_trace_hits(result, ctx, skill, subdir="references", filename=filename)
+    target = f"{skill}/references/{filename}" if filename else f"{skill}/references/*"
+    if hits:
+        return AssertionResult(
+            "skill_reference_read", True,
+            _label(cfg, f"reference {target} read"),
+            details={"hits": hits})
+    return AssertionResult(
+        "skill_reference_read", False,
+        _label(cfg, f"reference {target} not read"))
+
+
+@register("skill_reference_not_read")
+def _skill_reference_not_read(result, workdir, spec, cfg, ctx):
+    skill = cfg["skill"]
+    filename = cfg.get("path", "")
+    hits = _skill_trace_hits(result, ctx, skill, subdir="references", filename=filename)
+    target = f"{skill}/references/{filename}" if filename else f"{skill}/references/*"
+    if not hits:
+        return AssertionResult(
+            "skill_reference_not_read", True,
+            _label(cfg, f"reference {target} correctly not read"))
+    return AssertionResult(
+        "skill_reference_not_read", False,
+        _label(cfg, f"reference {target} was read"),
+        details={"hits": hits})
+
+
+@register("skill_script_executed")
+def _skill_script_executed(result, workdir, spec, cfg, ctx):
+    skill = cfg["skill"]
+    filename = cfg.get("path", "")
+    hits = _skill_trace_hits(result, ctx, skill, subdir="scripts", filename=filename)
+    target = f"{skill}/scripts/{filename}" if filename else f"{skill}/scripts/*"
+    if hits:
+        return AssertionResult(
+            "skill_script_executed", True,
+            _label(cfg, f"script {target} executed"),
+            details={"hits": hits})
+    return AssertionResult(
+        "skill_script_executed", False,
+        _label(cfg, f"script {target} not executed"))
+
+
+@register("skill_script_not_executed")
+def _skill_script_not_executed(result, workdir, spec, cfg, ctx):
+    skill = cfg["skill"]
+    filename = cfg.get("path", "")
+    hits = _skill_trace_hits(result, ctx, skill, subdir="scripts", filename=filename)
+    target = f"{skill}/scripts/{filename}" if filename else f"{skill}/scripts/*"
+    if not hits:
+        return AssertionResult(
+            "skill_script_not_executed", True,
+            _label(cfg, f"script {target} correctly not executed"))
+    return AssertionResult(
+        "skill_script_not_executed", False,
+        _label(cfg, f"script {target} was executed"),
+        details={"hits": hits})
 
 
 # ---------------------------------------------------------------------------

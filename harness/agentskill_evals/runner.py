@@ -199,7 +199,8 @@ class Runner:
         effective = spec.effective_assertions()
         skipped_judge = self.judge is None and any(
             c.get("type") == "llm_judge" for c in effective)
-        ctx = AssertionContext(spec=spec, judge=self.judge)
+        ctx = AssertionContext(spec=spec, judge=self.judge,
+                               skills_subdir=adapter.skills_subdir)
         checks = [
             run_assertion(cfg, rr, workspace, spec, ctx)
             for cfg in effective
