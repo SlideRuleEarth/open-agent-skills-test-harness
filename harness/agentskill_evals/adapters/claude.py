@@ -24,8 +24,8 @@ from typing import Any
 from ..schema import EventKind, NormalizedEvent
 from .base import Adapter, ParseOutput, ProbeResult, RunOptions, extract_command, extract_path, iter_jsonl
 
-# Claude tool names that mutate files (so we can also tag them as file touches).
 _FILE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Create"}
+_READ_TOOLS = {"Read", "View"}
 _SHELL_TOOLS = {"Bash", "BashOutput"}
 
 
@@ -115,7 +115,7 @@ class ClaudeAdapter(Adapter):
                             structured = inp
                             continue
                         cmd = extract_command(inp) if name in _SHELL_TOOLS else None
-                        path = extract_path(inp) if name in _FILE_TOOLS else None
+                        path = extract_path(inp) if name in (_FILE_TOOLS | _READ_TOOLS) else None
                         events.append(
                             NormalizedEvent(
                                 EventKind.TOOL_CALL,

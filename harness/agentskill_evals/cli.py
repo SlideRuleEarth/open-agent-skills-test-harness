@@ -289,10 +289,19 @@ def cmd_run(args) -> int:
     models = _resolve_models(agent, cli_models, cfg, args.all_models)
 
     # judge
-    do_judge = (not args.no_judge) and (ov.get("judge") is not False)
+    # `judge:` in a scenario can be true/false OR a mapping {agent, model}.
+    ov_judge = ov.get("judge")
+    ov_judge_cfg: dict = {}
+    if isinstance(ov_judge, dict):
+        ov_judge_cfg = ov_judge
+        do_judge = (not args.no_judge)
+    else:
+        do_judge = (not args.no_judge) and (ov_judge is not False)
     judge = None
     if do_judge:
-        judge_agent = (args.judge_agent or cfg.judge.get("agent")
+        judge_agent = (args.judge_agent
+                       or ov_judge_cfg.get("agent")
+                       or cfg.judge.get("agent")
                        or ("claude" if get_adapter("claude").is_available() else None))
         if judge_agent:
             try:
@@ -303,7 +312,10 @@ def cmd_run(args) -> int:
                       file=sys.stderr)
                 judge_agent = None
         if judge_agent:
-            judge_model = args.judge_model or cfg.judge.get("model") or cfg.default(judge_agent)
+            judge_model = (args.judge_model
+                           or ov_judge_cfg.get("model")
+                           or cfg.judge.get("model")
+                           or cfg.default(judge_agent))
             judge = Judge(agent=judge_agent, model=judge_model)
             if not judge.available():
                 print(f"warning: judge runner {judge_agent!r} not on PATH — "
