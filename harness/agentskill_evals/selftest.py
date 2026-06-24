@@ -564,6 +564,58 @@ def run_selftest(verbose: bool = False) -> int:
            vr10.ok and any("trivially" in w for w in vr10.warnings),
            f"warning for skill_not_triggered on unprovisioned: {vr10.warnings}", failures, verbose)
 
+    # error: unknown assertion type
+    bad_type = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", skills=["s"],
+                        assertions=[{"type": "bogus_check"}])
+    vr_bt = validate_spec(bad_type)
+    _check("validate.unknown_type", not vr_bt.ok and "unknown assertion type" in vr_bt.errors[0],
+           f"error for unknown type: {vr_bt.errors}", failures, verbose)
+
+    # error: missing required key
+    bad_key = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", skills=["s"],
+                       assertions=[{"type": "file_exists"}])
+    vr_bk = validate_spec(bad_key)
+    _check("validate.missing_key", not vr_bk.ok and "missing required key" in vr_bk.errors[0],
+           f"error for missing key: {vr_bk.errors}", failures, verbose)
+
+    # error: ran_command with no criterion
+    bad_rc = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", skills=["s"],
+                      assertions=[{"type": "ran_command"}])
+    vr_rc = validate_spec(bad_rc)
+    _check("validate.no_criterion", not vr_rc.ok and "will always fail" in vr_rc.errors[0],
+           f"error for no criterion: {vr_rc.errors}", failures, verbose)
+
+    # error: tool_count min > max
+    bad_tc = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", skills=["s"],
+                      assertions=[{"type": "tool_count", "min": 10, "max": 2}])
+    vr_tc = validate_spec(bad_tc)
+    _check("validate.tool_count_range", not vr_tc.ok and "impossible" in vr_tc.errors[0],
+           f"error for tool_count range: {vr_tc.errors}", failures, verbose)
+
+    # warning: duplicate skills
+    dup_skills = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml",
+                          skills=["sliderule-api", "sliderule-api"])
+    vr_ds = validate_spec(dup_skills)
+    _check("validate.duplicate_skills",
+           vr_ds.ok and any("duplicate skill" in w for w in vr_ds.warnings),
+           f"warning for duplicate skills: {vr_ds.warnings}", failures, verbose)
+
+    # warning: var shadows built-in
+    shadow = EvalSpec(name="t", prompt="Use {skill}", source_path="/x/e.yaml",
+                      skills=["s"], vars={"skill": "overridden"})
+    vr_sh = validate_spec(shadow)
+    _check("validate.shadow_builtin",
+           vr_sh.ok and any("shadow" in w for w in vr_sh.warnings),
+           f"warning for shadowed built-in: {vr_sh.warnings}", failures, verbose)
+
+    # warning: empty rubric item
+    empty_rubric = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml",
+                            skills=["s"], rubric=["good item", "", "  "])
+    vr_er = validate_spec(empty_rubric)
+    _check("validate.empty_rubric",
+           vr_er.ok and any("empty" in w for w in vr_er.warnings),
+           f"warning for empty rubric: {vr_er.warnings}", failures, verbose)
+
     # clean spec passes with no errors or warnings
     clean_spec = EvalSpec(name="t", prompt="Use {skill} to run", source_path="/x/e.yaml",
                           skills=["sliderule-api"],

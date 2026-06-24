@@ -126,6 +126,16 @@ _SKILL_NEGATIVE = {"skill_not_triggered", "skill_reference_not_read", "skill_scr
 _SKILL_ASSERTIONS = _SKILL_POSITIVE | _SKILL_NEGATIVE
 _BUILTINS = {"skill", "skills"}
 
+_REQUIRED_KEYS: dict[str, list[str]] = {
+    "file_exists": ["path"], "file_absent": ["path"], "dir_exists": ["path"],
+    "skill_triggered": ["skill"], "skill_not_triggered": ["skill"],
+    "skill_reference_read": ["skill"], "skill_reference_not_read": ["skill"],
+    "skill_script_executed": ["skill"], "skill_script_not_executed": ["skill"],
+    "used_tool": ["name"],
+}
+_NEEDS_CRITERION = {"ran_command", "final_contains"}
+_CRITERION_KEYS = {"contains", "matches", "equals"}
+
 import re
 _PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 
@@ -148,9 +158,29 @@ def validate_spec(spec: "EvalSpec", *,
     *available_skills* is the repo's skill superset (from ``skill_names()``).
     Returns a ``ValidationResult`` with errors (should block) and warnings.
     """
+    from .assertions import known_types
+    valid_types = set(known_types())
+
     errors: list[str] = []
     warnings: list[str] = []
     provisioned = set(spec.skills)
+
+    # --- per-assertion structural checks ---
+    for a in spec.assertions:
+        atype = a.get("type", "")
+        if atype and atype not in valid_types:
+            errors.append(f"unknown assertion type {atype!r} — will always fail")
+        for key in _REQUIRED_KEYS.get(atype, []):
+            if key not in a:
+                errors.append(f"`{atype}` assertion missing required key {key!r}")
+        if atype in _NEEDS_CRITERION and not (set(a) & _CRITERION_KEYS):
+            errors.append(
+                f"`{atype}` has no `contains`/`matches`/`equals` — will always fail")
+        if atype == "tool_count":
+            lo = int(a.get("min", 0))
+            hi = int(a.get("max", 10**9))
+            if lo > hi:
+                errors.append(f"`tool_count` min={lo} > max={hi} — impossible to satisfy")
 
     # --- skill assertions vs provisioned skills ---
     for a in spec.assertions:
@@ -226,6 +256,32 @@ def validate_spec(spec: "EvalSpec", *,
             warnings.append(f"duplicate assertion: {a}")
         else:
             seen.append(key)
+
+    # --- duplicate skills ---
+    if len(spec.skills) != len(set(spec.skills)):
+        dupes = [s for s in spec.skills if spec.skills.count(s) > 1]
+        warnings.append(f"duplicate skill(s) in `skills:`: {', '.join(sorted(set(dupes)))}")
+
+    # --- vars shadowing built-ins ---
+    shadowed = set(spec.vars) & _BUILTINS
+    if shadowed:
+        warnings.append(
+            f"`vars:` key(s) {{{', '.join(sorted(shadowed))}}} shadow the built-in "
+            "placeholder(s) — the var value wins and the adapter's skill substitution "
+            "will have no effect")
+
+    # --- seed files / fixture existence ---
+    for src, _ in spec.resolved_files():
+        if not os.path.isfile(src):
+            warnings.append(f"seed file {src!r} does not exist — workspace copy will fail")
+    fixture = spec.resolved_fixture()
+    if fixture and not os.path.isdir(fixture):
+        warnings.append(f"fixture {fixture!r} does not exist — workspace setup will fail")
+
+    # --- empty rubric items ---
+    for i, r in enumerate(spec.rubric):
+        if not r or not r.strip():
+            warnings.append(f"rubric item {i + 1} is empty — the judge will waste context on it")
 
     return ValidationResult(errors=errors, warnings=warnings)
 
