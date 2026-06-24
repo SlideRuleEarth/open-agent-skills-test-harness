@@ -36,6 +36,7 @@ class AssertionContext:
     spec: Any  # EvalSpec (avoid import cycle)
     judge: Optional[Callable[..., dict]] = None  # set by the runner when judging is enabled
     skills_subdir: str = ".claude/skills"  # adapter's skill provisioning path
+    judge_exec: Any = None  # populated by _llm_judge with the judge's ExecResult for artifact saving
 
 
 CheckFn = Callable[[RunResult, str, Any, dict, AssertionContext], AssertionResult]
@@ -360,7 +361,11 @@ def _llm_judge(result, workdir, spec, cfg, ctx):
                                kind="judge")
     rubric = cfg.get("rubric") or getattr(spec, "rubric", []) or []
     threshold = float(cfg.get("threshold", 1.0))  # fraction of rubric items that must pass
-    verdict = ctx.judge(result=result, workdir=workdir, spec=spec, rubric=rubric, cfg=cfg)
+    jr = ctx.judge(result=result, workdir=workdir, spec=spec, rubric=rubric, cfg=cfg)
+    # JudgeResult carries both the verdict and the full exec trace.
+    verdict = jr.verdict if hasattr(jr, "verdict") else jr
+    if hasattr(jr, "exec_result"):
+        ctx.judge_exec = jr.exec_result
     items = verdict.get("items", [])
     n = len(items) or 1
     passed_items = sum(1 for it in items if it.get("pass"))

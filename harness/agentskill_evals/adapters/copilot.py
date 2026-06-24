@@ -95,6 +95,8 @@ class CopilotAdapter(Adapter):
             argv += ["--allow-all"]
         if opts.model:
             argv += ["--model", opts.model]
+        if opts.disable_tools:
+            argv += ["--available-tools", ""]
         argv += opts.extra_args
         return argv
 
@@ -156,7 +158,11 @@ class CopilotAdapter(Adapter):
 
                     cmd = None
                     path = None
-                    if name in _SHELL_TOOLS:
+                    if name == "skill":
+                        skill_name = args.get("skill") or ""
+                        if skill_name:
+                            path = f"{self.skills_subdir}/{skill_name}/SKILL.md"
+                    elif name in _SHELL_TOOLS:
                         cmd = extract_command(args)
                     elif name in _FILE_TOOLS:
                         path = extract_path(args)

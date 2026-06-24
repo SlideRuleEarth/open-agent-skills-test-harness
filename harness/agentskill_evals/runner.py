@@ -218,6 +218,11 @@ class Runner:
         )
         self._write_cell_json(cell_dir, cell)
         _write(os.path.join(cell_dir, "report.md"), render_report(cell))
+
+        # 8) judge artifacts — same detail level as the agent, prefixed judge_*
+        if ctx.judge_exec is not None:
+            self._write_judge_artifacts(cell_dir, cell, ctx.judge_exec)
+
         return cell
 
     def _skill_dirs(self, spec: EvalSpec) -> list[str]:
@@ -277,6 +282,29 @@ class Runner:
                 ],
             },
         )
+
+    def _write_judge_artifacts(self, cell_dir: str, cell: CellResult, judge_ex) -> None:
+        """Write judge_* artifacts — same format as the agent's, so a human can
+        audit the judge's reasoning at the same level of detail."""
+        jrr = judge_ex.result
+        _write(os.path.join(cell_dir, "judge_stdout.jsonl"), judge_ex.stdout)
+        _write(os.path.join(cell_dir, "judge_stderr.txt"), judge_ex.stderr)
+        _write_json(os.path.join(cell_dir, "judge_events.json"),
+                     [e.to_dict() for e in jrr.events])
+        _write_json(os.path.join(cell_dir, "judge_result.json"), jrr.to_dict())
+
+        judge_assertion = next((a for a in cell.assertions if a.type == "llm_judge"), None)
+        judge_cell = CellResult(
+            agent=jrr.agent,
+            model=jrr.resolved_model or cell.model,
+            eval_name=cell.eval_name,
+            skill=cell.skill,
+            passed=judge_assertion.passed if judge_assertion else False,
+            run_result=jrr,
+            assertions=[judge_assertion] if judge_assertion else [],
+            artifacts_dir=cell_dir,
+        )
+        _write(os.path.join(cell_dir, "judge_report.md"), render_report(judge_cell))
 
     def _write_summary(self, results: list[CellResult], specs: list[EvalSpec]) -> None:
         summary = {

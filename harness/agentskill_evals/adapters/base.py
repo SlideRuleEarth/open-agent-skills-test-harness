@@ -87,6 +87,8 @@ class Adapter(ABC):
     # it can't read the real skills and bypass isolation.
     isolation_config_homes: list[tuple[str, str]] = []
 
+    supports_output_schema: bool = False
+
     # --- discovery ----------------------------------------------------------
 
     def is_available(self) -> bool:
