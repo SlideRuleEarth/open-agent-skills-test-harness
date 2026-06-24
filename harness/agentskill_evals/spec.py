@@ -118,6 +118,115 @@ class EvalSpec:
 
 
 # ---------------------------------------------------------------------------
+# Pre-flight validation
+# ---------------------------------------------------------------------------
+
+_SKILL_POSITIVE = {"skill_triggered", "skill_reference_read", "skill_script_executed"}
+_SKILL_NEGATIVE = {"skill_not_triggered", "skill_reference_not_read", "skill_script_not_executed"}
+_SKILL_ASSERTIONS = _SKILL_POSITIVE | _SKILL_NEGATIVE
+_BUILTINS = {"skill", "skills"}
+
+import re
+_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+
+
+@dataclass
+class ValidationResult:
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+def validate_spec(spec: "EvalSpec", *,
+                  available_skills: Optional[set[str]] = None,
+                  judge_enabled: bool = True) -> ValidationResult:
+    """Check a spec for logical errors before spending tokens.
+
+    *available_skills* is the repo's skill superset (from ``skill_names()``).
+    Returns a ``ValidationResult`` with errors (should block) and warnings.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    provisioned = set(spec.skills)
+
+    # --- skill assertions vs provisioned skills ---
+    for a in spec.assertions:
+        atype = a.get("type", "")
+        skill = a.get("skill", "")
+        if not skill or atype not in _SKILL_ASSERTIONS:
+            continue
+        if atype in _SKILL_POSITIVE and skill not in provisioned:
+            msg = (f"assertion `{atype}` expects skill {skill!r} but it is not in "
+                   f"`skills:` — it will be isolated out and can never fire")
+            if available_skills is not None and skill in available_skills:
+                msg += " (skill exists in the repo; add it to this scenario's `skills:`)"
+            errors.append(msg)
+        if atype in _SKILL_NEGATIVE and skill in provisioned:
+            warnings.append(
+                f"assertion `{atype}` for skill {skill!r} which IS provisioned — "
+                "the model can see it; is this intentional?")
+
+    # --- contradictory file assertions ---
+    exists_paths = {a["path"] for a in spec.assertions
+                    if a.get("type") == "file_exists" and "path" in a}
+    absent_paths = {a["path"] for a in spec.assertions
+                    if a.get("type") == "file_absent" and "path" in a}
+    for p in exists_paths & absent_paths:
+        errors.append(f"contradictory: both `file_exists` and `file_absent` for {p!r}")
+
+    # --- contradictory exit_code + no_error ---
+    has_no_error = any(a.get("type") == "no_error" for a in spec.assertions)
+    for a in spec.assertions:
+        if a.get("type") == "exit_code" and int(a.get("equals", 0)) != 0 and has_no_error:
+            errors.append(
+                f"contradictory: `exit_code` expects {a['equals']} but `no_error` requires 0")
+
+    # --- prompt placeholders ---
+    if spec.skills:
+        prompt_after_vars = spec.rendered_prompt()
+    else:
+        prompt_after_vars = spec.prompt
+    placeholders = set(_PLACEHOLDER_RE.findall(prompt_after_vars))
+
+    if not spec.skills and (placeholders & _BUILTINS):
+        errors.append(
+            "prompt references {skill}/{skills} but `skills:` is empty — "
+            "placeholder will stay literal")
+
+    defined = set(spec.vars) | _BUILTINS
+    undefined = placeholders - defined
+    if undefined:
+        warnings.append(
+            f"prompt placeholder(s) {{{', '.join(sorted(undefined))}}} not defined "
+            "in `vars:` or built-ins — will stay literal in the prompt")
+
+    unused_vars = set(spec.vars) - set(_PLACEHOLDER_RE.findall(spec.prompt))
+    if unused_vars:
+        warnings.append(
+            f"`vars:` key(s) {{{', '.join(sorted(unused_vars))}}} never referenced "
+            "in prompt — dead config, possible typo")
+
+    # --- rubric without judge ---
+    if spec.rubric and not judge_enabled:
+        warnings.append(
+            "rubric has items but judge is disabled — rubric will be silently skipped")
+
+    # --- duplicate assertions ---
+    seen: list[str] = []
+    for a in spec.assertions:
+        key = json.dumps(a, sort_keys=True)
+        if key in seen:
+            warnings.append(f"duplicate assertion: {a}")
+        else:
+            seen.append(key)
+
+    return ValidationResult(errors=errors, warnings=warnings)
+
+
+# ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
 
