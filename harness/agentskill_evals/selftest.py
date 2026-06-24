@@ -474,6 +474,22 @@ def run_selftest(verbose: bool = False) -> int:
                                {"type": "object", "required": ["name", "port"]})
     _check("schema.invalid", not bad, f"missing-required caught: {err}", failures, verbose)
 
+    # progress indicator
+    print("progress indicator:")
+    import io
+    from .progress import Progress
+    buf = io.StringIO()
+    with Progress(total_cells=2, file=buf) as p:
+        p.update(cell=1, phase="running agent", eval_name="demo", model="opus")
+        p.done(cell=1, passed=True)
+        p.update(cell=2, phase="running judge", eval_name="demo", model="opus")
+        p.done(cell=2, passed=False)
+    output = buf.getvalue()
+    _check("progress.phases", "running agent" in output and "running judge" in output,
+           "phase updates appear in non-TTY output", failures, verbose)
+    _check("progress.done", "✓" in output and "✗" in output,
+           "done marks appear for pass and fail", failures, verbose)
+
     # HOME isolation overlay + side-effect-free provisioning
     _check_isolation(failures, verbose)
     _check_provision(failures, verbose)

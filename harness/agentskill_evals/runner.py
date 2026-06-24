@@ -31,6 +31,7 @@ from .assertions import AssertionContext, AssertionResult, run_assertion
 from .exec import execute
 from .isolation import build_isolated_home
 from .judge import Judge
+from .progress import Progress
 from .schema import EventKind, RunResult
 from .spec import EvalSpec, skill_names
 from .workspace_view import file_tree, inline_files, writes_outside_workspace
@@ -76,6 +77,7 @@ class Runner:
         auto_approve: bool = True,
         jobs: int = 1,
         isolated: bool = True,
+        progress: Optional[Progress] = None,
     ):
         self.agent = agent
         self.adapter = get_adapter(agent)
@@ -88,6 +90,7 @@ class Runner:
         self.auto_approve = auto_approve
         self.jobs = max(1, jobs)
         self.isolated = isolated
+        self.progress = progress
         self._repo_skill_names = set(skill_names(skills_root))
         self.run_dir = os.path.join(artifacts_root, run_id)
 
@@ -104,13 +107,16 @@ class Runner:
 
         results: list[CellResult] = []
         if self.jobs == 1:
-            for model, spec in cells:
-                results.append(self._run_cell(model, spec))
+            for i, (model, spec) in enumerate(cells, 1):
+                results.append(self._run_cell(model, spec, cell_idx=i, total=len(cells)))
         else:
             with ThreadPoolExecutor(max_workers=self.jobs) as pool:
                 futs = {pool.submit(self._run_cell, m, s): (m, s) for m, s in cells}
-                for fut in as_completed(futs):
-                    results.append(fut.result())
+                for i, fut in enumerate(as_completed(futs), 1):
+                    r = fut.result()
+                    if self.progress:
+                        self.progress.done(cell=i, passed=r.passed if not r.ungraded else None)
+                    results.append(r)
 
         results.sort(key=lambda c: (c.eval_name, c.model or ""))
         self._write_summary(results, specs)
@@ -121,8 +127,17 @@ class Runner:
     def _eligible(self, spec: EvalSpec) -> bool:
         return spec.agents is None or self.agent in spec.agents
 
-    def _run_cell(self, model: Optional[str], spec: EvalSpec) -> CellResult:
+    def _run_cell(self, model: Optional[str], spec: EvalSpec,
+                  cell_idx: int = 0, total: int = 0) -> CellResult:
         adapter = self.adapter
+        p = self.progress
+        model_label = model or "default"
+
+        def _phase(phase: str):
+            if p:
+                p.update(cell=cell_idx, phase=phase,
+                         eval_name=spec.name, model=model_label)
+
         cell_dir = os.path.join(
             self.run_dir, _model_seg(model),
             _safe(spec.skill_name or "_"), _safe(spec.name)
@@ -131,6 +146,7 @@ class Runner:
         _prepare_workspace(workspace)
 
         # 1) provision skills + 2) seed files
+        _phase("provisioning workspace")
         declared_dirs = self._skill_dirs(spec)
         if self.provision and declared_dirs:
             adapter.provision_skills(workspace, declared_dirs)
@@ -171,6 +187,7 @@ class Runner:
                 iso_env = {}
 
         # 5) run
+        _phase(f"running agent ({self.agent}/{model_label})")
         opts = RunOptions(
             model=model,
             auto_approve=self.auto_approve,
@@ -193,19 +210,23 @@ class Runner:
             rr.error = f"model {model!r} rejected by {self.agent} — check models.yaml: {rr.error}"
 
         # 6) artifacts
+        _phase("writing artifacts")
         self._write_artifacts(cell_dir, ex.stdout, ex.stderr, rr)
 
         # 7) assertions
+        _phase("running assertions")
         effective = spec.effective_assertions()
         skipped_judge = self.judge is None and any(
             c.get("type") == "llm_judge" for c in effective)
         ctx = AssertionContext(spec=spec, judge=self.judge,
                                skills_subdir=adapter.skills_subdir)
-        checks = [
-            run_assertion(cfg, rr, workspace, spec, ctx)
-            for cfg in effective
-            if not (self.judge is None and cfg.get("type") == "llm_judge")
-        ]
+        checks = []
+        for cfg in effective:
+            if self.judge is None and cfg.get("type") == "llm_judge":
+                continue
+            if cfg.get("type") == "llm_judge":
+                _phase("running judge")
+            checks.append(run_assertion(cfg, rr, workspace, spec, ctx))
         clean = rr.error is None and not rr.timed_out
         ungraded = clean and not checks and skipped_judge
         passed = False if ungraded else (
@@ -223,6 +244,8 @@ class Runner:
         if ctx.judge_exec is not None:
             self._write_judge_artifacts(cell_dir, cell, ctx.judge_exec)
 
+        if p and cell_idx:
+            p.done(cell=cell_idx, passed=passed if not ungraded else None)
         return cell
 
     def _skill_dirs(self, spec: EvalSpec) -> list[str]:

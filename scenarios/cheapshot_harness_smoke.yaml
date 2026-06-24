@@ -1,0 +1,47 @@
+# cheapshot_harness_smoke.yaml — a minimal, dirt-cheap scenario for iterating on
+# harness UX.  Exercises multiple assertion types so every code path fires, but
+# the prompt is trivial enough that even the cheapest model finishes in seconds.
+#
+# Run:  agentskill-evals run --config scenarios/cheapshot_harness_smoke.yaml
+# Dry:  agentskill-evals run --config scenarios/cheapshot_harness_smoke.yaml --dry-run
+
+name: cheapshot harness smoke
+description: >
+  Trivial prompt that produces a file and touches two skills — just enough to
+  exercise file_exists, skill_triggered, skill_not_triggered, ran_command,
+  and final_contains assertions cheaply.
+
+target:
+  runner: copilot
+  model: claude-haiku-4.5        # cheapest copilot model
+
+skills:
+  - sliderule-api
+  - sliderule-params
+
+prompt: |
+  Using {skills}, write a short Python script called run.py that prints
+  "hello sliderule" and exits. The script should import json (nothing else)
+  and contain a comment referencing ATL06. Do not install anything.
+
+rubric:
+  - The script prints "hello sliderule" to stdout.
+  - The script contains an import of the json module.
+  - The script contains a comment mentioning ATL06.
+
+assertions:
+  # filesystem
+  - {type: file_exists, path: run.py}
+  - {type: file_exists, path: run.py, contains: "hello sliderule"}
+  - {type: file_exists, path: run.py, contains: "import json"}
+  - {type: file_absent,  path: output.csv}
+
+  # skill interaction
+  - {type: skill_triggered,     skill: sliderule-api}
+  - {type: skill_triggered,     skill: sliderule-params}
+
+  # process
+  - {type: no_error}
+
+judge: false          # skip LLM judge — keep it free
+isolated: true

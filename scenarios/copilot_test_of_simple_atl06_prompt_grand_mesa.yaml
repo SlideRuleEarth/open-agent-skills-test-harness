@@ -1,5 +1,5 @@
 # This is a basic 
-name: api+params combination
+name: SimpleGrandMesaATL06
 description: Exercises the SlideRule API and params skills together.
 
 target:                       # the runner:model this scenario tests
@@ -21,6 +21,16 @@ rubric:                       # graded by the LLM judge
 
 assertions:                   # deterministic checks
   - {type: file_exists, path: run.py}
+  - {type: skill_triggered,     skill: sliderule-api}
+  - {type: skill_triggered,     skill: sliderule-params}
+  - {type: skill_triggered,     skill: sliderule-openapi}
+  - {type: skill_triggered,     skill: sliderule-pipeline}
+  - {type: skill_not_triggered, skill: sliderule-region-picker}
+  - {type: skill_not_triggered, skill: sliderule-docsearch}
+  - {type: skill_not_triggered, skill: sliderule-examples}
+  - {type: skill_not_triggered, skill: nsidc-reference}
+  # process
+  - {type: no_error}
 
 # Optional run knobs (any CLI flag overrides these):
 judge: true
