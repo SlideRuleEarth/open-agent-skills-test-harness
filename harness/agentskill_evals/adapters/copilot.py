@@ -105,6 +105,7 @@ class CopilotAdapter(Adapter):
         final_text = ""
         structured: Any = None
         duration_ms = None
+        premium_requests = None
         resolved_model = None
         assistant_buf: list[str] = []
         seen_tools: set[str] = set()
@@ -205,6 +206,9 @@ class CopilotAdapter(Adapter):
             if etype == "result":
                 usage = obj.get("usage") or {}
                 duration_ms = usage.get("sessionDurationMs")
+                pr = usage.get("premiumRequests")
+                if pr is not None:
+                    premium_requests = float(pr)
                 final_text = assistant_buf[-1] if assistant_buf else ""
                 events.append(
                     NormalizedEvent(EventKind.RESULT, raw=obj, text=final_text)
@@ -228,6 +232,7 @@ class CopilotAdapter(Adapter):
             events=events,
             final_text=final_text,
             structured_output=structured,
+            premium_requests=premium_requests,
             duration_ms=duration_ms,
             resolved_model=resolved_model,
         )

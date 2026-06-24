@@ -75,14 +75,15 @@ class Progress:
         if not self._tty:
             self._print_plain()
 
-    def done(self, *, cell: int, passed: bool | None = None):
+    def done(self, *, cell: int, passed: bool | None = None, cost: str = ""):
         with self._lock:
             self._cell = cell
             self._phase = ""
         if not self._tty:
             mark = "✓" if passed else ("✗" if passed is False else "·")
             elapsed = _fmt_elapsed(time.monotonic() - self._start)
-            self._file.write(f"  {mark} cell {cell}/{self._total} done [{elapsed}]\n")
+            cost_str = f"  {cost}" if cost else ""
+            self._file.write(f"  {mark} cell {cell}/{self._total} done [{elapsed}]{cost_str}\n")
             self._file.flush()
 
     # --- internals ------------------------------------------------------------

@@ -68,12 +68,22 @@ class RunResult:
     final_text: str = ""
     structured_output: Optional[Any] = None  # parsed final JSON, when a schema was requested
     cost_usd: Optional[float] = None
+    premium_requests: Optional[float] = None
     duration_ms: Optional[int] = None
     resolved_model: Optional[str] = None  # actual model used (when adapter can detect it)
     stdout_path: Optional[str] = None
     stderr_path: Optional[str] = None
     timed_out: bool = False
     error: Optional[str] = None  # harness-level error (binary missing, crash, timeout)
+
+    @property
+    def cost_str(self) -> str:
+        parts = []
+        if self.cost_usd is not None:
+            parts.append(f"${self.cost_usd:.4f}")
+        if self.premium_requests is not None:
+            parts.append(f"{self.premium_requests}req")
+        return " / ".join(parts)
 
     # --- convenience views used by assertions -------------------------------
 
@@ -109,6 +119,7 @@ class RunResult:
             "final_text": self.final_text,
             "structured_output": self.structured_output,
             "cost_usd": self.cost_usd,
+            "premium_requests": self.premium_requests,
             "duration_ms": self.duration_ms,
             "resolved_model": self.resolved_model,
             "timed_out": self.timed_out,

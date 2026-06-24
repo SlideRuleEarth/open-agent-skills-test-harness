@@ -342,6 +342,21 @@ def _check_path_resolution(failures, verbose):
 def run_selftest(verbose: bool = False) -> int:
     failures: list[str] = []
 
+    # cost_str formatting
+    print("cost formatting:")
+    from .schema import RunResult as _RR
+    _check("cost.usd_only", _RR(agent="x", eval_name="", prompt="", workdir="",
+           cost_usd=0.0123).cost_str == "$0.0123",
+           "USD-only cost_str", failures, verbose)
+    _check("cost.req_only", _RR(agent="x", eval_name="", prompt="", workdir="",
+           premium_requests=0.33).cost_str == "0.33req",
+           "req-only cost_str", failures, verbose)
+    _check("cost.both", _RR(agent="x", eval_name="", prompt="", workdir="",
+           cost_usd=0.05, premium_requests=1.0).cost_str == "$0.0500 / 1.0req",
+           "both cost_str", failures, verbose)
+    _check("cost.none", _RR(agent="x", eval_name="", prompt="", workdir="").cost_str == "",
+           "empty cost_str", failures, verbose)
+
     # Claude
     print("claude adapter:")
     out = get_adapter("claude").parse(CLAUDE, "", 0)
@@ -408,6 +423,8 @@ def run_selftest(verbose: bool = False) -> int:
            repr(out.final_text), failures, verbose)
     _check("copilot.duration", out.duration_ms == 4000,
            f"duration={out.duration_ms}", failures, verbose)
+    _check("copilot.premium_requests", out.premium_requests == 1.0,
+           f"premium_requests={out.premium_requests}", failures, verbose)
     _check("copilot.resolved_model", out.resolved_model == "claude-sonnet-4.6",
            f"resolved_model={out.resolved_model}", failures, verbose)
     _check("copilot.ephemeral_skipped",
