@@ -37,6 +37,8 @@ class ClaudeAdapter(Adapter):
     # repointed (custom config dir kept, skills masked), else cleared to the isolated home.
     isolation_config_homes = [("CLAUDE_CONFIG_DIR", "skills")]
 
+    supports_output_schema = True
+
     # TODO: Claude Code has no `list-models` command yet (feature request pending).
     # When one ships, add has_model_list = True and a discover_models() override
     # like Codex and AntiGravity have — then probing falls back to free discovery.
@@ -126,8 +128,16 @@ class ClaudeAdapter(Adapter):
                         if name == "StructuredOutput":
                             structured = inp
                             continue
-                        cmd = extract_command(inp) if name in _SHELL_TOOLS else None
-                        path = extract_path(inp) if name in (_FILE_TOOLS | _READ_TOOLS) else None
+                        cmd = None
+                        path = None
+                        if name == "Skill":
+                            skill_name = inp.get("skill") or ""
+                            if skill_name:
+                                path = f"{self.skills_subdir}/{skill_name}/SKILL.md"
+                        elif name in _SHELL_TOOLS:
+                            cmd = extract_command(inp)
+                        elif name in (_FILE_TOOLS | _READ_TOOLS):
+                            path = extract_path(inp)
                         events.append(
                             NormalizedEvent(
                                 EventKind.TOOL_CALL,

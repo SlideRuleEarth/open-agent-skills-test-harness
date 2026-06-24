@@ -20,6 +20,7 @@ CLAUDE = """\
 {"type":"assistant","message":{"content":[{"type":"text","text":"I'll scaffold the app."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"npm install"}}]}}
 {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false}]}}
 {"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Write","input":{"file_path":"package.json"}}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t4","name":"Skill","input":{"skill":"sliderule-api"}}]}}
 {"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"StructuredOutput","input":{"ok":true}}]}}
 {"type":"result","subtype":"success","is_error":false,"result":"Done. Created the app.","total_cost_usd":0.0123,"duration_ms":4567,"structured_output":{"ok":true}}
 """
@@ -37,6 +38,7 @@ ANTIGRAVITY_STREAM = """\
 {"type":"session.start","id":"a1"}
 {"type":"tool_use","tool":"shell","args":{"command":"npm install"}}
 {"type":"tool_result","tool":"shell"}
+{"type":"tool_use","tool":"skill","args":{"skill":"sliderule-api"}}
 {"type":"result","text":"Done building demo-app."}
 """
 
@@ -48,7 +50,7 @@ COPILOT = """\
 {"type":"session.tools_updated","data":{"model":"claude-sonnet-4.6"},"id":"s2","timestamp":"2026-06-22T00:00:00Z","parentId":"p1","ephemeral":true}
 {"type":"user.message","data":{"content":"list files"},"id":"u1","timestamp":"2026-06-22T00:00:00Z","parentId":"p1"}
 {"type":"assistant.turn_start","data":{"turnId":"0","interactionId":"i1"},"id":"t1","timestamp":"2026-06-22T00:00:01Z","parentId":"u1"}
-{"type":"assistant.message","data":{"messageId":"m1","model":"claude-sonnet-4.6","content":"","toolRequests":[{"toolCallId":"tc1","name":"report_intent","arguments":{"intent":"Listing files"},"type":"function"},{"toolCallId":"tc2","name":"shell","arguments":{"command":"ls -la"},"type":"function"},{"toolCallId":"tc3","name":"view","arguments":{"path":"/tmp/project"},"type":"function"}],"interactionId":"i1","turnId":"0","outputTokens":50},"id":"m1","timestamp":"2026-06-22T00:00:02Z","parentId":"t1"}
+{"type":"assistant.message","data":{"messageId":"m1","model":"claude-sonnet-4.6","content":"","toolRequests":[{"toolCallId":"tc1","name":"report_intent","arguments":{"intent":"Listing files"},"type":"function"},{"toolCallId":"tc2","name":"shell","arguments":{"command":"ls -la"},"type":"function"},{"toolCallId":"tc3","name":"view","arguments":{"path":"/tmp/project"},"type":"function"},{"toolCallId":"tc4","name":"skill","arguments":{"skill":"sliderule-params"},"type":"function"}],"interactionId":"i1","turnId":"0","outputTokens":50},"id":"m1","timestamp":"2026-06-22T00:00:02Z","parentId":"t1"}
 {"type":"tool.execution_complete","data":{"toolCallId":"tc2","success":true,"result":{"content":"file1.txt\\nfile2.txt"}},"id":"r1","timestamp":"2026-06-22T00:00:02Z","parentId":"m1"}
 {"type":"tool.execution_complete","data":{"toolCallId":"tc3","success":true,"result":{"content":"file1.txt\\nfile2.txt"}},"id":"r2","timestamp":"2026-06-22T00:00:02Z","parentId":"m1"}
 {"type":"assistant.turn_end","data":{"turnId":"0"},"id":"e1","timestamp":"2026-06-22T00:00:03Z","parentId":"r2"}
@@ -253,6 +255,33 @@ def _check_report(failures, verbose):
         _check("report.judge_off_keeps_evidence",
                "Write run.py that prints hello." in md_off and "hello from run.py" in md_off,
                "judge-off still shows prompt + produced files", failures, verbose)
+
+        # judge artifacts — _write_judge_artifacts produces judge_* files + judge_report.md
+        from .exec import ExecResult
+        from .runner import Runner
+        judge_rr = RunResult(
+            agent="judge:claude", eval_name="demo",
+            prompt="You are grading whether an AI coding agent completed a task correctly.",
+            workdir="/tmp/judge-scratch",
+            final_text='{"items": [{"behavior": "creates run.py", "pass": true, "reason": "ok"}], "summary": "pass"}',
+            events=[NormalizedEvent(EventKind.AGENT_MESSAGE, text="Evaluating the rubric...")],
+            cost_usd=0.002, duration_ms=500, resolved_model="claude-haiku-4-5",
+        )
+        judge_ex = ExecResult(result=judge_rr, stdout='{"type":"result"}\n', stderr="")
+        runner_obj = Runner.__new__(Runner)
+        runner_obj._write_judge_artifacts(cell_dir, cell, judge_ex)
+        _check("report.judge_artifacts",
+               all(os.path.isfile(os.path.join(cell_dir, f))
+                   for f in ("judge_stdout.jsonl", "judge_stderr.txt", "judge_events.json",
+                             "judge_result.json", "judge_report.md")),
+               "all five judge_* files written", failures, verbose)
+        judge_md = open(os.path.join(cell_dir, "judge_report.md")).read()
+        _check("report.judge_report_prompt",
+               "grading whether" in judge_md,
+               "judge_report.md contains the grading prompt", failures, verbose)
+        _check("report.judge_report_transcript",
+               "Evaluating the rubric" in judge_md,
+               "judge_report.md contains the judge's transcript", failures, verbose)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -319,9 +348,12 @@ def run_selftest(verbose: bool = False) -> int:
     cmds = [e.command for e in out.events if e.command]
     tools = [e.tool_name for e in out.events if e.tool_name]
     _check("claude.command", "npm install" in cmds, f"commands={cmds}", failures, verbose)
-    _check("claude.tools", {"Bash", "Write"} <= set(tools), f"tools={tools}", failures, verbose)
+    _check("claude.tools", {"Bash", "Write", "Skill"} <= set(tools), f"tools={tools}", failures, verbose)
     _check("claude.no_structured_tool", "StructuredOutput" not in tools,
            "StructuredOutput is not traced as a real tool", failures, verbose)
+    skill_paths = [e.path for e in out.events if e.tool_name == "Skill"]
+    _check("claude.skill_path", skill_paths == [".claude/skills/sliderule-api/SKILL.md"],
+           f"Skill tool call extracts skill path: {skill_paths}", failures, verbose)
     _check("claude.structured", out.structured_output == {"ok": True},
            f"structured={out.structured_output}", failures, verbose)
     _check("claude.final", out.final_text == "Done. Created the app.", repr(out.final_text), failures, verbose)
@@ -365,8 +397,11 @@ def run_selftest(verbose: bool = False) -> int:
     cmds = [e.command for e in out.events if e.command]
     tools = [e.tool_name for e in out.events if e.tool_name]
     _check("copilot.command", "ls -la" in cmds, f"commands={cmds}", failures, verbose)
-    _check("copilot.tools", "shell" in tools and "view" in tools,
+    _check("copilot.tools", "shell" in tools and "view" in tools and "skill" in tools,
            f"tools={tools}", failures, verbose)
+    skill_paths = [e.path for e in out.events if e.tool_name == "skill"]
+    _check("copilot.skill_path", skill_paths == [".agents/skills/sliderule-params/SKILL.md"],
+           f"skill tool call extracts skill path: {skill_paths}", failures, verbose)
     _check("copilot.no_report_intent", "report_intent" not in tools,
            "report_intent is not traced as a real tool", failures, verbose)
     _check("copilot.final", out.final_text == "Found 2 files: file1.txt and file2.txt",
@@ -385,6 +420,13 @@ def run_selftest(verbose: bool = False) -> int:
            and "json" in cargv and "--allow-all" in cargv and "--model" in cargv
            and cargv[-1] != "do the task",
            f"copilot argv: {cargv}", failures, verbose)
+    cargv_dt = get_adapter("copilot").build_argv("judge", RunOptions(disable_tools=True))
+    _check("copilot.disable_tools",
+           "--available-tools" in cargv_dt and cargv_dt[cargv_dt.index("--available-tools") + 1] == "",
+           f"disable_tools → --available-tools '': {cargv_dt}", failures, verbose)
+    _check("copilot.no_output_schema",
+           not get_adapter("copilot").supports_output_schema,
+           "copilot has no native output schema support", failures, verbose)
 
     # AntiGravity (3 shapes)
     print("antigravity adapter:")
@@ -392,12 +434,34 @@ def run_selftest(verbose: bool = False) -> int:
     cmds = [e.command for e in out.events if e.command]
     _check("antigravity.stream.command", cmds == ["npm install"], f"commands={cmds}", failures, verbose)
     _check("antigravity.stream.final", out.final_text == "Done building demo-app.", repr(out.final_text), failures, verbose)
+    skill_paths = [e.path for e in out.events if e.tool_name == "skill"]
+    _check("antigravity.skill_path",
+           skill_paths == [".antigravity/skills/sliderule-api/SKILL.md"],
+           f"skill tool call extracts skill path: {skill_paths}", failures, verbose)
 
     out = get_adapter("antigravity").parse(ANTIGRAVITY_JSON, "", 0)
     _check("antigravity.json.final", out.final_text == "All done.", repr(out.final_text), failures, verbose)
 
     out = get_adapter("antigravity").parse(ANTIGRAVITY_RAW, "", 0)
     _check("antigravity.raw.final", out.final_text == ANTIGRAVITY_RAW, repr(out.final_text), failures, verbose)
+
+    # judge JSON extraction (markdown fences, bare JSON, mixed text)
+    print("judge verdict extraction:")
+    from .judge import _extract_json
+    fenced = '```json\n{"items": [{"behavior": "b", "pass": true, "reason": "ok"}], "summary": "good"}\n```'
+    _check("judge.fenced_json", _extract_json(fenced) is not None and "items" in _extract_json(fenced),
+           "extracts JSON from markdown code fence", failures, verbose)
+    bare = '{"items": [{"behavior": "b", "pass": true, "reason": "ok"}], "summary": "good"}'
+    _check("judge.bare_json", _extract_json(bare) is not None and "items" in _extract_json(bare),
+           "extracts bare JSON", failures, verbose)
+    mixed = 'Here is my verdict:\n\n```json\n{"items": [], "summary": "s"}\n```\n\nDone.'
+    _check("judge.mixed_text", _extract_json(mixed) is not None and "items" in _extract_json(mixed),
+           "extracts JSON from mixed text with fence", failures, verbose)
+    embedded = 'The result is {"items": [{"behavior": "x", "pass": false, "reason": "n"}], "summary": "s"} and that is it.'
+    _check("judge.embedded_json", _extract_json(embedded) is not None and "items" in _extract_json(embedded),
+           "extracts embedded JSON from surrounding text", failures, verbose)
+    _check("judge.no_json", _extract_json("just plain text with no json") is None,
+           "returns None for plain text", failures, verbose)
 
     # schema validator fallback
     print("schema validator:")

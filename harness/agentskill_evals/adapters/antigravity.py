@@ -106,7 +106,7 @@ class AntigravityAdapter(Adapter):
         # 1) Try JSONL (stream-style) — generic field mapping.
         jsonl_objs = list(iter_jsonl(stdout))
         if len(jsonl_objs) > 1 or (jsonl_objs and _looks_like_event(jsonl_objs[0])):
-            return _parse_generic_events(jsonl_objs)
+            return _parse_generic_events(jsonl_objs, skills_subdir=self.skills_subdir)
 
         # 2) Try a single JSON object.
         single = try_load_json(stdout)
@@ -140,7 +140,7 @@ def _looks_like_event(obj: Any) -> bool:
     )
 
 
-def _parse_generic_events(objs: list[dict]) -> ParseOutput:
+def _parse_generic_events(objs: list[dict], skills_subdir: str = "") -> ParseOutput:
     """Map an unknown JSONL event stream onto normalized events by field-sniffing."""
     events: list[NormalizedEvent] = []
     final_text = ""
@@ -157,13 +157,19 @@ def _parse_generic_events(objs: list[dict]) -> ParseOutput:
         elif "tool" in etype and "result" in etype:
             events.append(NormalizedEvent(EventKind.TOOL_RESULT, raw=obj))
         elif "tool" in etype or name:
+            cmd = extract_command(args)
+            path = extract_path(args)
+            if name and name.lower() == "skill" and not path and skills_subdir:
+                skill_name = args.get("skill") or ""
+                if skill_name:
+                    path = f"{skills_subdir}/{skill_name}/SKILL.md"
             events.append(
                 NormalizedEvent(
                     EventKind.TOOL_CALL,
                     raw=obj,
                     tool_name=name,
-                    command=extract_command(args),
-                    path=extract_path(args),
+                    command=cmd,
+                    path=path,
                 )
             )
         elif "result" in etype or "final" in etype or "done" in etype:
