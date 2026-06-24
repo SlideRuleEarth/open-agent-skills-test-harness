@@ -280,7 +280,8 @@ def validate_spec(spec: "EvalSpec", *,
 
     # --- empty rubric items ---
     for i, r in enumerate(spec.rubric):
-        if not r or not r.strip():
+        text = str(r) if not isinstance(r, str) else r
+        if not text or not text.strip():
             warnings.append(f"rubric item {i + 1} is empty — the judge will waste context on it")
 
     return ValidationResult(errors=errors, warnings=warnings)
