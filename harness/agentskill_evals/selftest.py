@@ -490,6 +490,142 @@ def run_selftest(verbose: bool = False) -> int:
     _check("progress.done", "✓" in output and "✗" in output,
            "done marks appear for pass and fail", failures, verbose)
 
+    # pre-flight spec validation
+    print("spec validation:")
+    from .spec import validate_spec
+
+    # error: skill_triggered for unprovisioned skill
+    bad_spec = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml",
+                        skills=["sliderule-api"],
+                        assertions=[{"type": "skill_triggered", "skill": "sliderule-params"}])
+    vr = validate_spec(bad_spec, available_skills={"sliderule-api", "sliderule-params"})
+    _check("validate.skill_not_provisioned", not vr.ok and "isolated out" in vr.errors[0],
+           f"error for unprovisioned skill_triggered: {vr.errors}", failures, verbose)
+
+    # error: contradictory file_exists + file_absent
+    bad_spec2 = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", skills=["s"],
+                         assertions=[{"type": "file_exists", "path": "run.py"},
+                                     {"type": "file_absent", "path": "run.py"}])
+    vr2 = validate_spec(bad_spec2)
+    _check("validate.contradictory_files", not vr2.ok and "contradictory" in vr2.errors[0],
+           f"error for file_exists+file_absent: {vr2.errors}", failures, verbose)
+
+    # error: exit_code != 0 with no_error
+    bad_spec3 = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", skills=["s"],
+                         assertions=[{"type": "no_error"},
+                                     {"type": "exit_code", "equals": 1}])
+    vr3 = validate_spec(bad_spec3)
+    _check("validate.contradictory_exit", not vr3.ok and "contradictory" in vr3.errors[0],
+           f"error for exit_code+no_error: {vr3.errors}", failures, verbose)
+
+    # error: {skill} placeholder with empty skills
+    bad_spec4 = EvalSpec(name="t", prompt="Using {skill}, do stuff", source_path="/x/e.yaml",
+                         skills=[])
+    vr4 = validate_spec(bad_spec4)
+    _check("validate.empty_skills_placeholder", not vr4.ok and "literal" in vr4.errors[0],
+           f"error for empty skills + placeholder: {vr4.errors}", failures, verbose)
+
+    # warning: rubric but judge off
+    warn_spec = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", skills=["s"],
+                         rubric=["checks something"])
+    vr5 = validate_spec(warn_spec, judge_enabled=False)
+    _check("validate.rubric_no_judge", vr5.ok and any("silently skipped" in w for w in vr5.warnings),
+           f"warning for rubric without judge: {vr5.warnings}", failures, verbose)
+
+    # warning: unused var
+    warn_spec2 = EvalSpec(name="t", prompt="hello {name}", source_path="/x/e.yaml",
+                          skills=["s"], vars={"name": "world", "unused": "x"})
+    vr6 = validate_spec(warn_spec2)
+    _check("validate.unused_var", vr6.ok and any("unused" in w for w in vr6.warnings),
+           f"warning for unused vars: {vr6.warnings}", failures, verbose)
+
+    # warning: undefined placeholder
+    warn_spec3 = EvalSpec(name="t", prompt="hello {unknown}", source_path="/x/e.yaml",
+                          skills=["s"])
+    vr7 = validate_spec(warn_spec3)
+    _check("validate.undefined_placeholder", vr7.ok and any("unknown" in w for w in vr7.warnings),
+           f"warning for undefined placeholder: {vr7.warnings}", failures, verbose)
+
+    # warning: skill_not_triggered for provisioned skill
+    warn_spec4 = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml",
+                          skills=["sliderule-api"],
+                          assertions=[{"type": "skill_not_triggered", "skill": "sliderule-api"}])
+    vr8 = validate_spec(warn_spec4)
+    _check("validate.not_triggered_provisioned",
+           vr8.ok and any("provisioned" in w for w in vr8.warnings),
+           f"warning for skill_not_triggered on provisioned: {vr8.warnings}", failures, verbose)
+
+    # warning: skill_not_triggered for unprovisioned skill (tautology)
+    warn_spec5 = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml",
+                          skills=["sliderule-api"],
+                          assertions=[{"type": "skill_not_triggered", "skill": "sliderule-params"}])
+    vr10 = validate_spec(warn_spec5)
+    _check("validate.not_triggered_unprovisioned",
+           vr10.ok and any("trivially" in w for w in vr10.warnings),
+           f"warning for skill_not_triggered on unprovisioned: {vr10.warnings}", failures, verbose)
+
+    # error: unknown assertion type
+    bad_type = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", skills=["s"],
+                        assertions=[{"type": "bogus_check"}])
+    vr_bt = validate_spec(bad_type)
+    _check("validate.unknown_type", not vr_bt.ok and "unknown assertion type" in vr_bt.errors[0],
+           f"error for unknown type: {vr_bt.errors}", failures, verbose)
+
+    # error: missing required key
+    bad_key = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", skills=["s"],
+                       assertions=[{"type": "file_exists"}])
+    vr_bk = validate_spec(bad_key)
+    _check("validate.missing_key", not vr_bk.ok and "missing required key" in vr_bk.errors[0],
+           f"error for missing key: {vr_bk.errors}", failures, verbose)
+
+    # error: ran_command with no criterion
+    bad_rc = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", skills=["s"],
+                      assertions=[{"type": "ran_command"}])
+    vr_rc = validate_spec(bad_rc)
+    _check("validate.no_criterion", not vr_rc.ok and "will always fail" in vr_rc.errors[0],
+           f"error for no criterion: {vr_rc.errors}", failures, verbose)
+
+    # error: tool_count min > max
+    bad_tc = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", skills=["s"],
+                      assertions=[{"type": "tool_count", "min": 10, "max": 2}])
+    vr_tc = validate_spec(bad_tc)
+    _check("validate.tool_count_range", not vr_tc.ok and "impossible" in vr_tc.errors[0],
+           f"error for tool_count range: {vr_tc.errors}", failures, verbose)
+
+    # warning: duplicate skills
+    dup_skills = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml",
+                          skills=["sliderule-api", "sliderule-api"])
+    vr_ds = validate_spec(dup_skills)
+    _check("validate.duplicate_skills",
+           vr_ds.ok and any("duplicate skill" in w for w in vr_ds.warnings),
+           f"warning for duplicate skills: {vr_ds.warnings}", failures, verbose)
+
+    # warning: var shadows built-in
+    shadow = EvalSpec(name="t", prompt="Use {skill}", source_path="/x/e.yaml",
+                      skills=["s"], vars={"skill": "overridden"})
+    vr_sh = validate_spec(shadow)
+    _check("validate.shadow_builtin",
+           vr_sh.ok and any("shadow" in w for w in vr_sh.warnings),
+           f"warning for shadowed built-in: {vr_sh.warnings}", failures, verbose)
+
+    # warning: empty rubric item
+    empty_rubric = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml",
+                            skills=["s"], rubric=["good item", "", "  "])
+    vr_er = validate_spec(empty_rubric)
+    _check("validate.empty_rubric",
+           vr_er.ok and any("empty" in w for w in vr_er.warnings),
+           f"warning for empty rubric: {vr_er.warnings}", failures, verbose)
+
+    # clean spec passes with no errors or warnings
+    clean_spec = EvalSpec(name="t", prompt="Use {skill} to run", source_path="/x/e.yaml",
+                          skills=["sliderule-api"],
+                          assertions=[{"type": "skill_triggered", "skill": "sliderule-api"},
+                                      {"type": "no_error"}],
+                          rubric=["does something"])
+    vr9 = validate_spec(clean_spec, judge_enabled=True)
+    _check("validate.clean", vr9.ok and not vr9.warnings,
+           f"clean spec: errors={vr9.errors} warnings={vr9.warnings}", failures, verbose)
+
     # HOME isolation overlay + side-effect-free provisioning
     _check_isolation(failures, verbose)
     _check_provision(failures, verbose)

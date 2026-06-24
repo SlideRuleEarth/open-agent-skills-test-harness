@@ -19,7 +19,7 @@ from .isolation import resolve_visible_skills
 from .judge import Judge
 from .progress import Progress
 from .runner import Runner, _cell_text, render_matrix
-from .spec import _load_raw, discover_specs, load_scenario, load_spec, skill_names
+from .spec import _load_raw, discover_specs, load_scenario, load_spec, skill_names, validate_spec
 
 DEFAULT_MAX_CELLS = 25
 DEFAULT_JOBS = 1
@@ -327,6 +327,21 @@ def cmd_run(args) -> int:
     if not do_judge and any(s.rubric for s in specs):
         print("note: rubric grading is off — only deterministic assertions are graded "
               "(llm_judge checks are skipped).", file=sys.stderr)
+
+    # pre-flight validation
+    has_errors = False
+    for s in specs:
+        vr = validate_spec(s, available_skills=valid_skills, judge_enabled=do_judge)
+        label = f"{s.name}" + (f" ({s.source_path})" if s.source_path else "")
+        for e in vr.errors:
+            print(f"error: {label}: {e}", file=sys.stderr)
+            has_errors = True
+        for w in vr.warnings:
+            print(f"warning: {label}: {w}", file=sys.stderr)
+    if has_errors:
+        print("\nFix the errors above before running — they will always fail and waste tokens.",
+              file=sys.stderr)
+        return 2
 
     # plan + cost guardrails
     isolated = (not args.no_isolated) and (ov.get("isolated") is not False)
