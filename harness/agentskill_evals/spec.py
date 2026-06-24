@@ -168,6 +168,10 @@ def validate_spec(spec: "EvalSpec", *,
             warnings.append(
                 f"assertion `{atype}` for skill {skill!r} which IS provisioned — "
                 "the model can see it; is this intentional?")
+        if atype in _SKILL_NEGATIVE and skill not in provisioned:
+            warnings.append(
+                f"assertion `{atype}` for skill {skill!r} which is not provisioned — "
+                "this will always pass trivially (possible copy-paste from another scenario)")
 
     # --- contradictory file assertions ---
     exists_paths = {a["path"] for a in spec.assertions

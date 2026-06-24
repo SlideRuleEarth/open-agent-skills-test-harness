@@ -555,6 +555,15 @@ def run_selftest(verbose: bool = False) -> int:
            vr8.ok and any("provisioned" in w for w in vr8.warnings),
            f"warning for skill_not_triggered on provisioned: {vr8.warnings}", failures, verbose)
 
+    # warning: skill_not_triggered for unprovisioned skill (tautology)
+    warn_spec5 = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml",
+                          skills=["sliderule-api"],
+                          assertions=[{"type": "skill_not_triggered", "skill": "sliderule-params"}])
+    vr10 = validate_spec(warn_spec5)
+    _check("validate.not_triggered_unprovisioned",
+           vr10.ok and any("trivially" in w for w in vr10.warnings),
+           f"warning for skill_not_triggered on unprovisioned: {vr10.warnings}", failures, verbose)
+
     # clean spec passes with no errors or warnings
     clean_spec = EvalSpec(name="t", prompt="Use {skill} to run", source_path="/x/e.yaml",
                           skills=["sliderule-api"],
