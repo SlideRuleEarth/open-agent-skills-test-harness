@@ -59,6 +59,14 @@ class CellResult:
         return len(self.assertions)
 
     @property
+    def det_assertions(self) -> list[AssertionResult]:
+        return [a for a in self.assertions if a.kind != "judge"]
+
+    @property
+    def judge_assertions(self) -> list[AssertionResult]:
+        return [a for a in self.assertions if a.kind == "judge"]
+
+    @property
     def model_label(self) -> str:
         return _model_seg(self.model)
 
@@ -365,6 +373,28 @@ def _model_label(model: Optional[str]) -> str:
     return model if model else "default"
 
 
+def _judge_score(c: CellResult) -> Optional[tuple[int, int]]:
+    """(passed, total) rubric items from the judge, or None if no judge ran."""
+    for a in c.judge_assertions:
+        items = (a.details or {}).get("items", [])
+        if items:
+            return sum(1 for it in items if it.get("pass")), len(items)
+    return None
+
+
+def _score_parts(c: CellResult) -> str:
+    """Format split scores: 'det 2/4  rubric 3/3', or omit a section when empty."""
+    parts = []
+    det = c.det_assertions
+    if det:
+        det_pass = sum(1 for a in det if a.passed)
+        parts.append(f"det {det_pass}/{len(det)}")
+    js = _judge_score(c)
+    if js is not None:
+        parts.append(f"rubric {js[0]}/{js[1]}")
+    return "  ".join(parts) if parts else f"{c.n_pass}/{c.n_total}"
+
+
 def _cell_text(c: Optional[CellResult]) -> str:
     if c is None:
         return "-"
@@ -372,7 +402,7 @@ def _cell_text(c: Optional[CellResult]) -> str:
         return "ERR"
     if c.ungraded:
         return "SKIP"
-    return f"{'PASS' if c.passed else 'FAIL'} {c.n_pass}/{c.n_total}"
+    return f"{'PASS' if c.passed else 'FAIL'}  {_score_parts(c)}"
 
 
 def _cell_mark(c: Optional[CellResult]) -> str:
@@ -382,7 +412,7 @@ def _cell_mark(c: Optional[CellResult]) -> str:
         return f"⚠️ {c.run_result.error}"
     if c.ungraded:
         return "⚪ ungraded"
-    return f"{'✅' if c.passed else '❌'} {c.n_pass}/{c.n_total}"
+    return f"{'✅' if c.passed else '❌'} {_score_parts(c)}"
 
 
 def render_matrix(results: list[CellResult], agent: str,
