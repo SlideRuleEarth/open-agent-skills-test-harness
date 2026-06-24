@@ -17,6 +17,7 @@ from . import __version__
 from .adapters import adapter_names, all_adapters, get_adapter
 from .isolation import resolve_visible_skills
 from .judge import Judge
+from .progress import Progress
 from .runner import Runner, _cell_text, render_matrix
 from .spec import _load_raw, discover_specs, load_scenario, load_spec, skill_names
 
@@ -394,20 +395,22 @@ def cmd_run(args) -> int:
             print("aborted.")
             return 1
 
-    runner = Runner(
-        agent,
-        models=models,
-        artifacts_root=os.path.abspath(args.artifacts),
-        run_id=run_id,
-        skills_root=skills_root,
-        judge=judge,
-        provision=provision,
-        auto_approve=not args.no_auto_approve,
-        jobs=jobs,
-        isolated=isolated,
-    )
+    with Progress(total_cells=n_cells) as progress:
+        runner = Runner(
+            agent,
+            models=models,
+            artifacts_root=os.path.abspath(args.artifacts),
+            run_id=run_id,
+            skills_root=skills_root,
+            judge=judge,
+            provision=provision,
+            auto_approve=not args.no_auto_approve,
+            jobs=jobs,
+            isolated=isolated,
+            progress=progress,
+        )
 
-    results = runner.run(specs)
+        results = runner.run(specs)
 
     print(render_matrix(results, agent, models))
     graded = [c for c in results if not c.ungraded]

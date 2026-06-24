@@ -1,0 +1,174 @@
+# example_full_schema.yaml — reference example showing every scenario field.
+#
+# This file is a working scenario that exercises the complete schema. Use it as
+# a template when writing new scenarios. Every field is annotated with its type,
+# default, and purpose.
+#
+# Run:  agentskill-evals run --config scenarios/example_full_schema.yaml -y
+# Dry:  agentskill-evals run --config scenarios/example_full_schema.yaml --dry-run
+
+# --------------------------------------------------------------------------
+# Identity
+# --------------------------------------------------------------------------
+
+name: full-schema example              # string (required) — unique identifier for this eval
+description: >                         # string (optional, default: "") — human-readable goal
+  Reference scenario exercising every schema field. Asks the model to write a
+  trivial script and checks it with every assertion type the harness supports.
+
+# --------------------------------------------------------------------------
+# Target — which runner:model to test (scenarios only; per-skill evals omit this)
+# --------------------------------------------------------------------------
+
+target:
+  runner: copilot                      # string (required) — adapter name: claude | codex | copilot | antigravity
+  model: claude-haiku-4.5             # string (optional) — model id; omit to use models.yaml default
+
+# --------------------------------------------------------------------------
+# Skills — provisioned into the workspace; the ONLY repo skills visible (when isolated)
+# --------------------------------------------------------------------------
+
+skills:                                # list[str] (required for scenarios, non-empty)
+  - sliderule-api
+  - sliderule-params
+
+# --------------------------------------------------------------------------
+# Prompt — the instruction sent to the agent
+# --------------------------------------------------------------------------
+
+# Use {skill} for the primary skill name (first in skills:), {skills} for all
+# of them joined, and {key} for any entry in vars: below.
+prompt: |
+  Using {skills}, write a Python script called run.py in the workspace root.
+  The script should:
+  1. Import json
+  2. Print "{greeting}" to stdout
+  3. Include a comment mentioning ATL06
+  Region: {region}
+
+# --------------------------------------------------------------------------
+# Prompt variables — substituted into {placeholders} in the prompt
+# --------------------------------------------------------------------------
+
+vars:                                  # dict[str, Any] (optional, default: {})
+  greeting: hello sliderule
+  region: Grand Mesa
+
+# --------------------------------------------------------------------------
+# Seed files — copied into the workspace before the agent runs
+# --------------------------------------------------------------------------
+
+# Each entry is either:
+#   - a relative path (copied at that path):        "fixtures/input.json"
+#   - a {source: dest} mapping for explicit dest:    {"data/raw.csv": "input.csv"}
+files: []                              # list[str | dict] (optional, default: [])
+
+# --------------------------------------------------------------------------
+# Fixture — a directory tree copied as the starting workspace
+# --------------------------------------------------------------------------
+
+fixture: null                          # string | null (optional) — path relative to this file
+
+# --------------------------------------------------------------------------
+# Agent restriction — omit to run on all; set to restrict
+# --------------------------------------------------------------------------
+
+agents: null                           # list[str] | null (optional) — null = all runners
+                                       # NOTE: in scenarios, the target governs the runner;
+                                       # agents: is ignored. Useful in per-skill evals.
+
+# --------------------------------------------------------------------------
+# Timeout
+# --------------------------------------------------------------------------
+
+timeout_sec: 600                       # int (optional, default: 600) — max seconds for the agent run
+
+# --------------------------------------------------------------------------
+# Tags — for filtering with --tag
+# --------------------------------------------------------------------------
+
+tags:                                  # list[str] (optional, default: [])
+  - example
+  - smoke
+
+# --------------------------------------------------------------------------
+# Environment variables — injected into the agent subprocess
+# --------------------------------------------------------------------------
+
+env: {}                                # dict[str, str] (optional, default: {})
+
+# --------------------------------------------------------------------------
+# Deterministic assertions — all must pass
+# --------------------------------------------------------------------------
+#
+# Available assertion types:
+#
+#   Filesystem:
+#     file_exists:    {type: file_exists, path: <rel>, contains: <str>, matches: <regex>, min_size: <int>}
+#     file_absent:    {type: file_absent, path: <rel>}
+#     dir_exists:     {type: dir_exists, path: <rel>}
+#
+#   Tool / command trace:
+#     ran_command:    {type: ran_command, contains: <str>, matches: <regex>, equals: <str>, ignore_case: <bool>}
+#     used_tool:      {type: used_tool, name: <tool>}
+#     tool_count:     {type: tool_count, min: <int>, max: <int>}
+#
+#   Skill interaction:
+#     skill_triggered:           {type: skill_triggered, skill: <name>}
+#     skill_not_triggered:       {type: skill_not_triggered, skill: <name>}
+#     skill_reference_read:      {type: skill_reference_read, skill: <name>, path: <filename>}
+#     skill_reference_not_read:  {type: skill_reference_not_read, skill: <name>, path: <filename>}
+#     skill_script_executed:     {type: skill_script_executed, skill: <name>, path: <filename>}
+#     skill_script_not_executed: {type: skill_script_not_executed, skill: <name>, path: <filename>}
+#
+#   Process / output:
+#     no_error:       {type: no_error}
+#     exit_code:      {type: exit_code, equals: <int>}
+#     final_contains: {type: final_contains, contains: <str>, matches: <regex>, ignore_case: <bool>}
+#
+#   Schema / judge (usually auto-added; can be explicit):
+#     output_matches_schema: {type: output_matches_schema, schema: <json-schema>}
+#     llm_judge:             {type: llm_judge, rubric: [...], threshold: <0.0-1.0>}
+#
+#   All assertion types accept an optional `description:` for custom messages.
+
+assertions:
+  # filesystem
+  - {type: file_exists, path: run.py}
+  - {type: file_exists, path: run.py, contains: "import json"}
+  - {type: file_absent,  path: output.csv}
+
+  # skill interaction
+  - {type: skill_triggered,     skill: sliderule-api}
+  - {type: skill_triggered,     skill: sliderule-params}
+
+  # process
+  - {type: no_error}
+
+# --------------------------------------------------------------------------
+# Rubric — behaviors graded by the LLM judge
+# --------------------------------------------------------------------------
+#
+# Each entry is a plain-English behavior the judge evaluates pass/fail.
+# Compiled into a single llm_judge assertion automatically.
+
+rubric:
+  - The script prints "hello sliderule" to stdout.
+  - The script imports the json module.
+  - The script contains a comment mentioning ATL06.
+
+# --------------------------------------------------------------------------
+# Output schema — JSON Schema the agent's structured output must match
+# --------------------------------------------------------------------------
+
+output_schema: null                    # dict | null (optional) — JSON Schema object
+
+# --------------------------------------------------------------------------
+# Run knobs — overridable from CLI flags
+# --------------------------------------------------------------------------
+
+judge: true                            # bool | dict (optional) — false to skip LLM judge;
+                                       # or {agent: claude, model: haiku} to override judge config
+isolated: true                         # bool (optional, default: true) — isolate skill visibility
+# max_cells: 25                        # int (optional) — cap for this scenario
+# jobs: 1                              # int (optional) — parallel cells
