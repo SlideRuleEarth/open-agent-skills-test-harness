@@ -1,20 +1,12 @@
 # This is a basic 
-name: Mnt Rainier Slope with Skills
-description: Tests all the skills together.
+name: Mnt Rainier Slope No Skills
+description: Tests with no skills provisioned, so the LLM must reason about the API and params on its own.
 
 target:                       # the runner:model this scenario tests
   runner: copilot
   model: claude-opus-4.8     
 
-skills:                       # provisioned together; the only repo skills visible (isolated)
-  - nsidc-reference
-  - sliderule-api
-  - sliderule-docsearch
-  - sliderule-examples
-  - sliderule-openapi
-  - sliderule-params
-  - sliderule-pipeline
-  - sliderule-region-picker
+                      # norepo skills visible (isolated)
 
 prompt: |
    Using ICESat-2 (Oct 2018–present), how have the glaciated flanks of Mount Rainier — above ~2000 m, excluding the summit dome — changed in surface elevation? Give me a spatial pattern and a one-paragraph summary.
@@ -54,19 +46,8 @@ rubric:                       # graded by the LLM judge
   - Polygon used for the request is reported or visualized so the region is auditable.
   - Caveats are present but proportionate (not a wall of disclaimers crowding out the result).
 
-  # --- Tier 5: suite hygiene (optional; only relevant if grading a SlideRule-agent run) ---
-  - Calls an ATL06 endpoint from the SlideRule API skill (atl06x or atl06p).
-  - Sets request parameters via the params skill rather than hardcoded guesses.
-  - Looks up output column names via the openapi skill rather than guessing field names.
-  - Saves the raw parquet response to disk so re-aggregation does not require re-fetching.
-  - Produces a single reproducible pipeline script rather than a sequence of disconnected snippets.
 
 assertions:                   # deterministic checks
-  - {type: file_exists, path: pipeline.py}
-  - {type: skill_triggered,     skill: sliderule-api}
-  - {type: skill_triggered,     skill: sliderule-params}
-  - {type: skill_triggered,     skill: sliderule-openapi}
-  - {type: skill_triggered,     skill: sliderule-pipeline}
   # process
   - {type: no_error}
 
