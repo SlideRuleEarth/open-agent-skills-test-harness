@@ -408,10 +408,6 @@ def load_scenario(path: str) -> Scenario:
     model = str(model) if model else None
 
     spec = _spec_from_raw(raw, path)     # reuses prompt/skills parsing + the prompt-required check
-    if not spec.skills:
-        raise ValueError(
-            f"{path}: a scenario needs a non-empty `skills:` list — the combination to "
-            "provision together.")
     spec.agents = None                   # the target governs the runner; ignore any eval `agents:`
     spec.skill_name = "scenario"         # artifacts: .../<runner>/<model>/scenario/<name>/
 
