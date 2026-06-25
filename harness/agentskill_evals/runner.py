@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -157,6 +158,12 @@ class Runner:
         )
         workspace = os.path.join(cell_dir, "workspace")
         _prepare_workspace(workspace)
+
+        # 0) git-root boundary — agents walk up from cwd looking for .git to discover
+        #    project-level skills. Without this, the workspace (inside the repo tree) leaks
+        #    all repo-root skills. `git init` stops the walk at the workspace.
+        if self.isolated:
+            subprocess.run(["git", "init", workspace], capture_output=True)
 
         # 1) provision skills + 2) seed files
         _phase("provisioning workspace")
