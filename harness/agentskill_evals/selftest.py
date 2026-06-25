@@ -168,9 +168,12 @@ def _check_provision(failures, verbose):
 
 
 def _check_workspace_reset(failures, verbose):
-    """A reused run-id must not let stale files survive into the next cell workspace."""
+    """A reused run-id must not let stale files survive into the next cell workspace.
+    When isolated, `git init` creates a .git boundary to stop agents from walking up
+    to the repo root and discovering project-level skills."""
     import os
     import shutil
+    import subprocess
     import tempfile
 
     from .runner import _prepare_workspace
@@ -188,6 +191,13 @@ def _check_workspace_reset(failures, verbose):
         clean = os.path.isdir(ws) and not os.listdir(ws)
         _check("runner.workspace_reset", clean,
                f"existing per-cell workspace is recreated empty (clean={clean})",
+               failures, verbose)
+
+        # git init boundary — same as runner does when isolated
+        subprocess.run(["git", "init", ws], capture_output=True)
+        has_git = os.path.isdir(os.path.join(ws, ".git"))
+        _check("runner.git_boundary", has_git,
+               "git init creates .git boundary for project-level skill isolation",
                failures, verbose)
     finally:
         shutil.rmtree(root, ignore_errors=True)

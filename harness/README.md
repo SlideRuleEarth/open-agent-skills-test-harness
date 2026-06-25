@@ -229,12 +229,20 @@ artifacts/<run_id>/
 
 ## Skill isolation
 
-By default every run is **isolated**: each cell runs against a private HOME that mirrors your
-real one (so logins, settings, and the agent's own vendor skills keep working) but **hides this
-repo's globally-installed skills**. So the model sees only the skills the eval/scenario
-provisions — plus the agent's built-in/vendor skills — never other repo skills you happen to
-have installed (e.g. via `make link-global`). This is what makes "test skill X (or this
-*combination*) in isolation" actually true.
+By default every run is **isolated**: agents discover skills from two locations, and the
+harness blocks both:
+
+1. **Global (HOME-based):** `~/.claude/skills/`, `~/.agents/skills/`, etc. Blocked by a
+   **HOME symlink overlay** (`isolation.py`) that masks this repo's skills while keeping
+   vendor bundles and auth/config.
+2. **Project-local (git-root-based):** `.claude/skills/`, `.agents/skills/`, etc. at the
+   git repository root. Blocked by running **`git init`** in each cell's workspace, which
+   creates a `.git` boundary that stops agents from walking up to the real repo root.
+
+Together these ensure the model sees only the skills the eval/scenario provisions — plus the
+agent's built-in/vendor skills — never other repo skills you happen to have installed.
+This is what makes "test skill X (or this *combination*) in isolation" actually true, and
+enables A/B testing with vs without skills.
 
 - **Surgical, not a blank sandbox.** Only the global skills dirs are masked (per-runner
   `global_skills_subpaths`), and only *this repo's* skills are removed from them — vendor

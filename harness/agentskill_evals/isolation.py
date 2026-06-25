@@ -1,15 +1,25 @@
 """Per-cell HOME isolation for hermetic skill visibility.
 
-Agents discover skills from the project *and* the user's global skills folders, so
-globally-installed skills leak into a run regardless of what an eval provisions. To make
-a run see only the skills it declares — while keeping the agent's own *vendor* skills and
-all of its auth/config — we run each cell against a temporary HOME that is a **symlink
+Agents discover skills from two locations:
+
+  1. **Global (HOME-based):** ``~/.claude/skills/``, ``~/.agents/skills/``, etc.
+  2. **Project-local (git-root-based):** ``.claude/skills/``, ``.agents/skills/``, etc.
+     at the git repository root, found by walking up from cwd.
+
+This module handles layer 1 (global skills). The runner handles layer 2 by running
+``git init`` in each cell's workspace (see ``runner.py``), which creates a ``.git``
+boundary that stops agents from walking up to the real repo root.
+
+**Layer 1 — HOME overlay (this module):**
+
+To make a run see only the skills it declares — while keeping the agent's own *vendor* skills
+and all of its auth/config — we run each cell against a temporary HOME that is a **symlink
 overlay** of the real one:
 
-  * every top-level HOME entry (`.gitconfig`, `.ssh`, `.config`, `.claude/plugins`, …) is a
-    single wholesale symlink to the real one, so logins/settings/toolchains keep working;
+  * every top-level HOME entry (``.gitconfig``, ``.ssh``, ``.config``, ``.claude/plugins``, …)
+    is a single wholesale symlink to the real one, so logins/settings/toolchains keep working;
   * only each *global skills directory* is rebuilt as a real dir that symlinks through every
-    entry **except** this repo's skills (preserving vendor skills such as codex's `.system`),
+    entry **except** this repo's skills (preserving vendor skills such as codex's ``.system``),
     then *copies* in the cell's *declared* skills.
 
 Net effect inside a skills dir: ``vendor/other ∪ declared`` — undeclared repo skills are gone.
