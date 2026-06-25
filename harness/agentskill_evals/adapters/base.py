@@ -68,6 +68,7 @@ class ParseOutput:
     final_text: str = ""
     structured_output: Optional[Any] = None
     cost_usd: Optional[float] = None
+    premium_requests: Optional[float] = None
     duration_ms: Optional[int] = None
     resolved_model: Optional[str] = None
 

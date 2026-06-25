@@ -67,6 +67,10 @@ class CellResult:
         return [a for a in self.assertions if a.kind == "judge"]
 
     @property
+    def cost_str(self) -> str:
+        return self.run_result.cost_str
+
+    @property
     def model_label(self) -> str:
         return _model_seg(self.model)
 
@@ -123,7 +127,8 @@ class Runner:
                 for i, fut in enumerate(as_completed(futs), 1):
                     r = fut.result()
                     if self.progress:
-                        self.progress.done(cell=i, passed=r.passed if not r.ungraded else None)
+                        self.progress.done(cell=i, passed=r.passed if not r.ungraded else None,
+                                           cost=r.cost_str)
                     results.append(r)
 
         results.sort(key=lambda c: (c.eval_name, c.model or ""))
@@ -253,7 +258,8 @@ class Runner:
             self._write_judge_artifacts(cell_dir, cell, ctx.judge_exec)
 
         if p and cell_idx:
-            p.done(cell=cell_idx, passed=passed if not ungraded else None)
+            p.done(cell=cell_idx, passed=passed if not ungraded else None,
+                   cost=cell.cost_str)
         return cell
 
     def _skill_dirs(self, spec: EvalSpec) -> list[str]:
@@ -355,6 +361,7 @@ class Runner:
                     "passed": c.passed, "n_pass": c.n_pass, "n_total": c.n_total,
                     "error": c.run_result.error, "timed_out": c.run_result.timed_out,
                     "cost_usd": c.run_result.cost_usd,
+                    "premium_requests": c.run_result.premium_requests,
                     "artifacts": os.path.relpath(c.artifacts_dir, self.run_dir),
                 }
                 for c in results
@@ -402,7 +409,8 @@ def _cell_text(c: Optional[CellResult]) -> str:
         return "ERR"
     if c.ungraded:
         return "SKIP"
-    return f"{'PASS' if c.passed else 'FAIL'}  {_score_parts(c)}"
+    cost = f"  ({c.cost_str})" if c.cost_str else ""
+    return f"{'PASS' if c.passed else 'FAIL'}  {_score_parts(c)}{cost}"
 
 
 def _cell_mark(c: Optional[CellResult]) -> str:
@@ -412,7 +420,8 @@ def _cell_mark(c: Optional[CellResult]) -> str:
         return f"⚠️ {c.run_result.error}"
     if c.ungraded:
         return "⚪ ungraded"
-    return f"{'✅' if c.passed else '❌'} {_score_parts(c)}"
+    cost = f"  ({c.cost_str})" if c.cost_str else ""
+    return f"{'✅' if c.passed else '❌'} {_score_parts(c)}{cost}"
 
 
 def render_matrix(results: list[CellResult], agent: str,
@@ -531,8 +540,8 @@ def render_report(cell: CellResult) -> str:
     if cell.skill:
         out.append(f"- **skill(s):** {cell.skill}")
     meta = []
-    if rr.cost_usd is not None:
-        meta.append(f"cost ${rr.cost_usd:.4f}")
+    if rr.cost_str:
+        meta.append(f"cost {rr.cost_str}")
     if rr.duration_ms is not None:
         meta.append(f"{rr.duration_ms / 1000:.1f}s")
     if rr.resolved_model and rr.resolved_model != cell.model:

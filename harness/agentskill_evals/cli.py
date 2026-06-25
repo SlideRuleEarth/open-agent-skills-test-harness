@@ -434,6 +434,18 @@ def cmd_run(args) -> int:
     line = f"\n{n_pass}/{len(graded)} cells passed"
     if ung:
         line += f"   ({ung} ungraded — rubric-only evals with no judge)"
+
+    # cost total
+    total_usd = sum(c.run_result.cost_usd for c in results if c.run_result.cost_usd)
+    total_req = sum(c.run_result.premium_requests for c in results if c.run_result.premium_requests)
+    cost_parts = []
+    if total_usd:
+        cost_parts.append(f"${total_usd:.4f}")
+    if total_req:
+        cost_parts.append(f"{total_req:.2f}req")
+    if cost_parts:
+        line += f"   cost: {' / '.join(cost_parts)}"
+
     print(f"{line}   (details: {runner.run_dir}/summary.md)")
 
     if args.verbose:
