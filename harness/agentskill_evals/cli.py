@@ -44,6 +44,24 @@ def _dedup(seq) -> list:
     return list(dict.fromkeys(seq))
 
 
+def _safe_slug(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
+
+
+def _default_run_id(args, scenario, specs) -> str:
+    ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    if scenario:
+        return f"{ts}_scen_{_safe_slug(scenario.spec.name)}"
+    if args.skill:
+        return f"{ts}_skill_{_safe_slug(args.skill)}"
+    if args.evals:
+        if len(args.evals) == 1:
+            name = os.path.splitext(os.path.basename(args.evals[0]))[0]
+            return f"{ts}_eval_{_safe_slug(name)}"
+        return f"{ts}_evals_{len(args.evals)}"
+    return ts
+
+
 # ---------------------------------------------------------------------------
 # models.yaml
 # ---------------------------------------------------------------------------
@@ -366,7 +384,7 @@ def cmd_run(args) -> int:
     judge_label = f"{judge.agent}/{judge.model or 'default'}" if judge else "off"
     n_llm = n_cells * (2 if judge else 1)
 
-    run_id = args.run_id or _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_id = args.run_id or _default_run_id(args, scenario, specs)
     run_dir = os.path.join(os.path.abspath(args.artifacts), run_id)
 
     print(f"Plan: {n_cells} cell(s) — {n_eligible} eval(s) × {agent} "
@@ -410,6 +428,19 @@ def cmd_run(args) -> int:
             print("aborted.")
             return 1
 
+    # build a concise command string for the summary heading
+    cmd_parts = ["run"]
+    if args.config:
+        cmd_parts.append(f"--config {os.path.basename(args.config)}")
+    elif args.skill:
+        cmd_parts.append(f"--skill {args.skill}")
+    elif args.evals:
+        cmd_parts.append(f"--evals {' '.join(os.path.basename(e) for e in args.evals)}")
+    cmd_parts.append(f"--agent {agent}")
+    if cli_models:
+        cmd_parts.append(f"--model {','.join(cli_models)}")
+    command = " ".join(cmd_parts)
+
     with Progress(total_cells=n_cells) as progress:
         runner = Runner(
             agent,
@@ -423,6 +454,7 @@ def cmd_run(args) -> int:
             jobs=jobs,
             isolated=isolated,
             progress=progress,
+            command=command,
         )
 
         results = runner.run(specs)

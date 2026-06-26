@@ -96,6 +96,7 @@ class Runner:
         jobs: int = 1,
         isolated: bool = True,
         progress: Optional[Progress] = None,
+        command: str = "",
     ):
         self.agent = agent
         self.adapter = get_adapter(agent)
@@ -105,6 +106,7 @@ class Runner:
         self.skills_root = skills_root
         self.judge = judge
         self.provision = provision
+        self.command = command
         self.auto_approve = auto_approve
         self.jobs = max(1, jobs)
         self.isolated = isolated
@@ -359,6 +361,7 @@ class Runner:
     def _write_summary(self, results: list[CellResult], specs: list[EvalSpec]) -> None:
         summary = {
             "run_id": self.run_id,
+            "command": self.command,
             "agent": self.agent,
             "models": [m for m in self.models if m is not None] or ["default"],
             "isolated": self.isolated,
@@ -384,7 +387,8 @@ class Runner:
         }
         _write_json(os.path.join(self.run_dir, "summary.json"), summary)
         _write(os.path.join(self.run_dir, "summary.md"),
-               render_markdown(results, self.agent, self.models, run_dir=self.run_dir))
+               render_markdown(results, self.agent, self.models,
+                               run_dir=self.run_dir, command=self.command))
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +473,8 @@ def render_matrix(results: list[CellResult], agent: str,
 
 def render_markdown(results: list[CellResult], agent: str,
                     models: list[Optional[str]],
-                    run_dir: Optional[str] = None) -> str:
+                    run_dir: Optional[str] = None,
+                    command: str = "") -> str:
     by_key = {(c.eval_name, c.model): c for c in results}
     evals = sorted({c.eval_name for c in results})
     labels = [_model_label(m) for m in models]
@@ -481,7 +486,10 @@ def render_markdown(results: list[CellResult], agent: str,
             return f"[{mark}]({rel})"
         return mark
 
-    lines = [f"# Eval results — {agent}", "",
+    heading = f"# Eval results — {agent}"
+    if command:
+        heading += f" ({command})"
+    lines = [heading, "",
              "Each cell links to a per-cell `report.md` — the prompt the model was given, "
              "its complete response (full transcript), and every file it produced.", "",
              "| eval | " + " | ".join(labels) + " |",
