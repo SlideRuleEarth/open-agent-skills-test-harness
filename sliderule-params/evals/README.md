@@ -25,10 +25,10 @@ and assertion reference.
 From the repo root (install the `agentskill-evals` CLI first — see the [runner README](../../harness/README.md#install)):
 
 ```bash
-# this skill, on every installed agent, graded by the default judge (claude)
-agentskill-evals run --skill sliderule-params
+# this skill on one agent, graded by the default judge
+agentskill-evals run --skill sliderule-params --agent copilot
 
-# specific agents, parallel, show failing checks
+# specific agent + model, parallel, show failing checks
 agentskill-evals run --skill sliderule-params \
     --agent claude --jobs 4 -v
 ```
@@ -50,14 +50,14 @@ cheapest model per runner, `--all-models` runs the full set.
 
 ```bash
 # cheapest model per runner (safe default)
-agentskill-evals run --skill sliderule-params
+agentskill-evals run --skill sliderule-params --agent copilot
 
 # compare specific models — Haiku is the canonical weak-model probe (most likely to skip
 # SKILL.md and answer from training; if it works on Haiku it usually works everywhere)
-agentskill-evals run --skill sliderule-params --model claude=claude-opus-4-8,claude-haiku-4-5
+agentskill-evals run --skill sliderule-params --agent claude --model claude=claude-opus-4-8,claude-haiku-4-5
 
 # the full models.yaml grid (opt-in; prompts to confirm, bounded by --max-cells)
-agentskill-evals run --skill sliderule-params --all-models
+agentskill-evals run --skill sliderule-params --agent copilot --all-models
 ```
 
 See the [harness README](../../harness/README.md#cross-model-testing) for cost
