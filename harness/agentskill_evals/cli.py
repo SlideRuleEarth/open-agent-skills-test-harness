@@ -303,8 +303,10 @@ def cmd_run(args) -> int:
     cli_models = None
     if args.model:
         cli_models = [m.strip() for m in args.model.split(",") if m.strip()]
-    if scenario and scenario.model and not cli_models and not args.all_models:
-        cli_models = [scenario.model]
+    if scenario and not cli_models and not args.all_models:
+        non_none = [m for m in scenario.models if m is not None]
+        if non_none:
+            cli_models = non_none
     models = _resolve_models(agent, cli_models, cfg, args.all_models)
 
     # judge

@@ -55,7 +55,7 @@ rubric:                       # graded by the LLM judge
   - Caveats are present but proportionate (not a wall of disclaimers crowding out the result).
 
   # --- Tier 5: suite hygiene (optional; only relevant if grading a SlideRule-agent run) ---
-  - Calls an ATL06 endpoint from the SlideRule API skill (atl06x or atl06p).
+  - Calls an ATL06 endpoint from the SlideRule API (atl06x or atl06p).
   - Sets request parameters via the params skill rather than hardcoded guesses.
   - Looks up output column names via the openapi skill rather than guessing field names.
   - Saves the raw parquet response to disk so re-aggregation does not require re-fetching.

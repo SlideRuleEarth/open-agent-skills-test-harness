@@ -1,11 +1,12 @@
 # This is a basic 
-name: SimpleATL06PromptGrandMesa
+name: SimpleATL06PromptGrandMesa_Multi
 description: Exercises the SlideRule API and params skills together.
 
 target:                       # the runner:model this scenario tests
   runner: copilot
-  model: claude-haiku-4.5     # cheapest; omit to use models.yaml's default
-
+  model: 
+    - claude-haiku-4.5     # cheapest; omit to use models.yaml's default
+    - gpt-5.4-mini         
 skills:                       # provisioned together; the only repo skills visible (isolated)
   - sliderule-api
   - sliderule-params
