@@ -24,7 +24,10 @@ import subprocess
 from typing import Any, Optional
 
 from ..schema import EventKind, NormalizedEvent
-from .base import Adapter, ParseOutput, ProbeResult, RunOptions, extract_command, extract_path, iter_jsonl, try_load_json
+from .base import Adapter, ParseOutput, ProbeResult, RunOptions, extract_command, extract_path, iter_jsonl, try_load_json, warn_unknown_usage
+
+
+_KNOWN_USAGE_KEYS = {"input_tokens", "output_tokens", "reasoning_tokens", "total_tokens"}
 
 
 class CodexAdapter(Adapter):
@@ -169,6 +172,9 @@ class CodexAdapter(Adapter):
                 continue
 
             if etype == "turn.completed":
+                usage = obj.get("usage") or {}
+                if usage:
+                    warn_unknown_usage("codex", usage, _KNOWN_USAGE_KEYS)
                 events.append(NormalizedEvent(EventKind.RESULT, raw=obj, text=final_text))
 
             if etype == "error":
