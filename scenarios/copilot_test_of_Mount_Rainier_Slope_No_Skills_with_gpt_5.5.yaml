@@ -1,0 +1,62 @@
+# This is a basic 
+name: Mnt Rainier Slope No Skills
+description: Tests with no skills provisioned, so the LLM must reason about the API and params on its own.
+
+target:                       # the runner:model this scenario tests
+  runner: copilot
+  model: gpt-5.5  
+
+                      # norepo skills visible (isolated)
+
+prompt: |
+   Using ICESat-2 (Oct 2018–present), how have the glaciated flanks of Mount Rainier — above ~2000 m, excluding the summit dome — changed in surface elevation? Give me a spatial pattern and a one-paragraph summary.
+
+rubric:                       # graded by the LLM judge
+
+  # --- Tier 1: literal compliance (necessary, uninformative) ---
+  - Uses ICESat-2 data specifically (not GEDI, SRTM, Landsat, or another sensor).
+  - Time window starts at or near October 2018 and runs through the present.
+  - Region is restricted to elevations above approximately 2000 m.
+  - Region excludes the summit dome rather than including it in a convex hull.
+  - Delivers a spatial pattern of the change (map, per-flank breakdown, or equivalent 2D representation).
+  - Delivers a one-paragraph summary of the result.
+
+  # --- Tier 2: methodology (the test) ---
+  - Acknowledges that fitting elevation vs. time on steep terrain conflates intra-cell topography with temporal change, OR uses a method that avoids this (plane-fit-with-time, crossover analysis, DEM differencing, or equivalent).
+  - If per-cell linear regression of h vs. t was used without detrending, explicitly flags slope contamination as a limitation in the response.
+  - Filters ATL06 segments on atl06_quality_summary (keeps only quality_summary == 0) or equivalent quality gate.
+  - Sets a minimum-points-per-cell threshold and a minimum-temporal-span threshold before fitting a trend.
+  - Rejects or flags cells with non-physical dh/dt magnitudes (e.g. |dh/dt| > ~25 m/yr) or unreliable slope standard errors.
+  - Aggregates per-cell rates using a robust statistic (median) for headline numbers, or justifies the use of mean.
+  - Uses a spatial cell size appropriate for the polygon and expected sample density (roughly hundreds of meters, not kilometers or tens of meters).
+
+  # --- Tier 3: calibration and honesty ---
+  - Reports per-cell or per-flank uncertainty (standard error, n, fit RMSE, or confidence interval) rather than presenting point estimates as exact.
+  - Headline dh/dt values pass basic sanity checks: signs are mostly negative (glaciers are known to be retreating globally and Rainier's glaciers in particular have been documented as losing mass for decades), magnitudes are within roughly ±10 m/yr per cell (rates above this on a non-collapsing temperate glacier indicate a fit artifact, not real change), and no flank reports rapid thickening (>+2 m/yr sustained) without an explicit explanation.
+  - Identifies flanks or regions with few samples as weakly constrained, rather than reporting them with equal confidence as well-sampled flanks.
+  - Distinguishes what the data measures (surface elevation change, ellipsoidal) from related-but-different quantities (mass balance, ice thickness change, slope change).
+  - Does not invent or report values for quantities the prompt did not ask about (e.g. does not present a slope-change number when only elevation change was requested).
+  - Notes that ICESat-2 sampling is sparse and track-geometry dependent, and that the result is a reconnaissance estimate rather than a calibrated mass-balance product.
+  - Does not naively difference annual mean elevations across years to claim a trend (sampling location varies year to year).
+
+  # --- Tier 4: deliverable craft ---
+  - One-paragraph summary is in fact one paragraph (not multiple paragraphs or a bulleted list).
+  - Spatial visualization uses a diverging color scale centered on zero with units labeled.
+  - Summit location is marked or otherwise distinguishable on the spatial visualization.
+  - Polygon used for the request is reported or visualized so the region is auditable.
+  - Caveats are present but proportionate (not a wall of disclaimers crowding out the result).
+
+
+assertions:                   # deterministic checks
+  # process
+  - {type: no_error}
+
+# In an eval or scenario file:
+timeout_sec: 1200    # override the default 600s
+
+# Optional run knobs (any CLI flag overrides these):
+judge: 
+    agent: copilot
+    model: claude-opus-4.8
+isolated: true
+

@@ -47,6 +47,7 @@ class CellResult:
     passed: bool
     run_result: RunResult
     assertions: list[AssertionResult] = field(default_factory=list)
+    judge_run_result: Optional[RunResult] = None
     artifacts_dir: str = ""
     isolated: bool = False
     ungraded: bool = False
@@ -69,7 +70,11 @@ class CellResult:
 
     @property
     def cost_str(self) -> str:
-        return self.run_result.cost_str
+        agent = self.run_result.cost_str
+        judge = self.judge_run_result.cost_str if self.judge_run_result else ""
+        if agent and judge:
+            return f"agent {agent} + judge {judge}"
+        return agent
 
     @property
     def model_label(self) -> str:
@@ -262,6 +267,7 @@ class Runner:
 
         # 8) judge artifacts — same detail level as the agent, prefixed judge_*
         if ctx.judge_exec is not None:
+            cell.judge_run_result = ctx.judge_exec.result
             self._write_judge_artifacts(cell_dir, cell, ctx.judge_exec)
 
         if p and cell_idx:
@@ -369,6 +375,8 @@ class Runner:
                     "error": c.run_result.error, "timed_out": c.run_result.timed_out,
                     "cost_usd": c.run_result.cost_usd,
                     "premium_requests": c.run_result.premium_requests,
+                    "judge_cost_usd": c.judge_run_result.cost_usd if c.judge_run_result else None,
+                    "judge_premium_requests": c.judge_run_result.premium_requests if c.judge_run_result else None,
                     "artifacts": os.path.relpath(c.artifacts_dir, self.run_dir),
                 }
                 for c in results
