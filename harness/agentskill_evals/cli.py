@@ -435,16 +435,23 @@ def cmd_run(args) -> int:
     if ung:
         line += f"   ({ung} ungraded — rubric-only evals with no judge)"
 
-    # cost total
-    total_usd = sum(c.run_result.cost_usd for c in results if c.run_result.cost_usd)
-    total_req = sum(c.run_result.premium_requests for c in results if c.run_result.premium_requests)
-    cost_parts = []
-    if total_usd:
-        cost_parts.append(f"${total_usd:.4f}")
-    if total_req:
-        cost_parts.append(f"{total_req:.2f}req")
-    if cost_parts:
-        line += f"   cost: {' / '.join(cost_parts)}"
+    # cost total — agent and judge separated
+    def _sum_cost(rrs):
+        usd = sum(r.cost_usd for r in rrs if r and r.cost_usd)
+        req = sum(r.premium_requests for r in rrs if r and r.premium_requests)
+        parts = []
+        if usd:
+            parts.append(f"${usd:.4f}")
+        if req:
+            parts.append(f"{req:.2f}req")
+        return " / ".join(parts)
+
+    agent_cost = _sum_cost(c.run_result for c in results)
+    judge_cost = _sum_cost(c.judge_run_result for c in results if c.judge_run_result)
+    if agent_cost and judge_cost:
+        line += f"   cost: agent {agent_cost} + judge {judge_cost}"
+    elif agent_cost:
+        line += f"   cost: {agent_cost}"
 
     print(f"{line}   (details: {runner.run_dir}/summary.md)")
 
