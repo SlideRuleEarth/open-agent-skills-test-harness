@@ -41,6 +41,7 @@ class Progress:
         self._label = ""
         self._start = time.monotonic()
         self._phase_start = self._start
+        self._phase_count = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -65,6 +66,7 @@ class Progress:
             self._cell = cell
             self._phase = phase
             self._phase_start = time.monotonic()
+            self._phase_count += 1
             if eval_name or model:
                 parts = []
                 if eval_name:
@@ -106,7 +108,7 @@ class Progress:
             parts.append(cell_str)
         if self._phase:
             parts.append(self._phase)
-            if phase_elapsed != elapsed:
+            if self._phase_count > 1:
                 parts.append(f"({phase_elapsed})")
         if self._label:
             parts.append(self._label)
