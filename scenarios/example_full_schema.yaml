@@ -17,27 +17,41 @@ description: >                         # string (optional, default: "") — huma
   trivial script and checks it with every assertion type the harness supports.
 
 # --------------------------------------------------------------------------
-# Target — which runner:model to test (scenarios only; per-skill evals omit this)
+# Target — which runner:model(s) to test (scenarios only; per-skill evals omit this)
 # --------------------------------------------------------------------------
 
 target:
   runner: copilot                      # string (required) — adapter name: claude | codex | copilot | antigravity
-  model: claude-haiku-4.5             # string (optional) — model id; omit to use models.yaml default
+  model: claude-haiku-4.5             # string or list (optional) — model id(s); omit for models.yaml default
+  # A list creates one cell per model (same as --model a,b on the CLI):
+  # model:
+  #   - claude-opus-4-8
+  #   - claude-haiku-4-5
 
 # --------------------------------------------------------------------------
 # Skills — provisioned into the workspace; the ONLY repo skills visible (when isolated)
 # --------------------------------------------------------------------------
 
-skills:                                # list[str] (required for scenarios, non-empty)
-  - sliderule-api
+skills:                                # list[str] (optional, default: [])
+  - sliderule-api                      # each entry must match a <skills-root>/<name>/SKILL.md
   - sliderule-params
+# Accepted aliases: `skill: sliderule-api` (singular string) also works.
+# An empty list is valid — useful for A/B testing with vs. without skills.
 
 # --------------------------------------------------------------------------
 # Prompt — the instruction sent to the agent
 # --------------------------------------------------------------------------
+#
+# Built-in placeholders (substituted per-adapter at run time):
+#   {skill}  — the primary skill name (first entry in skills:)
+#   {skills} — all skills, comma-joined
+#
+# Custom placeholders: {key} for any entry in vars: below.
+#
+# The `|` (literal block scalar) preserves newlines and trailing newline;
+# `>` (folded scalar) joins lines into a paragraph. Use `|` for prompts
+# with numbered steps or line-sensitive formatting.
 
-# Use {skill} for the primary skill name (first in skills:), {skills} for all
-# of them joined, and {key} for any entry in vars: below.
 prompt: |
   Using {skills}, write a Python script called run.py in the workspace root.
   The script should:
@@ -45,6 +59,8 @@ prompt: |
   2. Print "{greeting}" to stdout
   3. Include a comment mentioning ATL06
   Region: {region}
+
+# Accepted aliases: `query:` or `input:` work as legacy names for `prompt:`.
 
 # --------------------------------------------------------------------------
 # Prompt variables — substituted into {placeholders} in the prompt
@@ -61,6 +77,7 @@ vars:                                  # dict[str, Any] (optional, default: {})
 # Each entry is either:
 #   - a relative path (copied at that path):        "fixtures/input.json"
 #   - a {source: dest} mapping for explicit dest:    {"data/raw.csv": "input.csv"}
+# Paths are relative to this YAML file's directory.
 files: []                              # list[str | dict] (optional, default: [])
 
 # --------------------------------------------------------------------------
@@ -96,41 +113,55 @@ tags:                                  # list[str] (optional, default: [])
 # --------------------------------------------------------------------------
 
 env: {}                                # dict[str, str] (optional, default: {})
+                                       # NOTE: under isolation, HOME/USERPROFILE/XDG_* and
+                                       # adapter config-homes are managed and override env: values.
 
 # --------------------------------------------------------------------------
 # Deterministic assertions — all must pass
 # --------------------------------------------------------------------------
 #
-# Available assertion types:
+# Available assertion types and their keys:
 #
 #   Filesystem:
-#     file_exists:    {type: file_exists, path: <rel>, contains: <str>, matches: <regex>, min_size: <int>}
+#     file_exists:    {type: file_exists, path: <rel>}
+#                      optional: contains: <str>, matches: <regex>, min_size: <int>
 #     file_absent:    {type: file_absent, path: <rel>}
 #     dir_exists:     {type: dir_exists, path: <rel>}
 #
 #   Tool / command trace:
-#     ran_command:    {type: ran_command, contains: <str>, matches: <regex>, equals: <str>, ignore_case: <bool>}
+#     ran_command:    {type: ran_command}
+#                      at least one of: contains: <str>, matches: <regex>, equals: <str>
+#                      optional: ignore_case: <bool>
 #     used_tool:      {type: used_tool, name: <tool>}
-#     tool_count:     {type: tool_count, min: <int>, max: <int>}
+#     tool_count:     {type: tool_count}
+#                      optional: min: <int>, max: <int>
 #
 #   Skill interaction:
 #     skill_triggered:           {type: skill_triggered, skill: <name>}
 #     skill_not_triggered:       {type: skill_not_triggered, skill: <name>}
-#     skill_reference_read:      {type: skill_reference_read, skill: <name>, path: <filename>}
-#     skill_reference_not_read:  {type: skill_reference_not_read, skill: <name>, path: <filename>}
-#     skill_script_executed:     {type: skill_script_executed, skill: <name>, path: <filename>}
-#     skill_script_not_executed: {type: skill_script_not_executed, skill: <name>, path: <filename>}
+#     skill_reference_read:      {type: skill_reference_read, skill: <name>}
+#                                 optional: path: <filename> (within references/ subdir)
+#     skill_reference_not_read:  {type: skill_reference_not_read, skill: <name>}
+#                                 optional: path: <filename>
+#     skill_script_executed:     {type: skill_script_executed, skill: <name>}
+#                                 optional: path: <filename> (within scripts/ subdir)
+#     skill_script_not_executed: {type: skill_script_not_executed, skill: <name>}
+#                                 optional: path: <filename>
 #
 #   Process / output:
 #     no_error:       {type: no_error}
 #     exit_code:      {type: exit_code, equals: <int>}
-#     final_contains: {type: final_contains, contains: <str>, matches: <regex>, ignore_case: <bool>}
+#     final_contains: {type: final_contains}
+#                      at least one of: contains: <str>, matches: <regex>
+#                      optional: ignore_case: <bool>
 #
-#   Schema / judge (usually auto-added; can be explicit):
-#     output_matches_schema: {type: output_matches_schema, schema: <json-schema>}
-#     llm_judge:             {type: llm_judge, rubric: [...], threshold: <0.0-1.0>}
+#   Schema / judge (usually auto-added from rubric:/output_schema:; can be explicit):
+#     output_matches_schema: {type: output_matches_schema}
+#                             optional: schema: <json-schema> (defaults to top-level output_schema:)
+#     llm_judge:             {type: llm_judge, rubric: [...]}
+#                             optional: threshold: <0.0-1.0>
 #
-#   All assertion types accept an optional `description:` for custom messages.
+#   All assertion types accept an optional `description:` for custom failure messages.
 
 assertions:
   # filesystem
@@ -150,7 +181,8 @@ assertions:
 # --------------------------------------------------------------------------
 #
 # Each entry is a plain-English behavior the judge evaluates pass/fail.
-# Compiled into a single llm_judge assertion automatically.
+# Automatically compiled into a single llm_judge assertion at run time.
+# Accepted alias: `expected_behavior:` (legacy).
 
 rubric:
   - The script prints "hello sliderule" to stdout.
@@ -160,6 +192,9 @@ rubric:
 # --------------------------------------------------------------------------
 # Output schema — JSON Schema the agent's structured output must match
 # --------------------------------------------------------------------------
+#
+# When set, an output_matches_schema assertion is auto-added. Only meaningful
+# for adapters that support structured output (e.g. claude with --json-schema).
 
 output_schema: null                    # dict | null (optional) — JSON Schema object
 
@@ -167,7 +202,8 @@ output_schema: null                    # dict | null (optional) — JSON Schema 
 # Run knobs — overridable from CLI flags
 # --------------------------------------------------------------------------
 
-judge: true                            # bool | dict (optional) — false to skip LLM judge;
+judge: true                            # bool | dict (optional, default: true)
+                                       # false → skip LLM judge
                                        # or {agent: claude, model: haiku} to override judge config
 isolated: true                         # bool (optional, default: true) — isolate skill visibility
 # max_cells: 25                        # int (optional) — cap for this scenario

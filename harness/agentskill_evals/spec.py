@@ -386,8 +386,8 @@ class Scenario:
     """A combination eval: an EvalSpec plus a pinned target and optional run-knob overrides."""
     spec: EvalSpec
     runner: str
-    model: Optional[str]
-    overrides: dict          # subset of {max_cells, jobs, judge, isolated}
+    models: list[str | None]   # one or more models; [None] means "use default"
+    overrides: dict            # subset of {max_cells, jobs, judge, isolated}
     source_path: str
 
 
@@ -404,15 +404,21 @@ def load_scenario(path: str) -> Scenario:
     runner = target.get("runner")
     if not runner or not isinstance(runner, str):
         raise ValueError(f"{path}: target.runner is required (a runner name, e.g. claude).")
-    model = target.get("model")
-    model = str(model) if model else None
+
+    raw_model = target.get("model")
+    if isinstance(raw_model, list):
+        models = [str(m) for m in raw_model if m] or [None]
+    elif raw_model:
+        models = [str(raw_model)]
+    else:
+        models = [None]
 
     spec = _spec_from_raw(raw, path)     # reuses prompt/skills parsing + the prompt-required check
     spec.agents = None                   # the target governs the runner; ignore any eval `agents:`
     spec.skill_name = "scenario"         # artifacts: .../<runner>/<model>/scenario/<name>/
 
     overrides = {k: raw[k] for k in _SCENARIO_OVERRIDE_KEYS if k in raw}
-    return Scenario(spec=spec, runner=runner.strip(), model=model,
+    return Scenario(spec=spec, runner=runner.strip(), models=models,
                     overrides=overrides, source_path=os.path.abspath(path))
 
 
