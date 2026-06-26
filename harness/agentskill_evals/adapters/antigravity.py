@@ -31,6 +31,7 @@ from .base import (
     extract_path,
     iter_jsonl,
     try_load_json,
+    warn_unknown_usage,
 )
 
 import re
@@ -173,6 +174,9 @@ def _parse_generic_events(objs: list[dict], skills_subdir: str = "") -> ParseOut
                 )
             )
         elif "result" in etype or "final" in etype or "done" in etype:
+            usage = obj.get("usage")
+            if isinstance(usage, dict) and usage:
+                warn_unknown_usage("antigravity", usage, set())
             if isinstance(text, str):
                 final_text = text
             events.append(NormalizedEvent(EventKind.RESULT, raw=obj, text=text))

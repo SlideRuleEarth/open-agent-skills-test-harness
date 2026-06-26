@@ -221,6 +221,16 @@ class Adapter(ABC):
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+def warn_unknown_usage(agent_name: str, usage: dict, known_keys: set[str]) -> None:
+    """Warn on stderr if a usage/result dict contains keys we don't capture."""
+    unknown = set(usage) - known_keys
+    if unknown:
+        import sys
+        print(f"warning: {agent_name} reported unknown usage/billing fields: "
+              f"{sorted(unknown)} — check if new billing metrics need capturing",
+              file=sys.stderr)
+
+
 def iter_jsonl(text: str):
     """Yield parsed JSON objects from JSONL text, skipping blank/non-JSON lines.
 

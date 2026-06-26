@@ -22,11 +22,16 @@ import json
 from typing import Any
 
 from ..schema import EventKind, NormalizedEvent
-from .base import Adapter, ParseOutput, ProbeResult, RunOptions, extract_command, extract_path, iter_jsonl
+from .base import Adapter, ParseOutput, ProbeResult, RunOptions, extract_command, extract_path, iter_jsonl, warn_unknown_usage
 
 _FILE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Create"}
 _READ_TOOLS = {"Read", "View"}
 _SHELL_TOOLS = {"Bash", "BashOutput"}
+_KNOWN_RESULT_KEYS = {
+    "type", "subtype", "result", "is_error",
+    "total_cost_usd", "duration_ms", "structured_output",
+    "session_id", "model",
+}
 
 
 class ClaudeAdapter(Adapter):
@@ -161,6 +166,7 @@ class ClaudeAdapter(Adapter):
                         )
 
             elif etype == "result":
+                warn_unknown_usage("claude", obj, _KNOWN_RESULT_KEYS)
                 result_text = obj.get("result")
                 if isinstance(result_text, str):
                     final_text = result_text

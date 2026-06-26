@@ -45,11 +45,15 @@ from .base import (
     extract_path,
     iter_jsonl,
     try_load_json,
+    warn_unknown_usage,
 )
 
 _SHELL_TOOLS = {"shell", "bash", "run_command"}
 _FILE_TOOLS = {"write", "edit", "create", "multi_edit"}
 _VIEW_TOOLS = {"view", "read"}
+_KNOWN_USAGE_KEYS = {
+    "premiumRequests", "totalApiDurationMs", "sessionDurationMs", "codeChanges",
+}
 
 
 class CopilotAdapter(Adapter):
@@ -205,6 +209,7 @@ class CopilotAdapter(Adapter):
 
             if etype == "result":
                 usage = obj.get("usage") or {}
+                warn_unknown_usage("copilot", usage, _KNOWN_USAGE_KEYS)
                 duration_ms = usage.get("sessionDurationMs")
                 pr = usage.get("premiumRequests")
                 if pr is not None:
