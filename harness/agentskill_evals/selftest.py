@@ -344,9 +344,112 @@ def _check_path_resolution(failures, verbose):
         out = writes_outside_workspace(_rr([abs_out]), ws)
         _check("paths.abs_outside_surfaced", out == [os.path.abspath(abs_out)],
                f"absolute outside write surfaced (got {out})", failures, verbose)
+
+        # 5. relative symlink trace path that escapes workspace is blocked
+        secret = os.path.join(outside, "secret.txt")
+        open(secret, "w").close()
+        os.symlink(outside, os.path.join(ws, "link"))
+        path, where = _resolve_artifact(_rr(["link/secret.txt"]), ws, "secret.txt")
+        _check("paths.symlink_rel_blocked", path is None,
+               f"relative symlink trace escape blocked (got {path}, {where})",
+               failures, verbose)
+
+        # 6. absolute trace path through workspace symlink is also blocked
+        abs_link_path = os.path.join(ws, "link", "secret.txt")
+        path, where = _resolve_artifact(_rr([abs_link_path]), ws, "secret.txt")
+        _check("paths.symlink_abs_blocked", path is None,
+               f"absolute symlink trace escape blocked (got {path}, {where})",
+               failures, verbose)
+
+        # 7. genuinely-outside absolute trace path still passes
+        path, where = _resolve_artifact(_rr([secret]), ws, "secret.txt")
+        _check("paths.outside_abs_passes",
+               path == os.path.abspath(secret) and where == "write-trace",
+               f"genuine outside absolute trace passes (got {path}, {where})",
+               failures, verbose)
+
+        # 8. normal inside trace path through no symlink still works
+        normal = os.path.join(ws, "sub")
+        os.makedirs(normal, exist_ok=True)
+        open(os.path.join(normal, "ok.txt"), "w").close()
+        path, where = _resolve_artifact(_rr(["sub/ok.txt"]), ws, "ok.txt")
+        _check("paths.normal_inside_passes",
+               path is not None and where == "write-trace",
+               f"normal inside trace passes (got {path}, {where})",
+               failures, verbose)
     finally:
         shutil.rmtree(ws, ignore_errors=True)
         shutil.rmtree(outside, ignore_errors=True)
+
+
+def _check_verdict_coercion(failures, verbose):
+    """Top-level and per-item verdict 'pass' coercion edge cases."""
+    from .assertions import AssertionContext, run_assertion
+    from .judge import _coerce_verdict
+    from .schema import RunResult
+
+    print("verdict coercion:")
+
+    rr = RunResult(agent="x", eval_name="e", prompt="", workdir="/tmp")
+
+    # "pass": "false" at item level must be False
+    v1 = _coerce_verdict(rr, ["a"])
+    v1["items"] = [{"behavior": "a", "pass": "false", "reason": "r"}]
+    from .judge import _coerce_verdict as _cv
+    coerced = {"items": [{"behavior": "a", "pass": "false", "reason": "r"}], "summary": "s"}
+    for it in coerced["items"]:
+        v = it.get("pass")
+        it["pass"] = v is True or (isinstance(v, str) and v.lower() == "true")
+    _check("verdict.item_false_str", coerced["items"][0]["pass"] is False,
+           "item 'pass': 'false' coerced to False", failures, verbose)
+
+    # "pass": "true" at item level must be True
+    coerced2 = {"items": [{"behavior": "a", "pass": "true", "reason": "r"}]}
+    for it in coerced2["items"]:
+        v = it.get("pass")
+        it["pass"] = v is True or (isinstance(v, str) and v.lower() == "true")
+    _check("verdict.item_true_str", coerced2["items"][0]["pass"] is True,
+           "item 'pass': 'true' coerced to True", failures, verbose)
+
+    # top-level {"items": [], "pass": "false"} must fail
+    def _fake_judge(**kw):
+        from dataclasses import dataclass
+        @dataclass
+        class FakeJR:
+            verdict: dict
+        return FakeJR(verdict={"items": [], "pass": "false", "summary": "nope"})
+
+    spec = EvalSpec(name="t", prompt="p", source_path="/x.yaml", rubric=["a"])
+    ctx = AssertionContext(spec=spec, judge=_fake_judge)
+    ar = run_assertion({"type": "llm_judge", "rubric": ["a"]}, rr, "/tmp", spec, ctx)
+    _check("verdict.toplevel_false_str", ar.passed is False,
+           f"top-level 'pass': 'false' must fail (got passed={ar.passed})",
+           failures, verbose)
+
+    # extra judge items beyond rubric length must not inflate score
+    def _fake_judge_extra(**kw):
+        from dataclasses import dataclass
+        @dataclass
+        class FakeJR:
+            verdict: dict
+        return FakeJR(verdict={
+            "items": [
+                {"behavior": "a", "pass": False, "reason": "no"},
+                {"behavior": "b", "pass": False, "reason": "no"},
+                {"behavior": "c", "pass": False, "reason": "no"},
+                {"behavior": "extra1", "pass": True, "reason": "y"},
+                {"behavior": "extra2", "pass": True, "reason": "y"},
+                {"behavior": "extra3", "pass": True, "reason": "y"},
+            ],
+            "summary": "mixed",
+        })
+
+    ctx2 = AssertionContext(spec=spec, judge=_fake_judge_extra)
+    spec3 = EvalSpec(name="t", prompt="p", source_path="/x.yaml", rubric=["a", "b", "c"])
+    ar2 = run_assertion({"type": "llm_judge", "rubric": ["a", "b", "c"]}, rr, "/tmp", spec3, ctx2)
+    _check("verdict.extra_items_no_inflate", ar2.passed is False,
+           f"3 failed + 3 extra passing must not pass a 3-item rubric (got passed={ar2.passed})",
+           failures, verbose)
 
 
 def run_selftest(verbose: bool = False) -> int:
@@ -697,8 +800,12 @@ def run_selftest(verbose: bool = False) -> int:
     # per-cell readable report
     _check_report(failures, verbose)
 
-    # artifact / trace path resolution (no false passes on seeded fixtures; workspace-relative)
+    # artifact / trace path resolution (no false passes on seeded fixtures; workspace-relative;
+    # symlink escapes via write-trace)
     _check_path_resolution(failures, verbose)
+
+    # verdict coercion edge cases (string "false", extra items)
+    _check_verdict_coercion(failures, verbose)
 
     print()
     if failures:
