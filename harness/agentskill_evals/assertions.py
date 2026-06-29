@@ -86,6 +86,12 @@ def _is_within(path: str, root: str) -> bool:
     return rp == rr or rp.startswith(rr + os.sep)
 
 
+def _is_lexically_within(path: str, root: str) -> bool:
+    ap = os.path.abspath(path)
+    ar = os.path.abspath(root)
+    return ap == ar or ap.startswith(ar + os.sep)
+
+
 @register("file_exists")
 def _file_exists(result, workdir, spec, cfg, ctx):
     rel = cfg["path"]
@@ -148,9 +154,7 @@ def _resolve_artifact(result, workdir: str, rel: str) -> tuple[Optional[str], Op
                 continue
             ap = os.path.abspath(resolve_trace_path(p, workdir))
             if os.path.basename(ap) == base and os.path.isfile(ap):
-                lexically_inside = _is_within(ap, workdir)
-                really_inside = _is_within(os.path.realpath(ap), workdir)
-                if lexically_inside and not really_inside:
+                if _is_lexically_within(ap, workdir) and not _is_within(ap, workdir):
                     continue
                 return ap, "write-trace"
     return None, None
@@ -406,7 +410,11 @@ def _llm_judge(result, workdir, spec, cfg, ctx):
     scored = items[:expected]
     passed_items = sum(1 for it in scored if it.get("pass"))
     frac = passed_items / expected
-    ok = bool(verdict.get("pass")) if "pass" in verdict and not items else frac >= threshold
+    if "pass" in verdict and not items:
+        vp = verdict["pass"]
+        ok = vp is True or (isinstance(vp, str) and vp.lower() == "true")
+    else:
+        ok = frac >= threshold
     msg = verdict.get("summary") or f"{passed_items}/{expected} rubric items satisfied"
     return AssertionResult("llm_judge", ok, msg, kind="judge", details=verdict)
 
