@@ -148,6 +148,8 @@ def _resolve_artifact(result, workdir: str, rel: str) -> tuple[Optional[str], Op
                 continue
             ap = os.path.abspath(resolve_trace_path(p, workdir))
             if os.path.basename(ap) == base and os.path.isfile(ap):
+                if not os.path.isabs(p) and not _is_within(ap, workdir):
+                    continue
                 return ap, "write-trace"
     return None, None
 
