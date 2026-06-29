@@ -75,19 +75,29 @@ def _label(cfg: dict, default: str) -> str:
 # Filesystem
 # ---------------------------------------------------------------------------
 
+def _escapes_workspace(rel: str) -> bool:
+    norm = os.path.normpath(rel)
+    return os.path.isabs(norm) or norm == os.pardir or norm.startswith(os.pardir + os.sep)
+
+
 def _is_within(path: str, root: str) -> bool:
-    return os.path.realpath(path).startswith(os.path.realpath(root) + os.sep)
+    rp = os.path.realpath(path)
+    rr = os.path.realpath(root)
+    return rp == rr or rp.startswith(rr + os.sep)
 
 
 @register("file_exists")
 def _file_exists(result, workdir, spec, cfg, ctx):
     rel = cfg["path"]
-    if os.path.isabs(rel) or os.path.normpath(rel).startswith(".."):
+    if _escapes_workspace(rel):
         return AssertionResult("file_exists", False,
                                _label(cfg, f"path {rel!r} escapes workspace"))
     path, where = _resolve_artifact(result, workdir, rel)
     if path is None:
         return AssertionResult("file_exists", False, _label(cfg, f"missing file: {rel}"))
+    if not _is_within(path, workdir):
+        return AssertionResult("file_exists", False,
+                               _label(cfg, f"path {rel!r} resolves outside workspace (symlink?)"))
     # An artifact produced *anywhere* still counts as produced: the harness grades whether the
     # run created it, not whether the model typed the destination correctly (e.g. an absolute
     # path with a mangled run-id). Flag a non-workspace hit so it's visible, never silent.
@@ -145,10 +155,14 @@ def _resolve_artifact(result, workdir: str, rel: str) -> tuple[Optional[str], Op
 @register("file_absent")
 def _file_absent(result, workdir, spec, cfg, ctx):
     rel = cfg["path"]
-    if os.path.isabs(rel) or os.path.normpath(rel).startswith(".."):
+    if _escapes_workspace(rel):
         return AssertionResult("file_absent", False,
                                _label(cfg, f"path {rel!r} escapes workspace"))
-    exists = os.path.exists(os.path.join(workdir, rel))
+    target = os.path.join(workdir, rel)
+    if not _is_within(target, workdir):
+        return AssertionResult("file_absent", False,
+                               _label(cfg, f"path {rel!r} resolves outside workspace (symlink?)"))
+    exists = os.path.exists(target)
     return AssertionResult("file_absent", not exists,
                            _label(cfg, f"{rel} {'unexpectedly present' if exists else 'absent'}"))
 
@@ -156,10 +170,14 @@ def _file_absent(result, workdir, spec, cfg, ctx):
 @register("dir_exists")
 def _dir_exists(result, workdir, spec, cfg, ctx):
     rel = cfg["path"]
-    if os.path.isabs(rel) or os.path.normpath(rel).startswith(".."):
+    if _escapes_workspace(rel):
         return AssertionResult("dir_exists", False,
                                _label(cfg, f"path {rel!r} escapes workspace"))
-    ok = os.path.isdir(os.path.join(workdir, rel))
+    target = os.path.join(workdir, rel)
+    if not _is_within(target, workdir):
+        return AssertionResult("dir_exists", False,
+                               _label(cfg, f"path {rel!r} resolves outside workspace (symlink?)"))
+    ok = os.path.isdir(target)
     return AssertionResult("dir_exists", ok, _label(cfg, f"dir {rel} {'exists' if ok else 'missing'}"))
 
 
@@ -381,7 +399,8 @@ def _llm_judge(result, workdir, spec, cfg, ctx):
         ctx.judge_exec = jr.exec_result
     items = verdict.get("items", [])
     expected = len(rubric) if rubric else (len(items) or 1)
-    passed_items = sum(1 for it in items if it.get("pass"))
+    scored = items[:expected]
+    passed_items = sum(1 for it in scored if it.get("pass"))
     frac = passed_items / expected
     ok = bool(verdict.get("pass")) if "pass" in verdict and not items else frac >= threshold
     msg = verdict.get("summary") or f"{passed_items}/{expected} rubric items satisfied"
