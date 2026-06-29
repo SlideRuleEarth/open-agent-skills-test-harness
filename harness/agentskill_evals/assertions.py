@@ -95,7 +95,7 @@ def _file_exists(result, workdir, spec, cfg, ctx):
     path, where = _resolve_artifact(result, workdir, rel)
     if path is None:
         return AssertionResult("file_exists", False, _label(cfg, f"missing file: {rel}"))
-    if not _is_within(path, workdir):
+    if where == "workspace" and not _is_within(path, workdir):
         return AssertionResult("file_exists", False,
                                _label(cfg, f"path {rel!r} resolves outside workspace (symlink?)"))
     # An artifact produced *anywhere* still counts as produced: the harness grades whether the
