@@ -1,6 +1,14 @@
 # sliderule-skills
 
-A set of open-standard Agent Skills for working with [SlideRule Earth](https://slideruleearth.io). Each top-level folder is a self-contained skill that can be used by any platform that supports the open Agent Skills standard (Claude Code, the Claude Agent SDK, etc.).
+AI agent skills for [SlideRule Earth](https://slideruleearth.io) — a NASA ICESat-2/GEDI cloud processing service — plus a cross-agent test harness to evaluate how well those skills work across different models.
+
+**Two parts:**
+
+1. **Skills** (top-level dirs) — each contains a `SKILL.md` and supporting references/scripts that teach an AI agent how to use SlideRule's API, plan request parameters, search docs, etc. Skills follow cross-agent conventions (`.claude/skills/`, `.agents/skills/`, `.codex/skills/`) and work with any platform that supports the open Agent Skills standard.
+
+2. **Harness** ([`harness/`](harness/)) — a CLI tool (`agentskill-evals`) that evaluates skills across multiple agent CLIs (Claude Code, GitHub Copilot, OpenAI Codex, AntiGravity). It provisions skills into isolated workspaces, runs a prompt through an agent, then grades the result with deterministic assertions (file exists, skill triggered, etc.) and an LLM judge (rubric-based). Evals live per-skill in `<skill>/evals/*.yaml`; scenarios in `scenarios/` combine multiple skills with a pinned runner/model.
+
+**Key design choices:** an adapter abstraction normalizes each CLI's output into a common event stream; workspace isolation (HOME overlay + git boundary) ensures agents see only provisioned skills; the judge runs through the same adapter machinery so any agent can grade any other.
 
 ## Skills in this repo
 
@@ -13,11 +21,7 @@ A set of open-standard Agent Skills for working with [SlideRule Earth](https://s
 - [sliderule-region-picker](sliderule-region-picker/) — Interactive map for defining geographic regions
 - [nsidc-reference](nsidc-reference/) — Reference for NASA NSIDC and ORNL DAAC data products
 
-> **Just want to use the skills?** Install them (below) and you're done — you can stop reading there.
-> The [`harness/`](harness/) folder is a separate **test harness** that
-> maintainers use to evaluate these skills across different models; it's entirely optional and plays
-> no part in using the skills. Ignore it unless you're contributing — see
-> [Testing the skills across models](#testing-the-skills-across-models) if you're curious.
+> **Just want to use the skills?** Install them below and you're done — the harness is optional.
 
 ## Installing the skills (one source of truth)
 
