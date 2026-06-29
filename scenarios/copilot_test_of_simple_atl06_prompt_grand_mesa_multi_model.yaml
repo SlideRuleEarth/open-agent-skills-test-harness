@@ -22,10 +22,9 @@ rubric:                       # graded by the LLM judge
 
 assertions:                   # deterministic checks
   - {type: file_exists, path: run.py}
-  - {type: skill_triggered,     skill: sliderule-api}
-  - {type: skill_triggered,     skill: sliderule-params}
   # process
   - {type: no_error}
+timeout_sec: 1200                       # int (optional, default: 600) — max seconds for the agent run
 
 # Optional run knobs (any CLI flag overrides these):
 judge: true

@@ -5,11 +5,15 @@ throwaway workspace. It is handed a compact transcript of the graded run — the
 user prompt, the agent's final answer, the commands/tools it ran, and the
 resulting file tree — and scores each rubric behavior pass/fail with a reason.
 
+All judge runs are tool-free (``disable_tools=True``): the judge prompt
+contains everything needed for grading (transcript, tool trace, file
+contents). Tools would let the judge explore its own empty temp workspace
+and draw wrong conclusions about file existence.
+
 Adapters that support native structured output (``supports_output_schema``,
-e.g. Claude Code's ``--json-schema``) run tool-free with a schema constraint.
-Other adapters (Copilot, Codex, AntiGravity) run with tools enabled so the
-model can reason freely; the prompt carries explicit JSON format instructions
-and the verdict is parsed from the final answer text.
+e.g. Claude Code's ``--json-schema``) additionally get a schema constraint.
+Other adapters (Copilot, Codex, AntiGravity) get explicit JSON format
+instructions in the prompt and the verdict is parsed from the final answer.
 
 Because the judge rides on the same adapter machinery, you can grade with any
 agent (``--judge-agent codex``), not just Claude.
@@ -102,7 +106,7 @@ class Judge:
             opts = RunOptions(
                 model=self.model,
                 auto_approve=True,
-                disable_tools=False,
+                disable_tools=True,
             )
 
         with tempfile.TemporaryDirectory(prefix="judge-") as tmp:
