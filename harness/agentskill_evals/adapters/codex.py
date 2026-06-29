@@ -116,20 +116,20 @@ class CodexAdapter(Adapter):
 
                 if itype == "command_execution":
                     cmd = item.get("command") or extract_command(item)
-                    key = ("cmd", item_id, cmd)
-                    if etype == "item.started" or (etype == "item.completed" and key not in seen):
-                        if ("cmd", item_id, cmd) not in seen:
-                            seen.add(("cmd", item_id, cmd))
-                            events.append(
-                                NormalizedEvent(
-                                    EventKind.TOOL_CALL, raw=item, tool_name="shell", command=cmd
-                                )
+                    id_key = ("cmd", item_id)
+                    if id_key not in seen:
+                        seen.add(id_key)
+                        events.append(
+                            NormalizedEvent(
+                                EventKind.TOOL_CALL, raw=item, tool_name="shell", command=cmd
                             )
+                        )
                     if etype == "item.completed":
                         events.append(
                             NormalizedEvent(
                                 EventKind.TOOL_RESULT,
                                 raw=item,
+                                text=item.get("aggregated_output") or "",
                                 is_error=bool(item.get("exit_code")),
                             )
                         )

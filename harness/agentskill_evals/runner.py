@@ -170,7 +170,11 @@ class Runner:
         #    project-level skills. Without this, the workspace (inside the repo tree) leaks
         #    all repo-root skills. `git init` stops the walk at the workspace.
         if self.isolated:
-            subprocess.run(["git", "init", workspace], capture_output=True)
+            gi = subprocess.run(["git", "init", workspace], capture_output=True)
+            if gi.returncode != 0:
+                print(f"warning: [{self.agent}] git init failed (rc={gi.returncode}); "
+                      "skill isolation may leak project-level skills.",
+                      file=sys.stderr)
 
         # 1) provision skills + 2) seed files
         _phase("provisioning workspace")
@@ -291,7 +295,11 @@ class Runner:
             shutil.copytree(fixture, workspace, dirs_exist_ok=True)
         for src, dest_rel in spec.resolved_files():
             if os.path.isfile(src):
-                dest = os.path.join(workspace, dest_rel)
+                dest = os.path.realpath(os.path.join(workspace, dest_rel))
+                if not dest.startswith(os.path.realpath(workspace) + os.sep):
+                    print(f"warning: seed file {dest_rel!r} escapes workspace, skipping",
+                          file=sys.stderr)
+                    continue
                 os.makedirs(os.path.dirname(dest) or workspace, exist_ok=True)
                 shutil.copy2(src, dest)
 
