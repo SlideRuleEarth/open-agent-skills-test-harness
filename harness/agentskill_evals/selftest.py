@@ -653,36 +653,41 @@ def run_selftest(verbose: bool = False) -> int:
     _check("validate.clean", vr9.ok and not vr9.warnings,
            f"clean spec: errors={vr9.errors} warnings={vr9.warnings}", failures, verbose)
 
-    # scenario multi-model target
+    # scenario multi-model target (needs PyYAML)
     print("scenario multi-model:")
-    import tempfile as _tmpmod
-    import yaml as _yaml
-    from .spec import load_scenario
-    _scen_yaml = {"name": "multi", "prompt": "say hi",
-                  "target": {"runner": "claude", "model": ["opus-4-8", "haiku-4-5"]},
-                  "skills": []}
-    with _tmpmod.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as _f:
-        _yaml.dump(_scen_yaml, _f)
-        _f.flush()
-        _scen = load_scenario(_f.name)
-    _check("scenario.multi_model", _scen.models == ["opus-4-8", "haiku-4-5"],
-           f"list model parsed: {_scen.models}", failures, verbose)
-    _scen_single = {"name": "single", "prompt": "say hi",
-                    "target": {"runner": "claude", "model": "opus-4-8"}, "skills": []}
-    with _tmpmod.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as _f:
-        _yaml.dump(_scen_single, _f)
-        _f.flush()
-        _scen = load_scenario(_f.name)
-    _check("scenario.single_model", _scen.models == ["opus-4-8"],
-           f"string model parsed: {_scen.models}", failures, verbose)
-    _scen_none = {"name": "nomodel", "prompt": "say hi",
-                  "target": {"runner": "claude"}, "skills": []}
-    with _tmpmod.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as _f:
-        _yaml.dump(_scen_none, _f)
-        _f.flush()
-        _scen = load_scenario(_f.name)
-    _check("scenario.no_model", _scen.models == [None],
-           f"omitted model → [None]: {_scen.models}", failures, verbose)
+    try:
+        import yaml as _yaml
+    except ModuleNotFoundError:
+        print("  [skipped — PyYAML not installed]")
+        _yaml = None
+    if _yaml is not None:
+        import tempfile as _tmpmod
+        from .spec import load_scenario
+        _scen_yaml = {"name": "multi", "prompt": "say hi",
+                      "target": {"runner": "claude", "model": ["opus-4-8", "haiku-4-5"]},
+                      "skills": []}
+        with _tmpmod.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as _f:
+            _yaml.dump(_scen_yaml, _f)
+            _f.flush()
+            _scen = load_scenario(_f.name)
+        _check("scenario.multi_model", _scen.models == ["opus-4-8", "haiku-4-5"],
+               f"list model parsed: {_scen.models}", failures, verbose)
+        _scen_single = {"name": "single", "prompt": "say hi",
+                        "target": {"runner": "claude", "model": "opus-4-8"}, "skills": []}
+        with _tmpmod.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as _f:
+            _yaml.dump(_scen_single, _f)
+            _f.flush()
+            _scen = load_scenario(_f.name)
+        _check("scenario.single_model", _scen.models == ["opus-4-8"],
+               f"string model parsed: {_scen.models}", failures, verbose)
+        _scen_none = {"name": "nomodel", "prompt": "say hi",
+                      "target": {"runner": "claude"}, "skills": []}
+        with _tmpmod.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as _f:
+            _yaml.dump(_scen_none, _f)
+            _f.flush()
+            _scen = load_scenario(_f.name)
+        _check("scenario.no_model", _scen.models == [None],
+               f"omitted model → [None]: {_scen.models}", failures, verbose)
 
     # HOME isolation overlay + side-effect-free provisioning
     _check_isolation(failures, verbose)

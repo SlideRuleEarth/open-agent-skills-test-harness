@@ -157,10 +157,20 @@ class ClaudeAdapter(Adapter):
                 content = (obj.get("message") or {}).get("content") or []
                 for block in content:
                     if block.get("type") == "tool_result":
+                        result_content = block.get("content")
+                        text = ""
+                        if isinstance(result_content, str):
+                            text = result_content
+                        elif isinstance(result_content, list):
+                            text = "\n".join(
+                                p.get("text", "") for p in result_content
+                                if isinstance(p, dict) and p.get("type") == "text"
+                            )
                         events.append(
                             NormalizedEvent(
                                 EventKind.TOOL_RESULT,
                                 raw=block,
+                                text=text,
                                 is_error=bool(block.get("is_error")),
                             )
                         )

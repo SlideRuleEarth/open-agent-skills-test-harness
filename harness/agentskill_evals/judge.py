@@ -211,8 +211,8 @@ def _coerce_verdict(rr: RunResult, rubric: list[str]) -> dict:
             "summary": f"judge failed: {reason}",
             "judge_error": True,
         }
-    # ensure booleans
     for it in data.get("items", []):
-        it["pass"] = bool(it.get("pass"))
+        v = it.get("pass")
+        it["pass"] = v is True or (isinstance(v, str) and v.lower() == "true")
     data.setdefault("summary", "")
     return data

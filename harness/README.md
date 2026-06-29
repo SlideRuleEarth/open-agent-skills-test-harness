@@ -88,7 +88,7 @@ python3 -m agentskill_evals run --skills-root .. --config ../scenarios/<file>.ya
 - **Requires Python ≥ 3.10.** If pipx or `make dev` picks an older interpreter, install fails with a
   `requires-python` error — select one explicitly: `pipx install . --python python3.12`, or
   `make dev PYTHON=python3.12`.
-- `selftest` and `--help` need no dependencies; anything that reads YAML evals or `models.yaml`
+- `selftest` and `--help` need no dependencies (scenario tests are skipped without PyYAML); anything that reads YAML evals or `models.yaml`
   (`run`, `list-evals`, `list-agents-configured-models`) needs `pyyaml` — every option above provides it.
 - Install whichever agent CLIs you want to test (`claude`, `codex`, `agy`). Missing ones are marked
   `ERR` / skipped — `list-agents-configured-models` shows what's available.

@@ -75,9 +75,16 @@ def _label(cfg: dict, default: str) -> str:
 # Filesystem
 # ---------------------------------------------------------------------------
 
+def _is_within(path: str, root: str) -> bool:
+    return os.path.realpath(path).startswith(os.path.realpath(root) + os.sep)
+
+
 @register("file_exists")
 def _file_exists(result, workdir, spec, cfg, ctx):
     rel = cfg["path"]
+    if os.path.isabs(rel) or os.path.normpath(rel).startswith(".."):
+        return AssertionResult("file_exists", False,
+                               _label(cfg, f"path {rel!r} escapes workspace"))
     path, where = _resolve_artifact(result, workdir, rel)
     if path is None:
         return AssertionResult("file_exists", False, _label(cfg, f"missing file: {rel}"))
@@ -138,6 +145,9 @@ def _resolve_artifact(result, workdir: str, rel: str) -> tuple[Optional[str], Op
 @register("file_absent")
 def _file_absent(result, workdir, spec, cfg, ctx):
     rel = cfg["path"]
+    if os.path.isabs(rel) or os.path.normpath(rel).startswith(".."):
+        return AssertionResult("file_absent", False,
+                               _label(cfg, f"path {rel!r} escapes workspace"))
     exists = os.path.exists(os.path.join(workdir, rel))
     return AssertionResult("file_absent", not exists,
                            _label(cfg, f"{rel} {'unexpectedly present' if exists else 'absent'}"))
@@ -146,6 +156,9 @@ def _file_absent(result, workdir, spec, cfg, ctx):
 @register("dir_exists")
 def _dir_exists(result, workdir, spec, cfg, ctx):
     rel = cfg["path"]
+    if os.path.isabs(rel) or os.path.normpath(rel).startswith(".."):
+        return AssertionResult("dir_exists", False,
+                               _label(cfg, f"path {rel!r} escapes workspace"))
     ok = os.path.isdir(os.path.join(workdir, rel))
     return AssertionResult("dir_exists", ok, _label(cfg, f"dir {rel} {'exists' if ok else 'missing'}"))
 
@@ -367,11 +380,11 @@ def _llm_judge(result, workdir, spec, cfg, ctx):
     if hasattr(jr, "exec_result"):
         ctx.judge_exec = jr.exec_result
     items = verdict.get("items", [])
-    n = len(items) or 1
+    expected = len(rubric) if rubric else (len(items) or 1)
     passed_items = sum(1 for it in items if it.get("pass"))
-    frac = passed_items / n
+    frac = passed_items / expected
     ok = bool(verdict.get("pass")) if "pass" in verdict and not items else frac >= threshold
-    msg = verdict.get("summary") or f"{passed_items}/{n} rubric items satisfied"
+    msg = verdict.get("summary") or f"{passed_items}/{expected} rubric items satisfied"
     return AssertionResult("llm_judge", ok, msg, kind="judge", details=verdict)
 
 
@@ -404,7 +417,7 @@ def _match_any(strings: list[str], cfg: dict) -> Optional[str]:
         if matches is not None:
             if re.search(matches, s, re.IGNORECASE if ci else 0):
                 return s
-        if equals is not None and s.strip() == str(equals).strip():
+        if equals is not None and hay.strip() == (str(equals).lower() if ci else str(equals)).strip():
             return s
     return None
 

@@ -96,7 +96,10 @@ class EvalSpec:
             src = src_rel if os.path.isabs(src_rel) else os.path.join(self.base_dir(), src_rel)
             norm = os.path.normpath(str(dest))
             # never let a seed write outside the workspace
-            dest = os.path.basename(norm) if os.path.isabs(norm) or norm.startswith("..") else norm
+            if os.path.isabs(norm) or norm == os.pardir or norm.startswith(os.pardir + os.sep):
+                dest = os.path.basename(src_rel)
+            else:
+                dest = norm
             out.append((src, dest))
         return out
 
