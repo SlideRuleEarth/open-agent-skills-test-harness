@@ -1,0 +1,37 @@
+# This is a basic 
+name: Adirondacks Canopy with No Skills
+description: A/B test of the SlideRule no skills vs. the SlideRule skills scenario.
+
+target:                       # the runner:model this scenario tests
+  runner: copilot
+  model: claude-opus-4.8     
+
+skills:                       # provisioned together; the only repo skills visible (isolated)
+
+prompt: | 
+    Do a Canopy analysis for a reasonable region in the Adirondacks and provide a one-paragraph summary.
+
+rubric:                       # graded by the LLM judge
+
+  # --- Tier 1: literal compliance (necessary, uninformative) ---
+  - Delivers a one-paragraph summary of the result.
+ 
+  # --- Tier 4: deliverable craft ---
+  - One-paragraph summary is in fact one paragraph (not multiple paragraphs or a bulleted list).
+  - Polygon used for the request is reported or visualized so the region is auditable.
+  - Caveats are present but proportionate (not a wall of disclaimers crowding out the result).
+
+
+assertions:                   # deterministic checks
+  # process
+  - {type: no_error}
+
+# In an eval or scenario file:
+timeout_sec: 2400    # override the default 600s
+
+# Optional run knobs (any CLI flag overrides these):
+judge: 
+    agent: copilot
+    model: claude-opus-4.8
+isolated: true
+
