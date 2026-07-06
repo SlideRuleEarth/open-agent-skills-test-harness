@@ -45,6 +45,27 @@ ANTIGRAVITY_STREAM = """\
 ANTIGRAVITY_JSON = '{"result":"All done."}'
 ANTIGRAVITY_RAW = "just a plain text answer with no JSON"
 
+# The real `--output-format json` shape (agy 1.0.16+) — a conversation_id that keys the
+# on-disk transcript, tested together in _check_antigravity_transcript below.
+ANTIGRAVITY_JSON_RESULT = (
+    '{"conversation_id":"conv-test-1","status":"SUCCESS",'
+    '"response":"Done building demo-app.","duration_seconds":1.5,"num_turns":1,'
+    '"usage":{"input_tokens":10,"output_tokens":20,"thinking_tokens":5,"total_tokens":35}}'
+)
+
+ANTIGRAVITY_TRANSCRIPT = """\
+{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"do the task"}
+{"step_index":1,"source":"SYSTEM","type":"CONVERSATION_HISTORY"}
+{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","thinking":"planning the work","tool_calls":[{"name":"run_command","args":{"CommandLine":"npm install"}}]}
+{"step_index":3,"source":"MODEL","type":"RUN_COMMAND","content":"added 1 package"}
+{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"write_to_file","args":{"TargetFile":"package.json","CodeContent":"{}"}}]}
+{"step_index":5,"source":"MODEL","type":"CODE_ACTION","content":"Created file package.json"}
+{"step_index":6,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"skill","args":{"skill":"sliderule-api"}}]}
+{"step_index":7,"source":"SYSTEM","type":"CHECKPOINT","content":"summary"}
+{"step_index":8,"source":"MODEL","type":"ERROR_MESSAGE","content":"a transient warning"}
+{"step_index":9,"source":"MODEL","type":"PLANNER_RESPONSE","content":"Done building demo-app."}
+"""
+
 COPILOT = """\
 {"type":"session.skills_loaded","data":{"skills":[]},"id":"s1","timestamp":"2026-06-22T00:00:00Z","parentId":"p1","ephemeral":true}
 {"type":"session.tools_updated","data":{"model":"claude-sonnet-4.6"},"id":"s2","timestamp":"2026-06-22T00:00:00Z","parentId":"p1","ephemeral":true}
@@ -71,7 +92,8 @@ def _check(name, cond, msg, failures, verbose):
 
 def _check_isolation(failures, verbose):
     """Validate the HOME overlay: declared skills present, undeclared masked, vendor kept,
-    auth/config passed through, missing ancestors built. Pure filesystem — no CLIs."""
+    auth/config passed through, missing ancestors built, plugin-registry skills masked
+    without duplicating declared ones into unrelated plugins. Pure filesystem — no CLIs."""
     import os
     import shutil
     import tempfile
@@ -92,6 +114,18 @@ def _check_isolation(failures, verbose):
         os.makedirs(os.path.join(real, "_cfg"))  # reproduce the config-mirror escape hazard
         open(os.path.join(real, ".codex", "auth.json"), "w").close()
         open(os.path.join(real, ".gitconfig"), "w").close()
+        # a plugin registry sibling of .gemini/config/skills (both live under .gemini/config/,
+        # exercising two different leaf types sharing an ancestor): one plugin mirrors this
+        # repo's skills (the real-world leak — e.g. via `agy plugin import`), plus a vendor
+        # skill in the same plugin, plus a second, unrelated vendor-only plugin.
+        os.makedirs(os.path.join(real, ".gemini", "config", "plugins",
+                                  "sliderule-skills", "skills", "sliderule-api"))
+        os.makedirs(os.path.join(real, ".gemini", "config", "plugins",
+                                  "sliderule-skills", "skills", "vendor-thing"))
+        open(os.path.join(real, ".gemini", "config", "plugins",
+                           "sliderule-skills", "plugin.json"), "w").close()
+        os.makedirs(os.path.join(real, ".gemini", "config", "plugins",
+                                  "other-plugin", "skills", "other-skill"))
         # the cell declares only sliderule-api (its source lives outside HOME, like skills_root)
         os.makedirs(os.path.join(declared_root, "sliderule-api"))
 
@@ -101,6 +135,7 @@ def _check_isolation(failures, verbose):
             {"sliderule-api", "sliderule-params"},        # repo superset to mask
             [os.path.join(declared_root, "sliderule-api")],
             real,
+            plugin_registry_subpaths=[".gemini/config/plugins"],
         )
 
         skills = os.path.join(dest, ".codex", "skills")
@@ -126,6 +161,26 @@ def _check_isolation(failures, verbose):
         _check("isolation.missing_ancestor_built", gem_names == ["sliderule-api"],
                f"missing nested skills dir built with declared only (got {gem_names})",
                failures, verbose)
+
+        plugin_skills = os.path.join(dest, ".gemini", "config", "plugins",
+                                      "sliderule-skills", "skills")
+        plugin_names = sorted(os.listdir(plugin_skills)) if os.path.isdir(plugin_skills) else []
+        _check("isolation.plugin_repo_skill_masked", plugin_names == ["vendor-thing"],
+               f"plugin's leaked repo skill dropped, its vendor skill kept "
+               f"(got {plugin_names})", failures, verbose)
+        _check("isolation.plugin_not_re_added",
+               "sliderule-api" not in plugin_names,
+               "declared skill isn't duplicated into an unrelated plugin's skills/ "
+               "(it's already injected once via the primary skills dir)", failures, verbose)
+        _check("isolation.plugin_metadata_passthrough",
+               os.path.islink(os.path.join(dest, ".gemini", "config", "plugins",
+                                            "sliderule-skills", "plugin.json")),
+               "plugin.json passed through as a symlink", failures, verbose)
+        other_plugin_skills = os.path.join(dest, ".gemini", "config", "plugins",
+                                            "other-plugin", "skills")
+        other_names = sorted(os.listdir(other_plugin_skills)) if os.path.isdir(other_plugin_skills) else []
+        _check("isolation.unrelated_plugin_untouched", other_names == ["other-skill"],
+               f"vendor-only plugin left alone (got {other_names})", failures, verbose)
 
         # config mirrors must use a fresh temp dir, not dest/_cfg — which is a symlink to the
         # real HOME's _cfg here, so writing through it would escape the temp tree.
@@ -452,6 +507,92 @@ def _check_verdict_coercion(failures, verbose):
            failures, verbose)
 
 
+def _check_antigravity_transcript(failures, verbose):
+    """AntiGravity's --output-format json result carries no tool trace itself (just the
+    final answer) — parse() has to go read the on-disk transcript, keyed by the result's
+    conversation_id, to recover it. Builds a fake isolated HOME with that transcript planted
+    at the real on-disk layout and drives parse() through opts.home, like a real isolated
+    run would. Pure filesystem — no CLIs."""
+    import os
+    import shutil
+    import tempfile
+
+    print("antigravity transcript trace:")
+    home = tempfile.mkdtemp(prefix="ase-agy-home-")
+    try:
+        log_dir = os.path.join(home, ".gemini", "antigravity-cli", "brain", "conv-test-1",
+                                ".system_generated", "logs")
+        os.makedirs(log_dir)
+        with open(os.path.join(log_dir, "transcript_full.jsonl"), "w") as f:
+            f.write(ANTIGRAVITY_TRANSCRIPT)
+
+        out = get_adapter("antigravity").parse(
+            ANTIGRAVITY_JSON_RESULT, "", 0, opts=RunOptions(home=home)
+        )
+        _check("antigravity.transcript.final", out.final_text == "Done building demo-app.",
+               repr(out.final_text), failures, verbose)
+        _check("antigravity.transcript.duration_ms", out.duration_ms == 1500,
+               f"1.5s duration_seconds -> {out.duration_ms}ms", failures, verbose)
+
+        cmds = [e.command for e in out.events if e.command]
+        _check("antigravity.transcript.command",
+               cmds == ["npm install"],
+               f"CommandLine (PascalCase) extracted via snake_case_keys: {cmds}",
+               failures, verbose)
+
+        paths = [e.path for e in out.events if e.path]
+        _check("antigravity.transcript.file_path", "package.json" in paths,
+               f"TargetFile (PascalCase) extracted via snake_case_keys: {paths}",
+               failures, verbose)
+        _check("antigravity.transcript.skill_path",
+               ".antigravity/skills/sliderule-api/SKILL.md" in paths,
+               f"skill tool call resolves to its SKILL.md path: {paths}", failures, verbose)
+
+        tool_names = [e.tool_name for e in out.events if e.tool_name]
+        _check("antigravity.transcript.tool_names",
+               {"run_command", "write_to_file", "skill"} <= set(tool_names),
+               f"tool_names={tool_names}", failures, verbose)
+
+        reasoning = [e for e in out.events if e.kind == EventKind.REASONING]
+        _check("antigravity.transcript.reasoning", len(reasoning) == 1,
+               f"PLANNER_RESPONSE 'thinking' surfaced as REASONING: {len(reasoning)}",
+               failures, verbose)
+
+        errors = [e for e in out.events if e.kind == EventKind.ERROR]
+        _check("antigravity.transcript.error_message",
+               len(errors) == 1 and errors[0].is_error,
+               f"ERROR_MESSAGE step mapped to an ERROR event: {errors}", failures, verbose)
+
+        # step_index 0 (USER_INPUT) legitimately backs the SESSION_START event; 1
+        # (CONVERSATION_HISTORY) and 7 (CHECKPOINT) should produce no event at all.
+        skipped = any(
+            isinstance(e.raw, dict) and e.raw.get("step_index") in (1, 7)
+            for e in out.events
+        )
+        _check("antigravity.transcript.housekeeping_skipped", not skipped,
+               "CONVERSATION_HISTORY (step 1) / CHECKPOINT (step 7) produce no events",
+               failures, verbose)
+
+        result_events = [e for e in out.events if e.kind == EventKind.RESULT]
+        _check("antigravity.transcript.status_success",
+               len(result_events) == 1 and not result_events[0].is_error,
+               f"status SUCCESS -> RESULT.is_error=False: {result_events}",
+               failures, verbose)
+
+        cargv = get_adapter("antigravity").build_argv(
+            "do the task", RunOptions(model="gemini-3.5-flash"), cwd="/tmp/some-workspace"
+        )
+        _check("antigravity.argv",
+               cargv[0] == "agy" and "-p" in cargv
+               and "--output-format" in cargv and "json" in cargv
+               and "--add-dir" in cargv
+               and cargv[cargv.index("--add-dir") + 1] == "/tmp/some-workspace"
+               and "--model" in cargv,
+               f"antigravity argv: {cargv}", failures, verbose)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def run_selftest(verbose: bool = False) -> int:
     failures: list[str] = []
 
@@ -495,7 +636,7 @@ def run_selftest(verbose: bool = False) -> int:
     _check("codex.command", cmds == ["npm install"], f"commands={cmds}", failures, verbose)
     _check("codex.file", "package.json" in paths, f"paths={paths}", failures, verbose)
     _check("codex.final", out.final_text == "Created demo-app.", repr(out.final_text), failures, verbose)
-    cargv = get_adapter("codex").build_argv("do the task", RunOptions(model="gpt-5.4-mini"))
+    cargv = get_adapter("codex").build_argv("do the task", RunOptions(model="gpt-5.4-mini"), cwd="/tmp")
     pre = cargv[:cargv.index("exec")]  # top-level flags precede the exec subcommand
     _check("codex.argv",
            "--ask-for-approval" in pre and "never" in pre
@@ -544,13 +685,13 @@ def run_selftest(verbose: bool = False) -> int:
            not any(e.kind == EventKind.SESSION_START and "skills_loaded" in str(e.raw)
                    for e in out.events),
            "ephemeral session events skipped", failures, verbose)
-    cargv = get_adapter("copilot").build_argv("do the task", RunOptions(model="auto"))
+    cargv = get_adapter("copilot").build_argv("do the task", RunOptions(model="auto"), cwd="/tmp")
     _check("copilot.argv",
            cargv[0] == "copilot" and "-p" in cargv and "--output-format" in cargv
            and "json" in cargv and "--allow-all" in cargv and "--model" in cargv
            and cargv[-1] != "do the task",
            f"copilot argv: {cargv}", failures, verbose)
-    cargv_dt = get_adapter("copilot").build_argv("judge", RunOptions(disable_tools=True))
+    cargv_dt = get_adapter("copilot").build_argv("judge", RunOptions(disable_tools=True), cwd="/tmp")
     _check("copilot.disable_tools",
            "--available-tools" in cargv_dt and cargv_dt[cargv_dt.index("--available-tools") + 1] == "",
            f"disable_tools → --available-tools '': {cargv_dt}", failures, verbose)
@@ -796,6 +937,7 @@ def run_selftest(verbose: bool = False) -> int:
     _check_isolation(failures, verbose)
     _check_provision(failures, verbose)
     _check_workspace_reset(failures, verbose)
+    _check_antigravity_transcript(failures, verbose)
 
     # per-cell readable report
     _check_report(failures, verbose)

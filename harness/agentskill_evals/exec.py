@@ -32,7 +32,7 @@ def execute(
     agent_name: str | None = None,
     eval_name: str = "",
 ) -> ExecResult:
-    argv = adapter.build_argv(prompt, opts)
+    argv = adapter.build_argv(prompt, opts, cwd=cwd)
     # Apply the eval/scenario env first, then let adapter.env() layer isolation on top — so an
     # isolated run's HOME / XDG / config-home vars can't be overridden by an eval's `env:`.
     base = dict(os.environ)
@@ -86,7 +86,7 @@ def execute(
 
     rr.exit_code = code
     try:
-        parsed = adapter.parse(stdout, stderr, code)
+        parsed = adapter.parse(stdout, stderr, code, opts=opts)
         rr.events = parsed.events
         rr.final_text = parsed.final_text
         rr.structured_output = parsed.structured_output

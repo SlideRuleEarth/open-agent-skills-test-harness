@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
@@ -37,7 +38,6 @@ class RunOptions:
     allowed_tools: Optional[list[str]] = None
     disable_tools: bool = False          # run reasoning-only (used by the judge)
     extra_args: list[str] = field(default_factory=list)  # raw flags appended verbatim
-    output_format: Optional[str] = None  # adapter-specific override (e.g. "json"/"stream-json")
     home: Optional[str] = None           # isolated HOME for this run (see isolation.py); None = real HOME
     isolation_env: dict = field(default_factory=dict)  # config-home vars repointed at isolated mirrors
 
@@ -81,6 +81,10 @@ class Adapter(ABC):
     # HOME-relative global skills dirs this agent discovers (masked under isolation so a
     # run sees only the skills it provisions). Empty = isolation has nothing to mask.
     global_skills_subpaths: list[str] = []
+    # HOME-relative plugin-registry dirs (see isolation.py) whose entries are plugin
+    # packages that can each carry a nested skills/ — a second, independent skill-discovery
+    # channel some CLIs support (e.g. AntiGravity's `.gemini/config/plugins`).
+    global_plugin_registry_subpaths: list[str] = []
     # Env vars that redirect this agent's config/home away from $HOME, as
     # (env var, skills-subdir within that home) — e.g. ("CODEX_HOME", "skills"). Under
     # isolation a *set* one is mirrored into the isolated home (skills masked) and repointed,
@@ -180,8 +184,15 @@ class Adapter(ABC):
     # --- invocation ---------------------------------------------------------
 
     @abstractmethod
-    def build_argv(self, prompt: str, opts: RunOptions) -> list[str]:
-        """Return the full argv (including the binary) to run this prompt."""
+    def build_argv(self, prompt: str, opts: RunOptions, *, cwd: str) -> list[str]:
+        """Return the full argv (including the binary) to run this prompt.
+
+        ``cwd`` is the workspace the subprocess will be launched with (same value passed
+        as ``subprocess.run(..., cwd=cwd)``). Most adapters ignore it because their CLI
+        already scopes itself to the process's actual working directory; an adapter whose
+        CLI resolves its own project root independently of cwd (see AntiGravity) uses it
+        to pin the run back to the workspace explicitly.
+        """
         raise NotImplementedError
 
     def env(self, base_env: dict[str, str], opts: RunOptions) -> dict[str, str]:
@@ -212,8 +223,15 @@ class Adapter(ABC):
     # --- output normalization ----------------------------------------------
 
     @abstractmethod
-    def parse(self, stdout: str, stderr: str, exit_code: int) -> ParseOutput:
-        """Translate raw agent output into the normalized shape."""
+    def parse(self, stdout: str, stderr: str, exit_code: int,
+               *, opts: Optional[RunOptions] = None) -> ParseOutput:
+        """Translate raw agent output into the normalized shape.
+
+        ``opts`` is the same RunOptions the run was built from (``opts.home`` in
+        particular) — most adapters get everything they need from stdout/stderr, but one
+        whose CLI writes richer structured data to disk (keyed by an id in stdout) rather
+        than to the stream itself needs it to locate that side-channel.
+        """
         raise NotImplementedError
 
 
@@ -274,8 +292,8 @@ def try_load_json(text: str) -> Optional[Any]:
 
 # Keys commonly used by various agents to carry a shell command inside a tool
 # call's argument object. Checked in order.
-_COMMAND_KEYS = ("command", "cmd", "script", "shell", "code", "args", "input")
-_PATH_KEYS = ("file_path", "path", "filepath", "file", "filename", "target_file")
+_COMMAND_KEYS = ("command", "cmd", "script", "shell", "code", "args", "input", "command_line")
+_PATH_KEYS = ("file_path", "path", "filepath", "file", "filename", "target_file", "directory_path")
 
 
 def extract_command(obj: Any) -> Optional[str]:
@@ -302,3 +320,15 @@ def extract_path(obj: Any) -> Optional[str]:
         if isinstance(v, str) and v.strip():
             return v
     return None
+
+
+_CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
+
+
+def snake_case_keys(obj: Any) -> Any:
+    """Rewrite a dict's PascalCase/camelCase keys to snake_case (e.g. ``TargetFile`` ->
+    ``target_file``) so tool args from CLIs with a different naming convention still match
+    ``extract_command``/``extract_path``'s key lists. Non-dicts pass through unchanged."""
+    if not isinstance(obj, dict):
+        return obj
+    return {_CAMEL_BOUNDARY.sub("_", k).lower(): v for k, v in obj.items()}

@@ -198,6 +198,7 @@ class Runner:
                 build_isolated_home(
                     iso_home, adapter.global_skills_subpaths, self._repo_skill_names,
                     seed_dirs, os.path.expanduser("~"),
+                    plugin_registry_subpaths=getattr(adapter, "global_plugin_registry_subpaths", []),
                 )
                 cfg_root = None
                 for var, skills_sub in getattr(adapter, "isolation_config_homes", []):
