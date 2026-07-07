@@ -189,7 +189,11 @@ def _is_yaml_error(exc: Exception) -> bool:
 def _discover(args, skills_root: str):
     try:
         return discover_specs(skills_root=skills_root, skill=args.skill, paths=args.evals)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError, FileNotFoundError, OSError) as exc:
+        # ValueError covers both a spec's own structural errors (missing `prompt`, bad `skills`
+        # shape) and malformed JSON (json.JSONDecodeError is a ValueError subclass) — without it,
+        # only RuntimeError/yaml-error was caught and either of those cases raised a raw
+        # traceback instead of this function's clean `error: ...` exit.
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2)
     except Exception as exc:

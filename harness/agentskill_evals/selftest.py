@@ -556,6 +556,18 @@ def _check_leaked_skill_reads(failures, verbose):
                f"undeclared skill script referenced in a command is caught: {leaks4}",
                failures, verbose)
 
+        # 4b. the marker embedded MID-TOKEN (e.g. --script=/repo/...), not just at the start of
+        # the token, must also be caught — a bare startswith() check misses this shape entirely.
+        cmd_embedded = f"python --script={script} --verbose"
+        rr4b = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="run_command",
+                                    command=cmd_embedded)])
+        leaks4b = leaked_skill_reads(rr4b, workspace, repo_root, repo_skill_names,
+                                     declared_names=set())
+        _check("leak.command_reference_mid_token_detected",
+               leaks4b == [os.path.realpath(script)],
+               f"undeclared skill script embedded mid-token (--script=...) is caught: {leaks4b}",
+               failures, verbose)
+
         # 5. no leaked names at all (every repo skill declared) -> no leaks, no filesystem work.
         rr5 = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="view_file", path=leak_path)])
         leaks5 = leaked_skill_reads(rr5, workspace, repo_root, repo_skill_names,
@@ -650,6 +662,67 @@ def _check_workspace_relocation(failures, verbose):
         _check("relocate.temp_exec_dir_cleaned",
                cwd_used is not None and not os.path.isdir(cwd_used),
                "temp exec dir removed after copy-back", failures, verbose)
+    finally:
+        runner_mod.execute = orig_execute
+        shutil.rmtree(repo_root, ignore_errors=True)
+
+
+def _check_parallel_cell_idx(failures, verbose):
+    """Under --jobs>1, each future submitted to the pool must carry its OWN cell_idx/total —
+    before the fix, `pool.submit(self._run_cell, m, s)` passed neither, so every parallel cell
+    defaulted to cell_idx=0: phase updates were indistinguishable ("cell 0/N" for every cell),
+    and `if p and cell_idx:` inside _run_cell_body is falsy for 0, so its own p.done() call never
+    fired at all — run()'s parallel branch called p.done() separately instead, using
+    as_completed()'s completion ORDER as the cell number, not the cell's real identity."""
+    import os
+    import shutil
+    import tempfile
+
+    import agentskill_evals.runner as runner_mod
+    from .exec import ExecResult
+    from .progress import Progress
+    from .schema import RunResult
+    from .spec import EvalSpec
+
+    print("parallel cell_idx assignment:")
+    repo_root = tempfile.mkdtemp(prefix="ase-repo4-")
+    seen_cell_idxs: list = []
+    orig_execute = runner_mod.execute
+
+    def _fake_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides, agent_name, eval_name):
+        rr = RunResult(agent=agent_name, eval_name=eval_name, prompt=prompt, workdir=cwd,
+                       final_text="done")
+        return ExecResult(result=rr, stdout="", stderr="")
+
+    class _RecordingProgress(Progress):
+        def done(self, *, cell, passed=None, cost=""):
+            seen_cell_idxs.append(cell)
+
+    runner_mod.execute = _fake_execute
+    try:
+        run_dir = os.path.join(repo_root, "artifacts", "run1")
+        os.makedirs(run_dir)
+        r = runner_mod.Runner.__new__(runner_mod.Runner)
+        r.agent, r.adapter, r.models = "fake", _FakeAdapter(), [None]
+        r.artifacts_root = os.path.join(repo_root, "artifacts")
+        r.run_id, r.skills_root, r.judge = "run1", repo_root, None
+        r.provision, r.command, r.auto_approve = False, "", True
+        r.jobs, r.isolated = 2, True
+        r.progress = _RecordingProgress(total_cells=2, file=open(os.devnull, "w"))
+        r._repo_skill_names, r.run_dir = set(), run_dir
+
+        specs = [EvalSpec(name=f"demo{i}", prompt="hi",
+                          source_path=os.path.join(repo_root, f"demo{i}.yaml"))
+                for i in range(2)]
+        r.run(specs)
+
+        _check("runner.parallel_cell_idx_nonzero",
+               len(seen_cell_idxs) == 2 and all(c != 0 for c in seen_cell_idxs),
+               f"each parallel cell's own p.done() call fires with a real (nonzero) cell_idx: "
+               f"{seen_cell_idxs}", failures, verbose)
+        _check("runner.parallel_cell_idx_distinct", sorted(seen_cell_idxs) == [1, 2],
+               f"the 2 cells get distinct indices matching their actual identity, not both "
+               f"0 or a duplicate: {seen_cell_idxs}", failures, verbose)
     finally:
         runner_mod.execute = orig_execute
         shutil.rmtree(repo_root, ignore_errors=True)
@@ -1579,6 +1652,7 @@ def run_selftest(verbose: bool = False) -> int:
     # undeclared repo skills read via the real on-disk checkout (workspace-escape leak)
     _check_leaked_skill_reads(failures, verbose)
     _check_workspace_relocation(failures, verbose)
+    _check_parallel_cell_idx(failures, verbose)
     _check_cell_crash_safety(failures, verbose)
 
     # cli.py's pure helpers (YAML-error detection, --model/--all-models, models.yaml validation)

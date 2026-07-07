@@ -142,8 +142,15 @@ def leaked_skill_reads(
             tokens = cmd.split()
         for tok in tokens:
             for marker in markers:
-                if tok.startswith(marker):
-                    _flag(tok)
+                # `in`, not `startswith`: the marker can be embedded mid-token (e.g.
+                # --script=/repo/sliderule-api/scripts/tool.py or --path=/repo/... ), not just
+                # at the start. Flag from where the marker begins, not the whole raw token (a
+                # leading flag like "--script=" isn't a path itself, so realpath-ing it whole
+                # would resolve it relative to cwd instead of recognizing the embedded absolute
+                # path).
+                idx = tok.find(marker)
+                if idx != -1:
+                    _flag(tok[idx:])
 
     return hits
 

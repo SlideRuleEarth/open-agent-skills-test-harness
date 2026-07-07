@@ -132,7 +132,7 @@ output_schema: null
 
 `{skill}` in a prompt is rendered per-adapter (`/scaffold-readme` for Claude/
 AntiGravity, `$scaffold-readme` for Codex). `{skills}` expands to all of
-them. `skills:` are copied/symlinked into each agent's project-local skills dir
+them. `skills:` are copied into each agent's project-local skills dir
 (`.claude/skills` for Claude, `.agents/skills` for Codex, `.antigravity/skills`
 for AntiGravity) so the run is hermetic.
 
@@ -197,16 +197,16 @@ agentskill-evals list-evals --skills-root .
 
 # `run` always requires --skill, --evals, or --config (no unscoped broad runs)
 
-# one skill, specific agents, parallel, verbose failures
+# one skill, specific agent, parallel, verbose failures
 agentskill-evals run --skill sliderule-docsearch \
     --agent claude --jobs 4 -v
 
 # a single eval file, no judge, just deterministic checks
-agentskill-evals run --evals path/to/eval.yaml --no-judge
+agentskill-evals run --agent claude --evals path/to/eval.yaml --no-judge
 
-# grade with a different judge / model
-agentskill-evals run --skill foo --judge-agent codex
-agentskill-evals run --skill foo --model claude=claude-haiku-4-5
+# grade with a different judge agent, and pin the run's own model
+agentskill-evals run --agent claude --skill foo --judge-agent codex
+agentskill-evals run --agent claude --skill foo --model claude-haiku-4-5
 ```
 
 Output: a pass/fail matrix on stdout, plus per-run artifacts under
@@ -344,25 +344,26 @@ judge:
   model: claude-haiku-4-5            # the (cheap) model that grades rubrics
 ```
 
-Per-runner model selection, in priority order:
+Model selection for the one runner picked via `--agent`, in priority order:
 
-1. `--model claude=opus,haiku` (comma list; repeatable; `runner=` or bare for all) — explicit.
+1. `--model <id1>,<id2>,...` (comma-separated list, for that run's single `--agent`) — explicit;
+   wins even over `--all-models` if both are given (a warning is printed, not a silent drop).
 2. `--all-models` — the runner's full `models:` list.
 3. otherwise — the runner's `default:` (cheapest); if unset, the runner's own built-in default.
 
 ```bash
-# cheapest model per runner (the safe default)
-agentskill-evals run --skill sliderule-region-picker
+# cheapest model on this runner (the safe default)
+agentskill-evals run --agent claude --skill sliderule-region-picker
 
 # compare specific models on one runner
-agentskill-evals run --skill sliderule-region-picker \
-    --model claude=claude-opus-4-8,claude-haiku-4-5
+agentskill-evals run --agent claude --skill sliderule-region-picker \
+    --model claude-opus-4-8,claude-haiku-4-5
 
 # the full grid (opt-in; will ask to confirm, and is bounded by --max-cells)
-agentskill-evals run --skill sliderule-region-picker --all-models
+agentskill-evals run --agent claude --skill sliderule-region-picker --all-models
 
 # preview scope/cost without spending anything
-agentskill-evals run --skill sliderule-region-picker --all-models --dry-run
+agentskill-evals run --agent claude --skill sliderule-region-picker --all-models --dry-run
 ```
 
 The terminal shows a single wide grid (eval rows × model columns) plus a
@@ -451,8 +452,12 @@ its schema.
   bypassing per-eval skill declaration. `global_plugin_registry_subpaths` (see
   [`isolation.py`](agentskill_evals/isolation.py)) masks it the same way regular skills
   dirs are masked; `list-skills` folds it into each adapter's `vendor`/`masked` counts.
-- Skills are provisioned by **symlink** when possible (small, read-only),
-  falling back to a copy on platforms without symlinks.
+- Skills are provisioned by **copy**, not symlink (`Adapter.provision_skills`,
+  `adapters/base.py`) — deliberately, so a run that writes inside a provisioned skill dir
+  mutates only the throwaway workspace copy, never the repo's actual skill source. The HOME
+  overlay (`isolation.py`) also copies declared skills for the same reason; it uses symlinks
+  only for *passthrough* entries (vendor skills, auth/config, unrelated plugins) that aren't
+  the content being provisioned.
 - `--no-auto-approve` disables the per-agent "run without prompts" flags
   (`--dangerously-skip-permissions` for Claude/AntiGravity; `--ask-for-approval never
   --sandbox workspace-write` for Codex).

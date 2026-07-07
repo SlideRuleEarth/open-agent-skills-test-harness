@@ -131,13 +131,18 @@ class Runner:
                 results.append(self._run_cell(model, spec, cell_idx=i, total=len(cells)))
         else:
             with ThreadPoolExecutor(max_workers=self.jobs) as pool:
-                futs = {pool.submit(self._run_cell, m, s): (m, s) for m, s in cells}
-                for i, fut in enumerate(as_completed(futs), 1):
-                    r = fut.result()
-                    if self.progress:
-                        self.progress.done(cell=i, passed=r.passed if not r.ungraded else None,
-                                           cost=r.cost_str)
-                    results.append(r)
+                # Each future must carry its OWN cell_idx/total — without it, _run_cell defaults
+                # to cell_idx=0 for every parallel cell (all phase updates show "cell 0/...",
+                # indistinguishable), and `if p and cell_idx:` inside _run_cell_body is falsy for
+                # 0, so its own internal p.done() call never fires either. The (now removed) fix
+                # of calling p.done() here instead used as_completed()'s completion ORDER as the
+                # cell number, not the cell's actual identity.
+                futs = {
+                    pool.submit(self._run_cell, m, s, cell_idx=i, total=len(cells)): (m, s)
+                    for i, (m, s) in enumerate(cells, 1)
+                }
+                for fut in as_completed(futs):
+                    results.append(fut.result())
 
         results.sort(key=lambda c: (c.eval_name, c.model or ""))
         self._write_summary(results, specs)
@@ -259,6 +264,13 @@ class Runner:
                 shutil.rmtree(iso_home, ignore_errors=True)
                 iso_home = None
                 iso_env = {}
+            except Exception:
+                # Anything other than OSError building the isolated home must not leak the
+                # tempdir either — clean up, then re-raise so _run_cell's crash-safety wrapper
+                # records a failed cell instead of aborting the whole batch (it has no way to
+                # reach this function-local iso_home itself).
+                shutil.rmtree(iso_home, ignore_errors=True)
+                raise
 
         # 5) run
         _phase(f"running agent ({self.agent}/{model_label})")
