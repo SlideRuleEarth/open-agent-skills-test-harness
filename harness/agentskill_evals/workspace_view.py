@@ -11,6 +11,7 @@ the same walk so they never diverge on what counts as "the model's output"
 from __future__ import annotations
 
 import os
+import shlex
 from typing import Any, Iterable, Iterator, Optional
 
 # Budgets for the judge's compact view (the report passes None == no cap).
@@ -39,6 +40,14 @@ def _iter_files(workdir: str) -> Iterator[tuple[str, str]]:
             yield path, os.path.relpath(path, workdir)
 
 
+def _is_under(base: str, path: str) -> bool:
+    """True if the absolute `path` resolves inside the absolute `base` directory."""
+    try:
+        return os.path.commonpath([base, path]) == base
+    except ValueError:        # different drives, etc. → treat as outside
+        return False
+
+
 def resolve_trace_path(path: str, workdir: str) -> str:
     """Resolve a tool-trace path to an absolute path. The agent ran with cwd == the workspace, so a
     RELATIVE trace path is relative to the WORKSPACE — never the harness process cwd (resolving it
@@ -63,11 +72,7 @@ def writes_outside_workspace(result: Any, workdir: str) -> list[str]:
         ap = os.path.abspath(resolve_trace_path(p, workdir))
         if ap in seen:
             continue
-        try:
-            inside = os.path.commonpath([wd, ap]) == wd
-        except ValueError:        # different drives, etc. → treat as outside
-            inside = False
-        if not inside and os.path.isfile(ap):
+        if not _is_under(wd, ap) and os.path.isfile(ap):
             seen.add(ap)
             out.append(ap)
     return out
@@ -80,13 +85,10 @@ def leaked_skill_reads(
     """Absolute paths (or referenced script paths) this run touched that reach an UNDECLARED
     skill through the real, on-disk repo checkout rather than the provisioned workspace copy.
 
-    The eval workspace is nested inside this repo's own working tree (``runner.py`` runs
-    ``git init`` there specifically to stop project-level skill discovery from walking up past
-    it). That trick defeats a discovery mechanism that itself deliberately halts at the nearest
-    ``.git`` — it does nothing against a general-purpose file-browsing agent (list_dir/view_file/
-    shell on arbitrary absolute paths) that just lists a parent directory and reads whatever
-    undeclared skill sits there in plain sight, one level above the workspace. This detects that
-    escape after the fact from the trace, so a leak isn't silently reported as ``isolated: true``.
+    Even with the eval workspace relocated to a tempdir outside this repo's working tree
+    (``runner.py``), a run could still reach an undeclared skill some other way (e.g. searching
+    the real disk by name) — this is the residual safety net that catches it from the trace, so
+    a leak is never silently reported as ``isolated: true``.
     """
     leaked_names = set(repo_skill_names) - set(declared_names)
     if not leaked_names:
@@ -96,17 +98,11 @@ def leaked_skill_reads(
     hits: list[str] = []
     seen: set[str] = set()
 
-    def _under(base: str, ap: str) -> bool:
-        try:
-            return os.path.commonpath([base, ap]) == base
-        except ValueError:
-            return False
-
     def _flag(candidate: str) -> None:
         if not candidate or candidate in seen:
             return
         ap = os.path.abspath(candidate)
-        if not _under(root, ap) or _under(wd, ap):
+        if not _is_under(root, ap) or _is_under(wd, ap):
             return
         rel_parts = os.path.relpath(ap, root).split(os.sep)
         if rel_parts and rel_parts[0] in leaked_names:
@@ -116,16 +112,16 @@ def leaked_skill_reads(
     for p in result.file_paths_touched():
         _flag(resolve_trace_path(p, workdir))
 
+    markers = [os.path.join(root, name) for name in leaked_names]
     for cmd in result.commands():
-        for name in leaked_names:
-            marker = os.path.join(root, name)
-            idx = cmd.find(marker)
-            if idx == -1:
-                continue
-            end = idx
-            while end < len(cmd) and not cmd[end].isspace():
-                end += 1
-            _flag(cmd[idx:end])
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError:        # unbalanced quotes, etc. — fall back to whitespace split
+            tokens = cmd.split()
+        for tok in tokens:
+            for marker in markers:
+                if tok.startswith(marker):
+                    _flag(tok)
 
     return hits
 
