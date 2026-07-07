@@ -437,6 +437,168 @@ def _check_path_resolution(failures, verbose):
         shutil.rmtree(outside, ignore_errors=True)
 
 
+def _check_leaked_skill_reads(failures, verbose):
+    """Reproduces the antigravity escape from run 20260707-072933_scen_SimpleATL06PromptGrandMesa:
+    the eval workspace is nested inside this repo's own checkout (``<repo>/artifacts/<run>/.../
+    workspace``); ``git init`` in the workspace (runner.py) stops a skill-discovery mechanism that
+    deliberately halts its walk-up at the nearest ``.git``, but does nothing against a
+    general-purpose file-browsing agent that just ``list_dir``s a parent directory by absolute
+    path and reads whatever undeclared skill sits there in plain sight. The real transcript showed
+    exactly that: `list_dir` on the scenario dir, then the repo root, then `view_file` on
+    ``sliderule-api/SKILL.md`` and ``sliderule-openapi/scripts/openapi.py`` — none of which were
+    declared — while the run was still reported as ``isolated: true``.
+
+    ``leaked_skill_reads`` must catch this after the fact from the trace: an undeclared repo
+    skill read via an absolute path that resolves under the real repo root but outside the
+    workspace copy."""
+    import os
+    import shutil
+    import tempfile
+
+    from .schema import EventKind, NormalizedEvent, RunResult
+    from .workspace_view import leaked_skill_reads
+
+    print("leaked skill reads (hermeticity escape):")
+    repo_root = tempfile.mkdtemp(prefix="ase-repo-")
+    try:
+        # Mirror the real layout: workspace nested inside the repo checkout, sibling to the
+        # repo's own skill directories.
+        for name in ("sliderule-api", "sliderule-openapi", "sliderule-examples"):
+            os.makedirs(os.path.join(repo_root, name))
+            with open(os.path.join(repo_root, name, "SKILL.md"), "w") as f:
+                f.write("---\nname: " + name + "\n---\n")
+        workspace = os.path.join(repo_root, "artifacts", "run1", "model", "scenario",
+                                  "SimpleATL06PromptGrandMesa", "workspace")
+        os.makedirs(workspace)
+
+        def _rr(events):
+            return RunResult(agent="antigravity", eval_name="e", prompt="", workdir=workspace,
+                             events=events)
+
+        repo_skill_names = {"sliderule-api", "sliderule-openapi", "sliderule-examples"}
+
+        # 1. the real escape: list_dir/view_file on the undeclared sliderule-api SKILL.md via
+        #    the repo's real absolute path — no skill declared for this eval at all.
+        leak_path = os.path.join(repo_root, "sliderule-api", "SKILL.md")
+        rr = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="view_file", path=leak_path)])
+        leaks = leaked_skill_reads(rr, workspace, repo_root, repo_skill_names, declared_names=set())
+        _check("leak.undeclared_skill_read_detected", leaks == [os.path.abspath(leak_path)],
+               f"undeclared skill read via real repo path is caught: {leaks}", failures, verbose)
+
+        # 2. a read of a DECLARED skill's real path is not a leak (it's expected the model was
+        #    given this one).
+        rr2 = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="view_file", path=leak_path)])
+        leaks2 = leaked_skill_reads(rr2, workspace, repo_root, repo_skill_names,
+                                    declared_names={"sliderule-api"})
+        _check("leak.declared_skill_not_flagged", leaks2 == [],
+               f"declared skill's real-path read is not a leak: {leaks2}", failures, verbose)
+
+        # 3. reading the provisioned COPY inside the workspace itself is not a leak.
+        prov_dir = os.path.join(workspace, ".antigravity", "skills", "sliderule-api")
+        os.makedirs(prov_dir)
+        prov_path = os.path.join(prov_dir, "SKILL.md")
+        open(prov_path, "w").close()
+        rr3 = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="view_file", path=prov_path)])
+        leaks3 = leaked_skill_reads(rr3, workspace, repo_root, repo_skill_names, declared_names=set())
+        _check("leak.workspace_copy_not_flagged", leaks3 == [],
+               f"provisioned in-workspace copy is not a leak: {leaks3}", failures, verbose)
+
+        # 4. a run_command whose command string references the undeclared skill's real script
+        #    path (e.g. `python /repo/sliderule-openapi/scripts/openapi.py ...`) is also caught.
+        script = os.path.join(repo_root, "sliderule-openapi", "scripts", "openapi.py")
+        cmd = f"conda run -n env python {script} applies-to atl06x"
+        rr4 = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="run_command", command=cmd)])
+        leaks4 = leaked_skill_reads(rr4, workspace, repo_root, repo_skill_names, declared_names=set())
+        _check("leak.command_reference_detected", leaks4 == [os.path.abspath(script)],
+               f"undeclared skill script referenced in a command is caught: {leaks4}",
+               failures, verbose)
+
+        # 5. no leaked names at all (every repo skill declared) -> no leaks, no filesystem work.
+        rr5 = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="view_file", path=leak_path)])
+        leaks5 = leaked_skill_reads(rr5, workspace, repo_root, repo_skill_names,
+                                    declared_names=repo_skill_names)
+        _check("leak.all_declared_short_circuits", leaks5 == [],
+               f"nothing to leak once every repo skill is declared: {leaks5}", failures, verbose)
+    finally:
+        shutil.rmtree(repo_root, ignore_errors=True)
+
+
+class _FakeAdapter:
+    """Bare-minimum adapter stand-in for _check_workspace_relocation — no real CLI is invoked
+    (execute() itself is monkeypatched), this only needs to satisfy the attributes _run_cell
+    reads before it gets there."""
+    global_skills_subpaths: list[str] = []
+    skills_subdir = "fake/skills"
+
+
+def _check_workspace_relocation(failures, verbose):
+    """Under isolation, _run_cell must execute the agent in a tempdir with NO path
+    relationship to this repo's checkout — not `<repo>/artifacts/.../workspace`, which let
+    antigravity `list_dir` its way up two directories into the real repo's undeclared skills
+    (run 20260707-072933_scen_SimpleATL06PromptGrandMesa; see _check_leaked_skill_reads).
+    Monkeypatches `execute()` so no real agent CLI runs, drives `_run_cell` end to end, and
+    checks: (1) the cwd the fake agent saw is outside the repo tree, (2) the file it "produced"
+    still ends up in cell_dir/workspace for artifacts/report, (3) the temp exec dir is gone
+    afterward."""
+    import os
+    import shutil
+    import tempfile
+
+    import agentskill_evals.runner as runner_mod
+    from .exec import ExecResult
+    from .schema import EventKind, NormalizedEvent, RunResult
+    from .spec import EvalSpec
+
+    print("workspace relocation (exec dir escapes the repo tree):")
+    repo_root = tempfile.mkdtemp(prefix="ase-repo2-")
+    seen: dict = {}
+    orig_execute = runner_mod.execute
+
+    def _fake_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides, agent_name, eval_name):
+        seen["cwd"] = cwd
+        with open(os.path.join(cwd, "run.py"), "w") as f:
+            f.write("print('hi')\n")
+        rr = RunResult(
+            agent=agent_name, eval_name=eval_name, prompt=prompt, workdir=cwd,
+            events=[NormalizedEvent(EventKind.FILE_CHANGE, path="run.py")],
+            final_text="done",
+        )
+        return ExecResult(result=rr, stdout="", stderr="")
+
+    runner_mod.execute = _fake_execute
+    try:
+        run_dir = os.path.join(repo_root, "artifacts", "run1")
+        os.makedirs(run_dir)
+        r = runner_mod.Runner.__new__(runner_mod.Runner)
+        r.agent, r.adapter, r.models = "fake", _FakeAdapter(), [None]
+        r.artifacts_root = os.path.join(repo_root, "artifacts")
+        r.run_id, r.skills_root, r.judge = "run1", repo_root, None
+        r.provision, r.command, r.auto_approve = False, "", True
+        r.jobs, r.isolated, r.progress = 1, True, None
+        r._repo_skill_names, r.run_dir = set(), run_dir
+
+        spec = EvalSpec(name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"))
+        cell = r._run_cell(None, spec)
+
+        cell_workspace = os.path.join(cell.artifacts_dir, "workspace")
+        cwd_used = seen.get("cwd")
+        outside = cwd_used is not None and not (
+            os.path.abspath(cwd_used) == os.path.abspath(repo_root)
+            or os.path.abspath(cwd_used).startswith(os.path.abspath(repo_root) + os.sep)
+        )
+        _check("relocate.exec_cwd_outside_repo", outside,
+               f"exec cwd is outside the repo checkout (got {cwd_used})", failures, verbose)
+        _check("relocate.produced_file_in_artifacts",
+               os.path.isfile(os.path.join(cell_workspace, "run.py")),
+               "produced file still lands in cell_dir/workspace for artifacts", failures, verbose)
+        _check("relocate.temp_exec_dir_cleaned",
+               cwd_used is not None and not os.path.isdir(cwd_used),
+               "temp exec dir removed after copy-back", failures, verbose)
+    finally:
+        runner_mod.execute = orig_execute
+        shutil.rmtree(repo_root, ignore_errors=True)
+
+
 def _check_verdict_coercion(failures, verbose):
     """Top-level and per-item verdict 'pass' coercion edge cases."""
     from .assertions import AssertionContext, run_assertion
@@ -945,6 +1107,10 @@ def run_selftest(verbose: bool = False) -> int:
     # artifact / trace path resolution (no false passes on seeded fixtures; workspace-relative;
     # symlink escapes via write-trace)
     _check_path_resolution(failures, verbose)
+
+    # undeclared repo skills read via the real on-disk checkout (workspace-escape leak)
+    _check_leaked_skill_reads(failures, verbose)
+    _check_workspace_relocation(failures, verbose)
 
     # verdict coercion edge cases (string "false", extra items)
     _check_verdict_coercion(failures, verbose)

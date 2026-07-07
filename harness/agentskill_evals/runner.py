@@ -35,7 +35,7 @@ from .judge import Judge
 from .progress import Progress
 from .schema import EventKind, RunResult
 from .spec import EvalSpec, skill_names
-from .workspace_view import file_tree, inline_files, writes_outside_workspace
+from .workspace_view import file_tree, inline_files, leaked_skill_reads, writes_outside_workspace
 
 
 @dataclass
@@ -51,6 +51,7 @@ class CellResult:
     artifacts_dir: str = ""
     isolated: bool = False
     ungraded: bool = False
+    isolation_leaks: list[str] = field(default_factory=list)
 
     @property
     def n_pass(self) -> int:
@@ -166,11 +167,24 @@ class Runner:
         workspace = os.path.join(cell_dir, "workspace")
         _prepare_workspace(workspace)
 
-        # 0) git-root boundary — agents walk up from cwd looking for .git to discover
-        #    project-level skills. Without this, the workspace (inside the repo tree) leaks
-        #    all repo-root skills. `git init` stops the walk at the workspace.
+        # The directory the agent actually runs in. Under isolation this is a tempdir with NO
+        # path relationship to this repo's checkout — not `<repo>/artifacts/.../workspace`,
+        # which put every eval's cwd two `list_dir`/`cd ..` hops from the repo's own undeclared
+        # skill directories. HOME-overlay isolation (below) only masks global skill-discovery
+        # paths; it did nothing to stop a general-purpose file-browsing agent (antigravity's
+        # list_dir/view_file/shell on arbitrary absolute paths, not just its own cwd) from
+        # walking up and reading them directly, which is exactly what happened in run
+        # 20260707-072933_scen_SimpleATL06PromptGrandMesa. Copied back into `workspace` (inside
+        # cell_dir) once the run + assertions are done, so artifacts/report are unaffected.
+        exec_ws = workspace
         if self.isolated:
-            gi = subprocess.run(["git", "init", workspace], capture_output=True)
+            exec_ws = tempfile.mkdtemp(prefix="ase-ws-")
+
+        # 0) git-root boundary — belt-and-suspenders for any skill-discovery mechanism that
+        #    walks up from cwd looking for .git: with exec_ws now outside the repo tree there's
+        #    nothing left to find, but `git init` is cheap and harmless either way.
+        if self.isolated:
+            gi = subprocess.run(["git", "init", exec_ws], capture_output=True)
             if gi.returncode != 0:
                 print(f"warning: [{self.agent}] git init failed (rc={gi.returncode}); "
                       "skill isolation may leak project-level skills.",
@@ -180,8 +194,8 @@ class Runner:
         _phase("provisioning workspace")
         declared_dirs = self._skill_dirs(spec)
         if self.provision and declared_dirs:
-            adapter.provision_skills(workspace, declared_dirs)
-        self._seed_files(workspace, spec)
+            adapter.provision_skills(exec_ws, declared_dirs)
+        self._seed_files(exec_ws, spec)
 
         # 3) render prompt (fill {skill}/{skills} for this adapter)
         prompt = self._render_prompt(spec)
@@ -230,7 +244,7 @@ class Runner:
         try:
             ex = execute(
                 adapter, prompt, opts,
-                cwd=workspace, timeout=spec.timeout_sec,
+                cwd=exec_ws, timeout=spec.timeout_sec,
                 env_overrides=spec.env, agent_name=self.agent, eval_name=spec.name,
             )
         finally:
@@ -240,6 +254,17 @@ class Runner:
 
         if model and rr.error and _looks_like_model_error(rr.error, ex.stderr):
             rr.error = f"model {model!r} rejected by {self.agent} — check models.yaml: {rr.error}"
+
+        # Residual safety net: even with exec_ws relocated outside the repo tree, a run could
+        # still reach an undeclared skill some other way (e.g. searching the real disk by name).
+        # Catch that from the trace so a leak is never silently reported as `isolated: true`.
+        leaks: list[str] = []
+        if isolated:
+            leaks = leaked_skill_reads(
+                rr, exec_ws, self.skills_root, self._repo_skill_names, set(spec.skills)
+            )
+            if leaks:
+                isolated = False
 
         # 6) artifacts
         _phase("writing artifacts")
@@ -258,16 +283,23 @@ class Runner:
                 continue
             if cfg.get("type") == "llm_judge":
                 _phase("running judge")
-            checks.append(run_assertion(cfg, rr, workspace, spec, ctx))
+            checks.append(run_assertion(cfg, rr, exec_ws, spec, ctx))
         clean = rr.error is None and not rr.timed_out
         ungraded = clean and not checks and skipped_judge
         passed = False if ungraded else (
             (clean and all(c.passed for c in checks)) if checks else clean)
 
+        # copy the tempdir exec workspace back into cell_dir/workspace for artifacts/report,
+        # then discard the temp dir (never the source — it only ever held a copy of the
+        # declared skills plus whatever the agent produced).
+        if exec_ws != workspace:
+            shutil.copytree(exec_ws, workspace, dirs_exist_ok=True)
+            shutil.rmtree(exec_ws, ignore_errors=True)
+
         cell = CellResult(
             agent=self.agent, model=model, eval_name=spec.name, skill=spec.skill_name,
             passed=passed, run_result=rr, assertions=checks, artifacts_dir=cell_dir,
-            isolated=isolated, ungraded=ungraded,
+            isolated=isolated, ungraded=ungraded, isolation_leaks=leaks,
         )
         self._write_cell_json(cell_dir, cell)
         _write(os.path.join(cell_dir, "report.md"), render_report(cell))
@@ -334,6 +366,7 @@ class Runner:
                 "eval": cell.eval_name,
                 "skill": cell.skill,
                 "isolated": cell.isolated,
+                "isolation_leaks": cell.isolation_leaks,
                 "ungraded": cell.ungraded,
                 "passed": cell.passed,
                 "assertions": [
@@ -382,7 +415,8 @@ class Runner:
             "cells": [
                 {
                     "agent": c.agent, "model": c.model, "eval": c.eval_name, "skill": c.skill,
-                    "isolated": c.isolated, "ungraded": c.ungraded,
+                    "isolated": c.isolated, "isolation_leaks": c.isolation_leaks,
+                    "ungraded": c.ungraded,
                     "passed": c.passed, "n_pass": c.n_pass, "n_total": c.n_total,
                     "error": c.run_result.error, "timed_out": c.run_result.timed_out,
                     "cost_usd": c.run_result.cost_usd,
@@ -584,6 +618,11 @@ def render_report(cell: CellResult) -> str:
     out.append(f"- **run:** {', '.join(meta)}")
     if rr.error:
         out.append(f"- **error:** {rr.error}")
+    if cell.isolation_leaks:
+        out += ["", "> ⚠ **Isolation leak:** this run read undeclared skill(s) from the real "
+                    "repo checkout, bypassing HOME-based isolation:"]
+        for p in cell.isolation_leaks:
+            out.append(f"> - `{p}`")
 
     out += ["", "## Prompt given to the model", "", "```", rr.prompt or "(empty)", "```"]
 
