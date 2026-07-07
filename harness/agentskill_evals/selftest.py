@@ -21,6 +21,7 @@ CLAUDE = """\
 {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false}]}}
 {"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Write","input":{"file_path":"package.json"}}]}}
 {"type":"assistant","message":{"content":[{"type":"tool_use","id":"t4","name":"Skill","input":{"skill":"sliderule-api"}}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t5","name":"Glob","input":{"pattern":"**/SKILL.md","path":"/etc"}}]}}
 {"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"StructuredOutput","input":{"ok":true}}]}}
 {"type":"result","subtype":"success","is_error":false,"result":"Done. Created the app.","total_cost_usd":0.0123,"duration_ms":4567,"structured_output":{"ok":true}}
 """
@@ -36,8 +37,10 @@ CODEX = """\
 
 # Covers branches CODEX above never exercises: an mcp_tool_call's completion (success is silently
 # dropped once its id is deduped — this must still surface a TOOL_RESULT, error or not), a
-# `reasoning` item, a top-level `error` event, and file_change's dict-form `changes` / single
-# `path` fallback shapes (_codex_changed_paths).
+# `reasoning` item, a top-level `error` event, file_change's dict-form `changes` / single
+# `path` fallback shapes (_codex_changed_paths), and an itype this adapter doesn't specifically
+# recognize (e.g. a native tool added after this adapter was written) still surfacing its path
+# via the generic fallback rather than being silently dropped.
 CODEX_EXTRA = """\
 {"type":"thread.started","thread_id":"th2"}
 {"type":"item.started","item":{"id":"m1","type":"mcp_tool_call","tool":"search","server":"web"}}
@@ -46,6 +49,7 @@ CODEX_EXTRA = """\
 {"type":"error","message":"a transient network error"}
 {"type":"item.completed","item":{"id":"f1","type":"file_change","changes":{"a.txt":{},"b.txt":{}}}}
 {"type":"item.completed","item":{"id":"f2","type":"file_change","path":"single.txt"}}
+{"type":"item.completed","item":{"id":"u1","type":"file_search","path":"/etc/passwd"}}
 {"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":5}}
 """
 
@@ -1242,6 +1246,11 @@ def run_selftest(verbose: bool = False) -> int:
     skill_paths = [e.path for e in out.events if e.tool_name == "Skill"]
     _check("claude.skill_path", skill_paths == [".claude/skills/sliderule-api/SKILL.md"],
            f"Skill tool call extracts skill path: {skill_paths}", failures, verbose)
+    glob_paths = [e.path for e in out.events if e.tool_name == "Glob"]
+    _check("claude.unrecognized_tool_path", glob_paths == ["/etc"],
+           f"Glob isn't in _FILE_TOOLS/_READ_TOOLS but still yields a path via the generic "
+           f"fallback, so leaked_skill_reads() has something to check: {glob_paths}",
+           failures, verbose)
     _check("claude.structured", out.structured_output == {"ok": True},
            f"structured={out.structured_output}", failures, verbose)
     _check("claude.final", out.final_text == "Done. Created the app.", repr(out.final_text), failures, verbose)
@@ -1311,6 +1320,10 @@ def run_selftest(verbose: bool = False) -> int:
            failures, verbose)
     _check("codex.file_change_single_path", "single.txt" in extra_paths,
            f"file_change single `path` fallback is extracted: {extra_paths}",
+           failures, verbose)
+    _check("codex.unrecognized_itype_path", "/etc/passwd" in extra_paths,
+           f"an itype outside the known set (e.g. a new native tool) still surfaces its path "
+           f"via the generic fallback instead of being silently dropped: {extra_paths}",
            failures, verbose)
 
     # Copilot
