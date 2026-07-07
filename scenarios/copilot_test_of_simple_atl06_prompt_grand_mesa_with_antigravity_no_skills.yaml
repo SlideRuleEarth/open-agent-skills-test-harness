@@ -1,0 +1,26 @@
+# This is a basic 
+name: SimpleATL06PromptGrandMesa
+description: Exercises the SlideRule API and params skills together.
+
+target:                       # the runner:model this scenario tests
+  runner: antigravity
+  model: claude-opus-4.6      # omit to use models.yaml's default
+
+skills:                       # provisioned together; the only repo skills visible (isolated)
+prompt: |
+  Write a Python script run.py that submits an ATL06 request over a
+  reasonable region of Grand Mesa National Park. Keep it minimal and runnable.
+
+rubric:                       # graded by the LLM judge
+  - Calls an ATL06 endpoint from the SlideRule API (e.g. atl06p / atl06x).
+  - Defines a small region/polygon for the request.
+
+assertions:                   # deterministic checks
+  - {type: file_exists, path: run.py}
+
+  # process
+  - {type: no_error}
+
+# Optional run knobs (any CLI flag overrides these):
+judge: true
+isolated: true
