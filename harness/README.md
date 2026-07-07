@@ -33,7 +33,7 @@ Each agent CLI speaks a different dialect of "structured output":
 |-------|-----------|--------|
 | Claude Code | `claude -p … --output-format stream-json --verbose` | JSONL: `system`/`assistant`/`user`/`result`; tool calls in `tool_use` blocks; `--json-schema` → `structured_output` on the result event |
 | Codex | `codex --ask-for-approval never --sandbox workspace-write exec --json` | JSONL: `item.started`/`item.completed` with `item.type` = `command_execution`/`file_change`/`agent_message` |
-| AntiGravity | `agy -p "<prompt>" --dangerously-skip-permissions` | plain text by default (`agy` 1.0.9 has no `--output-format`) → parsed defensively: JSONL → single JSON → raw text |
+| AntiGravity | `agy -p "<prompt>" --output-format json --add-dir <workspace> --dangerously-skip-permissions` | one JSON object (`conversation_id`/`status`/`response`/`usage`) — the tool-call trace itself is read separately off disk, keyed by `conversation_id`; parse() falls back to JSONL → single JSON → raw text for older builds |
 
 Every adapter maps its CLI's events onto one [`NormalizedEvent`](agentskill_evals/schema.py)
 stream and a `RunResult`. Assertions, the judge, and reports only ever see that
@@ -237,7 +237,14 @@ harness blocks both:
    vendor bundles and auth/config.
 2. **Project-local (git-root-based):** `.claude/skills/`, `.agents/skills/`, etc. at the
    git repository root. Blocked by running **`git init`** in each cell's workspace, which
-   creates a `.git` boundary that stops agents from walking up to the real repo root.
+   creates a `.git` boundary that stops agents from walking up to the real repo root — *and*
+   by running the cell's workspace in a tempdir with no path relationship to this repo's
+   checkout in the first place (`runner.py`), so a general-purpose file-browsing agent (one
+   that just `list_dir`s a parent directory by absolute path, unbound by any `.git` boundary)
+   can't stumble onto undeclared skills by walking up a couple of directories either. This is
+   what antigravity actually did in practice — see `leaked_skill_reads()` in
+   `workspace_view.py`, the after-the-fact detector that catches it if it ever recurs, and
+   downgrades that cell's `isolated` flag to `false` instead of a silent false positive.
 
 Together these ensure the model sees only the skills the eval/scenario provisions — plus the
 agent's built-in/vendor skills — never other repo skills you happen to have installed.
@@ -259,7 +266,15 @@ enables A/B testing with vs without skills.
 - **Caveats:** skills bundled inside a CLI's package or plugins live outside these dirs and are
   *not* masked (that's intentional — the platform baseline). On a platform without symlink
   privileges the cell falls back to a non-isolated run with a warning. Config-dir *writes* still
-  pass through to the real dirs (only skill *visibility* is isolated).
+  pass through to the real dirs (only skill *visibility* is isolated). None of this is an OS-level
+  jail — an agent that deliberately searches the whole disk (e.g. `find / -iname sliderule-skills`)
+  rather than just exploring its own cwd can still find the real checkout, since it genuinely
+  exists somewhere on the same filesystem. Closing that would need a container/VM per cell (a
+  real, cross-platform fs boundary) or per-OS native sandboxes (macOS Seatbelt, Linux
+  namespaces/bubblewrap, Windows AppContainer — three incompatible APIs, no shared primitive).
+  Deliberate choice for now: accept that residual risk, rely on `leaked_skill_reads()` to catch it
+  if it's ever actually exercised, and revisit with a container-based execution backend if a real
+  run shows deliberate broad-disk searching rather than incidental cwd exploration.
 
 See [FAQ.md](FAQ.md) for the plain-language version.
 
@@ -420,11 +435,23 @@ its schema.
 
 ## Notes & caveats
 
-- **AntiGravity** (`agy`) is young: 1.0.9 emits **plain text** (no `--output-format`),
-  so the adapter parses defensively (JSONL → single JSON → raw text) and tool-trace
-  extraction is best-effort. Prefer filesystem / `llm_judge` assertions for it. Tighten
-  [`adapters/antigravity.py`](agentskill_evals/adapters/antigravity.py) once
-  your build exposes a structured schema.
+- **AntiGravity** (`agy`) moves fast — re-verify against `agy --help` / `agy changelog`
+  before trusting any of this. As of 1.0.16: `--output-format json` works but is
+  undocumented (absent from `--help`); its stdout is just the final answer, so the real
+  tool-call trace is read separately from the on-disk transcript the CLI writes for every
+  run (`~/.gemini/antigravity-cli/brain/<conversation_id>/.system_generated/logs/
+  transcript_full.jsonl`), keyed by the `conversation_id` in the JSON result. Print mode
+  also doesn't scope itself to the process's cwd by default — it operates against a fixed,
+  shared `~/.gemini/antigravity-cli/scratch` dir otherwise, so `build_argv` always passes
+  `--add-dir <workspace>`. [`adapters/antigravity.py`](agentskill_evals/adapters/antigravity.py)'s
+  module docstring has the full detail; parse() still falls back to JSONL → single JSON →
+  raw text for older builds without `--output-format`.
+- AntiGravity also discovers skills via a **plugin registry**
+  (`~/.gemini/config/plugins/<name>/skills/…`) independent of its regular global skills
+  dirs — e.g. `agy plugin import claude` can mirror this repo's skills there, invisibly
+  bypassing per-eval skill declaration. `global_plugin_registry_subpaths` (see
+  [`isolation.py`](agentskill_evals/isolation.py)) masks it the same way regular skills
+  dirs are masked; `list-skills` folds it into each adapter's `vendor`/`masked` counts.
 - Skills are provisioned by **symlink** when possible (small, read-only),
   falling back to a copy on platforms without symlinks.
 - `--no-auto-approve` disables the per-agent "run without prompts" flags

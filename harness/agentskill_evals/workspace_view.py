@@ -11,7 +11,7 @@ the same walk so they never diverge on what counts as "the model's output"
 from __future__ import annotations
 
 import os
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 # Budgets for the judge's compact view (the report passes None == no cap).
 JUDGE_MAX_FILES = 60
@@ -71,6 +71,63 @@ def writes_outside_workspace(result: Any, workdir: str) -> list[str]:
             seen.add(ap)
             out.append(ap)
     return out
+
+
+def leaked_skill_reads(
+    result: Any, workdir: str, repo_root: str,
+    repo_skill_names: Iterable[str], declared_names: Iterable[str],
+) -> list[str]:
+    """Absolute paths (or referenced script paths) this run touched that reach an UNDECLARED
+    skill through the real, on-disk repo checkout rather than the provisioned workspace copy.
+
+    The eval workspace is nested inside this repo's own working tree (``runner.py`` runs
+    ``git init`` there specifically to stop project-level skill discovery from walking up past
+    it). That trick defeats a discovery mechanism that itself deliberately halts at the nearest
+    ``.git`` — it does nothing against a general-purpose file-browsing agent (list_dir/view_file/
+    shell on arbitrary absolute paths) that just lists a parent directory and reads whatever
+    undeclared skill sits there in plain sight, one level above the workspace. This detects that
+    escape after the fact from the trace, so a leak isn't silently reported as ``isolated: true``.
+    """
+    leaked_names = set(repo_skill_names) - set(declared_names)
+    if not leaked_names:
+        return []
+    root = os.path.abspath(repo_root)
+    wd = os.path.abspath(workdir)
+    hits: list[str] = []
+    seen: set[str] = set()
+
+    def _under(base: str, ap: str) -> bool:
+        try:
+            return os.path.commonpath([base, ap]) == base
+        except ValueError:
+            return False
+
+    def _flag(candidate: str) -> None:
+        if not candidate or candidate in seen:
+            return
+        ap = os.path.abspath(candidate)
+        if not _under(root, ap) or _under(wd, ap):
+            return
+        rel_parts = os.path.relpath(ap, root).split(os.sep)
+        if rel_parts and rel_parts[0] in leaked_names:
+            seen.add(candidate)
+            hits.append(ap)
+
+    for p in result.file_paths_touched():
+        _flag(resolve_trace_path(p, workdir))
+
+    for cmd in result.commands():
+        for name in leaked_names:
+            marker = os.path.join(root, name)
+            idx = cmd.find(marker)
+            if idx == -1:
+                continue
+            end = idx
+            while end < len(cmd) and not cmd[end].isspace():
+                end += 1
+            _flag(cmd[idx:end])
+
+    return hits
 
 
 def file_tree(workdir: str, extra: list[str] = (), max_files: Optional[int] = None) -> str:

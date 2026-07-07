@@ -45,6 +45,27 @@ ANTIGRAVITY_STREAM = """\
 ANTIGRAVITY_JSON = '{"result":"All done."}'
 ANTIGRAVITY_RAW = "just a plain text answer with no JSON"
 
+# The real `--output-format json` shape (agy 1.0.16+) — a conversation_id that keys the
+# on-disk transcript, tested together in _check_antigravity_transcript below.
+ANTIGRAVITY_JSON_RESULT = (
+    '{"conversation_id":"conv-test-1","status":"SUCCESS",'
+    '"response":"Done building demo-app.","duration_seconds":1.5,"num_turns":1,'
+    '"usage":{"input_tokens":10,"output_tokens":20,"thinking_tokens":5,"total_tokens":35}}'
+)
+
+ANTIGRAVITY_TRANSCRIPT = """\
+{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"do the task"}
+{"step_index":1,"source":"SYSTEM","type":"CONVERSATION_HISTORY"}
+{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","thinking":"planning the work","tool_calls":[{"name":"run_command","args":{"CommandLine":"npm install"}}]}
+{"step_index":3,"source":"MODEL","type":"RUN_COMMAND","content":"added 1 package"}
+{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"write_to_file","args":{"TargetFile":"package.json","CodeContent":"{}"}}]}
+{"step_index":5,"source":"MODEL","type":"CODE_ACTION","content":"Created file package.json"}
+{"step_index":6,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"skill","args":{"skill":"sliderule-api"}}]}
+{"step_index":7,"source":"SYSTEM","type":"CHECKPOINT","content":"summary"}
+{"step_index":8,"source":"MODEL","type":"ERROR_MESSAGE","content":"a transient warning"}
+{"step_index":9,"source":"MODEL","type":"PLANNER_RESPONSE","content":"Done building demo-app."}
+"""
+
 COPILOT = """\
 {"type":"session.skills_loaded","data":{"skills":[]},"id":"s1","timestamp":"2026-06-22T00:00:00Z","parentId":"p1","ephemeral":true}
 {"type":"session.tools_updated","data":{"model":"claude-sonnet-4.6"},"id":"s2","timestamp":"2026-06-22T00:00:00Z","parentId":"p1","ephemeral":true}
@@ -71,7 +92,8 @@ def _check(name, cond, msg, failures, verbose):
 
 def _check_isolation(failures, verbose):
     """Validate the HOME overlay: declared skills present, undeclared masked, vendor kept,
-    auth/config passed through, missing ancestors built. Pure filesystem — no CLIs."""
+    auth/config passed through, missing ancestors built, plugin-registry skills masked
+    without duplicating declared ones into unrelated plugins. Pure filesystem — no CLIs."""
     import os
     import shutil
     import tempfile
@@ -92,6 +114,18 @@ def _check_isolation(failures, verbose):
         os.makedirs(os.path.join(real, "_cfg"))  # reproduce the config-mirror escape hazard
         open(os.path.join(real, ".codex", "auth.json"), "w").close()
         open(os.path.join(real, ".gitconfig"), "w").close()
+        # a plugin registry sibling of .gemini/config/skills (both live under .gemini/config/,
+        # exercising two different leaf types sharing an ancestor): one plugin mirrors this
+        # repo's skills (the real-world leak — e.g. via `agy plugin import`), plus a vendor
+        # skill in the same plugin, plus a second, unrelated vendor-only plugin.
+        os.makedirs(os.path.join(real, ".gemini", "config", "plugins",
+                                  "sliderule-skills", "skills", "sliderule-api"))
+        os.makedirs(os.path.join(real, ".gemini", "config", "plugins",
+                                  "sliderule-skills", "skills", "vendor-thing"))
+        open(os.path.join(real, ".gemini", "config", "plugins",
+                           "sliderule-skills", "plugin.json"), "w").close()
+        os.makedirs(os.path.join(real, ".gemini", "config", "plugins",
+                                  "other-plugin", "skills", "other-skill"))
         # the cell declares only sliderule-api (its source lives outside HOME, like skills_root)
         os.makedirs(os.path.join(declared_root, "sliderule-api"))
 
@@ -101,6 +135,7 @@ def _check_isolation(failures, verbose):
             {"sliderule-api", "sliderule-params"},        # repo superset to mask
             [os.path.join(declared_root, "sliderule-api")],
             real,
+            plugin_registry_subpaths=[".gemini/config/plugins"],
         )
 
         skills = os.path.join(dest, ".codex", "skills")
@@ -126,6 +161,26 @@ def _check_isolation(failures, verbose):
         _check("isolation.missing_ancestor_built", gem_names == ["sliderule-api"],
                f"missing nested skills dir built with declared only (got {gem_names})",
                failures, verbose)
+
+        plugin_skills = os.path.join(dest, ".gemini", "config", "plugins",
+                                      "sliderule-skills", "skills")
+        plugin_names = sorted(os.listdir(plugin_skills)) if os.path.isdir(plugin_skills) else []
+        _check("isolation.plugin_repo_skill_masked", plugin_names == ["vendor-thing"],
+               f"plugin's leaked repo skill dropped, its vendor skill kept "
+               f"(got {plugin_names})", failures, verbose)
+        _check("isolation.plugin_not_re_added",
+               "sliderule-api" not in plugin_names,
+               "declared skill isn't duplicated into an unrelated plugin's skills/ "
+               "(it's already injected once via the primary skills dir)", failures, verbose)
+        _check("isolation.plugin_metadata_passthrough",
+               os.path.islink(os.path.join(dest, ".gemini", "config", "plugins",
+                                            "sliderule-skills", "plugin.json")),
+               "plugin.json passed through as a symlink", failures, verbose)
+        other_plugin_skills = os.path.join(dest, ".gemini", "config", "plugins",
+                                            "other-plugin", "skills")
+        other_names = sorted(os.listdir(other_plugin_skills)) if os.path.isdir(other_plugin_skills) else []
+        _check("isolation.unrelated_plugin_untouched", other_names == ["other-skill"],
+               f"vendor-only plugin left alone (got {other_names})", failures, verbose)
 
         # config mirrors must use a fresh temp dir, not dest/_cfg — which is a symlink to the
         # real HOME's _cfg here, so writing through it would escape the temp tree.
@@ -382,6 +437,168 @@ def _check_path_resolution(failures, verbose):
         shutil.rmtree(outside, ignore_errors=True)
 
 
+def _check_leaked_skill_reads(failures, verbose):
+    """Reproduces the antigravity escape from run 20260707-072933_scen_SimpleATL06PromptGrandMesa:
+    the eval workspace is nested inside this repo's own checkout (``<repo>/artifacts/<run>/.../
+    workspace``); ``git init`` in the workspace (runner.py) stops a skill-discovery mechanism that
+    deliberately halts its walk-up at the nearest ``.git``, but does nothing against a
+    general-purpose file-browsing agent that just ``list_dir``s a parent directory by absolute
+    path and reads whatever undeclared skill sits there in plain sight. The real transcript showed
+    exactly that: `list_dir` on the scenario dir, then the repo root, then `view_file` on
+    ``sliderule-api/SKILL.md`` and ``sliderule-openapi/scripts/openapi.py`` — none of which were
+    declared — while the run was still reported as ``isolated: true``.
+
+    ``leaked_skill_reads`` must catch this after the fact from the trace: an undeclared repo
+    skill read via an absolute path that resolves under the real repo root but outside the
+    workspace copy."""
+    import os
+    import shutil
+    import tempfile
+
+    from .schema import EventKind, NormalizedEvent, RunResult
+    from .workspace_view import leaked_skill_reads
+
+    print("leaked skill reads (hermeticity escape):")
+    repo_root = tempfile.mkdtemp(prefix="ase-repo-")
+    try:
+        # Mirror the real layout: workspace nested inside the repo checkout, sibling to the
+        # repo's own skill directories.
+        for name in ("sliderule-api", "sliderule-openapi", "sliderule-examples"):
+            os.makedirs(os.path.join(repo_root, name))
+            with open(os.path.join(repo_root, name, "SKILL.md"), "w") as f:
+                f.write("---\nname: " + name + "\n---\n")
+        workspace = os.path.join(repo_root, "artifacts", "run1", "model", "scenario",
+                                  "SimpleATL06PromptGrandMesa", "workspace")
+        os.makedirs(workspace)
+
+        def _rr(events):
+            return RunResult(agent="antigravity", eval_name="e", prompt="", workdir=workspace,
+                             events=events)
+
+        repo_skill_names = {"sliderule-api", "sliderule-openapi", "sliderule-examples"}
+
+        # 1. the real escape: list_dir/view_file on the undeclared sliderule-api SKILL.md via
+        #    the repo's real absolute path — no skill declared for this eval at all.
+        leak_path = os.path.join(repo_root, "sliderule-api", "SKILL.md")
+        rr = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="view_file", path=leak_path)])
+        leaks = leaked_skill_reads(rr, workspace, repo_root, repo_skill_names, declared_names=set())
+        _check("leak.undeclared_skill_read_detected", leaks == [os.path.abspath(leak_path)],
+               f"undeclared skill read via real repo path is caught: {leaks}", failures, verbose)
+
+        # 2. a read of a DECLARED skill's real path is not a leak (it's expected the model was
+        #    given this one).
+        rr2 = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="view_file", path=leak_path)])
+        leaks2 = leaked_skill_reads(rr2, workspace, repo_root, repo_skill_names,
+                                    declared_names={"sliderule-api"})
+        _check("leak.declared_skill_not_flagged", leaks2 == [],
+               f"declared skill's real-path read is not a leak: {leaks2}", failures, verbose)
+
+        # 3. reading the provisioned COPY inside the workspace itself is not a leak.
+        prov_dir = os.path.join(workspace, ".antigravity", "skills", "sliderule-api")
+        os.makedirs(prov_dir)
+        prov_path = os.path.join(prov_dir, "SKILL.md")
+        open(prov_path, "w").close()
+        rr3 = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="view_file", path=prov_path)])
+        leaks3 = leaked_skill_reads(rr3, workspace, repo_root, repo_skill_names, declared_names=set())
+        _check("leak.workspace_copy_not_flagged", leaks3 == [],
+               f"provisioned in-workspace copy is not a leak: {leaks3}", failures, verbose)
+
+        # 4. a run_command whose command string references the undeclared skill's real script
+        #    path (e.g. `python /repo/sliderule-openapi/scripts/openapi.py ...`) is also caught.
+        script = os.path.join(repo_root, "sliderule-openapi", "scripts", "openapi.py")
+        cmd = f"conda run -n env python {script} applies-to atl06x"
+        rr4 = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="run_command", command=cmd)])
+        leaks4 = leaked_skill_reads(rr4, workspace, repo_root, repo_skill_names, declared_names=set())
+        _check("leak.command_reference_detected", leaks4 == [os.path.abspath(script)],
+               f"undeclared skill script referenced in a command is caught: {leaks4}",
+               failures, verbose)
+
+        # 5. no leaked names at all (every repo skill declared) -> no leaks, no filesystem work.
+        rr5 = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="view_file", path=leak_path)])
+        leaks5 = leaked_skill_reads(rr5, workspace, repo_root, repo_skill_names,
+                                    declared_names=repo_skill_names)
+        _check("leak.all_declared_short_circuits", leaks5 == [],
+               f"nothing to leak once every repo skill is declared: {leaks5}", failures, verbose)
+    finally:
+        shutil.rmtree(repo_root, ignore_errors=True)
+
+
+class _FakeAdapter:
+    """Bare-minimum adapter stand-in for _check_workspace_relocation — no real CLI is invoked
+    (execute() itself is monkeypatched), this only needs to satisfy the attributes _run_cell
+    reads before it gets there."""
+    global_skills_subpaths: list[str] = []
+    skills_subdir = "fake/skills"
+
+
+def _check_workspace_relocation(failures, verbose):
+    """Under isolation, _run_cell must execute the agent in a tempdir with NO path
+    relationship to this repo's checkout — not `<repo>/artifacts/.../workspace`, which let
+    antigravity `list_dir` its way up two directories into the real repo's undeclared skills
+    (run 20260707-072933_scen_SimpleATL06PromptGrandMesa; see _check_leaked_skill_reads).
+    Monkeypatches `execute()` so no real agent CLI runs, drives `_run_cell` end to end, and
+    checks: (1) the cwd the fake agent saw is outside the repo tree, (2) the file it "produced"
+    still ends up in cell_dir/workspace for artifacts/report, (3) the temp exec dir is gone
+    afterward."""
+    import os
+    import shutil
+    import tempfile
+
+    import agentskill_evals.runner as runner_mod
+    from .exec import ExecResult
+    from .schema import EventKind, NormalizedEvent, RunResult
+    from .spec import EvalSpec
+
+    print("workspace relocation (exec dir escapes the repo tree):")
+    repo_root = tempfile.mkdtemp(prefix="ase-repo2-")
+    seen: dict = {}
+    orig_execute = runner_mod.execute
+
+    def _fake_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides, agent_name, eval_name):
+        seen["cwd"] = cwd
+        with open(os.path.join(cwd, "run.py"), "w") as f:
+            f.write("print('hi')\n")
+        rr = RunResult(
+            agent=agent_name, eval_name=eval_name, prompt=prompt, workdir=cwd,
+            events=[NormalizedEvent(EventKind.FILE_CHANGE, path="run.py")],
+            final_text="done",
+        )
+        return ExecResult(result=rr, stdout="", stderr="")
+
+    runner_mod.execute = _fake_execute
+    try:
+        run_dir = os.path.join(repo_root, "artifacts", "run1")
+        os.makedirs(run_dir)
+        r = runner_mod.Runner.__new__(runner_mod.Runner)
+        r.agent, r.adapter, r.models = "fake", _FakeAdapter(), [None]
+        r.artifacts_root = os.path.join(repo_root, "artifacts")
+        r.run_id, r.skills_root, r.judge = "run1", repo_root, None
+        r.provision, r.command, r.auto_approve = False, "", True
+        r.jobs, r.isolated, r.progress = 1, True, None
+        r._repo_skill_names, r.run_dir = set(), run_dir
+
+        spec = EvalSpec(name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"))
+        cell = r._run_cell(None, spec)
+
+        cell_workspace = os.path.join(cell.artifacts_dir, "workspace")
+        cwd_used = seen.get("cwd")
+        outside = cwd_used is not None and not (
+            os.path.abspath(cwd_used) == os.path.abspath(repo_root)
+            or os.path.abspath(cwd_used).startswith(os.path.abspath(repo_root) + os.sep)
+        )
+        _check("relocate.exec_cwd_outside_repo", outside,
+               f"exec cwd is outside the repo checkout (got {cwd_used})", failures, verbose)
+        _check("relocate.produced_file_in_artifacts",
+               os.path.isfile(os.path.join(cell_workspace, "run.py")),
+               "produced file still lands in cell_dir/workspace for artifacts", failures, verbose)
+        _check("relocate.temp_exec_dir_cleaned",
+               cwd_used is not None and not os.path.isdir(cwd_used),
+               "temp exec dir removed after copy-back", failures, verbose)
+    finally:
+        runner_mod.execute = orig_execute
+        shutil.rmtree(repo_root, ignore_errors=True)
+
+
 def _check_verdict_coercion(failures, verbose):
     """Top-level and per-item verdict 'pass' coercion edge cases."""
     from .assertions import AssertionContext, run_assertion
@@ -452,6 +669,92 @@ def _check_verdict_coercion(failures, verbose):
            failures, verbose)
 
 
+def _check_antigravity_transcript(failures, verbose):
+    """AntiGravity's --output-format json result carries no tool trace itself (just the
+    final answer) — parse() has to go read the on-disk transcript, keyed by the result's
+    conversation_id, to recover it. Builds a fake isolated HOME with that transcript planted
+    at the real on-disk layout and drives parse() through opts.home, like a real isolated
+    run would. Pure filesystem — no CLIs."""
+    import os
+    import shutil
+    import tempfile
+
+    print("antigravity transcript trace:")
+    home = tempfile.mkdtemp(prefix="ase-agy-home-")
+    try:
+        log_dir = os.path.join(home, ".gemini", "antigravity-cli", "brain", "conv-test-1",
+                                ".system_generated", "logs")
+        os.makedirs(log_dir)
+        with open(os.path.join(log_dir, "transcript_full.jsonl"), "w") as f:
+            f.write(ANTIGRAVITY_TRANSCRIPT)
+
+        out = get_adapter("antigravity").parse(
+            ANTIGRAVITY_JSON_RESULT, "", 0, opts=RunOptions(home=home)
+        )
+        _check("antigravity.transcript.final", out.final_text == "Done building demo-app.",
+               repr(out.final_text), failures, verbose)
+        _check("antigravity.transcript.duration_ms", out.duration_ms == 1500,
+               f"1.5s duration_seconds -> {out.duration_ms}ms", failures, verbose)
+
+        cmds = [e.command for e in out.events if e.command]
+        _check("antigravity.transcript.command",
+               cmds == ["npm install"],
+               f"CommandLine (PascalCase) extracted via snake_case_keys: {cmds}",
+               failures, verbose)
+
+        paths = [e.path for e in out.events if e.path]
+        _check("antigravity.transcript.file_path", "package.json" in paths,
+               f"TargetFile (PascalCase) extracted via snake_case_keys: {paths}",
+               failures, verbose)
+        _check("antigravity.transcript.skill_path",
+               ".antigravity/skills/sliderule-api/SKILL.md" in paths,
+               f"skill tool call resolves to its SKILL.md path: {paths}", failures, verbose)
+
+        tool_names = [e.tool_name for e in out.events if e.tool_name]
+        _check("antigravity.transcript.tool_names",
+               {"run_command", "write_to_file", "skill"} <= set(tool_names),
+               f"tool_names={tool_names}", failures, verbose)
+
+        reasoning = [e for e in out.events if e.kind == EventKind.REASONING]
+        _check("antigravity.transcript.reasoning", len(reasoning) == 1,
+               f"PLANNER_RESPONSE 'thinking' surfaced as REASONING: {len(reasoning)}",
+               failures, verbose)
+
+        errors = [e for e in out.events if e.kind == EventKind.ERROR]
+        _check("antigravity.transcript.error_message",
+               len(errors) == 1 and errors[0].is_error,
+               f"ERROR_MESSAGE step mapped to an ERROR event: {errors}", failures, verbose)
+
+        # step_index 0 (USER_INPUT) legitimately backs the SESSION_START event; 1
+        # (CONVERSATION_HISTORY) and 7 (CHECKPOINT) should produce no event at all.
+        skipped = any(
+            isinstance(e.raw, dict) and e.raw.get("step_index") in (1, 7)
+            for e in out.events
+        )
+        _check("antigravity.transcript.housekeeping_skipped", not skipped,
+               "CONVERSATION_HISTORY (step 1) / CHECKPOINT (step 7) produce no events",
+               failures, verbose)
+
+        result_events = [e for e in out.events if e.kind == EventKind.RESULT]
+        _check("antigravity.transcript.status_success",
+               len(result_events) == 1 and not result_events[0].is_error,
+               f"status SUCCESS -> RESULT.is_error=False: {result_events}",
+               failures, verbose)
+
+        cargv = get_adapter("antigravity").build_argv(
+            "do the task", RunOptions(model="gemini-3.5-flash"), cwd="/tmp/some-workspace"
+        )
+        _check("antigravity.argv",
+               cargv[0] == "agy" and "-p" in cargv
+               and "--output-format" in cargv and "json" in cargv
+               and "--add-dir" in cargv
+               and cargv[cargv.index("--add-dir") + 1] == "/tmp/some-workspace"
+               and "--model" in cargv,
+               f"antigravity argv: {cargv}", failures, verbose)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def run_selftest(verbose: bool = False) -> int:
     failures: list[str] = []
 
@@ -495,7 +798,7 @@ def run_selftest(verbose: bool = False) -> int:
     _check("codex.command", cmds == ["npm install"], f"commands={cmds}", failures, verbose)
     _check("codex.file", "package.json" in paths, f"paths={paths}", failures, verbose)
     _check("codex.final", out.final_text == "Created demo-app.", repr(out.final_text), failures, verbose)
-    cargv = get_adapter("codex").build_argv("do the task", RunOptions(model="gpt-5.4-mini"))
+    cargv = get_adapter("codex").build_argv("do the task", RunOptions(model="gpt-5.4-mini"), cwd="/tmp")
     pre = cargv[:cargv.index("exec")]  # top-level flags precede the exec subcommand
     _check("codex.argv",
            "--ask-for-approval" in pre and "never" in pre
@@ -544,13 +847,13 @@ def run_selftest(verbose: bool = False) -> int:
            not any(e.kind == EventKind.SESSION_START and "skills_loaded" in str(e.raw)
                    for e in out.events),
            "ephemeral session events skipped", failures, verbose)
-    cargv = get_adapter("copilot").build_argv("do the task", RunOptions(model="auto"))
+    cargv = get_adapter("copilot").build_argv("do the task", RunOptions(model="auto"), cwd="/tmp")
     _check("copilot.argv",
            cargv[0] == "copilot" and "-p" in cargv and "--output-format" in cargv
            and "json" in cargv and "--allow-all" in cargv and "--model" in cargv
            and cargv[-1] != "do the task",
            f"copilot argv: {cargv}", failures, verbose)
-    cargv_dt = get_adapter("copilot").build_argv("judge", RunOptions(disable_tools=True))
+    cargv_dt = get_adapter("copilot").build_argv("judge", RunOptions(disable_tools=True), cwd="/tmp")
     _check("copilot.disable_tools",
            "--available-tools" in cargv_dt and cargv_dt[cargv_dt.index("--available-tools") + 1] == "",
            f"disable_tools → --available-tools '': {cargv_dt}", failures, verbose)
@@ -796,6 +1099,7 @@ def run_selftest(verbose: bool = False) -> int:
     _check_isolation(failures, verbose)
     _check_provision(failures, verbose)
     _check_workspace_reset(failures, verbose)
+    _check_antigravity_transcript(failures, verbose)
 
     # per-cell readable report
     _check_report(failures, verbose)
@@ -803,6 +1107,10 @@ def run_selftest(verbose: bool = False) -> int:
     # artifact / trace path resolution (no false passes on seeded fixtures; workspace-relative;
     # symlink escapes via write-trace)
     _check_path_resolution(failures, verbose)
+
+    # undeclared repo skills read via the real on-disk checkout (workspace-escape leak)
+    _check_leaked_skill_reads(failures, verbose)
+    _check_workspace_relocation(failures, verbose)
 
     # verdict coercion edge cases (string "false", extra items)
     _check_verdict_coercion(failures, verbose)

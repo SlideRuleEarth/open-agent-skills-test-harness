@@ -207,7 +207,7 @@ def _print_skill_visibility(specs, agent, models, isolated, skills_root, provisi
         prov = ", ".join(vis["provisioned"]) or "(none)"
     print(f"      provisioned:  {prov}")
     vend = ", ".join(vis["vendor"]) or "(none in global dirs)"
-    print(f"      vendor kept:  {vend}  + the agent's built-in/plugin skills (not listed)")
+    print(f"      vendor kept:  {vend}  + the agent's built-in skills (not listed)")
     if isolated:
         print(f"      masked:       {', '.join(vis['masked']) or '(none)'}")
     else:
@@ -672,7 +672,8 @@ def cmd_list_skills(args) -> int:
     for a in all_adapters():
         vis = resolve_visible_skills(a, (), repo, isolated=True, real_home=real_home)
         masked, vendor = vis["masked"], vis["vendor"]
-        dirs = a.global_skills_subpaths or []
+        dirs = list(a.global_skills_subpaths or []) + list(
+            getattr(a, "global_plugin_registry_subpaths", []) or [])
         print(f"\n{a.name}:")
         print("  dirs: " + (", ".join("~/" + d for d in dirs) if dirs else "(none)"))
         print(f"  repo skills (masked under isolation): {', '.join(masked) or '(none)'}")
@@ -685,7 +686,8 @@ def cmd_list_skills(args) -> int:
 
     print("\nWith isolation ON (default) a run sees only the skills it provisions + vendor "
           "skills; with --no-isolated it also sees the repo skills above.")
-    print("Note: skills bundled inside a CLI's package or plugins aren't listed here.")
+    print("Note: skills bundled inside a CLI's own package aren't listed here; skills nested\n"
+          "in a tracked plugin registry (see 'dirs' above) are, folded into vendor/masked.")
     return 0
 
 

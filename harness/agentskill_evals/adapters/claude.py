@@ -19,7 +19,7 @@ Anthropic SDK message objects:
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Optional
 
 from ..schema import EventKind, NormalizedEvent
 from .base import Adapter, ParseOutput, ProbeResult, RunOptions, extract_command, extract_path, iter_jsonl, warn_unknown_usage
@@ -78,7 +78,7 @@ class ClaudeAdapter(Adapter):
     def format_skill(self, skill: str) -> str:
         return f"/{skill}"
 
-    def build_argv(self, prompt: str, opts: RunOptions) -> list[str]:
+    def build_argv(self, prompt: str, opts: RunOptions, *, cwd: str) -> list[str]:
         argv = [
             self.binary,
             "-p",
@@ -101,7 +101,8 @@ class ClaudeAdapter(Adapter):
         argv += opts.extra_args
         return argv
 
-    def parse(self, stdout: str, stderr: str, exit_code: int) -> ParseOutput:
+    def parse(self, stdout: str, stderr: str, exit_code: int,
+               *, opts: Optional[RunOptions] = None) -> ParseOutput:
         events: list[NormalizedEvent] = []
         final_text = ""
         structured: Any = None

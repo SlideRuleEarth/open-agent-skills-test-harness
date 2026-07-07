@@ -33,7 +33,7 @@ Verified against copilot 1.0.63 on 2026-06-22.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from ..schema import EventKind, NormalizedEvent
 from .base import (
@@ -93,7 +93,7 @@ class CopilotAdapter(Adapter):
     def format_skill(self, skill: str) -> str:
         return f"/{skill}"
 
-    def build_argv(self, prompt: str, opts: RunOptions) -> list[str]:
+    def build_argv(self, prompt: str, opts: RunOptions, *, cwd: str) -> list[str]:
         argv = [self.binary, "-p", prompt, *self._HERMETIC, "--output-format", "json"]
         if opts.auto_approve:
             argv += ["--allow-all"]
@@ -104,7 +104,8 @@ class CopilotAdapter(Adapter):
         argv += opts.extra_args
         return argv
 
-    def parse(self, stdout: str, stderr: str, exit_code: int) -> ParseOutput:
+    def parse(self, stdout: str, stderr: str, exit_code: int,
+               *, opts: Optional[RunOptions] = None) -> ParseOutput:
         events: list[NormalizedEvent] = []
         final_text = ""
         structured: Any = None

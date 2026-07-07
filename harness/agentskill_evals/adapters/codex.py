@@ -79,7 +79,7 @@ class CodexAdapter(Adapter):
         # Mirrors the OpenAI example which referenced skills as "$skill-name".
         return f"${skill}"
 
-    def build_argv(self, prompt: str, opts: RunOptions) -> list[str]:
+    def build_argv(self, prompt: str, opts: RunOptions, *, cwd: str) -> list[str]:
         argv = [self.binary]
         if opts.auto_approve:
             # Non-interactive parity with the deprecated `--full-auto`: never prompt for
@@ -96,7 +96,8 @@ class CodexAdapter(Adapter):
         argv += [prompt]  # prompt is positional and must come last
         return argv
 
-    def parse(self, stdout: str, stderr: str, exit_code: int) -> ParseOutput:
+    def parse(self, stdout: str, stderr: str, exit_code: int,
+               *, opts: Optional[RunOptions] = None) -> ParseOutput:
         events: list[NormalizedEvent] = []
         final_text = ""
         structured: Any = None

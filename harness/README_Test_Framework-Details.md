@@ -54,8 +54,12 @@ file (`CLI > scenario > default`). See [scenarios/README.md](../scenarios/README
 2. Run the agent CLI through its adapter with the eval prompt.
 3. Adapter `parse()` normalizes that CLI's output into a common
    [`NormalizedEvent`](agentskill_evals/schema.py) stream + `RunResult`
-   (tool calls, commands, files touched, `final_text`, `structured_output`, cost). Tool-trace
-   extraction degrades gracefully when a CLI emits plain text (e.g. AntiGravity).
+   (tool calls, commands, files touched, `final_text`, `structured_output`, cost). Not every
+   CLI puts its tool-call trace on stdout — AntiGravity's `--output-format json` returns only
+   the final answer, so its adapter reads the trace from a separate on-disk transcript keyed
+   by the result's `conversation_id` (see
+   [`adapters/antigravity.py`](agentskill_evals/adapters/antigravity.py)). Extraction still
+   degrades gracefully to plain-text parsing for older/misconfigured builds.
 4. Grade.
 
 ## Grading — two layers
