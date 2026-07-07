@@ -236,15 +236,14 @@ harness blocks both:
    **HOME symlink overlay** (`isolation.py`) that masks this repo's skills while keeping
    vendor bundles and auth/config.
 2. **Project-local (git-root-based):** `.claude/skills/`, `.agents/skills/`, etc. at the
-   git repository root. Blocked by running **`git init`** in each cell's workspace, which
-   creates a `.git` boundary that stops agents from walking up to the real repo root — *and*
-   by running the cell's workspace in a tempdir with no path relationship to this repo's
-   checkout in the first place (`runner.py`), so a general-purpose file-browsing agent (one
-   that just `list_dir`s a parent directory by absolute path, unbound by any `.git` boundary)
-   can't stumble onto undeclared skills by walking up a couple of directories either. This is
-   what antigravity actually did in practice — see `leaked_skill_reads()` in
-   `workspace_view.py`, the after-the-fact detector that catches it if it ever recurs, and
-   downgrades that cell's `isolated` flag to `false` instead of a silent false positive.
+   git repository root, found by walking up from cwd. Blocked by running the cell's workspace
+   in a tempdir with no path relationship to this repo's checkout in the first place
+   (`runner.py`) — there's no real repo root above it to walk up into, whether the walk is a
+   `.git`-aware skill-discovery mechanism or a general-purpose file-browsing agent that just
+   `list_dir`s a parent directory by absolute path. That second case is what antigravity
+   actually did in practice before the workspace was relocated — see `leaked_skill_reads()` in
+   `workspace_view.py`, the after-the-fact detector that catches it if it ever recurs some other
+   way, and downgrades that cell's `isolated` flag to `false` instead of a silent false positive.
 
 Together these ensure the model sees only the skills the eval/scenario provisions — plus the
 agent's built-in/vendor skills — never other repo skills you happen to have installed.

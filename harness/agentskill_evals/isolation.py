@@ -6,9 +6,9 @@ Agents discover skills from two locations:
   2. **Project-local (git-root-based):** ``.claude/skills/``, ``.agents/skills/``, etc.
      at the git repository root, found by walking up from cwd.
 
-This module handles layer 1 (global skills). The runner handles layer 2 by running
-``git init`` in each cell's workspace (see ``runner.py``), which creates a ``.git``
-boundary that stops agents from walking up to the real repo root.
+This module handles layer 1 (global skills). The runner handles layer 2 by running each
+cell's workspace in a tempdir with no path relationship to this repo's checkout (see
+``runner.py``), so there's no real repo root above it for an agent to walk up into.
 
 **Layer 1 — HOME overlay (this module):**
 
@@ -233,9 +233,6 @@ def _mask_plugin_registry_dir(real_dir: str, dst_dir: str, repo_skills: set) -> 
             os.symlink(os.path.join(real_plugin, name), os.path.join(dst_plugin, name))
         real_skills = os.path.join(real_plugin, "skills")
         if os.path.isdir(real_skills):
-            dst_skills = os.path.join(dst_plugin, "skills")
-            os.makedirs(dst_skills, exist_ok=True)
-            for name in os.listdir(real_skills):
-                if name in repo_skills:
-                    continue
-                os.symlink(os.path.join(real_skills, name), os.path.join(dst_skills, name))
+            # mask-only: an empty `declared` makes _build_skills_dir's re-add step a no-op,
+            # leaving just its drop-repo-skills/symlink-the-rest behavior.
+            _build_skills_dir(real_skills, os.path.join(dst_plugin, "skills"), repo_skills, [])

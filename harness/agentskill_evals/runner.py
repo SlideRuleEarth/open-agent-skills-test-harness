@@ -19,7 +19,6 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -174,21 +173,11 @@ class Runner:
         # paths; it did nothing to stop a general-purpose file-browsing agent (antigravity's
         # list_dir/view_file/shell on arbitrary absolute paths, not just its own cwd) from
         # walking up and reading them directly, which is exactly what happened in run
-        # 20260707-072933_scen_SimpleATL06PromptGrandMesa. Copied back into `workspace` (inside
+        # 20260707-072933_scen_SimpleATL06PromptGrandMesa. Moved into `workspace` (inside
         # cell_dir) once the run + assertions are done, so artifacts/report are unaffected.
         exec_ws = workspace
         if self.isolated:
             exec_ws = tempfile.mkdtemp(prefix="ase-ws-")
-
-        # 0) git-root boundary — belt-and-suspenders for any skill-discovery mechanism that
-        #    walks up from cwd looking for .git: with exec_ws now outside the repo tree there's
-        #    nothing left to find, but `git init` is cheap and harmless either way.
-        if self.isolated:
-            gi = subprocess.run(["git", "init", exec_ws], capture_output=True)
-            if gi.returncode != 0:
-                print(f"warning: [{self.agent}] git init failed (rc={gi.returncode}); "
-                      "skill isolation may leak project-level skills.",
-                      file=sys.stderr)
 
         # 1) provision skills + 2) seed files
         _phase("provisioning workspace")
@@ -266,7 +255,10 @@ class Runner:
             if leaks:
                 isolated = False
 
-        # 6) artifacts
+        # 6) artifacts. NOTE: rr.workdir (serialized into result.json below) still names the
+        # ephemeral exec_ws tempdir, not its final `workspace` location — that's the directory
+        # the run actually executed in, before its contents were moved into the artifacts dir
+        # below; the tempdir itself is gone by the time anyone reads result.json.
         _phase("writing artifacts")
         self._write_artifacts(cell_dir, ex.stdout, ex.stderr, rr)
 
@@ -289,12 +281,12 @@ class Runner:
         passed = False if ungraded else (
             (clean and all(c.passed for c in checks)) if checks else clean)
 
-        # copy the tempdir exec workspace back into cell_dir/workspace for artifacts/report,
-        # then discard the temp dir (never the source — it only ever held a copy of the
-        # declared skills plus whatever the agent produced).
-        if exec_ws != workspace:
-            shutil.copytree(exec_ws, workspace, dirs_exist_ok=True)
-            shutil.rmtree(exec_ws, ignore_errors=True)
+        # Move the tempdir exec workspace into cell_dir/workspace for artifacts/report — `rmdir`
+        # is safe since `_prepare_workspace` left it empty and nothing else wrote into it while
+        # isolated; `move` renames when possible (same filesystem) instead of a copy+delete pass.
+        if self.isolated:
+            os.rmdir(workspace)
+            shutil.move(exec_ws, workspace)
 
         cell = CellResult(
             agent=self.agent, model=model, eval_name=spec.name, skill=spec.skill_name,
