@@ -186,6 +186,25 @@ class CodexAdapter(Adapter):
                                 is_error=is_err,
                             )
                         )
+
+                else:
+                    # An itype we don't specifically recognize (a native tool the CLI added
+                    # since this adapter was written) — attempt generic extraction rather
+                    # than silently dropping it, so leaked_skill_reads() still has a
+                    # command/path to check instead of the event vanishing entirely.
+                    cmd = extract_command(item)
+                    path = extract_path(item)
+                    if (cmd or path) and ("tool", item_id) not in seen:
+                        seen.add(("tool", item_id))
+                        events.append(
+                            NormalizedEvent(
+                                EventKind.TOOL_CALL,
+                                raw=item,
+                                tool_name=itype or "tool",
+                                command=cmd,
+                                path=path,
+                            )
+                        )
                 continue
 
             if etype == "turn.completed":

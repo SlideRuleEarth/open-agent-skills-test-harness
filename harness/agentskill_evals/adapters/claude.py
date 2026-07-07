@@ -146,6 +146,14 @@ class ClaudeAdapter(Adapter):
                             cmd = extract_command(inp)
                         elif name in (_FILE_TOOLS | _READ_TOOLS):
                             path = extract_path(inp)
+                        else:
+                            # Glob/Grep/LS/WebFetch/etc. all take a `path`-shaped argument
+                            # for an arbitrary absolute location, not just cwd — leaving
+                            # these unhandled would silently drop that leak signal from
+                            # leaked_skill_reads() (see workspace_view.py).
+                            cmd = extract_command(inp)
+                            if not cmd:
+                                path = extract_path(inp)
                         events.append(
                             NormalizedEvent(
                                 EventKind.TOOL_CALL,
