@@ -172,7 +172,8 @@ def _file_absent(result, workdir, spec, cfg, ctx):
                                _label(cfg, f"path {rel!r} resolves outside workspace (symlink?)"))
     exists = os.path.exists(target)
     return AssertionResult("file_absent", not exists,
-                           _label(cfg, f"{rel} {'unexpectedly present' if exists else 'absent'}"))
+                           _label(cfg, f"{rel} {'unexpectedly present' if exists else 'absent'}"),
+                           details={"path": target})
 
 
 @register("dir_exists")
@@ -186,7 +187,8 @@ def _dir_exists(result, workdir, spec, cfg, ctx):
         return AssertionResult("dir_exists", False,
                                _label(cfg, f"path {rel!r} resolves outside workspace (symlink?)"))
     ok = os.path.isdir(target)
-    return AssertionResult("dir_exists", ok, _label(cfg, f"dir {rel} {'exists' if ok else 'missing'}"))
+    return AssertionResult("dir_exists", ok, _label(cfg, f"dir {rel} {'exists' if ok else 'missing'}"),
+                           details={"path": target})
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +224,8 @@ def _tool_count(result, workdir, spec, cfg, ctx):
     lo = int(cfg.get("min", 0))
     hi = int(cfg.get("max", 10**9))
     ok = lo <= n <= hi
-    return AssertionResult("tool_count", ok, _label(cfg, f"{n} tool calls (want {lo}..{hi})"))
+    return AssertionResult("tool_count", ok, _label(cfg, f"{n} tool calls (want {lo}..{hi})"),
+                           details={"n": n, "min": lo, "max": hi})
 
 
 # ---------------------------------------------------------------------------
@@ -357,14 +360,17 @@ def _skill_script_not_executed(result, workdir, spec, cfg, ctx):
 def _exit_code(result, workdir, spec, cfg, ctx):
     want = int(cfg.get("equals", 0))
     ok = result.exit_code == want
-    return AssertionResult("exit_code", ok, _label(cfg, f"exit={result.exit_code} (want {want})"))
+    return AssertionResult("exit_code", ok, _label(cfg, f"exit={result.exit_code} (want {want})"),
+                           details={"exit_code": result.exit_code, "want": want})
 
 
 @register("no_error")
 def _no_error(result, workdir, spec, cfg, ctx):
     ok = not result.error and not result.timed_out and result.exit_code == 0
     msg = "clean run" if ok else (result.error or ("timed out" if result.timed_out else f"exit {result.exit_code}"))
-    return AssertionResult("no_error", ok, _label(cfg, msg))
+    return AssertionResult("no_error", ok, _label(cfg, msg),
+                           details={"error": result.error, "timed_out": result.timed_out,
+                                     "exit_code": result.exit_code})
 
 
 @register("final_contains")
@@ -373,7 +379,8 @@ def _final_contains(result, workdir, spec, cfg, ctx):
     ok = hit is not None
     crit = cfg.get("contains") or cfg.get("matches") or "?"
     return AssertionResult("final_contains", ok,
-                           _label(cfg, f"final answer {'matched' if ok else 'did not match'} {crit!r}"))
+                           _label(cfg, f"final answer {'matched' if ok else 'did not match'} {crit!r}"),
+                           details={"final_text": result.final_text})
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +397,8 @@ def _output_matches_schema(result, workdir, spec, cfg, ctx):
                                "agent produced no parseable structured output")
     ok, err = validate_schema(result.structured_output, schema)
     return AssertionResult("output_matches_schema", ok,
-                           _label(cfg, "structured output valid" if ok else f"schema: {err}"))
+                           _label(cfg, "structured output valid" if ok else f"schema: {err}"),
+                           details={} if ok else {"schema_error": err})
 
 
 @register("llm_judge")
@@ -410,7 +418,12 @@ def _llm_judge(result, workdir, spec, cfg, ctx):
     scored = items[:expected]
     passed_items = sum(1 for it in scored if it.get("pass"))
     frac = passed_items / expected
-    if "pass" in verdict and not items:
+    # The bare top-level `pass` is only trustworthy when there was never a rubric to score in
+    # the first place (`not rubric`) — gating on `not items` instead would let a judge that
+    # ignores the "one entry per rubric item" instruction and returns `{"items": [], "pass":
+    # true}` bypass real per-item scoring: `frac` would correctly compute 0/expected, but the
+    # bare `pass` would silently override it into a pass.
+    if not rubric and "pass" in verdict and not items:
         vp = verdict["pass"]
         ok = vp is True or (isinstance(vp, str) and vp.lower() == "true")
     else:
@@ -432,24 +445,35 @@ def _read_text(path: str) -> str:
 
 
 def _match_any(strings: list[str], cfg: dict) -> Optional[str]:
-    """Return the first string matching the cfg criterion, else None."""
+    """Return the first string satisfying EVERY criterion `cfg` supplies, else None.
+
+    `contains`/`matches`/`equals` are ANDed when more than one is given — a cfg like
+    `{contains: "atl06x", matches: "^conda run"}` means "a command that both mentions atl06x AND
+    starts with conda run", not "either." (ORing them would let any string satisfying just one
+    criterion pass, silently more permissive than a spec author supplying two constraints would
+    expect.)
+    """
     contains = cfg.get("contains")
     matches = cfg.get("matches")
     equals = cfg.get("equals")
     ci = cfg.get("ignore_case", False)
+    if contains is None and matches is None and equals is None:
+        return None
     for s in strings:
         if s is None:
             continue
         hay = s.lower() if ci else s
         if contains is not None:
             needle = contains.lower() if ci else contains
-            if needle in hay:
-                return s
-        if matches is not None:
-            if re.search(matches, s, re.IGNORECASE if ci else 0):
-                return s
-        if equals is not None and hay.strip() == (str(equals).lower() if ci else str(equals)).strip():
-            return s
+            if needle not in hay:
+                continue
+        if matches is not None and not re.search(matches, s, re.IGNORECASE if ci else 0):
+            continue
+        if equals is not None:
+            want = str(equals).lower() if ci else str(equals)
+            if hay.strip() != want.strip():
+                continue
+        return s
     return None
 
 

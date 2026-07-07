@@ -108,12 +108,14 @@ class ClaudeAdapter(Adapter):
         structured: Any = None
         cost = None
         dur = None
+        resolved_model: Optional[str] = None
         last_assistant_text = ""
 
         for obj in iter_jsonl(stdout):
             etype = obj.get("type")
 
             if etype == "system" and obj.get("subtype") == "init":
+                resolved_model = obj.get("model") or resolved_model
                 events.append(NormalizedEvent(EventKind.SESSION_START, raw=obj))
 
             elif etype == "assistant":
@@ -183,6 +185,7 @@ class ClaudeAdapter(Adapter):
                     final_text = result_text
                 cost = obj.get("total_cost_usd", cost)
                 dur = obj.get("duration_ms", dur)
+                resolved_model = obj.get("model") or resolved_model
                 # With --json-schema, the validated object is delivered in a
                 # dedicated `structured_output` field (the `result` string is
                 # just the assistant's closing text). Fall back to parsing the
@@ -212,4 +215,5 @@ class ClaudeAdapter(Adapter):
             structured_output=structured,
             cost_usd=cost,
             duration_ms=dur,
+            resolved_model=resolved_model,
         )

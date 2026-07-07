@@ -322,7 +322,16 @@ def extract_path(obj: Any) -> Optional[str]:
     return None
 
 
-_CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
+_CAMEL_BOUNDARY_1 = re.compile(r"(.)([A-Z][a-z]+)")
+_CAMEL_BOUNDARY_2 = re.compile(r"([a-z0-9])([A-Z])")
+
+
+def _camel_to_snake(name: str) -> str:
+    """``TargetFile`` -> ``target_file``, ``URLPath`` -> ``url_path`` (not ``u_r_l_path`` — a
+    naive "insert _ before every capital" rule mangles runs of capitals in an acronym; splitting
+    only at a lower/acronym-to-new-word boundary keeps the acronym intact as one segment)."""
+    s = _CAMEL_BOUNDARY_1.sub(r"\1_\2", name)
+    return _CAMEL_BOUNDARY_2.sub(r"\1_\2", s).lower()
 
 
 def snake_case_keys(obj: Any) -> Any:
@@ -331,4 +340,4 @@ def snake_case_keys(obj: Any) -> Any:
     ``extract_command``/``extract_path``'s key lists. Non-dicts pass through unchanged."""
     if not isinstance(obj, dict):
         return obj
-    return {_CAMEL_BOUNDARY.sub("_", k).lower(): v for k, v in obj.items()}
+    return {_camel_to_snake(k): v for k, v in obj.items()}

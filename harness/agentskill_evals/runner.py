@@ -131,13 +131,18 @@ class Runner:
                 results.append(self._run_cell(model, spec, cell_idx=i, total=len(cells)))
         else:
             with ThreadPoolExecutor(max_workers=self.jobs) as pool:
-                futs = {pool.submit(self._run_cell, m, s): (m, s) for m, s in cells}
-                for i, fut in enumerate(as_completed(futs), 1):
-                    r = fut.result()
-                    if self.progress:
-                        self.progress.done(cell=i, passed=r.passed if not r.ungraded else None,
-                                           cost=r.cost_str)
-                    results.append(r)
+                # Each future must carry its OWN cell_idx/total — without it, _run_cell defaults
+                # to cell_idx=0 for every parallel cell (all phase updates show "cell 0/...",
+                # indistinguishable), and `if p and cell_idx:` inside _run_cell_body is falsy for
+                # 0, so its own internal p.done() call never fires either. The (now removed) fix
+                # of calling p.done() here instead used as_completed()'s completion ORDER as the
+                # cell number, not the cell's actual identity.
+                futs = {
+                    pool.submit(self._run_cell, m, s, cell_idx=i, total=len(cells)): (m, s)
+                    for i, (m, s) in enumerate(cells, 1)
+                }
+                for fut in as_completed(futs):
+                    results.append(fut.result())
 
         results.sort(key=lambda c: (c.eval_name, c.model or ""))
         self._write_summary(results, specs)
@@ -150,15 +155,6 @@ class Runner:
 
     def _run_cell(self, model: Optional[str], spec: EvalSpec,
                   cell_idx: int = 0, total: int = 0) -> CellResult:
-        adapter = self.adapter
-        p = self.progress
-        model_label = model or "default"
-
-        def _phase(phase: str):
-            if p:
-                p.update(cell=cell_idx, phase=phase,
-                         eval_name=spec.name, model=model_label)
-
         cell_dir = os.path.join(
             self.run_dir, _model_seg(model),
             _safe(spec.skill_name or "_"), _safe(spec.name)
@@ -179,6 +175,51 @@ class Runner:
         if self.isolated:
             exec_ws = tempfile.mkdtemp(prefix="ase-ws-")
 
+        # A cell that raises (a buggy assertion, the judge choking on a malformed response, an
+        # OSError mid-move, ...) must not: (a) leak the exec_ws tempdir forever, or (b) abort
+        # every other cell in the batch — `run()` has no try/except of its own around this call,
+        # so this is the only backstop.
+        try:
+            return self._run_cell_body(model, spec, cell_idx, cell_dir, workspace, exec_ws)
+        except Exception as exc:
+            return self._failed_cell(model, spec, cell_idx, cell_dir, exec_ws, exc)
+        finally:
+            # A no-op on the success path: `shutil.move` already relocated exec_ws to `workspace`,
+            # so there's nothing left at the old path to remove.
+            if exec_ws != workspace and os.path.isdir(exec_ws):
+                shutil.rmtree(exec_ws, ignore_errors=True)
+
+    def _failed_cell(self, model: Optional[str], spec: EvalSpec, cell_idx: int,
+                     cell_dir: str, exec_ws: str, exc: Exception) -> CellResult:
+        """Best-effort CellResult for a cell that raised instead of completing normally — keeps
+        one broken eval from aborting the whole run() batch, and still records something on disk
+        (report.md/assertions.json) rather than leaving the cell's artifacts dir silently empty."""
+        print(f"warning: [{self.agent}] cell {spec.name!r} crashed: {exc}", file=sys.stderr)
+        rr = RunResult(agent=self.agent, eval_name=spec.name, prompt="", workdir=exec_ws,
+                       error=f"{type(exc).__name__}: {exc}")
+        cell = CellResult(agent=self.agent, model=model, eval_name=spec.name,
+                          skill=spec.skill_name, passed=False, run_result=rr,
+                          artifacts_dir=cell_dir)
+        try:
+            self._write_cell_json(cell_dir, cell)
+            _write(os.path.join(cell_dir, "report.md"), render_report(cell))
+        except Exception:
+            pass  # best-effort only — don't let artifact-writing mask the real error above
+        if self.progress and cell_idx:
+            self.progress.done(cell=cell_idx, passed=False, cost="")
+        return cell
+
+    def _run_cell_body(self, model: Optional[str], spec: EvalSpec, cell_idx: int,
+                       cell_dir: str, workspace: str, exec_ws: str) -> CellResult:
+        adapter = self.adapter
+        p = self.progress
+        model_label = model or "default"
+
+        def _phase(phase: str):
+            if p:
+                p.update(cell=cell_idx, phase=phase,
+                         eval_name=spec.name, model=model_label)
+
         # 1) provision skills + 2) seed files
         _phase("provisioning workspace")
         declared_dirs = self._skill_dirs(spec)
@@ -193,7 +234,10 @@ class Runner:
         #    vendor skills), not this repo's globally-installed skills.
         iso_home = None
         iso_env: dict[str, str] = {}
-        isolated = False
+        # Distinct from `self.isolated` (the run-level config flag, which also gates the exec_ws
+        # relocation above): this tracks whether THIS cell's HOME-overlay skill masking actually
+        # succeeded, which can independently fail (e.g. no symlink privileges) and fall back.
+        home_isolated = False
         if self.isolated and adapter.global_skills_subpaths:
             iso_home = tempfile.mkdtemp(prefix="ase-home-")
             seed_dirs = declared_dirs if self.provision else []
@@ -213,13 +257,20 @@ class Runner:
                         build_isolated_home(mirror, [skills_sub], self._repo_skill_names,
                                             seed_dirs, custom)
                         iso_env[var] = mirror
-                isolated = True
+                home_isolated = True
             except OSError as exc:
                 print(f"warning: [{self.agent}] skill isolation unavailable ({exc}); "
                       "running non-isolated.", file=sys.stderr)
                 shutil.rmtree(iso_home, ignore_errors=True)
                 iso_home = None
                 iso_env = {}
+            except Exception:
+                # Anything other than OSError building the isolated home must not leak the
+                # tempdir either — clean up, then re-raise so _run_cell's crash-safety wrapper
+                # records a failed cell instead of aborting the whole batch (it has no way to
+                # reach this function-local iso_home itself).
+                shutil.rmtree(iso_home, ignore_errors=True)
+                raise
 
         # 5) run
         _phase(f"running agent ({self.agent}/{model_label})")
@@ -248,12 +299,12 @@ class Runner:
         # still reach an undeclared skill some other way (e.g. searching the real disk by name).
         # Catch that from the trace so a leak is never silently reported as `isolated: true`.
         leaks: list[str] = []
-        if isolated:
+        if home_isolated:
             leaks = leaked_skill_reads(
                 rr, exec_ws, self.skills_root, self._repo_skill_names, set(spec.skills)
             )
             if leaks:
-                isolated = False
+                home_isolated = False
 
         # 6) artifacts. NOTE: rr.workdir (serialized into result.json below) still names the
         # ephemeral exec_ws tempdir, not its final `workspace` location — that's the directory
@@ -291,7 +342,7 @@ class Runner:
         cell = CellResult(
             agent=self.agent, model=model, eval_name=spec.name, skill=spec.skill_name,
             passed=passed, run_result=rr, assertions=checks, artifacts_dir=cell_dir,
-            isolated=isolated, ungraded=ungraded, isolation_leaks=leaks,
+            isolated=home_isolated, ungraded=ungraded, isolation_leaks=leaks,
         )
         self._write_cell_json(cell_dir, cell)
         _write(os.path.join(cell_dir, "report.md"), render_report(cell))
@@ -314,18 +365,21 @@ class Runner:
                 dirs.append(d)
         return dirs
 
-    def _seed_files(self, workspace: str, spec: EvalSpec) -> None:
+    def _seed_files(self, dest_dir: str, spec: EvalSpec) -> None:
+        """Seed `spec`'s fixture/files into `dest_dir` — named generically, not `workspace`,
+        since the caller passes whatever directory the agent will actually run in (`exec_ws`
+        under isolation), distinct from `_run_cell`'s own `workspace` variable."""
         fixture = spec.resolved_fixture()
         if fixture and os.path.isdir(fixture):
-            shutil.copytree(fixture, workspace, dirs_exist_ok=True)
+            shutil.copytree(fixture, dest_dir, dirs_exist_ok=True)
         for src, dest_rel in spec.resolved_files():
             if os.path.isfile(src):
-                dest = os.path.realpath(os.path.join(workspace, dest_rel))
-                if not dest.startswith(os.path.realpath(workspace) + os.sep):
+                dest = os.path.realpath(os.path.join(dest_dir, dest_rel))
+                if not dest.startswith(os.path.realpath(dest_dir) + os.sep):
                     print(f"warning: seed file {dest_rel!r} escapes workspace, skipping",
                           file=sys.stderr)
                     continue
-                os.makedirs(os.path.dirname(dest) or workspace, exist_ok=True)
+                os.makedirs(os.path.dirname(dest) or dest_dir, exist_ok=True)
                 shutil.copy2(src, dest)
 
     def _render_prompt(self, spec: EvalSpec) -> str:

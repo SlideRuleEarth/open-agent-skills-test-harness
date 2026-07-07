@@ -170,6 +170,22 @@ class CodexAdapter(Adapter):
                                 path=extract_path(item.get("arguments") or item),
                             )
                         )
+                    # Mirror command_execution: the TOOL_CALL is deduped by id (added once, on
+                    # whichever of started/completed arrives first), but its completion — success
+                    # or failure — must still be surfaced every time, or a failed MCP/tool call is
+                    # otherwise invisible (dropped silently once its id is already in `seen`).
+                    if etype == "item.completed":
+                        is_err = bool(item.get("error")) or item.get("status") in (
+                            "failed", "error")
+                        result_text = item.get("result") or item.get("output") or item.get("error")
+                        events.append(
+                            NormalizedEvent(
+                                EventKind.TOOL_RESULT,
+                                raw=item,
+                                text=str(result_text) if result_text else "",
+                                is_error=is_err,
+                            )
+                        )
                 continue
 
             if etype == "turn.completed":
