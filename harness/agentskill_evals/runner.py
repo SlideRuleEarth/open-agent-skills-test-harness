@@ -51,6 +51,7 @@ class CellResult:
     isolated: bool = False
     ungraded: bool = False
     isolation_leaks: list[str] = field(default_factory=list)
+    scenario_path: Optional[str] = None
 
     @property
     def n_pass(self) -> int:
@@ -199,7 +200,8 @@ class Runner:
                        error=f"{type(exc).__name__}: {exc}")
         cell = CellResult(agent=self.agent, model=model, eval_name=spec.name,
                           skill=spec.skill_name, passed=False, run_result=rr,
-                          artifacts_dir=cell_dir)
+                          artifacts_dir=cell_dir,
+                          scenario_path=getattr(spec, "source_path", None))
         try:
             self._write_cell_json(cell_dir, cell)
             _write(os.path.join(cell_dir, "report.md"), render_report(cell))
@@ -343,6 +345,7 @@ class Runner:
             agent=self.agent, model=model, eval_name=spec.name, skill=spec.skill_name,
             passed=passed, run_result=rr, assertions=checks, artifacts_dir=cell_dir,
             isolated=home_isolated, ungraded=ungraded, isolation_leaks=leaks,
+            scenario_path=getattr(spec, "source_path", None),
         )
         self._write_cell_json(cell_dir, cell)
         _write(os.path.join(cell_dir, "report.md"), render_report(cell))
@@ -651,6 +654,10 @@ def render_report(cell: CellResult) -> str:
     out.append(f"- **verdict:** {_cell_mark(cell)}")
     if cell.skill:
         out.append(f"- **skill(s):** {cell.skill}")
+    if cell.scenario_path:
+        # The `name:` inside the file is free text and can drift from the filename — the
+        # full path is the one unambiguous pointer back to exactly what was run.
+        out.append(f"- **source:** `{cell.scenario_path}`")
     meta = []
     if rr.cost_str:
         meta.append(f"cost {rr.cost_str}")
@@ -718,6 +725,7 @@ def render_report(cell: CellResult) -> str:
 # ---------------------------------------------------------------------------
 # small fs helpers
 # ---------------------------------------------------------------------------
+
 
 def _safe(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
