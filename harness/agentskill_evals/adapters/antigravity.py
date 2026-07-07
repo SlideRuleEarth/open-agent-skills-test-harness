@@ -226,6 +226,11 @@ def _parse_generic_events(objs: list[dict], skills_subdir: str = "") -> ParseOut
 
         if "init" in etype or "start" in etype or "session" in etype:
             events.append(NormalizedEvent(EventKind.SESSION_START, raw=obj))
+        elif "error" in etype:
+            events.append(
+                NormalizedEvent(EventKind.ERROR, raw=obj,
+                                text=text if isinstance(text, str) else str(obj), is_error=True)
+            )
         elif "tool" in etype and "result" in etype:
             events.append(NormalizedEvent(EventKind.TOOL_RESULT, raw=obj))
         elif "tool" in etype or name:

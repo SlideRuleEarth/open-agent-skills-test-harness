@@ -34,10 +34,26 @@ CODEX = """\
 {"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":20}}
 """
 
+# Covers branches CODEX above never exercises: an mcp_tool_call's completion (success is silently
+# dropped once its id is deduped — this must still surface a TOOL_RESULT, error or not), a
+# `reasoning` item, a top-level `error` event, and file_change's dict-form `changes` / single
+# `path` fallback shapes (_codex_changed_paths).
+CODEX_EXTRA = """\
+{"type":"thread.started","thread_id":"th2"}
+{"type":"item.started","item":{"id":"m1","type":"mcp_tool_call","tool":"search","server":"web"}}
+{"type":"item.completed","item":{"id":"m1","type":"mcp_tool_call","tool":"search","server":"web","error":"timeout"}}
+{"type":"item.completed","item":{"id":"r1","type":"reasoning","text":"thinking about the plan"}}
+{"type":"error","message":"a transient network error"}
+{"type":"item.completed","item":{"id":"f1","type":"file_change","changes":{"a.txt":{},"b.txt":{}}}}
+{"type":"item.completed","item":{"id":"f2","type":"file_change","path":"single.txt"}}
+{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":5}}
+"""
+
 ANTIGRAVITY_STREAM = """\
 {"type":"session.start","id":"a1"}
 {"type":"tool_use","tool":"shell","args":{"command":"npm install"}}
 {"type":"tool_result","tool":"shell"}
+{"type":"error","message":"a transient error"}
 {"type":"tool_use","tool":"skill","args":{"skill":"sliderule-api"}}
 {"type":"result","text":"Done building demo-app."}
 """
@@ -387,7 +403,7 @@ def _check_path_resolution(failures, verbose):
         abs_out = os.path.join(outside, "evil.md")
         open(abs_out, "w").close()
         out = writes_outside_workspace(_rr([abs_out]), ws)
-        _check("paths.abs_outside_surfaced", out == [os.path.abspath(abs_out)],
+        _check("paths.abs_outside_surfaced", out == [os.path.realpath(abs_out)],
                f"absolute outside write surfaced (got {out})", failures, verbose)
 
         # 5. relative symlink trace path that escapes workspace is blocked
@@ -422,9 +438,46 @@ def _check_path_resolution(failures, verbose):
                path is not None and where == "write-trace",
                f"normal inside trace passes (got {path}, {where})",
                failures, verbose)
+
+        # 9. writes_outside_workspace must resolve the same `ws/link -> outside` symlink from
+        #    case 5/6: a bare abspath check sees `link/secret.txt` as textually inside ws and
+        #    would miss that the write really landed outside.
+        out = writes_outside_workspace(_rr(["link/secret.txt"]), ws)
+        _check("paths.symlink_write_surfaced_as_outside",
+               out == [os.path.realpath(secret)],
+               f"write through a workspace-internal symlink is surfaced as outside (got {out})",
+               failures, verbose)
     finally:
         shutil.rmtree(ws, ignore_errors=True)
         shutil.rmtree(outside, ignore_errors=True)
+
+
+def _check_workspace_view_skill_dir_match(failures, verbose):
+    """file_tree/inline_files must exclude the provisioned skill dirs (.claude/.agents/etc.) by
+    path SEGMENT, not bare string prefix — a real top-level dir the model creates named e.g.
+    `.codexnotes` must not be swallowed just because it starts with `.codex`."""
+    import os
+    import shutil
+    import tempfile
+
+    from .workspace_view import file_tree
+
+    print("workspace_view skill-dir matching:")
+    ws = tempfile.mkdtemp(prefix="ase-skilldir-")
+    try:
+        os.makedirs(os.path.join(ws, ".codex"))
+        open(os.path.join(ws, ".codex", "SKILL.md"), "w").close()
+        os.makedirs(os.path.join(ws, ".codexnotes"))
+        open(os.path.join(ws, ".codexnotes", "real_output.txt"), "w").close()
+
+        tree = file_tree(ws)
+        _check("workspace_view.lookalike_dir_kept", "real_output.txt" in tree,
+               f"a real dir merely PREFIXED by a skill-dir name is not swallowed: {tree!r}",
+               failures, verbose)
+        _check("workspace_view.real_skill_dir_excluded", "SKILL.md" not in tree,
+               f"the actual provisioned skill dir is still excluded: {tree!r}", failures, verbose)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
 
 
 def _check_leaked_skill_reads(failures, verbose):
@@ -472,7 +525,7 @@ def _check_leaked_skill_reads(failures, verbose):
         leak_path = os.path.join(repo_root, "sliderule-api", "SKILL.md")
         rr = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="view_file", path=leak_path)])
         leaks = leaked_skill_reads(rr, workspace, repo_root, repo_skill_names, declared_names=set())
-        _check("leak.undeclared_skill_read_detected", leaks == [os.path.abspath(leak_path)],
+        _check("leak.undeclared_skill_read_detected", leaks == [os.path.realpath(leak_path)],
                f"undeclared skill read via real repo path is caught: {leaks}", failures, verbose)
 
         # 2. a read of a DECLARED skill's real path is not a leak (it's expected the model was
@@ -499,7 +552,7 @@ def _check_leaked_skill_reads(failures, verbose):
         cmd = f"conda run -n env python {script} applies-to atl06x"
         rr4 = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="run_command", command=cmd)])
         leaks4 = leaked_skill_reads(rr4, workspace, repo_root, repo_skill_names, declared_names=set())
-        _check("leak.command_reference_detected", leaks4 == [os.path.abspath(script)],
+        _check("leak.command_reference_detected", leaks4 == [os.path.realpath(script)],
                f"undeclared skill script referenced in a command is caught: {leaks4}",
                failures, verbose)
 
@@ -509,6 +562,19 @@ def _check_leaked_skill_reads(failures, verbose):
                                     declared_names=repo_skill_names)
         _check("leak.all_declared_short_circuits", leaks5 == [],
                f"nothing to leak once every repo skill is declared: {leaks5}", failures, verbose)
+
+        # 6. a symlink planted inside the workspace pointing at an undeclared skill IS caught —
+        #    a bare abspath check sees `workspace/evil/SKILL.md` as textually "inside" and would
+        #    miss it entirely; realpath resolution follows it to the real, undeclared target.
+        evil_link = os.path.join(workspace, "evil")
+        os.symlink(os.path.join(repo_root, "sliderule-api"), evil_link)
+        rr6 = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="view_file",
+                                   path=os.path.join(evil_link, "SKILL.md"))])
+        leaks6 = leaked_skill_reads(rr6, workspace, repo_root, repo_skill_names, declared_names=set())
+        _check("leak.symlink_escape_detected",
+               leaks6 == [os.path.realpath(os.path.join(repo_root, "sliderule-api", "SKILL.md"))],
+               f"symlink from inside workspace to an undeclared skill is caught: {leaks6}",
+               failures, verbose)
     finally:
         shutil.rmtree(repo_root, ignore_errors=True)
 
@@ -589,6 +655,297 @@ def _check_workspace_relocation(failures, verbose):
         shutil.rmtree(repo_root, ignore_errors=True)
 
 
+def _check_cell_crash_safety(failures, verbose):
+    """A cell that raises mid-run (a network blip inside execute(), a buggy assertion, ...) must
+    not propagate out of _run_cell: run() has no try/except of its own around the call, so an
+    uncaught exception here would abort every OTHER cell in the batch too. _run_cell must catch
+    it, still write SOME artifacts (report.md/assertions.json) recording the failure, and clean
+    up the exec_ws tempdir rather than leaking it."""
+    import os
+    import shutil
+    import tempfile
+
+    import agentskill_evals.runner as runner_mod
+    from .spec import EvalSpec
+
+    print("cell crash safety:")
+    repo_root = tempfile.mkdtemp(prefix="ase-repo3-")
+    seen: dict = {}
+    orig_execute = runner_mod.execute
+
+    def _crashing_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides, agent_name, eval_name):
+        seen["cwd"] = cwd
+        raise RuntimeError("simulated mid-run crash")
+
+    runner_mod.execute = _crashing_execute
+    try:
+        run_dir = os.path.join(repo_root, "artifacts", "run1")
+        os.makedirs(run_dir)
+        r = runner_mod.Runner.__new__(runner_mod.Runner)
+        r.agent, r.adapter, r.models = "fake", _FakeAdapter(), [None]
+        r.artifacts_root = os.path.join(repo_root, "artifacts")
+        r.run_id, r.skills_root, r.judge = "run1", repo_root, None
+        r.provision, r.command, r.auto_approve = False, "", True
+        r.jobs, r.isolated, r.progress = 1, True, None
+        r._repo_skill_names, r.run_dir = set(), run_dir
+
+        spec = EvalSpec(name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"))
+        cell = None
+        raised = False
+        try:
+            cell = r._run_cell(None, spec)
+        except Exception:
+            raised = True
+
+        _check("crash.no_exception_propagates", not raised and cell is not None,
+               "a raising cell returns a CellResult instead of propagating", failures, verbose)
+        if cell is not None:
+            _check("crash.marked_failed", cell.passed is False,
+                   f"crashed cell is recorded as failed (passed={cell.passed})",
+                   failures, verbose)
+            _check("crash.error_recorded", "simulated mid-run crash" in (cell.run_result.error or ""),
+                   f"the exception message is preserved: {cell.run_result.error!r}",
+                   failures, verbose)
+            report_path = os.path.join(cell.artifacts_dir, "report.md")
+            _check("crash.report_written", os.path.isfile(report_path),
+                   "report.md is still written for a crashed cell", failures, verbose)
+        cwd_used = seen.get("cwd")
+        _check("crash.exec_ws_cleaned_up",
+               cwd_used is not None and not os.path.isdir(cwd_used),
+               f"exec_ws tempdir is removed even though the cell crashed (got {cwd_used})",
+               failures, verbose)
+    finally:
+        runner_mod.execute = orig_execute
+        shutil.rmtree(repo_root, ignore_errors=True)
+
+
+def _check_progress_thread_safety(failures, verbose):
+    """Under --jobs>1, every worker thread shares one Progress instance. Before the fix, update()
+    mutated shared state under a lock but then printed OUTSIDE it — another thread's update()
+    could interleave between "mutate" and "print", producing a torn line combining one thread's
+    cell number with another's phase/label. Drives many concurrent update() calls from several
+    threads and checks every printed line is internally coherent."""
+    import io
+    import re
+    import threading
+
+    from .progress import Progress
+
+    print("progress thread safety:")
+    buf = io.StringIO()
+    p = Progress(total_cells=4, file=buf)
+
+    def worker(n):
+        for _ in range(50):
+            p.update(cell=n, phase=f"phase-{n}", eval_name=f"eval-{n}", model=f"model-{n}")
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(1, 5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    torn = []
+    for ln in lines:
+        m = re.search(r"cell (\d+)/4", ln)
+        if not m:
+            continue
+        this_n = m.group(1)
+        for other in "1234":
+            if other == this_n:
+                continue
+            if f"phase-{other}" in ln or f"eval-{other}" in ln or f"model-{other}" in ln:
+                torn.append(ln)
+    _check("progress.thread_safety_no_torn_lines", not torn and len(lines) > 0,
+           f"no printed line mixes one cell's number with another cell's phase/label "
+           f"({len(lines)} lines checked, torn={torn[:3]})", failures, verbose)
+
+
+def _check_cli_helpers(failures, verbose):
+    """Pure cli.py helpers, testable without any agent CLI or PyYAML: the yaml.YAMLError
+    detection that gives malformed-YAML scenario/eval loads a clean error instead of a raw
+    traceback, the --model/--all-models conflict warning, and _load_models_config's structural
+    validation (duplicate model / missing default warnings). cli.py otherwise has zero selftest
+    coverage — these are the pieces cheap to exercise without driving the full CLI."""
+    import contextlib
+    import io
+    import os
+    import tempfile
+
+    from .cli import ModelsConfig, _is_yaml_error, _load_models_config, _resolve_models
+
+    print("cli.py helpers:")
+
+    _check("cli.is_yaml_error.plain_exception_false",
+           _is_yaml_error(ValueError("not a yaml error")) is False,
+           "an ordinary exception is not mistaken for a YAML error", failures, verbose)
+    try:
+        import yaml  # type: ignore
+        has_yaml = True
+    except ModuleNotFoundError:
+        has_yaml = False
+    if has_yaml:
+        try:
+            yaml.safe_load("key: [unterminated")
+        except yaml.YAMLError as exc:
+            _check("cli.is_yaml_error.real_yaml_error", _is_yaml_error(exc),
+                   "a real yaml.YAMLError is recognized", failures, verbose)
+        else:
+            _check("cli.is_yaml_error.real_yaml_error", False,
+                   "expected malformed YAML to raise", failures, verbose)
+    elif verbose:
+        print("  [skipped — PyYAML not installed] cli.is_yaml_error.real_yaml_error")
+
+    # --model + --all-models: --model wins, and a warning is printed (not silently dropped)
+    cfg = ModelsConfig({"claude": ["a", "b"]}, {"claude": "a"}, {}, [])
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        models = _resolve_models("claude", ["explicit"], cfg, all_models=True)
+    _check("cli.resolve_models.explicit_wins", models == ["explicit"],
+           f"--model wins over --all-models: {models}", failures, verbose)
+    _check("cli.resolve_models.conflict_warned", "ignored" in buf.getvalue(),
+           f"a warning is printed instead of silently dropping --all-models: {buf.getvalue()!r}",
+           failures, verbose)
+
+    # _load_models_config: duplicate model + missing default warnings (JSON, so no PyYAML needed)
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    try:
+        tmp.write('{"agents": {"claude": {"models": ["a", "a"]}}}')
+        tmp.close()
+        mc = _load_models_config(tmp.name)
+        _check("cli.load_models_config.duplicate_warned",
+               any("more than once" in w for w in mc.warnings),
+               f"duplicate model listing warns: {mc.warnings}", failures, verbose)
+        _check("cli.load_models_config.no_default_warned",
+               any("no `default:`" in w for w in mc.warnings),
+               f"missing default warns: {mc.warnings}", failures, verbose)
+    finally:
+        os.unlink(tmp.name)
+
+
+def _check_assertion_pass_fail(failures, verbose):
+    """Real pass/fail coverage for every deterministic assertion type via run_assertion() — not
+    just "is this cfg structurally valid" (spec validation already covers that), but "does the
+    function actually pass on a matching run and fail on a non-matching one." Before this, only
+    llm_judge was exercised through run_assertion(); a regression flipping e.g.
+    skill_not_triggered's `if not hits` to `if hits`, or breaking tool_count's bounds check, would
+    have passed every existing selftest."""
+    import os
+    import shutil
+    import tempfile
+
+    from .assertions import AssertionContext, run_assertion
+    from .schema import EventKind, NormalizedEvent, RunResult
+    from .spec import EvalSpec
+
+    print("assertion pass/fail:")
+    ws = tempfile.mkdtemp(prefix="ase-assertions-")
+    try:
+        with open(os.path.join(ws, "run.py"), "w") as f:
+            f.write("print('hello')\n")
+        os.makedirs(os.path.join(ws, "subdir"))
+
+        events = [
+            NormalizedEvent(EventKind.TOOL_CALL, tool_name="Bash", command="python run.py"),
+            NormalizedEvent(EventKind.TOOL_CALL, tool_name="Read",
+                            path=".claude/skills/sliderule-api/references/foo.md"),
+            NormalizedEvent(EventKind.TOOL_CALL, tool_name="Bash",
+                            path=".claude/skills/sliderule-api/scripts/bar.py"),
+        ]
+        rr = RunResult(agent="x", eval_name="e", prompt="", workdir=ws, events=events,
+                       exit_code=0, final_text="Done, printed hello",
+                       structured_output={"ok": True})
+        spec = EvalSpec(name="t", prompt="p", source_path="/x.yaml", skills=["sliderule-api"])
+        ctx = AssertionContext(spec=spec, skills_subdir=".claude/skills")
+
+        def _pf(cfg, expect_pass, label):
+            ar = run_assertion(cfg, rr, ws, spec, ctx)
+            _check(f"assertion.{label}", ar.passed is expect_pass,
+                   f"{cfg} -> passed={ar.passed} (want {expect_pass}): {ar.message}",
+                   failures, verbose)
+
+        _pf({"type": "file_exists", "path": "run.py"}, True, "file_exists.pass")
+        _pf({"type": "file_exists", "path": "missing.txt"}, False, "file_exists.fail")
+
+        _pf({"type": "file_absent", "path": "missing.txt"}, True, "file_absent.pass")
+        _pf({"type": "file_absent", "path": "run.py"}, False, "file_absent.fail")
+
+        _pf({"type": "dir_exists", "path": "subdir"}, True, "dir_exists.pass")
+        _pf({"type": "dir_exists", "path": "no_such_dir"}, False, "dir_exists.fail")
+
+        _pf({"type": "ran_command", "contains": "python run.py"}, True, "ran_command.pass")
+        _pf({"type": "ran_command", "contains": "totally different command"}, False,
+            "ran_command.fail")
+
+        _pf({"type": "used_tool", "name": "Bash"}, True, "used_tool.pass")
+        _pf({"type": "used_tool", "name": "Nonexistent"}, False, "used_tool.fail")
+
+        _pf({"type": "tool_count", "min": 0, "max": 10}, True, "tool_count.pass")
+        _pf({"type": "tool_count", "min": 100}, False, "tool_count.fail")
+
+        _pf({"type": "skill_triggered", "skill": "sliderule-api"}, True, "skill_triggered.pass")
+        _pf({"type": "skill_triggered", "skill": "sliderule-other"}, False,
+            "skill_triggered.fail")
+
+        _pf({"type": "skill_not_triggered", "skill": "sliderule-other"}, True,
+            "skill_not_triggered.pass")
+        _pf({"type": "skill_not_triggered", "skill": "sliderule-api"}, False,
+            "skill_not_triggered.fail")
+
+        _pf({"type": "skill_reference_read", "skill": "sliderule-api"}, True,
+            "skill_reference_read.pass")
+        _pf({"type": "skill_reference_read", "skill": "sliderule-other"}, False,
+            "skill_reference_read.fail")
+
+        _pf({"type": "skill_reference_not_read", "skill": "sliderule-other"}, True,
+            "skill_reference_not_read.pass")
+        _pf({"type": "skill_reference_not_read", "skill": "sliderule-api"}, False,
+            "skill_reference_not_read.fail")
+
+        _pf({"type": "skill_script_executed", "skill": "sliderule-api"}, True,
+            "skill_script_executed.pass")
+        _pf({"type": "skill_script_executed", "skill": "sliderule-other"}, False,
+            "skill_script_executed.fail")
+
+        _pf({"type": "skill_script_not_executed", "skill": "sliderule-other"}, True,
+            "skill_script_not_executed.pass")
+        _pf({"type": "skill_script_not_executed", "skill": "sliderule-api"}, False,
+            "skill_script_not_executed.fail")
+
+        _pf({"type": "exit_code", "equals": 0}, True, "exit_code.pass")
+        _pf({"type": "exit_code", "equals": 1}, False, "exit_code.fail")
+
+        _pf({"type": "no_error"}, True, "no_error.pass")
+        rr_err = RunResult(agent="x", eval_name="e", prompt="", workdir=ws, events=[],
+                           exit_code=1, error="boom")
+        ar_err = run_assertion({"type": "no_error"}, rr_err, ws, spec, ctx)
+        _check("assertion.no_error.fail", ar_err.passed is False,
+               f"no_error fails on a run with an error: {ar_err.message}", failures, verbose)
+
+        _pf({"type": "final_contains", "contains": "hello"}, True, "final_contains.pass")
+        _pf({"type": "final_contains", "contains": "goodbye"}, False, "final_contains.fail")
+
+        _pf({"type": "output_matches_schema",
+            "schema": {"type": "object", "required": ["ok"]}}, True,
+            "output_matches_schema.pass")
+        _pf({"type": "output_matches_schema",
+            "schema": {"type": "object", "required": ["nonexistent_field"]}}, False,
+            "output_matches_schema.fail")
+
+        # _escapes_workspace guard: file_exists/file_absent/dir_exists must reject a path that
+        # normalizes outside the workspace, not crash or (worse) silently check the real
+        # filesystem at that absolute location.
+        for atype in ("file_exists", "file_absent", "dir_exists"):
+            ar = run_assertion({"type": atype, "path": "../../etc/passwd"}, rr, ws, spec, ctx)
+            _check(f"assertion.{atype}.escapes_workspace_rejected",
+                   ar.passed is False and "escapes workspace" in ar.message,
+                   f"{atype} rejects a path escaping the workspace: {ar.message}",
+                   failures, verbose)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
 def _check_verdict_coercion(failures, verbose):
     """Top-level and per-item verdict 'pass' coercion edge cases."""
     from .assertions import AssertionContext, run_assertion
@@ -599,24 +956,27 @@ def _check_verdict_coercion(failures, verbose):
 
     rr = RunResult(agent="x", eval_name="e", prompt="", workdir="/tmp")
 
-    # "pass": "false" at item level must be False
-    v1 = _coerce_verdict(rr, ["a"])
-    v1["items"] = [{"behavior": "a", "pass": "false", "reason": "r"}]
-    from .judge import _coerce_verdict as _cv
-    coerced = {"items": [{"behavior": "a", "pass": "false", "reason": "r"}], "summary": "s"}
-    for it in coerced["items"]:
-        v = it.get("pass")
-        it["pass"] = v is True or (isinstance(v, str) and v.lower() == "true")
-    _check("verdict.item_false_str", coerced["items"][0]["pass"] is False,
-           "item 'pass': 'false' coerced to False", failures, verbose)
+    # "pass": "false" at item level must be coerced to False — by the REAL _coerce_verdict, fed
+    # through its actual final_text -> JSON -> per-item coercion path (not a hand-duplicated
+    # snippet re-run on a literal, which would still pass even if _coerce_verdict itself broke).
+    rr_false = RunResult(
+        agent="x", eval_name="e", prompt="", workdir="/tmp",
+        final_text='{"items": [{"behavior": "a", "pass": "false", "reason": "r"}], "summary": "s"}',
+    )
+    v1 = _coerce_verdict(rr_false, ["a"])
+    _check("verdict.item_false_str", v1["items"][0]["pass"] is False,
+           f"item 'pass': 'false' coerced to False by the real _coerce_verdict: {v1}",
+           failures, verbose)
 
-    # "pass": "true" at item level must be True
-    coerced2 = {"items": [{"behavior": "a", "pass": "true", "reason": "r"}]}
-    for it in coerced2["items"]:
-        v = it.get("pass")
-        it["pass"] = v is True or (isinstance(v, str) and v.lower() == "true")
-    _check("verdict.item_true_str", coerced2["items"][0]["pass"] is True,
-           "item 'pass': 'true' coerced to True", failures, verbose)
+    # "pass": "true" at item level must be coerced to True, likewise through the real function.
+    rr_true = RunResult(
+        agent="x", eval_name="e", prompt="", workdir="/tmp",
+        final_text='{"items": [{"behavior": "a", "pass": "true", "reason": "r"}], "summary": "s"}',
+    )
+    v2 = _coerce_verdict(rr_true, ["a"])
+    _check("verdict.item_true_str", v2["items"][0]["pass"] is True,
+           f"item 'pass': 'true' coerced to True by the real _coerce_verdict: {v2}",
+           failures, verbose)
 
     # top-level {"items": [], "pass": "false"} must fail
     def _fake_judge(**kw):
@@ -632,6 +992,23 @@ def _check_verdict_coercion(failures, verbose):
     _check("verdict.toplevel_false_str", ar.passed is False,
            f"top-level 'pass': 'false' must fail (got passed={ar.passed})",
            failures, verbose)
+
+    # top-level {"items": [], "pass": "true"} with a REAL rubric must NOT bypass real scoring —
+    # a judge that ignores the "one entry per rubric item" instruction and returns zero items
+    # scored zero of the rubric; a bare top-level 'pass': true must not override that into a pass.
+    def _fake_judge_bypass(**kw):
+        from dataclasses import dataclass
+        @dataclass
+        class FakeJR:
+            verdict: dict
+        return FakeJR(verdict={"items": [], "pass": "true", "summary": "judge ignored the rubric"})
+
+    ctx_bypass = AssertionContext(spec=spec, judge=_fake_judge_bypass)
+    ar_bypass = run_assertion({"type": "llm_judge", "rubric": ["a", "b", "c"]}, rr, "/tmp",
+                              spec, ctx_bypass)
+    _check("verdict.toplevel_true_no_bypass", ar_bypass.passed is False,
+           f"bare top-level 'pass': true must not bypass zero-item scoring against a real "
+           f"rubric (got passed={ar_bypass.passed})", failures, verbose)
 
     # extra judge items beyond rubric length must not inflate score
     def _fake_judge_extra(**kw):
@@ -656,6 +1033,23 @@ def _check_verdict_coercion(failures, verbose):
     ar2 = run_assertion({"type": "llm_judge", "rubric": ["a", "b", "c"]}, rr, "/tmp", spec3, ctx2)
     _check("verdict.extra_items_no_inflate", ar2.passed is False,
            f"3 failed + 3 extra passing must not pass a 3-item rubric (got passed={ar2.passed})",
+           failures, verbose)
+
+
+def _check_snake_case_keys(failures, verbose):
+    """A naive "insert _ before every capital" rule mangles acronyms (`URLPath` -> `u_r_l_path`),
+    which would silently fail to match extract_command/extract_path's key lists for any future
+    acronym-bearing tool-arg key. Pure — no CLIs."""
+    from .adapters.base import snake_case_keys
+
+    print("snake_case_keys:")
+    out = snake_case_keys({"TargetFile": "a", "CommandLine": "b", "URLPath": "c", "APIKey": "d"})
+    _check("snake_case.plain_pascal",
+           out.get("target_file") == "a" and out.get("command_line") == "b",
+           f"ordinary PascalCase keys unaffected: {out}", failures, verbose)
+    _check("snake_case.acronym_not_mangled",
+           out.get("url_path") == "c" and out.get("api_key") == "d",
+           f"acronym-bearing keys keep the acronym as one segment (not u_r_l_path): {out}",
            failures, verbose)
 
 
@@ -779,6 +1173,9 @@ def run_selftest(verbose: bool = False) -> int:
            f"structured={out.structured_output}", failures, verbose)
     _check("claude.final", out.final_text == "Done. Created the app.", repr(out.final_text), failures, verbose)
     _check("claude.cost", out.cost_usd == 0.0123, f"cost={out.cost_usd}", failures, verbose)
+    _check("claude.resolved_model", out.resolved_model == "claude",
+           f"resolved_model captured from the system/init event: {out.resolved_model!r}",
+           failures, verbose)
 
     # Codex
     print("codex adapter:")
@@ -796,11 +1193,21 @@ def run_selftest(verbose: bool = False) -> int:
            and "--full-auto" not in cargv and cargv[-1] == "do the task",
            f"non-interactive approval+sandbox before exec, prompt last: {cargv}", failures, verbose)
     sf = EvalSpec(name="t", prompt="p", source_path="/r/skill/evals/e.yaml",
-                  files=["a.json", "fixtures/in.json", {"x/a.json": "data/a.json"}, "../esc.json"])
+                  files=["a.json", "fixtures/in.json", {"x/a.json": "data/a.json"},
+                         "../esc.json",
+                         # deeper traversal in the identity (bare string) form
+                         "../../deep/etc/passwd",
+                         # the {src: dest} MAPPING form with a malicious dest — the realistic
+                         # attack surface, since `dest` is the field spec.py's guard actually
+                         # checks (resolved_files docstring); falls back to the SOURCE's own
+                         # basename, not the malicious dest's basename
+                         {"b.json": "../../etc/shadow"}])
     dests = [d for _, d in sf.resolved_files()]
     _check("spec.resolved_files",
-           dests == ["a.json", "fixtures/in.json", "data/a.json", "esc.json"],
-           f"seed dests (subdirs kept, traversal guarded): {dests}", failures, verbose)
+           dests == ["a.json", "fixtures/in.json", "data/a.json", "esc.json",
+                     "passwd", "b.json"],
+           f"seed dests (subdirs kept, traversal guarded — identity AND mapping forms, "
+           f"shallow AND deep): {dests}", failures, verbose)
     e1 = get_adapter("codex").env({"CODEX_HOME": "/real", "HOME": "/old"}, RunOptions(home="/iso"))
     _check("codex.iso_env.clear",
            e1.get("HOME") == "/iso" and "CODEX_HOME" not in e1,
@@ -811,6 +1218,27 @@ def run_selftest(verbose: bool = False) -> int:
     _check("codex.iso_env.repoint",
            e2.get("CODEX_HOME") == "/iso/_cfg/CODEX_HOME",
            f"mirrored config-home repointed: {e2}", failures, verbose)
+
+    out_extra = get_adapter("codex").parse(CODEX_EXTRA, "", 0)
+    tool_results = [e for e in out_extra.events if e.kind == EventKind.TOOL_RESULT]
+    _check("codex.mcp_tool_call_completion_surfaced",
+           any(e.is_error for e in tool_results),
+           f"a failed mcp_tool_call's completion is surfaced as an error TOOL_RESULT, not "
+           f"silently dropped once its id is deduped: {tool_results}", failures, verbose)
+    reasoning = [e.text for e in out_extra.events if e.kind == EventKind.REASONING]
+    _check("codex.reasoning_item", "thinking about the plan" in reasoning,
+           f"a `reasoning` item is surfaced: {reasoning}", failures, verbose)
+    errors = [e for e in out_extra.events if e.kind == EventKind.ERROR]
+    _check("codex.error_event", len(errors) == 1 and errors[0].is_error,
+           f"a top-level `error` event is surfaced: {errors}", failures, verbose)
+    extra_paths = [e.path for e in out_extra.events if e.path]
+    _check("codex.file_change_dict_form",
+           "a.txt" in extra_paths and "b.txt" in extra_paths,
+           f"file_change dict-form `changes` keys are extracted: {extra_paths}",
+           failures, verbose)
+    _check("codex.file_change_single_path", "single.txt" in extra_paths,
+           f"file_change single `path` fallback is extracted: {extra_paths}",
+           failures, verbose)
 
     # Copilot
     print("copilot adapter:")
@@ -851,6 +1279,23 @@ def run_selftest(verbose: bool = False) -> int:
            not get_adapter("copilot").supports_output_schema,
            "copilot has no native output schema support", failures, verbose)
 
+    # A _FILE_TOOLS write must be counted ONCE by file_paths_touched(), not twice — Copilot
+    # emits both a TOOL_CALL and a FILE_CHANGE for the same write, and file_paths_touched() reads
+    # paths from both kinds.
+    copilot_write = (
+        '{"type":"assistant.message","data":{"model":"claude-sonnet-4.6","content":"writing",'
+        '"toolRequests":[{"toolCallId":"tc1","name":"write","arguments":{"path":"out.txt"}}]}}\n'
+        '{"type":"error","data":{"message":"rate limited"}}\n'
+    )
+    out_ft = get_adapter("copilot").parse(copilot_write, "", 0)
+    ft_rr = _RR(agent="copilot", eval_name="e", prompt="", workdir="/tmp", events=out_ft.events)
+    touched = ft_rr.file_paths_touched()
+    _check("copilot.file_tool_not_double_counted", touched.count("out.txt") == 1,
+           f"a file-tool write is counted once, not twice: {touched}", failures, verbose)
+    ft_errors = [e for e in out_ft.events if e.kind == EventKind.ERROR]
+    _check("copilot.error_event", len(ft_errors) == 1 and ft_errors[0].is_error,
+           f"an `error` event is surfaced: {ft_errors}", failures, verbose)
+
     # AntiGravity (3 shapes)
     print("antigravity adapter:")
     out = get_adapter("antigravity").parse(ANTIGRAVITY_STREAM, "", 0)
@@ -861,6 +1306,18 @@ def run_selftest(verbose: bool = False) -> int:
     _check("antigravity.skill_path",
            skill_paths == [".antigravity/skills/sliderule-api/SKILL.md"],
            f"skill tool call extracts skill path: {skill_paths}", failures, verbose)
+    stream_errors = [e for e in out.events if e.kind == EventKind.ERROR]
+    _check("antigravity.stream.error_event", len(stream_errors) == 1 and stream_errors[0].is_error,
+           f"generic-fallback parser surfaces an `error` event, not OTHER: {stream_errors}",
+           failures, verbose)
+
+    from .adapters.antigravity import _display_to_model_id
+    _check("antigravity.display_to_model_id.tiered",
+           _display_to_model_id("Gemini 3.5 Flash (Medium)") == "gemini-3.5-flash-medium",
+           "tiered display name maps to a hyphenated id", failures, verbose)
+    _check("antigravity.display_to_model_id.plain",
+           _display_to_model_id("Gemini 3.5 Pro") == "gemini-3.5-pro",
+           "untiered display name maps to a hyphenated id", failures, verbose)
 
     out = get_adapter("antigravity").parse(ANTIGRAVITY_JSON, "", 0)
     _check("antigravity.json.final", out.final_text == "All done.", repr(out.final_text), failures, verbose)
@@ -1015,6 +1472,25 @@ def run_selftest(verbose: bool = False) -> int:
     _check("validate.tool_count_range", not vr_tc.ok and "impossible" in vr_tc.errors[0],
            f"error for tool_count range: {vr_tc.errors}", failures, verbose)
 
+    # error: tool_count with a non-integer min/max must be a clean validation error, not an
+    # unguarded int() crash that takes down the whole pre-flight pass.
+    bad_tc_type = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", skills=["s"],
+                           assertions=[{"type": "tool_count", "min": "many"}])
+    vr_tc_type = validate_spec(bad_tc_type)
+    _check("validate.tool_count_bad_type",
+           not vr_tc_type.ok and "must be integers" in vr_tc_type.errors[0],
+           f"clean error (not a crash) for non-integer tool_count min: {vr_tc_type.errors}",
+           failures, verbose)
+
+    # error: exit_code with a non-integer `equals` must also be a clean validation error.
+    bad_ec_type = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", skills=["s"],
+                           assertions=[{"type": "exit_code", "equals": "zero"}])
+    vr_ec_type = validate_spec(bad_ec_type)
+    _check("validate.exit_code_bad_type",
+           not vr_ec_type.ok and "must be an integer" in vr_ec_type.errors[0],
+           f"clean error (not a crash) for non-integer exit_code equals: {vr_ec_type.errors}",
+           failures, verbose)
+
     # warning: duplicate skills
     dup_skills = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml",
                           skills=["sliderule-api", "sliderule-api"])
@@ -1089,6 +1565,7 @@ def run_selftest(verbose: bool = False) -> int:
     _check_isolation(failures, verbose)
     _check_provision(failures, verbose)
     _check_workspace_reset(failures, verbose)
+    _check_snake_case_keys(failures, verbose)
     _check_antigravity_transcript(failures, verbose)
 
     # per-cell readable report
@@ -1097,10 +1574,19 @@ def run_selftest(verbose: bool = False) -> int:
     # artifact / trace path resolution (no false passes on seeded fixtures; workspace-relative;
     # symlink escapes via write-trace)
     _check_path_resolution(failures, verbose)
+    _check_workspace_view_skill_dir_match(failures, verbose)
 
     # undeclared repo skills read via the real on-disk checkout (workspace-escape leak)
     _check_leaked_skill_reads(failures, verbose)
     _check_workspace_relocation(failures, verbose)
+    _check_cell_crash_safety(failures, verbose)
+
+    # cli.py's pure helpers (YAML-error detection, --model/--all-models, models.yaml validation)
+    _check_cli_helpers(failures, verbose)
+    _check_progress_thread_safety(failures, verbose)
+
+    # real pass/fail behavior for every deterministic assertion type
+    _check_assertion_pass_fail(failures, verbose)
 
     # verdict coercion edge cases (string "false", extra items)
     _check_verdict_coercion(failures, verbose)

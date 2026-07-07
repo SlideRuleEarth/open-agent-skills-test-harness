@@ -122,6 +122,8 @@ class RunResult:
             "premium_requests": self.premium_requests,
             "duration_ms": self.duration_ms,
             "resolved_model": self.resolved_model,
+            "stdout_path": self.stdout_path,
+            "stderr_path": self.stderr_path,
             "timed_out": self.timed_out,
             "error": self.error,
             "n_events": len(self.events),

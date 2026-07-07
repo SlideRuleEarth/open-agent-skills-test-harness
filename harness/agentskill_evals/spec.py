@@ -180,10 +180,16 @@ def validate_spec(spec: "EvalSpec", *,
             errors.append(
                 f"`{atype}` has no `contains`/`matches`/`equals` — will always fail")
         if atype == "tool_count":
-            lo = int(a.get("min", 0))
-            hi = int(a.get("max", 10**9))
-            if lo > hi:
-                errors.append(f"`tool_count` min={lo} > max={hi} — impossible to satisfy")
+            try:
+                lo = int(a.get("min", 0))
+                hi = int(a.get("max", 10**9))
+            except (TypeError, ValueError):
+                errors.append(
+                    f"`tool_count` min/max must be integers, got min={a.get('min')!r} "
+                    f"max={a.get('max')!r}")
+            else:
+                if lo > hi:
+                    errors.append(f"`tool_count` min={lo} > max={hi} — impossible to satisfy")
 
     # --- skill assertions vs provisioned skills ---
     for a in spec.assertions:
@@ -217,9 +223,16 @@ def validate_spec(spec: "EvalSpec", *,
     # --- contradictory exit_code + no_error ---
     has_no_error = any(a.get("type") == "no_error" for a in spec.assertions)
     for a in spec.assertions:
-        if a.get("type") == "exit_code" and int(a.get("equals", 0)) != 0 and has_no_error:
+        if a.get("type") != "exit_code":
+            continue
+        try:
+            equals = int(a.get("equals", 0))
+        except (TypeError, ValueError):
+            errors.append(f"`exit_code` equals must be an integer, got {a.get('equals')!r}")
+            continue
+        if equals != 0 and has_no_error:
             errors.append(
-                f"contradictory: `exit_code` expects {a['equals']} but `no_error` requires 0")
+                f"contradictory: `exit_code` expects {equals} but `no_error` requires 0")
 
     # --- prompt placeholders ---
     if spec.skills:

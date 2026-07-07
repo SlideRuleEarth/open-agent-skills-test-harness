@@ -27,13 +27,20 @@ _SKILL_DIRS = (".claude", ".agents", ".antigravity", ".codex")
 _SKIP_DIRS = {".git", "node_modules", "__pycache__"}
 
 
+def _is_skill_dir(rel_root: str) -> bool:
+    """True if `rel_root` IS one of the provisioned skill dirs, or a path underneath one — a path
+    segment match, not a bare string prefix (a real dir named e.g. `.codexnotes` must NOT match
+    `.codex`, or the model's actual output would silently vanish from the report)."""
+    return any(rel_root == d or rel_root.startswith(d + os.sep) for d in _SKILL_DIRS)
+
+
 def _iter_files(workdir: str) -> Iterator[tuple[str, str]]:
     """Yield (abspath, relpath) for files the model could have produced —
     excluding VCS/build noise and the provisioned skill dirs."""
     for root, dirs, files in os.walk(workdir):
         dirs[:] = [d for d in sorted(dirs) if d not in _SKIP_DIRS]
         rel_root = os.path.relpath(root, workdir)
-        if rel_root.startswith(_SKILL_DIRS):
+        if _is_skill_dir(rel_root):
             continue
         for f in sorted(files):
             path = os.path.join(root, f)
@@ -62,14 +69,18 @@ def resolve_trace_path(path: str, workdir: str) -> str:
 def writes_outside_workspace(result: Any, workdir: str) -> list[str]:
     """Absolute paths the run created that landed OUTSIDE the workspace (e.g. the model wrote to an
     absolute path with a mangled run-id). Surfacing them lets the judge grade — and the report show —
-    the artifact the run actually produced, not just whatever happened to land in the workspace."""
-    wd = os.path.abspath(workdir)
+    the artifact the run actually produced, not just whatever happened to land in the workspace.
+
+    Uses ``realpath`` (not ``abspath``) on both sides of the containment check: a symlink inside the
+    workspace pointing outside it (e.g. `workspace/link -> /elsewhere`) must resolve to its real
+    target, or a write through that link would be wrongly counted as "inside"."""
+    wd = os.path.realpath(workdir)
     out: list[str] = []
     seen: set[str] = set()
     for p in result.file_paths_touched():
         if not p:
             continue
-        ap = os.path.abspath(resolve_trace_path(p, workdir))
+        ap = os.path.realpath(resolve_trace_path(p, workdir))
         if ap in seen:
             continue
         if not _is_under(wd, ap) and os.path.isfile(ap):
@@ -87,21 +98,26 @@ def leaked_skill_reads(
 
     Even with the eval workspace relocated to a tempdir outside this repo's working tree
     (``runner.py``), a run could still reach an undeclared skill some other way (e.g. searching
-    the real disk by name) — this is the residual safety net that catches it from the trace, so
-    a leak is never silently reported as ``isolated: true``.
+    the real disk by name, or a symlink planted inside the workspace pointing at the repo) — this
+    is the residual safety net that catches it from the trace, so a leak is never silently
+    reported as ``isolated: true``.
+
+    Uses ``realpath`` (not ``abspath``): an agent that symlinks a workspace-local name at an
+    undeclared skill (e.g. ``ln -s <repo>/sliderule-api evil`` then reads ``evil/SKILL.md``) would
+    otherwise look textually "inside the workspace" and never get flagged at all.
     """
     leaked_names = set(repo_skill_names) - set(declared_names)
     if not leaked_names:
         return []
-    root = os.path.abspath(repo_root)
-    wd = os.path.abspath(workdir)
+    root = os.path.realpath(repo_root)
+    wd = os.path.realpath(workdir)
     hits: list[str] = []
     seen: set[str] = set()
 
     def _flag(candidate: str) -> None:
         if not candidate or candidate in seen:
             return
-        ap = os.path.abspath(candidate)
+        ap = os.path.realpath(candidate)
         if not _is_under(root, ap) or _is_under(wd, ap):
             return
         rel_parts = os.path.relpath(ap, root).split(os.sep)
@@ -112,7 +128,13 @@ def leaked_skill_reads(
     for p in result.file_paths_touched():
         _flag(resolve_trace_path(p, workdir))
 
-    markers = [os.path.join(root, name) for name in leaked_names]
+    # Markers match literal text in a raw shell command string, so they must use the SAME
+    # (unresolved) form the agent would actually have typed — not the realpath'd `root` above,
+    # which e.g. on macOS resolves /var -> /private/var and would never textually match a
+    # command referencing the ordinary /var path. `_flag` still realpath-resolves the matched
+    # token for the actual containment decision.
+    raw_root = os.path.abspath(repo_root)
+    markers = [os.path.join(raw_root, name) for name in leaked_names]
     for cmd in result.commands():
         try:
             tokens = shlex.split(cmd)

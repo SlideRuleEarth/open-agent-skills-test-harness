@@ -62,6 +62,14 @@ class Progress:
 
     def update(self, *, cell: int, phase: str,
                eval_name: str = "", model: str = ""):
+        # Under --jobs>1, every worker thread shares this one Progress instance. Holding the
+        # lock across the state mutation AND the (non-tty) print keeps each printed line an
+        # atomic, coherent snapshot — without it, another thread's update() could interleave
+        # between "mutate state" and "read state to print", printing a torn mix of two cells'
+        # values. This does NOT fix the deeper limitation that the tty spinner (below) only ever
+        # shows the most recently active cell — a true multi-cell display would need per-cell
+        # tracking, not just a lock; each *log line* in the non-tty case is still correct on its
+        # own, since a fresh line is written per update rather than overwritten in place.
         with self._lock:
             self._cell = cell
             self._phase = phase
@@ -74,19 +82,20 @@ class Progress:
                 if model:
                     parts.append(model)
                 self._label = " — ".join(parts)
-        if not self._tty:
-            self._print_plain()
+            if not self._tty:
+                self._print_plain()
 
     def done(self, *, cell: int, passed: bool | None = None, cost: str = ""):
         with self._lock:
             self._cell = cell
             self._phase = ""
-        if not self._tty:
-            mark = "✓" if passed else ("✗" if passed is False else "·")
-            elapsed = _fmt_elapsed(time.monotonic() - self._start)
-            cost_str = f"  {cost}" if cost else ""
-            self._file.write(f"  {mark} cell {cell}/{self._total} done [{elapsed}]{cost_str}\n")
-            self._file.flush()
+            if not self._tty:
+                mark = "✓" if passed else ("✗" if passed is False else "·")
+                elapsed = _fmt_elapsed(time.monotonic() - self._start)
+                cost_str = f"  {cost}" if cost else ""
+                self._file.write(
+                    f"  {mark} cell {cell}/{self._total} done [{elapsed}]{cost_str}\n")
+                self._file.flush()
 
     # --- internals ------------------------------------------------------------
 

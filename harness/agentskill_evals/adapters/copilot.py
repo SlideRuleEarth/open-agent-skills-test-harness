@@ -185,7 +185,12 @@ class CopilotAdapter(Adapter):
                             raw=req,
                             tool_name=name,
                             command=cmd,
-                            path=path,
+                            # A file-tool write gets its own FILE_CHANGE event below, not
+                            # duplicated here — RunResult.file_paths_touched() reads paths from
+                            # BOTH TOOL_CALL and FILE_CHANGE kinds, so putting the same path on
+                            # both would double-count a single write (unlike Claude/Codex, which
+                            # each report a file write via only one of the two kinds).
+                            path=None if name in _FILE_TOOLS else path,
                         )
                     )
                     if name in _FILE_TOOLS and path:
