@@ -51,6 +51,7 @@ class CellResult:
     isolated: bool = False
     ungraded: bool = False
     isolation_leaks: list[str] = field(default_factory=list)
+    scenario_source: Optional[str] = None
 
     @property
     def n_pass(self) -> int:
@@ -199,7 +200,8 @@ class Runner:
                        error=f"{type(exc).__name__}: {exc}")
         cell = CellResult(agent=self.agent, model=model, eval_name=spec.name,
                           skill=spec.skill_name, passed=False, run_result=rr,
-                          artifacts_dir=cell_dir)
+                          artifacts_dir=cell_dir,
+                          scenario_source=_read_scenario_source(spec))
         try:
             self._write_cell_json(cell_dir, cell)
             _write(os.path.join(cell_dir, "report.md"), render_report(cell))
@@ -343,6 +345,7 @@ class Runner:
             agent=self.agent, model=model, eval_name=spec.name, skill=spec.skill_name,
             passed=passed, run_result=rr, assertions=checks, artifacts_dir=cell_dir,
             isolated=home_isolated, ungraded=ungraded, isolation_leaks=leaks,
+            scenario_source=_read_scenario_source(spec),
         )
         self._write_cell_json(cell_dir, cell)
         _write(os.path.join(cell_dir, "report.md"), render_report(cell))
@@ -670,6 +673,10 @@ def render_report(cell: CellResult) -> str:
         for p in cell.isolation_leaks:
             out.append(f"> - `{p}`")
 
+    if cell.scenario_source:
+        out += ["", "## Scenario configuration", "",
+                "```yaml", cell.scenario_source.rstrip(), "```"]
+
     out += ["", "## Prompt given to the model", "", "```", rr.prompt or "(empty)", "```"]
 
     transcript = _render_transcript(rr)
@@ -718,6 +725,18 @@ def render_report(cell: CellResult) -> str:
 # ---------------------------------------------------------------------------
 # small fs helpers
 # ---------------------------------------------------------------------------
+
+
+def _read_scenario_source(spec) -> Optional[str]:
+    """Read the raw scenario YAML from disk, if available."""
+    path = getattr(spec, "source_path", None)
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return None
 
 def _safe(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
