@@ -15,7 +15,6 @@ prompt: |
 
 rubric:                       # graded by the LLM judge
   - Calls an ATL06 endpoint from the SlideRule API (e.g. atl06p / atl06x).
-  - Sets request parameters via the params skill rather than hardcoded guesses.
   - Defines a small region/polygon for the request.
 
 assertions:                   # deterministic checks
