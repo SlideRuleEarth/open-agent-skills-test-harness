@@ -319,6 +319,22 @@ def _check_report(failures, verbose):
                "produced file inlined in full", failures, verbose)
         _check("report.judge", "partially correct" in md and "creates run.py" in md,
                "judge verdict + per-item reasons present", failures, verbose)
+        _check("report.no_scenario_source", "**source:**" not in md,
+               "no scenario_path set -> no source line", failures, verbose)
+
+        # scenario_path set -> the report points back at the exact file that produced the run
+        # (its `name:` is free text and can drift from the filename, so the path is the one
+        # unambiguous pointer), instead of inlining the whole YAML.
+        cell_scen = CellResult(agent="claude", model="claude-haiku-4-5", eval_name="demo",
+                               skill="scenario", passed=False, run_result=rr,
+                               assertions=[fa, ja], artifacts_dir=cell_dir,
+                               scenario_path="/repo/scenarios/some_scenario.yaml")
+        md_scen = render_report(cell_scen)
+        _check("report.scenario_source_path",
+               "- **source:** `/repo/scenarios/some_scenario.yaml`" in md_scen,
+               f"scenario_path renders as a source line, not inlined YAML: "
+               f"{[line for line in md_scen.splitlines() if 'source' in line]}",
+               failures, verbose)
 
         # judge off → no llm_judge assertion: graceful note, but prompt + response stay.
         cell_off = CellResult(agent="claude", model=None, eval_name="demo",
