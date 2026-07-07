@@ -11,7 +11,7 @@ the same walk so they never diverge on what counts as "the model's output"
 from __future__ import annotations
 
 import os
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 # Budgets for the judge's compact view (the report passes None == no cap).
 JUDGE_MAX_FILES = 60
@@ -75,7 +75,7 @@ def writes_outside_workspace(result: Any, workdir: str) -> list[str]:
 
 def leaked_skill_reads(
     result: Any, workdir: str, repo_root: str,
-    repo_skill_names: "Iterable[str]", declared_names: "Iterable[str]",
+    repo_skill_names: Iterable[str], declared_names: Iterable[str],
 ) -> list[str]:
     """Absolute paths (or referenced script paths) this run touched that reach an UNDECLARED
     skill through the real, on-disk repo checkout rather than the provisioned workspace copy.

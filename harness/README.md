@@ -237,7 +237,14 @@ harness blocks both:
    vendor bundles and auth/config.
 2. **Project-local (git-root-based):** `.claude/skills/`, `.agents/skills/`, etc. at the
    git repository root. Blocked by running **`git init`** in each cell's workspace, which
-   creates a `.git` boundary that stops agents from walking up to the real repo root.
+   creates a `.git` boundary that stops agents from walking up to the real repo root — *and*
+   by running the cell's workspace in a tempdir with no path relationship to this repo's
+   checkout in the first place (`runner.py`), so a general-purpose file-browsing agent (one
+   that just `list_dir`s a parent directory by absolute path, unbound by any `.git` boundary)
+   can't stumble onto undeclared skills by walking up a couple of directories either. This is
+   what antigravity actually did in practice — see `leaked_skill_reads()` in
+   `workspace_view.py`, the after-the-fact detector that catches it if it ever recurs, and
+   downgrades that cell's `isolated` flag to `false` instead of a silent false positive.
 
 Together these ensure the model sees only the skills the eval/scenario provisions — plus the
 agent's built-in/vendor skills — never other repo skills you happen to have installed.
@@ -259,7 +266,15 @@ enables A/B testing with vs without skills.
 - **Caveats:** skills bundled inside a CLI's package or plugins live outside these dirs and are
   *not* masked (that's intentional — the platform baseline). On a platform without symlink
   privileges the cell falls back to a non-isolated run with a warning. Config-dir *writes* still
-  pass through to the real dirs (only skill *visibility* is isolated).
+  pass through to the real dirs (only skill *visibility* is isolated). None of this is an OS-level
+  jail — an agent that deliberately searches the whole disk (e.g. `find / -iname sliderule-skills`)
+  rather than just exploring its own cwd can still find the real checkout, since it genuinely
+  exists somewhere on the same filesystem. Closing that would need a container/VM per cell (a
+  real, cross-platform fs boundary) or per-OS native sandboxes (macOS Seatbelt, Linux
+  namespaces/bubblewrap, Windows AppContainer — three incompatible APIs, no shared primitive).
+  Deliberate choice for now: accept that residual risk, rely on `leaked_skill_reads()` to catch it
+  if it's ever actually exercised, and revisit with a container-based execution backend if a real
+  run shows deliberate broad-disk searching rather than incidental cwd exploration.
 
 See [FAQ.md](FAQ.md) for the plain-language version.
 
