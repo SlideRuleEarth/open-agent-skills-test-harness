@@ -1,0 +1,27 @@
+# This is a basic 
+name: ATL06PromptSkaneateles_MultiModel_No_Skills
+description: Multi-model test of the lake levels Skaneateles
+
+target:                       # the runner:model this scenario tests
+  runner: copilot
+  model: 
+    - gpt-5.4-mini   
+    - claude-opus-4.8      
+skills:                       # no skills
+ 
+prompt: |
+  Do a lake level study of Skaneateles Lake in New York using ICESAT-2 ATL06 data. Include any observations about the lake level changes over time or any other ancillary info that would be of interest. Write a repeatable Python script run.py that submits an ATL06 request over a reasonable region of Skaneateles Lake well within its boundaries.
+
+rubric:                       # graded by the LLM judge
+  - Calls an ATL06 endpoint from the SlideRule API (e.g. atl06p / atl06x).
+  - Defines a small region/polygon for the request.
+
+assertions:                   # deterministic checks
+  - {type: file_exists, path: run.py}
+  # process
+  - {type: no_error}
+timeout_sec: 1200                       # int (optional, default: 600) — max seconds for the agent run
+
+# Optional run knobs (any CLI flag overrides these):
+judge: true
+isolated: true
