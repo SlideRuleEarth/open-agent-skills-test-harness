@@ -1,0 +1,29 @@
+# This is a basic 
+name: OrthometricPrompt_MultiModel_No_Skills
+description: Multi-model test of the lake levels Skaneateles
+
+target:                       # the runner:model this scenario tests
+  runner: copilot
+  model: 
+    - gpt-5.5  
+    - claude-opus-4.8      
+skills:                       # provisioned together; the only repo skills visible (isolated)
+  - sliderule-pipeline
+ 
+prompt: |
+  Using SlideRule, what are the orthometric heights of the canopy over Grand Mesa at 20 meter resolution?
+
+rubric:                       # graded by the LLM judge
+  - Calls an endpoint from the SlideRule API (e.g. atl08p / atl08x or alt03x PhoReal).
+  - Defines a region/polygon for the request over Grand Mesa.
+  - Computes orthometric heights at 20 meter resolution.
+
+assertions:                   # deterministic checks
+  - {type: file_exists, path: pipeline.py}
+  # process
+  - {type: no_error}
+timeout_sec: 1200                       # int (optional, default: 600) — max seconds for the agent run
+
+# Optional run knobs (any CLI flag overrides these):
+judge: true
+isolated: true

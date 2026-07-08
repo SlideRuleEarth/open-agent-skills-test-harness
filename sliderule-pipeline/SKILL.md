@@ -4,7 +4,7 @@ description: >
   Behavioral directives for orchestrating SlideRule analyses as single-script
   pipelines and reporting task metrics. Use when consolidating a multi-step
   SlideRule workflow (fetch → parse → filter → aggregate → export) into one
-  script execution rather than separate invocations; pairs with sliderule-api.
+  script execution rather than separate invocations.
   A SQL or pandas filtering/aggregation pass can be folded into the same
   pipeline script. Governs HOW the work is structured (single script, defensive coding,
   JSON export), HOW the executed script is surfaced (saved as a file and surfaced
