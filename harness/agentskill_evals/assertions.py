@@ -36,6 +36,12 @@ class AssertionContext:
     spec: Any  # EvalSpec (avoid import cycle)
     judge: Optional[Callable[..., dict]] = None  # set by the runner when judging is enabled
     skills_subdir: str = ".claude/skills"  # adapter's skill provisioning path
+    # ALL the dirs this adapter can discover a provisioned skill from: the project-local
+    # skills_subdir PLUS the adapter's global skills dirs. Isolation deliberately copies
+    # declared skills into every global dir of the isolated HOME (isolation.py), so an agent
+    # reading e.g. ~/.codex/skills/<skill>/SKILL.md has still "triggered" the skill — matching
+    # only skills_subdir would false-negative that read. None → fall back to [skills_subdir].
+    skill_dirs: Optional[list[str]] = None
     judge_exec: Any = None  # populated by _llm_judge with the judge's ExecResult for artifact saving
 
 
@@ -232,30 +238,33 @@ def _tool_count(result, workdir, spec, cfg, ctx):
 # Skill interaction trace
 # ---------------------------------------------------------------------------
 
-def _in_skill_dir(path: str, skills_subdir: str, skill: str,
+def _in_skill_dir(path: str, skills_dirs: list[str], skill: str,
                   subdir: str = "", filename: str = "") -> bool:
     """Check whether *path* falls inside a skill's provisioned directory.
 
-    Works for both absolute and relative (to workspace) paths because it
-    does a substring match on the canonical ``<skills_subdir>/<skill>/…`` segment.
+    Works for both absolute and relative (to workspace) paths because it does a substring
+    match on the canonical ``<skills_dir>/<skill>/…`` segment — checked against EVERY dir
+    the adapter can discover the skill from (project-local + isolated-HOME globals).
     """
-    prefix = f"{skills_subdir}/{skill}"
-    if subdir:
-        prefix = f"{prefix}/{subdir}"
-    if filename:
-        return f"{prefix}/{filename}" in path
-    return f"{prefix}/" in path
+    for sd in skills_dirs:
+        prefix = f"{sd}/{skill}"
+        if subdir:
+            prefix = f"{prefix}/{subdir}"
+        target = f"{prefix}/{filename}" if filename else f"{prefix}/"
+        if target in path:
+            return True
+    return False
 
 
 def _skill_trace_hits(result, ctx, skill: str,
                       subdir: str = "", filename: str = "") -> list[str]:
     """Return trace paths/commands that reference a skill (or sub-path within it)."""
-    sd = ctx.skills_subdir
+    dirs = list(dict.fromkeys(ctx.skill_dirs or [ctx.skills_subdir]))
     hits: list[str] = []
     for e in result.events:
-        if e.path and _in_skill_dir(e.path, sd, skill, subdir, filename):
+        if e.path and _in_skill_dir(e.path, dirs, skill, subdir, filename):
             hits.append(e.path)
-        if e.command and _in_skill_dir(e.command, sd, skill, subdir, filename):
+        if e.command and _in_skill_dir(e.command, dirs, skill, subdir, filename):
             hits.append(e.command)
     return hits
 

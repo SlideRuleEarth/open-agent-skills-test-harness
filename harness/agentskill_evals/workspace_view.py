@@ -14,10 +14,14 @@ import os
 import shlex
 from typing import Any, Iterable, Iterator, Optional
 
-# Budgets for the judge's compact view (the report passes None == no cap).
+# Budgets for the judge's compact view (the report passes None == no file-count cap).
 JUDGE_MAX_FILES = 60
 JUDGE_MAX_INLINE_FILES = 5
 JUDGE_MAX_INLINE_BYTES = 1500
+# The report inlines every text file, but per-file only up to this many bytes (with a
+# truncation note) — a run that legitimately produces a multi-MB CSV/JSON export must not
+# balloon report.md; the full file is still in workspace/.
+REPORT_MAX_INLINE_BYTES = 200_000
 
 _TEXT_EXT = {".md", ".txt", ".py", ".json", ".yaml", ".yml", ".toml", ".cfg",
              ".ini", ".js", ".ts", ".html", ".css", ".sh", ".csv"}
@@ -53,6 +57,29 @@ def _is_under(base: str, path: str) -> bool:
         return os.path.commonpath([base, path]) == base
     except ValueError:        # different drives, etc. → treat as outside
         return False
+
+
+def seeded_relpaths(spec: Any) -> set[str]:
+    """Workspace-relative paths that were seeded into the workspace BEFORE the run (the
+    fixture tree plus each `files:` destination) — inputs, not model output. Both the judge
+    and the report annotate these so a seeded file is never credited as work the model did."""
+    seeded: set[str] = set()
+    if spec is None:
+        return seeded
+    try:
+        fixture = spec.resolved_fixture()
+    except Exception:
+        fixture = None
+    if fixture and os.path.isdir(fixture):
+        for root, _dirs, files in os.walk(fixture):
+            for f in files:
+                seeded.add(os.path.relpath(os.path.join(root, f), fixture))
+    try:
+        for _src, dest in spec.resolved_files():
+            seeded.add(dest)
+    except Exception:
+        pass
+    return seeded
 
 
 def resolve_trace_path(path: str, workdir: str) -> str:
@@ -155,10 +182,12 @@ def leaked_skill_reads(
     return hits
 
 
-def file_tree(workdir: str, extra: list[str] = (), max_files: Optional[int] = None) -> str:
+def file_tree(workdir: str, extra: list[str] = (), max_files: Optional[int] = None,
+              seeded: Iterable[str] = ()) -> str:
     """A flat listing of every file under `workdir` (skill dirs / noise excluded), plus any
     `extra` paths written outside it. `max_files=None` lists everything (the report); the judge
-    passes a cap."""
+    passes a cap. Paths in `seeded` (workspace-relative) are annotated as pre-seeded inputs."""
+    seeded_set = set(seeded or ())
     lines: list[str] = []
     count = 0
     truncated = False
@@ -166,7 +195,8 @@ def file_tree(workdir: str, extra: list[str] = (), max_files: Optional[int] = No
         if max_files is not None and count >= max_files:
             truncated = True
             break
-        lines.append(f"  {rel}")
+        tag = "   [seeded input, not model output]" if rel in seeded_set else ""
+        lines.append(f"  {rel}{tag}")
         count += 1
     if truncated:
         lines.append(f"  ... (+ more, truncated at {max_files})")
@@ -176,10 +206,14 @@ def file_tree(workdir: str, extra: list[str] = (), max_files: Optional[int] = No
 
 
 def inline_files(workdir: str, extra: list[str] = (), max_files: Optional[int] = None,
-                 max_bytes: Optional[int] = None) -> str:
-    """Inline the contents of text files under `workdir` (and `extra`). With max_files/max_bytes
-    None (the report) every text file is inlined in full; the judge passes small caps to keep its
-    prompt cheap. Non-text files are skipped (they appear in `file_tree`)."""
+                 max_bytes: Optional[int] = None, truncate: bool = False,
+                 seeded: Iterable[str] = ()) -> str:
+    """Inline the contents of text files under `workdir` (and `extra`). With max_files None
+    (the report) every text file is inlined; the judge passes small caps to keep its prompt
+    cheap. A file over `max_bytes` is skipped by default (judge) or, with `truncate=True`
+    (report), inlined up to the cap with a truncation note. Paths in `seeded` are labelled as
+    pre-seeded inputs. Non-text files are skipped (they appear in `file_tree`)."""
+    seeded_set = set(seeded or ())
     chunks: list[str] = []
     used = 0
 
@@ -191,10 +225,14 @@ def inline_files(workdir: str, extra: list[str] = (), max_files: Optional[int] =
         if os.path.splitext(path)[1].lower() not in _TEXT_EXT:
             return True   # binary: skip contents, keep walking
         try:
-            if max_bytes is not None and os.path.getsize(path) > max_bytes:
+            size = os.path.getsize(path)
+            if max_bytes is not None and size > max_bytes and not truncate:
                 return True
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                body = fh.read()
+                body = fh.read(max_bytes) if max_bytes is not None else fh.read()
+            if max_bytes is not None and size > max_bytes:
+                body += (f"\n… [truncated at {max_bytes} bytes of {size} — "
+                         "full file in workspace/]")
         except OSError:
             return True
         chunks.append(f"--- {label} ---\n{body}")
@@ -202,7 +240,8 @@ def inline_files(workdir: str, extra: list[str] = (), max_files: Optional[int] =
         return True
 
     for ap, rel in _iter_files(workdir):
-        if not _maybe(ap, rel):
+        label = f"{rel}  [seeded input, not model output]" if rel in seeded_set else rel
+        if not _maybe(ap, label):
             break
     else:
         for ap in extra:

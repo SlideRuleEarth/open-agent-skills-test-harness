@@ -18,7 +18,7 @@ from .adapters import adapter_names, all_adapters, get_adapter
 from .isolation import resolve_visible_skills
 from .judge import Judge
 from .progress import Progress
-from .runner import Runner, _cell_text, render_matrix
+from .runner import Runner, _cell_text, _safe, render_matrix
 from .spec import _load_raw, discover_specs, load_scenario, load_spec, skill_names, validate_spec
 
 DEFAULT_MAX_CELLS = 25
@@ -44,22 +44,28 @@ def _dedup(seq) -> list:
     return list(dict.fromkeys(seq))
 
 
-def _safe_slug(name: str) -> str:
-    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
-
-
 def _default_run_id(args, scenario, specs) -> str:
     ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     if scenario:
-        return f"{ts}_scen_{_safe_slug(scenario.spec.name)}"
+        return f"{ts}_scen_{_safe(scenario.spec.name)}"
     if args.skill:
-        return f"{ts}_skill_{_safe_slug(args.skill)}"
+        return f"{ts}_skill_{_safe(args.skill)}"
     if args.evals:
         if len(args.evals) == 1:
             name = os.path.splitext(os.path.basename(args.evals[0]))[0]
-            return f"{ts}_eval_{_safe_slug(name)}"
+            return f"{ts}_eval_{_safe(name)}"
         return f"{ts}_evals_{len(args.evals)}"
     return ts
+
+
+def _duplicate_names(specs) -> dict[str, list[str]]:
+    """Eval names shared by more than one discovered spec. Duplicates silently collide:
+    same artifacts cell dir (the second wipes the first's workspace) and same key in the
+    results matrix (one row shown, pass rates undercount) — so cmd_run blocks on them."""
+    by_name: dict[str, list[str]] = {}
+    for s in specs:
+        by_name.setdefault(s.name, []).append(s.source_path or "?")
+    return {n: paths for n, paths in by_name.items() if len(paths) > 1}
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +157,12 @@ def _load_models_config(path) -> ModelsConfig:
             warnings.append(f"judge.agent {jagent!r} has no registered adapter — ignored")
     if jblk.get("model"):
         judge["model"] = str(jblk["model"])
+    if jblk.get("timeout") is not None:
+        try:
+            judge["timeout"] = int(jblk["timeout"])
+        except (TypeError, ValueError):
+            warnings.append(
+                f"judge.timeout must be an integer (seconds), got {jblk['timeout']!r} — ignored")
     return ModelsConfig(models, defaults, judge, warnings)
 
 
@@ -216,7 +228,7 @@ def _load_scenario(path: str):
         raise SystemExit(2)
 
 
-def _print_skill_visibility(specs, agent, models, isolated, skills_root, provision) -> None:
+def _print_skill_visibility(specs, agent, isolated, skills_root, provision) -> None:
     repo = set(skill_names(skills_root))
     real_home = os.path.expanduser("~")
     single = specs[0] if len(specs) == 1 else None
@@ -282,6 +294,17 @@ def cmd_run(args) -> int:
                   f"{skills_root!r} (use --skill / --evals to target).", file=sys.stderr)
             return 2
     ov = scenario.overrides if scenario else {}
+
+    # duplicate eval names collide in artifacts dirs and the results matrix — block early
+    dupes = _duplicate_names(specs)
+    if dupes:
+        print("error: duplicate eval name(s) — rename so results don't collide:",
+              file=sys.stderr)
+        for n, paths in sorted(dupes.items()):
+            print(f"    {n!r}:", file=sys.stderr)
+            for p in paths:
+                print(f"        {p}", file=sys.stderr)
+        return 2
 
     # validate declared skills
     valid_skills = set(skill_names(skills_root))
@@ -367,7 +390,17 @@ def cmd_run(args) -> int:
                            or ov_judge_cfg.get("model")
                            or cfg.judge.get("model")
                            or cfg.default(judge_agent))
-            judge = Judge(agent=judge_agent, model=judge_model)
+            judge_timeout = (args.judge_timeout
+                             or ov_judge_cfg.get("timeout")
+                             or cfg.judge.get("timeout")
+                             or 240)
+            try:
+                judge_timeout = int(judge_timeout)
+            except (TypeError, ValueError):
+                print(f"warning: judge timeout {judge_timeout!r} is not an integer — "
+                      "using 240s", file=sys.stderr)
+                judge_timeout = 240
+            judge = Judge(agent=judge_agent, model=judge_model, timeout=judge_timeout)
             if not judge.available():
                 print(f"warning: judge runner {judge_agent!r} not on PATH — "
                       "llm_judge checks will fail.", file=sys.stderr)
@@ -425,7 +458,7 @@ def cmd_run(args) -> int:
           f"≈{n_llm} LLM calls   artifacts: {run_dir}\n")
 
     if args.dry_run:
-        _print_skill_visibility(specs, agent, models, isolated, skills_root, provision)
+        _print_skill_visibility(specs, agent, isolated, skills_root, provision)
         print("(dry run — nothing executed)")
         return 0
 
@@ -541,7 +574,14 @@ def cmd_run(args) -> int:
                 print(f"    → {os.path.join(c.artifacts_dir, 'report.md')}")
 
     failed = [c for c in graded if not c.passed]
-    return 0 if graded and not failed else 1
+    if not graded:
+        # Nothing was graded (rubric-only evals with the judge off, or no eligible cells) —
+        # exit 3 so CI can tell "no verdict" apart from a real failure (1) without falsely
+        # claiming success (0).
+        print("\nnote: no cells were graded — exiting 3 (no verdict; not a failure).",
+              file=sys.stderr)
+        return 3
+    return 0 if not failed else 1
 
 
 def cmd_list_configured_agents(args) -> int:
@@ -751,6 +791,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--jobs", type=int, default=None, help="parallel cells (default 1)")
     sp.add_argument("--judge-agent", help="agent to grade rubrics (default: claude if installed)")
     sp.add_argument("--judge-model", help="model override for the judge")
+    sp.add_argument("--judge-timeout", type=int, default=None,
+                    help="seconds before a judge run is killed (default 240; also settable "
+                         "as judge.timeout in models.yaml or a scenario's judge: block)")
     sp.add_argument("--no-judge", action="store_true", help="disable LLM-judge rubric grading")
     sp.add_argument("--no-provision", action="store_true", help="don't copy skills into workspaces")
     sp.add_argument("--no-isolated", action="store_true",

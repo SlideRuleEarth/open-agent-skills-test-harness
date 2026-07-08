@@ -336,6 +336,22 @@ def _check_report(failures, verbose):
                f"{[line for line in md_scen.splitlines() if 'source' in line]}",
                failures, verbose)
 
+        # a seeded input file is annotated as such, not presented as model output
+        with open(os.path.join(ws, "input.json"), "w") as fh:
+            fh.write('{"seed": true}')
+        cell_seed = CellResult(agent="claude", model=None, eval_name="demo",
+                               skill="scenario", passed=True, run_result=rr,
+                               assertions=[fa], artifacts_dir=cell_dir,
+                               seeded_paths=["input.json"])
+        md_seed = render_report(cell_seed)
+        _check("report.seeded_annotated",
+               "input.json   [seeded input, not model output]" in md_seed,
+               "seeded file annotated in the report's file tree", failures, verbose)
+        _check("report.seeded_inline_labeled",
+               "input.json  [seeded input, not model output] ---" in md_seed,
+               "seeded file's inline block labeled as input", failures, verbose)
+        os.unlink(os.path.join(ws, "input.json"))
+
         # judge off → no llm_judge assertion: graceful note, but prompt + response stay.
         cell_off = CellResult(agent="claude", model=None, eval_name="demo",
                               skill="scenario", passed=True, run_result=rr,
@@ -668,7 +684,8 @@ def _check_workspace_relocation(failures, verbose):
         r.jobs, r.isolated, r.progress = 1, True, None
         r._repo_skill_names, r.run_dir = set(), run_dir
 
-        spec = EvalSpec(name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"))
+        spec = EvalSpec(name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"),
+                        assertions=[{"type": "file_exists", "path": "run.py"}])
         cell = r._run_cell(None, spec)
 
         cell_workspace = os.path.join(cell.artifacts_dir, "workspace")
@@ -685,6 +702,15 @@ def _check_workspace_relocation(failures, verbose):
         _check("relocate.temp_exec_dir_cleaned",
                cwd_used is not None and not os.path.isdir(cwd_used),
                "temp exec dir removed after copy-back", failures, verbose)
+        # assertion details recorded paths under the (now deleted) exec_ws tempdir — they
+        # must be remapped onto the final cell workspace so assertions.json points at
+        # files that still exist.
+        fe = next((a for a in cell.assertions if a.type == "file_exists"), None)
+        rp = ((fe.details or {}).get("resolved_path", "") if fe else "")
+        _check("relocate.assertion_details_remapped",
+               rp == os.path.join(cell_workspace, "run.py") and os.path.isfile(rp),
+               f"file_exists resolved_path points at the final workspace, not the deleted "
+               f"tempdir: {rp}", failures, verbose)
     finally:
         runner_mod.execute = orig_execute
         shutil.rmtree(repo_root, ignore_errors=True)
@@ -771,6 +797,8 @@ def _check_cell_crash_safety(failures, verbose):
 
     def _crashing_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides, agent_name, eval_name):
         seen["cwd"] = cwd
+        with open(os.path.join(cwd, "partial.txt"), "w") as f:
+            f.write("partial output before crash\n")
         raise RuntimeError("simulated mid-run crash")
 
     runner_mod.execute = _crashing_execute
@@ -805,6 +833,11 @@ def _check_cell_crash_safety(failures, verbose):
             report_path = os.path.join(cell.artifacts_dir, "report.md")
             _check("crash.report_written", os.path.isfile(report_path),
                    "report.md is still written for a crashed cell", failures, verbose)
+            _check("crash.partial_output_preserved",
+                   os.path.isfile(os.path.join(cell.artifacts_dir, "workspace", "partial.txt")),
+                   "partial output written before the crash is moved into cell_dir/workspace "
+                   "(the evidence needed to debug the crash), not deleted with the tempdir",
+                   failures, verbose)
         cwd_used = seen.get("cwd")
         _check("crash.exec_ws_cleaned_up",
                cwd_used is not None and not os.path.isdir(cwd_used),
@@ -869,9 +902,21 @@ def _check_cli_helpers(failures, verbose):
     import os
     import tempfile
 
-    from .cli import ModelsConfig, _is_yaml_error, _load_models_config, _resolve_models
+    from .cli import (ModelsConfig, _duplicate_names, _is_yaml_error,
+                      _load_models_config, _resolve_models)
 
     print("cli.py helpers:")
+
+    # duplicate eval names (same artifacts dir + same matrix key) are detected
+    dup_specs = [EvalSpec(name="a", prompt="p", source_path="/one/evals/a.yaml"),
+                 EvalSpec(name="a", prompt="p", source_path="/two/evals/a.yaml"),
+                 EvalSpec(name="b", prompt="p", source_path="/one/evals/b.yaml")]
+    dupes = _duplicate_names(dup_specs)
+    _check("cli.duplicate_names",
+           set(dupes) == {"a"} and len(dupes["a"]) == 2,
+           f"duplicate eval names detected with their sources: {dupes}", failures, verbose)
+    _check("cli.no_false_duplicates", _duplicate_names(dup_specs[1:]) == {},
+           "distinct names produce no duplicates", failures, verbose)
 
     _check("cli.is_yaml_error.plain_exception_false",
            _is_yaml_error(ValueError("not a yaml error")) is False,
@@ -918,6 +963,28 @@ def _check_cli_helpers(failures, verbose):
                f"missing default warns: {mc.warnings}", failures, verbose)
     finally:
         os.unlink(tmp.name)
+
+    # judge.timeout: parsed as an int; a bad value warns and is ignored (never crashes)
+    tmp2 = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    try:
+        tmp2.write('{"judge": {"agent": "claude", "timeout": "300"}}')
+        tmp2.close()
+        mc2 = _load_models_config(tmp2.name)
+        _check("cli.judge_timeout_parsed", mc2.judge.get("timeout") == 300,
+               f"judge.timeout coerced to int: {mc2.judge}", failures, verbose)
+    finally:
+        os.unlink(tmp2.name)
+    tmp3 = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    try:
+        tmp3.write('{"judge": {"agent": "claude", "timeout": "soon"}}')
+        tmp3.close()
+        mc3 = _load_models_config(tmp3.name)
+        _check("cli.judge_timeout_bad_warned",
+               "timeout" not in mc3.judge and any("timeout" in w for w in mc3.warnings),
+               f"non-integer judge.timeout warns and is dropped: {mc3.warnings}",
+               failures, verbose)
+    finally:
+        os.unlink(tmp3.name)
 
 
 def _check_assertion_pass_fail(failures, verbose):
@@ -1038,6 +1105,31 @@ def _check_assertion_pass_fail(failures, verbose):
                    ar.passed is False and "escapes workspace" in ar.message,
                    f"{atype} rejects a path escaping the workspace: {ar.message}",
                    failures, verbose)
+
+        # A skill read via the adapter's GLOBAL skills dir must also count as triggered:
+        # isolation copies declared skills into every global dir of the isolated HOME, so
+        # codex reading ~/.codex/skills/<skill>/SKILL.md used the skill even though the
+        # path never mentions the project-local .agents/skills.
+        rr_glob = RunResult(
+            agent="codex", eval_name="e", prompt="", workdir=ws,
+            events=[NormalizedEvent(
+                EventKind.TOOL_CALL, tool_name="Read",
+                path="/tmp/ase-home-x/.codex/skills/sliderule-api/SKILL.md")])
+        ctx_glob = AssertionContext(
+            spec=spec, skills_subdir=".agents/skills",
+            skill_dirs=[".agents/skills", ".codex/skills", ".agents/skills"])
+        ar_g = run_assertion({"type": "skill_triggered", "skill": "sliderule-api"},
+                             rr_glob, ws, spec, ctx_glob)
+        _check("assertion.skill_triggered.global_dir", ar_g.passed is True,
+               f"a global-skills-dir read counts as triggered: {ar_g.message}",
+               failures, verbose)
+        # ...and without skill_dirs, the single-subdir fallback still works as before.
+        ctx_fallback = AssertionContext(spec=spec, skills_subdir=".codex/skills")
+        ar_f = run_assertion({"type": "skill_triggered", "skill": "sliderule-api"},
+                             rr_glob, ws, spec, ctx_fallback)
+        _check("assertion.skill_triggered.subdir_fallback", ar_f.passed is True,
+               f"skill_dirs=None falls back to skills_subdir: {ar_f.message}",
+               failures, verbose)
     finally:
         shutil.rmtree(ws, ignore_errors=True)
 
@@ -1233,6 +1325,180 @@ def _check_antigravity_transcript(failures, verbose):
                f"antigravity argv: {cargv}", failures, verbose)
     finally:
         shutil.rmtree(home, ignore_errors=True)
+
+
+def _check_exec_timeout_group_kill(failures, verbose):
+    """A timed-out agent must not orphan its grandchildren: agent CLIs spawn subprocesses
+    (shell tools, MCP servers), and killing only the direct child leaves them burning API
+    budget and writing into a workspace the runner is about to relocate. execute() starts
+    the agent in its own process group and SIGKILLs the whole group on timeout."""
+    import os
+    import shutil
+    import sys
+    import tempfile
+    import time
+
+    from .adapters.base import Adapter, ParseOutput, RunOptions
+    from .exec import execute
+
+    print("exec timeout group kill:")
+    if not hasattr(os, "killpg"):
+        if verbose:
+            print("  [skipped — no process groups on this platform]")
+        return
+
+    tmp = tempfile.mkdtemp(prefix="ase-timeout-")
+    pidfile = os.path.join(tmp, "grandchild.pid")
+    script = (
+        "import os, subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"open({pidfile!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(60)\n"
+    )
+
+    class _SleeperAdapter(Adapter):
+        name = "fake-sleeper"
+        binary = sys.executable
+
+        def build_argv(self, prompt, opts, *, cwd):
+            return [sys.executable, "-c", script]
+
+        def parse(self, stdout, stderr, exit_code, *, opts=None):
+            return ParseOutput()
+
+    grandchild_pid = None
+    try:
+        start = time.monotonic()
+        ex = execute(_SleeperAdapter(), "p", RunOptions(), cwd=tmp, timeout=1,
+                     agent_name="fake-sleeper", eval_name="t")
+        elapsed = time.monotonic() - start
+        _check("exec.timeout_flagged", ex.result.timed_out and ex.result.error is not None,
+               f"timeout surfaced (timed_out={ex.result.timed_out})", failures, verbose)
+        _check("exec.timeout_returns_promptly", elapsed < 15,
+               f"execute() returned in {elapsed:.1f}s, not hung on surviving pipes",
+               failures, verbose)
+
+        for _ in range(20):
+            if os.path.isfile(pidfile):
+                try:
+                    grandchild_pid = int(open(pidfile).read().strip())
+                    break
+                except ValueError:
+                    pass
+            time.sleep(0.05)
+        alive = None
+        if grandchild_pid:
+            for _ in range(40):     # give SIGKILL a moment to be delivered/reaped
+                try:
+                    os.kill(grandchild_pid, 0)
+                    alive = True
+                except ProcessLookupError:
+                    alive = False
+                    break
+                time.sleep(0.05)
+        _check("exec.timeout_kills_grandchild",
+               grandchild_pid is not None and alive is False,
+               f"grandchild (pid={grandchild_pid}) dead after group kill (alive={alive})",
+               failures, verbose)
+    finally:
+        if grandchild_pid:
+            try:
+                os.kill(grandchild_pid, 9)   # never leak a sleeper if the check failed
+            except (ProcessLookupError, PermissionError):
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _check_inline_truncation(failures, verbose):
+    """The report inlines every text file but must cap each one: a legitimate multi-MB CSV
+    export would otherwise land verbatim in report.md. truncate=True (report) inlines up to
+    the cap with a note; truncate=False (judge) keeps the old skip-entirely behavior."""
+    import os
+    import shutil
+    import tempfile
+
+    from .workspace_view import inline_files
+
+    print("inline truncation:")
+    ws = tempfile.mkdtemp(prefix="ase-inline-")
+    try:
+        with open(os.path.join(ws, "big.csv"), "w") as fh:
+            fh.write("x" * 100)
+        out_trunc = inline_files(ws, max_bytes=10, truncate=True)
+        _check("inline.truncated_with_note",
+               "xxxxxxxxxx" in out_trunc and "truncated at 10 bytes" in out_trunc
+               and "x" * 11 not in out_trunc,
+               f"oversize file inlined up to the cap with a note: {out_trunc!r}",
+               failures, verbose)
+        out_skip = inline_files(ws, max_bytes=10)
+        _check("inline.judge_still_skips", out_skip == "",
+               f"without truncate, an oversize file is skipped entirely: {out_skip!r}",
+               failures, verbose)
+        out_full = inline_files(ws)
+        _check("inline.uncapped_full", "x" * 100 in out_full,
+               "no cap inlines the whole file", failures, verbose)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+def _check_model_error_heuristic(failures, verbose):
+    """_looks_like_model_error must not re-label unrelated failures: the old any-of
+    ("model", "not found", ...) check fired whenever stderr merely mentioned the model name
+    or said "not found" about something else, steering debugging at models.yaml for wrong
+    reasons."""
+    from .runner import _looks_like_model_error
+
+    print("model-error heuristic:")
+    _check("modelerr.phrase_hit",
+           _looks_like_model_error("", "error: invalid model 'foo'", "foo"),
+           "an explicit rejection phrase fires", failures, verbose)
+    _check("modelerr.model_plus_keyword",
+           _looks_like_model_error("exit 1", "gpt-x is not available", "gpt-x"),
+           "model id + rejection keyword fires", failures, verbose)
+    _check("modelerr.unrelated_not_found",
+           not _looks_like_model_error("config file not found", "", "claude-opus-4-8"),
+           "'not found' about something else does NOT fire", failures, verbose)
+    _check("modelerr.model_mention_alone",
+           not _looks_like_model_error("network unreachable", "retrying model claude-opus",
+                                       "claude-opus"),
+           "mentioning the model without a rejection keyword does NOT fire",
+           failures, verbose)
+
+
+def _check_scenario_override_validation(failures, verbose):
+    """Bad run-knob overrides in a scenario (`jobs: two`, `judge: 3`) must be a clean
+    ValueError at load time — the same treatment as any other malformed scenario — not an
+    unguarded int() traceback later in cmd_run. JSON scenarios, so no PyYAML needed."""
+    import os
+    import tempfile
+
+    from .spec import load_scenario
+
+    print("scenario override validation:")
+
+    def _load(payload: str):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write(payload)
+            name = f.name
+        try:
+            return load_scenario(name)
+        finally:
+            os.unlink(name)
+
+    base = '"name": "s", "prompt": "p", "target": {"runner": "claude"}'
+    for field, bad in (("jobs", '"two"'), ("max_cells", '[1]'),
+                       ("isolated", '"yes"'), ("judge", '3')):
+        try:
+            _load("{" + base + f', "{field}": {bad}' + "}")
+            ok = False
+        except ValueError:
+            ok = True
+        _check(f"scenario.bad_{field}_rejected", ok,
+               f"`{field}: {bad}` raises a clean ValueError", failures, verbose)
+
+    scen = _load("{" + base + ', "jobs": "4"' + "}")
+    _check("scenario.jobs_coerced", scen.overrides.get("jobs") == 4,
+           f"a numeric string is coerced to int: {scen.overrides}", failures, verbose)
 
 
 def run_selftest(verbose: bool = False) -> int:
@@ -1620,6 +1886,51 @@ def run_selftest(verbose: bool = False) -> int:
            vr_er.ok and any("empty" in w for w in vr_er.warnings),
            f"warning for empty rubric: {vr_er.warnings}", failures, verbose)
 
+    # error (not warning): a missing seed file — the run would silently skip it and fail
+    # confusingly downstream, so block before spending tokens
+    seed_spec = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", skills=["s"],
+                         files=["no_such_seed_file.json"])
+    vr_seed = validate_spec(seed_spec)
+    _check("validate.missing_seed_is_error",
+           not vr_seed.ok and any("does not exist" in e for e in vr_seed.errors),
+           f"missing seed file blocks the run: {vr_seed.errors}", failures, verbose)
+
+    # rubric + explicit llm_judge: exactly ONE judge assertion (no double judge run/billing)
+    dedup_spec = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml",
+                          rubric=["a"],
+                          assertions=[{"type": "llm_judge", "threshold": 0.5}])
+    n_judge = sum(1 for a in dedup_spec.effective_assertions()
+                  if a.get("type") == "llm_judge")
+    _check("spec.judge_not_doubled", n_judge == 1,
+           f"explicit llm_judge suppresses the rubric-compiled one: {n_judge} judge "
+           "assertion(s)", failures, verbose)
+    rubric_only = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", rubric=["a"])
+    n_judge2 = sum(1 for a in rubric_only.effective_assertions()
+                   if a.get("type") == "llm_judge")
+    _check("spec.rubric_still_compiled", n_judge2 == 1,
+           f"rubric alone still compiles to one llm_judge: {n_judge2}", failures, verbose)
+
+    # warning: top-level rubric shadowed by an explicit llm_judge with its OWN rubric
+    shadow_rubric = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml", skills=["s"],
+                             rubric=["x"],
+                             assertions=[{"type": "llm_judge", "rubric": ["y"]}])
+    vr_shadow = validate_spec(shadow_rubric)
+    _check("validate.rubric_shadowed_warned",
+           vr_shadow.ok and any("ignored" in w for w in vr_shadow.warnings),
+           f"warning when an explicit llm_judge rubric shadows the top-level one: "
+           f"{vr_shadow.warnings}", failures, verbose)
+
+    # a malformed `files:` entry (two-key dict) must be a clean load error, not a TypeError
+    # later inside resolved_files()
+    from .spec import _spec_from_raw
+    try:
+        _spec_from_raw({"prompt": "p", "files": [{"a": "b", "c": "d"}]}, "/x.yaml")
+        files_ok = False
+    except ValueError:
+        files_ok = True
+    _check("spec.malformed_files_entry", files_ok,
+           "a two-key files mapping raises a clean ValueError at load", failures, verbose)
+
     # clean spec passes with no errors or warnings
     clean_spec = EvalSpec(name="t", prompt="Use {skill} to run", source_path="/x/e.yaml",
                           skills=["sliderule-api"],
@@ -1696,6 +2007,18 @@ def run_selftest(verbose: bool = False) -> int:
 
     # verdict coercion edge cases (string "false", extra items)
     _check_verdict_coercion(failures, verbose)
+
+    # timeout kills the agent's whole process group, not just the direct child
+    _check_exec_timeout_group_kill(failures, verbose)
+
+    # report inlining is capped per file; the judge's skip behavior is unchanged
+    _check_inline_truncation(failures, verbose)
+
+    # model-rejection annotation only fires on actual rejections
+    _check_model_error_heuristic(failures, verbose)
+
+    # scenario run-knob overrides are type-checked at load
+    _check_scenario_override_validation(failures, verbose)
 
     print()
     if failures:

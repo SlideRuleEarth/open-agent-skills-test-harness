@@ -34,7 +34,14 @@ from .judge import Judge
 from .progress import Progress
 from .schema import EventKind, RunResult
 from .spec import EvalSpec, skill_names
-from .workspace_view import file_tree, inline_files, leaked_skill_reads, writes_outside_workspace
+from .workspace_view import (
+    REPORT_MAX_INLINE_BYTES,
+    file_tree,
+    inline_files,
+    leaked_skill_reads,
+    seeded_relpaths,
+    writes_outside_workspace,
+)
 
 
 @dataclass
@@ -52,6 +59,9 @@ class CellResult:
     ungraded: bool = False
     isolation_leaks: list[str] = field(default_factory=list)
     scenario_path: Optional[str] = None
+    # workspace-relative paths seeded before the run (fixture + files:) — inputs the report
+    # annotates so they aren't mistaken for model output
+    seeded_paths: list[str] = field(default_factory=list)
 
     @property
     def n_pass(self) -> int:
@@ -185,8 +195,9 @@ class Runner:
         except Exception as exc:
             return self._failed_cell(model, spec, cell_idx, cell_dir, exec_ws, exc)
         finally:
-            # A no-op on the success path: `shutil.move` already relocated exec_ws to `workspace`,
-            # so there's nothing left at the old path to remove.
+            # A no-op on the success path AND the usual crash path: `shutil.move` (here or in
+            # _failed_cell) already relocated exec_ws to `workspace`, so there's nothing left
+            # at the old path to remove. This only fires when even that preservation failed.
             if exec_ws != workspace and os.path.isdir(exec_ws):
                 shutil.rmtree(exec_ws, ignore_errors=True)
 
@@ -202,6 +213,19 @@ class Runner:
                           skill=spec.skill_name, passed=False, run_result=rr,
                           artifacts_dir=cell_dir,
                           scenario_path=getattr(spec, "source_path", None))
+        # Preserve whatever the run produced before crashing: move exec_ws into
+        # cell_dir/workspace (as the success path does) instead of letting _run_cell's
+        # finally delete it — partial output is exactly the evidence needed to debug the
+        # crash, and report.md below can then still show it.
+        workspace = os.path.join(cell_dir, "workspace")
+        try:
+            if exec_ws != workspace and os.path.isdir(exec_ws):
+                if os.path.isdir(workspace) and not os.listdir(workspace):
+                    os.rmdir(workspace)
+                if not os.path.lexists(workspace):
+                    shutil.move(exec_ws, workspace)
+        except OSError:
+            pass  # best-effort — the finally in _run_cell still cleans up the tempdir
         try:
             self._write_cell_json(cell_dir, cell)
             _write(os.path.join(cell_dir, "report.md"), render_report(cell))
@@ -294,7 +318,7 @@ class Runner:
                 shutil.rmtree(iso_home, ignore_errors=True)
         rr = ex.result
 
-        if model and rr.error and _looks_like_model_error(rr.error, ex.stderr):
+        if model and rr.error and _looks_like_model_error(rr.error, ex.stderr, model):
             rr.error = f"model {model!r} rejected by {self.agent} — check models.yaml: {rr.error}"
 
         # Residual safety net: even with exec_ws relocated outside the repo tree, a run could
@@ -320,8 +344,12 @@ class Runner:
         effective = spec.effective_assertions()
         skipped_judge = self.judge is None and any(
             c.get("type") == "llm_judge" for c in effective)
-        ctx = AssertionContext(spec=spec, judge=self.judge,
-                               skills_subdir=adapter.skills_subdir)
+        # skill_dirs: every location this adapter can discover a provisioned skill from —
+        # isolation copies declared skills into the global dirs too, so a read via e.g.
+        # ~/.codex/skills/<skill>/ must still count as the skill being triggered.
+        ctx = AssertionContext(
+            spec=spec, judge=self.judge, skills_subdir=adapter.skills_subdir,
+            skill_dirs=[adapter.skills_subdir, *(adapter.global_skills_subpaths or [])])
         checks = []
         for cfg in effective:
             if self.judge is None and cfg.get("type") == "llm_judge":
@@ -337,22 +365,30 @@ class Runner:
         # Move the tempdir exec workspace into cell_dir/workspace for artifacts/report — `rmdir`
         # is safe since `_prepare_workspace` left it empty and nothing else wrote into it while
         # isolated; `move` renames when possible (same filesystem) instead of a copy+delete pass.
+        # Assertion details recorded paths under the (about to vanish) exec_ws tempdir — remap
+        # them onto the final workspace location so assertions.json points at real files.
         if self.isolated:
             os.rmdir(workspace)
             shutil.move(exec_ws, workspace)
+            for c in checks:
+                c.details = _remap_paths(c.details, exec_ws, workspace)
 
         cell = CellResult(
             agent=self.agent, model=model, eval_name=spec.name, skill=spec.skill_name,
             passed=passed, run_result=rr, assertions=checks, artifacts_dir=cell_dir,
             isolated=home_isolated, ungraded=ungraded, isolation_leaks=leaks,
             scenario_path=getattr(spec, "source_path", None),
+            seeded_paths=sorted(seeded_relpaths(spec)),
         )
+        # Attach the judge's run BEFORE rendering, so report.md's verdict line shows the
+        # combined agent+judge cost (previously only summary.* had it).
+        if ctx.judge_exec is not None:
+            cell.judge_run_result = ctx.judge_exec.result
         self._write_cell_json(cell_dir, cell)
         _write(os.path.join(cell_dir, "report.md"), render_report(cell))
 
         # 8) judge artifacts — same detail level as the agent, prefixed judge_*
         if ctx.judge_exec is not None:
-            cell.judge_run_result = ctx.judge_exec.result
             self._write_judge_artifacts(cell_dir, cell, ctx.judge_exec)
 
         if p and cell_idx:
@@ -373,17 +409,25 @@ class Runner:
         since the caller passes whatever directory the agent will actually run in (`exec_ws`
         under isolation), distinct from `_run_cell`'s own `workspace` variable."""
         fixture = spec.resolved_fixture()
-        if fixture and os.path.isdir(fixture):
-            shutil.copytree(fixture, dest_dir, dirs_exist_ok=True)
+        if fixture:
+            if os.path.isdir(fixture):
+                shutil.copytree(fixture, dest_dir, dirs_exist_ok=True)
+            else:
+                # validate_spec blocks this in cmd_run; this backstop covers programmatic use
+                print(f"warning: fixture {fixture!r} does not exist — skipping",
+                      file=sys.stderr)
         for src, dest_rel in spec.resolved_files():
-            if os.path.isfile(src):
-                dest = os.path.realpath(os.path.join(dest_dir, dest_rel))
-                if not dest.startswith(os.path.realpath(dest_dir) + os.sep):
-                    print(f"warning: seed file {dest_rel!r} escapes workspace, skipping",
-                          file=sys.stderr)
-                    continue
-                os.makedirs(os.path.dirname(dest) or dest_dir, exist_ok=True)
-                shutil.copy2(src, dest)
+            if not os.path.isfile(src):
+                print(f"warning: seed file {src!r} does not exist — skipping",
+                      file=sys.stderr)
+                continue
+            dest = os.path.realpath(os.path.join(dest_dir, dest_rel))
+            if not dest.startswith(os.path.realpath(dest_dir) + os.sep):
+                print(f"warning: seed file {dest_rel!r} escapes workspace, skipping",
+                      file=sys.stderr)
+                continue
+            os.makedirs(os.path.dirname(dest) or dest_dir, exist_ok=True)
+            shutil.copy2(src, dest)
 
     def _render_prompt(self, spec: EvalSpec) -> str:
         prompt = spec.rendered_prompt()
@@ -436,7 +480,12 @@ class Runner:
                      [e.to_dict() for e in jrr.events])
         _write_json(os.path.join(cell_dir, "judge_result.json"), jrr.to_dict())
 
-        judge_assertion = next((a for a in cell.assertions if a.type == "llm_judge"), None)
+        # The LAST llm_judge assertion, to match ctx.judge_exec — _llm_judge overwrites
+        # judge_exec on each run, so with several llm_judge assertions the saved exec trace
+        # belongs to the final one; picking the first would pair a verdict with the wrong
+        # transcript.
+        judge_assertion = next(
+            (a for a in reversed(cell.assertions) if a.type == "llm_judge"), None)
         judge_cell = CellResult(
             agent=jrr.agent,
             model=jrr.resolved_model or cell.model,
@@ -587,7 +636,8 @@ def render_markdown(results: list[CellResult], agent: str,
         heading += f" ({command})"
     lines = [heading, "",
              "Each cell links to a per-cell `report.md` — the prompt the model was given, "
-             "its complete response (full transcript), and every file it produced.", "",
+             "its complete response (full transcript), and the workspace files after the "
+             "run (seeded inputs marked).", "",
              "| eval | " + " | ".join(labels) + " |",
              "|" + "---|" * (len(labels) + 1)]
     for ev in evals:
@@ -695,12 +745,15 @@ def render_report(cell: CellResult) -> str:
 
     workspace = os.path.join(cell.artifacts_dir, "workspace")
     extra = writes_outside_workspace(rr, workspace)
-    out += ["", "## Files the model produced", "",
-            "```", file_tree(workspace, extra), "```"]
-    inline = inline_files(workspace, extra)
+    seeded = set(cell.seeded_paths)
+    out += ["", "## Files in the workspace after the run", "",
+            "```", file_tree(workspace, extra, seeded=seeded), "```"]
+    inline = inline_files(workspace, extra,
+                          max_bytes=REPORT_MAX_INLINE_BYTES, truncate=True, seeded=seeded)
     if inline.strip():
         out += ["", inline]
-    out += ["", "_(Non-text files are listed above but not inlined.)_"]
+    out += ["", "_(Non-text files are listed above but not inlined; files seeded before the "
+                "run are marked as inputs.)_"]
 
     out += ["", "## Judge verdict", ""]
     judge_a = next((a for a in cell.assertions if a.type == "llm_judge"), None)
@@ -744,9 +797,39 @@ def _model_seg(model: Optional[str]) -> str:
     return safe
 
 
-def _looks_like_model_error(error: Optional[str], stderr: Optional[str]) -> bool:
+# Phrases a CLI actually emits when rejecting a model id. Deliberately tight: the old
+# any-of ("model", "not found", "unknown", "invalid", "unsupported") heuristic re-labelled
+# unrelated failures as "model rejected" whenever stderr merely mentioned the model name or
+# said "not found" about something else.
+_MODEL_ERR_PHRASES = (
+    "invalid model", "unknown model", "model not found", "model_not_found",
+    "unsupported model", "no such model", "not a valid model", "model is not available",
+    "model not available", "model not supported",
+)
+_MODEL_ERR_KEYWORDS = ("not found", "unknown", "invalid", "unsupported",
+                       "not available", "rejected")
+
+
+def _looks_like_model_error(error: Optional[str], stderr: Optional[str],
+                            model: Optional[str] = None) -> bool:
     blob = f"{error or ''} {stderr or ''}".lower()
-    return any(k in blob for k in ("model", "not found", "unknown", "invalid", "unsupported"))
+    if any(p in blob for p in _MODEL_ERR_PHRASES):
+        return True
+    # …or the specific model id is named alongside a rejection keyword.
+    return bool(model) and model.lower() in blob and any(
+        k in blob for k in _MODEL_ERR_KEYWORDS)
+
+
+def _remap_paths(obj, old: str, new: str):
+    """Rewrite the (now deleted) exec_ws tempdir prefix to the final workspace path in
+    assertion details, recursively over dicts/lists/strings."""
+    if isinstance(obj, str):
+        return obj.replace(old, new)
+    if isinstance(obj, list):
+        return [_remap_paths(x, old, new) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _remap_paths(v, old, new) for k, v in obj.items()}
+    return obj
 
 
 def _write(path: str, text: str) -> None:
