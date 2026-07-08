@@ -39,6 +39,10 @@ class CodexAdapter(Adapter):
     # CODEX_HOME overrides ~/.codex (skills under $CODEX_HOME/skills). Under isolation it's
     # mirrored + repointed (custom home kept, skills masked), else cleared to the isolated home.
     isolation_config_homes = [("CODEX_HOME", "skills")]
+    # No dedicated flag; the config.toml key `model_reasoning_effort` (settable per-run via
+    # `-c`) reaches the API as `reasoning.effort` (verified 2026-07-08: the API echoes
+    # supported values none|minimal|low|medium|high|xhigh on a bad one).
+    supports_reasoning_effort = True
     has_model_list = True
 
     def discover_models(self) -> Optional[list[str]]:
@@ -92,6 +96,9 @@ class CodexAdapter(Adapter):
                  "--json"]
         if opts.model:
             argv += ["-m", opts.model]
+        if opts.reasoning_effort:
+            # Quoted so the value part parses as a TOML string (see `-c` help text).
+            argv += ["-c", f'model_reasoning_effort="{opts.reasoning_effort}"']
         argv += opts.extra_args
         argv += [prompt]  # prompt is positional and must come last
         return argv

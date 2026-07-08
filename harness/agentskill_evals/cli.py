@@ -19,7 +19,15 @@ from .isolation import resolve_visible_skills
 from .judge import Judge
 from .progress import Progress
 from .runner import Runner, _cell_text, _safe, render_matrix
-from .spec import _load_raw, discover_specs, load_scenario, load_spec, skill_names, validate_spec
+from .spec import (
+    REASONING_EFFORT_LEVELS,
+    _load_raw,
+    discover_specs,
+    load_scenario,
+    load_spec,
+    skill_names,
+    validate_spec,
+)
 
 DEFAULT_MAX_CELLS = 25
 DEFAULT_JOBS = 1
@@ -430,6 +438,16 @@ def cmd_run(args) -> int:
     isolated = (not args.no_isolated) and (ov.get("isolated") is not False)
     provision = not args.no_provision
 
+    # reasoning effort: CLI flag > per-spec `reasoning_effort:`. Warn up front when the
+    # chosen runner can't honor it — the run proceeds with the runner's default effort.
+    if not get_adapter(agent).supports_reasoning_effort:
+        wanted = args.reasoning_effort or next(
+            (s.reasoning_effort for s in specs if s.reasoning_effort), None)
+        if wanted:
+            print(f"warning: runner {agent!r} has no reasoning-effort control — "
+                  f"`reasoning_effort: {wanted}` is ignored (on antigravity pick a tiered "
+                  "model id instead, e.g. gemini-3.5-flash-medium).", file=sys.stderr)
+
     if isolated:
         managed = {"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
                    "XDG_CACHE_HOME", "XDG_STATE_HOME"}
@@ -452,10 +470,15 @@ def cmd_run(args) -> int:
     run_id = args.run_id or _default_run_id(args, scenario, specs)
     run_dir = os.path.join(os.path.abspath(args.artifacts), run_id)
 
+    # Only shown when set somewhere — an unset effort keeps the plan line unchanged.
+    efforts = sorted({e for e in ((args.reasoning_effort or s.reasoning_effort)
+                                  for s in specs) if e})
+    effort_label = f"   effort: {'/'.join(efforts)}" if efforts else ""
+
     print(f"Plan: {n_cells} cell(s) — {n_eligible} eval(s) × {agent} "
           f"[{', '.join(model_labels)}]")
-    print(f"      judge: {judge_label}   isolated: {'on' if isolated else 'off'}   "
-          f"≈{n_llm} LLM calls   artifacts: {run_dir}\n")
+    print(f"      judge: {judge_label}   isolated: {'on' if isolated else 'off'}"
+          f"{effort_label}   ≈{n_llm} LLM calls   artifacts: {run_dir}\n")
 
     if args.dry_run:
         _print_skill_visibility(specs, agent, isolated, skills_root, provision)
@@ -504,6 +527,8 @@ def cmd_run(args) -> int:
     cmd_parts.append(f"--agent {agent}")
     if cli_models:
         cmd_parts.append(f"--model {','.join(cli_models)}")
+    if args.reasoning_effort:
+        cmd_parts.append(f"--reasoning-effort {args.reasoning_effort}")
     command = " ".join(cmd_parts)
 
     with Progress(total_cells=n_cells) as progress:
@@ -516,6 +541,7 @@ def cmd_run(args) -> int:
             judge=judge,
             provision=provision,
             auto_approve=not args.no_auto_approve,
+            reasoning_effort=args.reasoning_effort,
             jobs=jobs,
             isolated=isolated,
             progress=progress,
@@ -803,6 +829,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-auto-approve", action="store_true",
                     help="don't auto-approve tool/file actions")
     sp.add_argument("--model", help="model(s) to run, comma-separated; overrides models.yaml")
+    sp.add_argument("--reasoning-effort", choices=list(REASONING_EFFORT_LEVELS),
+                    help="thinking/reasoning budget for agent runs; overrides an eval/"
+                         "scenario's `reasoning_effort:`. Mapped to the runner's native "
+                         "control (claude --effort, codex model_reasoning_effort, copilot "
+                         "--reasoning-effort); ignored with a warning by runners without "
+                         "one (antigravity encodes effort in the model id tier instead)")
     sp.add_argument("--models-config", help="models.yaml path (default: <skills-root>/models.yaml)")
     sp.add_argument("--all-models", action="store_true",
                     help="run this agent's full models.yaml list (default: just the cheapest)")

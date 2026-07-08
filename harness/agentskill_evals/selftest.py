@@ -681,6 +681,7 @@ def _check_workspace_relocation(failures, verbose):
         r.artifacts_root = os.path.join(repo_root, "artifacts")
         r.run_id, r.skills_root, r.judge = "run1", repo_root, None
         r.provision, r.command, r.auto_approve = False, "", True
+        r.reasoning_effort = None
         r.jobs, r.isolated, r.progress = 1, True, None
         r._repo_skill_names, r.run_dir = set(), run_dir
 
@@ -756,6 +757,7 @@ def _check_parallel_cell_idx(failures, verbose):
         r.artifacts_root = os.path.join(repo_root, "artifacts")
         r.run_id, r.skills_root, r.judge = "run1", repo_root, None
         r.provision, r.command, r.auto_approve = False, "", True
+        r.reasoning_effort = None
         r.jobs, r.isolated = 2, True
         r.progress = _RecordingProgress(total_cells=2, file=open(os.devnull, "w"))
         r._repo_skill_names, r.run_dir = set(), run_dir
@@ -810,6 +812,7 @@ def _check_cell_crash_safety(failures, verbose):
         r.artifacts_root = os.path.join(repo_root, "artifacts")
         r.run_id, r.skills_root, r.judge = "run1", repo_root, None
         r.provision, r.command, r.auto_approve = False, "", True
+        r.reasoning_effort = None
         r.jobs, r.isolated, r.progress = 1, True, None
         r._repo_skill_names, r.run_dir = set(), run_dir
 
@@ -1501,6 +1504,132 @@ def _check_scenario_override_validation(failures, verbose):
            f"a numeric string is coerced to int: {scen.overrides}", failures, verbose)
 
 
+def _check_reasoning_effort(failures, verbose):
+    """The typed `reasoning_effort` knob (issue #67): validated at spec load, threaded
+    CLI-override > spec > unset through Runner into RunOptions, and mapped per adapter only
+    where the CLI has an equivalent control (claude --effort, codex model_reasoning_effort,
+    copilot --reasoning-effort; antigravity has none — effort lives in its model-id tier)."""
+    import os
+    import shutil
+    import tempfile
+
+    import agentskill_evals.runner as runner_mod
+    from .exec import ExecResult
+    from .schema import RunResult
+    from .spec import REASONING_EFFORT_LEVELS, EvalSpec, _spec_from_raw, load_scenario
+
+    print("reasoning effort:")
+
+    # --- per-adapter argv mapping ---
+    argv = get_adapter("claude").build_argv("p", RunOptions(reasoning_effort="high"), cwd="/tmp")
+    _check("effort.claude_flag",
+           "--effort" in argv and argv[argv.index("--effort") + 1] == "high",
+           f"claude maps to --effort: {argv}", failures, verbose)
+    argv = get_adapter("codex").build_argv("p", RunOptions(reasoning_effort="low"), cwd="/tmp")
+    _check("effort.codex_config",
+           'model_reasoning_effort="low"' in argv
+           and argv[argv.index('model_reasoning_effort="low"') - 1] == "-c"
+           and argv[-1] == "p",
+           f"codex maps to -c model_reasoning_effort, before the positional prompt: {argv}",
+           failures, verbose)
+    argv = get_adapter("copilot").build_argv("p", RunOptions(reasoning_effort="medium"), cwd="/tmp")
+    _check("effort.copilot_flag",
+           "--reasoning-effort" in argv
+           and argv[argv.index("--reasoning-effort") + 1] == "medium",
+           f"copilot maps to --reasoning-effort: {argv}", failures, verbose)
+    for name in ("claude", "codex", "copilot"):
+        _check(f"effort.{name}_supported_declared",
+               get_adapter(name).supports_reasoning_effort,
+               f"{name} declares supports_reasoning_effort", failures, verbose)
+    ag = get_adapter("antigravity")
+    _check("effort.antigravity_unsupported", not ag.supports_reasoning_effort,
+           "antigravity declares no reasoning-effort support (tiered model ids instead)",
+           failures, verbose)
+    ag_plain = ag.build_argv("p", RunOptions(), cwd="/tmp")
+    ag_effort = ag.build_argv("p", RunOptions(reasoning_effort="high"), cwd="/tmp")
+    _check("effort.antigravity_argv_unchanged", ag_plain == ag_effort,
+           f"antigravity argv unchanged when effort set: {ag_effort}", failures, verbose)
+
+    # --- unset keeps every argv unchanged (existing behavior preserved) ---
+    for name in ("claude", "codex", "copilot"):
+        plain = get_adapter(name).build_argv("p", RunOptions(), cwd="/tmp")
+        _check(f"effort.{name}_absent_when_unset",
+               not any("effort" in a for a in plain),
+               f"{name} argv carries no effort token when unset: {plain}", failures, verbose)
+
+    # --- spec load: normalization + typed validation ---
+    s = _spec_from_raw({"prompt": "p", "reasoning_effort": " HIGH "}, "/x.yaml")
+    _check("effort.spec_normalized", s.reasoning_effort == "high",
+           f"value is trimmed + lowercased at load: {s.reasoning_effort!r}", failures, verbose)
+    _check("effort.spec_default_none",
+           _spec_from_raw({"prompt": "p"}, "/x.yaml").reasoning_effort is None,
+           "unset stays None", failures, verbose)
+    try:
+        _spec_from_raw({"prompt": "p", "reasoning_effort": "hgih"}, "/x.yaml")
+        bad_ok = False
+    except ValueError as exc:
+        bad_ok = all(l in str(exc) for l in REASONING_EFFORT_LEVELS)
+    _check("effort.spec_bad_value_rejected", bad_ok,
+           "an unknown level raises a clean ValueError naming the valid levels",
+           failures, verbose)
+
+    # --- scenario files get the same field (via the shared _spec_from_raw) ---
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        f.write('{"name": "s", "prompt": "p", "reasoning_effort": "medium", '
+                '"target": {"runner": "claude"}}')
+        scen_path = f.name
+    try:
+        scen = load_scenario(scen_path)
+    finally:
+        os.unlink(scen_path)
+    _check("effort.scenario_field", scen.spec.reasoning_effort == "medium",
+           f"a scenario's top-level reasoning_effort lands on its spec: "
+           f"{scen.spec.reasoning_effort!r}", failures, verbose)
+
+    # --- Runner threading: CLI override > spec > unset ---
+    repo_root = tempfile.mkdtemp(prefix="ase-effort-")
+    seen: dict = {}
+    orig_execute = runner_mod.execute
+
+    def _fake_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides, agent_name, eval_name):
+        seen["effort"] = opts.reasoning_effort
+        rr = RunResult(agent=agent_name, eval_name=eval_name, prompt=prompt,
+                       workdir=cwd, final_text="done")
+        return ExecResult(result=rr, stdout="", stderr="")
+
+    runner_mod.execute = _fake_execute
+    try:
+        r = runner_mod.Runner.__new__(runner_mod.Runner)
+        r.agent, r.adapter, r.models = "fake", _FakeAdapter(), [None]
+        r.artifacts_root = os.path.join(repo_root, "artifacts")
+        r.run_id, r.skills_root, r.judge = "run1", repo_root, None
+        r.provision, r.command, r.auto_approve = False, "", True
+        r.jobs, r.isolated, r.progress = 1, True, None
+        r._repo_skill_names = set()
+        r.run_dir = os.path.join(repo_root, "artifacts", "run1")
+        os.makedirs(r.run_dir)
+
+        spec = EvalSpec(name="demo", prompt="hi", reasoning_effort="low",
+                        source_path=os.path.join(repo_root, "demo.yaml"))
+        r.reasoning_effort = "high"
+        r._run_cell(None, spec)
+        _check("effort.cli_override_wins", seen.get("effort") == "high",
+               f"run-level effort beats the spec's: {seen.get('effort')!r}", failures, verbose)
+        r.reasoning_effort = None
+        r._run_cell(None, spec)
+        _check("effort.spec_value_used", seen.get("effort") == "low",
+               f"spec effort used when no run-level override: {seen.get('effort')!r}",
+               failures, verbose)
+        r._run_cell(None, EvalSpec(name="demo2", prompt="hi",
+                                   source_path=os.path.join(repo_root, "demo2.yaml")))
+        _check("effort.unset_stays_none", seen.get("effort") is None,
+               f"nothing set → RunOptions.reasoning_effort is None: {seen.get('effort')!r}",
+               failures, verbose)
+    finally:
+        runner_mod.execute = orig_execute
+        shutil.rmtree(repo_root, ignore_errors=True)
+
+
 def run_selftest(verbose: bool = False) -> int:
     failures: list[str] = []
 
@@ -2019,6 +2148,9 @@ def run_selftest(verbose: bool = False) -> int:
 
     # scenario run-knob overrides are type-checked at load
     _check_scenario_override_validation(failures, verbose)
+
+    # typed reasoning-effort knob: spec validation, Runner threading, per-adapter mapping
+    _check_reasoning_effort(failures, verbose)
 
     print()
     if failures:

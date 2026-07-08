@@ -34,6 +34,9 @@ class RunOptions:
 
     model: Optional[str] = None
     auto_approve: bool = True            # allow file/command execution without prompts
+    reasoning_effort: Optional[str] = None  # "low" | "medium" | "high" — thinking budget;
+                                            # mapped to a native flag only where the runner
+                                            # has one (see supports_reasoning_effort)
     output_schema: Optional[dict] = None  # JSON Schema for the final structured answer
     allowed_tools: Optional[list[str]] = None
     disable_tools: bool = False          # run reasoning-only (used by the judge)
@@ -93,6 +96,10 @@ class Adapter(ABC):
     isolation_config_homes: list[tuple[str, str]] = []
 
     supports_output_schema: bool = False
+    # True if build_argv maps RunOptions.reasoning_effort onto a native flag/config of this
+    # CLI. When False the option is silently ignored here — the CLI layer warns the user up
+    # front (cmd_run) so a run never half-applies an effort across a comparison matrix.
+    supports_reasoning_effort: bool = False
 
     # --- discovery ----------------------------------------------------------
 

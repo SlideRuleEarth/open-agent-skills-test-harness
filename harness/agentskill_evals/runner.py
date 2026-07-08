@@ -104,6 +104,7 @@ class Runner:
         judge: Optional[Judge] = None,
         provision: bool = True,
         auto_approve: bool = True,
+        reasoning_effort: Optional[str] = None,
         jobs: int = 1,
         isolated: bool = True,
         progress: Optional[Progress] = None,
@@ -119,6 +120,9 @@ class Runner:
         self.provision = provision
         self.command = command
         self.auto_approve = auto_approve
+        # Run-level override (from --reasoning-effort); per cell it beats the spec's own
+        # `reasoning_effort:` — same CLI-flag > file precedence as every other run knob.
+        self.reasoning_effort = reasoning_effort
         self.jobs = max(1, jobs)
         self.isolated = isolated
         self.progress = progress
@@ -303,6 +307,7 @@ class Runner:
         opts = RunOptions(
             model=model,
             auto_approve=self.auto_approve,
+            reasoning_effort=self.reasoning_effort or spec.reasoning_effort,
             output_schema=spec.output_schema,
             home=iso_home,
             isolation_env=iso_env,

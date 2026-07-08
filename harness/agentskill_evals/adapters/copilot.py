@@ -61,6 +61,9 @@ class CopilotAdapter(Adapter):
     binary = "copilot"
     skills_subdir = ".agents/skills"
     global_skills_subpaths = [".agents/skills"]
+    # `--reasoning-effort <level>` (verified 2026-07-08: choices none|low|medium|high|
+    # xhigh|max — the harness only passes the typed cross-runner subset low|medium|high).
+    supports_reasoning_effort = True
 
     # Hermetic flags — memory is already off in -p mode; these block the
     # remaining state channels (custom instructions / AGENTS.md, built-in
@@ -99,6 +102,8 @@ class CopilotAdapter(Adapter):
             argv += ["--allow-all"]
         if opts.model:
             argv += ["--model", opts.model]
+        if opts.reasoning_effort:
+            argv += ["--reasoning-effort", opts.reasoning_effort]
         if opts.disable_tools:
             argv += ["--available-tools", ""]
         argv += opts.extra_args

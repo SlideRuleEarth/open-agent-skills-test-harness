@@ -101,6 +101,11 @@ class AntigravityAdapter(Adapter):
     # channel independent of global_skills_subpaths above (see module docstring).
     global_plugin_registry_subpaths = [".gemini/config/plugins"]
 
+    # supports_reasoning_effort stays False: agy has no effort flag — thinking budget is
+    # encoded in the model id's tier suffix instead (e.g. gemini-3.5-flash-medium, see
+    # _display_to_model_id). RunOptions.reasoning_effort is ignored here (cmd_run warns);
+    # pick a tiered model id to control effort on this runner.
+
     has_model_list = True
 
     def discover_models(self) -> Optional[list[str]]:

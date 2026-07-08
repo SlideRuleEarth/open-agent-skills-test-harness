@@ -30,7 +30,10 @@ Per skill, in `<skill>/evals/*.yaml` (auto-discovered). Each eval
 - `files` — files the agent starts with
 - `rubric` — behaviors graded by an LLM judge
 - `assertions` — deterministic checks
-- optional `tags` / `vars` / `env` / `output_schema` / `timeout_sec`
+- optional `tags` / `vars` / `env` / `output_schema` / `timeout_sec` / `reasoning_effort`
+  (`low|medium|high` thinking budget; CLI `--reasoning-effort` overrides — mapped to claude
+  `--effort`, codex `model_reasoning_effort`, copilot `--reasoning-effort`; AntiGravity has no
+  equivalent control and warns + ignores it — pick a tiered model id there instead)
 
 ## Scenarios — the first-class higher-level eval
 

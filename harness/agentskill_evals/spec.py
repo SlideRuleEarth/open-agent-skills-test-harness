@@ -14,6 +14,9 @@ The improved, forward-looking eval format (YAML preferred, JSON also accepted):
     tags: [routing]
     vars: {}                           # {placeholders} substituted into prompt
     env: {}                            # extra env vars for the agent process
+    reasoning_effort: null             # low|medium|high — thinking budget, mapped per
+                                       # adapter; ignored (with a CLI warning) by runners
+                                       # with no equivalent control
 
     # Deterministic checks. All must pass.
     assertions:
@@ -46,6 +49,11 @@ from typing import Any, Optional
 
 EVAL_SUFFIXES = (".yaml", ".yml", ".json")
 
+# The typed cross-runner effort levels — deliberately the common subset every supporting
+# CLI accepts, so one scenario stays comparable across runners (runner-specific extremes
+# like codex's `minimal` or claude's `max` are not exposed).
+REASONING_EFFORT_LEVELS = ("low", "medium", "high")
+
 
 @dataclass
 class EvalSpec:
@@ -60,6 +68,7 @@ class EvalSpec:
     tags: list[str] = field(default_factory=list)
     vars: dict[str, Any] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
+    reasoning_effort: Optional[str] = None    # one of REASONING_EFFORT_LEVELS, or None
     assertions: list[dict] = field(default_factory=list)
     rubric: list[str] = field(default_factory=list)
     output_schema: Optional[dict] = None
@@ -395,6 +404,16 @@ def _spec_from_raw(raw: dict, path: str) -> EvalSpec:
             f"{path}: each `files` entry must be a string or a one-key "
             f"{{src: dest}} mapping of strings; got {entry!r}")
 
+    # Validate the typed effort value at load so a typo (`reasoning_effort: hgih`) is a clean
+    # `error: ...` before any tokens are spent, not a per-adapter CLI rejection mid-run.
+    effort = raw.get("reasoning_effort")
+    if effort is not None:
+        effort = str(effort).strip().lower()
+        if effort not in REASONING_EFFORT_LEVELS:
+            raise ValueError(
+                f"{path}: `reasoning_effort` must be one of "
+                f"{', '.join(REASONING_EFFORT_LEVELS)}; got {raw.get('reasoning_effort')!r}")
+
     name = raw.get("name") or os.path.splitext(os.path.basename(path))[0]
     skill_name = _infer_skill_name(path) or (skills[0] if skills else None)
 
@@ -409,6 +428,7 @@ def _spec_from_raw(raw: dict, path: str) -> EvalSpec:
         tags=raw.get("tags", []) or [],
         vars=raw.get("vars", {}) or {},
         env={str(k): str(v) for k, v in (raw.get("env", {}) or {}).items()},
+        reasoning_effort=effort,
         files=files,
         assertions=raw.get("assertions", []) or [],
         rubric=list(rubric),

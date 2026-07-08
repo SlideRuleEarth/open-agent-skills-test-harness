@@ -151,6 +151,7 @@ for AntiGravity) so the run is hermetic.
 | `tags` | filter with `run --tag` |
 | `vars` | `{placeholder}` substitutions into the prompt |
 | `env` | extra env vars for the agent process |
+| `reasoning_effort` | thinking/reasoning budget: `low` \| `medium` \| `high` (CLI `--reasoning-effort` overrides). Mapped to the runner's native control — claude `--effort`, codex `model_reasoning_effort`, copilot `--reasoning-effort`. AntiGravity has no such control (effort is encoded in its model-id tier, e.g. `gemini-3.5-flash-medium`) — the value is ignored there with a warning. Unset = each runner's own default |
 | `assertions` | deterministic checks (below) |
 | `rubric` | behaviors graded by the LLM judge (legacy `expected_behavior` accepted) |
 | `output_schema` | JSON Schema for the final structured answer |
@@ -217,6 +218,9 @@ agentskill-evals run --agent claude --evals path/to/eval.yaml --no-judge
 # grade with a different judge agent, and pin the run's own model
 agentskill-evals run --agent claude --skill foo --judge-agent codex
 agentskill-evals run --agent claude --skill foo --model claude-haiku-4-5
+
+# pin a comparable thinking budget across runners (claude/codex/copilot)
+agentskill-evals run --agent codex --skill foo --reasoning-effort high
 ```
 
 Output: a pass/fail matrix on stdout, plus per-run artifacts under
@@ -319,6 +323,7 @@ prompt: |
   Using {skills}, write run.py that ...
 rubric: [ ... ]
 assertions: [{type: file_exists, path: run.py}]
+reasoning_effort: high   # optional: low|medium|high thinking budget (see the fields table)
 judge: true        # optional run knobs (CLI flags override): judge / isolated / max_cells / jobs
 isolated: true
 ```
