@@ -502,11 +502,14 @@ def _check_workspace_view_skill_dir_match(failures, verbose):
 
 def _check_leaked_skill_reads(failures, verbose):
     """Reproduces the antigravity escape from run 20260707-072933_scen_SimpleATL06PromptGrandMesa:
-    the eval workspace is nested inside this repo's own checkout (``<repo>/artifacts/<run>/.../
-    workspace``); ``git init`` in the workspace (runner.py) stops a skill-discovery mechanism that
-    deliberately halts its walk-up at the nearest ``.git``, but does nothing against a
-    general-purpose file-browsing agent that just ``list_dir``s a parent directory by absolute
-    path and reads whatever undeclared skill sits there in plain sight. The real transcript showed
+    the eval workspace was nested inside this repo's own checkout (``<repo>/artifacts/<run>/.../
+    workspace``). At the time, a ``git init`` in the workspace (runner.py) stopped a
+    skill-discovery mechanism that deliberately halts its walk-up at the nearest ``.git``, but did
+    nothing against a general-purpose file-browsing agent that just ``list_dir``s a parent
+    directory by absolute path and reads whatever undeclared skill sits there in plain sight — so
+    the `git init` boundary was later removed as dead weight once the exec workspace was relocated
+    to a tempdir outside the repo tree (see the "how one cell runs" isolation layers in
+    runner.py). The real transcript showed
     exactly that: `list_dir` on the scenario dir, then the repo root, then `view_file` on
     ``sliderule-api/SKILL.md`` and ``sliderule-openapi/scripts/openapi.py`` — none of which were
     declared — while the run was still reported as ``isolated: true``.

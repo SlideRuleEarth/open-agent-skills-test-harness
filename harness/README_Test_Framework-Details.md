@@ -46,11 +46,14 @@ file (`CLI > scenario > default`). See [scenarios/README.md](../scenarios/README
 [runner.py](agentskill_evals/runner.py) →
 [exec.py](agentskill_evals/exec.py):
 
-1. Build a hermetic workspace, provision the eval's skill(s) (symlink, fallback copy), and —
-   by default — isolate skill visibility via two layers: an **isolated HOME** that masks
-   globally-installed repo skills, and a **`git init`** in the workspace that stops agents from
-   walking up to the repo root to discover project-level skills. Together these ensure the model
-   sees only what's provisioned plus the agent's vendor skills (`--no-isolated` opts out).
+1. Build a hermetic workspace, provision the eval's skill(s) (copy, never symlink — so a run
+   that writes inside a provisioned skill dir mutates only the throwaway copy), and — by
+   default — isolate skill visibility via two layers: an **isolated HOME** that masks
+   globally-installed repo skills, and running the cell's workspace in a **tempdir with no
+   path relationship to this repo's checkout** so there's no real repo root above it for any
+   skill-discovery mechanism — `.git`-aware or a general-purpose file-browsing agent doing
+   plain absolute-path `list_dir`s — to walk up into. Together these ensure the model sees only
+   what's provisioned plus the agent's vendor skills (`--no-isolated` opts out).
 2. Run the agent CLI through its adapter with the eval prompt.
 3. Adapter `parse()` normalizes that CLI's output into a common
    [`NormalizedEvent`](agentskill_evals/schema.py) stream + `RunResult`

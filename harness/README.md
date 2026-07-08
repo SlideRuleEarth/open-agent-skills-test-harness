@@ -264,7 +264,9 @@ enables A/B testing with vs without skills.
   `run … --dry-run`, which prints a per-target *"Skills visible to the model"* block — no API cost.
 - **Caveats:** skills bundled inside a CLI's package or plugins live outside these dirs and are
   *not* masked (that's intentional — the platform baseline). On a platform without symlink
-  privileges the cell falls back to a non-isolated run with a warning. Config-dir *writes* still
+  privileges only the HOME-overlay layer falls back non-isolated, with a warning (`isolated`
+  is reported `false` for that cell) — the separate project-local tempdir-relocation layer
+  doesn't use symlinks and still applies regardless. Config-dir *writes* still
   pass through to the real dirs (only skill *visibility* is isolated). None of this is an OS-level
   jail — an agent that deliberately searches the whole disk (e.g. `find / -iname sliderule-skills`)
   rather than just exploring its own cwd can still find the real checkout, since it genuinely
