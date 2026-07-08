@@ -6,8 +6,8 @@ A short, plain-language FAQ for the skill test harness.
 
 Run a simple A/B test: take one prompt and run it twice on the same model — once with the skill
 provisioned and once without (`--no-provision`) — then compare the graded results. Because
-isolation is on by default, the "without" run sees no repo skills at all, so the skill is the only
-variable.
+isolation is on by default, the "without" run does not get repo skills through the harness's
+tracked skill-discovery paths, so the provisioned skill is the intended variable.
 
 The step-by-step walkthrough — writing the scenario, the neutral-prompt gotcha, previewing with
 `--dry-run`, and reading the two result sets — is in **[Simple-A-B-Test.md](HowTos/Simple-A-B-Test.md)**.
@@ -15,8 +15,8 @@ The step-by-step walkthrough — writing the scenario, the neutral-prompt gotcha
 ## Can I test a combination of skills?
 
 Yes. List several skills under a scenario's `skills:` block and they're provisioned **together**;
-with isolation on (the default) they're the *only* repo skills the model sees, so you're testing
-exactly that combination working in concert — nothing else from this repo leaks in.
+with isolation on (the default) they're the only repo skills exposed through normal skill
+discovery, so you're testing exactly that combination working in concert.
 
 The walkthrough — writing the multi-skill scenario, rubrics that check the skills hand off to each
 other, and previewing with `--dry-run` — is in
@@ -51,10 +51,10 @@ the file format. For scenarios in action, see the
 
 ## Which skills can the model actually see during a test?
 
-**Short answer:** by default, only the skills that test provisions for itself — plus the
-agent's own built-in skills. Each test runs in an isolated home directory that hides the
-SlideRule skills you've installed globally, so the model sees exactly the set the test
-declares (and nothing else from this repo).
+**Short answer:** by default, normal skill discovery sees only the skills that test provisions for
+itself — plus the agent's own built-in skills. Each test runs in an isolated home directory that
+hides the SlideRule skills you've installed globally, so the normal path is exactly the set the
+test declares.
 
 **What the harness does for each test**
 
@@ -62,8 +62,8 @@ declares (and nothing else from this repo).
 2. Adds the test's declared skills into that workspace.
 3. Runs the agent against a private home that mirrors your real one — so your logins, settings,
    and the agent's own bundled skills keep working — but with this repo's global skills hidden.
-4. So the model sees the provisioned skills plus the agent's vendor skills, and no other repo
-   skills you happen to have installed.
+4. So normal skill discovery sees the provisioned skills plus the agent's vendor skills, and no
+   other repo skills you happen to have installed in the tracked global/project locations.
 
 **Want to test against your real, installed setup instead?** Pass `--no-isolated`. Then the
 agent also sees whatever skills you've installed globally — the test's skills *plus* every
@@ -94,5 +94,8 @@ global install that's missing a skill).
 
 - Your logins, settings, and git config still work under isolation — only this repo's global
   skills are masked.
-- There's also a switch (`--no-provision`) to skip provisioning entirely, to rely solely on
-  your global install.
+- This is skill-visibility isolation, not an OS-level jail. A deliberate broad-disk search can
+  still find the real checkout; if the captured trace shows an undeclared repo-skill read, that
+  cell is reported as not isolated.
+- `--no-provision` by itself creates a no-repo-skills baseline under isolation. Pair it with
+  `--no-isolated` when you intentionally want to rely on your real global install.

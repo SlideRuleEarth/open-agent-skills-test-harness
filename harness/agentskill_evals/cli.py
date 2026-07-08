@@ -714,8 +714,8 @@ def cmd_list_skills(args) -> int:
             print(f"  ⚠ drift: global is missing {', '.join(missing_skills)} "
                   "(run `make link-global` to refresh)")
 
-    print("\nWith isolation ON (default) a run sees only the skills it provisions + vendor "
-          "skills; with --no-isolated it also sees the repo skills above.")
+    print("\nWith isolation ON (default) normal skill discovery sees only the skills a run "
+          "provisions + vendor skills; with --no-isolated it also sees the repo skills above.")
     print("Note: skills bundled inside a CLI's own package aren't listed here; skills nested\n"
           "in a tracked plugin registry (see 'dirs' above) are, folded into vendor/masked.")
     return 0
@@ -755,7 +755,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-provision", action="store_true", help="don't copy skills into workspaces")
     sp.add_argument("--no-isolated", action="store_true",
                     help="also expose your globally-installed repo skills (default: each run is "
-                         "isolated to only the skills it provisions + the agent's vendor skills)")
+                         "isolated so normal skill discovery sees only provisioned skills + the "
+                         "agent's vendor skills)")
     sp.add_argument("--no-auto-approve", action="store_true",
                     help="don't auto-approve tool/file actions")
     sp.add_argument("--model", help="model(s) to run, comma-separated; overrides models.yaml")

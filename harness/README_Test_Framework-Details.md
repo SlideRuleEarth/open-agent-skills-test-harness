@@ -37,9 +37,10 @@ Per skill, in `<skill>/evals/*.yaml` (auto-discovered). Each eval
 Per-skill evals test one skill at a time. A **scenario** is a higher-level, ad-hoc eval: one
 self-describing file ([scenarios/](../scenarios/)) that provisions a **combination of skills
 together** and pins a **target** (`runner:model`), run with `agentskill-evals run --config
-<file>`. Because runs are isolated by default, a scenario tests exactly its declared skill set
-(plus the agent's vendor skills) — nothing else from this repo leaks in. CLI flags override the
-file (`CLI > scenario > default`). See [scenarios/README.md](../scenarios/README.md).
+<file>`. Because runs are isolated by default, normal skill discovery sees the declared skill set
+(plus the agent's vendor skills) and not other repo skills from tracked global/project locations.
+CLI flags override the file (`CLI > scenario > default`). See
+[scenarios/README.md](../scenarios/README.md).
 
 ## How one cell runs
 
@@ -52,8 +53,11 @@ file (`CLI > scenario > default`). See [scenarios/README.md](../scenarios/README
    globally-installed repo skills, and running the cell's workspace in a **tempdir with no
    path relationship to this repo's checkout** so there's no real repo root above it for any
    skill-discovery mechanism — `.git`-aware or a general-purpose file-browsing agent doing
-   plain absolute-path `list_dir`s — to walk up into. Together these ensure the model sees only
-   what's provisioned plus the agent's vendor skills (`--no-isolated` opts out).
+   plain absolute-path `list_dir`s — to walk up into. Together these make normal skill discovery
+   see only what's provisioned plus the agent's vendor skills (`--no-isolated` opts out).
+   This is skill-visibility isolation, not an OS-level filesystem jail; deliberate broad-disk
+   searches can still find the real checkout, and the harness downgrades a cell's `isolated`
+   flag if the captured trace shows an undeclared repo-skill read.
 2. Run the agent CLI through its adapter with the eval prompt.
 3. Adapter `parse()` normalizes that CLI's output into a common
    [`NormalizedEvent`](agentskill_evals/schema.py) stream + `RunResult`

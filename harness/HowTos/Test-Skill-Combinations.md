@@ -10,8 +10,8 @@ self-describing file.
 ## The idea in one line
 
 List several skills under a scenario's `skills:` block. They're all provisioned into the run, and —
-because isolation is on by default — they're the **only** repo skills the model can see. So the run
-tests *exactly* that combination working in concert; nothing else from this repo leaks in.
+because isolation is on by default — they're the only repo skills exposed through normal skill
+discovery. So the run tests that combination working in concert.
 
 ## 1. Write the scenario
 
@@ -56,7 +56,7 @@ isolated: true                   # keep the default — only these three skills 
 ## 2. Preview (no API cost)
 
 `--dry-run` prints the plan and a **"Skills visible to the model"** block — confirm all three show
-up under `provisioned` and that nothing else from the repo is visible:
+up under `provisioned` and that other repo skills are masked:
 
 ```bash
 agentskill-evals run --config scenarios/atl06-pipeline_on_claude-haiku.yaml --dry-run

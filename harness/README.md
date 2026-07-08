@@ -245,8 +245,9 @@ harness blocks both:
    `workspace_view.py`, the after-the-fact detector that catches it if it ever recurs some other
    way, and downgrades that cell's `isolated` flag to `false` instead of a silent false positive.
 
-Together these ensure the model sees only the skills the eval/scenario provisions — plus the
-agent's built-in/vendor skills — never other repo skills you happen to have installed.
+For normal skill discovery, these layers make the model see only the skills the eval/scenario
+provisions — plus the agent's built-in/vendor skills — not other repo skills you happen to have
+installed.
 This is what makes "test skill X (or this *combination*) in isolation" actually true, and
 enables A/B testing with vs without skills.
 

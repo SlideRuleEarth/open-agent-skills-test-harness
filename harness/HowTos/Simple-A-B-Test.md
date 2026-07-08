@@ -9,13 +9,13 @@ thing that changes between the two runs is whether the skill is provisioned.
 
 ## The idea in one line
 
-Isolation is **on by default**, so a run sees *only* the skills it provisions (plus the agent's
-own vendor skills). That gives you a clean toggle:
+Isolation is **on by default**, so normal skill discovery sees only the skills the run provisions
+(plus the agent's own vendor skills). That gives you a clean toggle:
 
 | Arm | Command | What the model sees |
 | --- | --- | --- |
 | **With skill** (treatment) | `run --config <file>` | the scenario's skill(s) + vendor skills |
-| **Without skill** (baseline) | `run --config <file> --no-provision` | no repo skills — just vendor skills |
+| **Without skill** (baseline) | `run --config <file> --no-provision` | no repo skills through normal discovery — just vendor skills |
 
 Same prompt, same model, same rubric and assertions → the difference in the graded result is the
 skill's contribution.

@@ -21,9 +21,9 @@ Preview first — see the plan **and exactly which skills the model will see**, 
 agentskill-evals run --config scenarios/example_api+params_on_claude-haiku.yaml --dry-run
 ```
 
-By default each run is **isolated**: the model sees only the skills the scenario lists (plus the
-agent's own vendor skills), never other skills you have installed globally. Add `--no-isolated`
-to test against your real, globally-installed setup instead.
+By default each run is **isolated**: normal skill discovery sees only the skills the scenario lists
+(plus the agent's own vendor skills), while other repo skills in tracked global/project locations
+are masked. Add `--no-isolated` to test against your real, globally-installed setup instead.
 
 ## File format
 

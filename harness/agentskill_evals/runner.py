@@ -455,7 +455,11 @@ class Runner:
             "command": self.command,
             "agent": self.agent,
             "models": [m for m in self.models if m is not None] or ["default"],
+            # Keep the legacy `isolated` key as the requested run mode. Per-cell `isolated`
+            # records whether skill isolation actually held after fallback/leak detection.
             "isolated": self.isolated,
+            "isolation_requested": self.isolated,
+            "all_cells_isolated": all(c.isolated for c in results) if results else self.isolated,
             "n_evals": len(specs),
             "n_cells": len(results),
             "n_passed": sum(1 for c in results if c.passed),
