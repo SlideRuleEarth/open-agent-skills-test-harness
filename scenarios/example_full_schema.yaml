@@ -101,6 +101,18 @@ agents: null                           # list[str] | null (optional) — null = 
 timeout_sec: 600                       # int (optional, default: 600) — max seconds for the agent run
 
 # --------------------------------------------------------------------------
+# Reasoning effort — thinking budget for the target runner
+# --------------------------------------------------------------------------
+
+reasoning_effort: null                 # "low" | "medium" | "high" | null (optional, default: null)
+                                       # null = the runner's own default. CLI --reasoning-effort
+                                       # overrides. Mapped to the runner's native control:
+                                       # claude --effort, codex model_reasoning_effort,
+                                       # copilot --reasoning-effort. Antigravity has no such
+                                       # control (effort is part of its model id tier, e.g.
+                                       # gemini-3.5-flash-medium) — warned + ignored there.
+
+# --------------------------------------------------------------------------
 # Tags — for filtering with --tag
 # --------------------------------------------------------------------------
 
