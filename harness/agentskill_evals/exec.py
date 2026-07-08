@@ -7,6 +7,7 @@ subprocess/timeout/error handling in one place so adapters stay pure.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 from dataclasses import dataclass
 
@@ -53,34 +54,48 @@ def execute(
         return ExecResult(rr, "", "")
 
     try:
-        proc = subprocess.run(
+        # start_new_session puts the agent in its OWN process group: agent CLIs spawn
+        # children (shell tool commands, MCP servers), and subprocess.run's timeout kill
+        # only reaches the direct child — orphaned grandchildren would keep burning API
+        # budget and keep writing into the workspace while the runner relocates it.
+        # Killing the whole group on timeout reaps them too.
+        proc = subprocess.Popen(
             argv,
             cwd=cwd,
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             stdin=subprocess.DEVNULL,  # non-interactive: agents that probe stdin (e.g. codex
                                        # exec) get immediate EOF instead of blocking forever
+            start_new_session=hasattr(os, "killpg"),
         )
-        stdout, stderr, code = proc.stdout, proc.stderr, proc.returncode
-    except subprocess.TimeoutExpired as exc:
-        # On TimeoutExpired the partial stdout/stderr can come back as bytes even with
-        # text=True, so decode BEFORE appending the timeout note (else: can't concat str+bytes).
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode("utf-8", "replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode("utf-8", "replace")
-        stderr += f"\n[timeout after {timeout}s]"
-        rr.timed_out = True
-        rr.error = f"timed out after {timeout}s"
-        code = -9
     except FileNotFoundError:
         rr.error = f"{adapter.binary!r} not found on PATH"
         return ExecResult(rr, "", "")
     except Exception as exc:  # pragma: no cover - defensive
+        rr.error = f"exec failed: {exc}"
+        return ExecResult(rr, "", "")
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        code = proc.returncode
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        try:
+            # The group is dead, so the pipes close and this returns quickly with all
+            # output accumulated so far (communicate() retried after a timeout loses none).
+            stdout, stderr = proc.communicate(timeout=10)
+        except (subprocess.TimeoutExpired, ValueError, OSError):  # pragma: no cover
+            proc.kill()
+            stdout, stderr = "", ""
+        stdout = stdout or ""
+        stderr = (stderr or "") + f"\n[timeout after {timeout}s]"
+        rr.timed_out = True
+        rr.error = f"timed out after {timeout}s"
+        code = -9
+    except Exception as exc:  # pragma: no cover - defensive
+        _kill_process_group(proc)
         rr.error = f"exec failed: {exc}"
         return ExecResult(rr, "", "")
 
@@ -104,6 +119,21 @@ def execute(
         rr.error = f"{adapter.binary} exited with code {code}: {tail}"
 
     return ExecResult(rr, stdout, stderr)
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the agent's whole process group (POSIX); fall back to killing just the
+    direct child where process groups aren't available (Windows) or the group is gone."""
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        proc.kill()
+    except OSError:  # pragma: no cover — already gone
+        pass
 
 
 def _tail(text: str | None, limit: int = 400) -> str:

@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -111,7 +112,11 @@ class EvalSpec:
     def effective_assertions(self) -> list[dict]:
         """All checks to run: explicit assertions + compiled rubric + schema."""
         out = list(self.assertions)
-        if self.rubric:
+        # Same dedup guard as output_matches_schema below: an explicit `llm_judge` assertion
+        # (the documented way to set `threshold`) already grades the top-level rubric via
+        # `cfg.get("rubric") or spec.rubric`, so compiling a second judge assertion would run
+        # — and bill — the judge twice on the same rubric.
+        if self.rubric and not any(a.get("type") == "llm_judge" for a in out):
             out.append({"type": "llm_judge", "rubric": list(self.rubric)})
         if self.output_schema and not any(
             a.get("type") == "output_matches_schema" for a in out
@@ -139,7 +144,6 @@ _REQUIRED_KEYS: dict[str, list[str]] = {
 _NEEDS_CRITERION = {"ran_command", "final_contains"}
 _CRITERION_KEYS = {"contains", "matches", "equals"}
 
-import re
 _PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 
 
@@ -264,6 +268,14 @@ def validate_spec(spec: "EvalSpec", *,
         warnings.append(
             "rubric has items but judge is disabled — rubric will be silently skipped")
 
+    # --- rubric shadowed by an explicit llm_judge with its own rubric ---
+    explicit_judge_rubrics = [a for a in spec.assertions
+                              if a.get("type") == "llm_judge" and a.get("rubric")]
+    if spec.rubric and explicit_judge_rubrics:
+        warnings.append(
+            "top-level `rubric:` is ignored — an explicit `llm_judge` assertion defines its "
+            "own rubric, and only one judge run happens per cell")
+
     # --- duplicate assertions ---
     seen: list[str] = []
     for a in spec.assertions:
@@ -287,12 +299,15 @@ def validate_spec(spec: "EvalSpec", *,
             "will have no effect")
 
     # --- seed files / fixture existence ---
+    # Errors, not warnings: a missing seed/fixture is silently SKIPPED at run time
+    # (runner._seed_files), so the eval would run without its declared inputs and fail
+    # confusingly downstream — better to block before spending tokens.
     for src, _ in spec.resolved_files():
         if not os.path.isfile(src):
-            warnings.append(f"seed file {src!r} does not exist — workspace copy will fail")
+            errors.append(f"seed file {src!r} does not exist — fix `files:` or the path")
     fixture = spec.resolved_fixture()
     if fixture and not os.path.isdir(fixture):
-        warnings.append(f"fixture {fixture!r} does not exist — workspace setup will fail")
+        errors.append(f"fixture {fixture!r} does not exist — fix `fixture:` or the path")
 
     # --- empty rubric items ---
     for i, r in enumerate(spec.rubric):
@@ -366,6 +381,20 @@ def _spec_from_raw(raw: dict, path: str) -> EvalSpec:
             f"{path}: `skills` must be a string or a list of strings, "
             f"got {type(skills).__name__}")
 
+    # Validate `files:` entries up front — resolved_files() assumes each entry is a string
+    # or a one-key {src: dest} mapping, and a malformed entry (e.g. a two-key dict) would
+    # otherwise surface later as a raw TypeError inside validation instead of a clean error.
+    files = raw.get("files", []) or []
+    for entry in files:
+        if isinstance(entry, str):
+            continue
+        if (isinstance(entry, dict) and len(entry) == 1
+                and all(isinstance(x, str) for kv in entry.items() for x in kv)):
+            continue
+        raise ValueError(
+            f"{path}: each `files` entry must be a string or a one-key "
+            f"{{src: dest}} mapping of strings; got {entry!r}")
+
     name = raw.get("name") or os.path.splitext(os.path.basename(path))[0]
     skill_name = _infer_skill_name(path) or (skills[0] if skills else None)
 
@@ -374,13 +403,13 @@ def _spec_from_raw(raw: dict, path: str) -> EvalSpec:
         prompt=str(prompt).strip(),
         description=raw.get("description", ""),
         skills=skills,
-        files=raw.get("files", []) or [],
         fixture=raw.get("fixture"),
         agents=raw.get("agents"),
         timeout_sec=int(raw.get("timeout_sec", 600)),
         tags=raw.get("tags", []) or [],
         vars=raw.get("vars", {}) or {},
         env={str(k): str(v) for k, v in (raw.get("env", {}) or {}).items()},
+        files=files,
         assertions=raw.get("assertions", []) or [],
         rubric=list(rubric),
         output_schema=raw.get("output_schema"),
@@ -434,6 +463,22 @@ def load_scenario(path: str) -> Scenario:
     spec.skill_name = "scenario"         # artifacts: .../<runner>/<model>/scenario/<name>/
 
     overrides = {k: raw[k] for k in _SCENARIO_OVERRIDE_KEYS if k in raw}
+    # Type-check the overrides here so a bad value (`jobs: [2]`, `max_cells: many`) gets the
+    # same clean `error: ...` treatment as any other malformed scenario, instead of an
+    # unguarded int() traceback later in cmd_run.
+    for k in ("max_cells", "jobs"):
+        if k in overrides:
+            try:
+                overrides[k] = int(overrides[k])
+            except (TypeError, ValueError):
+                raise ValueError(f"{path}: `{k}` must be an integer, got {overrides[k]!r}")
+    if "isolated" in overrides and not isinstance(overrides["isolated"], bool):
+        raise ValueError(
+            f"{path}: `isolated` must be true or false, got {overrides['isolated']!r}")
+    if "judge" in overrides and not isinstance(overrides["judge"], (bool, dict)):
+        raise ValueError(
+            f"{path}: `judge` must be true/false or a mapping {{agent, model}}, "
+            f"got {overrides['judge']!r}")
     return Scenario(spec=spec, runner=runner.strip(), models=models,
                     overrides=overrides, source_path=os.path.abspath(path))
 

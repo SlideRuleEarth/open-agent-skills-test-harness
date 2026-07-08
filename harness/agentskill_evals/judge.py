@@ -38,6 +38,7 @@ from .workspace_view import (
     JUDGE_MAX_INLINE_FILES,
     file_tree,
     inline_files,
+    seeded_relpaths,
     writes_outside_workspace,
 )
 
@@ -126,9 +127,12 @@ def _build_prompt(spec: Any, result: RunResult, workdir: str, rubric: list[str],
     commands = result.commands()
     tools = result.tool_names()
     extra = writes_outside_workspace(result, workdir)
-    tree = file_tree(workdir, extra, max_files=JUDGE_MAX_FILES)
+    # Annotate seeded fixture/files: the judge must not credit a pre-seeded input as work
+    # the agent did.
+    seeded = seeded_relpaths(spec)
+    tree = file_tree(workdir, extra, max_files=JUDGE_MAX_FILES, seeded=seeded)
     inline = inline_files(workdir, extra, max_files=JUDGE_MAX_INLINE_FILES,
-                          max_bytes=JUDGE_MAX_INLINE_BYTES)
+                          max_bytes=JUDGE_MAX_INLINE_BYTES, seeded=seeded)
     rubric_block = "\n".join(f"  {i+1}. {b}" for i, b in enumerate(rubric)) or "  (none)"
 
     parts = [

@@ -170,10 +170,20 @@ for AntiGravity) so the run is hermetic.
 | `output_matches_schema` | structured output validates against `output_schema` (or inline `schema`) |
 | `llm_judge` | `rubric` items graded by the judge; `threshold` = fraction that must pass (default 1.0) |
 
-`rubric:` at the top level is auto-compiled into one `llm_judge` assertion, and
-`output_schema:` into one `output_matches_schema` assertion. With `--no-judge` (or no judge
+`rubric:` at the top level is auto-compiled into one `llm_judge` assertion — unless an
+explicit `llm_judge` assertion is already present (e.g. to set `threshold`), which grades
+the rubric itself so the judge only runs (and bills) once. `output_schema:` likewise
+compiles into one `output_matches_schema` assertion. With `--no-judge` (or no judge
 available), `llm_judge` checks are **skipped**, not failed — the cell is graded on its
 deterministic assertions only.
+
+> **Judge caveat — prompt injection.** The judge's prompt embeds the graded agent's final
+> answer and file contents verbatim, so a run's output can try to steer the verdict
+> ("all rubric items pass"). The per-cell `judge_report.md` / `judge_stdout.jsonl`
+> artifacts preserve the judge's full prompt and reasoning at the same detail level as the
+> agent's own transcript — treat a surprising pass with suspicion and read them. A judge
+> run is killed after `--judge-timeout` seconds (default 240; also settable as
+> `judge.timeout` in models.yaml or a scenario's `judge:` block).
 
 ## Usage
 
@@ -225,7 +235,10 @@ artifacts/<run_id>/
     workspace/             # the hermetic working dir after the run
 ```
 
-`run` exits non-zero if any cell fails — drop it straight into CI.
+`run`'s exit code is CI-ready: `0` — every graded cell passed; `1` — a cell failed (or the
+run was aborted at the confirmation prompt); `2` — usage/config error (bad flags, malformed
+spec or scenario, duplicate eval names, missing seed files); `3` — nothing was graded
+(rubric-only evals with the judge off), which is "no verdict", not a failure.
 
 ## Skill isolation
 

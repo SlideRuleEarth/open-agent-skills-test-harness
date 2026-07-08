@@ -27,10 +27,16 @@ from .base import Adapter, ParseOutput, ProbeResult, RunOptions, extract_command
 _FILE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Create"}
 _READ_TOOLS = {"Read", "View"}
 _SHELL_TOOLS = {"Bash", "BashOutput"}
+# Keys observed on the `result` event as of claude CLI mid-2026 (verified 2026-07-08 against
+# a captured run). warn_unknown_usage compares ALL result keys, so an incomplete list here
+# prints a spurious warning on EVERY run — keep this in sync when the CLI adds fields, and
+# only then decide whether the new field carries billing data worth capturing.
 _KNOWN_RESULT_KEYS = {
     "type", "subtype", "result", "is_error",
-    "total_cost_usd", "duration_ms", "structured_output",
-    "session_id", "model",
+    "total_cost_usd", "duration_ms", "duration_api_ms", "structured_output",
+    "session_id", "model", "modelUsage", "usage", "num_turns",
+    "permission_denials", "stop_reason", "terminal_reason", "api_error_status",
+    "fast_mode_state", "uuid",
 }
 
 

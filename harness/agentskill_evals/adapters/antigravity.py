@@ -43,6 +43,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import tempfile
 from typing import Any, Optional
 
 from ..schema import EventKind, NormalizedEvent
@@ -59,6 +60,10 @@ from .base import (
 )
 
 _PAREN_RE = re.compile(r"\s*\(([^)]+)\)\s*$")
+# What a normalized model id must look like. `agy models` output is display names, one per
+# line, but any banner/header line ("Available models:", blank-ish separators) would
+# otherwise get mangled into a bogus id and offered for probing.
+_MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]*$")
 
 # Top-level keys of the `--output-format json` result object we've seen.
 _KNOWN_RESULT_KEYS = {
@@ -111,16 +116,24 @@ class AntigravityAdapter(Adapter):
             )
             if r.returncode != 0:
                 return None
-            return [
+            ids = [
                 _display_to_model_id(line.strip())
                 for line in r.stdout.splitlines()
                 if line.strip()
             ]
+            # drop anything that doesn't normalize to a plausible model id (headers etc.)
+            return [m for m in ids if _MODEL_ID_RE.match(m)]
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return None
 
     def _probe_argv(self, model: str):
+        # --add-dir: without it a bare `agy -p` operates against the fixed, shared
+        # ~/.gemini/antigravity-cli/scratch dir and leaves state there (see module
+        # docstring); the system temp dir is a harmless, non-registering anchor for a
+        # trivial "say ok" probe. --output-format json keeps the probe's output shape
+        # consistent with real runs.
         return [self.binary, "-p", "say ok", "--dangerously-skip-permissions",
+                "--output-format", "json", "--add-dir", tempfile.gettempdir(),
                 "--model", model]
 
     def format_skill(self, skill: str) -> str:
