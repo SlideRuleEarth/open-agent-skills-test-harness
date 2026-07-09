@@ -19,7 +19,17 @@ from .isolation import resolve_visible_skills
 from .judge import Judge
 from .progress import Progress
 from .runner import Runner, _cell_text, _safe, render_matrix
-from .spec import _load_raw, discover_specs, load_scenario, load_spec, skill_names, validate_spec
+from .spec import (
+    REASONING_EFFORT_LEVELS,
+    ModelTarget,
+    _load_raw,
+    discover_specs,
+    load_scenario,
+    load_spec,
+    parse_model_target,
+    skill_names,
+    validate_spec,
+)
 
 DEFAULT_MAX_CELLS = 25
 DEFAULT_JOBS = 1
@@ -166,19 +176,22 @@ def _load_models_config(path) -> ModelsConfig:
     return ModelsConfig(models, defaults, judge, warnings)
 
 
-def _resolve_models(agent: str, cli_models: list[str] | None,
-                    cfg: ModelsConfig, all_models: bool) -> list:
-    """Precedence: CLI --model > (--all-models ? full list) > default > [None]."""
-    if cli_models:
+def _resolve_targets(agent: str, cli_targets: list[ModelTarget] | None,
+                     cfg: ModelsConfig, all_models: bool) -> list[ModelTarget]:
+    """Precedence: CLI --model / scenario target > (--all-models ? full list) > default >
+    [default target]. A target that pins only an effort (no model id) gets the models.yaml
+    default model, preserving how a model-less scenario resolves."""
+    if cli_targets:
         if all_models:
             print("warning: --model and --all-models both given — --model wins, "
                   "--all-models is ignored", file=sys.stderr)
-        return _dedup(cli_models)
+        return _dedup(ModelTarget(t.model or cfg.default(agent), t.reasoning_effort)
+                      for t in cli_targets)
     if all_models and cfg.models(agent):
-        return cfg.models(agent)
+        return [ModelTarget(m) for m in cfg.models(agent)]
     if cfg.default(agent):
-        return [cfg.default(agent)]
-    return [None]
+        return [ModelTarget(cfg.default(agent))]
+    return [ModelTarget()]
 
 
 # ---------------------------------------------------------------------------
@@ -353,14 +366,20 @@ def cmd_run(args) -> int:
     for w in cfg.warnings:
         print(f"warning: models.yaml: {w}", file=sys.stderr)
 
-    cli_models = None
+    cli_targets = None
     if args.model:
-        cli_models = [m.strip() for m in args.model.split(",") if m.strip()]
-    if scenario and not cli_models and not args.all_models:
-        non_none = [m for m in scenario.models if m is not None]
-        if non_none:
-            cli_models = non_none
-    models = _resolve_models(agent, cli_models, cfg, args.all_models)
+        try:
+            cli_targets = [parse_model_target(tok, "--model")
+                           for tok in args.model.split(",") if tok.strip()]
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    if scenario and not cli_targets and not args.all_models:
+        pinned = [t for t in scenario.targets
+                  if t.model is not None or t.reasoning_effort is not None]
+        if pinned:
+            cli_targets = pinned
+    targets = _resolve_targets(agent, cli_targets, cfg, args.all_models)
 
     # judge
     # `judge:` in a scenario can be true/false OR a mapping {agent, model}.
@@ -430,6 +449,24 @@ def cmd_run(args) -> int:
     isolated = (not args.no_isolated) and (ov.get("isolated") is not False)
     provision = not args.no_provision
 
+    # reasoning effort: CLI flag > per-target pin > per-spec `reasoning_effort:`. Warn up
+    # front when the chosen runner can't honor it — the run proceeds with the runner's
+    # default effort.
+    if not get_adapter(agent).supports_reasoning_effort:
+        wanted = (args.reasoning_effort
+                  or next((t.reasoning_effort for t in targets if t.reasoning_effort), None)
+                  or next((s.reasoning_effort for s in specs if s.reasoning_effort), None))
+        if wanted:
+            print(f"warning: runner {agent!r} has no reasoning-effort control — "
+                  f"`reasoning_effort: {wanted}` is ignored (on antigravity pick a tiered "
+                  "model id instead, e.g. gemini-3.5-flash-medium).", file=sys.stderr)
+    elif args.reasoning_effort and any(t.reasoning_effort for t in targets):
+        # A global flag on top of a per-model comparison collapses the comparison —
+        # say so instead of silently running every column at the same effort.
+        print(f"note: --reasoning-effort {args.reasoning_effort} overrides the per-model "
+              "efforts pinned in the target — every cell runs at that effort.",
+              file=sys.stderr)
+
     if isolated:
         managed = {"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
                    "XDG_CACHE_HOME", "XDG_STATE_HOME"}
@@ -444,18 +481,28 @@ def cmd_run(args) -> int:
     max_cells = args.max_cells if args.max_cells is not None else int(ov.get("max_cells", DEFAULT_MAX_CELLS))
     jobs = args.jobs if args.jobs is not None else int(ov.get("jobs", DEFAULT_JOBS))
     n_eligible = sum(1 for s in specs if s.agents is None or agent in s.agents)
-    n_cells = n_eligible * len(models)
-    model_labels = [m or "default" for m in models]
+    n_cells = n_eligible * len(targets)
+    model_labels = [t.label for t in targets]
     judge_label = f"{judge.agent}/{judge.model or 'default'}" if judge else "off"
     n_llm = n_cells * (2 if judge else 1)
 
     run_id = args.run_id or _default_run_id(args, scenario, specs)
     run_dir = os.path.join(os.path.abspath(args.artifacts), run_id)
 
+    # Only shown when set somewhere — an unset effort keeps the plan line unchanged. A runner
+    # without an effort control shows nothing: the run proceeds at its own default (warned
+    # above), so the plan must not claim a budget that won't be applied.
+    efforts: list[str] = []
+    if get_adapter(agent).supports_reasoning_effort:
+        efforts = sorted({e for e in ((args.reasoning_effort or t.reasoning_effort
+                                       or s.reasoning_effort)
+                                      for t in targets for s in specs) if e})
+    effort_label = f"   effort: {'/'.join(efforts)}" if efforts else ""
+
     print(f"Plan: {n_cells} cell(s) — {n_eligible} eval(s) × {agent} "
           f"[{', '.join(model_labels)}]")
-    print(f"      judge: {judge_label}   isolated: {'on' if isolated else 'off'}   "
-          f"≈{n_llm} LLM calls   artifacts: {run_dir}\n")
+    print(f"      judge: {judge_label}   isolated: {'on' if isolated else 'off'}"
+          f"{effort_label}   ≈{n_llm} LLM calls   artifacts: {run_dir}\n")
 
     if args.dry_run:
         _print_skill_visibility(specs, agent, isolated, skills_root, provision)
@@ -502,20 +549,23 @@ def cmd_run(args) -> int:
     elif args.evals:
         cmd_parts.append(f"--evals {' '.join(os.path.basename(e) for e in args.evals)}")
     cmd_parts.append(f"--agent {agent}")
-    if cli_models:
-        cmd_parts.append(f"--model {','.join(cli_models)}")
+    if cli_targets:
+        cmd_parts.append(f"--model {','.join(t.label for t in cli_targets)}")
+    if args.reasoning_effort:
+        cmd_parts.append(f"--reasoning-effort {args.reasoning_effort}")
     command = " ".join(cmd_parts)
 
     with Progress(total_cells=n_cells) as progress:
         runner = Runner(
             agent,
-            models=models,
+            targets=targets,
             artifacts_root=os.path.abspath(args.artifacts),
             run_id=run_id,
             skills_root=skills_root,
             judge=judge,
             provision=provision,
             auto_approve=not args.no_auto_approve,
+            reasoning_effort=args.reasoning_effort,
             jobs=jobs,
             isolated=isolated,
             progress=progress,
@@ -524,7 +574,7 @@ def cmd_run(args) -> int:
 
         results = runner.run(specs)
 
-    print(render_matrix(results, agent, models))
+    print(render_matrix(results, agent, targets))
     graded = [c for c in results if not c.ungraded]
     n_pass = sum(1 for c in graded if c.passed)
     ung = len(results) - len(graded)
@@ -555,7 +605,7 @@ def cmd_run(args) -> int:
     if args.verbose:
         for c in results:
             if not c.passed and not c.ungraded:
-                print(f"\n✗ {c.eval_name} [{c.agent}/{c.model or 'default'}]"
+                print(f"\n✗ {c.eval_name} [{c.agent}/{c.target_label}]"
                       + (f"  ERROR: {c.run_result.error}" if c.run_result.error else ""))
                 for a in c.assertions:
                     if not a.passed:
@@ -570,7 +620,7 @@ def cmd_run(args) -> int:
         if shown:
             print("\nreports (prompt + complete response + produced files):")
             for c in shown:
-                print(f"  {_cell_text(c):<10} {c.eval_name} [{c.model or 'default'}]")
+                print(f"  {_cell_text(c):<10} {c.eval_name} [{c.target_label}]")
                 print(f"    → {os.path.join(c.artifacts_dir, 'report.md')}")
 
     failed = [c for c in graded if not c.passed]
@@ -802,7 +852,17 @@ def build_parser() -> argparse.ArgumentParser:
                          "agent's vendor skills)")
     sp.add_argument("--no-auto-approve", action="store_true",
                     help="don't auto-approve tool/file actions")
-    sp.add_argument("--model", help="model(s) to run, comma-separated; overrides models.yaml")
+    sp.add_argument("--model", help="model(s) to run, comma-separated; overrides models.yaml. "
+                    "Append @low|@medium|@high to pin a per-model reasoning effort so one "
+                    "run can compare efforts, e.g. "
+                    "--model claude-haiku-4.5@high,claude-opus-4.6@low")
+    sp.add_argument("--reasoning-effort", choices=list(REASONING_EFFORT_LEVELS),
+                    help="thinking/reasoning budget for ALL agent runs; overrides per-model "
+                         "@effort pins and an eval/scenario's `reasoning_effort:`. Mapped to "
+                         "the runner's native control (claude --effort, codex "
+                         "model_reasoning_effort, copilot --reasoning-effort); ignored with "
+                         "a warning by runners without one (antigravity encodes effort in "
+                         "the model id tier instead)")
     sp.add_argument("--models-config", help="models.yaml path (default: <skills-root>/models.yaml)")
     sp.add_argument("--all-models", action="store_true",
                     help="run this agent's full models.yaml list (default: just the cheapest)")

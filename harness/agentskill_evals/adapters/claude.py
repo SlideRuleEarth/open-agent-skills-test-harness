@@ -49,6 +49,9 @@ class ClaudeAdapter(Adapter):
     isolation_config_homes = [("CLAUDE_CONFIG_DIR", "skills")]
 
     supports_output_schema = True
+    # `--effort <level>` (verified 2026-07-08: choices low|medium|high|xhigh|max — the
+    # harness only passes the typed cross-runner subset low|medium|high).
+    supports_reasoning_effort = True
 
     # TODO: Claude Code has no `list-models` command yet (feature request pending).
     # When one ships, add has_model_list = True and a discover_models() override
@@ -98,6 +101,8 @@ class ClaudeAdapter(Adapter):
             argv += ["--dangerously-skip-permissions"]
         if opts.model:
             argv += ["--model", opts.model]
+        if opts.reasoning_effort:
+            argv += ["--effort", opts.reasoning_effort]
         if opts.output_schema:
             argv += ["--json-schema", json.dumps(opts.output_schema)]
         if opts.allowed_tools:

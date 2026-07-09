@@ -636,6 +636,9 @@ class _FakeAdapter:
     reads before it gets there."""
     global_skills_subpaths: list[str] = []
     skills_subdir = "fake/skills"
+    # True so effort-threading checks see the resolved value in RunOptions; _run_cell_body
+    # nulls the effort for adapters without this control (see effort.unsupported_not_claimed).
+    supports_reasoning_effort = True
 
 
 def _check_workspace_relocation(failures, verbose):
@@ -654,7 +657,7 @@ def _check_workspace_relocation(failures, verbose):
     import agentskill_evals.runner as runner_mod
     from .exec import ExecResult
     from .schema import EventKind, NormalizedEvent, RunResult
-    from .spec import EvalSpec
+    from .spec import EvalSpec, ModelTarget
 
     print("workspace relocation (exec dir escapes the repo tree):")
     repo_root = tempfile.mkdtemp(prefix="ase-repo2-")
@@ -677,16 +680,17 @@ def _check_workspace_relocation(failures, verbose):
         run_dir = os.path.join(repo_root, "artifacts", "run1")
         os.makedirs(run_dir)
         r = runner_mod.Runner.__new__(runner_mod.Runner)
-        r.agent, r.adapter, r.models = "fake", _FakeAdapter(), [None]
+        r.agent, r.adapter, r.targets = "fake", _FakeAdapter(), [ModelTarget()]
         r.artifacts_root = os.path.join(repo_root, "artifacts")
         r.run_id, r.skills_root, r.judge = "run1", repo_root, None
         r.provision, r.command, r.auto_approve = False, "", True
+        r.reasoning_effort = None
         r.jobs, r.isolated, r.progress = 1, True, None
         r._repo_skill_names, r.run_dir = set(), run_dir
 
         spec = EvalSpec(name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"),
                         assertions=[{"type": "file_exists", "path": "run.py"}])
-        cell = r._run_cell(None, spec)
+        cell = r._run_cell(ModelTarget(), spec)
 
         cell_workspace = os.path.join(cell.artifacts_dir, "workspace")
         cwd_used = seen.get("cwd")
@@ -731,7 +735,7 @@ def _check_parallel_cell_idx(failures, verbose):
     from .exec import ExecResult
     from .progress import Progress
     from .schema import RunResult
-    from .spec import EvalSpec
+    from .spec import EvalSpec, ModelTarget
 
     print("parallel cell_idx assignment:")
     repo_root = tempfile.mkdtemp(prefix="ase-repo4-")
@@ -752,10 +756,11 @@ def _check_parallel_cell_idx(failures, verbose):
         run_dir = os.path.join(repo_root, "artifacts", "run1")
         os.makedirs(run_dir)
         r = runner_mod.Runner.__new__(runner_mod.Runner)
-        r.agent, r.adapter, r.models = "fake", _FakeAdapter(), [None]
+        r.agent, r.adapter, r.targets = "fake", _FakeAdapter(), [ModelTarget()]
         r.artifacts_root = os.path.join(repo_root, "artifacts")
         r.run_id, r.skills_root, r.judge = "run1", repo_root, None
         r.provision, r.command, r.auto_approve = False, "", True
+        r.reasoning_effort = None
         r.jobs, r.isolated = 2, True
         r.progress = _RecordingProgress(total_cells=2, file=open(os.devnull, "w"))
         r._repo_skill_names, r.run_dir = set(), run_dir
@@ -788,7 +793,7 @@ def _check_cell_crash_safety(failures, verbose):
     import tempfile
 
     import agentskill_evals.runner as runner_mod
-    from .spec import EvalSpec
+    from .spec import EvalSpec, ModelTarget
 
     print("cell crash safety:")
     repo_root = tempfile.mkdtemp(prefix="ase-repo3-")
@@ -806,10 +811,11 @@ def _check_cell_crash_safety(failures, verbose):
         run_dir = os.path.join(repo_root, "artifacts", "run1")
         os.makedirs(run_dir)
         r = runner_mod.Runner.__new__(runner_mod.Runner)
-        r.agent, r.adapter, r.models = "fake", _FakeAdapter(), [None]
+        r.agent, r.adapter, r.targets = "fake", _FakeAdapter(), [ModelTarget()]
         r.artifacts_root = os.path.join(repo_root, "artifacts")
         r.run_id, r.skills_root, r.judge = "run1", repo_root, None
         r.provision, r.command, r.auto_approve = False, "", True
+        r.reasoning_effort = None
         r.jobs, r.isolated, r.progress = 1, True, None
         r._repo_skill_names, r.run_dir = set(), run_dir
 
@@ -817,7 +823,7 @@ def _check_cell_crash_safety(failures, verbose):
         cell = None
         raised = False
         try:
-            cell = r._run_cell(None, spec)
+            cell = r._run_cell(ModelTarget(), spec)
         except Exception:
             raised = True
 
@@ -903,7 +909,8 @@ def _check_cli_helpers(failures, verbose):
     import tempfile
 
     from .cli import (ModelsConfig, _duplicate_names, _is_yaml_error,
-                      _load_models_config, _resolve_models)
+                      _load_models_config, _resolve_targets)
+    from .spec import ModelTarget
 
     print("cli.py helpers:")
 
@@ -942,12 +949,17 @@ def _check_cli_helpers(failures, verbose):
     cfg = ModelsConfig({"claude": ["a", "b"]}, {"claude": "a"}, {}, [])
     buf = io.StringIO()
     with contextlib.redirect_stderr(buf):
-        models = _resolve_models("claude", ["explicit"], cfg, all_models=True)
-    _check("cli.resolve_models.explicit_wins", models == ["explicit"],
-           f"--model wins over --all-models: {models}", failures, verbose)
-    _check("cli.resolve_models.conflict_warned", "ignored" in buf.getvalue(),
+        targets = _resolve_targets("claude", [ModelTarget("explicit")], cfg, all_models=True)
+    _check("cli.resolve_targets.explicit_wins", targets == [ModelTarget("explicit")],
+           f"--model wins over --all-models: {targets}", failures, verbose)
+    _check("cli.resolve_targets.conflict_warned", "ignored" in buf.getvalue(),
            f"a warning is printed instead of silently dropping --all-models: {buf.getvalue()!r}",
            failures, verbose)
+    # a target that pins only an effort inherits the models.yaml default model
+    targets = _resolve_targets("claude", [ModelTarget(None, "high")], cfg, all_models=False)
+    _check("cli.resolve_targets.effort_only_gets_default",
+           targets == [ModelTarget("a", "high")],
+           f"effort-only target resolves the default model: {targets}", failures, verbose)
 
     # _load_models_config: duplicate model + missing default warnings (JSON, so no PyYAML needed)
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
@@ -1501,6 +1513,228 @@ def _check_scenario_override_validation(failures, verbose):
            f"a numeric string is coerced to int: {scen.overrides}", failures, verbose)
 
 
+def _check_reasoning_effort(failures, verbose):
+    """The typed `reasoning_effort` knob (issue #67): validated at spec load, threaded
+    CLI-override > per-target pin > spec > unset through Runner into RunOptions, and mapped
+    per adapter only where the CLI has an equivalent control (claude --effort, codex
+    model_reasoning_effort, copilot --reasoning-effort; antigravity has none — effort lives
+    in its model-id tier). Per-target pins (ModelTarget) let one run compare the same or
+    different models at different efforts."""
+    import os
+    import shutil
+    import tempfile
+
+    import agentskill_evals.runner as runner_mod
+    from .exec import ExecResult
+    from .schema import RunResult
+    from .spec import (REASONING_EFFORT_LEVELS, EvalSpec, ModelTarget,
+                       _spec_from_raw, load_scenario, parse_model_target)
+
+    print("reasoning effort:")
+
+    # --- per-adapter argv mapping ---
+    argv = get_adapter("claude").build_argv("p", RunOptions(reasoning_effort="high"), cwd="/tmp")
+    _check("effort.claude_flag",
+           "--effort" in argv and argv[argv.index("--effort") + 1] == "high",
+           f"claude maps to --effort: {argv}", failures, verbose)
+    argv = get_adapter("codex").build_argv("p", RunOptions(reasoning_effort="low"), cwd="/tmp")
+    _check("effort.codex_config",
+           'model_reasoning_effort="low"' in argv
+           and argv[argv.index('model_reasoning_effort="low"') - 1] == "-c"
+           and argv[-1] == "p",
+           f"codex maps to -c model_reasoning_effort, before the positional prompt: {argv}",
+           failures, verbose)
+    argv = get_adapter("copilot").build_argv("p", RunOptions(reasoning_effort="medium"), cwd="/tmp")
+    _check("effort.copilot_flag",
+           "--reasoning-effort" in argv
+           and argv[argv.index("--reasoning-effort") + 1] == "medium",
+           f"copilot maps to --reasoning-effort: {argv}", failures, verbose)
+    for name in ("claude", "codex", "copilot"):
+        _check(f"effort.{name}_supported_declared",
+               get_adapter(name).supports_reasoning_effort,
+               f"{name} declares supports_reasoning_effort", failures, verbose)
+    ag = get_adapter("antigravity")
+    _check("effort.antigravity_unsupported", not ag.supports_reasoning_effort,
+           "antigravity declares no reasoning-effort support (tiered model ids instead)",
+           failures, verbose)
+    ag_plain = ag.build_argv("p", RunOptions(), cwd="/tmp")
+    ag_effort = ag.build_argv("p", RunOptions(reasoning_effort="high"), cwd="/tmp")
+    _check("effort.antigravity_argv_unchanged", ag_plain == ag_effort,
+           f"antigravity argv unchanged when effort set: {ag_effort}", failures, verbose)
+
+    # --- unset keeps every argv unchanged (existing behavior preserved) ---
+    for name in ("claude", "codex", "copilot"):
+        plain = get_adapter(name).build_argv("p", RunOptions(), cwd="/tmp")
+        _check(f"effort.{name}_absent_when_unset",
+               not any("effort" in a for a in plain),
+               f"{name} argv carries no effort token when unset: {plain}", failures, verbose)
+
+    # --- spec load: normalization + typed validation ---
+    s = _spec_from_raw({"prompt": "p", "reasoning_effort": " HIGH "}, "/x.yaml")
+    _check("effort.spec_normalized", s.reasoning_effort == "high",
+           f"value is trimmed + lowercased at load: {s.reasoning_effort!r}", failures, verbose)
+    _check("effort.spec_default_none",
+           _spec_from_raw({"prompt": "p"}, "/x.yaml").reasoning_effort is None,
+           "unset stays None", failures, verbose)
+    try:
+        _spec_from_raw({"prompt": "p", "reasoning_effort": "hgih"}, "/x.yaml")
+        bad_ok = False
+    except ValueError as exc:
+        bad_ok = all(l in str(exc) for l in REASONING_EFFORT_LEVELS)
+    _check("effort.spec_bad_value_rejected", bad_ok,
+           "an unknown level raises a clean ValueError naming the valid levels",
+           failures, verbose)
+
+    # --- scenario files get the same field (via the shared _spec_from_raw) ---
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        f.write('{"name": "s", "prompt": "p", "reasoning_effort": "medium", '
+                '"target": {"runner": "claude"}}')
+        scen_path = f.name
+    try:
+        scen = load_scenario(scen_path)
+    finally:
+        os.unlink(scen_path)
+    _check("effort.scenario_field", scen.spec.reasoning_effort == "medium",
+           f"a scenario's top-level reasoning_effort lands on its spec: "
+           f"{scen.spec.reasoning_effort!r}", failures, verbose)
+
+    # --- per-target parsing: `id@effort` strings and mappings (shared by --model + scenarios) ---
+    t = parse_model_target("claude-haiku-4.5@high", "--model")
+    _check("effort.at_suffix_parsed", t == ModelTarget("claude-haiku-4.5", "high"),
+           f"'id@effort' splits into (model, effort): {t}", failures, verbose)
+    t = parse_model_target("plain-model", "--model")
+    _check("effort.plain_model_no_effort", t == ModelTarget("plain-model"),
+           f"a plain id stays effortless: {t}", failures, verbose)
+    t = parse_model_target({"model": "m", "reasoning_effort": "LOW"}, "/s.yaml")
+    _check("effort.mapping_normalized", t == ModelTarget("m", "low"),
+           f"mapping form parses + normalizes: {t}", failures, verbose)
+    for bad, tag in (("haiku@hgih", "bad_suffix"), ({"model": "m", "efort": "low"}, "bad_key"),
+                     ({}, "empty_mapping"), ("@high", "no_model_before_at")):
+        try:
+            parse_model_target(bad, "--model")
+            ok = False
+        except ValueError:
+            ok = True
+        _check(f"effort.parse_{tag}_rejected", ok,
+               f"{bad!r} raises a clean ValueError", failures, verbose)
+
+    # --- artifact dirs: same model at two efforts must not collide ---
+    _check("effort.target_seg_distinct",
+           runner_mod._target_seg(ModelTarget("m", "high"))
+           != runner_mod._target_seg(ModelTarget("m")),
+           "an effort-pinned target gets its own artifacts segment", failures, verbose)
+
+    # --- Runner threading: CLI override > per-target pin > spec > unset ---
+    repo_root = tempfile.mkdtemp(prefix="ase-effort-")
+    seen: dict = {}
+    orig_execute = runner_mod.execute
+
+    def _fake_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides, agent_name, eval_name):
+        seen["effort"] = opts.reasoning_effort
+        rr = RunResult(agent=agent_name, eval_name=eval_name, prompt=prompt,
+                       workdir=cwd, final_text="done")
+        return ExecResult(result=rr, stdout="", stderr="")
+
+    runner_mod.execute = _fake_execute
+    try:
+        r = runner_mod.Runner.__new__(runner_mod.Runner)
+        r.agent, r.adapter, r.targets = "fake", _FakeAdapter(), [ModelTarget()]
+        r.artifacts_root = os.path.join(repo_root, "artifacts")
+        r.run_id, r.skills_root, r.judge = "run1", repo_root, None
+        r.provision, r.command, r.auto_approve = False, "", True
+        r.jobs, r.isolated, r.progress = 1, True, None
+        r._repo_skill_names = set()
+        r.run_dir = os.path.join(repo_root, "artifacts", "run1")
+        os.makedirs(r.run_dir)
+
+        spec = EvalSpec(name="demo", prompt="hi", reasoning_effort="low",
+                        source_path=os.path.join(repo_root, "demo.yaml"))
+        r.reasoning_effort = "high"
+        r._run_cell(ModelTarget(), spec)
+        _check("effort.cli_override_wins", seen.get("effort") == "high",
+               f"run-level effort beats the spec's: {seen.get('effort')!r}", failures, verbose)
+        r._run_cell(ModelTarget("m", "medium"), spec)
+        _check("effort.cli_beats_target", seen.get("effort") == "high",
+               f"run-level effort beats a per-target pin: {seen.get('effort')!r}",
+               failures, verbose)
+        r.reasoning_effort = None
+        cell = r._run_cell(ModelTarget("m", "medium"), spec)
+        _check("effort.target_beats_spec", seen.get("effort") == "medium",
+               f"a per-target pin beats the spec's effort: {seen.get('effort')!r}",
+               failures, verbose)
+        _check("effort.cell_records_both",
+               cell.reasoning_effort == "medium" and cell.effective_effort == "medium",
+               f"the cell records the pinned + effective efforts: "
+               f"{cell.reasoning_effort!r}/{cell.effective_effort!r}", failures, verbose)
+        r._run_cell(ModelTarget(), spec)
+        _check("effort.spec_value_used", seen.get("effort") == "low",
+               f"spec effort used when no run-level or per-target value: "
+               f"{seen.get('effort')!r}", failures, verbose)
+        r._run_cell(ModelTarget(), EvalSpec(name="demo2", prompt="hi",
+                                            source_path=os.path.join(repo_root, "demo2.yaml")))
+        _check("effort.unset_stays_none", seen.get("effort") is None,
+               f"nothing set → RunOptions.reasoning_effort is None: {seen.get('effort')!r}",
+               failures, verbose)
+
+        # a runner with NO effort control must not claim one: the resolved effort is nulled
+        # before RunOptions, and effective_effort stays None (the pin is still recorded as
+        # requested column identity) — otherwise summary.json/report.md would report a
+        # thinking budget the CLI silently ignored.
+        class _NoEffortAdapter(_FakeAdapter):
+            supports_reasoning_effort = False
+
+        r.adapter = _NoEffortAdapter()
+        r.reasoning_effort = "high"
+        cell = r._run_cell(ModelTarget("m", "medium"), spec)
+        _check("effort.unsupported_not_claimed",
+               seen.get("effort") is None and cell.effective_effort is None
+               and cell.reasoning_effort == "medium",
+               f"unsupporting runner: opts={seen.get('effort')!r} "
+               f"effective={cell.effective_effort!r} pin={cell.reasoning_effort!r}",
+               failures, verbose)
+    finally:
+        runner_mod.execute = orig_execute
+        shutil.rmtree(repo_root, ignore_errors=True)
+
+
+def _check_api_compat(failures, verbose):
+    """The pre-#67 module API keeps working for programmatic callers: Runner(models=[...]),
+    Runner.models / Scenario.models, and render_matrix/render_markdown called with plain
+    model-id columns — each converts to an effort-less ModelTarget instead of raising."""
+    import os
+    import shutil
+    import tempfile
+
+    import agentskill_evals.runner as runner_mod
+    from .spec import ModelTarget
+
+    print("pre-#67 API compat:")
+    repo_root = tempfile.mkdtemp(prefix="ase-compat-")
+    try:
+        r = runner_mod.Runner("claude", models=["m1", None],
+                              artifacts_root=os.path.join(repo_root, "artifacts"),
+                              run_id="compat", skills_root=repo_root)
+        _check("compat.runner_models_kwarg",
+               r.targets == [ModelTarget("m1"), ModelTarget(None)],
+               f"models= converts to effort-less targets: {r.targets}", failures, verbose)
+        _check("compat.runner_models_property", r.models == ["m1", None],
+               f"Runner.models still answers with model ids: {r.models}", failures, verbose)
+        try:
+            runner_mod.Runner("claude", artifacts_root=os.path.join(repo_root, "artifacts"),
+                              run_id="x", skills_root=repo_root)
+            ok = False
+        except TypeError:
+            ok = True
+        _check("compat.runner_requires_columns", ok,
+               "neither targets= nor models= raises a clear TypeError", failures, verbose)
+        out = runner_mod.render_matrix([], "claude", ["m1", None])
+        _check("compat.render_matrix_plain_ids",
+               "m1" in out and "default" in out,
+               f"render_matrix accepts plain model-id columns: {out!r}", failures, verbose)
+    finally:
+        shutil.rmtree(repo_root, ignore_errors=True)
+
+
 def run_selftest(verbose: bool = False) -> int:
     failures: list[str] = []
 
@@ -1950,32 +2184,72 @@ def run_selftest(verbose: bool = False) -> int:
         _yaml = None
     if _yaml is not None:
         import tempfile as _tmpmod
-        from .spec import load_scenario
-        _scen_yaml = {"name": "multi", "prompt": "say hi",
-                      "target": {"runner": "claude", "model": ["opus-4-8", "haiku-4-5"]},
-                      "skills": []}
-        with _tmpmod.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as _f:
-            _yaml.dump(_scen_yaml, _f)
-            _f.flush()
-            _scen = load_scenario(_f.name)
-        _check("scenario.multi_model", _scen.models == ["opus-4-8", "haiku-4-5"],
-               f"list model parsed: {_scen.models}", failures, verbose)
-        _scen_single = {"name": "single", "prompt": "say hi",
-                        "target": {"runner": "claude", "model": "opus-4-8"}, "skills": []}
-        with _tmpmod.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as _f:
-            _yaml.dump(_scen_single, _f)
-            _f.flush()
-            _scen = load_scenario(_f.name)
-        _check("scenario.single_model", _scen.models == ["opus-4-8"],
-               f"string model parsed: {_scen.models}", failures, verbose)
-        _scen_none = {"name": "nomodel", "prompt": "say hi",
-                      "target": {"runner": "claude"}, "skills": []}
-        with _tmpmod.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as _f:
-            _yaml.dump(_scen_none, _f)
-            _f.flush()
-            _scen = load_scenario(_f.name)
-        _check("scenario.no_model", _scen.models == [None],
-               f"omitted model → [None]: {_scen.models}", failures, verbose)
+        from .spec import ModelTarget, load_scenario
+
+        def _load_scen(payload):
+            with _tmpmod.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as _f:
+                _yaml.dump(payload, _f)
+                _f.flush()
+                return load_scenario(_f.name)
+
+        _scen = _load_scen({"name": "multi", "prompt": "say hi",
+                            "target": {"runner": "claude", "model": ["opus-4-8", "haiku-4-5"]},
+                            "skills": []})
+        _check("scenario.multi_model",
+               _scen.targets == [ModelTarget("opus-4-8"), ModelTarget("haiku-4-5")],
+               f"list model parsed: {_scen.targets}", failures, verbose)
+        _scen = _load_scen({"name": "single", "prompt": "say hi",
+                            "target": {"runner": "claude", "model": "opus-4-8"}, "skills": []})
+        _check("scenario.single_model", _scen.targets == [ModelTarget("opus-4-8")],
+               f"string model parsed: {_scen.targets}", failures, verbose)
+        _scen = _load_scen({"name": "nomodel", "prompt": "say hi",
+                            "target": {"runner": "claude"}, "skills": []})
+        _check("scenario.no_model", _scen.targets == [ModelTarget()],
+               f"omitted model → [ModelTarget()]: {_scen.targets}", failures, verbose)
+        # per-model efforts (issue #67 follow-up): one run compares different efforts —
+        # both the `id@effort` suffix and the mapping form pin an effort per column
+        _scen = _load_scen({"name": "efforts", "prompt": "say hi",
+                            "target": {"runner": "copilot",
+                                       "model": ["claude-haiku-4.5@high",
+                                                 {"model": "claude-opus-4.6",
+                                                  "reasoning_effort": "low"}]},
+                            "skills": []})
+        _check("scenario.per_model_effort",
+               _scen.targets == [ModelTarget("claude-haiku-4.5", "high"),
+                                 ModelTarget("claude-opus-4.6", "low")],
+               f"@suffix and mapping forms pin per-model efforts: {_scen.targets}",
+               failures, verbose)
+        try:
+            _load_scen({"name": "bad", "prompt": "say hi",
+                        "target": {"runner": "claude", "model": "haiku@hgih"}, "skills": []})
+            bad_ok = False
+        except ValueError:
+            bad_ok = True
+        _check("scenario.bad_effort_suffix_rejected", bad_ok,
+               "a typo'd @effort suffix raises a clean ValueError at load", failures, verbose)
+        # malformed list entries must be load errors, not silently dropped so the run spends
+        # budget on the DEFAULT model instead of what the author (mis)wrote
+        for bad_model, tag in (([{}], "empty_mapping"), ([None], "null_entry"),
+                               ([""], "blank_entry")):
+            try:
+                _load_scen({"name": "bad", "prompt": "say hi",
+                            "target": {"runner": "claude", "model": bad_model},
+                            "skills": []})
+                ok = False
+            except ValueError:
+                ok = True
+            _check(f"scenario.{tag}_model_rejected", ok,
+                   f"model: {bad_model!r} raises a clean ValueError instead of running "
+                   "the default model", failures, verbose)
+        _scen = _load_scen({"name": "emptylist", "prompt": "say hi",
+                            "target": {"runner": "claude", "model": []}, "skills": []})
+        _check("scenario.empty_model_list_is_default", _scen.targets == [ModelTarget()],
+               f"an empty model list still means the default target: {_scen.targets}",
+               failures, verbose)
+        # deprecated pre-#67 `.models` view still answers with the model ids
+        _check("scenario.models_compat_property", _scen.models == [None],
+               f"Scenario.models keeps working for old callers: {_scen.models}",
+               failures, verbose)
 
     # HOME isolation overlay + side-effect-free provisioning
     _check_isolation(failures, verbose)
@@ -2019,6 +2293,12 @@ def run_selftest(verbose: bool = False) -> int:
 
     # scenario run-knob overrides are type-checked at load
     _check_scenario_override_validation(failures, verbose)
+
+    # typed reasoning-effort knob: spec validation, Runner threading, per-adapter mapping
+    _check_reasoning_effort(failures, verbose)
+
+    # deprecated pre-#67 module API (models= / .models / plain-id render columns)
+    _check_api_compat(failures, verbose)
 
     print()
     if failures:

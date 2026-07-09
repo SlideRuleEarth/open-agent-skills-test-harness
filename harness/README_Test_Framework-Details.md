@@ -30,13 +30,20 @@ Per skill, in `<skill>/evals/*.yaml` (auto-discovered). Each eval
 - `files` — files the agent starts with
 - `rubric` — behaviors graded by an LLM judge
 - `assertions` — deterministic checks
-- optional `tags` / `vars` / `env` / `output_schema` / `timeout_sec`
+- optional `tags` / `vars` / `env` / `output_schema` / `timeout_sec` / `reasoning_effort`
+  (`low|medium|high` thinking budget; per cell the precedence is CLI `--reasoning-effort` >
+  a per-model `@effort` pin (in `--model` or a scenario's `target.model`) > this field —
+  mapped to claude `--effort`, codex `model_reasoning_effort`, copilot `--reasoning-effort`;
+  AntiGravity has no equivalent control and warns + ignores it — pick a tiered model id
+  there instead)
 
 ## Scenarios — the first-class higher-level eval
 
 Per-skill evals test one skill at a time. A **scenario** is a higher-level, ad-hoc eval: one
 self-describing file ([scenarios/](../scenarios/)) that provisions a **combination of skills
-together** and pins a **target** (`runner:model`), run with `agentskill-evals run --config
+together** and pins a **target** (`runner:model`, where each model entry may pin its own
+reasoning effort — `claude-haiku-4.5@high` — so one scenario compares models and/or thinking
+budgets), run with `agentskill-evals run --config
 <file>`. Because runs are isolated by default, normal skill discovery sees the declared skill set
 (plus the agent's vendor skills) and not other repo skills from tracked global/project locations.
 CLI flags override the file (`CLI > scenario > default`). See

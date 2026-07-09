@@ -1,4 +1,6 @@
-"""The runner: execute a matrix of (model × eval) for a single agent, assert, and report.
+"""The runner: execute a matrix of (target × eval) for a single agent, assert, and report.
+A target is a model id plus an optional pinned reasoning effort (see spec.ModelTarget), so
+one run can compare e.g. claude-haiku-4.5@high against claude-opus-4.6@low.
 
 For each cell it:
   1. builds a hermetic workspace (optionally from a fixture),
@@ -33,7 +35,7 @@ from .isolation import build_isolated_home
 from .judge import Judge
 from .progress import Progress
 from .schema import EventKind, RunResult
-from .spec import EvalSpec, skill_names
+from .spec import EvalSpec, ModelTarget, skill_names
 from .workspace_view import (
     REPORT_MAX_INLINE_BYTES,
     file_tree,
@@ -52,6 +54,11 @@ class CellResult:
     skill: Optional[str]
     passed: bool
     run_result: RunResult
+    # The target column's pinned effort (None = unpinned) — part of the cell's matrix
+    # identity, so the same model can appear twice at different efforts.
+    reasoning_effort: Optional[str] = None
+    # What the run actually used after resolution (CLI --reasoning-effort > target > spec).
+    effective_effort: Optional[str] = None
     assertions: list[AssertionResult] = field(default_factory=list)
     judge_run_result: Optional[RunResult] = None
     artifacts_dir: str = ""
@@ -91,27 +98,41 @@ class CellResult:
     def model_label(self) -> str:
         return _model_seg(self.model)
 
+    @property
+    def target_label(self) -> str:
+        """Human-readable column identity: `model@effort` when an effort is pinned."""
+        base = self.model or "default"
+        return f"{base}@{self.reasoning_effort}" if self.reasoning_effort else base
+
 
 class Runner:
     def __init__(
         self,
         agent: str,
         *,
-        models: list[Optional[str]],
+        targets: Optional[list[ModelTarget]] = None,
+        models: Optional[list[Optional[str]]] = None,
         artifacts_root: str,
         run_id: str,
         skills_root: str,
         judge: Optional[Judge] = None,
         provision: bool = True,
         auto_approve: bool = True,
+        reasoning_effort: Optional[str] = None,
         jobs: int = 1,
         isolated: bool = True,
         progress: Optional[Progress] = None,
         command: str = "",
     ):
+        if targets is None:
+            if models is None:
+                raise TypeError("Runner() requires targets= (or the deprecated models=)")
+            # Deprecated pre-#67 alias: a list of model ids/None — each entry becomes an
+            # effort-less column, so existing programmatic callers keep working.
+            targets = [m if isinstance(m, ModelTarget) else ModelTarget(m) for m in models]
         self.agent = agent
         self.adapter = get_adapter(agent)
-        self.models = models
+        self.targets = targets
         self.artifacts_root = artifacts_root
         self.run_id = run_id
         self.skills_root = skills_root
@@ -119,27 +140,36 @@ class Runner:
         self.provision = provision
         self.command = command
         self.auto_approve = auto_approve
+        # Run-level override (from --reasoning-effort); per cell it beats both a target's
+        # pinned effort and the spec's own `reasoning_effort:` — same CLI-flag > file
+        # precedence as every other run knob.
+        self.reasoning_effort = reasoning_effort
         self.jobs = max(1, jobs)
         self.isolated = isolated
         self.progress = progress
         self._repo_skill_names = set(skill_names(skills_root))
         self.run_dir = os.path.join(artifacts_root, run_id)
 
+    @property
+    def models(self) -> list[Optional[str]]:
+        """Deprecated pre-#67 view of the target columns: model ids only (effort dropped)."""
+        return [t.model for t in self.targets]
+
     # --- public -------------------------------------------------------------
 
     def run(self, specs: list[EvalSpec]) -> list[CellResult]:
         os.makedirs(self.run_dir, exist_ok=True)
         cells = [
-            (model, spec)
+            (target, spec)
             for spec in specs
             if self._eligible(spec)
-            for model in self.models
+            for target in self.targets
         ]
 
         results: list[CellResult] = []
         if self.jobs == 1:
-            for i, (model, spec) in enumerate(cells, 1):
-                results.append(self._run_cell(model, spec, cell_idx=i, total=len(cells)))
+            for i, (target, spec) in enumerate(cells, 1):
+                results.append(self._run_cell(target, spec, cell_idx=i, total=len(cells)))
         else:
             with ThreadPoolExecutor(max_workers=self.jobs) as pool:
                 # Each future must carry its OWN cell_idx/total — without it, _run_cell defaults
@@ -149,13 +179,13 @@ class Runner:
                 # of calling p.done() here instead used as_completed()'s completion ORDER as the
                 # cell number, not the cell's actual identity.
                 futs = {
-                    pool.submit(self._run_cell, m, s, cell_idx=i, total=len(cells)): (m, s)
-                    for i, (m, s) in enumerate(cells, 1)
+                    pool.submit(self._run_cell, t, s, cell_idx=i, total=len(cells)): (t, s)
+                    for i, (t, s) in enumerate(cells, 1)
                 }
                 for fut in as_completed(futs):
                     results.append(fut.result())
 
-        results.sort(key=lambda c: (c.eval_name, c.model or ""))
+        results.sort(key=lambda c: (c.eval_name, c.model or "", c.reasoning_effort or ""))
         self._write_summary(results, specs)
         return results
 
@@ -164,10 +194,10 @@ class Runner:
     def _eligible(self, spec: EvalSpec) -> bool:
         return spec.agents is None or self.agent in spec.agents
 
-    def _run_cell(self, model: Optional[str], spec: EvalSpec,
+    def _run_cell(self, target: ModelTarget, spec: EvalSpec,
                   cell_idx: int = 0, total: int = 0) -> CellResult:
         cell_dir = os.path.join(
-            self.run_dir, _model_seg(model),
+            self.run_dir, _target_seg(target),
             _safe(spec.skill_name or "_"), _safe(spec.name)
         )
         workspace = os.path.join(cell_dir, "workspace")
@@ -191,9 +221,9 @@ class Runner:
         # every other cell in the batch — `run()` has no try/except of its own around this call,
         # so this is the only backstop.
         try:
-            return self._run_cell_body(model, spec, cell_idx, cell_dir, workspace, exec_ws)
+            return self._run_cell_body(target, spec, cell_idx, cell_dir, workspace, exec_ws)
         except Exception as exc:
-            return self._failed_cell(model, spec, cell_idx, cell_dir, exec_ws, exc)
+            return self._failed_cell(target, spec, cell_idx, cell_dir, exec_ws, exc)
         finally:
             # A no-op on the success path AND the usual crash path: `shutil.move` (here or in
             # _failed_cell) already relocated exec_ws to `workspace`, so there's nothing left
@@ -201,7 +231,7 @@ class Runner:
             if exec_ws != workspace and os.path.isdir(exec_ws):
                 shutil.rmtree(exec_ws, ignore_errors=True)
 
-    def _failed_cell(self, model: Optional[str], spec: EvalSpec, cell_idx: int,
+    def _failed_cell(self, target: ModelTarget, spec: EvalSpec, cell_idx: int,
                      cell_dir: str, exec_ws: str, exc: Exception) -> CellResult:
         """Best-effort CellResult for a cell that raised instead of completing normally — keeps
         one broken eval from aborting the whole run() batch, and still records something on disk
@@ -209,8 +239,9 @@ class Runner:
         print(f"warning: [{self.agent}] cell {spec.name!r} crashed: {exc}", file=sys.stderr)
         rr = RunResult(agent=self.agent, eval_name=spec.name, prompt="", workdir=exec_ws,
                        error=f"{type(exc).__name__}: {exc}")
-        cell = CellResult(agent=self.agent, model=model, eval_name=spec.name,
+        cell = CellResult(agent=self.agent, model=target.model, eval_name=spec.name,
                           skill=spec.skill_name, passed=False, run_result=rr,
+                          reasoning_effort=target.reasoning_effort,
                           artifacts_dir=cell_dir,
                           scenario_path=getattr(spec, "source_path", None))
         # Preserve whatever the run produced before crashing: move exec_ws into
@@ -235,11 +266,12 @@ class Runner:
             self.progress.done(cell=cell_idx, passed=False, cost="")
         return cell
 
-    def _run_cell_body(self, model: Optional[str], spec: EvalSpec, cell_idx: int,
+    def _run_cell_body(self, target: ModelTarget, spec: EvalSpec, cell_idx: int,
                        cell_dir: str, workspace: str, exec_ws: str) -> CellResult:
         adapter = self.adapter
         p = self.progress
-        model_label = model or "default"
+        model = target.model
+        model_label = target.label
 
         def _phase(phase: str):
             if p:
@@ -300,9 +332,17 @@ class Runner:
 
         # 5) run
         _phase(f"running agent ({self.agent}/{model_label})")
+        effort = (self.reasoning_effort or target.reasoning_effort
+                  or spec.reasoning_effort)
+        if not adapter.supports_reasoning_effort:
+            # This runner has no effort control (cmd_run warns up front): resolve to None so
+            # neither RunOptions nor the recorded effective_effort claims a thinking budget
+            # the CLI silently ignored — that would corrupt cross-effort comparisons.
+            effort = None
         opts = RunOptions(
             model=model,
             auto_approve=self.auto_approve,
+            reasoning_effort=effort,
             output_schema=spec.output_schema,
             home=iso_home,
             isolation_env=iso_env,
@@ -376,6 +416,7 @@ class Runner:
         cell = CellResult(
             agent=self.agent, model=model, eval_name=spec.name, skill=spec.skill_name,
             passed=passed, run_result=rr, assertions=checks, artifacts_dir=cell_dir,
+            reasoning_effort=target.reasoning_effort, effective_effort=effort,
             isolated=home_isolated, ungraded=ungraded, isolation_leaks=leaks,
             scenario_path=getattr(spec, "source_path", None),
             seeded_paths=sorted(seeded_relpaths(spec)),
@@ -456,6 +497,8 @@ class Runner:
             {
                 "agent": cell.agent,
                 "model": cell.model,
+                "reasoning_effort": cell.reasoning_effort,
+                "effective_effort": cell.effective_effort,
                 "eval": cell.eval_name,
                 "skill": cell.skill,
                 "isolated": cell.isolated,
@@ -503,7 +546,9 @@ class Runner:
             "run_id": self.run_id,
             "command": self.command,
             "agent": self.agent,
-            "models": [m for m in self.models if m is not None] or ["default"],
+            "models": [t.model for t in self.targets if t.model is not None] or ["default"],
+            "targets": [{"model": t.model, "reasoning_effort": t.reasoning_effort}
+                        for t in self.targets],
             # Keep the legacy `isolated` key as the requested run mode. Per-cell `isolated`
             # records whether skill isolation actually held after fallback/leak detection.
             "isolated": self.isolated,
@@ -516,7 +561,10 @@ class Runner:
             "judge_model": self.judge.model if self.judge else None,
             "cells": [
                 {
-                    "agent": c.agent, "model": c.model, "eval": c.eval_name, "skill": c.skill,
+                    "agent": c.agent, "model": c.model,
+                    "reasoning_effort": c.reasoning_effort,
+                    "effective_effort": c.effective_effort,
+                    "eval": c.eval_name, "skill": c.skill,
                     "isolated": c.isolated, "isolation_leaks": c.isolation_leaks,
                     "ungraded": c.ungraded,
                     "passed": c.passed, "n_pass": c.n_pass, "n_total": c.n_total,
@@ -532,7 +580,7 @@ class Runner:
         }
         _write_json(os.path.join(self.run_dir, "summary.json"), summary)
         _write(os.path.join(self.run_dir, "summary.md"),
-               render_markdown(results, self.agent, self.models,
+               render_markdown(results, self.agent, self.targets,
                                run_dir=self.run_dir, command=self.command))
 
 
@@ -540,8 +588,15 @@ class Runner:
 # Reporting helpers (also used by the CLI for stdout)
 # ---------------------------------------------------------------------------
 
-def _model_label(model: Optional[str]) -> str:
-    return model if model else "default"
+def _cell_key(c: CellResult) -> tuple:
+    """Matrix identity of a cell: eval row × (model, pinned effort) column."""
+    return (c.eval_name, c.model, c.reasoning_effort)
+
+
+def _as_targets(targets) -> list[ModelTarget]:
+    """Accept the deprecated pre-#67 column list (model ids/None) alongside ModelTargets,
+    so external render_matrix/render_markdown callers keep working."""
+    return [t if isinstance(t, ModelTarget) else ModelTarget(t) for t in targets]
 
 
 def _judge_score(c: CellResult) -> Optional[tuple[int, int]]:
@@ -589,11 +644,12 @@ def _cell_mark(c: Optional[CellResult]) -> str:
 
 
 def render_matrix(results: list[CellResult], agent: str,
-                  models: list[Optional[str]]) -> str:
-    """Eval × model pass/fail grid for the terminal."""
-    by_key = {(c.eval_name, c.model): c for c in results}
+                  targets: list[ModelTarget]) -> str:
+    """Eval × target (model@effort) pass/fail grid for the terminal."""
+    targets = _as_targets(targets)
+    by_key = {_cell_key(c): c for c in results}
     evals = sorted({c.eval_name for c in results})
-    labels = [_model_label(m) for m in models]
+    labels = [t.label for t in targets]
 
     eval_w = max([len("EVAL")] + [len(e) for e in evals]) + 2
     col_w = max([14] + [len(l) + 2 for l in labels]) if labels else 14
@@ -601,28 +657,30 @@ def render_matrix(results: list[CellResult], agent: str,
     lines = [f"agent: {agent}", header, "-" * len(header)]
     for ev in evals:
         row = ev.ljust(eval_w)
-        for m in models:
-            row += _cell_text(by_key.get((ev, m))).center(col_w)
+        for t in targets:
+            row += _cell_text(by_key.get((ev, t.model, t.reasoning_effort))).center(col_w)
         lines.append(row)
 
     lines += ["", "pass rate:"]
-    for m in models:
-        cells = [c for c in (by_key.get((ev, m)) for ev in evals) if c is not None]
+    for t in targets:
+        cells = [c for c in (by_key.get((ev, t.model, t.reasoning_effort)) for ev in evals)
+                 if c is not None]
         graded = [c for c in cells if not c.ungraded]
         npass = sum(1 for c in graded if c.passed)
         ung = len(cells) - len(graded)
         extra = f"   ({ung} ungraded)" if ung else ""
-        lines.append(f"  {_model_label(m):<28} {npass}/{len(graded)}{extra}")
+        lines.append(f"  {t.label:<28} {npass}/{len(graded)}{extra}")
     return "\n".join(lines)
 
 
 def render_markdown(results: list[CellResult], agent: str,
-                    models: list[Optional[str]],
+                    targets: list[ModelTarget],
                     run_dir: Optional[str] = None,
                     command: str = "") -> str:
-    by_key = {(c.eval_name, c.model): c for c in results}
+    targets = _as_targets(targets)
+    by_key = {_cell_key(c): c for c in results}
     evals = sorted({c.eval_name for c in results})
-    labels = [_model_label(m) for m in models]
+    labels = [t.label for t in targets]
 
     def _linked_mark(c: Optional[CellResult]) -> str:
         mark = _cell_mark(c)
@@ -641,17 +699,19 @@ def render_markdown(results: list[CellResult], agent: str,
              "| eval | " + " | ".join(labels) + " |",
              "|" + "---|" * (len(labels) + 1)]
     for ev in evals:
-        cells = [_linked_mark(by_key.get((ev, m))) for m in models]
+        cells = [_linked_mark(by_key.get((ev, t.model, t.reasoning_effort)))
+                 for t in targets]
         lines.append(f"| {ev} | " + " | ".join(cells) + " |")
 
     lines += ["", "## Pass rate", "", "| model | pass rate |", "|---|---|"]
-    for m in models:
-        cells = [c for c in (by_key.get((ev, m)) for ev in evals) if c is not None]
+    for t in targets:
+        cells = [c for c in (by_key.get((ev, t.model, t.reasoning_effort)) for ev in evals)
+                 if c is not None]
         graded = [c for c in cells if not c.ungraded]
         npass = sum(1 for c in graded if c.passed)
         ung = len(cells) - len(graded)
         rate = f"{npass}/{len(graded)}" + (f" ({ung} ungraded)" if ung else "")
-        lines.append(f"| {_model_label(m)} | {rate} |")
+        lines.append(f"| {t.label} | {rate} |")
     return "\n".join(lines) + "\n"
 
 
@@ -702,7 +762,7 @@ def _render_transcript(rr: RunResult) -> str:
 
 def render_report(cell: CellResult) -> str:
     rr = cell.run_result
-    title = f"{cell.agent}:{cell.model or 'default'}"
+    title = f"{cell.agent}:{cell.target_label}"
     out: list[str] = [f"# {cell.eval_name} — {title}", ""]
 
     out.append(f"- **verdict:** {_cell_mark(cell)}")
@@ -715,6 +775,8 @@ def render_report(cell: CellResult) -> str:
     meta = []
     if rr.cost_str:
         meta.append(f"cost {rr.cost_str}")
+    if cell.effective_effort:
+        meta.append(f"effort {cell.effective_effort}")
     if rr.duration_ms is not None:
         meta.append(f"{rr.duration_ms / 1000:.1f}s")
     if rr.resolved_model and rr.resolved_model != cell.model:
@@ -795,6 +857,13 @@ def _model_seg(model: Optional[str]) -> str:
     if safe != model:
         return f"{safe}-{hashlib.sha1(model.encode('utf-8')).hexdigest()[:6]}"
     return safe
+
+
+def _target_seg(target: ModelTarget) -> str:
+    """Artifacts dir segment for a matrix column. The effort suffix keeps two runs of the
+    SAME model at different efforts from colliding in one cell dir ('@' is fs-safe)."""
+    seg = _model_seg(target.model)
+    return f"{seg}@{target.reasoning_effort}" if target.reasoning_effort else seg
 
 
 # Phrases a CLI actually emits when rejecting a model id. Deliberately tight: the old

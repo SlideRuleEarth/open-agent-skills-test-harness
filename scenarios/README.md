@@ -33,6 +33,12 @@ description: ...                   # optional
 target:                            # REQUIRED
   runner: copilot                  #   required — one of: claude, codex, antigravity, copilot
   model: claude-haiku-4.5          #   optional — omit to use models.yaml's cheapest default
+  # A list makes one matrix column per entry, and each entry may pin its own reasoning
+  # effort (as an @suffix or a mapping) — so one scenario can compare a small model
+  # thinking hard against a big model thinking little:
+  # model:
+  #   - claude-haiku-4.5@high
+  #   - {model: claude-opus-4.6, reasoning_effort: low}
 skills:                            # REQUIRED, non-empty — provisioned together
   - sliderule-api
   - sliderule-params
@@ -41,6 +47,12 @@ prompt: |                          # REQUIRED. {skills} expands to the agent's s
 rubric: [ ... ]                    # optional — graded by the LLM judge
 assertions:                        # optional — deterministic checks
   - {type: file_exists, path: run.py}
+reasoning_effort: high             # optional — low|medium|high thinking budget for target
+                                   #   models WITHOUT their own @effort pin (per cell:
+                                   #   CLI --reasoning-effort > per-model pin > this field).
+                                   #   Mapped natively on claude/codex/copilot; antigravity
+                                   #   has no equivalent control and warns + ignores it
+                                   #   (its effort tier is part of the model id).
 # optional run knobs (CLI flags override these):
 judge: true                        # false to skip rubric grading (see Judge section below)
 isolated: true                     # false to expose globally-installed repo skills
@@ -48,8 +60,8 @@ max_cells: 25
 jobs: 1
 ```
 
-`vars` / `env` / `output_schema` / `timeout_sec` / `tags` work exactly as in a normal eval.
-The only scenario-specific key is `target:`.
+`vars` / `env` / `output_schema` / `timeout_sec` / `tags` / `reasoning_effort` work exactly
+as in a normal eval. The only scenario-specific key is `target:`.
 
 ## Judge
 
