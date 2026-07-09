@@ -151,7 +151,7 @@ for AntiGravity) so the run is hermetic.
 | `tags` | filter with `run --tag` |
 | `vars` | `{placeholder}` substitutions into the prompt |
 | `env` | extra env vars for the agent process |
-| `reasoning_effort` | thinking/reasoning budget: `low` \| `medium` \| `high` (CLI `--reasoning-effort` overrides). Mapped to the runner's native control — claude `--effort`, codex `model_reasoning_effort`, copilot `--reasoning-effort`. AntiGravity has no such control (effort is encoded in its model-id tier, e.g. `gemini-3.5-flash-medium`) — the value is ignored there with a warning. Unset = each runner's own default |
+| `reasoning_effort` | thinking/reasoning budget: `low` \| `medium` \| `high`. Precedence per cell: CLI `--reasoning-effort` > a per-model `@effort` pin (in `--model` or a scenario's `target.model`) > this field. Mapped to the runner's native control — claude `--effort`, codex `model_reasoning_effort`, copilot `--reasoning-effort`. AntiGravity has no such control (effort is encoded in its model-id tier, e.g. `gemini-3.5-flash-medium`) — the value is ignored there with a warning. Unset = each runner's own default |
 | `assertions` | deterministic checks (below) |
 | `rubric` | behaviors graded by the LLM judge (legacy `expected_behavior` accepted) |
 | `output_schema` | JSON Schema for the final structured answer |
@@ -221,6 +221,10 @@ agentskill-evals run --agent claude --skill foo --model claude-haiku-4-5
 
 # pin a comparable thinking budget across runners (claude/codex/copilot)
 agentskill-evals run --agent codex --skill foo --reasoning-effort high
+
+# per-model efforts: compare a small model thinking hard vs a big model thinking little
+agentskill-evals run --agent copilot --skill foo \
+    --model claude-haiku-4.5@high,claude-opus-4.6@low
 ```
 
 Output: a pass/fail matrix on stdout, plus per-run artifacts under
@@ -230,7 +234,8 @@ Output: a pass/fail matrix on stdout, plus per-run artifacts under
 artifacts/<run_id>/
   summary.json              # machine-readable matrix (per-cell `model`; top-level `targets`)
   summary.md               # rendered table
-  <runner>/<model>/<skill>/<eval>/    # <model> is `_default` when no model is set
+  <runner>/<model>/<skill>/<eval>/    # <model> is `_default` when no model is set, and
+                                      # `<model>@<effort>` when a per-model effort is pinned
     stdout.jsonl           # raw agent output
     stderr.txt
     events.json            # normalized event stream
@@ -318,19 +323,26 @@ name: api+params combination
 target:
   runner: claude
   model: claude-haiku-4-5      # optional; omit → models.yaml's cheapest default
+  # or a list — one matrix column per entry, each with an optional pinned effort,
+  # so one scenario compares models and/or reasoning budgets:
+  # model:
+  #   - claude-haiku-4.5@high
+  #   - {model: claude-opus-4.6, reasoning_effort: low}
 skills: [sliderule-api, sliderule-params]   # provisioned together; the only repo skills visible
 prompt: |
   Using {skills}, write run.py that ...
 rubric: [ ... ]
 assertions: [{type: file_exists, path: run.py}]
-reasoning_effort: high   # optional: low|medium|high thinking budget (see the fields table)
+reasoning_effort: high   # optional: low|medium|high thinking budget for targets without
+                         # their own @effort pin (see the fields table)
 judge: true        # optional run knobs (CLI flags override): judge / isolated / max_cells / jobs
 isolated: true
 ```
 
 Precedence for a run is **CLI flag > scenario file > built-in default**, so `--agent`,
 `--model`, `--no-isolated`, etc. override the file without editing it. Scenario artifacts land
-under `artifacts/<run_id>/<model>/scenario/<name>/`. Files live in
+under `artifacts/<run_id>/<model>/scenario/<name>/` (the `<model>` segment becomes
+`<model>@<effort>` when a per-model effort is pinned). Files live in
 [`../scenarios/`](../scenarios/) with the convention `<what>_on_<runner>-<model>.yaml`; see
 [scenarios/README.md](../scenarios/README.md).
 
@@ -372,6 +384,10 @@ Model selection for the one runner picked via `--agent`, in priority order:
 2. `--all-models` — the runner's full `models:` list.
 3. otherwise — the runner's `default:` (cheapest); if unset, the runner's own built-in default.
 
+Each `--model` entry may carry a **per-model reasoning effort** as an `@low`/`@medium`/`@high`
+suffix — that entry becomes its own matrix column, so one run can compare efforts (even for
+the same model id twice). A global `--reasoning-effort` overrides every per-model pin.
+
 ```bash
 # cheapest model on this runner (the safe default)
 agentskill-evals run --agent claude --skill sliderule-region-picker
@@ -380,6 +396,10 @@ agentskill-evals run --agent claude --skill sliderule-region-picker
 agentskill-evals run --agent claude --skill sliderule-region-picker \
     --model claude-opus-4-8,claude-haiku-4-5
 
+# compare per-model reasoning efforts in one run (each pin is its own column)
+agentskill-evals run --agent copilot --skill sliderule-region-picker \
+    --model claude-haiku-4.5@high,claude-opus-4.6@low
+
 # the full grid (opt-in; will ask to confirm, and is bounded by --max-cells)
 agentskill-evals run --agent claude --skill sliderule-region-picker --all-models
 
@@ -387,8 +407,10 @@ agentskill-evals run --agent claude --skill sliderule-region-picker --all-models
 agentskill-evals run --agent claude --skill sliderule-region-picker --all-models --dry-run
 ```
 
-The terminal shows a single wide grid (eval rows × model columns) plus a
-pass-rate footer; `summary.json` records each cell's `model` and the agent.
+The terminal shows a single wide grid (eval rows × target columns, labelled
+`model@effort` when an effort is pinned) plus a pass-rate footer; `summary.json` records
+each cell's `model`, its pinned `reasoning_effort`, the `effective_effort` the run actually
+used, and the agent.
 
 ### Single-runner invocations
 

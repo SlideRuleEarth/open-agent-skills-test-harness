@@ -27,6 +27,12 @@ target:
   # model:
   #   - claude-opus-4-8
   #   - claude-haiku-4-5
+  # Each entry may pin its own reasoning effort — an @low|@medium|@high suffix or a
+  # mapping — so one scenario compares models and/or thinking budgets per column
+  # (same as --model claude-haiku-4.5@high,claude-opus-4.6@low on the CLI):
+  # model:
+  #   - claude-haiku-4.5@high
+  #   - {model: claude-opus-4.6, reasoning_effort: low}
 
 # --------------------------------------------------------------------------
 # Skills — provisioned into the workspace; the ONLY repo skills visible (when isolated)
@@ -105,12 +111,15 @@ timeout_sec: 600                       # int (optional, default: 600) — max se
 # --------------------------------------------------------------------------
 
 reasoning_effort: null                 # "low" | "medium" | "high" | null (optional, default: null)
-                                       # null = the runner's own default. CLI --reasoning-effort
-                                       # overrides. Mapped to the runner's native control:
-                                       # claude --effort, codex model_reasoning_effort,
-                                       # copilot --reasoning-effort. Antigravity has no such
-                                       # control (effort is part of its model id tier, e.g.
-                                       # gemini-3.5-flash-medium) — warned + ignored there.
+                                       # null = the runner's own default. Applies to target
+                                       # models WITHOUT their own @effort pin; per cell the
+                                       # precedence is CLI --reasoning-effort > a per-model
+                                       # pin in target.model > this field. Mapped to the
+                                       # runner's native control: claude --effort, codex
+                                       # model_reasoning_effort, copilot --reasoning-effort.
+                                       # Antigravity has no such control (effort is part of
+                                       # its model id tier, e.g. gemini-3.5-flash-medium) —
+                                       # warned + ignored there.
 
 # --------------------------------------------------------------------------
 # Tags — for filtering with --tag

@@ -33,6 +33,12 @@ description: ...                   # optional
 target:                            # REQUIRED
   runner: copilot                  #   required — one of: claude, codex, antigravity, copilot
   model: claude-haiku-4.5          #   optional — omit to use models.yaml's cheapest default
+  # A list makes one matrix column per entry, and each entry may pin its own reasoning
+  # effort (as an @suffix or a mapping) — so one scenario can compare a small model
+  # thinking hard against a big model thinking little:
+  # model:
+  #   - claude-haiku-4.5@high
+  #   - {model: claude-opus-4.6, reasoning_effort: low}
 skills:                            # REQUIRED, non-empty — provisioned together
   - sliderule-api
   - sliderule-params
@@ -41,8 +47,9 @@ prompt: |                          # REQUIRED. {skills} expands to the agent's s
 rubric: [ ... ]                    # optional — graded by the LLM judge
 assertions:                        # optional — deterministic checks
   - {type: file_exists, path: run.py}
-reasoning_effort: high             # optional — low|medium|high thinking budget for the
-                                   #   target runner (CLI --reasoning-effort overrides).
+reasoning_effort: high             # optional — low|medium|high thinking budget for target
+                                   #   models WITHOUT their own @effort pin (per cell:
+                                   #   CLI --reasoning-effort > per-model pin > this field).
                                    #   Mapped natively on claude/codex/copilot; antigravity
                                    #   has no equivalent control and warns + ignores it
                                    #   (its effort tier is part of the model id).

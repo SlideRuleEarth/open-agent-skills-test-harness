@@ -55,6 +55,74 @@ EVAL_SUFFIXES = (".yaml", ".yml", ".json")
 REASONING_EFFORT_LEVELS = ("low", "medium", "high")
 
 
+def _normalize_effort(value, where: str) -> Optional[str]:
+    """Trim/lowercase and validate a reasoning-effort level; `where` prefixes the error so a
+    typo (`reasoning_effort: hgih`) is a clean `error: ...` before any tokens are spent."""
+    if value is None:
+        return None
+    effort = str(value).strip().lower()
+    if effort not in REASONING_EFFORT_LEVELS:
+        raise ValueError(
+            f"{where}: `reasoning_effort` must be one of "
+            f"{', '.join(REASONING_EFFORT_LEVELS)}; got {value!r}")
+    return effort
+
+
+@dataclass(frozen=True)
+class ModelTarget:
+    """One column of the run matrix: a model id (None = the runner's default) plus an
+    optional per-target reasoning effort, so a single run can compare e.g.
+    claude-haiku-4.5@high against claude-opus-4.6@low. Effort resolves per cell as
+    CLI --reasoning-effort > target > the spec's own `reasoning_effort:`."""
+    model: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+
+    @property
+    def label(self) -> str:
+        base = self.model or "default"
+        return f"{base}@{self.reasoning_effort}" if self.reasoning_effort else base
+
+
+def parse_model_target(entry, where: str) -> ModelTarget:
+    """Parse one target-model entry into a ModelTarget.
+
+    Accepted forms (scenario `target.model` entries and CLI `--model` tokens alike):
+      * a plain id:                    "claude-haiku-4.5"
+      * an `@effort` suffix:           "claude-haiku-4.5@high"
+      * a mapping:                     {model: claude-haiku-4.5, reasoning_effort: high}
+    """
+    if entry is None:
+        # An explicit null LIST entry (`model: [null]`) is a mistake, not "use the default"
+        # — str(None) would otherwise silently become the model id "None".
+        raise ValueError(f"{where}: empty model entry")
+    if isinstance(entry, dict):
+        unknown = set(entry) - {"model", "reasoning_effort"}
+        if unknown:
+            raise ValueError(
+                f"{where}: unknown key(s) {sorted(unknown)} in a target model entry — "
+                "allowed: model, reasoning_effort")
+        model = entry.get("model")
+        model = str(model) if model else None
+        effort = _normalize_effort(entry.get("reasoning_effort"), where)
+        if model is None and effort is None:
+            raise ValueError(
+                f"{where}: a target model entry needs `model` and/or `reasoning_effort`")
+        return ModelTarget(model=model, reasoning_effort=effort)
+    text = str(entry).strip()
+    if "@" in text:
+        base, _, suffix = text.rpartition("@")
+        if not base:
+            raise ValueError(f"{where}: model entry {entry!r} has no model id before '@'")
+        if suffix.strip().lower() not in REASONING_EFFORT_LEVELS:
+            raise ValueError(
+                f"{where}: model entry {entry!r} — the '@' suffix must be a reasoning "
+                f"effort ({', '.join(REASONING_EFFORT_LEVELS)}); got {suffix!r}")
+        return ModelTarget(model=base, reasoning_effort=suffix.strip().lower())
+    if not text:
+        raise ValueError(f"{where}: empty model entry")
+    return ModelTarget(model=text)
+
+
 @dataclass
 class EvalSpec:
     name: str
@@ -406,13 +474,7 @@ def _spec_from_raw(raw: dict, path: str) -> EvalSpec:
 
     # Validate the typed effort value at load so a typo (`reasoning_effort: hgih`) is a clean
     # `error: ...` before any tokens are spent, not a per-adapter CLI rejection mid-run.
-    effort = raw.get("reasoning_effort")
-    if effort is not None:
-        effort = str(effort).strip().lower()
-        if effort not in REASONING_EFFORT_LEVELS:
-            raise ValueError(
-                f"{path}: `reasoning_effort` must be one of "
-                f"{', '.join(REASONING_EFFORT_LEVELS)}; got {raw.get('reasoning_effort')!r}")
+    effort = _normalize_effort(raw.get("reasoning_effort"), path)
 
     name = raw.get("name") or os.path.splitext(os.path.basename(path))[0]
     skill_name = _infer_skill_name(path) or (skills[0] if skills else None)
@@ -451,9 +513,14 @@ class Scenario:
     """A combination eval: an EvalSpec plus a pinned target and optional run-knob overrides."""
     spec: EvalSpec
     runner: str
-    models: list[str | None]   # one or more models; [None] means "use default"
-    overrides: dict            # subset of {max_cells, jobs, judge, isolated}
+    targets: list[ModelTarget]  # one or more (model, effort) columns; ModelTarget() = defaults
+    overrides: dict             # subset of {max_cells, jobs, judge, isolated}
     source_path: str
+
+    @property
+    def models(self) -> list[Optional[str]]:
+        """Deprecated pre-#67 view of the target columns: model ids only (effort dropped)."""
+        return [t.model for t in self.targets]
 
 
 def load_scenario(path: str) -> Scenario:
@@ -470,13 +537,16 @@ def load_scenario(path: str) -> Scenario:
     if not runner or not isinstance(runner, str):
         raise ValueError(f"{path}: target.runner is required (a runner name, e.g. claude).")
 
+    # Every list entry goes through parse_model_target — a malformed one (`{}`, null, "")
+    # must be a load error, not silently dropped so the run spends budget on the default
+    # model instead. Only an ABSENT/null `model:` key (or an empty list) means "default".
     raw_model = target.get("model")
     if isinstance(raw_model, list):
-        models = [str(m) for m in raw_model if m] or [None]
-    elif raw_model:
-        models = [str(raw_model)]
+        targets = [parse_model_target(m, path) for m in raw_model] or [ModelTarget()]
+    elif raw_model is not None:
+        targets = [parse_model_target(raw_model, path)]
     else:
-        models = [None]
+        targets = [ModelTarget()]
 
     spec = _spec_from_raw(raw, path)     # reuses prompt/skills parsing + the prompt-required check
     spec.agents = None                   # the target governs the runner; ignore any eval `agents:`
@@ -499,7 +569,7 @@ def load_scenario(path: str) -> Scenario:
         raise ValueError(
             f"{path}: `judge` must be true/false or a mapping {{agent, model}}, "
             f"got {overrides['judge']!r}")
-    return Scenario(spec=spec, runner=runner.strip(), models=models,
+    return Scenario(spec=spec, runner=runner.strip(), targets=targets,
                     overrides=overrides, source_path=os.path.abspath(path))
 
 
