@@ -1,9 +1,9 @@
 # Evaluations
 
-Evaluations for the `sliderule-region-picker` skill. Each `*.yaml` file is one eval,
+Evaluations for the `sliderule-pipeline` skill. Each `*.yaml` file is one eval,
 loosely following the schema in Anthropic's
 [Agent Skills best practices](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices)
-and extended for the [`harness`](../../harness/) runner.
+and extended for the [`harness`](../../../harness/) runner.
 
 ## Format
 
@@ -17,19 +17,19 @@ Each eval has:
 - `rubric` — behaviors a correct answer must exhibit, graded by an LLM judge
 - `assertions` — optional deterministic checks (filesystem, tool-call trace, …)
 
-See the [runner README](../../harness/README.md) for the full field
+See the [runner README](../../../harness/README.md) for the full field
 and assertion reference.
 
 ## Running
 
-From the repo root (install the `agentskill-evals` CLI first — see the [runner README](../../harness/README.md#install)):
+From the repo root (install the `agentskill-evals` CLI first — see the [runner README](../../../harness/README.md#install)):
 
 ```bash
 # this skill on one agent, graded by the default judge
-agentskill-evals run --skill sliderule-region-picker --agent copilot
+agentskill-evals run --skill sliderule-pipeline --agent copilot
 
 # specific agent + model, parallel, show failing checks
-agentskill-evals run --skill sliderule-region-picker \
+agentskill-evals run --skill sliderule-pipeline \
     --agent claude --jobs 4 -v
 ```
 
@@ -44,29 +44,29 @@ compare — per the best-practices doc, the with/without delta is the real signa
 
 How well a skill works is determined mostly by the model, so the harness tests across
 **models** (not across every surface — see the
-[harness README](../../harness/README.md#what-we-test-models-not-surfaces)).
-Models live in the repo-root [`models.yaml`](../../models.yaml); a plain run uses the
+[harness README](../../../harness/README.md#what-we-test-models-not-surfaces)).
+Models live in the repo-root [`models.yaml`](../../../models.yaml); a plain run uses the
 cheapest model per runner, `--all-models` runs the full set.
 
 ```bash
 # cheapest model per runner (safe default)
-agentskill-evals run --skill sliderule-region-picker --agent copilot
+agentskill-evals run --skill sliderule-pipeline --agent copilot
 
 # compare specific models — Haiku is the canonical weak-model probe (most likely to skip
 # SKILL.md and answer from training; if it works on Haiku it usually works everywhere)
-agentskill-evals run --skill sliderule-region-picker --agent claude --model claude=claude-opus-4-8,claude-haiku-4-5
+agentskill-evals run --skill sliderule-pipeline --agent claude --model claude=claude-opus-4-8,claude-haiku-4-5
 
 # the full models.yaml grid (opt-in; prompts to confirm, bounded by --max-cells)
-agentskill-evals run --skill sliderule-region-picker --agent copilot --all-models
+agentskill-evals run --skill sliderule-pipeline --agent copilot --all-models
 ```
 
-See the [harness README](../../harness/README.md#cross-model-testing) for cost
+See the [harness README](../../../harness/README.md#cross-model-testing) for cost
 guardrails and how the model list is maintained.
 
 ## The evals
 
 | File | Catches |
 | ---- | ------- |
-| [01-draw-region-present-map.yaml](01-draw-region-present-map.yaml) | Rendering a tile map inline or inventing coordinates instead of presenting the helper-map link + copy-paste round-trip |
-| [02-coordinates-given-no-map.yaml](02-coordinates-given-no-map.yaml) | Pushing the helper map when the user already supplied an explicit bounding box |
-| [03-affirmative-offer-handoff.yaml](03-affirmative-offer-handoff.yaml) | Failing to hand off the helper-map link after the user accepts the offer, or confusing the `poly` vs `raster` paste formats |
+| [01-single-script-consolidation.yaml](01-single-script-consolidation.yaml) | Splitting a fetch → filter → aggregate workflow across separate ad-hoc steps instead of one consolidated pipeline script |
+| [02-surface-reproducible-script.yaml](02-surface-reproducible-script.yaml) | Running an ephemeral inline/heredoc script instead of saving + surfacing a named `pipeline.py` under `agents_outputs/<run>/` |
+| [03-task-metrics-reporting.yaml](03-task-metrics-reporting.yaml) | Omitting the "SlideRule Task Summary" task-metrics block — including on a zero-row or failed request |

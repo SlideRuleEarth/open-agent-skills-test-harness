@@ -35,12 +35,55 @@ DEFAULT_MAX_CELLS = 25
 DEFAULT_JOBS = 1
 
 
+SKILLS_SUBDIR = "skills_under_test"
+
+
 def _default_skills_root() -> str:
     return os.getcwd()
 
 
+def _has_skill_dirs(path: str) -> bool:
+    """True if `path` directly contains at least one `<name>/SKILL.md`."""
+    try:
+        return any(
+            os.path.isfile(os.path.join(path, name, "SKILL.md"))
+            for name in os.listdir(path)
+        )
+    except OSError:
+        return False
+
+
+def _resolve_skills_root(raw: str | None) -> str:
+    """Resolve the effective skills root (skills are its immediate subdirs).
+
+    If `raw` itself holds the skill folders it's used as-is; otherwise, when it
+    has a `skills_under_test/` subdir that does, we descend into it. This keeps
+    the documented `--skills-root .` / `--skills-root ..` invocations working now
+    that the example skills live under `skills_under_test/`.
+    """
+    base = os.path.abspath(raw or _default_skills_root())
+    if _has_skill_dirs(base):
+        return base
+    nested = os.path.join(base, SKILLS_SUBDIR)
+    if _has_skill_dirs(nested):
+        return nested
+    return base
+
+
 def _default_config_path(skills_root: str) -> str:
-    return os.path.join(skills_root, "models.yaml")
+    """Locate models.yaml — the repo-root single source of truth.
+
+    Prefer `<skills_root>/models.yaml`, but when skills live under
+    `skills_under_test/` the config still sits at the repo root (the parent), so
+    fall back there.
+    """
+    here = os.path.join(skills_root, "models.yaml")
+    if os.path.isfile(here):
+        return here
+    parent = os.path.join(os.path.dirname(os.path.abspath(skills_root)), "models.yaml")
+    if os.path.isfile(parent):
+        return parent
+    return here
 
 
 def _canonical_agent(name: str) -> str:
@@ -271,7 +314,7 @@ def _print_skill_visibility(specs, agent, isolated, skills_root, provision) -> N
 
 
 def cmd_run(args) -> int:
-    skills_root = os.path.abspath(args.skills_root)
+    skills_root = _resolve_skills_root(args.skills_root)
 
     # spec source: a scenario file (--config) OR per-skill discovery
     scenario = None
@@ -635,7 +678,7 @@ def cmd_run(args) -> int:
 
 
 def cmd_list_configured_agents(args) -> int:
-    skills_root = os.path.abspath(getattr(args, "skills_root", None) or _default_skills_root())
+    skills_root = _resolve_skills_root(getattr(args, "skills_root", None))
     config_path = os.path.abspath(
         getattr(args, "models_config", None) or _default_config_path(skills_root))
     cfg = _load_models_config(config_path)
@@ -659,7 +702,7 @@ def cmd_list_configured_agents(args) -> int:
 
 
 def cmd_list_available_agents(args) -> int:
-    skills_root = os.path.abspath(getattr(args, "skills_root", None) or _default_skills_root())
+    skills_root = _resolve_skills_root(getattr(args, "skills_root", None))
     config_path = os.path.abspath(
         getattr(args, "models_config", None) or _default_config_path(skills_root))
     cfg = _load_models_config(config_path)
@@ -763,7 +806,7 @@ def cmd_list_available_agents(args) -> int:
 
 
 def cmd_list_evals(args) -> int:
-    skills_root = os.path.abspath(args.skills_root)
+    skills_root = _resolve_skills_root(args.skills_root)
     specs = _discover(args, skills_root)
     if not specs:
         print("no evals found.", file=sys.stderr)
@@ -780,7 +823,7 @@ def cmd_list_evals(args) -> int:
 
 
 def cmd_list_skills(args) -> int:
-    skills_root = os.path.abspath(args.skills_root)
+    skills_root = _resolve_skills_root(args.skills_root)
     superset = skill_names(skills_root)
     repo = set(superset)
     real_home = os.path.expanduser("~")
@@ -827,7 +870,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_discovery(sp):
         sp.add_argument("--skills-root", default=_default_skills_root(),
-                        help="dir containing skill folders (each with an evals/). Default: cwd")
+                        help="dir containing skill folders (each with an evals/); "
+                             "auto-descends into skills_under_test/ if present. Default: cwd")
         sp.add_argument("--skill", help="only this skill's evals/")
         sp.add_argument("--evals", nargs="*", help="explicit eval files or directories")
 
@@ -863,7 +907,7 @@ def build_parser() -> argparse.ArgumentParser:
                          "model_reasoning_effort, copilot --reasoning-effort); ignored with "
                          "a warning by runners without one (antigravity encodes effort in "
                          "the model id tier instead)")
-    sp.add_argument("--models-config", help="models.yaml path (default: <skills-root>/models.yaml)")
+    sp.add_argument("--models-config", help="models.yaml path (default: models.yaml under the skills-root, else the repo root)")
     sp.add_argument("--all-models", action="store_true",
                     help="run this agent's full models.yaml list (default: just the cheapest)")
     sp.add_argument("--max-cells", type=int, default=None,
@@ -883,14 +927,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="show runners and their configured models from models.yaml")
     sp.add_argument("--skills-root", default=_default_skills_root(),
                     help="dir to look for models.yaml (default: cwd)")
-    sp.add_argument("--models-config", help="models.yaml path (default: <skills-root>/models.yaml)")
+    sp.add_argument("--models-config", help="models.yaml path (default: models.yaml under the skills-root, else the repo root)")
     sp.set_defaults(func=cmd_list_configured_agents)
 
     sp = sub.add_parser("list-agents-available-models",
                         help="probe installed CLIs to discover available models and check config")
     sp.add_argument("--skills-root", default=_default_skills_root(),
                     help="dir to look for models.yaml (default: cwd)")
-    sp.add_argument("--models-config", help="models.yaml path (default: <skills-root>/models.yaml)")
+    sp.add_argument("--models-config", help="models.yaml path (default: models.yaml under the skills-root, else the repo root)")
     sp.add_argument("-y", "--yes", action="store_true",
                     help="skip the confirmation prompt")
     sp.set_defaults(func=cmd_list_available_agents)
@@ -902,7 +946,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("list-skills",
                         help="audit skill visibility (superset + per-runner masked/kept + drift)")
     sp.add_argument("--skills-root", default=_default_skills_root(),
-                    help="dir containing skill folders (default: cwd)")
+                    help="dir containing skill folders; auto-descends into "
+                         "skills_under_test/ if present (default: cwd)")
     sp.set_defaults(func=cmd_list_skills)
 
     sp = sub.add_parser("selftest", help="test the adapter parsers against bundled fixtures")

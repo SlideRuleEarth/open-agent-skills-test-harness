@@ -98,11 +98,12 @@ python3 -m agentskill_evals run --skills-root .. --config ../scenarios/<file>.ya
 Evals are **per-skill**: each skill directory owns an `evals/` folder.
 
 ```
-sliderule-pipeline/
-  SKILL.md
-  evals/
-    01-single-script-consolidation.yaml
-    02-surface-reproducible-script.yaml
+skills_under_test/
+  sliderule-pipeline/
+    SKILL.md
+    evals/
+      01-single-script-consolidation.yaml
+      02-surface-reproducible-script.yaml
 ```
 
 A spec (YAML or JSON):
@@ -190,8 +191,9 @@ deterministic assertions only.
 
 Examples use the installed `agentskill-evals` CLI (see [Install](#install)). From a
 source checkout without installing, run them as `python3 -m agentskill_evals …` from
-inside `harness/`, adding `--skills-root ..` so the harness finds the sibling
-skill evals and the repo-root `models.yaml` (the default skills-root is the current
+inside `harness/`, adding `--skills-root ..` so the harness finds the example skills
+under `skills_under_test/` and the repo-root `models.yaml` (a skills-root pointed at the
+repo root auto-descends into `skills_under_test/`; the default skills-root is the current
 directory).
 
 ```bash

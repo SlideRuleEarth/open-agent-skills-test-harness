@@ -1,10 +1,11 @@
-# Makefile for SlideRule skills — build zip archives for import into claude.ai
+# Makefile for the example skills — build zip archives for import into claude.ai
 
 PYTHON     ?= python3
 OUTPUT_DIR ?= exports
 
-# Skill directories (any top-level dir containing a SKILL.md)
-SKILLS         := $(patsubst %/SKILL.md,%,$(wildcard */SKILL.md))
+# Skill directories (each example skill lives under skills_under_test/<name>/SKILL.md)
+SKILLS_DIR     := skills_under_test
+SKILLS         := $(patsubst $(SKILLS_DIR)/%/SKILL.md,%,$(wildcard $(SKILLS_DIR)/*/SKILL.md))
 EXPORT_TARGETS := $(addprefix export-,$(SKILLS))
 
 # --- Skill symlink layout (one source of truth: this repo) -----------------
@@ -63,7 +64,7 @@ link-project: ## Create committed, relative skill symlinks (.claude/.agents/.ant
 	@for d in $(PROJECT_SKILL_DIRS); do \
 		mkdir -p "$$d"; \
 		for s in $(SKILLS); do \
-			ln -sfn "../../$$s" "$$d/$$s" && echo "  $$d/$$s -> ../../$$s"; \
+			ln -sfn "../../$(SKILLS_DIR)/$$s" "$$d/$$s" && echo "  $$d/$$s -> ../../$(SKILLS_DIR)/$$s"; \
 		done; \
 	done
 
@@ -71,7 +72,7 @@ link-global: ## Symlink skills into your per-user agent dirs (~/.claude, ~/.agen
 	@for d in $(GLOBAL_SKILL_DIRS); do \
 		mkdir -p "$$d"; \
 		for s in $(SKILLS); do \
-			ln -sfn "$(CURDIR)/$$s" "$$d/$$s" && echo "  $$d/$$s -> $(CURDIR)/$$s"; \
+			ln -sfn "$(CURDIR)/$(SKILLS_DIR)/$$s" "$$d/$$s" && echo "  $$d/$$s -> $(CURDIR)/$(SKILLS_DIR)/$$s"; \
 		done; \
 	done
 
