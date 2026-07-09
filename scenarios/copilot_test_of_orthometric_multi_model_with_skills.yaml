@@ -8,7 +8,7 @@ target:                       # the runner:model this scenario tests
     - gpt-5.5  
     - claude-opus-4.8      
 skills:                       # provisioned together; the only repo skills visible (isolated)
-  - sliderule-pipeline
+  - sliderule-pipeline-direct_request
  
 prompt: |
   Using SlideRule, what are the orthometric heights of the canopy over Grand Mesa at 20 meter resolution?

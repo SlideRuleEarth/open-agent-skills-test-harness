@@ -1,5 +1,5 @@
 ---
-name: sliderule-pipeline
+name: sliderule-pipeline-direct_request
 description: >
   Behavioral directives for orchestrating SlideRule analyses as single-script
   pipelines and reporting task metrics. Use when consolidating a multi-step

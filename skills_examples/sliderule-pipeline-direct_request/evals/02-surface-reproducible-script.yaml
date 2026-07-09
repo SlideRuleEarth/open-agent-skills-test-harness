@@ -5,7 +5,7 @@ description: >
   reproducible script to the user — so the user can change a coordinate or date
   and rerun without reconstructing the request from the chat transcript.
 skills:
-- sliderule-pipeline
+- sliderule-pipeline-direct_request
 prompt: |
   Pull atl13p lake surface heights for Lake Powell for summer 2023 and export
   the results. Make sure I can rerun exactly what you ran later — I'll probably

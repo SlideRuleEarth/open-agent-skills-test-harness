@@ -39,9 +39,9 @@ target:
 # --------------------------------------------------------------------------
 
 skills:                                # list[str] (optional, default: [])
-  - sliderule-pipeline                 # each entry must match a <skills-root>/<name>/SKILL.md
+  - sliderule-pipeline-direct_request                 # each entry must match a <skills-root>/<name>/SKILL.md
   - sliderule-region-picker
-# Accepted aliases: `skill: sliderule-pipeline` (singular string) also works.
+# Accepted aliases: `skill: sliderule-pipeline-direct_request` (singular string) also works.
 # An empty list is valid — useful for A/B testing with vs. without skills.
 
 # --------------------------------------------------------------------------
@@ -191,7 +191,7 @@ assertions:
   - {type: file_absent,  path: output.csv}
 
   # skill interaction
-  - {type: skill_triggered,     skill: sliderule-pipeline}
+  - {type: skill_triggered,     skill: sliderule-pipeline-direct_request}
   - {type: skill_triggered,     skill: sliderule-region-picker}
 
   # process

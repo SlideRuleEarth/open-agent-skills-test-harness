@@ -16,7 +16,7 @@ target:
   model: claude-haiku-4.5        # cheapest copilot model
 
 skills:
-  - sliderule-pipeline
+  - sliderule-pipeline-direct_request
   - sliderule-region-picker
 
 prompt: |
@@ -37,7 +37,7 @@ assertions:
   - {type: file_absent,  path: output.csv}
 
   # skill interaction
-  - {type: skill_triggered,     skill: sliderule-pipeline}
+  - {type: skill_triggered,     skill: sliderule-pipeline-direct_request}
   - {type: skill_triggered,     skill: sliderule-region-picker}
 
   # process

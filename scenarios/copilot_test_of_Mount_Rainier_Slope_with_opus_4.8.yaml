@@ -7,7 +7,7 @@ target:                       # the runner:model this scenario tests
   model: claude-opus-4.8     
 
 skills:                       # provisioned together; the only repo skills visible (isolated)
-  - sliderule-pipeline
+  - sliderule-pipeline-direct_request
   - sliderule-region-picker
 
 prompt: |
@@ -55,7 +55,7 @@ rubric:                       # graded by the LLM judge
 
 assertions:                   # deterministic checks
   - {type: file_exists, path: pipeline.py}
-  - {type: skill_triggered,     skill: sliderule-pipeline}
+  - {type: skill_triggered,     skill: sliderule-pipeline-direct_request}
   # process
   - {type: no_error}
 

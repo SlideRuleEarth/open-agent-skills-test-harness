@@ -40,7 +40,7 @@ target:                            # REQUIRED
   #   - claude-haiku-4.5@high
   #   - {model: claude-opus-4.6, reasoning_effort: low}
 skills:                            # REQUIRED, non-empty — provisioned together
-  - sliderule-pipeline
+  - sliderule-pipeline-direct_request
   - sliderule-region-picker
 prompt: |                          # REQUIRED. {skills} expands to the agent's skill refs.
   Using {skills}, write ...
@@ -146,8 +146,8 @@ assertions:
   # Verify the agent used sliderule-region-picker
   - {type: skill_triggered, skill: sliderule-region-picker}
 
-  # Verify it did NOT use sliderule-pipeline (boundary test)
-  - {type: skill_not_triggered, skill: sliderule-pipeline}
+  # Verify it did NOT use sliderule-pipeline-direct_request (boundary test)
+  - {type: skill_not_triggered, skill: sliderule-pipeline-direct_request}
 
   # For skills that ship a references/ dir: verify it read a specific reference file
   - {type: skill_reference_read, skill: some-skill, path: notes.md}

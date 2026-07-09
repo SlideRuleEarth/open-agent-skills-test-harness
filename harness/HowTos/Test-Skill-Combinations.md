@@ -2,7 +2,7 @@
 
 A per-skill eval ([`<skill>/evals/`](../../scenarios/README.md)) tests one skill in isolation. But
 skills are often used *together* — e.g. `sliderule-region-picker` helps define the analysis region
-and `sliderule-pipeline` consolidates the work into a single reproducible script. A
+and `sliderule-pipeline-direct_request` consolidates the work into a single reproducible script. A
 **[scenario](../../scenarios/README.md)** is the tool for testing that: it provisions a
 **combination of skills together** against one target (`runner:model`), from a single
 self-describing file.
@@ -28,7 +28,7 @@ target:
 
 skills:                          # provisioned TOGETHER; the only repo skills visible (isolated)
   - sliderule-region-picker
-  - sliderule-pipeline
+  - sliderule-pipeline-direct_request
 
 prompt: |
   Using {skills}, write a Python script run.py that submits an ATL06 request over a small
@@ -48,7 +48,7 @@ assertions:
 isolated: true                   # keep the default — only these two skills are visible
 ```
 
-> `{skills}` expands to both skill references (e.g. `/sliderule-region-picker, /sliderule-pipeline`
+> `{skills}` expands to both skill references (e.g. `/sliderule-region-picker, /sliderule-pipeline-direct_request`
 > on Claude), so the prompt can name them as a set. If you'd rather the model *discover* which
 > skills to reach for, drop `{skills}` and write the task plainly.
 

@@ -12,7 +12,7 @@ Each skill directory contains:
 - `scripts/` — optional Python helpers invoked at runtime by the skill
 - `requirements.txt` — dependencies for the scripts (if present)
 
-Current example skills (under `skills_examples/`): `sliderule-pipeline`, `sliderule-region-picker`. These are **examples** — the repo's purpose is the harness, not this particular skill set.
+Current example skills (under `skills_examples/`): `sliderule-pipeline-direct_request`, `sliderule-region-picker`. These are **examples** — the repo's purpose is the harness, not this particular skill set.
 
 Example skills live in `skills_examples/<name>/` (each with a `SKILL.md`). The `Makefile` auto-discovers them via `$(wildcard skills_examples/*/SKILL.md)`, and the harness treats `skills_examples/` as its skills root — a `--skills-root` pointed at the repo root (`.` or `..`) auto-descends into `skills_examples/`.
 
@@ -32,7 +32,7 @@ Adding a new surface (agent runtime): add its skills directory to `PROJECT_SKILL
 
 ```bash
 make export                   # build all skills as zips into exports/
-make export-sliderule-pipeline  # build a single skill
+make export-sliderule-pipeline-direct_request  # build a single skill
 python export.py -h           # full options
 make clean                    # remove exports/
 ```
@@ -64,10 +64,10 @@ agentskill-evals list-agents-configured-models --skills-root .
 agentskill-evals list-evals  --skills-root .
 
 # run one skill's evals on one agent (cheapest model)
-agentskill-evals run --agent claude --skill sliderule-pipeline
+agentskill-evals run --agent claude --skill sliderule-pipeline-direct_request
 
 # run a single eval file, skip LLM judge
-agentskill-evals run --agent claude --evals skills_examples/sliderule-pipeline/evals/01-single-script-consolidation.yaml --no-judge
+agentskill-evals run --agent claude --evals skills_examples/sliderule-pipeline-direct_request/evals/01-single-script-consolidation.yaml --no-judge
 
 # preview scope and cost without spending anything
 agentskill-evals run --agent copilot --skill sliderule-region-picker --all-models --dry-run

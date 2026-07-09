@@ -40,7 +40,7 @@ help: ## That's me!
 	@printf "\033[37m%-30s\033[0m %s\n" "#----target--------------------description------------------------------------------------"
 	@grep -E '^[a-zA-Z_-].+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
 	@echo
-	@echo "Per-skill export: make export-<skill>   (e.g. make export-sliderule-pipeline)"
+	@echo "Per-skill export: make export-<skill>   (e.g. make export-sliderule-pipeline-direct_request)"
 	@echo
 	@echo SKILLS: $(SKILLS)
 	@echo OUTPUT_DIR: $(OUTPUT_DIR)
@@ -50,7 +50,7 @@ help: ## That's me!
 export: ## Export all skills as zips into $(OUTPUT_DIR)/
 	$(PYTHON) export.py -o $(OUTPUT_DIR)
 
-# Per-skill export: make export-<skill> (e.g. make export-sliderule-pipeline)
+# Per-skill export: make export-<skill> (e.g. make export-sliderule-pipeline-direct_request)
 $(EXPORT_TARGETS): export-%:
 	$(PYTHON) export.py -o $(OUTPUT_DIR) $*
 

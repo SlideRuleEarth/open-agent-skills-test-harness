@@ -14,7 +14,7 @@ A cross-agent **test harness for evaluating [Agent Skills](https://platform.clau
 
 The bundled skills are **examples** — this repo is a harness, not a skills library. They currently target [SlideRule Earth](https://slideruleearth.io) (a NASA ICESat-2/GEDI cloud-processing service):
 
-- [sliderule-pipeline](skills_examples/sliderule-pipeline/) — Directives for orchestrating SlideRule analyses as single-script pipelines
+- [sliderule-pipeline-direct_request](skills_examples/sliderule-pipeline-direct_request/) — Directives for orchestrating SlideRule analyses as single-script pipelines
 - [sliderule-region-picker](skills_examples/sliderule-region-picker/) — Interactive map for defining geographic regions
 
 > **Just want to use these skills?** Install them below and you're done — the harness is optional.
@@ -61,7 +61,7 @@ These are **absolute** symlinks into this checkout and are *not* committed; a `g
 
 ```bash
 ls -l ~/.claude/skills ~/.agents/skills
-# each entry: sliderule-pipeline -> /path/to/open-agent-skills-test-harness/skills_examples/sliderule-pipeline
+# each entry: sliderule-pipeline-direct_request -> /path/to/open-agent-skills-test-harness/skills_examples/sliderule-pipeline-direct_request
 ```
 
 `ln -sfn` (used by the targets) replaces existing symlinks, so the targets are safe to re-run after adding skills. They won't overwrite a real directory — if you have a non-symlink copy of a skill installed, remove it first.
@@ -101,7 +101,7 @@ The `make` targets need a Unix shell (Git Bash or WSL) — run them there. In pl
 - **Directory junctions (recommended — no admin needed).** The closest equivalent to the symlink "single source of truth" model. In `cmd`:
 
   ```cmd
-  mklink /J "%USERPROFILE%\.claude\skills\sliderule-pipeline" "C:\path\to\open-agent-skills-test-harness\skills_examples\sliderule-pipeline"
+  mklink /J "%USERPROFILE%\.claude\skills\sliderule-pipeline-direct_request" "C:\path\to\open-agent-skills-test-harness\skills_examples\sliderule-pipeline-direct_request"
   ```
 
   Junctions work for directories without elevation, and a `git pull` in the repo updates every consumer.
@@ -110,7 +110,7 @@ The `make` targets need a Unix shell (Git Bash or WSL) — run them there. In pl
 
   ```powershell
   $repo = "C:\path\to\open-agent-skills-test-harness"
-  foreach ($s in "sliderule-pipeline","sliderule-region-picker") {
+  foreach ($s in "sliderule-pipeline-direct_request","sliderule-region-picker") {
     New-Item -ItemType SymbolicLink -Path "$env:USERPROFILE\.claude\skills\$s" -Target "$repo\skills_examples\$s" -Force
   }
   ```
@@ -159,7 +159,7 @@ make export
 This writes one `<skill>.zip` per skill into `exports/`, each containing the skill's top-level folder and its `SKILL.md` — the layout these apps expect. To build a single skill:
 
 ```bash
-make export-sliderule-pipeline
+make export-sliderule-pipeline-direct_request
 ```
 
 (`make export` just runs `export.py`; see `python export.py -h` for its options, including a custom output directory.)
