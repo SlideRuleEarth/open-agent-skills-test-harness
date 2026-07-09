@@ -8,14 +8,8 @@ Each `.zip` file is one self-contained skill:
 
 | File | What it does |
 |---|---|
-| `sliderule-api.zip` | HTTP mechanics for calling the SlideRule processing API |
-| `sliderule-params.zip` | Systematic planning of request parameters before making API calls |
-| `sliderule-openapi.zip` | Structured lookups against the SlideRule OpenAPI spec (parameters, output columns, field enumerations) |
-| `sliderule-docsearch.zip` | Semantic search over SlideRule documentation |
-| `sliderule-examples.zip` | Worked Python examples from the SlideRule client notebooks |
 | `sliderule-pipeline.zip` | Directives for orchestrating multi-step analyses as single scripts |
 | `sliderule-region-picker.zip` | Interactive map for defining geographic regions |
-| `nsidc-reference.zip` | Search NASA NSIDC/ORNL DAAC reference docs for ICESat-2 and GEDI science |
 
 ## How to upload
 
@@ -37,15 +31,11 @@ For example, on claude.ai:
 
 ## Which skills to upload
 
-**For most users**, upload all of them. The skills are designed to work together — when the agent is planning a SlideRule request, it uses `sliderule-params` for parameter planning, `sliderule-openapi` for schema lookups, and `sliderule-api` for the HTTP call.
+**For most users**, upload both. They're independent, standalone tools: `sliderule-pipeline` guides consolidating an analysis into a single reproducible script, and `sliderule-region-picker` provides an interactive map for defining the geographic region.
 
-**If you only need a subset**, here are the dependency relationships:
+**If you only need one**, both skills are standalone:
 
-- `sliderule-params` references `sliderule-openapi` for schema lookups
-- `sliderule-api` references `sliderule-openapi` for schema details and `sliderule-params` for parameter planning
-- `sliderule-docsearch` and `nsidc-reference` are independent search tools
-- `sliderule-examples` is standalone reference material
-- `sliderule-pipeline` and `sliderule-region-picker` are standalone
+- `sliderule-pipeline` and `sliderule-region-picker` are independent — neither depends on the other.
 
 ## Regenerating the exports
 
@@ -58,15 +48,11 @@ python export.py
 Or export specific skills:
 
 ```bash
-python export.py sliderule-api sliderule-params
+python export.py sliderule-pipeline sliderule-region-picker
 ```
 
 Output goes to `exports/` by default (override with `-o <dir>`).
 
 ## Notes
 
-- Several skills include Python scripts that the agent runs wherever it has a code sandbox with network access — that includes local runtimes (Claude Code, Cursor, Windsurf) **and** hosted ones like claude.ai, which executes skills in a container. The scripts become read-only reference only when a session has no code sandbox, no network grant, or a sandbox whose egress allowlist excludes the target host (e.g. the search endpoint or `docs.slideruleearth.io`); in that case the agent can read the script text but not run it. The scripts:
-  - `nsidc-reference` — `scripts/search.py` (semantic search over NSIDC/ORNL DAAC docs)
-  - `sliderule-docsearch` — `scripts/search.py` (semantic search over SlideRule docs), `scripts/fetch_doc.py` (fetch a full docs page as fallback)
-  - `sliderule-openapi` — `scripts/openapi.py` (loads and slices the OpenAPI spec by endpoint, parameter, or schema)
-- The `SKILL.md` file in each zip is the main instruction set. The `references/` and `scripts/` directories contain supplementary material that the instructions reference.
+- Both skills are prose-only — the `SKILL.md` file in each zip is the complete instruction set, with no Python scripts to execute. They work anywhere the agent can read the skill text.

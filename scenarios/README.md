@@ -12,13 +12,13 @@ auto-discovered**. You run one explicitly by path.
 From the **repo root** (so the skills resolve and the run is isolated against this repo):
 
 ```bash
-agentskill-evals run --config scenarios/example_api+params_on_claude-haiku.yaml
+agentskill-evals run --config scenarios/example_full_schema.yaml
 ```
 
 Preview first — see the plan **and exactly which skills the model will see**, with no API cost:
 
 ```bash
-agentskill-evals run --config scenarios/example_api+params_on_claude-haiku.yaml --dry-run
+agentskill-evals run --config scenarios/example_full_schema.yaml --dry-run
 ```
 
 By default each run is **isolated**: normal skill discovery sees only the skills the scenario lists
@@ -28,7 +28,7 @@ are masked. Add `--no-isolated` to test against your real, globally-installed se
 ## File format
 
 ```yaml
-name: api+params combination       # optional; defaults to the filename
+name: pipeline+region-picker combination  # optional; defaults to the filename
 description: ...                   # optional
 target:                            # REQUIRED
   runner: copilot                  #   required — one of: claude, codex, antigravity, copilot
@@ -40,8 +40,8 @@ target:                            # REQUIRED
   #   - claude-haiku-4.5@high
   #   - {model: claude-opus-4.6, reasoning_effort: low}
 skills:                            # REQUIRED, non-empty — provisioned together
-  - sliderule-api
-  - sliderule-params
+  - sliderule-pipeline
+  - sliderule-region-picker
 prompt: |                          # REQUIRED. {skills} expands to the agent's skill refs.
   Using {skills}, write ...
 rubric: [ ... ]                    # optional — graded by the LLM judge
@@ -143,23 +143,23 @@ Examples:
 
 ```yaml
 assertions:
-  # Verify the agent used sliderule-params
-  - {type: skill_triggered, skill: sliderule-params}
+  # Verify the agent used sliderule-region-picker
+  - {type: skill_triggered, skill: sliderule-region-picker}
 
-  # Verify it did NOT try to use sliderule-api (boundary test)
-  - {type: skill_not_triggered, skill: sliderule-api}
+  # Verify it did NOT use sliderule-pipeline (boundary test)
+  - {type: skill_not_triggered, skill: sliderule-pipeline}
 
-  # Verify it read a specific reference file
-  - {type: skill_reference_read, skill: sliderule-openapi, path: parameter_couplings.md}
+  # For skills that ship a references/ dir: verify it read a specific reference file
+  - {type: skill_reference_read, skill: some-skill, path: notes.md}
 
   # Verify it did NOT read the wrong reference
-  - {type: skill_reference_not_read, skill: sliderule-openapi, path: elevation_datums.md}
+  - {type: skill_reference_not_read, skill: some-skill, path: other.md}
 
-  # Verify it ran the OpenAPI script
-  - {type: skill_script_executed, skill: sliderule-openapi, path: openapi.py}
+  # For skills that ship a scripts/ dir: verify it ran the script
+  - {type: skill_script_executed, skill: some-skill, path: tool.py}
 
-  # Verify it did NOT run the script (narrative question, not a spec lookup)
-  - {type: skill_script_not_executed, skill: sliderule-openapi}
+  # Verify it did NOT run the script (narrative question, not a script task)
+  - {type: skill_script_not_executed, skill: some-skill}
 ```
 
 ### Process / output
@@ -180,7 +180,7 @@ assertions:
 ## Naming convention
 
 Name files so a newcomer knows what each is for: **`<what>_on_<runner>-<model>.yaml`**, e.g.
-`api+params_on_claude-haiku.yaml`, `full-pipeline_on_codex-gpt5.5.yaml`. The target also lives
+`pipeline+region-picker_on_claude-haiku.yaml`, `full-pipeline_on_codex-gpt5.5.yaml`. The target also lives
 inside the file; the filename just makes the directory self-describing at a glance.
 
 ## Override precedence

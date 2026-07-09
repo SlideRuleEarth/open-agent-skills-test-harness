@@ -1,9 +1,9 @@
 # Test a combination of skills
 
 A per-skill eval ([`<skill>/evals/`](../../scenarios/README.md)) tests one skill in isolation. But
-the SlideRule skills are designed to work *together* — e.g. `sliderule-params` plans a request,
-`sliderule-openapi` looks up the exact parameter/column schema, and `sliderule-api` builds the HTTP
-call. A **[scenario](../../scenarios/README.md)** is the tool for testing that: it provisions a
+skills are often used *together* — e.g. `sliderule-region-picker` helps define the analysis region
+and `sliderule-pipeline` consolidates the work into a single reproducible script. A
+**[scenario](../../scenarios/README.md)** is the tool for testing that: it provisions a
 **combination of skills together** against one target (`runner:model`), from a single
 self-describing file.
 
@@ -19,17 +19,16 @@ Save a file under [`scenarios/`](../../scenarios/), named `<what>_on_<runner>-<m
 `atl06-pipeline_on_claude-haiku.yaml`:
 
 ```yaml
-name: atl06 pipeline combination
-description: Do params + openapi + api work together to build a correct ATL06 request?
+name: region + pipeline combination
+description: Do the region-picker and pipeline skills work together to produce a clean, reproducible analysis script?
 
 target:
   runner: claude
   model: claude-haiku-4-5        # cheapest claude model; omit → models.yaml default
 
 skills:                          # provisioned TOGETHER; the only repo skills visible (isolated)
-  - sliderule-params
-  - sliderule-openapi
-  - sliderule-api
+  - sliderule-region-picker
+  - sliderule-pipeline
 
 prompt: |
   Using {skills}, write a Python script run.py that submits an ATL06 request over a small
@@ -38,24 +37,24 @@ prompt: |
 
 # Rubric items that check the HANDOFF between skills — that each one pulled its weight.
 rubric:
-  - Plans the request parameters via the params skill rather than hardcoded guesses.
-  - Confirms parameter/column names against the OpenAPI schema (openapi skill) instead of inventing them.
-  - Builds and posts a correct request envelope to an ATL06 endpoint (api skill).
+  - Defines the analysis region up front (region-picker skill) rather than guessing coordinates.
+  - Consolidates the work into a single reproducible script (pipeline skill) instead of scattered snippets.
+  - Builds and posts a correct request envelope to an ATL06 endpoint.
   - Writes the output to out.parquet.
 
 assertions:
   - {type: file_exists, path: run.py}
 
-isolated: true                   # keep the default — only these three skills are visible
+isolated: true                   # keep the default — only these two skills are visible
 ```
 
-> `{skills}` expands to all three skill references (e.g. `/sliderule-params, /sliderule-openapi,
-> /sliderule-api` on Claude), so the prompt can name them as a set. If you'd rather the model
-> *discover* which skills to reach for, drop `{skills}` and write the task plainly.
+> `{skills}` expands to both skill references (e.g. `/sliderule-region-picker, /sliderule-pipeline`
+> on Claude), so the prompt can name them as a set. If you'd rather the model *discover* which
+> skills to reach for, drop `{skills}` and write the task plainly.
 
 ## 2. Preview (no API cost)
 
-`--dry-run` prints the plan and a **"Skills visible to the model"** block — confirm all three show
+`--dry-run` prints the plan and a **"Skills visible to the model"** block — confirm both show
 up under `provisioned` and that other repo skills are masked:
 
 ```bash
@@ -82,8 +81,8 @@ Artifacts land under `artifacts/<run_id>/<runner>/<model>/scenario/<name>/`:
 
 ## Tips
 
-- **Rubric carries the signal.** Write rubric items per skill (one for the planning step, one for the
-  schema lookup, one for the HTTP call) so a failure tells you *which* skill in the combination was
+- **Rubric carries the signal.** Write rubric items per skill (one for defining the region, one for the
+  single-script structure) so a failure tells you *which* skill in the combination was
   ignored.
 - **Does the combination beat a subset?** A/B it: run the full set, then run again with a trimmed
   `skills:` list (or `--no-provision` for none) and compare. See

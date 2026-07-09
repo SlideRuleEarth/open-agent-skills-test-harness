@@ -12,7 +12,7 @@ Each skill directory contains:
 - `scripts/` — optional Python helpers invoked at runtime by the skill
 - `requirements.txt` — dependencies for the scripts (if present)
 
-Current skills: `sliderule-api`, `sliderule-docsearch`, `sliderule-examples`, `sliderule-openapi`, `sliderule-params`, `sliderule-pipeline`, `sliderule-region-picker`, `nsidc-reference`.
+Current skills: `sliderule-pipeline`, `sliderule-region-picker`.
 
 Skills are discovered as any top-level directory containing a `SKILL.md`. The `Makefile` auto-discovers them via `$(wildcard */SKILL.md)`.
 
@@ -32,7 +32,7 @@ Adding a new surface (agent runtime): add its skills directory to `PROJECT_SKILL
 
 ```bash
 make export                   # build all skills as zips into exports/
-make export-sliderule-api     # build a single skill
+make export-sliderule-pipeline  # build a single skill
 python export.py -h           # full options
 make clean                    # remove exports/
 ```
@@ -64,16 +64,16 @@ agentskill-evals list-agents-configured-models --skills-root .
 agentskill-evals list-evals  --skills-root .
 
 # run one skill's evals on one agent (cheapest model)
-agentskill-evals run --agent claude --skill sliderule-docsearch
+agentskill-evals run --agent claude --skill sliderule-pipeline
 
 # run a single eval file, skip LLM judge
-agentskill-evals run --agent claude --evals sliderule-api/evals/01-request-envelope-construction.yaml --no-judge
+agentskill-evals run --agent claude --evals sliderule-pipeline/evals/01-single-script-consolidation.yaml --no-judge
 
 # preview scope and cost without spending anything
-agentskill-evals run --agent copilot --skill sliderule-params --all-models --dry-run
+agentskill-evals run --agent copilot --skill sliderule-region-picker --all-models --dry-run
 
 # run a combination scenario
-agentskill-evals run --config scenarios/example_api+params_on_claude-haiku.yaml
+agentskill-evals run --config scenarios/example_full_schema.yaml
 ```
 
 Run artifacts land in `artifacts/<run_id>/`.
@@ -93,10 +93,6 @@ Run artifacts land in `artifacts/<run_id>/`.
 ## Scenario conventions
 
 Scenarios test *combinations* of skills and live in `scenarios/`. They are **not** auto-discovered; run by explicit path. File naming: `<what>_on_<runner>-<model>.yaml`. A scenario is an eval spec with an added `target: {runner, model}` block.
-
-## Skill inter-dependencies (cross-skill boundary pattern)
-
-Skills have defined boundaries. Each skill's `SKILL.md` declares which other skills it defers to for certain concerns — e.g. `sliderule-api` always defers to `sliderule-params` for request planning and to `sliderule-openapi` for schema lookups. Eval files named `*cross-skill-boundary*.yaml` verify this routing. Preserve these boundaries when editing skill prose.
 
 ## Test coverage axis: models, not surfaces
 

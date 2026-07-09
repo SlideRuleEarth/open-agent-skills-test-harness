@@ -98,11 +98,11 @@ python3 -m agentskill_evals run --skills-root .. --config ../scenarios/<file>.ya
 Evals are **per-skill**: each skill directory owns an `evals/` folder.
 
 ```
-sliderule-docsearch/
+sliderule-pipeline/
   SKILL.md
   evals/
-    identifier-disambiguation.yaml
-    cross-skill-boundary-schema.yaml
+    01-single-script-consolidation.yaml
+    02-surface-reproducible-script.yaml
 ```
 
 A spec (YAML or JSON):
@@ -209,7 +209,7 @@ agentskill-evals list-evals --skills-root .
 # `run` always requires --skill, --evals, or --config (no unscoped broad runs)
 
 # one skill, specific agent, parallel, verbose failures
-agentskill-evals run --skill sliderule-docsearch \
+agentskill-evals run --skill sliderule-pipeline \
     --agent claude --jobs 4 -v
 
 # a single eval file, no judge, just deterministic checks
@@ -310,16 +310,16 @@ together against a chosen target (`runner:model`), from one self-describing file
 
 ```bash
 # preview what runs + exactly which skills are visible (no API cost)
-agentskill-evals run --config scenarios/example_api+params_on_claude-haiku.yaml --dry-run
+agentskill-evals run --config scenarios/example_full_schema.yaml --dry-run
 
 # run it
-agentskill-evals run --config scenarios/example_api+params_on_claude-haiku.yaml
+agentskill-evals run --config scenarios/example_full_schema.yaml
 ```
 
 A scenario file is an eval spec plus a `target:` block:
 
 ```yaml
-name: api+params combination
+name: pipeline+region-picker combination
 target:
   runner: claude
   model: claude-haiku-4-5      # optional; omit → models.yaml's cheapest default
@@ -328,7 +328,7 @@ target:
   # model:
   #   - claude-haiku-4.5@high
   #   - {model: claude-opus-4.6, reasoning_effort: low}
-skills: [sliderule-api, sliderule-params]   # provisioned together; the only repo skills visible
+skills: [sliderule-pipeline, sliderule-region-picker]   # provisioned together; the only repo skills visible
 prompt: |
   Using {skills}, write run.py that ...
 rubric: [ ... ]

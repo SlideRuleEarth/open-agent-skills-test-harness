@@ -116,8 +116,9 @@ parms = {
 
 ### Step 3: Proceed with the analysis
 
-Once you have the polygon, continue with the `sliderule-api` skill to
-make the actual processing request. The user may have already specified
+Once you have the polygon, use it as the `poly` parameter in your SlideRule
+processing request (for example an ATL06, ATL08, or ATL13 API call) to
+make the actual request. The user may have already specified
 what kind of analysis they want (canopy, water level, terrain, etc.)
 before or after drawing the region.
 

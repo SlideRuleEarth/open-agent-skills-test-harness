@@ -12,14 +12,8 @@ AI agent skills for [SlideRule Earth](https://slideruleearth.io) — a NASA ICES
 
 ## Skills in this repo
 
-- [sliderule-api](sliderule-api/) — Query NASA ICESat-2 and GEDI data via the SlideRule HTTP API
-- [sliderule-docsearch](sliderule-docsearch/) — Semantic search of the SlideRule documentation
-- [sliderule-examples](sliderule-examples/) — Worked examples from the SlideRule Python client notebooks
-- [sliderule-openapi](sliderule-openapi/) — OpenAPI specs for the SlideRule endpoints
-- [sliderule-params](sliderule-params/) — Reference for SlideRule request parameters
 - [sliderule-pipeline](sliderule-pipeline/) — Directives for orchestrating SlideRule analyses as single-script pipelines
 - [sliderule-region-picker](sliderule-region-picker/) — Interactive map for defining geographic regions
-- [nsidc-reference](nsidc-reference/) — Reference for NASA NSIDC and ORNL DAAC data products
 
 > **Just want to use the skills?** Install them below and you're done — the harness is optional.
 
@@ -63,7 +57,7 @@ These are **absolute** symlinks into this checkout and are *not* committed; a `g
 
 ```bash
 ls -l ~/.claude/skills ~/.agents/skills
-# each entry: sliderule-api -> /path/to/sliderule-skills/sliderule-api
+# each entry: sliderule-pipeline -> /path/to/sliderule-skills/sliderule-pipeline
 ```
 
 `ln -sfn` (used by the targets) replaces existing symlinks, so the targets are safe to re-run after adding skills. They won't overwrite a real directory — if you have a non-symlink copy of a skill installed, remove it first.
@@ -103,7 +97,7 @@ The `make` targets need a Unix shell (Git Bash or WSL) — run them there. In pl
 - **Directory junctions (recommended — no admin needed).** The closest equivalent to the symlink "single source of truth" model. In `cmd`:
 
   ```cmd
-  mklink /J "%USERPROFILE%\.claude\skills\sliderule-api" "C:\path\to\sliderule-skills\sliderule-api"
+  mklink /J "%USERPROFILE%\.claude\skills\sliderule-pipeline" "C:\path\to\sliderule-skills\sliderule-pipeline"
   ```
 
   Junctions work for directories without elevation, and a `git pull` in the repo updates every consumer.
@@ -112,7 +106,7 @@ The `make` targets need a Unix shell (Git Bash or WSL) — run them there. In pl
 
   ```powershell
   $repo = "C:\path\to\sliderule-skills"
-  foreach ($s in "sliderule-api","sliderule-docsearch","sliderule-examples","sliderule-openapi","sliderule-params","sliderule-pipeline","sliderule-region-picker","nsidc-reference") {
+  foreach ($s in "sliderule-pipeline","sliderule-region-picker") {
     New-Item -ItemType SymbolicLink -Path "$env:USERPROFILE\.claude\skills\$s" -Target "$repo\$s" -Force
   }
   ```
@@ -161,7 +155,7 @@ make export
 This writes one `<skill>.zip` per skill into `exports/`, each containing the skill's top-level folder and its `SKILL.md` — the layout these apps expect. To build a single skill:
 
 ```bash
-make export-sliderule-api
+make export-sliderule-pipeline
 ```
 
 (`make export` just runs `export.py`; see `python export.py -h` for its options, including a custom output directory.)
@@ -171,10 +165,6 @@ make export-sliderule-api
 Upload each zip from `exports/` through the app's skill-management settings, then repeat for the skills you want. Exact navigation varies by app — e.g. on [Claude.ai](https://claude.ai) the skills live under **Customize → Skills**: click **+** → **+ Create skill** and upload a zip (use the entry's **⋮** menu → **Replace** to update an existing skill). Custom uploads generally require a paid plan with skills enabled (and may be admin-gated on team/enterprise tiers).
 
 Uploaded skills are then offered to the agent across your chats, the same way the runtime-installed skills work locally.
-
-### Code execution
-
-Several of these skills (e.g. `sliderule-docsearch`, `sliderule-openapi`) run Python helper scripts, so a skill only works end-to-end where the agent can execute code in a sandbox — e.g. Claude.ai runs skill scripts in its hosted sandbox when code execution is enabled. Without that, only the prose in each `SKILL.md` is available, not the script-backed lookups.
 
 ### Updating
 

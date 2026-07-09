@@ -1,18 +1,12 @@
 # This is a basic 
 name: Adirondacks Canopy with Skills
-description: Tests all the skills together.
+description: Tests the pipeline and region-picker skills together.
 
 target:                       # the runner:model this scenario tests
   runner: copilot
   model: claude-opus-4.8     
 
 skills:                       # provisioned together; the only repo skills visible (isolated)
-  - nsidc-reference
-  - sliderule-api
-  - sliderule-docsearch
-  - sliderule-examples
-  - sliderule-openapi
-  - sliderule-params
   - sliderule-pipeline
   - sliderule-region-picker
 
@@ -32,8 +26,6 @@ rubric:                       # graded by the LLM judge
 
 assertions:                   # deterministic checks
   - {type: file_exists, path: pipeline.py}
-  - {type: skill_triggered,     skill: sliderule-api}
-  - {type: skill_triggered,     skill: sliderule-params}
   - {type: skill_triggered,     skill: sliderule-pipeline}
   # process
   - {type: no_error}
