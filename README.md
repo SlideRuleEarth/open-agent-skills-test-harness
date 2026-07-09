@@ -14,7 +14,8 @@ A cross-agent **test harness for evaluating [Agent Skills](https://platform.clau
 
 The bundled skills are **examples** — this repo is a harness, not a skills library. They currently target [SlideRule Earth](https://slideruleearth.io) (a NASA ICESat-2/GEDI cloud-processing service):
 
-- [sliderule-pipeline-direct_request](skills_examples/sliderule-pipeline-direct_request/) — Directives for orchestrating SlideRule analyses as single-script pipelines
+- [sliderule-pipeline-direct_request](skills_examples/sliderule-pipeline-direct_request/) — Directives for orchestrating SlideRule analyses as single-script pipelines via direct HTTP requests to the service
+- [sliderule-pipeline-python_client](skills_examples/sliderule-pipeline-python_client/) — The same single-script pipeline discipline, taught through the SlideRule Python client (`sliderule` package)
 - [sliderule-region-picker](skills_examples/sliderule-region-picker/) — Interactive map for defining geographic regions
 
 > **Just want to use these skills?** Install them below and you're done — the harness is optional.
@@ -110,7 +111,7 @@ The `make` targets need a Unix shell (Git Bash or WSL) — run them there. In pl
 
   ```powershell
   $repo = "C:\path\to\open-agent-skills-test-harness"
-  foreach ($s in "sliderule-pipeline-direct_request","sliderule-region-picker") {
+  foreach ($s in "sliderule-pipeline-direct_request","sliderule-pipeline-python_client","sliderule-region-picker") {
     New-Item -ItemType SymbolicLink -Path "$env:USERPROFILE\.claude\skills\$s" -Target "$repo\skills_examples\$s" -Force
   }
   ```

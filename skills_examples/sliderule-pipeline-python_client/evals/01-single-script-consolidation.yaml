@@ -1,0 +1,30 @@
+name: 01-single-script-consolidation
+description: >
+  Consolidates a multi-step fetch → filter → aggregate → export SlideRule
+  workflow into ONE pipeline script execution built on the SlideRule Python
+  client, folding the SQL/pandas filter and aggregation into the same script,
+  rather than running separate ad-hoc steps that each waste an execution cycle.
+skills:
+- sliderule-pipeline-python_client
+prompt: |
+  Using the sliderule Python package, run an atl06p request over Lake Tahoe,
+  drop the outlier elevations, then give me the median height per cycle. I'll
+  want to chart it afterward.
+files: []
+rubric:
+- Structures the work as a SINGLE Python pipeline script that calls `sliderule.init()` once, issues the
+  request through the client (e.g. `gdf = icesat2.atl06p(parms)`), filters/cleans (e.g. IQR outlier
+  removal), aggregates per-cycle, and exports — all in one execution, NOT as separate
+  fetch-then-filter-then-aggregate invocations.
+- Uses the SlideRule Python client (`sliderule` package) as the access layer, not a hand-rolled
+  `requests.post` envelope with manual Parquet parsing.
+- Folds the outlier filter and the per-cycle median aggregation INTO the same pipeline script (a pandas
+  or DuckDB SQL pass in-script), rather than fetching first and proposing a separate follow-up step to
+  filter or aggregate.
+- "Explicitly avoids the failure pattern the skill warns against (script #1 fetches → script #2 filters
+  with wrong assumptions → script #3 fixes a serialization bug → script #4 re-exports); does not split
+  the workflow across multiple execution cycles that each re-process prior output."
+- Prints a concise stdout summary (row counts, height stats, timing) so the downstream chart step has what
+  it needs, AND exports dashboard-ready JSON with the per-cycle medians from the same script.
+- Does not pad, mock, or interpolate values to replace the dropped outliers — only real returned rows reach
+  the aggregation, and a zero-row result would be reported as such, not filled with placeholders.

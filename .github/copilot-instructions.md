@@ -12,7 +12,7 @@ Each skill directory contains:
 - `scripts/` — optional Python helpers invoked at runtime by the skill
 - `requirements.txt` — dependencies for the scripts (if present)
 
-Current example skills (under `skills_examples/`): `sliderule-pipeline-direct_request`, `sliderule-region-picker`. These are **examples** — the repo's purpose is the harness, not this particular skill set.
+Current example skills (under `skills_examples/`): `sliderule-pipeline-direct_request`, `sliderule-pipeline-python_client`, `sliderule-region-picker`. These are **examples** — the repo's purpose is the harness, not this particular skill set.
 
 Example skills live in `skills_examples/<name>/` (each with a `SKILL.md`). The `Makefile` auto-discovers them via `$(wildcard skills_examples/*/SKILL.md)`, and the harness treats `skills_examples/` as its skills root — a `--skills-root` pointed at the repo root (`.` or `..`) auto-descends into `skills_examples/`.
 

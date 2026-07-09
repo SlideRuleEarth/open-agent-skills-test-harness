@@ -1,0 +1,22 @@
+name: 04-cross-skill-boundary-python-client
+description: >
+  Respects the access-method boundary: when the user explicitly wants the
+  SlideRule Python client (the `sliderule` package), this skill defers to the
+  client-based approach instead of forcing a raw requests.post envelope — while
+  still applying the shared pipeline discipline (single script, reproducible
+  file, task metrics).
+skills:
+- sliderule-pipeline-direct_request
+prompt: |
+  Please use the official sliderule Python package (not raw HTTP calls) to run
+  an atl06p query over Grand Mesa and summarize the elevations.
+files: []
+rubric:
+- Does NOT force a raw HTTP `requests.post` envelope on the user — honors the explicit ask by using the
+  SlideRule Python client (`sliderule.init()` + `icesat2.atl06p(parms)` or equivalent), or clearly states
+  it is switching to the client-based approach.
+- Still applies the shared pipeline discipline from the skill — a single consolidated script, saved and
+  surfaced as a reproducible file, with a task-metrics summary — rather than treating the constraint as a
+  reason to abandon the pipeline structure.
+- Does not claim the raw HTTP API is the only way to reach SlideRule, and does not hand-roll Parquet
+  response parsing when the client already returns a GeoDataFrame.

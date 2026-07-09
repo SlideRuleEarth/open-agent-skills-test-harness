@@ -1,0 +1,24 @@
+name: 04-cross-skill-boundary-direct-request
+description: >
+  Respects the access-method boundary: when the user explicitly wants raw HTTP
+  requests to the SlideRule API (no `sliderule` package), this skill defers to
+  the direct-request approach instead of forcing the Python client — while still
+  applying the shared pipeline discipline (single script, reproducible file,
+  task metrics).
+skills:
+- sliderule-pipeline-python_client
+prompt: |
+  I can't install the sliderule package in this environment, so hit the SlideRule
+  HTTP API directly with requests to run an atl06p query over Grand Mesa and
+  summarize the elevations.
+files: []
+rubric:
+- Does NOT force the SlideRule Python client (`sliderule` package) on the user — honors the explicit
+  constraint by issuing the request as a direct HTTP POST (e.g. `requests.post` to
+  sliderule.slideruleearth.io) with Parquet response parsing, or clearly states it is switching to the
+  direct-request approach.
+- Still applies the shared pipeline discipline from the skill — a single consolidated script, saved and
+  surfaced as a reproducible file, with a task-metrics summary — rather than treating the constraint as a
+  reason to abandon the pipeline structure.
+- Does not claim the Python client is the only way to reach SlideRule, and does not silently import
+  `sliderule` anyway.
