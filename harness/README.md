@@ -72,7 +72,7 @@ The targets just wrap standard tools; run these directly only if `make` doesn't 
 ```bash
 # pipx / uv — e.g. straight from git (note the subdirectory; the package isn't at the repo root):
 pipx install ./harness
-pipx install "git+https://github.com/SlideRuleEarth/sliderule-skills.git#subdirectory=harness"
+pipx install "git+https://github.com/SlideRuleEarth/open-agent-skills-test-harness.git#subdirectory=harness"
 uv tool install ./harness        # uv also manages the Python version
 
 # the hand-rolled venv that `make dev` automates:
@@ -291,7 +291,7 @@ enables A/B testing with vs without skills.
   is reported `false` for that cell) — the separate project-local tempdir-relocation layer
   doesn't use symlinks and still applies regardless. Config-dir *writes* still
   pass through to the real dirs (only skill *visibility* is isolated). None of this is an OS-level
-  jail — an agent that deliberately searches the whole disk (e.g. `find / -iname sliderule-skills`)
+  jail — an agent that deliberately searches the whole disk (e.g. `find / -iname open-agent-skills-test-harness`)
   rather than just exploring its own cwd can still find the real checkout, since it genuinely
   exists somewhere on the same filesystem. Closing that would need a container/VM per cell (a
   real, cross-platform fs boundary) or per-OS native sandboxes (macOS Seatbelt, Linux

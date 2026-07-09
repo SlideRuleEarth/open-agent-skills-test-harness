@@ -1,6 +1,6 @@
-# SlideRule Skills — Upload Guide
+# Skill Upload Guide
 
-This export contains a set of skills that teach the agent how to work with [SlideRule Earth](https://slideruleearth.io), a NASA-funded service for on-demand processing of ICESat-2 and GEDI satellite data.
+This export contains the **example skills** bundled with the open-agent-skills-test-harness repo. They currently teach the agent how to work with [SlideRule Earth](https://slideruleearth.io), a NASA-funded service for on-demand processing of ICESat-2 and GEDI satellite data — but the export tooling works for any skill kept in the repo.
 
 ## What's in each zip
 

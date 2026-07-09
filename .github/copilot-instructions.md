@@ -2,9 +2,9 @@
 
 ## What this repo is
 
-A collection of open-standard **Agent Skills** for querying NASA ICESat-2 and GEDI data via SlideRule Earth. Each top-level directory containing a `SKILL.md` is a self-contained skill consumed by Claude Code, Codex, AntiGravity (`agy`), and other agent runtimes. The `harness/` directory is an evaluation framework for testing skills across models — it is not part of the skills themselves.
+This repository is a cross-agent **test harness for evaluating Agent Skills** across models and runtimes — the `harness/` directory (CLI: `agentskill-evals`) is the durable purpose of the repo. It also ships a small set of **example skills** (each a top-level directory containing a `SKILL.md`, consumed by Claude Code, Codex, AntiGravity (`agy`), and other agent runtimes) used to exercise and demonstrate the harness. The example skills currently target SlideRule Earth (NASA ICESat-2/GEDI) and are slated to be replaced with neutral examples — they are illustrative, not the reason the repo exists.
 
-## Skills
+## Example skills
 
 Each skill directory contains:
 - `SKILL.md` — the skill manifest (YAML front matter + prose instructions read by the agent)
@@ -12,7 +12,7 @@ Each skill directory contains:
 - `scripts/` — optional Python helpers invoked at runtime by the skill
 - `requirements.txt` — dependencies for the scripts (if present)
 
-Current skills: `sliderule-pipeline`, `sliderule-region-picker`.
+Current skills: `sliderule-pipeline`, `sliderule-region-picker`. These are **examples** — the repo's purpose is the harness, not this particular skill set.
 
 Skills are discovered as any top-level directory containing a `SKILL.md`. The `Makefile` auto-discovers them via `$(wildcard */SKILL.md)`.
 

@@ -139,11 +139,11 @@ def _check_isolation(failures, verbose):
         # repo's skills (the real-world leak — e.g. via `agy plugin import`), plus a vendor
         # skill in the same plugin, plus a second, unrelated vendor-only plugin.
         os.makedirs(os.path.join(real, ".gemini", "config", "plugins",
-                                  "sliderule-skills", "skills", "skill-alpha"))
+                                  "repo-skills-plugin", "skills", "skill-alpha"))
         os.makedirs(os.path.join(real, ".gemini", "config", "plugins",
-                                  "sliderule-skills", "skills", "vendor-thing"))
+                                  "repo-skills-plugin", "skills", "vendor-thing"))
         open(os.path.join(real, ".gemini", "config", "plugins",
-                           "sliderule-skills", "plugin.json"), "w").close()
+                           "repo-skills-plugin", "plugin.json"), "w").close()
         os.makedirs(os.path.join(real, ".gemini", "config", "plugins",
                                   "other-plugin", "skills", "other-skill"))
         # the cell declares only skill-alpha (its source lives outside HOME, like skills_root)
@@ -183,7 +183,7 @@ def _check_isolation(failures, verbose):
                failures, verbose)
 
         plugin_skills = os.path.join(dest, ".gemini", "config", "plugins",
-                                      "sliderule-skills", "skills")
+                                      "repo-skills-plugin", "skills")
         plugin_names = sorted(os.listdir(plugin_skills)) if os.path.isdir(plugin_skills) else []
         _check("isolation.plugin_repo_skill_masked", plugin_names == ["vendor-thing"],
                f"plugin's leaked repo skill dropped, its vendor skill kept "
@@ -194,7 +194,7 @@ def _check_isolation(failures, verbose):
                "(it's already injected once via the primary skills dir)", failures, verbose)
         _check("isolation.plugin_metadata_passthrough",
                os.path.islink(os.path.join(dest, ".gemini", "config", "plugins",
-                                            "sliderule-skills", "plugin.json")),
+                                            "repo-skills-plugin", "plugin.json")),
                "plugin.json passed through as a symlink", failures, verbose)
         other_plugin_skills = os.path.join(dest, ".gemini", "config", "plugins",
                                             "other-plugin", "skills")

@@ -1,21 +1,23 @@
-# sliderule-skills
+# open-agent-skills-test-harness
 
-AI agent skills for [SlideRule Earth](https://slideruleearth.io) — a NASA ICESat-2/GEDI cloud processing service — plus a cross-agent test harness to evaluate how well those skills work across different models.
+A cross-agent **test harness for evaluating [Agent Skills](https://platform.claude.com/docs/en/agents-and-tools/agent-skills)** across models and runtimes. Write one eval, run it against Claude Code, Codex, GitHub Copilot, and AntiGravity, and grade the result with deterministic assertions and an LLM judge. The repo also ships a couple of **example skills** plus tooling to install and export any skills you keep here.
 
 **Two parts:**
 
-1. **Skills** (top-level dirs) — each contains a `SKILL.md` and supporting references/scripts that teach an AI agent how to use SlideRule's API, plan request parameters, search docs, etc. Skills follow cross-agent conventions (`.claude/skills/`, `.agents/skills/`, `.codex/skills/`) and work with any platform that supports the open Agent Skills standard.
+1. **Harness** ([`harness/`](harness/)) — a CLI tool (`agentskill-evals`) that evaluates skills across multiple agent CLIs (Claude Code, GitHub Copilot, OpenAI Codex, AntiGravity). It provisions skills into isolated workspaces, runs a prompt through an agent, then grades the result with deterministic assertions (file exists, skill triggered, etc.) and an LLM judge (rubric-based). Evals live per-skill in `<skill>/evals/*.yaml`; scenarios in `scenarios/` combine multiple skills with a pinned runner/model. **This is the durable purpose of the repo.**
 
-2. **Harness** ([`harness/`](harness/)) — a CLI tool (`agentskill-evals`) that evaluates skills across multiple agent CLIs (Claude Code, GitHub Copilot, OpenAI Codex, AntiGravity). It provisions skills into isolated workspaces, runs a prompt through an agent, then grades the result with deterministic assertions (file exists, skill triggered, etc.) and an LLM judge (rubric-based). Evals live per-skill in `<skill>/evals/*.yaml`; scenarios in `scenarios/` combine multiple skills with a pinned runner/model.
+2. **Example skills** (top-level dirs) — a small, illustrative set used to exercise and demonstrate the harness. Each contains a `SKILL.md` and follows the cross-agent conventions (`.claude/skills/`, `.agents/skills/`, `.antigravity/skills/`) so it works with any platform that supports the open Agent Skills standard. A neutral, domain-free example also lives under [`harness/examples/skills/`](harness/examples/skills/).
 
 **Key design choices:** an adapter abstraction normalizes each CLI's output into a common event stream; workspace isolation (HOME overlay + git boundary) ensures agents see only provisioned skills; the judge runs through the same adapter machinery so any agent can grade any other.
 
-## Skills in this repo
+## Example skills in this repo
+
+The bundled skills are **examples** — this repo is a harness, not a skills library. They currently target [SlideRule Earth](https://slideruleearth.io) (a NASA ICESat-2/GEDI cloud-processing service) and are slated to be swapped for neutral examples as part of the repo's repurposing:
 
 - [sliderule-pipeline](sliderule-pipeline/) — Directives for orchestrating SlideRule analyses as single-script pipelines
 - [sliderule-region-picker](sliderule-region-picker/) — Interactive map for defining geographic regions
 
-> **Just want to use the skills?** Install them below and you're done — the harness is optional.
+> **Just want to use these skills?** Install them below and you're done — the harness is optional.
 
 ## Installing the skills (one source of truth)
 
@@ -57,7 +59,7 @@ These are **absolute** symlinks into this checkout and are *not* committed; a `g
 
 ```bash
 ls -l ~/.claude/skills ~/.agents/skills
-# each entry: sliderule-pipeline -> /path/to/sliderule-skills/sliderule-pipeline
+# each entry: sliderule-pipeline -> /path/to/open-agent-skills-test-harness/sliderule-pipeline
 ```
 
 `ln -sfn` (used by the targets) replaces existing symlinks, so the targets are safe to re-run after adding skills. They won't overwrite a real directory — if you have a non-symlink copy of a skill installed, remove it first.
@@ -71,7 +73,7 @@ A "surface" is any tool that consumes the skills (Claude Code, Codex, AntiGravit
 
 ### How discovery works
 
-Claude Code (and the Agent SDK) discover project-level skills from `.claude/skills/` in the working directory, every parent up to the repo root, and nested subdirectories on demand — so the committed `.claude/skills/` is found automatically when you work in this repo. You can also point an external Claude session at the repo with `--add-dir /path/to/sliderule-skills` (a `.claude/skills/` inside an added directory is loaded automatically). Precedence: enterprise > personal (`~/.claude`) > project (`.claude`) > plugins.
+Claude Code (and the Agent SDK) discover project-level skills from `.claude/skills/` in the working directory, every parent up to the repo root, and nested subdirectories on demand — so the committed `.claude/skills/` is found automatically when you work in this repo. You can also point an external Claude session at the repo with `--add-dir /path/to/open-agent-skills-test-harness` (a `.claude/skills/` inside an added directory is loaded automatically). Precedence: enterprise > personal (`~/.claude`) > project (`.claude`) > plugins.
 
 ## Testing the skills across models
 
@@ -97,7 +99,7 @@ The `make` targets need a Unix shell (Git Bash or WSL) — run them there. In pl
 - **Directory junctions (recommended — no admin needed).** The closest equivalent to the symlink "single source of truth" model. In `cmd`:
 
   ```cmd
-  mklink /J "%USERPROFILE%\.claude\skills\sliderule-pipeline" "C:\path\to\sliderule-skills\sliderule-pipeline"
+  mklink /J "%USERPROFILE%\.claude\skills\sliderule-pipeline" "C:\path\to\open-agent-skills-test-harness\sliderule-pipeline"
   ```
 
   Junctions work for directories without elevation, and a `git pull` in the repo updates every consumer.
@@ -105,7 +107,7 @@ The `make` targets need a Unix shell (Git Bash or WSL) — run them there. In pl
 - **PowerShell symlinks (need admin or Developer Mode).**
 
   ```powershell
-  $repo = "C:\path\to\sliderule-skills"
+  $repo = "C:\path\to\open-agent-skills-test-harness"
   foreach ($s in "sliderule-pipeline","sliderule-region-picker") {
     New-Item -ItemType SymbolicLink -Path "$env:USERPROFILE\.claude\skills\$s" -Target "$repo\$s" -Force
   }
@@ -125,14 +127,14 @@ Codex uses the cross-agent `.agents/skills/` convention — `$REPO_ROOT/.agents/
 
 ### Project-level (committed)
 
-`make link-project` populates `.agents/skills/` in this repo, and those symlinks are committed — so a fresh clone already exposes every `sliderule-*` skill to Codex with no setup.
+`make link-project` populates `.agents/skills/` in this repo, and those symlinks are committed — so a fresh clone already exposes every skill in this repo to Codex with no setup.
 
 ### Per-project trusted scan (no symlinks)
 
 When Codex runs with its working directory at or under a **trusted** project, it also scans the tree for `*/SKILL.md` and registers each skill for the session. Mark the repo trusted in `~/.codex/config.toml`:
 
 ```toml
-[projects."/path/to/sliderule-skills"]
+[projects."/path/to/open-agent-skills-test-harness"]
 trust_level = "trusted"
 ```
 
