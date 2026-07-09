@@ -12,7 +12,7 @@ A cross-agent **test harness for evaluating [Agent Skills](https://platform.clau
 
 ## Example skills in this repo
 
-The bundled skills are **examples** — this repo is a harness, not a skills library. They currently target [SlideRule Earth](https://slideruleearth.io) (a NASA ICESat-2/GEDI cloud-processing service) and are slated to be swapped for neutral examples as part of the repo's repurposing:
+The bundled skills are **examples** — this repo is a harness, not a skills library. They currently target [SlideRule Earth](https://slideruleearth.io) (a NASA ICESat-2/GEDI cloud-processing service):
 
 - [sliderule-pipeline](skills_examples/sliderule-pipeline/) — Directives for orchestrating SlideRule analyses as single-script pipelines
 - [sliderule-region-picker](skills_examples/sliderule-region-picker/) — Interactive map for defining geographic regions

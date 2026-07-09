@@ -2,7 +2,7 @@
 
 ## What this repo is
 
-This repository is a cross-agent **test harness for evaluating Agent Skills** across models and runtimes — the `harness/` directory (CLI: `agentskill-evals`) is the durable purpose of the repo. It also ships a small set of **example skills** (each a directory under `skills_examples/` containing a `SKILL.md`, consumed by Claude Code, Codex, AntiGravity (`agy`), and other agent runtimes) used to exercise and demonstrate the harness. The example skills currently target SlideRule Earth (NASA ICESat-2/GEDI) and are slated to be replaced with neutral examples — they are illustrative, not the reason the repo exists.
+This repository is a cross-agent **test harness for evaluating Agent Skills** across models and runtimes — the `harness/` directory (CLI: `agentskill-evals`) is the durable purpose of the repo. It also ships a small set of **example skills** (each a directory under `skills_examples/` containing a `SKILL.md`, consumed by Claude Code, Codex, AntiGravity (`agy`), and other agent runtimes) used to exercise and demonstrate the harness. The example skills currently target SlideRule Earth (NASA ICESat-2/GEDI) — they are illustrative, not the reason the repo exists.
 
 ## Example skills
 
