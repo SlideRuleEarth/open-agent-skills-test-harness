@@ -130,7 +130,7 @@ def leaked_skill_reads(
     reported as ``isolated: true``.
 
     Uses ``realpath`` (not ``abspath``): an agent that symlinks a workspace-local name at an
-    undeclared skill (e.g. ``ln -s <repo>/sliderule-pipeline-direct_request evil`` then reads ``evil/SKILL.md``) would
+    undeclared skill (e.g. ``ln -s <repo>/sliderule-pipeline-direct-request evil`` then reads ``evil/SKILL.md``) would
     otherwise look textually "inside the workspace" and never get flagged at all.
     """
     leaked_names = set(repo_skill_names) - set(declared_names)
@@ -170,7 +170,7 @@ def leaked_skill_reads(
         for tok in tokens:
             for marker in markers:
                 # `in`, not `startswith`: the marker can be embedded mid-token (e.g.
-                # --script=/repo/sliderule-pipeline-direct_request/scripts/tool.py or --path=/repo/... ), not just
+                # --script=/repo/sliderule-pipeline-direct-request/scripts/tool.py or --path=/repo/... ), not just
                 # at the start. Flag from where the marker begins, not the whole raw token (a
                 # leading flag like "--script=" isn't a path itself, so realpath-ing it whole
                 # would resolve it relative to cwd instead of recognizing the embedded absolute

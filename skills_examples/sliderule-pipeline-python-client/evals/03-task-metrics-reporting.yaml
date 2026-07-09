@@ -6,7 +6,7 @@ description: >
   reports duration and a reason even when a request returns an empty
   GeoDataFrame or fails.
 skills:
-- sliderule-pipeline-python_client
+- sliderule-pipeline-python-client
 prompt: |
   Use the sliderule Python client to run an atl06p request over this tiny
   polygon for January 2019. Heads up — it might come back empty. Either way,

@@ -1,55 +1,56 @@
 ---
-name: sliderule-pipeline-python_client
+name: sliderule-pipeline-direct-request
 description: >
   Behavioral directives for orchestrating SlideRule analyses as single-script
-  pipelines using the SlideRule Python client (the `sliderule` package), and
-  reporting task metrics. Use when the workflow goes through the Python client —
-  `sliderule.init()` plus `icesat2.atl06p()` / `atl03x` / `gedi` request
-  functions returning GeoDataFrames — and a multi-step workflow
+  pipelines using direct HTTP requests to the SlideRule service (a
+  `requests.post` envelope with Parquet response parsing — no `sliderule`
+  package), and reporting task metrics. Use when the workflow talks to the API
+  directly and a multi-step SlideRule workflow
   (fetch → parse → filter → aggregate → export) should be consolidated into one
   script execution rather than separate invocations. A SQL or pandas
   filtering/aggregation pass can be folded into the same pipeline script.
   Governs HOW the work is structured (single script, defensive coding, JSON
   export), HOW the executed script is surfaced (saved as a file and surfaced as
-  a reproducible script), and HOW results are reported (task metrics). For
-  pipelines that call the SlideRule HTTP API directly (requests + Parquet
-  parsing, no `sliderule` package), use `sliderule-pipeline-direct_request`
+  a reproducible script), and HOW results are reported (task metrics). Also
+  trigger when the user asks about pipeline patterns, execution efficiency, task
+  reporting format, or wants to see, save, or reproduce the exact script that was
+  run. For pipelines built on the SlideRule Python client (the `sliderule`
+  package returning GeoDataFrames), use `sliderule-pipeline-python-client`
   instead.
 ---
 
-# SlideRule Pipeline Orchestration — Python Client
+# SlideRule Pipeline Orchestration — Direct Request
 
 ## Scope
 
-This skill covers pipelines built on the **SlideRule Python client** — the
-`sliderule` package (`sliderule.init()`, `icesat2.atl06p(parms)`, and friends),
-which returns GeoDataFrames and handles request framing, retries, and response
-decoding for you. If the user wants raw HTTP requests to the SlideRule service
-(a `requests.post` envelope with Parquet parsing — e.g. to avoid the client
-dependency), use the `sliderule-pipeline-direct_request` skill instead. When the
-user doesn't specify an access method and the `sliderule` package is available
-(or installable), prefer this client path — it is the supported, higher-level
-interface.
+This skill covers pipelines that issue **direct HTTP requests** to the SlideRule
+service: build the `parms` request envelope, `requests.post` it to
+`https://sliderule.slideruleearth.io`, and parse the Parquet response with
+`pyarrow`. Use it when the user asks for the raw API path or wants to avoid the
+client dependency. If the workflow should go through the SlideRule **Python
+client** (the `sliderule` package — `sliderule.init()`, `icesat2.atl06p(parms)`,
+GeoDataFrame results), use the `sliderule-pipeline-python-client` skill instead;
+when the user doesn't specify an access method, that client path is the
+preferred default.
 
 ## Requirements
 
 - Python 3.8+
-- Packages: `sliderule`, plus `pandas`/`geopandas` (pulled in by the client)
-  and `duckdb` if the pipeline does in-script SQL
-- Network access to `https://sliderule.slideruleearth.io` (the client's default)
+- Packages: `pyarrow`, `requests`, plus `pandas` if the pipeline aggregates
+  (and `duckdb` if it does in-script SQL)
+- Network access to `https://sliderule.slideruleearth.io`
 - Platform-neutral — works with any agent that can execute Python scripts
 
 See `CHANGELOG.md` for version history.
 
 ## Pipeline Approach — Single-Script Execution
 
-Combine fetch → filter → aggregate → export into a **single Python script**
+Combine fetch → parse → filter → aggregate → export into a **single Python script**
 executed in one step. Every separate script invocation adds overhead — the agent
 must process the output, decide on the next step, and issue another execution.
 A single pipeline script should:
 
-- **Call the client request function** (`sliderule.init()` once, then e.g.
-  `gdf = icesat2.atl06p(parms)`) and extract result metadata
+- **POST the API request**, parse the Parquet response, and extract metadata
 - **Filter/clean the data** (e.g., IQR outlier removal) — use explicit `float()`
   casts on numpy/pandas values to avoid JSON serialization errors with `float32`
 - **Aggregate** (e.g., per-cycle, per-RGT/beam) and compute summary statistics
@@ -110,10 +111,9 @@ For autonomous runs with no user prompt, write a one-line note identifying the
 trigger instead (cron, schedule, etc.).
 
 `manifest.json` must list the agent identifier, study slug, timestamp, request
-parameters, the client request function(s) called, generated files, task metrics,
-software/library versions when available (`sliderule.version` and the package
-version), and any cache/retry behavior. If a run does not produce a given
-artifact type, omit it from the directory and manifest rather than creating
+parameters, API endpoint(s), generated files, task metrics, software/library
+versions when available, and any cache/retry behavior. If a run does not produce a
+given artifact type, omit it from the directory and manifest rather than creating
 placeholders.
 
 Prefer run-local paths over shared filenames. Do not overwrite artifacts from a
@@ -126,11 +126,10 @@ change one coordinate or date and rerun, instead of reconstructing the whole
 request from the chat transcript — reproducibility is part of the deliverable, not
 just the chart.
 
-Keep the surfaced `pipeline.py` self-contained: imports, `sliderule.init()`, the
-`parms` dict, the client call, filtering, aggregation, export, and the stdout
-summary all in the one file. For multi-request workflows (e.g. comparing two time
-windows), keep all requests in that single script so the one file reproduces the
-entire comparison.
+Keep the surfaced `pipeline.py` self-contained: imports, the `parms` dict, the POST,
+parsing, filtering, aggregation, export, and the stdout summary all in the one file.
+For multi-request workflows (e.g. comparing two time windows), keep all requests in
+that single script so the one file reproduces the entire comparison.
 
 ## Defensive Coding Tips
 
@@ -138,7 +137,7 @@ entire comparison.
   ICESat-2 heights are ellipsoidal (WGS84), not orthometric, so lake surfaces may
   be tens of meters different from commonly cited elevations.
 - Always cast numpy scalars: `round(float(val), 4)` not `round(val, 4)`.
-- Call `sliderule.init()` once at the top of the script; don't re-init per request.
+- Set `timeout=300` on all `requests.post()` calls.
 - Wrap the full pipeline in try/except with informative error messages so a failure
   mid-script still reports what succeeded.
 - **Only real returned rows reach the chart.** Subsample or aggregate
@@ -146,20 +145,18 @@ entire comparison.
   a sparse or empty result. If the request returned zero usable rows,
   export the metadata and the zero-row finding, not a placeholder
   series.
-- **Critical: always `reset_index()` before saving parquet.** The client returns
-  GeoDataFrames indexed by time. If you save with `to_parquet(path, index=False)`,
-  the time column is silently dropped and you must re-fetch (which can take
-  minutes). Call `gdf = gdf.reset_index()` immediately after the client call.
+- **Critical: always `reset_index()` before saving parquet.** SlideRule returns
+  `time_ns` as the DataFrame index. If you save with `to_parquet(path, index=False)`,
+  the time column is silently dropped and you must re-fetch (which can take minutes).
+  Always call `df = df.reset_index()` immediately after `table.to_pandas()`.
 - **Print the schema inline.** Right after `reset_index()`, add
-  `print("Columns:", gdf.columns.tolist())` so the pipeline's stdout includes the
+  `print("Columns:", df.columns.tolist())` so the pipeline's stdout includes the
   actual column names. This avoids a separate schema-inspection (`DESCRIBE`) step and catches
   API/algorithm-dependent column differences (e.g., PhoREAL vs. surface) early.
-- An empty result comes back as an **empty GeoDataFrame**, not an error — check
-  `len(gdf)` before filtering/aggregating and report the zero-row finding.
 
 ## Task Metrics
 
-After every SlideRule client request, report a compact summary of task metrics.
+After every SlideRule API request, report a compact summary of task metrics.
 Capture timing and data stats during execution and present them alongside (or
 just before) the visualization.
 
@@ -167,22 +164,22 @@ just before) the visualization.
 
 ```python
 import time
-from sliderule import icesat2, sliderule
-
-sliderule.init()
 
 start = time.time()
-gdf = icesat2.atl06p(parms)
+r = requests.post(url, json=req, timeout=300)
 elapsed = time.time() - start
 
-gdf = gdf.reset_index()
+table = pq.read_table(io.BytesIO(r.content))
+df = table.to_pandas()
+meta = json.loads(table.schema.metadata[b'meta'])
 
 metrics = {
-    "request_function": "icesat2.atl06p",
+    "api": api_name,
     "request_duration_sec": round(elapsed, 1),
-    "rows": len(gdf),
-    "columns": len(gdf.columns),
-    "memory_mb": round(float(gdf.memory_usage(deep=True).sum()) / 1e6, 2),
+    "response_size_mb": round(len(r.content) / 1e6, 2),
+    "rows": len(df),
+    "columns": len(df.columns),
+    "granules_processed": len(meta.get("srctbl", {})),
     "time_window": f"{parms.get('t0', '?')} to {parms.get('t1', '?')}",
 }
 ```
@@ -190,14 +187,14 @@ metrics = {
 ### How to Report
 
 > **SlideRule Task Summary**
-> Request: `icesat2.atl06p` · Region: Adirondacks (0.15° × 0.15°)
+> API: `atl03x` (PhoREAL) · Region: Adirondacks (0.15° × 0.15°)
 > Time window: 2022-06-01 → 2022-09-01
-> Request duration: 12.3 s · In-memory: 2.41 MB
-> Rows: 48,217 · Columns: 22
+> Request duration: 12.3 s · Response: 2.41 MB
+> Rows: 48,217 · Columns: 22 · Granules: 14
 
 Adapt to what's relevant — lake name for water studies, algorithm for canopy,
 per-request timing for multi-request workflows. Always report duration and reason
 even if a request fails or returns zero rows.
 
-For multiple client calls, also report total wall-clock time, per-request row
-counts, and any throttle/retry behavior the client surfaced.
+For multiple API calls, also report total wall-clock time, per-request row counts,
+and any throttle encounters (HTTP 429/503).

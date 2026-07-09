@@ -7,7 +7,7 @@ its own archive preserving the directory structure.
 Usage:
     python export.py                  # writes to exports/
     python export.py -o dist/skills   # writes to dist/skills/
-    python export.py sliderule-pipeline-direct_request    # export only one skill
+    python export.py sliderule-pipeline-direct-request    # export only one skill
 """
 
 import argparse

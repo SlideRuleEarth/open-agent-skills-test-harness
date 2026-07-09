@@ -6,7 +6,7 @@ description: >
   applying the shared pipeline discipline (single script, reproducible file,
   task metrics).
 skills:
-- sliderule-pipeline-python_client
+- sliderule-pipeline-python-client
 prompt: |
   I can't install the sliderule package in this environment, so hit the SlideRule
   HTTP API directly with requests to run an atl06p query over Grand Mesa and

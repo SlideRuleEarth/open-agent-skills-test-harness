@@ -27,18 +27,18 @@ it's self-describing, e.g. `atl06-request_on_claude-haiku.yaml`:
 
 ```yaml
 name: atl06-request A/B
-description: Does sliderule-pipeline-direct_request help the model write a correct ATL06 request?
+description: Does sliderule-pipeline-direct-request help the model write a correct ATL06 request?
 
 target:                         # pin ONE runner:model so both arms are comparable
   runner: claude
   model: claude-haiku-4-5       # cheapest claude model; omit → models.yaml default
 
 skills:                         # the skill under test (provisioned in the "with" arm)
-  - sliderule-pipeline-direct_request
+  - sliderule-pipeline-direct-request
 
 # The user-supplied prompt. Keep it NEUTRAL — describe the task only, and do NOT
 # reference {skills}. Both arms must get the identical prompt; if the prompt told the
-# model to "use the sliderule-pipeline-direct_request skill", the baseline arm would point at a skill that
+# model to "use the sliderule-pipeline-direct-request skill", the baseline arm would point at a skill that
 # isn't there and the comparison wouldn't be fair.
 prompt: |
   Write a Python script run.py that uses SlideRule to fetch ATL06 land-ice elevations
@@ -58,7 +58,7 @@ isolated: true                  # keep the default — guarantees no globally-in
 ```
 
 > **Why the neutral prompt matters.** In the prompt, `{skills}` would expand to the skill's
-> reference (e.g. `/sliderule-pipeline-direct_request`) in *both* arms — even the baseline, where the skill isn't
+> reference (e.g. `/sliderule-pipeline-direct-request`) in *both* arms — even the baseline, where the skill isn't
 > provisioned. To keep the A/B honest, write the prompt as the task only and let the *presence of
 > the skill* be the sole variable.
 
@@ -68,7 +68,7 @@ isolated: true                  # keep the default — guarantees no globally-in
 toggle works before spending anything:
 
 ```bash
-# with skill — should list sliderule-pipeline-direct_request under "provisioned"
+# with skill — should list sliderule-pipeline-direct-request under "provisioned"
 agentskill-evals run --config scenarios/atl06-request_on_claude-haiku.yaml --dry-run
 
 # without skill — "provisioned" is (none — provisioning off)

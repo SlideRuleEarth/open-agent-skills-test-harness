@@ -6,7 +6,7 @@ description: >
   still applying the shared pipeline discipline (single script, reproducible
   file, task metrics).
 skills:
-- sliderule-pipeline-direct_request
+- sliderule-pipeline-direct-request
 prompt: |
   Please use the official sliderule Python package (not raw HTTP calls) to run
   an atl06p query over Grand Mesa and summarize the elevations.
