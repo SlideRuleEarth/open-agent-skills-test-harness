@@ -82,10 +82,20 @@ unlink-project: ## Remove the project-level skill symlinks
 		echo "  cleared $$d/"; \
 	done
 
-unlink-global: ## Remove the per-user skill symlinks created by link-global
-	@for d in $(GLOBAL_SKILL_DIRS); do \
-		for s in $(SKILLS); do rm -f "$$d/$$s"; done; \
-		echo "  cleared $$d/"; \
-	done
+# Removes by symlink TARGET, not by the current $(SKILLS) list, so it also cleans
+# stale links left by renamed/removed skills — plus broken links (their checkout
+# moved or was deleted). Symlinks resolving anywhere else are untouched.
+unlink-global: ## Remove per-user skill symlinks pointing into this checkout (incl. stale/broken)
+	@$(PYTHON) -c 'import os, sys; \
+repo = os.path.realpath(os.getcwd()); \
+dirs = [d for d in sys.argv[1:] if os.path.isdir(d)]; \
+links = [os.path.join(d, n) for d in dirs for n in sorted(os.listdir(d)) \
+         if os.path.islink(os.path.join(d, n))]; \
+stale = [p for p in links if not os.path.exists(os.path.realpath(p)) \
+         or os.path.realpath(p) == repo \
+         or os.path.realpath(p).startswith(repo + os.sep)]; \
+[print(f"  removed {p} -> {os.readlink(p)}") or os.remove(p) for p in stale]; \
+print(f"  removed {len(stale)} link(s) into this checkout (or broken) " \
+      f"across {len(dirs)} dir(s)")' $(GLOBAL_SKILL_DIRS)
 
 relink-project: unlink-project link-project ## Rebuild project symlinks (e.g. after adding a skill)

@@ -118,11 +118,13 @@ def _check_isolation(failures, verbose):
     import shutil
     import tempfile
 
-    from .isolation import build_isolated_home
+    from .isolation import build_isolated_home, resolve_visible_skills
 
     print("isolation overlay:")
     real = tempfile.mkdtemp(prefix="ase-realhome-")
     declared_root = tempfile.mkdtemp(prefix="ase-skills-")
+    repo_checkout = tempfile.mkdtemp(prefix="ase-repo-")     # a fake checkout of this repo
+    vendor_src = tempfile.mkdtemp(prefix="ase-vendorsrc-")   # a real skill dir outside it
     dest = tempfile.mkdtemp(prefix="ase-isohome-")
     shutil.rmtree(dest)  # build_isolated_home (re)creates it
     try:
@@ -148,6 +150,16 @@ def _check_isolation(failures, verbose):
                                   "other-plugin", "skills", "other-skill"))
         # the cell declares only skill-alpha (its source lives outside HOME, like skills_root)
         os.makedirs(os.path.join(declared_root, "skill-alpha"))
+        # stale installs the name-based mask can't catch: a symlink into the checkout under a
+        # retired name, and a broken symlink (its checkout was deleted). A symlink resolving
+        # elsewhere is a vendor skill and must survive.
+        os.makedirs(os.path.join(repo_checkout, "skills_examples", "skill-retired"))
+        skills_dir = os.path.join(real, ".codex", "skills")
+        os.symlink(os.path.join(repo_checkout, "skills_examples", "skill-retired"),
+                   os.path.join(skills_dir, "skill-retired"))
+        os.symlink(os.path.join(real, "no-such-checkout", "gone-skill"),
+                   os.path.join(skills_dir, "gone-skill"))
+        os.symlink(vendor_src, os.path.join(skills_dir, "vendor-linked"))
 
         build_isolated_home(
             dest,
@@ -156,6 +168,7 @@ def _check_isolation(failures, verbose):
             [os.path.join(declared_root, "skill-alpha")],
             real,
             plugin_registry_subpaths=[".gemini/config/plugins"],
+            repo_root=repo_checkout,
         )
 
         skills = os.path.join(dest, ".codex", "skills")
@@ -170,6 +183,24 @@ def _check_isolation(failures, verbose):
                "undeclared skill-beta removed", failures, verbose)
         _check("isolation.vendor_kept", ".system" in names,
                "vendor .system bundle preserved", failures, verbose)
+        _check("isolation.stale_repo_link_masked", "skill-retired" not in names,
+               "stale symlink into the checkout (retired name) dropped", failures, verbose)
+        _check("isolation.broken_link_masked", "gone-skill" not in names,
+               "broken symlink dropped", failures, verbose)
+        _check("isolation.vendor_symlink_kept", "vendor-linked" in names,
+               "symlink resolving outside the checkout kept as vendor", failures, verbose)
+
+        # resolve_visible_skills must classify the same way the overlay masks
+        class _FakeAdapter:
+            global_skills_subpaths = [".codex/skills"]
+        vis = resolve_visible_skills(_FakeAdapter(), ["skill-alpha"],
+                                     {"skill-alpha", "skill-beta"}, isolated=True,
+                                     real_home=real, repo_root=repo_checkout)
+        _check("isolation.visibility_classifies_stale",
+               {"skill-retired", "gone-skill"} <= set(vis["masked"])
+               and "vendor-linked" in vis["vendor"],
+               f"stale/broken links reported masked, external symlink reported vendor "
+               f"(masked={vis['masked']}, vendor={vis['vendor']})", failures, verbose)
         _check("isolation.auth_passthrough",
                os.path.islink(os.path.join(dest, ".codex", "auth.json")),
                "auth.json passed through as a symlink", failures, verbose)
@@ -212,7 +243,7 @@ def _check_isolation(failures, verbose):
                f"config mirror stays in temp even when ~/_cfg exists "
                f"(hazard_present={hazard}, escaped={escaped})", failures, verbose)
     finally:
-        for d in (real, declared_root, dest):
+        for d in (real, declared_root, repo_checkout, vendor_src, dest):
             shutil.rmtree(d, ignore_errors=True)
 
 
@@ -997,6 +1028,54 @@ def _check_cli_helpers(failures, verbose):
                failures, verbose)
     finally:
         os.unlink(tmp3.name)
+
+    # _resolve_skills_root / _default_config_path / repo_root_for: the skills_examples/
+    # auto-descent and models.yaml discovery, on a temp tree (no YAML parsing involved —
+    # only os.path checks, so a models.yaml can be an empty file here).
+    import shutil as _shutil
+    import tempfile as _tempfile
+
+    from .cli import _default_config_path, _resolve_skills_root
+    from .spec import repo_root_for
+
+    repo = _tempfile.mkdtemp(prefix="ase-fakerepo-")
+    ext = _tempfile.mkdtemp(prefix="ase-extskills-")
+    try:
+        nested = os.path.join(repo, "skills_examples")
+        os.makedirs(os.path.join(nested, "skill-x"))
+        open(os.path.join(nested, "skill-x", "SKILL.md"), "w").close()
+        open(os.path.join(repo, "models.yaml"), "w").close()
+
+        got = _resolve_skills_root(repo)
+        _check("cli.skills_root.auto_descends", got == nested,
+               f"repo root descends into skills_examples/ (got {got})", failures, verbose)
+        _check("cli.skills_root.direct_used_as_is", _resolve_skills_root(nested) == nested,
+               "a root that already holds skills is used as-is", failures, verbose)
+        _check("cli.skills_root.no_skills_unchanged",
+               _resolve_skills_root(ext) == os.path.abspath(ext),
+               "a dir with no skills (and no skills_examples/) is returned unchanged",
+               failures, verbose)
+        # an external skills root: skills at the top level, its own models.yaml
+        os.makedirs(os.path.join(ext, "skill-y"))
+        open(os.path.join(ext, "skill-y", "SKILL.md"), "w").close()
+        open(os.path.join(ext, "models.yaml"), "w").close()
+        _check("cli.skills_root.external_direct", _resolve_skills_root(ext) == os.path.abspath(ext),
+               "an external direct skills root is used as-is", failures, verbose)
+
+        _check("cli.config.parent_fallback",
+               _default_config_path(nested) == os.path.join(repo, "models.yaml"),
+               "skills under skills_examples/ find the repo-root models.yaml", failures, verbose)
+        _check("cli.config.local_preferred",
+               _default_config_path(ext) == os.path.join(ext, "models.yaml"),
+               "a skills root with its own models.yaml uses it", failures, verbose)
+
+        _check("cli.repo_root_for.nested", repo_root_for(nested) == repo,
+               "skills_examples/ maps back to its checkout root", failures, verbose)
+        _check("cli.repo_root_for.external", repo_root_for(ext) == os.path.abspath(ext),
+               "an external skills root is its own repo root", failures, verbose)
+    finally:
+        _shutil.rmtree(repo, ignore_errors=True)
+        _shutil.rmtree(ext, ignore_errors=True)
 
 
 def _check_assertion_pass_fail(failures, verbose):

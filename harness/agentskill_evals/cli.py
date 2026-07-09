@@ -21,21 +21,20 @@ from .progress import Progress
 from .runner import Runner, _cell_text, _safe, render_matrix
 from .spec import (
     REASONING_EFFORT_LEVELS,
+    SKILLS_SUBDIR,
     ModelTarget,
     _load_raw,
     discover_specs,
     load_scenario,
     load_spec,
     parse_model_target,
+    repo_root_for,
     skill_names,
     validate_spec,
 )
 
 DEFAULT_MAX_CELLS = 25
 DEFAULT_JOBS = 1
-
-
-SKILLS_SUBDIR = "skills_examples"
 
 
 def _default_skills_root() -> str:
@@ -294,7 +293,8 @@ def _print_skill_visibility(specs, agent, isolated, skills_root, provision) -> N
               "what's already installed)")
     adapter = get_adapter(agent)
     declared = set(single.skills) if (single and provision) else set()
-    vis = resolve_visible_skills(adapter, declared, repo, isolated, real_home)
+    vis = resolve_visible_skills(adapter, declared, repo, isolated, real_home,
+                                 repo_root=repo_root_for(skills_root))
     tag = "isolated" if isolated else "NOT isolated"
     print(f"  {agent} ({tag}):")
     if not provision:
@@ -833,7 +833,8 @@ def cmd_list_skills(args) -> int:
 
     print("\nper-runner global skills — what an un-isolated run also sees:")
     for a in all_adapters():
-        vis = resolve_visible_skills(a, (), repo, isolated=True, real_home=real_home)
+        vis = resolve_visible_skills(a, (), repo, isolated=True, real_home=real_home,
+                                     repo_root=repo_root_for(skills_root))
         masked, vendor = vis["masked"], vis["vendor"]
         dirs = list(a.global_skills_subpaths or []) + list(
             getattr(a, "global_plugin_registry_subpaths", []) or [])

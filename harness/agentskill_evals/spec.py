@@ -573,6 +573,19 @@ def load_scenario(path: str) -> Scenario:
                     overrides=overrides, source_path=os.path.abspath(path))
 
 
+SKILLS_SUBDIR = "skills_examples"
+
+
+def repo_root_for(skills_root: str) -> str:
+    """The checkout root a skills_root belongs to: its parent when it is this repo's
+    `skills_examples/` subdir, else the skills_root itself. Isolation uses it to mask
+    stale global symlinks that point into the checkout under retired skill names."""
+    root = os.path.abspath(skills_root)
+    if os.path.basename(root) == SKILLS_SUBDIR:
+        return os.path.dirname(root)
+    return root
+
+
 def skill_names(skills_root: str) -> list[str]:
     """Provisionable skills: immediate subdirectories of skills_root containing a SKILL.md.
 
