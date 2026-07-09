@@ -71,7 +71,7 @@ ls -l ~/.claude/skills ~/.agents/skills
 A "surface" is any tool that consumes the skills (Claude Code, Codex, AntiGravity, CoPilot, other aggregators…). Adding one has up to two parts, and most surfaces only need the first:
 
 1. **Install support — always.** The linking is data-driven: add the surface's `<platform>/skills` directory to `PROJECT_SKILL_DIRS` (and its per-user dir to `GLOBAL_SKILL_DIRS`) in the `Makefile`, re-run `make link-project` / `make link-global`, and **add a row to the install table above** with that surface's specific install instructions. New surfaces always get installation instructions.
-2. **Test-runner support — only if it adds model coverage.** A surface becomes a *test runner* in the eval harness only when it reaches a model no existing runner covers (see [Testing the skills across models](#testing-the-skills-across-models)). That needs an adapter — see [Adding a new runner](harness/README.md#adding-a-new-runner). Aggregators that only re-run already-covered models (e.g. CoPilot) stop at step 1.
+2. **Test-runner support — when you want to *test* through that surface.** A surface becomes a *test runner* in the eval harness by getting an adapter — see [Adding a new runner](harness/README.md#adding-a-new-runner). Two good reasons to add one: it reaches a **model** no existing runner covers, or it's **your actual setup** and you want the evals to reflect exactly how your surface runs the skills — the runner's scaffolding (skill injection, subagents, prompt execution) does influence behavior (see [Testing the skills across models](#testing-the-skills-across-models)). If neither applies — an aggregator that just re-runs models you don't use and that are already covered — step 1 is enough.
 
 ### How discovery works
 
@@ -82,7 +82,7 @@ Claude Code (and the Agent SDK) discover project-level skills from `.claude/skil
 Installation and testing are two different concerns:
 
 - **Installation is per *surface*** (Claude Code, Codex, AntiGravity, CoPilot, other aggregators…) — covered above; every surface gets its own install instructions.
-- **Test coverage is per *model*.** How well a skill works is determined by the LLM, not by which tool drives it, so the eval harness tests each skill across **models**, not across every surface. Running an already-covered model through another surface (e.g. CoPilot, or any aggregator) adds no coverage — those are install targets, not test targets.
+- **Test coverage is per *model*.** How well a skill works is dominated by the LLM, so the eval harness tests each skill across **models**, not across every surface. The runner's scaffolding does contribute — each CLI differs in how it injects/triggers skills, what tools and subagents it uses, and how it decomposes a prompt — so the same model can behave somewhat differently under different surfaces. By default we accept that variance: each model is tested through one designated runner, and that runner+model pair is the *tested configuration* — re-running an already-covered model through another surface isn't counted as new *model* coverage. But it can still be worth testing: if a particular surface (e.g. CoPilot, or any aggregator) is *your* setup, add it as a runner and evaluate through it directly so results reflect exactly how your surface runs the skills.
 
 The harness, the model matrix (`models.yaml`), the cost guardrails, and how to add/retire models live in **[harness/](harness/README.md)**.
 

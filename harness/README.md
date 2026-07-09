@@ -390,6 +390,14 @@ is the CLI used to reach a model (Claude Code, Codex, AntiGravity, Copilot); the
 live in **`models.yaml`** at the repo root — the single source of truth (no model ids are
 hardcoded in the harness). Each `run` targets one runner via `--agent`.
 
+The runner is not a passive pipe: its scaffolding (how it surfaces and triggers skills,
+its system prompt, tool set, subagent delegation, and prompt-execution design) also
+shapes skill behavior. The model is treated as the dominant axis and each model is
+tested through one runner — so a result is really for a *runner+model* pair, and that
+scaffolding variance is accepted, not swept per surface. Because some models overlap
+across runners (see `models.yaml`), you can run the same model through two runners to
+measure the scaffold's contribution when it matters.
+
 > ⚠️ **Cost.** Every cell is a full agent run **plus** a judge call, and the axes
 > multiply (`evals × models`). To keep that from happening by accident:
 > `run` **requires** `--agent` and `--skill`/`--evals`/`--config` (no unscoped broad
@@ -488,9 +496,11 @@ models.yaml`, so the fix location is obvious.
 
 ## Adding a new runner
 
-A runner is the harness used to reach a model. Add one **only if it reaches a model no
-existing runner covers** (see "What we test: models, not surfaces"); a surface that just
-runs already-covered models needs install support, not an adapter — see
+A runner is the harness used to reach a model. Add one when it reaches a **model no
+existing runner covers**, or when that surface is **your actual setup** and you want the
+evals to run through its scaffolding (skill injection, subagents, prompt execution) rather
+than a proxy runner's (see [Cross-model testing](#cross-model-testing)). A surface you
+don't test through only needs install support, not an adapter — see
 [Adding a new surface](../README.md#adding-a-new-surface) in the root README.
 
 1. Subclass [`Adapter`](agentskill_evals/adapters/base.py): set `name`/`binary`/
