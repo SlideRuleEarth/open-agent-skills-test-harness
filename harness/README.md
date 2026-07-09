@@ -72,7 +72,7 @@ The targets just wrap standard tools; run these directly only if `make` doesn't 
 ```bash
 # pipx / uv — e.g. straight from git (note the subdirectory; the package isn't at the repo root):
 pipx install ./harness
-pipx install "git+https://github.com/SlideRuleEarth/sliderule-skills.git#subdirectory=harness"
+pipx install "git+https://github.com/SlideRuleEarth/open-agent-skills-test-harness.git#subdirectory=harness"
 uv tool install ./harness        # uv also manages the Python version
 
 # the hand-rolled venv that `make dev` automates:
@@ -98,11 +98,12 @@ python3 -m agentskill_evals run --skills-root .. --config ../scenarios/<file>.ya
 Evals are **per-skill**: each skill directory owns an `evals/` folder.
 
 ```
-sliderule-docsearch/
-  SKILL.md
-  evals/
-    identifier-disambiguation.yaml
-    cross-skill-boundary-schema.yaml
+skills_examples/
+  sliderule-pipeline/
+    SKILL.md
+    evals/
+      01-single-script-consolidation.yaml
+      02-surface-reproducible-script.yaml
 ```
 
 A spec (YAML or JSON):
@@ -190,8 +191,9 @@ deterministic assertions only.
 
 Examples use the installed `agentskill-evals` CLI (see [Install](#install)). From a
 source checkout without installing, run them as `python3 -m agentskill_evals …` from
-inside `harness/`, adding `--skills-root ..` so the harness finds the sibling
-skill evals and the repo-root `models.yaml` (the default skills-root is the current
+inside `harness/`, adding `--skills-root ..` so the harness finds the example skills
+under `skills_examples/` and the repo-root `models.yaml` (a skills-root pointed at the
+repo root auto-descends into `skills_examples/`; the default skills-root is the current
 directory).
 
 ```bash
@@ -209,7 +211,7 @@ agentskill-evals list-evals --skills-root .
 # `run` always requires --skill, --evals, or --config (no unscoped broad runs)
 
 # one skill, specific agent, parallel, verbose failures
-agentskill-evals run --skill sliderule-docsearch \
+agentskill-evals run --skill sliderule-pipeline \
     --agent claude --jobs 4 -v
 
 # a single eval file, no judge, just deterministic checks
@@ -248,6 +250,40 @@ artifacts/<run_id>/
 run was aborted at the confirmation prompt); `2` — usage/config error (bad flags, malformed
 spec or scenario, duplicate eval names, missing seed files); `3` — nothing was graded
 (rubric-only evals with the judge off), which is "no verdict", not a failure.
+
+## Bring your own skills (external skills root)
+
+The skills in this repo are **examples** — the harness itself is skill-agnostic and
+runs against any directory of skills, including ones that live outside this repo and
+are never committed here. Each run **copies** the declared skills into an isolated,
+hermetic workspace (see [Skill isolation](#skill-isolation)), so a skill needs no
+commit, no `.claude`/`.agents`/`.antigravity` symlink, and no presence in this tree —
+just a `<name>/SKILL.md` on disk.
+
+Point `--skills-root` at the directory that **directly contains** your skill folders:
+
+```bash
+# your own skills living anywhere on disk
+~/my-skills/
+  my-skill/
+    SKILL.md
+    evals/
+      01-first.yaml
+
+# install the harness once (standalone, via pipx — see Install), then:
+agentskill-evals list-evals --skills-root ~/my-skills
+agentskill-evals run --skills-root ~/my-skills --skill my-skill \
+    --agent claude --models-config /path/to/open-agent-skills-test-harness/models.yaml
+```
+
+> **`models.yaml` caveat.** `models.yaml` is this repo's registry of model IDs and is
+> **not** bundled with the installed CLI; the default lookup only checks the skills-root
+> and its immediate parent, so an external root far from this repo won't find it. Runs
+> still work without it — each runner falls back to its **own built-in default model**
+> (shown as `[default]` in the plan). To pin specific model IDs, use the per-runner cheap
+> default, or run `--all-models`, either pass `--models-config /path/to/this-repo/models.yaml`
+> (as above) or a concrete `--model <id>`. A local checkout of this repo is the easiest way
+> to keep a `models.yaml` handy.
 
 ## Skill isolation
 
@@ -291,7 +327,7 @@ enables A/B testing with vs without skills.
   is reported `false` for that cell) — the separate project-local tempdir-relocation layer
   doesn't use symlinks and still applies regardless. Config-dir *writes* still
   pass through to the real dirs (only skill *visibility* is isolated). None of this is an OS-level
-  jail — an agent that deliberately searches the whole disk (e.g. `find / -iname sliderule-skills`)
+  jail — an agent that deliberately searches the whole disk (e.g. `find / -iname open-agent-skills-test-harness`)
   rather than just exploring its own cwd can still find the real checkout, since it genuinely
   exists somewhere on the same filesystem. Closing that would need a container/VM per cell (a
   real, cross-platform fs boundary) or per-OS native sandboxes (macOS Seatbelt, Linux
@@ -310,16 +346,16 @@ together against a chosen target (`runner:model`), from one self-describing file
 
 ```bash
 # preview what runs + exactly which skills are visible (no API cost)
-agentskill-evals run --config scenarios/example_api+params_on_claude-haiku.yaml --dry-run
+agentskill-evals run --config scenarios/example_full_schema.yaml --dry-run
 
 # run it
-agentskill-evals run --config scenarios/example_api+params_on_claude-haiku.yaml
+agentskill-evals run --config scenarios/example_full_schema.yaml
 ```
 
 A scenario file is an eval spec plus a `target:` block:
 
 ```yaml
-name: api+params combination
+name: pipeline+region-picker combination
 target:
   runner: claude
   model: claude-haiku-4-5      # optional; omit → models.yaml's cheapest default
@@ -328,7 +364,7 @@ target:
   # model:
   #   - claude-haiku-4.5@high
   #   - {model: claude-opus-4.6, reasoning_effort: low}
-skills: [sliderule-api, sliderule-params]   # provisioned together; the only repo skills visible
+skills: [sliderule-pipeline, sliderule-region-picker]   # provisioned together; the only repo skills visible
 prompt: |
   Using {skills}, write run.py that ...
 rubric: [ ... ]
@@ -353,6 +389,14 @@ first-class axis: a run is a matrix of `evals × models` for a single runner. A 
 is the CLI used to reach a model (Claude Code, Codex, AntiGravity, Copilot); the models
 live in **`models.yaml`** at the repo root — the single source of truth (no model ids are
 hardcoded in the harness). Each `run` targets one runner via `--agent`.
+
+The runner is not a passive pipe: its scaffolding (how it surfaces and triggers skills,
+its system prompt, tool set, subagent delegation, and prompt-execution design) also
+shapes skill behavior. The model is treated as the dominant axis and each model is
+tested through one runner — so a result is really for a *runner+model* pair, and that
+scaffolding variance is accepted, not swept per surface. Because some models overlap
+across runners (see `models.yaml`), you can run the same model through two runners to
+measure the scaffold's contribution when it matters.
 
 > ⚠️ **Cost.** Every cell is a full agent run **plus** a judge call, and the axes
 > multiply (`evals × models`). To keep that from happening by accident:
@@ -452,9 +496,11 @@ models.yaml`, so the fix location is obvious.
 
 ## Adding a new runner
 
-A runner is the harness used to reach a model. Add one **only if it reaches a model no
-existing runner covers** (see "What we test: models, not surfaces"); a surface that just
-runs already-covered models needs install support, not an adapter — see
+A runner is the harness used to reach a model. Add one when it reaches a **model no
+existing runner covers**, or when that surface is **your actual setup** and you want the
+evals to run through its scaffolding (skill injection, subagents, prompt execution) rather
+than a proxy runner's (see [Cross-model testing](#cross-model-testing)). A surface you
+don't test through only needs install support, not an adapter — see
 [Adding a new surface](../README.md#adding-a-new-surface) in the root README.
 
 1. Subclass [`Adapter`](agentskill_evals/adapters/base.py): set `name`/`binary`/

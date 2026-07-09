@@ -10,19 +10,20 @@ target:
   model: claude-haiku-4.5
 
 skills:
-  - sliderule-api
+  - sliderule-region-picker
 
 prompt: |
-  Read the sliderule-api skill and list the three HTTP endpoints it documents.
-  Write your answer to a file called endpoints.txt, one endpoint per line.
+  Read the sliderule-region-picker skill and list the steps it describes for letting
+  a user define an analysis region by drawing on the SlideRule helper map.
+  Write your answer to steps.txt, one step per line.
 
 rubric:
-  - Lists at least two real SlideRule endpoints from the skill (not invented ones).
-  - Wrote the answer to endpoints.txt rather than only printing it.
+  - Lists at least two real steps from the region-picker skill (not invented ones).
+  - Wrote the answer to steps.txt rather than only printing it.
 
 assertions:
-  - {type: file_exists, path: endpoints.txt}
-  - {type: skill_triggered, skill: sliderule-api}
+  - {type: file_exists, path: steps.txt}
+  - {type: skill_triggered, skill: sliderule-region-picker}
   - {type: no_error}
 
 judge:

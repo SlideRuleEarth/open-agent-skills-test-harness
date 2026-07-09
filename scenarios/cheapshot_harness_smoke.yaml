@@ -16,8 +16,8 @@ target:
   model: claude-haiku-4.5        # cheapest copilot model
 
 skills:
-  - sliderule-api
-  - sliderule-params
+  - sliderule-pipeline
+  - sliderule-region-picker
 
 prompt: |
   Using {skills}, write a short Python script called run.py that prints
@@ -37,8 +37,8 @@ assertions:
   - {type: file_absent,  path: output.csv}
 
   # skill interaction
-  - {type: skill_triggered,     skill: sliderule-api}
-  - {type: skill_triggered,     skill: sliderule-params}
+  - {type: skill_triggered,     skill: sliderule-pipeline}
+  - {type: skill_triggered,     skill: sliderule-region-picker}
 
   # process
   - {type: no_error}

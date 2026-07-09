@@ -53,7 +53,7 @@ the file format. For scenarios in action, see the
 
 **Short answer:** by default, normal skill discovery sees only the skills that test provisions for
 itself — plus the agent's own built-in skills. Each test runs in an isolated home directory that
-hides the SlideRule skills you've installed globally, so the normal path is exactly the set the
+hides this repo's skills you've installed globally, so the normal path is exactly the set the
 test declares.
 
 **What the harness does for each test**

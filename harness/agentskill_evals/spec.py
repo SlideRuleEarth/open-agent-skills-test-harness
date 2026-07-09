@@ -4,7 +4,7 @@ The improved, forward-looking eval format (YAML preferred, JSON also accepted):
 
     name: identifier-disambiguation
     description: Don't confuse atl06x (X-Series) with atl06p (legacy).
-    skills: [sliderule-docsearch]      # provisioned into each agent's workspace
+    skills: [sliderule-pipeline]      # provisioned into each agent's workspace
     prompt: |
       What does the atl06x endpoint do? How is it different from atl06p?
     files: []                          # seeded into the workspace (rel to eval file)
@@ -32,8 +32,8 @@ The improved, forward-looking eval format (YAML preferred, JSON also accepted):
     output_schema: null
 
 Discovery is per-skill: each skill directory owns an `evals/` folder, e.g.
-`sliderule-docsearch/evals/*.yaml`. The skill name is inferred from the
-directory that contains `evals/`.
+`skills_examples/sliderule-pipeline/evals/*.yaml`. The skill name is inferred
+from the directory that contains `evals/`.
 
 Legacy keys are accepted as aliases (`query`->`prompt`,
 `expected_behavior`->`rubric`) so existing files keep running.
@@ -439,7 +439,7 @@ def _spec_from_raw(raw: dict, path: str) -> EvalSpec:
     if isinstance(rubric, str):
         rubric = [rubric]
 
-    # Normalize skills to list[str]. A scalar `skills: sliderule-api` must become a
+    # Normalize skills to list[str]. A scalar `skills: sliderule-pipeline` must become a
     # one-element list, not be iterated character-by-character downstream.
     skills = raw.get("skills")
     if skills is None:
@@ -571,6 +571,19 @@ def load_scenario(path: str) -> Scenario:
             f"got {overrides['judge']!r}")
     return Scenario(spec=spec, runner=runner.strip(), targets=targets,
                     overrides=overrides, source_path=os.path.abspath(path))
+
+
+SKILLS_SUBDIR = "skills_examples"
+
+
+def repo_root_for(skills_root: str) -> str:
+    """The checkout root a skills_root belongs to: its parent when it is this repo's
+    `skills_examples/` subdir, else the skills_root itself. Isolation uses it to mask
+    stale global symlinks that point into the checkout under retired skill names."""
+    root = os.path.abspath(skills_root)
+    if os.path.basename(root) == SKILLS_SUBDIR:
+        return os.path.dirname(root)
+    return root
 
 
 def skill_names(skills_root: str) -> list[str]:

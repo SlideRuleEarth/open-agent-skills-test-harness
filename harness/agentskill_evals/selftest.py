@@ -20,7 +20,7 @@ CLAUDE = """\
 {"type":"assistant","message":{"content":[{"type":"text","text":"I'll scaffold the app."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"npm install"}}]}}
 {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false}]}}
 {"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Write","input":{"file_path":"package.json"}}]}}
-{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t4","name":"Skill","input":{"skill":"sliderule-api"}}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t4","name":"Skill","input":{"skill":"skill-alpha"}}]}}
 {"type":"assistant","message":{"content":[{"type":"tool_use","id":"t5","name":"Glob","input":{"pattern":"**/SKILL.md","path":"/etc"}}]}}
 {"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"StructuredOutput","input":{"ok":true}}]}}
 {"type":"result","subtype":"success","is_error":false,"result":"Done. Created the app.","total_cost_usd":0.0123,"duration_ms":4567,"structured_output":{"ok":true}}
@@ -58,7 +58,7 @@ ANTIGRAVITY_STREAM = """\
 {"type":"tool_use","tool":"shell","args":{"command":"npm install"}}
 {"type":"tool_result","tool":"shell"}
 {"type":"error","message":"a transient error"}
-{"type":"tool_use","tool":"skill","args":{"skill":"sliderule-api"}}
+{"type":"tool_use","tool":"skill","args":{"skill":"skill-alpha"}}
 {"type":"result","text":"Done building demo-app."}
 """
 
@@ -80,7 +80,7 @@ ANTIGRAVITY_TRANSCRIPT = """\
 {"step_index":3,"source":"MODEL","type":"RUN_COMMAND","content":"added 1 package"}
 {"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"write_to_file","args":{"TargetFile":"package.json","CodeContent":"{}"}}]}
 {"step_index":5,"source":"MODEL","type":"CODE_ACTION","content":"Created file package.json"}
-{"step_index":6,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"skill","args":{"skill":"sliderule-api"}}]}
+{"step_index":6,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"skill","args":{"skill":"skill-alpha"}}]}
 {"step_index":7,"source":"SYSTEM","type":"CHECKPOINT","content":"summary"}
 {"step_index":8,"source":"MODEL","type":"ERROR_MESSAGE","content":"a transient warning"}
 {"step_index":9,"source":"MODEL","type":"PLANNER_RESPONSE","content":"Done building demo-app."}
@@ -91,7 +91,7 @@ COPILOT = """\
 {"type":"session.tools_updated","data":{"model":"claude-sonnet-4.6"},"id":"s2","timestamp":"2026-06-22T00:00:00Z","parentId":"p1","ephemeral":true}
 {"type":"user.message","data":{"content":"list files"},"id":"u1","timestamp":"2026-06-22T00:00:00Z","parentId":"p1"}
 {"type":"assistant.turn_start","data":{"turnId":"0","interactionId":"i1"},"id":"t1","timestamp":"2026-06-22T00:00:01Z","parentId":"u1"}
-{"type":"assistant.message","data":{"messageId":"m1","model":"claude-sonnet-4.6","content":"","toolRequests":[{"toolCallId":"tc1","name":"report_intent","arguments":{"intent":"Listing files"},"type":"function"},{"toolCallId":"tc2","name":"shell","arguments":{"command":"ls -la"},"type":"function"},{"toolCallId":"tc3","name":"view","arguments":{"path":"/tmp/project"},"type":"function"},{"toolCallId":"tc4","name":"skill","arguments":{"skill":"sliderule-params"},"type":"function"}],"interactionId":"i1","turnId":"0","outputTokens":50},"id":"m1","timestamp":"2026-06-22T00:00:02Z","parentId":"t1"}
+{"type":"assistant.message","data":{"messageId":"m1","model":"claude-sonnet-4.6","content":"","toolRequests":[{"toolCallId":"tc1","name":"report_intent","arguments":{"intent":"Listing files"},"type":"function"},{"toolCallId":"tc2","name":"shell","arguments":{"command":"ls -la"},"type":"function"},{"toolCallId":"tc3","name":"view","arguments":{"path":"/tmp/project"},"type":"function"},{"toolCallId":"tc4","name":"skill","arguments":{"skill":"skill-beta"},"type":"function"}],"interactionId":"i1","turnId":"0","outputTokens":50},"id":"m1","timestamp":"2026-06-22T00:00:02Z","parentId":"t1"}
 {"type":"tool.execution_complete","data":{"toolCallId":"tc2","success":true,"result":{"content":"file1.txt\\nfile2.txt"}},"id":"r1","timestamp":"2026-06-22T00:00:02Z","parentId":"m1"}
 {"type":"tool.execution_complete","data":{"toolCallId":"tc3","success":true,"result":{"content":"file1.txt\\nfile2.txt"}},"id":"r2","timestamp":"2026-06-22T00:00:02Z","parentId":"m1"}
 {"type":"assistant.turn_end","data":{"turnId":"0"},"id":"e1","timestamp":"2026-06-22T00:00:03Z","parentId":"r2"}
@@ -118,18 +118,20 @@ def _check_isolation(failures, verbose):
     import shutil
     import tempfile
 
-    from .isolation import build_isolated_home
+    from .isolation import build_isolated_home, resolve_visible_skills
 
     print("isolation overlay:")
     real = tempfile.mkdtemp(prefix="ase-realhome-")
     declared_root = tempfile.mkdtemp(prefix="ase-skills-")
+    repo_checkout = tempfile.mkdtemp(prefix="ase-repo-")     # a fake checkout of this repo
+    vendor_src = tempfile.mkdtemp(prefix="ase-vendorsrc-")   # a real skill dir outside it
     dest = tempfile.mkdtemp(prefix="ase-isohome-")
     shutil.rmtree(dest)  # build_isolated_home (re)creates it
     try:
         # a fake real HOME: a global skills dir with two repo skills + a vendor bundle,
         # plus auth + an unrelated dotfile.
-        os.makedirs(os.path.join(real, ".codex", "skills", "sliderule-api"))
-        os.makedirs(os.path.join(real, ".codex", "skills", "sliderule-params"))
+        os.makedirs(os.path.join(real, ".codex", "skills", "skill-alpha"))
+        os.makedirs(os.path.join(real, ".codex", "skills", "skill-beta"))
         os.makedirs(os.path.join(real, ".codex", "skills", ".system", "imagegen"))
         os.makedirs(os.path.join(real, "_cfg"))  # reproduce the config-mirror escape hazard
         open(os.path.join(real, ".codex", "auth.json"), "w").close()
@@ -139,37 +141,66 @@ def _check_isolation(failures, verbose):
         # repo's skills (the real-world leak — e.g. via `agy plugin import`), plus a vendor
         # skill in the same plugin, plus a second, unrelated vendor-only plugin.
         os.makedirs(os.path.join(real, ".gemini", "config", "plugins",
-                                  "sliderule-skills", "skills", "sliderule-api"))
+                                  "repo-skills-plugin", "skills", "skill-alpha"))
         os.makedirs(os.path.join(real, ".gemini", "config", "plugins",
-                                  "sliderule-skills", "skills", "vendor-thing"))
+                                  "repo-skills-plugin", "skills", "vendor-thing"))
         open(os.path.join(real, ".gemini", "config", "plugins",
-                           "sliderule-skills", "plugin.json"), "w").close()
+                           "repo-skills-plugin", "plugin.json"), "w").close()
         os.makedirs(os.path.join(real, ".gemini", "config", "plugins",
                                   "other-plugin", "skills", "other-skill"))
-        # the cell declares only sliderule-api (its source lives outside HOME, like skills_root)
-        os.makedirs(os.path.join(declared_root, "sliderule-api"))
+        # the cell declares only skill-alpha (its source lives outside HOME, like skills_root)
+        os.makedirs(os.path.join(declared_root, "skill-alpha"))
+        # stale installs the name-based mask can't catch: a symlink into the checkout under a
+        # retired name, and a broken symlink (its checkout was deleted). A symlink resolving
+        # elsewhere is a vendor skill and must survive.
+        os.makedirs(os.path.join(repo_checkout, "skills_examples", "skill-retired"))
+        skills_dir = os.path.join(real, ".codex", "skills")
+        os.symlink(os.path.join(repo_checkout, "skills_examples", "skill-retired"),
+                   os.path.join(skills_dir, "skill-retired"))
+        os.symlink(os.path.join(real, "no-such-checkout", "gone-skill"),
+                   os.path.join(skills_dir, "gone-skill"))
+        os.symlink(vendor_src, os.path.join(skills_dir, "vendor-linked"))
 
         build_isolated_home(
             dest,
             [".codex/skills", ".gemini/config/skills"],   # one present, one missing (nested)
-            {"sliderule-api", "sliderule-params"},        # repo superset to mask
-            [os.path.join(declared_root, "sliderule-api")],
+            {"skill-alpha", "skill-beta"},        # repo superset to mask
+            [os.path.join(declared_root, "skill-alpha")],
             real,
             plugin_registry_subpaths=[".gemini/config/plugins"],
+            repo_root=repo_checkout,
         )
 
         skills = os.path.join(dest, ".codex", "skills")
         names = set(os.listdir(skills)) if os.path.isdir(skills) else set()
-        _check("isolation.declared_present", "sliderule-api" in names,
-               f"declared sliderule-api present (got {sorted(names)})", failures, verbose)
+        _check("isolation.declared_present", "skill-alpha" in names,
+               f"declared skill-alpha present (got {sorted(names)})", failures, verbose)
         _check("isolation.declared_is_copy",
-               os.path.isdir(os.path.join(skills, "sliderule-api"))
-               and not os.path.islink(os.path.join(skills, "sliderule-api")),
+               os.path.isdir(os.path.join(skills, "skill-alpha"))
+               and not os.path.islink(os.path.join(skills, "skill-alpha")),
                "declared skill is a copy (writes can't reach the source)", failures, verbose)
-        _check("isolation.undeclared_masked", "sliderule-params" not in names,
-               "undeclared sliderule-params removed", failures, verbose)
+        _check("isolation.undeclared_masked", "skill-beta" not in names,
+               "undeclared skill-beta removed", failures, verbose)
         _check("isolation.vendor_kept", ".system" in names,
                "vendor .system bundle preserved", failures, verbose)
+        _check("isolation.stale_repo_link_masked", "skill-retired" not in names,
+               "stale symlink into the checkout (retired name) dropped", failures, verbose)
+        _check("isolation.broken_link_masked", "gone-skill" not in names,
+               "broken symlink dropped", failures, verbose)
+        _check("isolation.vendor_symlink_kept", "vendor-linked" in names,
+               "symlink resolving outside the checkout kept as vendor", failures, verbose)
+
+        # resolve_visible_skills must classify the same way the overlay masks
+        class _FakeAdapter:
+            global_skills_subpaths = [".codex/skills"]
+        vis = resolve_visible_skills(_FakeAdapter(), ["skill-alpha"],
+                                     {"skill-alpha", "skill-beta"}, isolated=True,
+                                     real_home=real, repo_root=repo_checkout)
+        _check("isolation.visibility_classifies_stale",
+               {"skill-retired", "gone-skill"} <= set(vis["masked"])
+               and "vendor-linked" in vis["vendor"],
+               f"stale/broken links reported masked, external symlink reported vendor "
+               f"(masked={vis['masked']}, vendor={vis['vendor']})", failures, verbose)
         _check("isolation.auth_passthrough",
                os.path.islink(os.path.join(dest, ".codex", "auth.json")),
                "auth.json passed through as a symlink", failures, verbose)
@@ -178,23 +209,23 @@ def _check_isolation(failures, verbose):
                ".gitconfig passed through as a symlink", failures, verbose)
         gem = os.path.join(dest, ".gemini", "config", "skills")
         gem_names = sorted(os.listdir(gem)) if os.path.isdir(gem) else ["<MISSING>"]
-        _check("isolation.missing_ancestor_built", gem_names == ["sliderule-api"],
+        _check("isolation.missing_ancestor_built", gem_names == ["skill-alpha"],
                f"missing nested skills dir built with declared only (got {gem_names})",
                failures, verbose)
 
         plugin_skills = os.path.join(dest, ".gemini", "config", "plugins",
-                                      "sliderule-skills", "skills")
+                                      "repo-skills-plugin", "skills")
         plugin_names = sorted(os.listdir(plugin_skills)) if os.path.isdir(plugin_skills) else []
         _check("isolation.plugin_repo_skill_masked", plugin_names == ["vendor-thing"],
                f"plugin's leaked repo skill dropped, its vendor skill kept "
                f"(got {plugin_names})", failures, verbose)
         _check("isolation.plugin_not_re_added",
-               "sliderule-api" not in plugin_names,
+               "skill-alpha" not in plugin_names,
                "declared skill isn't duplicated into an unrelated plugin's skills/ "
                "(it's already injected once via the primary skills dir)", failures, verbose)
         _check("isolation.plugin_metadata_passthrough",
                os.path.islink(os.path.join(dest, ".gemini", "config", "plugins",
-                                            "sliderule-skills", "plugin.json")),
+                                            "repo-skills-plugin", "plugin.json")),
                "plugin.json passed through as a symlink", failures, verbose)
         other_plugin_skills = os.path.join(dest, ".gemini", "config", "plugins",
                                             "other-plugin", "skills")
@@ -212,7 +243,7 @@ def _check_isolation(failures, verbose):
                f"config mirror stays in temp even when ~/_cfg exists "
                f"(hazard_present={hazard}, escaped={escaped})", failures, verbose)
     finally:
-        for d in (real, declared_root, dest):
+        for d in (real, declared_root, repo_checkout, vendor_src, dest):
             shutil.rmtree(d, ignore_errors=True)
 
 
@@ -527,7 +558,7 @@ def _check_leaked_skill_reads(failures, verbose):
     to a tempdir outside the repo tree (see the "how one cell runs" isolation layers in
     runner.py). The real transcript showed
     exactly that: `list_dir` on the scenario dir, then the repo root, then `view_file` on
-    ``sliderule-api/SKILL.md`` and ``sliderule-openapi/scripts/openapi.py`` — none of which were
+    ``skill-alpha/SKILL.md`` and ``skill-gamma/scripts/openapi.py`` — none of which were
     declared — while the run was still reported as ``isolated: true``.
 
     ``leaked_skill_reads`` must catch this after the fact from the trace: an undeclared repo
@@ -545,7 +576,7 @@ def _check_leaked_skill_reads(failures, verbose):
     try:
         # Mirror the real layout: workspace nested inside the repo checkout, sibling to the
         # repo's own skill directories.
-        for name in ("sliderule-api", "sliderule-openapi", "sliderule-examples"):
+        for name in ("skill-alpha", "skill-gamma", "skill-delta"):
             os.makedirs(os.path.join(repo_root, name))
             with open(os.path.join(repo_root, name, "SKILL.md"), "w") as f:
                 f.write("---\nname: " + name + "\n---\n")
@@ -557,11 +588,11 @@ def _check_leaked_skill_reads(failures, verbose):
             return RunResult(agent="antigravity", eval_name="e", prompt="", workdir=workspace,
                              events=events)
 
-        repo_skill_names = {"sliderule-api", "sliderule-openapi", "sliderule-examples"}
+        repo_skill_names = {"skill-alpha", "skill-gamma", "skill-delta"}
 
-        # 1. the real escape: list_dir/view_file on the undeclared sliderule-api SKILL.md via
+        # 1. the real escape: list_dir/view_file on the undeclared skill-alpha SKILL.md via
         #    the repo's real absolute path — no skill declared for this eval at all.
-        leak_path = os.path.join(repo_root, "sliderule-api", "SKILL.md")
+        leak_path = os.path.join(repo_root, "skill-alpha", "SKILL.md")
         rr = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="view_file", path=leak_path)])
         leaks = leaked_skill_reads(rr, workspace, repo_root, repo_skill_names, declared_names=set())
         _check("leak.undeclared_skill_read_detected", leaks == [os.path.realpath(leak_path)],
@@ -571,12 +602,12 @@ def _check_leaked_skill_reads(failures, verbose):
         #    given this one).
         rr2 = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="view_file", path=leak_path)])
         leaks2 = leaked_skill_reads(rr2, workspace, repo_root, repo_skill_names,
-                                    declared_names={"sliderule-api"})
+                                    declared_names={"skill-alpha"})
         _check("leak.declared_skill_not_flagged", leaks2 == [],
                f"declared skill's real-path read is not a leak: {leaks2}", failures, verbose)
 
         # 3. reading the provisioned COPY inside the workspace itself is not a leak.
-        prov_dir = os.path.join(workspace, ".antigravity", "skills", "sliderule-api")
+        prov_dir = os.path.join(workspace, ".antigravity", "skills", "skill-alpha")
         os.makedirs(prov_dir)
         prov_path = os.path.join(prov_dir, "SKILL.md")
         open(prov_path, "w").close()
@@ -586,8 +617,8 @@ def _check_leaked_skill_reads(failures, verbose):
                f"provisioned in-workspace copy is not a leak: {leaks3}", failures, verbose)
 
         # 4. a run_command whose command string references the undeclared skill's real script
-        #    path (e.g. `python /repo/sliderule-openapi/scripts/openapi.py ...`) is also caught.
-        script = os.path.join(repo_root, "sliderule-openapi", "scripts", "openapi.py")
+        #    path (e.g. `python /repo/skill-gamma/scripts/openapi.py ...`) is also caught.
+        script = os.path.join(repo_root, "skill-gamma", "scripts", "openapi.py")
         cmd = f"conda run -n env python {script} applies-to atl06x"
         rr4 = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="run_command", command=cmd)])
         leaks4 = leaked_skill_reads(rr4, workspace, repo_root, repo_skill_names, declared_names=set())
@@ -618,12 +649,12 @@ def _check_leaked_skill_reads(failures, verbose):
         #    a bare abspath check sees `workspace/evil/SKILL.md` as textually "inside" and would
         #    miss it entirely; realpath resolution follows it to the real, undeclared target.
         evil_link = os.path.join(workspace, "evil")
-        os.symlink(os.path.join(repo_root, "sliderule-api"), evil_link)
+        os.symlink(os.path.join(repo_root, "skill-alpha"), evil_link)
         rr6 = _rr([NormalizedEvent(EventKind.TOOL_CALL, tool_name="view_file",
                                    path=os.path.join(evil_link, "SKILL.md"))])
         leaks6 = leaked_skill_reads(rr6, workspace, repo_root, repo_skill_names, declared_names=set())
         _check("leak.symlink_escape_detected",
-               leaks6 == [os.path.realpath(os.path.join(repo_root, "sliderule-api", "SKILL.md"))],
+               leaks6 == [os.path.realpath(os.path.join(repo_root, "skill-alpha", "SKILL.md"))],
                f"symlink from inside workspace to an undeclared skill is caught: {leaks6}",
                failures, verbose)
     finally:
@@ -998,6 +1029,54 @@ def _check_cli_helpers(failures, verbose):
     finally:
         os.unlink(tmp3.name)
 
+    # _resolve_skills_root / _default_config_path / repo_root_for: the skills_examples/
+    # auto-descent and models.yaml discovery, on a temp tree (no YAML parsing involved —
+    # only os.path checks, so a models.yaml can be an empty file here).
+    import shutil as _shutil
+    import tempfile as _tempfile
+
+    from .cli import _default_config_path, _resolve_skills_root
+    from .spec import repo_root_for
+
+    repo = _tempfile.mkdtemp(prefix="ase-fakerepo-")
+    ext = _tempfile.mkdtemp(prefix="ase-extskills-")
+    try:
+        nested = os.path.join(repo, "skills_examples")
+        os.makedirs(os.path.join(nested, "skill-x"))
+        open(os.path.join(nested, "skill-x", "SKILL.md"), "w").close()
+        open(os.path.join(repo, "models.yaml"), "w").close()
+
+        got = _resolve_skills_root(repo)
+        _check("cli.skills_root.auto_descends", got == nested,
+               f"repo root descends into skills_examples/ (got {got})", failures, verbose)
+        _check("cli.skills_root.direct_used_as_is", _resolve_skills_root(nested) == nested,
+               "a root that already holds skills is used as-is", failures, verbose)
+        _check("cli.skills_root.no_skills_unchanged",
+               _resolve_skills_root(ext) == os.path.abspath(ext),
+               "a dir with no skills (and no skills_examples/) is returned unchanged",
+               failures, verbose)
+        # an external skills root: skills at the top level, its own models.yaml
+        os.makedirs(os.path.join(ext, "skill-y"))
+        open(os.path.join(ext, "skill-y", "SKILL.md"), "w").close()
+        open(os.path.join(ext, "models.yaml"), "w").close()
+        _check("cli.skills_root.external_direct", _resolve_skills_root(ext) == os.path.abspath(ext),
+               "an external direct skills root is used as-is", failures, verbose)
+
+        _check("cli.config.parent_fallback",
+               _default_config_path(nested) == os.path.join(repo, "models.yaml"),
+               "skills under skills_examples/ find the repo-root models.yaml", failures, verbose)
+        _check("cli.config.local_preferred",
+               _default_config_path(ext) == os.path.join(ext, "models.yaml"),
+               "a skills root with its own models.yaml uses it", failures, verbose)
+
+        _check("cli.repo_root_for.nested", repo_root_for(nested) == repo,
+               "skills_examples/ maps back to its checkout root", failures, verbose)
+        _check("cli.repo_root_for.external", repo_root_for(ext) == os.path.abspath(ext),
+               "an external skills root is its own repo root", failures, verbose)
+    finally:
+        _shutil.rmtree(repo, ignore_errors=True)
+        _shutil.rmtree(ext, ignore_errors=True)
+
 
 def _check_assertion_pass_fail(failures, verbose):
     """Real pass/fail coverage for every deterministic assertion type via run_assertion() — not
@@ -1024,14 +1103,14 @@ def _check_assertion_pass_fail(failures, verbose):
         events = [
             NormalizedEvent(EventKind.TOOL_CALL, tool_name="Bash", command="python run.py"),
             NormalizedEvent(EventKind.TOOL_CALL, tool_name="Read",
-                            path=".claude/skills/sliderule-api/references/foo.md"),
+                            path=".claude/skills/skill-alpha/references/foo.md"),
             NormalizedEvent(EventKind.TOOL_CALL, tool_name="Bash",
-                            path=".claude/skills/sliderule-api/scripts/bar.py"),
+                            path=".claude/skills/skill-alpha/scripts/bar.py"),
         ]
         rr = RunResult(agent="x", eval_name="e", prompt="", workdir=ws, events=events,
                        exit_code=0, final_text="Done, printed hello",
                        structured_output={"ok": True})
-        spec = EvalSpec(name="t", prompt="p", source_path="/x.yaml", skills=["sliderule-api"])
+        spec = EvalSpec(name="t", prompt="p", source_path="/x.yaml", skills=["skill-alpha"])
         ctx = AssertionContext(spec=spec, skills_subdir=".claude/skills")
 
         def _pf(cfg, expect_pass, label):
@@ -1059,33 +1138,33 @@ def _check_assertion_pass_fail(failures, verbose):
         _pf({"type": "tool_count", "min": 0, "max": 10}, True, "tool_count.pass")
         _pf({"type": "tool_count", "min": 100}, False, "tool_count.fail")
 
-        _pf({"type": "skill_triggered", "skill": "sliderule-api"}, True, "skill_triggered.pass")
+        _pf({"type": "skill_triggered", "skill": "skill-alpha"}, True, "skill_triggered.pass")
         _pf({"type": "skill_triggered", "skill": "sliderule-other"}, False,
             "skill_triggered.fail")
 
         _pf({"type": "skill_not_triggered", "skill": "sliderule-other"}, True,
             "skill_not_triggered.pass")
-        _pf({"type": "skill_not_triggered", "skill": "sliderule-api"}, False,
+        _pf({"type": "skill_not_triggered", "skill": "skill-alpha"}, False,
             "skill_not_triggered.fail")
 
-        _pf({"type": "skill_reference_read", "skill": "sliderule-api"}, True,
+        _pf({"type": "skill_reference_read", "skill": "skill-alpha"}, True,
             "skill_reference_read.pass")
         _pf({"type": "skill_reference_read", "skill": "sliderule-other"}, False,
             "skill_reference_read.fail")
 
         _pf({"type": "skill_reference_not_read", "skill": "sliderule-other"}, True,
             "skill_reference_not_read.pass")
-        _pf({"type": "skill_reference_not_read", "skill": "sliderule-api"}, False,
+        _pf({"type": "skill_reference_not_read", "skill": "skill-alpha"}, False,
             "skill_reference_not_read.fail")
 
-        _pf({"type": "skill_script_executed", "skill": "sliderule-api"}, True,
+        _pf({"type": "skill_script_executed", "skill": "skill-alpha"}, True,
             "skill_script_executed.pass")
         _pf({"type": "skill_script_executed", "skill": "sliderule-other"}, False,
             "skill_script_executed.fail")
 
         _pf({"type": "skill_script_not_executed", "skill": "sliderule-other"}, True,
             "skill_script_not_executed.pass")
-        _pf({"type": "skill_script_not_executed", "skill": "sliderule-api"}, False,
+        _pf({"type": "skill_script_not_executed", "skill": "skill-alpha"}, False,
             "skill_script_not_executed.fail")
 
         _pf({"type": "exit_code", "equals": 0}, True, "exit_code.pass")
@@ -1126,18 +1205,18 @@ def _check_assertion_pass_fail(failures, verbose):
             agent="codex", eval_name="e", prompt="", workdir=ws,
             events=[NormalizedEvent(
                 EventKind.TOOL_CALL, tool_name="Read",
-                path="/tmp/ase-home-x/.codex/skills/sliderule-api/SKILL.md")])
+                path="/tmp/ase-home-x/.codex/skills/skill-alpha/SKILL.md")])
         ctx_glob = AssertionContext(
             spec=spec, skills_subdir=".agents/skills",
             skill_dirs=[".agents/skills", ".codex/skills", ".agents/skills"])
-        ar_g = run_assertion({"type": "skill_triggered", "skill": "sliderule-api"},
+        ar_g = run_assertion({"type": "skill_triggered", "skill": "skill-alpha"},
                              rr_glob, ws, spec, ctx_glob)
         _check("assertion.skill_triggered.global_dir", ar_g.passed is True,
                f"a global-skills-dir read counts as triggered: {ar_g.message}",
                failures, verbose)
         # ...and without skill_dirs, the single-subdir fallback still works as before.
         ctx_fallback = AssertionContext(spec=spec, skills_subdir=".codex/skills")
-        ar_f = run_assertion({"type": "skill_triggered", "skill": "sliderule-api"},
+        ar_f = run_assertion({"type": "skill_triggered", "skill": "skill-alpha"},
                              rr_glob, ws, spec, ctx_fallback)
         _check("assertion.skill_triggered.subdir_fallback", ar_f.passed is True,
                f"skill_dirs=None falls back to skills_subdir: {ar_f.message}",
@@ -1291,7 +1370,7 @@ def _check_antigravity_transcript(failures, verbose):
                f"TargetFile (PascalCase) extracted via snake_case_keys: {paths}",
                failures, verbose)
         _check("antigravity.transcript.skill_path",
-               ".antigravity/skills/sliderule-api/SKILL.md" in paths,
+               ".antigravity/skills/skill-alpha/SKILL.md" in paths,
                f"skill tool call resolves to its SKILL.md path: {paths}", failures, verbose)
 
         tool_names = [e.tool_name for e in out.events if e.tool_name]
@@ -1763,7 +1842,7 @@ def run_selftest(verbose: bool = False) -> int:
     _check("claude.no_structured_tool", "StructuredOutput" not in tools,
            "StructuredOutput is not traced as a real tool", failures, verbose)
     skill_paths = [e.path for e in out.events if e.tool_name == "Skill"]
-    _check("claude.skill_path", skill_paths == [".claude/skills/sliderule-api/SKILL.md"],
+    _check("claude.skill_path", skill_paths == [".claude/skills/skill-alpha/SKILL.md"],
            f"Skill tool call extracts skill path: {skill_paths}", failures, verbose)
     glob_paths = [e.path for e in out.events if e.tool_name == "Glob"]
     _check("claude.unrecognized_tool_path", glob_paths == ["/etc"],
@@ -1854,7 +1933,7 @@ def run_selftest(verbose: bool = False) -> int:
     _check("copilot.tools", "shell" in tools and "view" in tools and "skill" in tools,
            f"tools={tools}", failures, verbose)
     skill_paths = [e.path for e in out.events if e.tool_name == "skill"]
-    _check("copilot.skill_path", skill_paths == [".agents/skills/sliderule-params/SKILL.md"],
+    _check("copilot.skill_path", skill_paths == [".agents/skills/skill-beta/SKILL.md"],
            f"skill tool call extracts skill path: {skill_paths}", failures, verbose)
     _check("copilot.no_report_intent", "report_intent" not in tools,
            "report_intent is not traced as a real tool", failures, verbose)
@@ -1909,7 +1988,7 @@ def run_selftest(verbose: bool = False) -> int:
     _check("antigravity.stream.final", out.final_text == "Done building demo-app.", repr(out.final_text), failures, verbose)
     skill_paths = [e.path for e in out.events if e.tool_name == "skill"]
     _check("antigravity.skill_path",
-           skill_paths == [".antigravity/skills/sliderule-api/SKILL.md"],
+           skill_paths == [".antigravity/skills/skill-alpha/SKILL.md"],
            f"skill tool call extracts skill path: {skill_paths}", failures, verbose)
     stream_errors = [e for e in out.events if e.kind == EventKind.ERROR]
     _check("antigravity.stream.error_event", len(stream_errors) == 1 and stream_errors[0].is_error,
@@ -1981,9 +2060,9 @@ def run_selftest(verbose: bool = False) -> int:
 
     # error: skill_triggered for unprovisioned skill
     bad_spec = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml",
-                        skills=["sliderule-api"],
-                        assertions=[{"type": "skill_triggered", "skill": "sliderule-params"}])
-    vr = validate_spec(bad_spec, available_skills={"sliderule-api", "sliderule-params"})
+                        skills=["skill-alpha"],
+                        assertions=[{"type": "skill_triggered", "skill": "skill-beta"}])
+    vr = validate_spec(bad_spec, available_skills={"skill-alpha", "skill-beta"})
     _check("validate.skill_not_provisioned", not vr.ok and "isolated out" in vr.errors[0],
            f"error for unprovisioned skill_triggered: {vr.errors}", failures, verbose)
 
@@ -2033,8 +2112,8 @@ def run_selftest(verbose: bool = False) -> int:
 
     # warning: skill_not_triggered for provisioned skill
     warn_spec4 = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml",
-                          skills=["sliderule-api"],
-                          assertions=[{"type": "skill_not_triggered", "skill": "sliderule-api"}])
+                          skills=["skill-alpha"],
+                          assertions=[{"type": "skill_not_triggered", "skill": "skill-alpha"}])
     vr8 = validate_spec(warn_spec4)
     _check("validate.not_triggered_provisioned",
            vr8.ok and any("provisioned" in w for w in vr8.warnings),
@@ -2042,8 +2121,8 @@ def run_selftest(verbose: bool = False) -> int:
 
     # warning: skill_not_triggered for unprovisioned skill (tautology)
     warn_spec5 = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml",
-                          skills=["sliderule-api"],
-                          assertions=[{"type": "skill_not_triggered", "skill": "sliderule-params"}])
+                          skills=["skill-alpha"],
+                          assertions=[{"type": "skill_not_triggered", "skill": "skill-beta"}])
     vr10 = validate_spec(warn_spec5)
     _check("validate.not_triggered_unprovisioned",
            vr10.ok and any("trivially" in w for w in vr10.warnings),
@@ -2098,7 +2177,7 @@ def run_selftest(verbose: bool = False) -> int:
 
     # warning: duplicate skills
     dup_skills = EvalSpec(name="t", prompt="p", source_path="/x/e.yaml",
-                          skills=["sliderule-api", "sliderule-api"])
+                          skills=["skill-alpha", "skill-alpha"])
     vr_ds = validate_spec(dup_skills)
     _check("validate.duplicate_skills",
            vr_ds.ok and any("duplicate skill" in w for w in vr_ds.warnings),
@@ -2167,8 +2246,8 @@ def run_selftest(verbose: bool = False) -> int:
 
     # clean spec passes with no errors or warnings
     clean_spec = EvalSpec(name="t", prompt="Use {skill} to run", source_path="/x/e.yaml",
-                          skills=["sliderule-api"],
-                          assertions=[{"type": "skill_triggered", "skill": "sliderule-api"},
+                          skills=["skill-alpha"],
+                          assertions=[{"type": "skill_triggered", "skill": "skill-alpha"},
                                       {"type": "no_error"}],
                           rubric=["does something"])
     vr9 = validate_spec(clean_spec, judge_enabled=True)

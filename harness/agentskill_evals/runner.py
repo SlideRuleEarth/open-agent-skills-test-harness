@@ -35,7 +35,7 @@ from .isolation import build_isolated_home
 from .judge import Judge
 from .progress import Progress
 from .schema import EventKind, RunResult
-from .spec import EvalSpec, ModelTarget, skill_names
+from .spec import EvalSpec, ModelTarget, repo_root_for, skill_names
 from .workspace_view import (
     REPORT_MAX_INLINE_BYTES,
     file_tree,
@@ -148,6 +148,8 @@ class Runner:
         self.isolated = isolated
         self.progress = progress
         self._repo_skill_names = set(skill_names(skills_root))
+        # for masking stale global symlinks (retired names) that still point into this checkout
+        self._repo_root = repo_root_for(skills_root)
         self.run_dir = os.path.join(artifacts_root, run_id)
 
     @property
@@ -304,6 +306,7 @@ class Runner:
                     iso_home, adapter.global_skills_subpaths, self._repo_skill_names,
                     seed_dirs, os.path.expanduser("~"),
                     plugin_registry_subpaths=getattr(adapter, "global_plugin_registry_subpaths", []),
+                    repo_root=self._repo_root,
                 )
                 cfg_root = None
                 for var, skills_sub in getattr(adapter, "isolation_config_homes", []):
@@ -313,7 +316,7 @@ class Runner:
                             cfg_root = tempfile.mkdtemp(prefix="cfg-", dir=iso_home)
                         mirror = os.path.join(cfg_root, _safe(var))
                         build_isolated_home(mirror, [skills_sub], self._repo_skill_names,
-                                            seed_dirs, custom)
+                                            seed_dirs, custom, repo_root=self._repo_root)
                         iso_env[var] = mirror
                 home_isolated = True
             except OSError as exc:

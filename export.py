@@ -7,7 +7,7 @@ its own archive preserving the directory structure.
 Usage:
     python export.py                  # writes to exports/
     python export.py -o dist/skills   # writes to dist/skills/
-    python export.py sliderule-api    # export only one skill
+    python export.py sliderule-pipeline    # export only one skill
 """
 
 import argparse
@@ -17,14 +17,17 @@ import zipfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
+SKILLS_SUBDIR = "skills_examples"
 SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules"}
 
 
 def discover_skills(repo: Path) -> list[Path]:
+    root = repo / SKILLS_SUBDIR
     skills = []
-    for entry in sorted(repo.iterdir()):
-        if entry.is_dir() and (entry / "SKILL.md").exists():
-            skills.append(entry)
+    if root.is_dir():
+        for entry in sorted(root.iterdir()):
+            if entry.is_dir() and (entry / "SKILL.md").exists():
+                skills.append(entry)
     return skills
 
 

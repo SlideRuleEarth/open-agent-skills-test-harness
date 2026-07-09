@@ -2,9 +2,9 @@
 
 ## What this repo is
 
-A collection of open-standard **Agent Skills** for querying NASA ICESat-2 and GEDI data via SlideRule Earth. Each top-level directory containing a `SKILL.md` is a self-contained skill consumed by Claude Code, Codex, AntiGravity (`agy`), and other agent runtimes. The `harness/` directory is an evaluation framework for testing skills across models — it is not part of the skills themselves.
+This repository is a cross-agent **test harness for evaluating Agent Skills** across models and runtimes — the `harness/` directory (CLI: `agentskill-evals`) is the durable purpose of the repo. It also ships a small set of **example skills** (each a directory under `skills_examples/` containing a `SKILL.md`, consumed by Claude Code, Codex, AntiGravity (`agy`), and other agent runtimes) used to exercise and demonstrate the harness. The example skills currently target SlideRule Earth (NASA ICESat-2/GEDI) — they are illustrative, not the reason the repo exists.
 
-## Skills
+## Example skills
 
 Each skill directory contains:
 - `SKILL.md` — the skill manifest (YAML front matter + prose instructions read by the agent)
@@ -12,9 +12,9 @@ Each skill directory contains:
 - `scripts/` — optional Python helpers invoked at runtime by the skill
 - `requirements.txt` — dependencies for the scripts (if present)
 
-Current skills: `sliderule-api`, `sliderule-docsearch`, `sliderule-examples`, `sliderule-openapi`, `sliderule-params`, `sliderule-pipeline`, `sliderule-region-picker`, `nsidc-reference`.
+Current example skills (under `skills_examples/`): `sliderule-pipeline`, `sliderule-region-picker`. These are **examples** — the repo's purpose is the harness, not this particular skill set.
 
-Skills are discovered as any top-level directory containing a `SKILL.md`. The `Makefile` auto-discovers them via `$(wildcard */SKILL.md)`.
+Example skills live in `skills_examples/<name>/` (each with a `SKILL.md`). The `Makefile` auto-discovers them via `$(wildcard skills_examples/*/SKILL.md)`, and the harness treats `skills_examples/` as its skills root — a `--skills-root` pointed at the repo root (`.` or `..`) auto-descends into `skills_examples/`.
 
 ## Skill install / symlink management
 
@@ -32,7 +32,7 @@ Adding a new surface (agent runtime): add its skills directory to `PROJECT_SKILL
 
 ```bash
 make export                   # build all skills as zips into exports/
-make export-sliderule-api     # build a single skill
+make export-sliderule-pipeline  # build a single skill
 python export.py -h           # full options
 make clean                    # remove exports/
 ```
@@ -64,16 +64,16 @@ agentskill-evals list-agents-configured-models --skills-root .
 agentskill-evals list-evals  --skills-root .
 
 # run one skill's evals on one agent (cheapest model)
-agentskill-evals run --agent claude --skill sliderule-docsearch
+agentskill-evals run --agent claude --skill sliderule-pipeline
 
 # run a single eval file, skip LLM judge
-agentskill-evals run --agent claude --evals sliderule-api/evals/01-request-envelope-construction.yaml --no-judge
+agentskill-evals run --agent claude --evals skills_examples/sliderule-pipeline/evals/01-single-script-consolidation.yaml --no-judge
 
 # preview scope and cost without spending anything
-agentskill-evals run --agent copilot --skill sliderule-params --all-models --dry-run
+agentskill-evals run --agent copilot --skill sliderule-region-picker --all-models --dry-run
 
 # run a combination scenario
-agentskill-evals run --config scenarios/example_api+params_on_claude-haiku.yaml
+agentskill-evals run --config scenarios/example_full_schema.yaml
 ```
 
 Run artifacts land in `artifacts/<run_id>/`.
@@ -93,10 +93,6 @@ Run artifacts land in `artifacts/<run_id>/`.
 ## Scenario conventions
 
 Scenarios test *combinations* of skills and live in `scenarios/`. They are **not** auto-discovered; run by explicit path. File naming: `<what>_on_<runner>-<model>.yaml`. A scenario is an eval spec with an added `target: {runner, model}` block.
-
-## Skill inter-dependencies (cross-skill boundary pattern)
-
-Skills have defined boundaries. Each skill's `SKILL.md` declares which other skills it defers to for certain concerns — e.g. `sliderule-api` always defers to `sliderule-params` for request planning and to `sliderule-openapi` for schema lookups. Eval files named `*cross-skill-boundary*.yaml` verify this routing. Preserve these boundaries when editing skill prose.
 
 ## Test coverage axis: models, not surfaces
 

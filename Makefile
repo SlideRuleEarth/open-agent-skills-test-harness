@@ -1,10 +1,11 @@
-# Makefile for SlideRule skills — build zip archives for import into claude.ai
+# Makefile for the example skills — build zip archives for import into claude.ai
 
 PYTHON     ?= python3
 OUTPUT_DIR ?= exports
 
-# Skill directories (any top-level dir containing a SKILL.md)
-SKILLS         := $(patsubst %/SKILL.md,%,$(wildcard */SKILL.md))
+# Skill directories (each example skill lives under skills_examples/<name>/SKILL.md)
+SKILLS_DIR     := skills_examples
+SKILLS         := $(patsubst $(SKILLS_DIR)/%/SKILL.md,%,$(wildcard $(SKILLS_DIR)/*/SKILL.md))
 EXPORT_TARGETS := $(addprefix export-,$(SKILLS))
 
 # --- Skill symlink layout (one source of truth: this repo) -----------------
@@ -39,7 +40,7 @@ help: ## That's me!
 	@printf "\033[37m%-30s\033[0m %s\n" "#----target--------------------description------------------------------------------------"
 	@grep -E '^[a-zA-Z_-].+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
 	@echo
-	@echo "Per-skill export: make export-<skill>   (e.g. make export-sliderule-api)"
+	@echo "Per-skill export: make export-<skill>   (e.g. make export-sliderule-pipeline)"
 	@echo
 	@echo SKILLS: $(SKILLS)
 	@echo OUTPUT_DIR: $(OUTPUT_DIR)
@@ -49,7 +50,7 @@ help: ## That's me!
 export: ## Export all skills as zips into $(OUTPUT_DIR)/
 	$(PYTHON) export.py -o $(OUTPUT_DIR)
 
-# Per-skill export: make export-<skill> (e.g. make export-sliderule-api)
+# Per-skill export: make export-<skill> (e.g. make export-sliderule-pipeline)
 $(EXPORT_TARGETS): export-%:
 	$(PYTHON) export.py -o $(OUTPUT_DIR) $*
 
@@ -63,7 +64,7 @@ link-project: ## Create committed, relative skill symlinks (.claude/.agents/.ant
 	@for d in $(PROJECT_SKILL_DIRS); do \
 		mkdir -p "$$d"; \
 		for s in $(SKILLS); do \
-			ln -sfn "../../$$s" "$$d/$$s" && echo "  $$d/$$s -> ../../$$s"; \
+			ln -sfn "../../$(SKILLS_DIR)/$$s" "$$d/$$s" && echo "  $$d/$$s -> ../../$(SKILLS_DIR)/$$s"; \
 		done; \
 	done
 
@@ -71,7 +72,7 @@ link-global: ## Symlink skills into your per-user agent dirs (~/.claude, ~/.agen
 	@for d in $(GLOBAL_SKILL_DIRS); do \
 		mkdir -p "$$d"; \
 		for s in $(SKILLS); do \
-			ln -sfn "$(CURDIR)/$$s" "$$d/$$s" && echo "  $$d/$$s -> $(CURDIR)/$$s"; \
+			ln -sfn "$(CURDIR)/$(SKILLS_DIR)/$$s" "$$d/$$s" && echo "  $$d/$$s -> $(CURDIR)/$(SKILLS_DIR)/$$s"; \
 		done; \
 	done
 
@@ -81,10 +82,20 @@ unlink-project: ## Remove the project-level skill symlinks
 		echo "  cleared $$d/"; \
 	done
 
-unlink-global: ## Remove the per-user skill symlinks created by link-global
-	@for d in $(GLOBAL_SKILL_DIRS); do \
-		for s in $(SKILLS); do rm -f "$$d/$$s"; done; \
-		echo "  cleared $$d/"; \
-	done
+# Removes by symlink TARGET, not by the current $(SKILLS) list, so it also cleans
+# stale links left by renamed/removed skills — plus broken links (their checkout
+# moved or was deleted). Symlinks resolving anywhere else are untouched.
+unlink-global: ## Remove per-user skill symlinks pointing into this checkout (incl. stale/broken)
+	@$(PYTHON) -c 'import os, sys; \
+repo = os.path.realpath(os.getcwd()); \
+dirs = [d for d in sys.argv[1:] if os.path.isdir(d)]; \
+links = [os.path.join(d, n) for d in dirs for n in sorted(os.listdir(d)) \
+         if os.path.islink(os.path.join(d, n))]; \
+stale = [p for p in links if not os.path.exists(os.path.realpath(p)) \
+         or os.path.realpath(p) == repo \
+         or os.path.realpath(p).startswith(repo + os.sep)]; \
+[print(f"  removed {p} -> {os.readlink(p)}") or os.remove(p) for p in stale]; \
+print(f"  removed {len(stale)} link(s) into this checkout (or broken) " \
+      f"across {len(dirs)} dir(s)")' $(GLOBAL_SKILL_DIRS)
 
 relink-project: unlink-project link-project ## Rebuild project symlinks (e.g. after adding a skill)

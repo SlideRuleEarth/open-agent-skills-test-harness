@@ -54,6 +54,22 @@ _SKILLS_LEAF = object()
 _PLUGINS_LEAF = object()
 
 
+def _is_stale_repo_link(path: str, repo_root: Optional[str]) -> bool:
+    """True for a skills-dir entry left behind by an install of this repo that the name-based
+    mask can't catch: a symlink into ``repo_root`` under a name no longer in the skill superset
+    (the skill was renamed/removed), or a broken symlink (its checkout moved or was deleted).
+    Regular files/dirs and symlinks resolving elsewhere are vendor skills — never touched."""
+    if not os.path.islink(path):
+        return False
+    target = os.path.realpath(path)
+    if not os.path.exists(target):
+        return True
+    if repo_root:
+        root = os.path.realpath(repo_root)
+        return target == root or target.startswith(root + os.sep)
+    return False
+
+
 def build_isolated_home(
     dest_home: str,
     skills_subpaths: Iterable[str],
@@ -61,6 +77,7 @@ def build_isolated_home(
     declared_skill_dirs: Iterable[str],
     real_home: Optional[str] = None,
     plugin_registry_subpaths: Iterable[str] = (),
+    repo_root: Optional[str] = None,
 ) -> str:
     """Build a symlink overlay of ``real_home`` at ``dest_home`` with masked skills dirs.
 
@@ -75,6 +92,10 @@ def build_isolated_home(
         ``.gemini/config/plugins``) whose entries are plugin packages, each optionally
         holding a nested ``skills/`` — mask-only, unlike skills_subpaths (see module
         docstring).
+      repo_root: this repo's checkout root. Skills-dir symlinks resolving under it are
+        masked even when their name is no longer in ``repo_skill_names`` — stale installs
+        of renamed/removed skills (broken symlinks are masked too). None disables the
+        target-based check; the name-based mask still applies.
 
     Raises OSError if a symlink can't be created (e.g. Windows without privilege); the caller
     should fall back to a non-isolated run.
@@ -89,7 +110,7 @@ def build_isolated_home(
     _insert_leaf(tree, plugin_registry_subpaths, _PLUGINS_LEAF)
 
     os.makedirs(dest_home, exist_ok=True)
-    _overlay(real_home, dest_home, tree, repo_skills, declared)
+    _overlay(real_home, dest_home, tree, repo_skills, declared, repo_root)
     return dest_home
 
 
@@ -107,7 +128,7 @@ def _insert_leaf(tree: dict, subpaths: Iterable[str], leaf: object) -> None:
 
 
 def _overlay(real_dir: str, dst_dir: str, tree: dict,
-             repo_skills: set, declared: list) -> None:
+             repo_skills: set, declared: list, repo_root: Optional[str]) -> None:
     os.makedirs(dst_dir, exist_ok=True)
     special = set(tree)
     # 1) wholesale-symlink every real entry that isn't a special (skills/ancestor) path.
@@ -121,11 +142,11 @@ def _overlay(real_dir: str, dst_dir: str, tree: dict,
         real_child = os.path.join(real_dir, name)
         dst_child = os.path.join(dst_dir, name)
         if node is _SKILLS_LEAF:
-            _build_skills_dir(real_child, dst_child, repo_skills, declared)
+            _build_skills_dir(real_child, dst_child, repo_skills, declared, repo_root)
         elif node is _PLUGINS_LEAF:
-            _mask_plugin_registry_dir(real_child, dst_child, repo_skills)
+            _mask_plugin_registry_dir(real_child, dst_child, repo_skills, repo_root)
         else:
-            _overlay(real_child, dst_child, node, repo_skills, declared)
+            _overlay(real_child, dst_child, node, repo_skills, declared, repo_root)
 
 
 def resolve_visible_skills(
@@ -134,6 +155,7 @@ def resolve_visible_skills(
     repo_skill_names: Iterable[str],
     isolated: bool,
     real_home: Optional[str] = None,
+    repo_root: Optional[str] = None,
 ) -> dict:
     """What skills the model would see, computed from the filesystem (no agent run).
 
@@ -142,6 +164,8 @@ def resolve_visible_skills(
       provisioned   — the declared skills (always visible, from the workspace);
       vendor        — non-repo entries in the global dirs (kept even under isolation);
       masked        — repo skills present globally but not declared (hidden when isolated);
+                      includes stale installs — symlinks into `repo_root` under retired
+                      names, and broken symlinks;
       also_visible  — same set, shown when NOT isolated (they leak in).
     Skills bundled inside a CLI package live outside these dirs and aren't listed; skills
     nested in a plugin registry (``global_plugin_registry_subpaths``) are.
@@ -152,9 +176,9 @@ def resolve_visible_skills(
     vendor: set = set()
     leaked_repo: set = set()   # repo skills found globally but not declared
 
-    def _classify(names: Iterable[str]) -> None:
+    def _classify(parent_dir: str, names: Iterable[str]) -> None:
         for name in names:
-            if name in repo:
+            if name in repo or _is_stale_repo_link(os.path.join(parent_dir, name), repo_root):
                 if name not in declared:
                     leaked_repo.add(name)
             else:
@@ -169,7 +193,7 @@ def resolve_visible_skills(
             scan_dirs.append(os.path.join(custom, skills_sub))
     for d in scan_dirs:
         if os.path.isdir(d):
-            _classify(os.listdir(d))
+            _classify(d, os.listdir(d))
 
     # plugin registries nest skills one level deeper, under each plugin's own skills/.
     for sub in getattr(adapter, "global_plugin_registry_subpaths", []) or []:
@@ -179,7 +203,7 @@ def resolve_visible_skills(
         for plugin_name in os.listdir(registry):
             plugin_skills = os.path.join(registry, plugin_name, "skills")
             if os.path.isdir(plugin_skills):
-                _classify(os.listdir(plugin_skills))
+                _classify(plugin_skills, os.listdir(plugin_skills))
 
     return {
         "provisioned": sorted(declared),
@@ -190,15 +214,17 @@ def resolve_visible_skills(
 
 
 def _build_skills_dir(real_skills: str, dst_skills: str,
-                      repo_skills: set, declared: list) -> None:
-    """Rebuild one skills dir: vendor/other entries passed through, repo skills dropped,
-    declared skills added."""
+                      repo_skills: set, declared: list, repo_root: Optional[str]) -> None:
+    """Rebuild one skills dir: vendor/other entries passed through, repo skills dropped
+    (by name, or by symlink target for stale installs), declared skills added."""
     os.makedirs(dst_skills, exist_ok=True)
     placed: set = set()
     if os.path.isdir(real_skills):
         for name in os.listdir(real_skills):
             if name in repo_skills:
                 continue  # drop this repo's skills; declared ones are re-added below
+            if _is_stale_repo_link(os.path.join(real_skills, name), repo_root):
+                continue  # stale install of a renamed/removed repo skill
             os.symlink(os.path.join(real_skills, name), os.path.join(dst_skills, name))
             placed.add(name)
     for src in declared:
@@ -211,7 +237,8 @@ def _build_skills_dir(real_skills: str, dst_skills: str,
         placed.add(name)
 
 
-def _mask_plugin_registry_dir(real_dir: str, dst_dir: str, repo_skills: set) -> None:
+def _mask_plugin_registry_dir(real_dir: str, dst_dir: str, repo_skills: set,
+                              repo_root: Optional[str]) -> None:
     """Rebuild one plugin-registry dir: each child is a whole plugin package, passed through
     untouched (plugin.json, metadata, …) except its nested ``skills/``, where this repo's own
     skills are dropped. Mask-only — declared skills aren't re-added here; they're already
@@ -235,4 +262,5 @@ def _mask_plugin_registry_dir(real_dir: str, dst_dir: str, repo_skills: set) -> 
         if os.path.isdir(real_skills):
             # mask-only: an empty `declared` makes _build_skills_dir's re-add step a no-op,
             # leaving just its drop-repo-skills/symlink-the-rest behavior.
-            _build_skills_dir(real_skills, os.path.join(dst_plugin, "skills"), repo_skills, [])
+            _build_skills_dir(real_skills, os.path.join(dst_plugin, "skills"), repo_skills,
+                              [], repo_root)
