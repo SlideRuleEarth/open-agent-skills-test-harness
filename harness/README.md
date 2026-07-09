@@ -98,7 +98,7 @@ python3 -m agentskill_evals run --skills-root .. --config ../scenarios/<file>.ya
 Evals are **per-skill**: each skill directory owns an `evals/` folder.
 
 ```
-skills_under_test/
+skills_examples/
   sliderule-pipeline/
     SKILL.md
     evals/
@@ -192,8 +192,8 @@ deterministic assertions only.
 Examples use the installed `agentskill-evals` CLI (see [Install](#install)). From a
 source checkout without installing, run them as `python3 -m agentskill_evals …` from
 inside `harness/`, adding `--skills-root ..` so the harness finds the example skills
-under `skills_under_test/` and the repo-root `models.yaml` (a skills-root pointed at the
-repo root auto-descends into `skills_under_test/`; the default skills-root is the current
+under `skills_examples/` and the repo-root `models.yaml` (a skills-root pointed at the
+repo root auto-descends into `skills_examples/`; the default skills-root is the current
 directory).
 
 ```bash
@@ -250,6 +250,40 @@ artifacts/<run_id>/
 run was aborted at the confirmation prompt); `2` — usage/config error (bad flags, malformed
 spec or scenario, duplicate eval names, missing seed files); `3` — nothing was graded
 (rubric-only evals with the judge off), which is "no verdict", not a failure.
+
+## Bring your own skills (external skills root)
+
+The skills in this repo are **examples** — the harness itself is skill-agnostic and
+runs against any directory of skills, including ones that live outside this repo and
+are never committed here. Each run **copies** the declared skills into an isolated,
+hermetic workspace (see [Skill isolation](#skill-isolation)), so a skill needs no
+commit, no `.claude`/`.agents`/`.antigravity` symlink, and no presence in this tree —
+just a `<name>/SKILL.md` on disk.
+
+Point `--skills-root` at the directory that **directly contains** your skill folders:
+
+```bash
+# your own skills living anywhere on disk
+~/my-skills/
+  my-skill/
+    SKILL.md
+    evals/
+      01-first.yaml
+
+# install the harness once (standalone, via pipx — see Install), then:
+agentskill-evals list-evals --skills-root ~/my-skills
+agentskill-evals run --skills-root ~/my-skills --skill my-skill \
+    --agent claude --models-config /path/to/open-agent-skills-test-harness/models.yaml
+```
+
+> **`models.yaml` caveat.** `models.yaml` is this repo's registry of model IDs and is
+> **not** bundled with the installed CLI; the default lookup only checks the skills-root
+> and its immediate parent, so an external root far from this repo won't find it. Runs
+> still work without it — each runner falls back to its **own built-in default model**
+> (shown as `[default]` in the plan). To pin specific model IDs, use the per-runner cheap
+> default, or run `--all-models`, either pass `--models-config /path/to/this-repo/models.yaml`
+> (as above) or a concrete `--model <id>`. A local checkout of this repo is the easiest way
+> to keep a `models.yaml` handy.
 
 ## Skill isolation
 

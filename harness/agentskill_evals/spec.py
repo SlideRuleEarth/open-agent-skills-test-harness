@@ -32,7 +32,7 @@ The improved, forward-looking eval format (YAML preferred, JSON also accepted):
     output_schema: null
 
 Discovery is per-skill: each skill directory owns an `evals/` folder, e.g.
-`skills_under_test/sliderule-pipeline/evals/*.yaml`. The skill name is inferred
+`skills_examples/sliderule-pipeline/evals/*.yaml`. The skill name is inferred
 from the directory that contains `evals/`.
 
 Legacy keys are accepted as aliases (`query`->`prompt`,

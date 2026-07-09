@@ -17,7 +17,7 @@ import zipfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
-SKILLS_SUBDIR = "skills_under_test"
+SKILLS_SUBDIR = "skills_examples"
 SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules"}
 
 

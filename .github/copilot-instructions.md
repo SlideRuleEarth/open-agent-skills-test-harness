@@ -2,7 +2,7 @@
 
 ## What this repo is
 
-This repository is a cross-agent **test harness for evaluating Agent Skills** across models and runtimes — the `harness/` directory (CLI: `agentskill-evals`) is the durable purpose of the repo. It also ships a small set of **example skills** (each a directory under `skills_under_test/` containing a `SKILL.md`, consumed by Claude Code, Codex, AntiGravity (`agy`), and other agent runtimes) used to exercise and demonstrate the harness. The example skills currently target SlideRule Earth (NASA ICESat-2/GEDI) and are slated to be replaced with neutral examples — they are illustrative, not the reason the repo exists.
+This repository is a cross-agent **test harness for evaluating Agent Skills** across models and runtimes — the `harness/` directory (CLI: `agentskill-evals`) is the durable purpose of the repo. It also ships a small set of **example skills** (each a directory under `skills_examples/` containing a `SKILL.md`, consumed by Claude Code, Codex, AntiGravity (`agy`), and other agent runtimes) used to exercise and demonstrate the harness. The example skills currently target SlideRule Earth (NASA ICESat-2/GEDI) and are slated to be replaced with neutral examples — they are illustrative, not the reason the repo exists.
 
 ## Example skills
 
@@ -12,9 +12,9 @@ Each skill directory contains:
 - `scripts/` — optional Python helpers invoked at runtime by the skill
 - `requirements.txt` — dependencies for the scripts (if present)
 
-Current example skills (under `skills_under_test/`): `sliderule-pipeline`, `sliderule-region-picker`. These are **examples** — the repo's purpose is the harness, not this particular skill set.
+Current example skills (under `skills_examples/`): `sliderule-pipeline`, `sliderule-region-picker`. These are **examples** — the repo's purpose is the harness, not this particular skill set.
 
-Example skills live in `skills_under_test/<name>/` (each with a `SKILL.md`). The `Makefile` auto-discovers them via `$(wildcard skills_under_test/*/SKILL.md)`, and the harness treats `skills_under_test/` as its skills root — a `--skills-root` pointed at the repo root (`.` or `..`) auto-descends into `skills_under_test/`.
+Example skills live in `skills_examples/<name>/` (each with a `SKILL.md`). The `Makefile` auto-discovers them via `$(wildcard skills_examples/*/SKILL.md)`, and the harness treats `skills_examples/` as its skills root — a `--skills-root` pointed at the repo root (`.` or `..`) auto-descends into `skills_examples/`.
 
 ## Skill install / symlink management
 
@@ -67,7 +67,7 @@ agentskill-evals list-evals  --skills-root .
 agentskill-evals run --agent claude --skill sliderule-pipeline
 
 # run a single eval file, skip LLM judge
-agentskill-evals run --agent claude --evals skills_under_test/sliderule-pipeline/evals/01-single-script-consolidation.yaml --no-judge
+agentskill-evals run --agent claude --evals skills_examples/sliderule-pipeline/evals/01-single-script-consolidation.yaml --no-judge
 
 # preview scope and cost without spending anything
 agentskill-evals run --agent copilot --skill sliderule-region-picker --all-models --dry-run

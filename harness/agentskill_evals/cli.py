@@ -35,7 +35,7 @@ DEFAULT_MAX_CELLS = 25
 DEFAULT_JOBS = 1
 
 
-SKILLS_SUBDIR = "skills_under_test"
+SKILLS_SUBDIR = "skills_examples"
 
 
 def _default_skills_root() -> str:
@@ -57,9 +57,9 @@ def _resolve_skills_root(raw: str | None) -> str:
     """Resolve the effective skills root (skills are its immediate subdirs).
 
     If `raw` itself holds the skill folders it's used as-is; otherwise, when it
-    has a `skills_under_test/` subdir that does, we descend into it. This keeps
+    has a `skills_examples/` subdir that does, we descend into it. This keeps
     the documented `--skills-root .` / `--skills-root ..` invocations working now
-    that the example skills live under `skills_under_test/`.
+    that the example skills live under `skills_examples/`.
     """
     base = os.path.abspath(raw or _default_skills_root())
     if _has_skill_dirs(base):
@@ -74,7 +74,7 @@ def _default_config_path(skills_root: str) -> str:
     """Locate models.yaml — the repo-root single source of truth.
 
     Prefer `<skills_root>/models.yaml`, but when skills live under
-    `skills_under_test/` the config still sits at the repo root (the parent), so
+    `skills_examples/` the config still sits at the repo root (the parent), so
     fall back there.
     """
     here = os.path.join(skills_root, "models.yaml")
@@ -871,7 +871,7 @@ def build_parser() -> argparse.ArgumentParser:
     def add_discovery(sp):
         sp.add_argument("--skills-root", default=_default_skills_root(),
                         help="dir containing skill folders (each with an evals/); "
-                             "auto-descends into skills_under_test/ if present. Default: cwd")
+                             "auto-descends into skills_examples/ if present. Default: cwd")
         sp.add_argument("--skill", help="only this skill's evals/")
         sp.add_argument("--evals", nargs="*", help="explicit eval files or directories")
 
@@ -947,7 +947,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="audit skill visibility (superset + per-runner masked/kept + drift)")
     sp.add_argument("--skills-root", default=_default_skills_root(),
                     help="dir containing skill folders; auto-descends into "
-                         "skills_under_test/ if present (default: cwd)")
+                         "skills_examples/ if present (default: cwd)")
     sp.set_defaults(func=cmd_list_skills)
 
     sp = sub.add_parser("selftest", help="test the adapter parsers against bundled fixtures")

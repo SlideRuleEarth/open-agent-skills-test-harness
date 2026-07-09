@@ -3,8 +3,8 @@
 PYTHON     ?= python3
 OUTPUT_DIR ?= exports
 
-# Skill directories (each example skill lives under skills_under_test/<name>/SKILL.md)
-SKILLS_DIR     := skills_under_test
+# Skill directories (each example skill lives under skills_examples/<name>/SKILL.md)
+SKILLS_DIR     := skills_examples
 SKILLS         := $(patsubst $(SKILLS_DIR)/%/SKILL.md,%,$(wildcard $(SKILLS_DIR)/*/SKILL.md))
 EXPORT_TARGETS := $(addprefix export-,$(SKILLS))
 
