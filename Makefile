@@ -32,6 +32,7 @@ GLOBAL_SKILL_DIRS := \
 .PHONY: help export list clean \
 	link-project link-global unlink-project unlink-global relink-project \
 	agents agents-probe run-scenario dry-run-scenario \
+	release release-dry-run \
 	$(EXPORT_TARGETS)
 
 # --- Harness shortcuts ------------------------------------------------------
@@ -143,3 +144,49 @@ dry-run-scenario: ## Preview a scenario's scope/cost + skill visibility (no API 
 	$(require_cli)
 	$(require_scenario)
 	$(AGENTSKILL_EVALS) run --config "$(SCENARIO)" --dry-run $(ARGS)
+
+# --- Releases ----------------------------------------------------------------
+# Tags version the HARNESS (see issue #75): v$(VERSION) must equal the version
+# in harness/pyproject.toml. main is protected, so the version bump itself lands
+# via a normal PR first; these targets only publish what is already on main.
+PYPROJECT_VERSION = $(shell sed -n 's/^version *= *"\(.*\)"/\1/p' harness/pyproject.toml)
+
+define release_checks
+	@if [ -z "$(VERSION)" ]; then \
+		echo "error: VERSION is not set.  usage:  make $@ VERSION=X.Y.Z"; \
+		echo "  harness/pyproject.toml currently says: $(PYPROJECT_VERSION)"; \
+		exit 1; \
+	fi
+	@[ "$$(git rev-parse --abbrev-ref HEAD)" = "main" ] || { \
+		echo "error: releases are cut from main (currently on '$$(git rev-parse --abbrev-ref HEAD)')."; exit 1; }
+	@[ -z "$$(git status --porcelain)" ] || { \
+		echo "error: working tree is not clean:"; git status --short; exit 1; }
+	@git fetch -q origin main
+	@[ "$$(git rev-parse HEAD)" = "$$(git rev-parse origin/main)" ] || { \
+		echo "error: local main is not in sync with origin/main — pull/push first."; exit 1; }
+	@[ "$(PYPROJECT_VERSION)" = "$(VERSION)" ] || { \
+		echo "error: harness/pyproject.toml says '$(PYPROJECT_VERSION)', not '$(VERSION)'."; \
+		echo "  bump it via a normal PR first — tags version the harness (issue #75)."; exit 1; }
+	@! git rev-parse -q --verify "refs/tags/v$(VERSION)" >/dev/null || { \
+		echo "error: tag v$(VERSION) already exists locally."; exit 1; }
+	@[ -z "$$(git ls-remote --tags origin "v$(VERSION)")" ] || { \
+		echo "error: tag v$(VERSION) already exists on origin."; exit 1; }
+	@echo "release gate: harness selftest..."
+	@cd harness && $(PYTHON) -m agentskill_evals selftest >/dev/null || { \
+		echo "error: harness selftest FAILED — not releasing."; exit 1; }
+	@echo "release gate: selftest passed."
+	@$(MAKE) --no-print-directory export
+	@echo "zips to attach:"; ls -1 $(OUTPUT_DIR)/*.zip | sed 's/^/  /'
+endef
+
+release: ## Tag v$(VERSION) on main and publish a GitHub Release with the skill zips
+	$(release_checks)
+	git tag -a "v$(VERSION)" -m "harness v$(VERSION)"
+	git push origin "v$(VERSION)"
+	gh release create "v$(VERSION)" $(OUTPUT_DIR)/*.zip --generate-notes \
+		--title "harness v$(VERSION)"
+	@echo "released:  https://github.com/SlideRuleEarth/open-agent-skills-test-harness/releases/tag/v$(VERSION)"
+
+release-dry-run: ## Run every release check and show what would be tagged/uploaded (no tag, no publish)
+	$(release_checks)
+	@echo "dry run — would: git tag v$(VERSION); push it; gh release create with the zips above."
