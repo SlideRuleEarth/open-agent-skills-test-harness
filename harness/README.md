@@ -550,3 +550,30 @@ its schema.
 - `--no-auto-approve` disables the per-agent "run without prompts" flags
   (`--dangerously-skip-permissions` for Claude/AntiGravity; `--ask-for-approval never
   --sandbox workspace-write` for Codex).
+
+## Releases & versioning
+
+**Tags version the harness.** A release tag `v<X.Y.Z>` means harness version X.Y.Z and must
+equal `version` in [`pyproject.toml`](pyproject.toml) — patch for bug fixes, minor for
+backward-compatible capability (a new adapter, assertion type, CLI flag), major for breaking
+changes (eval YAML schema, renamed commands, artifact layout). Skill-only changes don't
+trigger releases: the skill zips attached to a release are a snapshot of the tagged commit,
+and each skill's `CHANGELOG.md` stays authoritative for skill history.
+
+Cutting a release (from the repo root; `main` is protected, so the version bump itself lands
+via a normal PR first):
+
+```bash
+# 1) bump `version` in harness/pyproject.toml via a PR, merge it
+# 2) preview every gate (clean main in sync with origin, version match, tag free,
+#    selftest, zip build) without tagging or publishing:
+make release-dry-run VERSION=X.Y.Z
+# 3) tag vX.Y.Z, push it, and publish the GitHub Release with the zips attached:
+make release VERSION=X.Y.Z
+```
+
+A tag is also a pinnable install ref:
+
+```bash
+pipx install "git+https://github.com/SlideRuleEarth/open-agent-skills-test-harness@vX.Y.Z#subdirectory=harness"
+```
