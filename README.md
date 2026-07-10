@@ -86,7 +86,7 @@ Installation and testing are two different concerns:
 - **Installation is per *surface*** (Claude Code, Codex, AntiGravity, CoPilot, other aggregators…) — covered above; every surface gets its own install instructions.
 - **Test coverage is per *model*.** How well a skill works is dominated by the LLM, so the eval harness tests each skill across **models**, not across every surface. The runner's scaffolding does contribute — each CLI differs in how it injects/triggers skills, what tools and subagents it uses, and how it decomposes a prompt — so the same model can behave somewhat differently under different surfaces. By default we accept that variance: each model is tested through one designated runner, and that runner+model pair is the *tested configuration* — re-running an already-covered model through another surface isn't counted as new *model* coverage. But it can still be worth testing: if a particular surface (e.g. CoPilot, or any aggregator) is *your* setup, add it as a runner and evaluate through it directly so results reflect exactly how your surface runs the skills.
 
-The harness, the model matrix (`models.yaml`), the cost guardrails, and how to add/retire models live in **[harness/](harness/README.md)**.
+The harness, the model matrix (`models.yaml`), the cost guardrails, and how to add/retire models live in **[harness/](harness/README.md)**. Step-by-step guides — a simple A/B test, testing skill combinations, and installing the skills for your agent — live in **[HowTos/](HowTos/)**.
 
 ## Non-macOS users
 

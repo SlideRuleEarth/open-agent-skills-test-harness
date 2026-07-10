@@ -1,9 +1,9 @@
 # Test a combination of skills
 
-A per-skill eval ([`<skill>/evals/`](../../scenarios/README.md)) tests one skill in isolation. But
+A per-skill eval ([`<skill>/evals/`](../scenarios/README.md)) tests one skill in isolation. But
 skills are often used *together* — e.g. `sliderule-region-picker` helps define the analysis region
 and `sliderule-pipeline-direct-request` consolidates the work into a single reproducible script. A
-**[scenario](../../scenarios/README.md)** is the tool for testing that: it provisions a
+**[scenario](../scenarios/README.md)** is the tool for testing that: it provisions a
 **combination of skills together** against one target (`runner:model`), from a single
 self-describing file.
 
@@ -15,7 +15,7 @@ discovery. So the run tests that combination working in concert.
 
 ## 1. Write the scenario
 
-Save a file under [`scenarios/`](../../scenarios/), named `<what>_on_<runner>-<model>.yaml`, e.g.
+Save a file under [`scenarios/`](../scenarios/), named `<what>_on_<runner>-<model>.yaml`, e.g.
 `atl06-pipeline_on_claude-haiku.yaml`:
 
 ```yaml
@@ -92,5 +92,5 @@ Artifacts land under `artifacts/<run_id>/<runner>/<model>/scenario/<name>/`:
 - **Scenarios are ad-hoc.** They aren't auto-discovered like per-skill evals — you always run one by
   path with `--config`.
 
-See [scenarios/README.md](../../scenarios/README.md) for the scenario format, [FAQ.md](../FAQ.md) for
-how skill visibility / isolation works, and [README.md](../README.md) for the full harness reference.
+See [scenarios/README.md](../scenarios/README.md) for the scenario format, [FAQ.md](../harness/FAQ.md) for
+how skill visibility / isolation works, and [README.md](../harness/README.md) for the full harness reference.
