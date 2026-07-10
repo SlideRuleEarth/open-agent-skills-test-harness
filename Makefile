@@ -31,7 +31,33 @@ GLOBAL_SKILL_DIRS := \
 
 .PHONY: help export list clean \
 	link-project link-global unlink-project unlink-global relink-project \
+	agents agents-probe run-scenario dry-run-scenario \
 	$(EXPORT_TARGETS)
+
+# --- Harness shortcuts ------------------------------------------------------
+# Thin wrappers around the agentskill-evals CLI (install it first: see
+# harness/README.md — `cd harness && make install`). Scenario targets take
+# SCENARIO=<file> and pass ARGS="..." through to the CLI.
+AGENTSKILL_EVALS ?= agentskill-evals
+ARGS ?=
+
+define require_cli
+	@command -v $(AGENTSKILL_EVALS) >/dev/null 2>&1 || { \
+		echo "error: '$(AGENTSKILL_EVALS)' not found on your PATH."; \
+		echo "  install it first:  cd harness && make install   (or make dev)"; \
+		exit 1; \
+	}
+endef
+
+define require_scenario
+	@if [ -z "$(SCENARIO)" ]; then \
+		echo "error: SCENARIO is not set."; \
+		echo "  usage:  make $@ SCENARIO=scenarios/<file>.yaml [ARGS=\"-v --jobs 4\"]"; \
+		echo "  available scenarios:"; \
+		ls scenarios/*.yaml 2>/dev/null | sed 's/^/    /' || echo "    (none found)"; \
+		exit 1; \
+	fi
+endef
 
 help: ## That's me!
 	@printf "\033[37m%-30s\033[0m %s\n" "#-----------------------------------------------------------------------------------------"
@@ -99,3 +125,21 @@ print(f"  removed {len(stale)} link(s) into this checkout (or broken) " \
       f"across {len(dirs)} dir(s)")' $(GLOBAL_SKILL_DIRS)
 
 relink-project: unlink-project link-project ## Rebuild project symlinks (e.g. after adding a skill)
+
+agents: ## Show the runners and their configured models (from models.yaml — free)
+	$(require_cli)
+	$(AGENTSKILL_EVALS) list-agents-configured-models $(ARGS)
+
+agents-probe: ## Probe the installed agent CLIs for available models (has a small cost)
+	$(require_cli)
+	$(AGENTSKILL_EVALS) list-agents-available-models $(ARGS)
+
+run-scenario: ## Run a scenario: make run-scenario SCENARIO=scenarios/<file>.yaml [ARGS="-v"]
+	$(require_cli)
+	$(require_scenario)
+	$(AGENTSKILL_EVALS) run --config "$(SCENARIO)" $(ARGS)
+
+dry-run-scenario: ## Preview a scenario's scope/cost + skill visibility (no API spend)
+	$(require_cli)
+	$(require_scenario)
+	$(AGENTSKILL_EVALS) run --config "$(SCENARIO)" --dry-run $(ARGS)
