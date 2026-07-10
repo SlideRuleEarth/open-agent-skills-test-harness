@@ -6,7 +6,7 @@ is an **installation** step, separate from testing.
 
 > **You do NOT need any of this to run the evals.** The harness provisions each eval's declared
 > skills itself — copied into an isolated, throwaway workspace — so a fresh clone plus the
-> [harness CLI](../README.md#install) and your agent's own CLI is enough to test. Skills you
+> [harness CLI](../harness/README.md#install) and your agent's own CLI is enough to test. Skills you
 > already have installed globally aren't touched (and this repo's, if installed, are masked
 > during runs so they can't contaminate results). The targets below are only for *using* the
 > skills in normal agent sessions.
@@ -14,7 +14,7 @@ is an **installation** step, separate from testing.
 ## How it works
 
 This repo is the **single source of truth**. Each agent runtime scans a *different* skills
-directory, so the [`Makefile`](../../Makefile) points them all at the real skill folders here via
+directory, so the [`Makefile`](../Makefile) points them all at the real skill folders here via
 symlinks. Update the repo → every consumer updates.
 
 | Runtime | Project-level (committed, in-repo) | Global (per-user) |
@@ -79,9 +79,9 @@ installed, remove that first.
 If your agent scans some other directory, teach the Makefile about it once:
 
 1. Add its **project** skills dir (`<platform>/skills`) to `PROJECT_SKILL_DIRS` and its **per-user**
-   dir to `GLOBAL_SKILL_DIRS` in the [`Makefile`](../../Makefile).
+   dir to `GLOBAL_SKILL_DIRS` in the [`Makefile`](../Makefile).
 2. Re-run `make link-project` and/or `make link-global`.
-3. Add a row to the install table in the [root README](../../README.md) so the next person knows the
+3. Add a row to the install table in the [root README](../README.md) so the next person knows the
    path.
 
 The linking is data-driven, so that's all it takes — no per-skill edits.
@@ -91,7 +91,7 @@ The linking is data-driven, so that's all it takes — no per-skill edits.
 The skills are plain text + Python and run anywhere; only the link mechanics differ. Linux is
 identical to macOS. On Windows use directory junctions (`mklink /J`, no admin needed) or PowerShell
 symlinks; under WSL treat it as Linux but install into the WSL `$HOME`. The
-[root README](../../README.md) has the exact Windows/WSL commands.
+[root README](../README.md) has the exact Windows/WSL commands.
 
-See the [root README](../../README.md) for the canonical install reference, [FAQ.md](../FAQ.md) for
-skill visibility during tests, and [README.md](../README.md) for the harness.
+See the [root README](../README.md) for the canonical install reference, [FAQ.md](../harness/FAQ.md) for
+skill visibility during tests, and [README.md](../harness/README.md) for the harness.

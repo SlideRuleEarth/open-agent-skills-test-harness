@@ -4,7 +4,7 @@ This walks through the simplest useful experiment in the harness: take **one pro
 *"does this skill actually help?"* by running the same prompt, on the same model, **once with the
 skill available and once without** — then comparing the two graded results.
 
-You do it with a single [scenario](../../scenarios/README.md) file and two `run` commands. The only
+You do it with a single [scenario](../scenarios/README.md) file and two `run` commands. The only
 thing that changes between the two runs is whether the skill is provisioned.
 
 ## The idea in one line
@@ -22,7 +22,7 @@ skill's contribution.
 
 ## 1. Write the scenario
 
-Save a file under [`scenarios/`](../../scenarios/) — name it `<what>_on_<runner>-<model>.yaml` so
+Save a file under [`scenarios/`](../scenarios/) — name it `<what>_on_<runner>-<model>.yaml` so
 it's self-describing, e.g. `atl06-request_on_claude-haiku.yaml`:
 
 ```yaml
@@ -114,7 +114,7 @@ show what the skill changed.
 - **CLI overrides the file.** Precedence is `CLI flag > scenario file > built-in default`, so you can
   retarget without editing the file, e.g. `--model claude=claude-opus-4-8` to A/B on a stronger model.
 - **Want a multi-skill combination instead?** List several skills under `skills:` — the "with" arm
-  then provisions the whole set together. See [scenarios/README.md](../../scenarios/README.md).
+  then provisions the whole set together. See [scenarios/README.md](../scenarios/README.md).
 
-See [FAQ.md](../FAQ.md) for how skill visibility / isolation works, and
-[README.md](../README.md) for the full harness reference.
+See [FAQ.md](../harness/FAQ.md) for how skill visibility / isolation works, and
+[README.md](../harness/README.md) for the full harness reference.

@@ -10,7 +10,7 @@ isolation is on by default, the "without" run does not get repo skills through t
 tracked skill-discovery paths, so the provisioned skill is the intended variable.
 
 The step-by-step walkthrough — writing the scenario, the neutral-prompt gotcha, previewing with
-`--dry-run`, and reading the two result sets — is in **[Simple-A-B-Test.md](HowTos/Simple-A-B-Test.md)**.
+`--dry-run`, and reading the two result sets — is in **[Simple-A-B-Test.md](../HowTos/Simple-A-B-Test.md)**.
 
 ## Can I test a combination of skills?
 
@@ -20,7 +20,7 @@ discovery, so you're testing exactly that combination working in concert.
 
 The walkthrough — writing the multi-skill scenario, rubrics that check the skills hand off to each
 other, and previewing with `--dry-run` — is in
-**[Test-Skill-Combinations.md](HowTos/Test-Skill-Combinations.md)**.
+**[Test-Skill-Combinations.md](../HowTos/Test-Skill-Combinations.md)**.
 
 ## I just cloned this repo — how do I make the skills work with my install of AntiGravity (or another agentic app)?
 
@@ -33,7 +33,7 @@ per-user dirs — for AntiGravity that's `~/.gemini/config/skills` (the `agy` CL
 dir to the `Makefile` and re-run.
 
 The full walkthrough — in-repo vs global install, AntiGravity's two homes, adding a brand-new app,
-and non-macOS notes — is in **[Install-For-Your-Agent.md](HowTos/Install-For-Your-Agent.md)**.
+and non-macOS notes — is in **[Install-For-Your-Agent.md](../HowTos/Install-For-Your-Agent.md)**.
 
 ## What are "scenarios"?
 
@@ -47,7 +47,7 @@ auto-discovered. Since runs are isolated by default, a scenario tests exactly th
 
 They live in [`../scenarios/`](../scenarios/) — see [scenarios/README.md](../scenarios/README.md) for
 the file format. For scenarios in action, see the
-[combination](HowTos/Test-Skill-Combinations.md) and [A/B](HowTos/Simple-A-B-Test.md) how-tos.
+[combination](../HowTos/Test-Skill-Combinations.md) and [A/B](../HowTos/Simple-A-B-Test.md) how-tos.
 
 ## Which skills can the model actually see during a test?
 
