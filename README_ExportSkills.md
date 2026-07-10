@@ -8,7 +8,7 @@ Each `.zip` file is one self-contained skill:
 
 | File | What it does |
 |---|---|
-| `sliderule-pipeline.zip` | Directives for orchestrating multi-step analyses as single scripts |
+| `sliderule-pipeline-direct-request.zip` | Directives for orchestrating multi-step analyses as single scripts |
 | `sliderule-region-picker.zip` | Interactive map for defining geographic regions |
 
 ## How to upload
@@ -31,11 +31,11 @@ For example, on claude.ai:
 
 ## Which skills to upload
 
-**For most users**, upload both. They're independent, standalone tools: `sliderule-pipeline` guides consolidating an analysis into a single reproducible script, and `sliderule-region-picker` provides an interactive map for defining the geographic region.
+**For most users**, upload both. They're independent, standalone tools: `sliderule-pipeline-direct-request` guides consolidating an analysis into a single reproducible script, and `sliderule-region-picker` provides an interactive map for defining the geographic region.
 
 **If you only need one**, both skills are standalone:
 
-- `sliderule-pipeline` and `sliderule-region-picker` are independent — neither depends on the other.
+- `sliderule-pipeline-direct-request` and `sliderule-region-picker` are independent — neither depends on the other.
 
 ## Regenerating the exports
 
@@ -48,7 +48,7 @@ python export.py
 Or export specific skills:
 
 ```bash
-python export.py sliderule-pipeline sliderule-region-picker
+python export.py sliderule-pipeline-direct-request sliderule-region-picker
 ```
 
 Output goes to `exports/` by default (override with `-o <dir>`).

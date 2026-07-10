@@ -1,6 +1,6 @@
 """Command-line interface.
 
-    agentskill-evals run --agent claude --skill sliderule-pipeline
+    agentskill-evals run --agent claude --skill sliderule-pipeline-direct-request
     agentskill-evals list-agents-configured-models
     agentskill-evals list-evals
     agentskill-evals selftest    # parser tests, no CLIs required

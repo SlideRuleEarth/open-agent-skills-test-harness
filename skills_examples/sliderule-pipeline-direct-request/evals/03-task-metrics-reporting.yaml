@@ -5,7 +5,7 @@ description: >
   request, capturing timing and data stats during execution — and still reports
   duration and a reason even when a request returns zero rows or fails.
 skills:
-- sliderule-pipeline
+- sliderule-pipeline-direct-request
 prompt: |
   Run an atl06p request over this tiny polygon for January 2019. Heads up — it
   might come back empty. Either way, tell me how the request went.

@@ -46,7 +46,7 @@ Verify:
 
 ```bash
 ls -l ~/.gemini/config/skills ~/.gemini/antigravity-ide/skills
-# each entry: sliderule-pipeline -> /path/to/open-agent-skills-test-harness/skills_examples/sliderule-pipeline
+# each entry: sliderule-pipeline-direct-request -> /path/to/open-agent-skills-test-harness/skills_examples/sliderule-pipeline-direct-request
 ```
 
 `make unlink-global` removes them. `make link-global` uses `ln -sfn`, so it's safe to re-run after

@@ -5,7 +5,7 @@ description: >
   filter and aggregation into the same script, rather than running separate
   ad-hoc steps that each waste an execution cycle.
 skills:
-- sliderule-pipeline
+- sliderule-pipeline-direct-request
 prompt: |
   Run an atl06p request over Lake Tahoe, drop the outlier elevations, then give
   me the median height per cycle. I'll want to chart it afterward.

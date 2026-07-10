@@ -1,6 +1,6 @@
 # Evaluations
 
-Evaluations for the `sliderule-pipeline` skill. Each `*.yaml` file is one eval,
+Evaluations for the `sliderule-pipeline-direct-request` skill. Each `*.yaml` file is one eval,
 loosely following the schema in Anthropic's
 [Agent Skills best practices](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices)
 and extended for the [`harness`](../../../harness/) runner.
@@ -26,10 +26,10 @@ From the repo root (install the `agentskill-evals` CLI first — see the [runner
 
 ```bash
 # this skill on one agent, graded by the default judge
-agentskill-evals run --skill sliderule-pipeline --agent copilot
+agentskill-evals run --skill sliderule-pipeline-direct-request --agent copilot
 
 # specific agent + model, parallel, show failing checks
-agentskill-evals run --skill sliderule-pipeline \
+agentskill-evals run --skill sliderule-pipeline-direct-request \
     --agent claude --jobs 4 -v
 ```
 
@@ -50,14 +50,14 @@ cheapest model per runner, `--all-models` runs the full set.
 
 ```bash
 # cheapest model per runner (safe default)
-agentskill-evals run --skill sliderule-pipeline --agent copilot
+agentskill-evals run --skill sliderule-pipeline-direct-request --agent copilot
 
 # compare specific models — Haiku is the canonical weak-model probe (most likely to skip
 # SKILL.md and answer from training; if it works on Haiku it usually works everywhere)
-agentskill-evals run --skill sliderule-pipeline --agent claude --model claude=claude-opus-4-8,claude-haiku-4-5
+agentskill-evals run --skill sliderule-pipeline-direct-request --agent claude --model claude=claude-opus-4-8,claude-haiku-4-5
 
 # the full models.yaml grid (opt-in; prompts to confirm, bounded by --max-cells)
-agentskill-evals run --skill sliderule-pipeline --agent copilot --all-models
+agentskill-evals run --skill sliderule-pipeline-direct-request --agent copilot --all-models
 ```
 
 See the [harness README](../../../harness/README.md#cross-model-testing) for cost
@@ -70,3 +70,4 @@ guardrails and how the model list is maintained.
 | [01-single-script-consolidation.yaml](01-single-script-consolidation.yaml) | Splitting a fetch → filter → aggregate workflow across separate ad-hoc steps instead of one consolidated pipeline script |
 | [02-surface-reproducible-script.yaml](02-surface-reproducible-script.yaml) | Running an ephemeral inline/heredoc script instead of saving + surfacing a named `pipeline.py` under `agents_outputs/<run>/` |
 | [03-task-metrics-reporting.yaml](03-task-metrics-reporting.yaml) | Omitting the "SlideRule Task Summary" task-metrics block — including on a zero-row or failed request |
+| [04-cross-skill-boundary-python-client.yaml](04-cross-skill-boundary-python-client.yaml) | Forcing a raw HTTP envelope when the user explicitly asked for the Python client (`sliderule-pipeline-python-client` territory) |

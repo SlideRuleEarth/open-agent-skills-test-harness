@@ -99,7 +99,7 @@ Evals are **per-skill**: each skill directory owns an `evals/` folder.
 
 ```
 skills_examples/
-  sliderule-pipeline/
+  sliderule-pipeline-direct-request/
     SKILL.md
     evals/
       01-single-script-consolidation.yaml
@@ -211,7 +211,7 @@ agentskill-evals list-evals --skills-root .
 # `run` always requires --skill, --evals, or --config (no unscoped broad runs)
 
 # one skill, specific agent, parallel, verbose failures
-agentskill-evals run --skill sliderule-pipeline \
+agentskill-evals run --skill sliderule-pipeline-direct-request \
     --agent claude --jobs 4 -v
 
 # a single eval file, no judge, just deterministic checks
@@ -364,7 +364,7 @@ target:
   # model:
   #   - claude-haiku-4.5@high
   #   - {model: claude-opus-4.6, reasoning_effort: low}
-skills: [sliderule-pipeline, sliderule-region-picker]   # provisioned together; the only repo skills visible
+skills: [sliderule-pipeline-direct-request, sliderule-region-picker]   # provisioned together; the only repo skills visible
 prompt: |
   Using {skills}, write run.py that ...
 rubric: [ ... ]

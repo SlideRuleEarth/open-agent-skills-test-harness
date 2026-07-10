@@ -1,20 +1,37 @@
 ---
-name: sliderule-pipeline
+name: sliderule-pipeline-direct-request
 description: >
   Behavioral directives for orchestrating SlideRule analyses as single-script
-  pipelines and reporting task metrics. Use when consolidating a multi-step
-  SlideRule workflow (fetch → parse → filter → aggregate → export) into one
-  script execution rather than separate invocations.
-  A SQL or pandas filtering/aggregation pass can be folded into the same
-  pipeline script. Governs HOW the work is structured (single script, defensive coding,
-  JSON export), HOW the executed script is surfaced (saved as a file and surfaced
-  as a reproducible script), and HOW results are reported (task metrics). Also
+  pipelines using direct HTTP requests to the SlideRule service (a
+  `requests.post` envelope with Parquet response parsing — no `sliderule`
+  package), and reporting task metrics. Use when the workflow talks to the API
+  directly and a multi-step SlideRule workflow
+  (fetch → parse → filter → aggregate → export) should be consolidated into one
+  script execution rather than separate invocations. A SQL or pandas
+  filtering/aggregation pass can be folded into the same pipeline script.
+  Governs HOW the work is structured (single script, defensive coding, JSON
+  export), HOW the executed script is surfaced (saved as a file and surfaced as
+  a reproducible script), and HOW results are reported (task metrics). Also
   trigger when the user asks about pipeline patterns, execution efficiency, task
   reporting format, or wants to see, save, or reproduce the exact script that was
-  run.
+  run. For pipelines built on the SlideRule Python client (the `sliderule`
+  package returning GeoDataFrames), use `sliderule-pipeline-python-client`
+  instead.
 ---
 
-# SlideRule Pipeline Orchestration
+# SlideRule Pipeline Orchestration — Direct Request
+
+## Scope
+
+This skill covers pipelines that issue **direct HTTP requests** to the SlideRule
+service: build the `parms` request envelope, `requests.post` it to
+`https://sliderule.slideruleearth.io`, and parse the Parquet response with
+`pyarrow`. Use it when the user asks for the raw API path or wants to avoid the
+client dependency. If the workflow should go through the SlideRule **Python
+client** (the `sliderule` package — `sliderule.init()`, `icesat2.atl06p(parms)`,
+GeoDataFrame results), use the `sliderule-pipeline-python-client` skill instead;
+when the user doesn't specify an access method, that client path is the
+preferred default.
 
 ## Requirements
 
