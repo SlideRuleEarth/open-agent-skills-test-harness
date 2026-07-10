@@ -1,4 +1,4 @@
-# Make the skills work with your agent outside of testing or normal agent sessions(AntiGravity, Copilot, or another app)
+# Make the skills work with your agent outside of testing for normal agent sessions(AntiGravity, Copilot, or another app)
 
 You just cloned this repo and want your agent — AntiGravity, Claude Code, Codex, GitHub Copilot,
 or something else — to actually see the `sliderule-*` skills in your **day-to-day sessions**. This
