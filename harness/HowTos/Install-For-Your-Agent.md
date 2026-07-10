@@ -1,8 +1,15 @@
-# Make the skills work with your agent (AntiGravity, or another app)
+# Make the skills work with your agent (AntiGravity, Copilot, or another app)
 
-You just cloned this repo and want your agent — AntiGravity, Claude Code, Codex, or something else
-— to actually see the `sliderule-*` skills. This is an **installation** step, separate from
-testing.
+You just cloned this repo and want your agent — AntiGravity, Claude Code, Codex, GitHub Copilot,
+or something else — to actually see the `sliderule-*` skills in your **day-to-day sessions**. This
+is an **installation** step, separate from testing.
+
+> **You do NOT need any of this to run the evals.** The harness provisions each eval's declared
+> skills itself — copied into an isolated, throwaway workspace — so a fresh clone plus the
+> [harness CLI](../README.md#install) and your agent's own CLI is enough to test. Skills you
+> already have installed globally aren't touched (and this repo's, if installed, are masked
+> during runs so they can't contaminate results). The targets below are only for *using* the
+> skills in normal agent sessions.
 
 ## How it works
 
@@ -14,6 +21,7 @@ symlinks. Update the repo → every consumer updates.
 | --- | --- | --- |
 | Claude Code / Agent SDK | `.claude/skills/` | `~/.claude/skills/` |
 | Codex | `.agents/skills/` | `~/.agents/skills/` |
+| GitHub Copilot CLI | `.agents/skills/` | `~/.agents/skills/` |
 | AntiGravity CLI (`agy`) | `.antigravity/skills/` | `~/.gemini/config/skills/` |
 | AntiGravity IDE | `.antigravity/skills/` | `~/.gemini/antigravity-ide/skills/` |
 
@@ -22,7 +30,7 @@ symlinks. Update the repo → every consumer updates.
 The project-level symlinks (`.claude/skills/`, `.agents/skills/`, `.antigravity/skills/`) are
 **committed**, so a fresh clone already exposes every skill. Just run your agent from the repo root
 (or point it here) — AntiGravity picks them up from `.antigravity/skills/`, Claude Code from
-`.claude/skills/`, Codex from `.agents/skills/`.
+`.claude/skills/`, Codex and the Copilot CLI from `.agents/skills/`.
 
 If the links didn't survive the clone (e.g. a Windows checkout without symlink support), rebuild
 them:
@@ -57,6 +65,14 @@ installed, remove that first.
 > `~/.gemini/antigravity-ide/skills` for the IDE. `make link-global` writes both, so it doesn't
 > matter which one you use. (Symlink-following into these dirs works in practice but isn't
 > officially documented — treat it as best-effort.)
+
+> The **GitHub Copilot CLI** shares the cross-agent `.agents/skills` convention with Codex, so
+> `make link-global` already covers it via `~/.agents/skills` — there is no separate
+> `~/.copilot/skills` directory to wire up. Run `copilot` from any directory and the globally
+> linked skills are visible; inside this repo, the committed `.agents/skills/` links serve it
+> project-level. (As with the others, this discovery path is convention-based rather than a
+> documented guarantee — it's what the harness's copilot adapter relies on and works with the
+> current CLI.)
 
 ## Option C — a different app that isn't wired up yet
 

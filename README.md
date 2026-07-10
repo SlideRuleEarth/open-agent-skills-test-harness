@@ -32,10 +32,11 @@ This repo is the single source of truth. Each agent runtime scans a **different*
 | --- | --- | --- |
 | Claude Code / Agent SDK | `.claude/skills/` | `~/.claude/skills/` |
 | Codex | `.agents/skills/` | `~/.agents/skills/` |
+| GitHub Copilot CLI | `.agents/skills/` | `~/.agents/skills/` |
 | AntiGravity CLI (`agy`) | `.antigravity/skills/` | `~/.gemini/config/skills/` |
 | AntiGravity IDE | `.antigravity/skills/` | `~/.gemini/antigravity-ide/skills/` |
 
-> **Note:** Claude Code (and the Agent SDK) read skills **only** from `.claude/skills/` — never `.agents/skills/`. Codex uses the cross-agent `.agents/skills/` convention (`$REPO_ROOT/.agents/skills/`, then `~/.agents/skills/`). AntiGravity keeps its skills under `~/.gemini/`. Symlink-following into these directories works in practice but isn't officially documented — treat it as best-effort.
+> **Note:** Claude Code (and the Agent SDK) read skills **only** from `.claude/skills/` — never `.agents/skills/`. Codex and the GitHub Copilot CLI use the cross-agent `.agents/skills/` convention (`$REPO_ROOT/.agents/skills/`, then `~/.agents/skills/`), so one pair of links serves both. AntiGravity keeps its skills under `~/.gemini/`. Symlink-following into these directories works in practice but isn't officially documented — treat it as best-effort.
 
 ### Project-level (committed — the recommended default)
 
