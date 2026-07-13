@@ -71,3 +71,4 @@ guardrails and how the model list is maintained.
 | [02-surface-reproducible-script.yaml](02-surface-reproducible-script.yaml) | Running an ephemeral inline/heredoc script instead of saving + surfacing a named `pipeline.py` under `agents_outputs/<run>/` |
 | [03-task-metrics-reporting.yaml](03-task-metrics-reporting.yaml) | Omitting the "SlideRule Task Summary" task-metrics block — including on an empty-GeoDataFrame or failed request |
 | [04-cross-skill-boundary-direct-request.yaml](04-cross-skill-boundary-direct-request.yaml) | Forcing the Python client when the user explicitly asked for raw HTTP requests (`sliderule-pipeline-direct-request` territory) |
+| [05-checkpoint-fetch.yaml](05-checkpoint-fetch.yaml) | Re-paying a minutes-long fetch on rerun — no `raw.parquet` checkpoint guard on the client call, or fabricated/reused request timing on a cached rerun |

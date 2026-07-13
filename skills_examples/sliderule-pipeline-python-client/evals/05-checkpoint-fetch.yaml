@@ -1,0 +1,31 @@
+name: 05-checkpoint-fetch
+description: >
+  Checkpoints the expensive client fetch so a downstream bug fix reruns in
+  seconds instead of re-paying a minutes-long SlideRule request: saves
+  raw.parquet immediately after reset_index(), guards the client call with an
+  existence check on raw.parquet, and on the cached rerun reports "loaded from
+  raw.parquet (cached)" instead of a request duration.
+skills:
+- sliderule-pipeline-python-client
+prompt: |
+  Using the sliderule Python client, pull atl06p elevations over Dickson Fjord
+  for 2023 and filter to heights below 50 m — the fjord surface. Fair warning:
+  the request took about four minutes when I ran something similar last week,
+  and I may ask you to adjust the height threshold after I see the results.
+files: []
+rubric:
+- Guards the client call with an existence check on `raw.parquet` in the run directory, loading the
+  checkpoint (e.g. `gpd.read_parquet`) when present and calling `icesat2.atl06p(parms)` only when absent —
+  so an adjusted-threshold rerun of the same `pipeline.py` skips the multi-minute fetch.
+- Saves `raw.parquet` immediately after `gdf = gdf.reset_index()` on the fetch path (reset_index first, so
+  the time index is not silently dropped).
+- Keeps the checkpoint logic INSIDE the single self-contained `pipeline.py` in the run directory — does not
+  split fetch and filter into two separately surfaced scripts.
+- Applies the height filter with awareness that ICESat-2 heights are ellipsoidal (WGS84), not orthometric —
+  checks the height distribution (percentiles) before or while applying the 50 m threshold rather than
+  assuming the user's number matches the data's datum.
+- If the response describes or performs a rerun that loaded the checkpoint, the task summary reports
+  "loaded from raw.parquet (cached)" in place of a request duration, and never reuses or fabricates a
+  timing number from the original fetch.
+- A fresh run directory (new timestamp) re-fetches rather than reading another run's `raw.parquet` — cached
+  data does not leak across studies.

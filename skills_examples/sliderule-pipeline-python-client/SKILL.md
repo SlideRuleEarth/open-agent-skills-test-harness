@@ -58,10 +58,34 @@ A single pipeline script should:
 - **Print a concise summary** to stdout (row counts, height stats, timing) so the
   next step (chart or visualization creation) has what it needs
 
-This avoids the common failure pattern of: script #1 fetches data → script #2 tries
-a filter with wrong assumptions → script #3 fixes a serialization bug → script #4
-re-exports. Each failed iteration wastes an execution cycle and forces the agent to
-re-process prior output.
+The client absorbs the request-framing and response-decoding failures that made
+fragmented workflows expensive over raw HTTP. The residual risks with the client
+are narrower — `float32` JSON serialization, algorithm-dependent columns, and
+height-datum filter mistakes — and each is cheapest to catch inside the one
+script (the explicit casts, inline schema print, and percentile check below)
+rather than across separate invocations that each re-process prior output.
+
+### Checkpoint the Fetch
+
+The client call is the only expensive step — requests can take minutes — while
+everything downstream is cheap pandas. Structure `pipeline.py` so a downstream
+bug never re-pays the fetch: save `raw.parquet` to the run directory immediately
+after `reset_index()`, and guard the client call with an existence check so a
+rerun loads the checkpoint instead of re-fetching.
+
+```python
+raw_path = RUN_DIR / "raw.parquet"
+if raw_path.exists():
+    gdf = gpd.read_parquet(raw_path)    # rerun after a downstream fix: seconds
+else:
+    gdf = icesat2.atl06p(parms).reset_index()  # first run: minutes
+    gdf.to_parquet(raw_path)
+```
+
+This keeps the pipeline a single reproducible file while making the
+fix-and-rerun loop cost seconds instead of minutes. A fresh run directory (new
+timestamp) always re-fetches, so cached data cannot silently leak across
+studies.
 
 ## Surface the Pipeline Script as a Reproducible File
 
@@ -198,6 +222,10 @@ metrics = {
 Adapt to what's relevant — lake name for water studies, algorithm for canopy,
 per-request timing for multi-request workflows. Always report duration and reason
 even if a request fails or returns zero rows.
+
+On a checkpointed rerun that loaded `raw.parquet` instead of calling the client,
+report `loaded from raw.parquet (cached)` in place of the request duration —
+never reuse a duration from a previous run or fabricate one.
 
 For multiple client calls, also report total wall-clock time, per-request row
 counts, and any throttle/retry behavior the client surfaced.

@@ -21,9 +21,9 @@ rubric:
 - Folds the outlier filter and the per-cycle median aggregation INTO the same pipeline script (a pandas
   or DuckDB SQL pass in-script), rather than fetching first and proposing a separate follow-up step to
   filter or aggregate.
-- "Explicitly avoids the failure pattern the skill warns against (script #1 fetches → script #2 filters
-  with wrong assumptions → script #3 fixes a serialization bug → script #4 re-exports); does not split
-  the workflow across multiple execution cycles that each re-process prior output."
+- Does not split the workflow across multiple execution cycles that each re-process prior output; catches
+  the client-era residual risks (float32 JSON serialization via explicit casts, algorithm-dependent
+  columns via the inline schema print) inside the one script rather than in follow-up invocations.
 - Prints a concise stdout summary (row counts, height stats, timing) so the downstream chart step has what
   it needs, AND exports dashboard-ready JSON with the per-cycle medians from the same script.
 - Does not pad, mock, or interpolate values to replace the dropped outliers — only real returned rows reach
