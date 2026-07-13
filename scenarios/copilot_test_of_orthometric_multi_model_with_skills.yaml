@@ -1,6 +1,6 @@
 # This is a basic 
-name: OrthometricPrompt_MultiModel_No_Skills
-description: Multi-model test of the lake levels Skaneateles
+name: OrthometricPrompt_MultiModel_With_Skills
+description: Multi-model test of Grand Mesa orthometric canopy heights with the direct-request pipeline skill provisioned.
 
 target:                       # the runner:model this scenario tests
   runner: copilot
