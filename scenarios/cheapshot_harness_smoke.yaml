@@ -8,8 +8,8 @@
 name: cheapshot harness smoke
 description: >
   Trivial prompt that produces a file and touches two skills — just enough to
-  exercise file_exists, skill_triggered, skill_not_triggered, ran_command,
-  and final_contains assertions cheaply.
+  exercise file_exists, file_absent, skill_triggered, and no_error
+  assertions cheaply.
 
 target:
   runner: copilot

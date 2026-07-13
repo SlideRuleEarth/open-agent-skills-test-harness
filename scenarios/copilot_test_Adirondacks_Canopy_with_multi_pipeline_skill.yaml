@@ -1,0 +1,42 @@
+# This is a basic 
+name: Adirondacks Canopy Multi-Model with Python-Client Pipeline Skill
+description: Multi-model test of the Adirondacks canopy prompt with the sliderule-pipeline-python-client skill provisioned.
+
+target:
+  runner: copilot
+  model: 
+    - claude-opus-4.8
+    - claude-sonnet-4.6
+    - gpt-5.5
+    - gpt-5.4
+
+skills:                       # provisioned together; the only repo skills visible (isolated)
+  - sliderule-pipeline-python-client
+
+prompt: | 
+    Do a Canopy study for a reasonable region in the Adirondacks and provide a one-paragraph summary.
+
+rubric:                       # graded by the LLM judge
+
+  # --- Tier 1: literal compliance (necessary, uninformative) ---
+  - Delivers a one-paragraph summary of the result.
+ 
+  # --- Tier 4: deliverable craft ---
+  - One-paragraph summary is in fact one paragraph (not multiple paragraphs or a bulleted list).
+  - Polygon used for the request is reported or visualized so the region is auditable.
+  - Caveats are present but proportionate (not a wall of disclaimers crowding out the result).
+
+
+assertions:                   # deterministic checks
+  # process
+  - {type: no_error}
+
+# In an eval or scenario file:
+timeout_sec: 24000    # override the default 600s
+
+# Optional run knobs (any CLI flag overrides these):
+judge: 
+    agent: copilot
+    model: claude-opus-4.8
+isolated: true
+
