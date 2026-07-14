@@ -122,8 +122,19 @@ class Judge:
         try:
             masked_home, iso_env = build_mcp_masked_home(self.adapter)
         except OSError as exc:
-            print(f"warning: [judge:{self.agent}] could not build the MCP-masking overlay "
-                  f"({exc}); judging with the real HOME.", file=sys.stderr)
+            # This judge's MCP-off depends on the overlay — judging with the real HOME
+            # would launch the user's real MCP servers, so fail closed: an explicit
+            # judge-failed verdict (every item false, judge_error set) instead of a
+            # non-hermetic run.
+            reason = (f"judge could not run MCP-hermetically: the masking overlay "
+                      f"failed to build ({exc})")
+            print(f"warning: [judge:{self.agent}] {reason}; failing the judge closed.",
+                  file=sys.stderr)
+            rr = RunResult(agent=f"judge:{self.agent}",
+                           eval_name=getattr(spec, "name", ""),
+                           prompt=prompt, workdir="", error=reason)
+            return JudgeResult(verdict=_coerce_verdict(rr, rubric),
+                               exec_result=ExecResult(result=rr, stdout="", stderr=""))
         if masked_home:
             opts.home = masked_home
             opts.isolation_env = iso_env

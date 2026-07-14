@@ -69,11 +69,28 @@ _PLUGINS_LEAF = object()
 class _FileMaskLeaf:
     """Leaf for a *config-file mask* (see module docstring): the node is a single file,
     written with this content instead of symlinked to the real HOME's copy — or, with
-    content ``None``, an empty real directory."""
+    content ``None``, an empty real directory. Content may also be a callable
+    ``(real_path) -> str`` for masks that *sanitize* the real file rather than replace it
+    outright (e.g. copilot's config.json, which holds auth alongside the plugin
+    registrations that must be dropped)."""
     __slots__ = ("content",)
 
-    def __init__(self, content: Optional[str]):
+    def __init__(self, content):
         self.content = content
+
+
+def config_home_entries(adapter: Any) -> list[tuple]:
+    """Normalized ``isolation_config_homes`` entries as (env var, HOME subdir it stands in
+    for or None, skills-subdir or None). Accepts the pre-Phase-0 out-of-tree 2-tuple form
+    ``(var, skills_sub)`` — those adapters predate config masks, so no stand-in dir."""
+    entries = []
+    for entry in getattr(adapter, "isolation_config_homes", []) or []:
+        entry = tuple(entry)
+        if len(entry) == 2:
+            entries.append((entry[0], None, entry[1]))
+        else:
+            entries.append(entry[:3])
+    return entries
 
 
 def _is_stale_repo_link(path: str, repo_root: Optional[str]) -> bool:
@@ -121,12 +138,12 @@ def build_isolated_home(
         of renamed/removed skills (broken symlinks are masked too). None disables the
         target-based check; the name-based mask still applies.
       config_file_masks: HOME-relative config *file* paths mapped to the content to
-        materialize them with (``"{}"`` to neutralize) instead of symlinking the real
-        file — written even when the real file doesn't exist, so a CLI can never fall
-        back to non-empty defaults (see module docstring). A ``None`` content means the
-        path is masked as an empty real *directory* instead. Paths must be relative and
-        ``..``-free (ValueError otherwise) — a traversing path would write outside the
-        overlay.
+        materialize them with instead of symlinking the real file — written even when the
+        real file doesn't exist, so a CLI can never fall back to non-empty defaults (see
+        module docstring). Content forms: a string (neutral replacement), ``None`` (mask
+        as an empty real *directory*), or a callable ``(real_path) -> str`` (sanitize the
+        real file's content). Paths must be relative and ``..``-free (ValueError
+        otherwise) — a traversing path would write outside the overlay.
       plugin_config_masks: file names materialized (with the given content) inside every
         plugin of every ``plugin_registry_subpaths`` dir, e.g. ``{"mcp_config.json": "{}"}``
         — per-plugin MCP configs are a server-discovery channel of their own.
@@ -154,10 +171,14 @@ def build_isolated_home(
 
 
 def _validate_mask_subpath(sub: str) -> None:
-    """Masks are opened for writing (O_TRUNC) at the joined path — an absolute or
-    ``..``-traversing subpath would clobber a file outside the overlay."""
-    parts = str(sub).replace("\\", "/").split("/")
-    if os.path.isabs(str(sub)) or ".." in parts:
+    """Masks are opened for writing (O_TRUNC) at the joined path — an absolute,
+    drive-anchored, or ``..``-traversing subpath would clobber a file outside the overlay.
+    Checked platform-independently (``C:evil.json`` is drive-relative on Windows even
+    though POSIX ``isabs`` says no)."""
+    s = str(sub)
+    parts = s.replace("\\", "/").split("/")
+    if (os.path.isabs(s) or s.startswith(("/", "\\")) or os.path.splitdrive(s)[0]
+            or (len(s) >= 2 and s[0].isalpha() and s[1] == ":") or ".." in parts):
         raise ValueError(f"config mask path must be HOME-relative without '..': {sub!r}")
 
 
@@ -195,7 +216,7 @@ def _overlay(real_dir: str, dst_dir: str, tree: dict,
             _mask_plugin_registry_dir(real_child, dst_child, repo_skills, repo_root,
                                       plugin_masks)
         elif isinstance(node, _FileMaskLeaf):
-            _write_mask_file(dst_child, node.content)
+            _write_mask_file(dst_child, node.content, real_child)
         else:
             _overlay(real_child, dst_child, node, repo_skills, declared, repo_root,
                      plugin_masks)
@@ -239,7 +260,7 @@ def resolve_visible_skills(
     scan_dirs = [os.path.join(real_home, sub)
                  for sub in getattr(adapter, "global_skills_subpaths", []) or []]
     # a custom config home (e.g. $CODEX_HOME) holds skills outside the HOME-relative dirs
-    for var, _replaces, skills_sub in getattr(adapter, "isolation_config_homes", []) or []:
+    for var, _replaces, skills_sub in config_home_entries(adapter):
         custom = os.environ.get(var)
         if custom and skills_sub:
             scan_dirs.append(os.path.join(custom, skills_sub))
@@ -289,14 +310,17 @@ def _build_skills_dir(real_skills: str, dst_skills: str,
         placed.add(name)
 
 
-def _write_mask_file(path: str, content: Optional[str]) -> None:
-    """Materialize one config mask: a real file with the supplied content — or, for
-    ``None``, an empty real directory — never a symlink to the real HOME's copy. 0600/0700
+def _write_mask_file(path: str, content, real_path: Optional[str] = None) -> None:
+    """Materialize one config mask: a real file with the supplied content — for ``None``,
+    an empty real directory; for a callable, the string it derives from the real file at
+    ``real_path`` (sanitizing masks) — never a symlink to the real HOME's copy. 0600/0700
     because the same mechanism that neutralizes with ``{}`` today will materialize declared
     MCP configs — which can carry credentials — in a later phase (DESIGN_MCP_Support.md §4)."""
     if content is None:
         os.makedirs(path, mode=0o700, exist_ok=True)
         return
+    if callable(content):
+        content = content(real_path or path)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(content)
@@ -377,7 +401,7 @@ def build_mcp_masked_home(adapter: Any, real_home: Optional[str] = None) -> tupl
                             plugin_config_masks=plugin_masks)
         env: dict = {}
         cfg_root = None
-        for var, replaces, _skills_sub in getattr(adapter, "isolation_config_homes", []) or []:
+        for var, replaces, _skills_sub in config_home_entries(adapter):
             custom = os.environ.get(var)
             if not custom or not os.path.isdir(custom):
                 continue

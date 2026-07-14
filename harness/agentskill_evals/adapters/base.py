@@ -21,7 +21,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from ..isolation import build_mcp_masked_home
+from ..isolation import build_mcp_masked_home, config_home_entries
 from ..schema import NormalizedEvent
 
 
@@ -94,8 +94,10 @@ class Adapter(ABC):
     # ("CODEX_HOME", ".codex", "skills"). Under isolation a *set* one is mirrored into the
     # isolated home (skills + config masks applied, masks re-rooted via the stand-in dir)
     # and repointed, so custom config homes keep their auth/config; if it can't be mirrored
-    # it is cleared so it can't read the real skills/config and bypass isolation.
-    isolation_config_homes: list[tuple[str, str, Optional[str]]] = []
+    # it is cleared so it can't read the real skills/config and bypass isolation. The
+    # pre-Phase-0 out-of-tree 2-tuple form (var, skills_sub) is still accepted
+    # (isolation.config_home_entries normalizes).
+    isolation_config_homes: list[tuple] = []
     # HOME-relative config paths the isolation overlay materializes instead of symlinking,
     # mapped to neutral content ("{}" = declare no MCP servers; None = an empty directory) —
     # the wholesale HOME symlinks otherwise pass the user's real MCP-server config straight
@@ -108,6 +110,12 @@ class Adapter(ABC):
     # global_plugin_registry_subpaths dir — plugins can carry their own MCP configs
     # (e.g. agy's plugins/<name>/mcp_config.json), a server-discovery channel of their own.
     plugin_registry_config_masks: dict[str, str] = {}
+    # Workspace-relative glob patterns → neutral content: config files a CLI discovers
+    # from the RUN WORKSPACE itself (e.g. agy's .agents/mcp_config.json), which the HOME
+    # overlay can't reach. The runner overwrites matching *seeded* files after seeding —
+    # only meaningful for runners with no CLI-level way to disable such servers (an
+    # enumerating adapter like copilot handles seeded configs on argv instead).
+    workspace_config_masks: dict[str, str] = {}
 
     supports_output_schema: bool = False
     # True if build_argv maps RunOptions.reasoning_effort onto a native flag/config of this
@@ -152,9 +160,13 @@ class Adapter(ABC):
         try:
             masked_home, iso_env = build_mcp_masked_home(self)
         except OSError as exc:
+            # This runner's MCP-off depends on the overlay (it has masks) — probing with
+            # the real HOME would launch the user's real MCP servers, so fail closed:
+            # report the model unavailable rather than probe non-hermetically.
             import sys
             print(f"warning: [{self.name}] could not build the MCP-masking overlay for a "
-                  f"model probe ({exc}); probing with the real HOME.", file=sys.stderr)
+                  f"model probe ({exc}); skipping the probe (fail-closed).", file=sys.stderr)
+            return ProbeResult(accepted=False)
         if masked_home:
             env = self.env(dict(os.environ),
                            RunOptions(home=masked_home, isolation_env=iso_env))
@@ -251,7 +263,7 @@ class Adapter(ABC):
         env["USERPROFILE"] = opts.home
         for k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
             env.pop(k, None)
-        for var, _replaces, _skills_sub in self.isolation_config_homes:
+        for var, _replaces, _skills_sub in config_home_entries(self):
             if var in (opts.isolation_env or {}):
                 env[var] = opts.isolation_env[var]   # repoint at the isolated mirror
             else:

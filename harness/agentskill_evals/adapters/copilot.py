@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any, Optional
 
 from ..schema import EventKind, NormalizedEvent
@@ -61,6 +62,8 @@ _KNOWN_USAGE_KEYS = {
 # ancestor (copilot walks up, like git-root discovery — verified in the 1.0.64 bundle).
 _WORKSPACE_MCP_FILES = (".mcp.json", ".github/mcp.json", ".vscode/mcp.json")
 
+_warned_windows_registry = False
+
 
 def _mcp_server_names(path: str) -> list[str]:
     """Server names declared in one MCP config JSON — ``{"mcpServers": {...}}`` (copilot's
@@ -80,6 +83,34 @@ def _mcp_server_names(path: str) -> list[str]:
     return names
 
 
+# Plugin state lives in ~/.copilot/config.json: "installedPlugins" records carry an
+# absolute cache_path the loader follows even when installed-plugins/ is masked empty
+# (verified 1.0.64 — an empty mirrored plugin dir still exposed a plugin's MCP server).
+_COPILOT_PLUGIN_STATE_KEYS = ("installedPlugins", "enabledPlugins")
+
+
+def _sanitized_copilot_config(real_path: str) -> str:
+    """Sanitizing mask for ~/.copilot/config.json: keep everything (auth tokens, settings)
+    but drop the plugin registrations. The file is JSONC-ish — full-line ``//`` comments
+    above/inside the JSON — so strip those before parsing. Unreadable/unparseable → "{}"
+    (fail closed: no plugins can load; auth loss surfaces loudly rather than servers
+    silently loading)."""
+    try:
+        with open(real_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
+        return "{}"
+    text = "\n".join(ln for ln in raw.splitlines() if not ln.lstrip().startswith("//"))
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return "{}"
+    if isinstance(data, dict):
+        for key in _COPILOT_PLUGIN_STATE_KEYS:
+            data.pop(key, None)
+    return json.dumps(data, indent=2)
+
+
 class CopilotAdapter(Adapter):
     name = "copilot"
     binary = "copilot"
@@ -89,14 +120,21 @@ class CopilotAdapter(Adapter):
     # config" flag (`--disable-builtin-mcps` below only covers the bundled GitHub server),
     # and servers come from several places: ~/.copilot/mcp-config.json, installed plugins
     # (each plugin's definition can declare mcpServers), and workspace configs. Isolation
-    # masks the first two (mcp-config.json → "{}", installed-plugins/ → empty dir — plugin
-    # skills/agents are unavailable in isolated runs as a consequence); _mcp_disable_args
-    # additionally disables every *enumerable* server by name on argv, which also covers
-    # probes, judge runs, and non-isolated runs (where plugins remain a documented gap).
-    isolation_config_masks = {".copilot/mcp-config.json": "{}",
-                              ".copilot/installed-plugins": None}
+    # masks the plugin channel twice over — installed-plugins/ → empty dir AND config.json
+    # sanitized, because plugin records there carry an absolute cache_path that loads the
+    # real plugin dir even when installed-plugins/ is empty (verified 1.0.64) — so plugin
+    # skills/agents are unavailable in isolated runs. mcp-config.json is replaced with the
+    # empty shape copilot actually accepts: bare "{}" fails validation with "mcpServers:
+    # Required" (verified 1.0.64), which would kill the run before execution.
+    # _mcp_disable_args additionally disables every *enumerable* server by name on argv,
+    # which also covers probes, judge runs, and non-isolated runs (where plugins remain a
+    # documented gap). Windows-only residual: copilot also discovers ODR servers from the
+    # registry (HKLM\...\CurrentVersion\Mcp), which no file mask or enumeration reaches.
+    isolation_config_masks = {".copilot/mcp-config.json": '{"mcpServers": {}}',
+                              ".copilot/installed-plugins": None,
+                              ".copilot/config.json": _sanitized_copilot_config}
     # COPILOT_HOME replaces ~/.copilot wholesale (verified in 1.0.64's bundle) — without
-    # mirroring it, a set var would bypass both masks above.
+    # mirroring it, a set var would bypass the masks above.
     isolation_config_homes = [("COPILOT_HOME", ".copilot", None)]
     # `--reasoning-effort <level>` (verified 2026-07-08: choices none|low|medium|high|
     # xhigh|max — the harness only passes the typed cross-runner subset low|medium|high).
@@ -126,6 +164,13 @@ class CopilotAdapter(Adapter):
         Plugin-declared servers can't be enumerated here (their names live inside each
         plugin's definition); those are covered by the installed-plugins isolation mask and
         remain a documented gap for non-isolated runs."""
+        global _warned_windows_registry
+        if sys.platform == "win32" and not _warned_windows_registry:  # pragma: no cover
+            _warned_windows_registry = True
+            print("warning: [copilot] on Windows, copilot also discovers MCP servers from "
+                  "the registry (HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Mcp); "
+                  "the harness cannot mask or enumerate that source — those servers stay "
+                  "live.", file=sys.stderr)
         home = os.environ.get("COPILOT_HOME") or os.path.join(os.path.expanduser("~"),
                                                               ".copilot")
         names = _mcp_server_names(os.path.join(home, "mcp-config.json"))

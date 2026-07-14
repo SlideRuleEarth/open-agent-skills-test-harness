@@ -17,6 +17,7 @@ Results stream to artifacts/<run_id>/ and a summary table is returned for the CL
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
@@ -31,7 +32,7 @@ from .adapters import get_adapter
 from .adapters.base import RunOptions
 from .assertions import AssertionContext, AssertionResult, run_assertion
 from .exec import execute
-from .isolation import build_isolated_home, reroot_config_masks
+from .isolation import build_isolated_home, config_home_entries, reroot_config_masks
 from .judge import Judge
 from .progress import Progress
 from .schema import EventKind, RunResult
@@ -294,6 +295,13 @@ class Runner:
         if self.provision and declared_dirs:
             adapter.provision_skills(exec_ws, declared_dirs)
         self._seed_files(exec_ws, spec)
+        # 2b) neutralize seeded MCP configs a CLI discovers from the workspace itself
+        # (e.g. agy's .agents/mcp_config.json) — the HOME overlay can't reach these, and
+        # runners with workspace_config_masks have no CLI-level disable either.
+        for rel in _apply_workspace_config_masks(adapter, exec_ws):
+            print(f"warning: [{self.agent}] {spec.name!r}: seeded workspace file {rel!r} "
+                  f"is an MCP config this runner would load — neutralized (MCP is "
+                  f"hermetically off; no `mcp_servers:` support yet).", file=sys.stderr)
 
         # 3) render prompt (fill {skill}/{skills} for this adapter)
         prompt = self._render_prompt(spec)
@@ -325,7 +333,7 @@ class Runner:
                     plugin_config_masks=plugin_cfg_masks,
                 )
                 cfg_root = None
-                for var, replaces, skills_sub in getattr(adapter, "isolation_config_homes", []):
+                for var, replaces, skills_sub in config_home_entries(adapter):
                     custom = os.environ.get(var)
                     if custom and os.path.isdir(custom):
                         if cfg_root is None:
@@ -958,3 +966,27 @@ def _prepare_workspace(path: str) -> None:
         else:
             os.unlink(path)
     os.makedirs(path, exist_ok=False)
+
+
+def _apply_workspace_config_masks(adapter, workspace: str) -> list[str]:
+    """Overwrite seeded workspace files matching the adapter's ``workspace_config_masks``
+    globs with their neutral content — MCP configs some CLIs discover from the run
+    workspace itself (agy's ``.agents/mcp_config.json``), which no HOME overlay or CLI
+    flag reaches. Only *existing* files are touched: pre-creating a config would pollute
+    the workspace the agent sees and the archived artifacts. A seeded symlink resolving
+    outside the workspace is skipped — its target must not be overwritten. Returns the
+    workspace-relative paths neutralized."""
+    masked: list[str] = []
+    ws_real = os.path.realpath(workspace)
+    for pattern, content in (getattr(adapter, "workspace_config_masks", {}) or {}).items():
+        full_pattern = os.path.join(glob.escape(workspace), *pattern.split("/"))
+        for path in glob.glob(full_pattern):
+            if not os.path.isfile(path):
+                continue
+            real = os.path.realpath(path)
+            if real != ws_real and not real.startswith(ws_real + os.sep):
+                continue
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            masked.append(os.path.relpath(path, workspace))
+    return sorted(masked)

@@ -42,15 +42,12 @@ _KNOWN_USAGE_KEYS = {"input_tokens", "output_tokens", "reasoning_tokens", "total
 # `-c mcp_servers.<name>...` dotted path.
 _BARE_KEY_RE = re.compile(r"[A-Za-z0-9_-]+\Z")
 
-# Regex fallbacks for Python 3.10 (no tomllib): `[mcp_servers.<name>]` table headers —
-# optionally under a `[profiles.<p>.…]` prefix, optionally quoted, optionally with
-# sub-table suffixes (`.env`) — plus name keys of a single-line inline table.
-_MCP_HEADER_RE = re.compile(
-    r'^\s*\[(?:profiles\.[^\].]+\.)?mcp_servers\.("(?:[^"\\]|\\.)*"|[A-Za-z0-9_-]+)',
-    re.MULTILINE)
-_MCP_INLINE_RE = re.compile(r"^\s*mcp_servers\s*=\s*\{(.*)\}\s*$", re.MULTILINE)
-_INLINE_KEY_RE = re.compile(r'("(?:[^"\\]|\\.)*"|[A-Za-z0-9_-]+)\s*=\s*\{')
-_PROFILE_KEY_RE = re.compile(r'^\s*profile\s*=\s*"([^"]+)"\s*$', re.MULTILINE)
+# For the Python 3.10 config-scan fallback (no tomllib): a dotted TOML key path (bare,
+# basic-quoted, or literal-quoted segments) and one key of an inline table.
+_KEY_PATH_RE = re.compile(
+    r'((?:"(?:[^"\\]|\\.)*"|\'[^\']*\'|[A-Za-z0-9_-]+)'
+    r'(?:\s*\.\s*(?:"(?:[^"\\]|\\.)*"|\'[^\']*\'|[A-Za-z0-9_-]+))*)\s*=')
+_INLINE_ONEKEY_RE = re.compile(r'\s*("(?:[^"\\]|\\.)*"|\'[^\']*\'|[A-Za-z0-9_-]+)\s*=')
 
 
 class CodexAdapter(Adapter):
@@ -84,6 +81,7 @@ class CodexAdapter(Adapter):
     def _probe_argv(self, model: str):
         return [self.binary, "--ask-for-approval", "never", "--sandbox", "read-only",
                 "exec", "--ephemeral", "--disable", "memories",
+                "--disable", "plugins",
                 "-c", "memories.use_memories=false",
                 "-c", "memories.generate_memories=false",
                 *self._mcp_disable_args(),
@@ -110,12 +108,14 @@ class CodexAdapter(Adapter):
     # --- MCP hermeticity ------------------------------------------------------
 
     def _mcp_disable_args(self) -> list[str]:
-        """`-c mcp_servers.<name>.enabled=false` for every server in the user's persisted
-        config. Verified on 0.140.0: `-c mcp_servers={}` deep-merges with config.toml
+        """`-c mcp_servers.<name>.enabled=false` for every server codex would actually
+        load. Verified on 0.140.0: `-c mcp_servers={}` deep-merges with config.toml
         instead of replacing it (the server stays enabled), while the per-server `enabled`
-        override does disable it — so hermeticity requires enumerating names. Riding on
-        argv (not the isolation overlay) makes this cover every invocation the same way:
-        cells (isolated or not), model probes, and judge runs."""
+        override does disable it — so hermeticity requires enumerating names. Enumeration
+        must match codex's *effective* view exactly: disabling a name codex doesn't load
+        creates an incomplete top-level entry and the run dies with "invalid transport"
+        (verified). Riding on argv (not the isolation overlay) makes this cover every
+        invocation the same way: cells (isolated or not), model probes, and judge runs."""
         args: list[str] = []
         for name in self._configured_mcp_server_names():
             if _BARE_KEY_RE.match(name):
@@ -132,66 +132,48 @@ class CodexAdapter(Adapter):
                 args += ["-c", f'mcp_servers."{name}".enabled=false']
         return args
 
-    def _configured_mcp_server_names(self) -> list[str]:
-        """Server names codex will load: `[mcp_servers.*]` in the effective config.toml
-        ($CODEX_HOME else ~/.codex), plus any `[profiles.<p>.mcp_servers.*]` tables and the
-        `<profile>.config.toml` layer of a config-selected profile. Parsed with tomllib
-        where available (3.11+), else a header-regex fallback. Best-effort by design: an
-        unreadable/unparseable config yields [] rather than an error — codex itself would
-        fail on such a config anyway."""
-        home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
-        names: set[str] = set()
-        for path in self._config_layers(home):
-            try:
-                with open(path, "rb") as f:
-                    raw = f.read()
-            except OSError:
-                continue
-            if tomllib is not None:
-                try:
-                    data = tomllib.loads(raw.decode("utf-8", "replace"))
-                except tomllib.TOMLDecodeError:
-                    continue
-                servers = data.get("mcp_servers")
-                if isinstance(servers, dict):
-                    names.update(str(k) for k in servers)
-                profiles = data.get("profiles")
-                if isinstance(profiles, dict):
-                    for prof in profiles.values():
-                        if isinstance(prof, dict) and isinstance(prof.get("mcp_servers"), dict):
-                            names.update(str(k) for k in prof["mcp_servers"])
-            else:  # pragma: no cover — exercised only on Python 3.10
-                text = raw.decode("utf-8", "replace")
-                for m in _MCP_HEADER_RE.finditer(text):
-                    names.add(_unquote_toml_key(m.group(1)))
-                for m in _MCP_INLINE_RE.finditer(text):
-                    for km in _INLINE_KEY_RE.finditer(m.group(1)):
-                        names.add(_unquote_toml_key(km.group(1)))
-        return sorted(names)
+    # (home, config.toml mtime_ns) -> names; adapters are singletons, so this caps the
+    # `codex mcp list` spawns at one per config state instead of one per argv build.
+    _mcp_names_cache: Optional[tuple] = None
 
-    def _config_layers(self, home: str) -> list[str]:
-        """config.toml plus the `<name>.config.toml` layer of a profile the config itself
-        selects (`profile = "<name>"`) — the harness never passes -p/--profile, so only a
-        config-selected profile can add servers."""
-        base = os.path.join(home, "config.toml")
-        layers = [base]
-        profile = None
+    def _configured_mcp_server_names(self) -> list[str]:
+        """Server names codex will load from *configuration* (its plugin channel is closed
+        separately by `--disable plugins`, and plugin-provided servers must NOT be disabled
+        by name — they have no config.toml entry, so a `-c` disable would create an
+        incomplete one and break the run). Primary source: `codex --disable plugins mcp
+        list --json`, codex's own effective-config resolution (profiles and future config
+        layers included). Fallback when the CLI can't answer: parse the config ourselves
+        (base table + the config-selected active profile only)."""
+        home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
         try:
-            with open(base, "rb") as f:
-                raw = f.read()
+            mtime = os.stat(os.path.join(home, "config.toml")).st_mtime_ns
         except OSError:
-            return layers
-        if tomllib is not None:
-            try:
-                profile = tomllib.loads(raw.decode("utf-8", "replace")).get("profile")
-            except tomllib.TOMLDecodeError:
-                profile = None
-        else:  # pragma: no cover — exercised only on Python 3.10
-            m = _PROFILE_KEY_RE.search(raw.decode("utf-8", "replace"))
-            profile = m.group(1) if m else None
-        if isinstance(profile, str) and profile and "/" not in profile and ".." not in profile:
-            layers.append(os.path.join(home, f"{profile}.config.toml"))
-        return layers
+            mtime = None
+        key = (home, mtime)
+        if self._mcp_names_cache and self._mcp_names_cache[0] == key:
+            return self._mcp_names_cache[1]
+        names = self._mcp_names_via_cli()
+        if names is None:
+            names = _parse_config_mcp_names(home)
+        self._mcp_names_cache = (key, names)
+        return names
+
+    def _mcp_names_via_cli(self) -> Optional[list[str]]:
+        """Ask codex itself which MCP servers its effective config defines. None (fall
+        back to parsing) when the binary is missing or errors out."""
+        try:
+            r = subprocess.run(
+                [self.binary, "--disable", "plugins", "mcp", "list", "--json"],
+                capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+            )
+            if r.returncode != 0:
+                return None
+            data = json.loads(r.stdout)
+            return sorted({str(s["name"]) for s in data
+                           if isinstance(s, dict) and s.get("name")})
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError,
+                ValueError, KeyError):
+            return None
 
     def build_argv(self, prompt: str, opts: RunOptions, *, cwd: str) -> list[str]:
         argv = [self.binary]
@@ -201,6 +183,10 @@ class CodexAdapter(Adapter):
             # `-s/--sandbox` are top-level options, so they precede the `exec` subcommand.
             argv += ["--ask-for-approval", "never", "--sandbox", "workspace-write"]
         argv += ["exec", "--ephemeral", "--disable", "memories",
+                 # Plugins are their own MCP channel (a plugin can ship .mcp.json servers
+                 # that never appear in config.toml); the feature switch removes the whole
+                 # channel — plugin-provided skills go with it, documented trade-off.
+                 "--disable", "plugins",
                  "-c", "memories.use_memories=false",
                  "-c", "memories.generate_memories=false",
                  # MCP kill-switch (DESIGN_MCP_Support.md, Phase 0): the isolated HOME
@@ -348,10 +334,151 @@ class CodexAdapter(Adapter):
 
 
 def _unquote_toml_key(key: str) -> str:
-    """Strip the quotes (and unescape) of a TOML basic-string key; bare keys pass through."""
+    """Strip the quotes (and unescape) of a TOML basic/literal-string key; bare keys pass
+    through."""
     if len(key) >= 2 and key.startswith('"') and key.endswith('"'):
         return re.sub(r'\\(.)', r'\1', key[1:-1])
+    if len(key) >= 2 and key.startswith("'") and key.endswith("'"):
+        return key[1:-1]
     return key
+
+
+def _split_toml_key(path: str) -> list[str]:
+    """``'mcp_servers."weird name.v2".env'`` → ``['mcp_servers', 'weird name.v2', 'env']``
+    — a dot-splitter that respects quoted segments (a naive ``split('.')`` would shear a
+    quoted name containing dots)."""
+    parts: list[str] = []
+    i, n = 0, len(path)
+    while i < n:
+        while i < n and path[i] in " \t":
+            i += 1
+        if i >= n:
+            break
+        if path[i] in "\"'":
+            quote = path[i]
+            buf = []
+            j = i + 1
+            while j < n:
+                c = path[j]
+                if quote == '"' and c == "\\" and j + 1 < n:
+                    buf.append(path[j + 1])
+                    j += 2
+                    continue
+                if c == quote:
+                    break
+                buf.append(c)
+                j += 1
+            parts.append("".join(buf))
+            i = j + 1
+        else:
+            j = i
+            while j < n and path[j] not in ". \t":
+                j += 1
+            parts.append(path[i:j])
+            i = j
+        while i < n and path[i] in " \t":
+            i += 1
+        if i < n and path[i] == ".":
+            i += 1
+    return parts
+
+
+def _parse_config_mcp_names(home: str) -> list[str]:
+    """Fallback enumerator when `codex mcp list` can't answer: server names in the
+    *top-level* ``mcp_servers`` table of config.toml — and nothing else. Profiles don't
+    contribute: 0.140.0 rejects the legacy ``profile = "x"`` config key outright ("no
+    longer supported; use --profile"), the harness never passes ``--profile``, and
+    ``[profiles.*]`` tables are ignored when inactive (all verified) — while disabling a
+    name codex doesn't load breaks the run (see _mcp_disable_args). Best-effort:
+    unreadable/unparseable config yields [] (codex itself fails on such a config
+    anyway)."""
+    try:
+        with open(os.path.join(home, "config.toml"), "rb") as f:
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    if tomllib is not None:
+        try:
+            servers = tomllib.loads(text).get("mcp_servers")
+        except tomllib.TOMLDecodeError:
+            return []
+        return sorted(str(k) for k in servers) if isinstance(servers, dict) else []
+    return sorted(_scan_toml_mcp_names(text))  # pragma: no cover — Python 3.10 path,
+                                               # forced in selftest by nulling tomllib
+
+
+def _collect_scanned_path(path: list[str], line: str, names: set) -> None:
+    """Given a fully-qualified key path (table header + assignment key), record the
+    top-level server name it addresses (``mcp_servers.<name>…``). A path ending AT
+    ``mcp_servers`` with an inline-table value contributes that table's keys."""
+    if path[:1] != ["mcp_servers"]:
+        return
+    if len(path) > 1:
+        names.add(path[1])
+        return
+    # `mcp_servers = { alpha = {...}, beta = {...} }` — single-line inline table
+    brace = line.find("{")
+    if brace != -1:
+        names.update(_inline_table_keys(line[brace + 1:]))
+
+
+def _inline_table_keys(body: str) -> list[str]:
+    """Top-level keys of a TOML inline table (text after its opening brace) — depth-tracked
+    so keys of nested tables (an ``env = {…}`` inside a server) don't read as server
+    names."""
+    keys: list[str] = []
+    depth, i, n = 1, 0, len(body)
+    at_key = True  # positioned where a key may start: table start, or after a depth-1 comma
+    while i < n and depth > 0:
+        if at_key and depth == 1:
+            m = _INLINE_ONEKEY_RE.match(body, i)
+            if m:
+                keys.append(_unquote_toml_key(m.group(1)))
+                i = m.end()
+                at_key = False
+                continue
+        c = body[i]
+        if c in "\"'":
+            quote = c
+            i += 1
+            while i < n:
+                if quote == '"' and body[i] == "\\":
+                    i += 2
+                    continue
+                if body[i] == quote:
+                    break
+                i += 1
+        elif c in "{[":
+            depth += 1
+        elif c in "}]":
+            depth -= 1
+        elif c == "," and depth == 1:
+            at_key = True
+        i += 1
+    return keys
+
+
+def _scan_toml_mcp_names(text: str) -> set[str]:
+    """Line-based TOML scan for the no-tomllib fallback: tracks the current table header
+    and resolves each assignment's dotted key against it, so ``[mcp_servers.a]`` headers,
+    top-level ``mcp_servers.a = {…}`` dotted assignments (valid TOML codex loads — a bare
+    header regex misses it), and inline tables all land, while the same shapes under a
+    ``[profiles.<p>]`` section (not loaded without --profile) don't."""
+    names: set[str] = set()
+    current: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            header = line.lstrip("[").split("]")[0].strip()
+            current = _split_toml_key(header)
+            _collect_scanned_path(current, "", names)
+            continue
+        m = _KEY_PATH_RE.match(line)
+        if m:
+            _collect_scanned_path(current + _split_toml_key(m.group(1)), line, names)
+    return names
 
 
 def _codex_changed_paths(item: dict) -> list[str]:
