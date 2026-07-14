@@ -513,7 +513,7 @@ def cmd_run(args) -> int:
     if isolated:
         managed = {"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
                    "XDG_CACHE_HOME", "XDG_STATE_HOME"}
-        managed.update(v for v, _ in getattr(get_adapter(agent), "isolation_config_homes", []))
+        managed.update(v for v, *_ in getattr(get_adapter(agent), "isolation_config_homes", []))
         for s in specs:
             clash = sorted(set(s.env) & managed)
             if clash:

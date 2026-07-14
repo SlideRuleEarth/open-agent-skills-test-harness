@@ -21,6 +21,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from ..isolation import build_mcp_masked_home
 from ..schema import NormalizedEvent
 
 
@@ -88,18 +89,25 @@ class Adapter(ABC):
     # packages that can each carry a nested skills/ — a second, independent skill-discovery
     # channel some CLIs support (e.g. AntiGravity's `.gemini/config/plugins`).
     global_plugin_registry_subpaths: list[str] = []
-    # Env vars that redirect this agent's config/home away from $HOME, as
-    # (env var, skills-subdir within that home) — e.g. ("CODEX_HOME", "skills"). Under
-    # isolation a *set* one is mirrored into the isolated home (skills masked) and repointed,
-    # so custom config homes keep their auth/config; if it can't be mirrored it is cleared so
-    # it can't read the real skills and bypass isolation.
-    isolation_config_homes: list[tuple[str, str]] = []
-    # HOME-relative config *files* the isolation overlay materializes with neutral content
-    # ("{}") instead of symlinking — the wholesale HOME symlinks otherwise pass the user's
-    # real MCP-server config straight into "hermetic" runs (e.g. ~/.copilot/mcp-config.json).
-    # Only adapters whose CLI lacks a flag-level MCP kill-switch need one; masks apply only
-    # under isolation.
-    isolation_config_masks: list[str] = []
+    # Env vars that redirect this agent's config/home away from $HOME, as (env var,
+    # HOME-relative dir it stands in for, skills-subdir within that home or None) — e.g.
+    # ("CODEX_HOME", ".codex", "skills"). Under isolation a *set* one is mirrored into the
+    # isolated home (skills + config masks applied, masks re-rooted via the stand-in dir)
+    # and repointed, so custom config homes keep their auth/config; if it can't be mirrored
+    # it is cleared so it can't read the real skills/config and bypass isolation.
+    isolation_config_homes: list[tuple[str, str, Optional[str]]] = []
+    # HOME-relative config paths the isolation overlay materializes instead of symlinking,
+    # mapped to neutral content ("{}" = declare no MCP servers; None = an empty directory) —
+    # the wholesale HOME symlinks otherwise pass the user's real MCP-server config straight
+    # into "hermetic" runs (e.g. ~/.copilot/mcp-config.json). Applied by the runner's
+    # isolation overlay AND by the mask-only overlay probes/judge runs get
+    # (isolation.build_mcp_masked_home). Adapters with a working flag-level kill-switch
+    # (claude --strict-mcp-config, codex per-server disables) don't need one.
+    isolation_config_masks: dict[str, Optional[str]] = {}
+    # File names materialized (with the given content) inside every plugin of every
+    # global_plugin_registry_subpaths dir — plugins can carry their own MCP configs
+    # (e.g. agy's plugins/<name>/mcp_config.json), a server-discovery channel of their own.
+    plugin_registry_config_masks: dict[str, str] = {}
 
     supports_output_schema: bool = False
     # True if build_argv maps RunOptions.reasoning_effort onto a native flag/config of this
@@ -131,14 +139,28 @@ class Adapter(ABC):
         """Probe whether the CLI accepts *model*.
 
         Returns a ProbeResult with acceptance status and cost information
-        extracted from the CLI's output.
+        extracted from the CLI's output. Probes inherit the real environment except for
+        MCP hermeticity: an adapter with config masks gets a throwaway mask-only HOME
+        overlay (auth/config/skills pass through; MCP configs neutralized), so probing
+        models never launches the user's real MCP servers.
         """
         argv = self._probe_argv(model)
         if not argv:
             return ProbeResult(accepted=True)
+        env = None
+        masked_home, iso_env = None, {}
+        try:
+            masked_home, iso_env = build_mcp_masked_home(self)
+        except OSError as exc:
+            import sys
+            print(f"warning: [{self.name}] could not build the MCP-masking overlay for a "
+                  f"model probe ({exc}); probing with the real HOME.", file=sys.stderr)
+        if masked_home:
+            env = self.env(dict(os.environ),
+                           RunOptions(home=masked_home, isolation_env=iso_env))
         try:
             r = subprocess.run(
-                argv, capture_output=True, text=True,
+                argv, capture_output=True, text=True, env=env,
                 timeout=timeout, stdin=subprocess.DEVNULL,
             )
             combined = r.stderr + r.stdout
@@ -150,6 +172,9 @@ class Adapter(ABC):
             return self._parse_probe_cost(combined)
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return ProbeResult(accepted=False)
+        finally:
+            if masked_home:
+                shutil.rmtree(masked_home, ignore_errors=True)
 
     def _parse_probe_cost(self, output: str) -> ProbeResult:
         """Extract cost info from probe output. Override per adapter."""
@@ -226,7 +251,7 @@ class Adapter(ABC):
         env["USERPROFILE"] = opts.home
         for k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
             env.pop(k, None)
-        for var, _skills_sub in self.isolation_config_homes:
+        for var, _replaces, _skills_sub in self.isolation_config_homes:
             if var in (opts.isolation_env or {}):
                 env[var] = opts.isolation_env[var]   # repoint at the isolated mirror
             else:

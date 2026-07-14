@@ -33,6 +33,8 @@ Verified against copilot 1.0.63 on 2026-06-22.
 
 from __future__ import annotations
 
+import json
+import os
 from typing import Any, Optional
 
 from ..schema import EventKind, NormalizedEvent
@@ -55,17 +57,47 @@ _KNOWN_USAGE_KEYS = {
     "premiumRequests", "totalApiDurationMs", "sessionDurationMs", "codeChanges",
 }
 
+# Workspace-level MCP config files copilot discovers, checked in the run cwd and every
+# ancestor (copilot walks up, like git-root discovery — verified in the 1.0.64 bundle).
+_WORKSPACE_MCP_FILES = (".mcp.json", ".github/mcp.json", ".vscode/mcp.json")
+
+
+def _mcp_server_names(path: str) -> list[str]:
+    """Server names declared in one MCP config JSON — ``{"mcpServers": {...}}`` (copilot's
+    user/workspace format) or ``{"servers": {...}}`` (the .vscode/mcp.json format).
+    Unreadable or invalid → [] (copilot would reject such a file too)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    names: list[str] = []
+    if isinstance(data, dict):
+        for key in ("mcpServers", "servers"):
+            block = data.get(key)
+            if isinstance(block, dict):
+                names.extend(str(k) for k in block)
+    return names
+
 
 class CopilotAdapter(Adapter):
     name = "copilot"
     binary = "copilot"
     skills_subdir = ".agents/skills"
     global_skills_subpaths = [".agents/skills"]
-    # The user's real ~/.copilot/mcp-config.json loads through the symlinked HOME in every
-    # run — `--disable-builtin-mcps` (below) only disables the bundled GitHub server, and no
-    # "ignore user mcp-config" flag exists — so isolation materializes it as an empty config
-    # instead (DESIGN_MCP_Support.md, Phase 0). Non-isolated runs still leak it.
-    isolation_config_masks = [".copilot/mcp-config.json"]
+    # MCP hermeticity (DESIGN_MCP_Support.md, Phase 0) — copilot has no "ignore user MCP
+    # config" flag (`--disable-builtin-mcps` below only covers the bundled GitHub server),
+    # and servers come from several places: ~/.copilot/mcp-config.json, installed plugins
+    # (each plugin's definition can declare mcpServers), and workspace configs. Isolation
+    # masks the first two (mcp-config.json → "{}", installed-plugins/ → empty dir — plugin
+    # skills/agents are unavailable in isolated runs as a consequence); _mcp_disable_args
+    # additionally disables every *enumerable* server by name on argv, which also covers
+    # probes, judge runs, and non-isolated runs (where plugins remain a documented gap).
+    isolation_config_masks = {".copilot/mcp-config.json": "{}",
+                              ".copilot/installed-plugins": None}
+    # COPILOT_HOME replaces ~/.copilot wholesale (verified in 1.0.64's bundle) — without
+    # mirroring it, a set var would bypass both masks above.
+    isolation_config_homes = [("COPILOT_HOME", ".copilot", None)]
     # `--reasoning-effort <level>` (verified 2026-07-08: choices none|low|medium|high|
     # xhigh|max — the harness only passes the typed cross-runner subset low|medium|high).
     supports_reasoning_effort = True
@@ -82,7 +114,34 @@ class CopilotAdapter(Adapter):
 
     def _probe_argv(self, model: str):
         return [self.binary, "-p", "say ok", *self._HERMETIC,
+                *self._mcp_disable_args(os.getcwd()),
                 "--model", model, "--output-format", "json", "--allow-all"]
+
+    def _mcp_disable_args(self, cwd: Optional[str]) -> list[str]:
+        """``--disable-mcp-server <name>`` for every enumerable server: the user config
+        ($COPILOT_HOME else ~/.copilot, mcp-config.json) plus the workspace configs copilot
+        discovers from the run cwd upward. Riding on argv makes this cover every invocation
+        the same way — cells (including a scenario-seeded workspace config), model probes,
+        judge runs, and non-isolated runs — with the isolation masks as the second layer.
+        Plugin-declared servers can't be enumerated here (their names live inside each
+        plugin's definition); those are covered by the installed-plugins isolation mask and
+        remain a documented gap for non-isolated runs."""
+        home = os.environ.get("COPILOT_HOME") or os.path.join(os.path.expanduser("~"),
+                                                              ".copilot")
+        names = _mcp_server_names(os.path.join(home, "mcp-config.json"))
+        if cwd:
+            d = os.path.abspath(cwd)
+            while True:
+                for rel in _WORKSPACE_MCP_FILES:
+                    names.extend(_mcp_server_names(os.path.join(d, *rel.split("/"))))
+                parent = os.path.dirname(d)
+                if parent == d:
+                    break
+                d = parent
+        args: list[str] = []
+        for name in dict.fromkeys(names):  # de-dupe, keep order
+            args += ["--disable-mcp-server", name]
+        return args
 
     def _parse_probe_cost(self, output: str) -> ProbeResult:
         import json as _json
@@ -102,7 +161,8 @@ class CopilotAdapter(Adapter):
         return f"/{skill}"
 
     def build_argv(self, prompt: str, opts: RunOptions, *, cwd: str) -> list[str]:
-        argv = [self.binary, "-p", prompt, *self._HERMETIC, "--output-format", "json"]
+        argv = [self.binary, "-p", prompt, *self._HERMETIC,
+                *self._mcp_disable_args(cwd), "--output-format", "json"]
         if opts.auto_approve:
             argv += ["--allow-all"]
         if opts.model:

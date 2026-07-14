@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import sys
 import tempfile
 from typing import Any, Optional
 
@@ -31,6 +33,7 @@ from dataclasses import dataclass
 from .adapters import get_adapter
 from .adapters.base import RunOptions
 from .exec import ExecResult, execute
+from .isolation import build_mcp_masked_home
 from .schema import RunResult
 from .workspace_view import (
     JUDGE_MAX_FILES,
@@ -110,12 +113,30 @@ class Judge:
                 disable_tools=True,
             )
 
-        with tempfile.TemporaryDirectory(prefix="judge-") as tmp:
-            ex = execute(
-                self.adapter, prompt, opts,
-                cwd=tmp, timeout=self.timeout,
-                agent_name=f"judge:{self.agent}", eval_name=getattr(spec, "name", ""),
-            )
+        # Judge runs execute against the real HOME (they need the CLI's real auth/config,
+        # and grade no skills) — but MCP must stay hermetically off here like everywhere
+        # else, so a judge on a runner whose MCP-off depends on config masks gets a
+        # mask-only overlay (isolation.build_mcp_masked_home). Tool-free judging alone
+        # doesn't cover it: MCP servers are launched at session start regardless.
+        masked_home, iso_env = None, {}
+        try:
+            masked_home, iso_env = build_mcp_masked_home(self.adapter)
+        except OSError as exc:
+            print(f"warning: [judge:{self.agent}] could not build the MCP-masking overlay "
+                  f"({exc}); judging with the real HOME.", file=sys.stderr)
+        if masked_home:
+            opts.home = masked_home
+            opts.isolation_env = iso_env
+        try:
+            with tempfile.TemporaryDirectory(prefix="judge-") as tmp:
+                ex = execute(
+                    self.adapter, prompt, opts,
+                    cwd=tmp, timeout=self.timeout,
+                    agent_name=f"judge:{self.agent}", eval_name=getattr(spec, "name", ""),
+                )
+        finally:
+            if masked_home:
+                shutil.rmtree(masked_home, ignore_errors=True)
         verdict = _coerce_verdict(ex.result, rubric)
         return JudgeResult(verdict=verdict, exec_result=ex)
 

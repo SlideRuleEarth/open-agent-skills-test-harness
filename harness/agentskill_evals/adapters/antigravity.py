@@ -104,7 +104,13 @@ class AntigravityAdapter(Adapter):
     # file, which the overlay would otherwise pass through as a symlink to the user's real
     # one (.gemini/config/ is a real dir in the overlay, being an ancestor of the skills
     # leaf above), so isolation materializes it as `{}` (DESIGN_MCP_Support.md, Phase 0).
-    isolation_config_masks = [".gemini/config/mcp_config.json"]
+    isolation_config_masks = {".gemini/config/mcp_config.json": "{}"}
+    # Plugins are an MCP channel of their own — "MCP Servers defined in
+    # plugins/<name>/mcp_config.json" (agy 1.1.1 embedded plugin docs) — so the registry
+    # overlay materializes that file as `{}` inside every plugin. With no flag-level
+    # kill-switch, isolation is the ONLY MCP-off mechanism on this runner: non-isolated
+    # runs can't be made hermetic (the runner warns) and an overlay failure fails closed.
+    plugin_registry_config_masks = {"mcp_config.json": "{}"}
 
     # supports_reasoning_effort stays False: agy has no effort flag — thinking budget is
     # encoded in the model id's tier suffix instead (e.g. gemini-3.5-flash-medium, see

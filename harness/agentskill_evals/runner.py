@@ -31,7 +31,7 @@ from .adapters import get_adapter
 from .adapters.base import RunOptions
 from .assertions import AssertionContext, AssertionResult, run_assertion
 from .exec import execute
-from .isolation import build_isolated_home
+from .isolation import build_isolated_home, reroot_config_masks
 from .judge import Judge
 from .progress import Progress
 from .schema import EventKind, RunResult
@@ -161,6 +161,14 @@ class Runner:
 
     def run(self, specs: list[EvalSpec]) -> list[CellResult]:
         os.makedirs(self.run_dir, exist_ok=True)
+        if not self.isolated and (getattr(self.adapter, "isolation_config_masks", None)
+                                  or getattr(self.adapter, "plugin_registry_config_masks", None)):
+            # This runner's MCP-off guarantee lives in the isolation overlay's config masks
+            # (it has no complete CLI-level kill-switch) — surface the exposure once, up
+            # front, instead of letting a non-isolated run silently load real MCP servers.
+            print(f"warning: [{self.agent}] running with isolation off — the user's real "
+                  f"MCP configuration (user config/plugins) is NOT masked on this runner; "
+                  f"MCP hermeticity is not guaranteed for this run.", file=sys.stderr)
         cells = [
             (target, spec)
             for spec in specs
@@ -298,11 +306,13 @@ class Runner:
         # relocation above): this tracks whether THIS cell's HOME-overlay skill masking actually
         # succeeded, which can independently fail (e.g. no symlink privileges) and fall back.
         home_isolated = False
-        # Config-file masks neutralize per-user config the overlay's wholesale symlinks would
+        # Config masks neutralize per-user config the overlay's wholesale symlinks would
         # otherwise pass through — today that's MCP server configs ("{}" = declare no
-        # servers), keeping runs hermetically MCP-off (DESIGN_MCP_Support.md, Phase 0).
-        cfg_masks = {p: "{}" for p in getattr(adapter, "isolation_config_masks", [])}
-        if self.isolated and (adapter.global_skills_subpaths or cfg_masks):
+        # servers; None = empty dir), keeping runs hermetically MCP-off
+        # (DESIGN_MCP_Support.md, Phase 0).
+        cfg_masks = dict(getattr(adapter, "isolation_config_masks", {}) or {})
+        plugin_cfg_masks = dict(getattr(adapter, "plugin_registry_config_masks", {}) or {})
+        if self.isolated and (adapter.global_skills_subpaths or cfg_masks or plugin_cfg_masks):
             iso_home = tempfile.mkdtemp(prefix="ase-home-")
             seed_dirs = declared_dirs if self.provision else []
             try:
@@ -312,19 +322,38 @@ class Runner:
                     plugin_registry_subpaths=getattr(adapter, "global_plugin_registry_subpaths", []),
                     repo_root=self._repo_root,
                     config_file_masks=cfg_masks,
+                    plugin_config_masks=plugin_cfg_masks,
                 )
                 cfg_root = None
-                for var, skills_sub in getattr(adapter, "isolation_config_homes", []):
+                for var, replaces, skills_sub in getattr(adapter, "isolation_config_homes", []):
                     custom = os.environ.get(var)
                     if custom and os.path.isdir(custom):
                         if cfg_root is None:
                             cfg_root = tempfile.mkdtemp(prefix="cfg-", dir=iso_home)
                         mirror = os.path.join(cfg_root, _safe(var))
-                        build_isolated_home(mirror, [skills_sub], self._repo_skill_names,
-                                            seed_dirs, custom, repo_root=self._repo_root)
+                        # the custom home stands in for one HOME subdir (e.g. $COPILOT_HOME
+                        # for ~/.copilot), so the masks under that subdir apply inside it —
+                        # otherwise pointing the var elsewhere would bypass them.
+                        build_isolated_home(mirror, [skills_sub] if skills_sub else [],
+                                            self._repo_skill_names,
+                                            seed_dirs, custom, repo_root=self._repo_root,
+                                            config_file_masks=reroot_config_masks(
+                                                cfg_masks, replaces))
                         iso_env[var] = mirror
                 home_isolated = True
             except OSError as exc:
+                if cfg_masks or plugin_cfg_masks:
+                    # This runner's MCP hermeticity lives in the overlay (no CLI-level
+                    # kill-switch) — running against the real HOME would load the user's
+                    # real MCP servers, so fail this cell instead of falling open. An
+                    # explicit `isolated: false` run is the documented opt-out.
+                    shutil.rmtree(iso_home, ignore_errors=True)
+                    raise RuntimeError(
+                        f"HOME-overlay isolation failed ({exc}) and {self.agent} depends "
+                        f"on it to keep MCP hermetically off — failing closed rather than "
+                        f"running with the user's real MCP servers loaded. Run with "
+                        f"isolated: false to explicitly accept a non-hermetic run."
+                    ) from exc
                 print(f"warning: [{self.agent}] skill isolation unavailable ({exc}); "
                       "running non-isolated.", file=sys.stderr)
                 shutil.rmtree(iso_home, ignore_errors=True)

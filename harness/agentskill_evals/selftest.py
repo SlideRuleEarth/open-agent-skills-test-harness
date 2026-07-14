@@ -159,6 +159,16 @@ def _check_isolation(failures, verbose):
         open(os.path.join(real, ".copilot", "config.json"), "w").close()
         with open(os.path.join(real, ".gemini", "config", "mcp_config.json"), "w") as fh:
             fh.write(user_mcp)
+        # installed plugins can carry MCP servers of their own: copilot's whole
+        # installed-plugins dir is neutralized as an empty-dir mask; agy's per-plugin
+        # mcp_config.json is masked inside the plugin registry overlay.
+        os.makedirs(os.path.join(real, ".copilot", "installed-plugins", "mkt", "some-plugin"))
+        with open(os.path.join(real, ".copilot", "installed-plugins", "mkt", "some-plugin",
+                               "plugin.json"), "w") as fh:
+            fh.write('{"mcpServers":{"plug":{"command":"evil"}}}')
+        with open(os.path.join(real, ".gemini", "config", "plugins", "repo-skills-plugin",
+                               "mcp_config.json"), "w") as fh:
+            fh.write(user_mcp)
         # the cell declares only skill-alpha (its source lives outside HOME, like skills_root)
         os.makedirs(os.path.join(declared_root, "skill-alpha"))
         # stale installs the name-based mask can't catch: a symlink into the checkout under a
@@ -181,8 +191,10 @@ def _check_isolation(failures, verbose):
             plugin_registry_subpaths=[".gemini/config/plugins"],
             repo_root=repo_checkout,
             config_file_masks={".copilot/mcp-config.json": "{}",
+                               ".copilot/installed-plugins": None,   # dir mask
                                ".gemini/config/mcp_config.json": "{}",
                                ".missing-cli/mcp.json": "{}"},  # real file absent
+            plugin_config_masks={"mcp_config.json": "{}"},
         )
 
         skills = os.path.join(dest, ".codex", "skills")
@@ -278,6 +290,42 @@ def _check_isolation(failures, verbose):
                and open(os.path.join(real, ".gemini", "config",
                                      "mcp_config.json")).read() == user_mcp,
                "the real HOME's MCP configs are never modified", failures, verbose)
+        plug_dir_mask = os.path.join(dest, ".copilot", "installed-plugins")
+        _check("isolation.mcp_dir_mask",
+               os.path.isdir(plug_dir_mask) and not os.path.islink(plug_dir_mask)
+               and os.listdir(plug_dir_mask) == [],
+               "a None-content mask materializes an empty real dir (installed plugins — "
+               "and their MCP servers — are gone)", failures, verbose)
+        _check("isolation.mcp_dir_mask_source_untouched",
+               os.path.isfile(os.path.join(real, ".copilot", "installed-plugins", "mkt",
+                                           "some-plugin", "plugin.json")),
+               "the real installed-plugins content is never modified", failures, verbose)
+        plug_mcp = os.path.join(dest, ".gemini", "config", "plugins",
+                                "repo-skills-plugin", "mcp_config.json")
+        _check("isolation.plugin_mcp_config_masked",
+               os.path.isfile(plug_mcp) and not os.path.islink(plug_mcp)
+               and open(plug_mcp).read() == "{}"
+               and open(os.path.join(real, ".gemini", "config", "plugins",
+                                     "repo-skills-plugin",
+                                     "mcp_config.json")).read() == user_mcp,
+               "a plugin's own mcp_config.json is masked inside the registry overlay; the "
+               "real one is untouched", failures, verbose)
+
+        # traversing/absolute mask paths must be rejected — the mask is opened O_TRUNC at
+        # the joined path, so '..' would clobber a file outside the overlay.
+        bad_dest = tempfile.mkdtemp(prefix="ase-badmask-")
+        try:
+            for bad in ("../evil.json", "/etc/evil.json", ".copilot/../../evil.json"):
+                try:
+                    build_isolated_home(bad_dest, [], (), (), real,
+                                        config_file_masks={bad: "{}"})
+                    ok = False
+                except ValueError:
+                    ok = True
+                _check(f"isolation.mask_path_rejected[{bad}]", ok,
+                       f"mask path {bad!r} raises ValueError", failures, verbose)
+        finally:
+            shutil.rmtree(bad_dest, ignore_errors=True)
 
         # config mirrors must use a fresh temp dir, not dest/_cfg — which is a symlink to the
         # real HOME's _cfg here, so writing through it would escape the temp tree.
@@ -762,7 +810,7 @@ def _check_workspace_relocation(failures, verbose):
     # the HOME overlay: the MCP kill-switch can't depend on an adapter also declaring
     # skills paths.
     class _MaskingFakeAdapter(_FakeAdapter):
-        isolation_config_masks = [".fakecli/mcp.json"]
+        isolation_config_masks = {".fakecli/mcp.json": "{}"}
 
     runner_mod.execute = _fake_execute
     try:
@@ -812,6 +860,235 @@ def _check_workspace_relocation(failures, verbose):
                f"tempdir: {rp}", failures, verbose)
     finally:
         runner_mod.execute = orig_execute
+        shutil.rmtree(repo_root, ignore_errors=True)
+
+
+def _check_mcp_hermetic_paths(failures, verbose):
+    """MCP hermeticity must hold on every execution path, not just successful isolated
+    Runner cells (the Phase-0 review's finding 5): (1) build_mcp_masked_home neutralizes
+    the MCP configs — including per-plugin ones and a custom config-home env var — while
+    passing everything else through; (2) model probes run against that mask-only overlay;
+    (3) judge runs get the same overlay; (4) an overlay build failure on a runner whose
+    MCP-off depends on it fails the cell CLOSED instead of executing with the real HOME
+    (while runners with a CLI-level kill-switch keep the graceful non-isolated fallback)."""
+    import os
+    import shutil
+    import sys
+    import tempfile
+
+    from .adapters.base import Adapter, ParseOutput, ProbeResult
+    from .isolation import build_mcp_masked_home
+
+    print("MCP hermetic paths (masked-home overlay, probes, judge, fail-closed):")
+
+    # --- 1) build_mcp_masked_home against a fake real HOME + custom config home ---------
+    real = tempfile.mkdtemp(prefix="ase-mcpreal-")
+    custom = tempfile.mkdtemp(prefix="ase-mcpcustom-")
+    home = None
+    old_var = os.environ.get("FAKECLI_HOME")
+    try:
+        os.makedirs(os.path.join(real, ".fakecli", "plugins", "p1"))
+        with open(os.path.join(real, ".fakecli", "mcp.json"), "w") as fh:
+            fh.write('{"mcpServers":{"leaky":{}}}')
+        with open(os.path.join(real, ".fakecli", "plugins", "p1", "mcp_config.json"), "w") as fh:
+            fh.write('{"mcpServers":{"plug":{}}}')
+        open(os.path.join(real, ".fakecli", "plugins", "p1", "plugin.json"), "w").close()
+        open(os.path.join(real, ".fakecli", "auth.json"), "w").close()
+        with open(os.path.join(custom, "mcp.json"), "w") as fh:
+            fh.write('{"mcpServers":{"custom-leaky":{}}}')
+        open(os.path.join(custom, "auth.json"), "w").close()
+
+        class _MaskedCli:
+            isolation_config_masks = {".fakecli/mcp.json": "{}"}
+            plugin_registry_config_masks = {"mcp_config.json": "{}"}
+            global_plugin_registry_subpaths = [".fakecli/plugins"]
+            isolation_config_homes = [("FAKECLI_HOME", ".fakecli", None)]
+
+        os.environ["FAKECLI_HOME"] = custom
+        home, iso_env = build_mcp_masked_home(_MaskedCli(), real_home=real)
+        mask = os.path.join(home, ".fakecli", "mcp.json")
+        plug_mask = os.path.join(home, ".fakecli", "plugins", "p1", "mcp_config.json")
+        _check("mcp_masked_home.global_and_plugin_masked",
+               open(mask).read() == "{}" and not os.path.islink(mask)
+               and open(plug_mask).read() == "{}" and not os.path.islink(plug_mask),
+               "global + per-plugin MCP configs neutralized in the overlay",
+               failures, verbose)
+        _check("mcp_masked_home.everything_else_passes_through",
+               os.path.islink(os.path.join(home, ".fakecli", "auth.json"))
+               and os.path.islink(os.path.join(home, ".fakecli", "plugins", "p1",
+                                               "plugin.json")),
+               "auth/config/plugin metadata still pass through as symlinks",
+               failures, verbose)
+        mirror = iso_env.get("FAKECLI_HOME", "")
+        _check("mcp_masked_home.custom_home_mirrored",
+               bool(mirror) and mirror != custom
+               and open(os.path.join(mirror, "mcp.json")).read() == "{}"
+               and os.path.islink(os.path.join(mirror, "auth.json")),
+               f"a set custom config-home var is mirrored with re-rooted masks, not left "
+               f"pointing at the real config: {iso_env}", failures, verbose)
+
+        class _NoMaskCli:
+            pass
+        none_home, none_env = build_mcp_masked_home(_NoMaskCli(), real_home=real)
+        _check("mcp_masked_home.no_masks_no_overlay",
+               none_home is None and none_env == {},
+               "an adapter without masks gets no overlay (runs against the real HOME)",
+               failures, verbose)
+    finally:
+        if old_var is None:
+            os.environ.pop("FAKECLI_HOME", None)
+        else:
+            os.environ["FAKECLI_HOME"] = old_var
+        for d in (home, real, custom):
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
+
+    # --- 2) probe_model runs inside the mask-only overlay -------------------------------
+    class _ProbeCli(Adapter):
+        name = "probefake"
+        binary = sys.executable
+        isolation_config_masks = {".fakeprobe-mcp/mcp.json": "{}"}
+
+        def _probe_argv(self, model):
+            return [sys.executable, "-c",
+                    "import os; home=os.environ.get('HOME',''); print('PROBEHOME='+home); "
+                    "print('PROBEMASK='+open(os.path.join(home,'.fakeprobe-mcp','mcp.json'))"
+                    ".read())"]
+
+        def _parse_probe_cost(self, output):
+            self.probe_output = output
+            return ProbeResult(accepted=True)
+
+        def build_argv(self, prompt, opts, *, cwd):
+            return []
+
+        def parse(self, stdout, stderr, exit_code, *, opts=None):
+            return ParseOutput()
+
+    probe_cli = _ProbeCli()
+    pr = probe_cli.probe_model("any")
+    out = getattr(probe_cli, "probe_output", "")
+    real_home = os.path.abspath(os.path.expanduser("~"))
+    probed_home = next((ln[len("PROBEHOME="):] for ln in out.splitlines()
+                        if ln.startswith("PROBEHOME=")), "")
+    _check("mcp_probe.masked_home",
+           pr.accepted and "PROBEMASK={}" in out
+           and probed_home and os.path.abspath(probed_home) != real_home,
+           f"the probe subprocess saw a masked throwaway HOME, not the real one "
+           f"(home={probed_home!r})", failures, verbose)
+    _check("mcp_probe.overlay_cleaned",
+           not probed_home or not os.path.isdir(probed_home),
+           "the probe's mask-only overlay is deleted afterwards", failures, verbose)
+
+    # --- 3) judge runs get the same overlay ---------------------------------------------
+    import agentskill_evals.judge as judge_mod
+    from .exec import ExecResult
+    from .schema import RunResult
+
+    seen: dict = {}
+    orig_execute = judge_mod.execute
+
+    def _fake_judge_execute(adapter, prompt, opts, *, cwd, timeout,
+                            agent_name=None, eval_name="", env_overrides=None):
+        seen["home"] = opts.home
+        if opts.home:
+            p = os.path.join(opts.home, ".copilot", "mcp-config.json")
+            if os.path.isfile(p) and not os.path.islink(p):
+                seen["mask"] = open(p).read()
+        rr = RunResult(agent=agent_name or "judge", eval_name=eval_name, prompt=prompt,
+                       workdir=cwd,
+                       final_text='{"items":[{"behavior":"b","pass":true,'
+                                  '"reason":"ok"}],"summary":"s"}')
+        return ExecResult(result=rr, stdout="", stderr="")
+
+    judge_mod.execute = _fake_judge_execute
+    try:
+        graded_rr = RunResult(agent="copilot", eval_name="e", prompt="p", workdir="/tmp")
+        j = judge_mod.Judge(agent="copilot")
+        ws = tempfile.mkdtemp(prefix="ase-judgews-")
+        try:
+            res = j(result=graded_rr, workdir=ws, spec=EvalSpec(name="e", prompt="p",
+                    source_path="/x.yaml"), rubric=["b"], cfg={})
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+        _check("mcp_judge.masked_home",
+               seen.get("home") and seen.get("mask") == "{}"
+               and res.verdict["items"][0]["pass"] is True,
+               f"a judge on a mask-dependent runner executes with the masked overlay "
+               f"(home={seen.get('home')!r}, mask={seen.get('mask')!r})", failures, verbose)
+        _check("mcp_judge.overlay_cleaned",
+               seen.get("home") and not os.path.isdir(seen["home"]),
+               "the judge's overlay is deleted afterwards", failures, verbose)
+    finally:
+        judge_mod.execute = orig_execute
+
+    # --- 4) overlay failure: fail closed with masks, graceful fallback without ----------
+    import agentskill_evals.runner as runner_mod
+    from .spec import ModelTarget
+
+    repo_root = tempfile.mkdtemp(prefix="ase-repo5-")
+    orig_run_execute = runner_mod.execute
+    orig_build = runner_mod.build_isolated_home
+
+    def _fake_run_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides,
+                          agent_name, eval_name):
+        with open(os.path.join(cwd, "ran.txt"), "w") as f:
+            f.write("ran\n")
+        rr = RunResult(agent=agent_name, eval_name=eval_name, prompt=prompt, workdir=cwd,
+                       final_text="done")
+        return ExecResult(result=rr, stdout="", stderr="")
+
+    def _broken_build(*a, **k):
+        raise OSError("symlinks unavailable")
+
+    class _MaskDependentCli(_FakeAdapter):
+        isolation_config_masks = {".fakecli/mcp.json": "{}"}
+
+    class _SkillsOnlyCli(_FakeAdapter):
+        global_skills_subpaths = [".fakecli/skills"]
+
+    runner_mod.execute = _fake_run_execute
+    runner_mod.build_isolated_home = _broken_build
+    try:
+        def _mk_runner(adapter):
+            run_dir = os.path.join(repo_root, "artifacts", adapter.__class__.__name__)
+            os.makedirs(run_dir, exist_ok=True)
+            r = runner_mod.Runner.__new__(runner_mod.Runner)
+            r.agent, r.adapter, r.targets = "fake", adapter, [ModelTarget()]
+            r.artifacts_root = os.path.join(repo_root, "artifacts")
+            r.run_id, r.skills_root, r.judge = "run1", repo_root, None
+            r.provision, r.command, r.auto_approve = False, "", True
+            r.reasoning_effort = None
+            r.jobs, r.isolated, r.progress = 1, True, None
+            r._repo_skill_names, r.run_dir = set(), run_dir
+            r._repo_root = repo_root
+            return r
+
+        import contextlib
+        import io
+        spec = EvalSpec(name="demo", prompt="hi",
+                        source_path=os.path.join(repo_root, "demo.yaml"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            cell_closed = _mk_runner(_MaskDependentCli())._run_cell(ModelTarget(), spec)
+        _check("mcp_failclosed.mask_dependent_cell_fails",
+               cell_closed.passed is False
+               and "failing closed" in (cell_closed.run_result.error or "")
+               and not os.path.isfile(os.path.join(cell_closed.artifacts_dir,
+                                                   "workspace", "ran.txt")),
+               f"overlay failure on a mask-dependent runner fails the cell without "
+               f"executing the agent: {cell_closed.run_result.error!r}", failures, verbose)
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            cell_open = _mk_runner(_SkillsOnlyCli())._run_cell(ModelTarget(), spec)
+        _check("mcp_failclosed.maskless_fallback_kept",
+               not cell_open.run_result.error
+               and os.path.isfile(os.path.join(cell_open.artifacts_dir,
+                                               "workspace", "ran.txt")),
+               f"a runner without masks keeps the graceful non-isolated fallback "
+               f"(error={cell_open.run_result.error!r})", failures, verbose)
+    finally:
+        runner_mod.execute = orig_run_execute
+        runner_mod.build_isolated_home = orig_build
         shutil.rmtree(repo_root, ignore_errors=True)
 
 
@@ -1937,16 +2214,73 @@ def run_selftest(verbose: bool = False) -> int:
            and "--full-auto" not in cargv and cargv[-1] == "do the task",
            f"non-interactive approval+sandbox before exec, prompt last: {cargv}", failures, verbose)
     # MCP kill-switch (DESIGN_MCP_Support.md Phase 0): the isolated HOME symlinks ~/.codex
-    # wholesale, so without this override any [mcp_servers.*] in the user's real config.toml
-    # would load in every run — and in every model probe.
-    mcp_i = cargv.index("mcp_servers={}") if "mcp_servers={}" in cargv else -1
-    _check("codex.argv_mcp_killswitch",
-           mcp_i > 0 and cargv[mcp_i - 1] == "-c",
-           f"-c mcp_servers={{}} empties the MCP server table on runs: {cargv}",
-           failures, verbose)
-    pargv = get_adapter("codex")._probe_argv("gpt-5.4-mini")
-    _check("codex.probe_mcp_killswitch", "mcp_servers={}" in pargv,
-           f"-c mcp_servers={{}} also passed on model probes: {pargv}", failures, verbose)
+    # wholesale, so any [mcp_servers.*] in the user's real config.toml loads in every run —
+    # and `-c mcp_servers={}` does NOT clear it (verified 0.140.0: -c deep-merges with the
+    # persisted table). Every configured server must be disabled BY NAME, on runs and on
+    # model probes alike. The enumerator is patched so this check never depends on (or
+    # reads) the machine's real ~/.codex.
+    from .adapters.codex import CodexAdapter
+    orig_enum = CodexAdapter._configured_mcp_server_names
+    try:
+        CodexAdapter._configured_mcp_server_names = lambda self: ["user_srv", "other-srv"]
+        kargv = get_adapter("codex").build_argv("do the task", RunOptions(), cwd="/tmp")
+        _check("codex.argv_mcp_killswitch",
+               "mcp_servers.user_srv.enabled=false" in kargv
+               and "mcp_servers.other-srv.enabled=false" in kargv
+               and "mcp_servers={}" not in kargv
+               and kargv[kargv.index("mcp_servers.user_srv.enabled=false") - 1] == "-c",
+               f"every configured server disabled by name (not the ineffective empty-table "
+               f"override): {kargv}", failures, verbose)
+        pargv = get_adapter("codex")._probe_argv("gpt-5.4-mini")
+        _check("codex.probe_mcp_killswitch",
+               "mcp_servers.user_srv.enabled=false" in pargv
+               and "mcp_servers.other-srv.enabled=false" in pargv,
+               f"per-name disables also passed on model probes: {pargv}", failures, verbose)
+        # a name outside codex's own `mcp add` charset can't be addressed by -c dotted
+        # paths; the quoted form is emitted anyway so codex refuses to load its config —
+        # the run fails closed instead of silently starting the server.
+        CodexAdapter._configured_mcp_server_names = lambda self: ["weird name.v2"]
+        import contextlib as _ctx
+        import io as _io
+        _stderr = _io.StringIO()
+        with _ctx.redirect_stderr(_stderr):
+            wargv = get_adapter("codex").build_argv("p", RunOptions(), cwd="/tmp")
+        _check("codex.exotic_mcp_name_fails_closed",
+               'mcp_servers."weird name.v2".enabled=false' in wargv
+               and "fail closed" in _stderr.getvalue(),
+               f"non-bare-key server name → quoted override (codex errors out, fail-closed) "
+               f"+ warning: {wargv}", failures, verbose)
+    finally:
+        CodexAdapter._configured_mcp_server_names = orig_enum
+
+    # the enumerator itself: reads the effective config.toml ($CODEX_HOME else ~/.codex),
+    # including a config-selected profile's layer file and [profiles.*] inline tables.
+    import os
+    import tempfile as _tmp
+    _codex_home = _tmp.mkdtemp(prefix="ase-codexhome-")
+    _old_codex_home = os.environ.get("CODEX_HOME")
+    try:
+        with open(os.path.join(_codex_home, "config.toml"), "w") as fh:
+            fh.write('profile = "work"\n'
+                     'model = "gpt-5.4"\n'
+                     '[mcp_servers.alpha]\ncommand = "echo"\n'
+                     '[mcp_servers."weird name.v2"]\ncommand = "echo"\n'
+                     '[profiles.side.mcp_servers.gamma]\ncommand = "echo"\n')
+        with open(os.path.join(_codex_home, "work.config.toml"), "w") as fh:
+            fh.write('[mcp_servers.beta]\ncommand = "echo"\n')
+        os.environ["CODEX_HOME"] = _codex_home
+        found = get_adapter("codex")._configured_mcp_server_names()
+        _check("codex.mcp_enumeration",
+               found == ["alpha", "beta", "gamma", "weird name.v2"],
+               f"servers found across config.toml, the selected profile's layer file, and "
+               f"[profiles.*] tables: {found}", failures, verbose)
+    finally:
+        if _old_codex_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = _old_codex_home
+        import shutil as _sh
+        _sh.rmtree(_codex_home, ignore_errors=True)
     sf = EvalSpec(name="t", prompt="p", source_path="/r/skill/evals/e.yaml",
                   files=["a.json", "fixtures/in.json", {"x/a.json": "data/a.json"},
                          "../esc.json",
@@ -2037,12 +2371,54 @@ def run_selftest(verbose: bool = False) -> int:
     _check("copilot.no_output_schema",
            not get_adapter("copilot").supports_output_schema,
            "copilot has no native output schema support", failures, verbose)
-    # copilot has no "ignore user mcp-config" flag (--disable-builtin-mcps only covers the
-    # bundled GitHub server) — the mask is its only MCP kill-switch (design, Phase 0).
+    # copilot has no "ignore user MCP config" flag (--disable-builtin-mcps only covers the
+    # bundled GitHub server) and loads servers from the user config, installed plugins, AND
+    # workspace configs — masks cover the first two under isolation; COPILOT_HOME must be
+    # mirrored or a set var bypasses both (design, Phase 0).
     _check("copilot.mcp_config_mask_declared",
-           get_adapter("copilot").isolation_config_masks == [".copilot/mcp-config.json"],
-           "copilot declares its user mcp-config.json for isolation masking",
+           get_adapter("copilot").isolation_config_masks
+           == {".copilot/mcp-config.json": "{}", ".copilot/installed-plugins": None}
+           and get_adapter("copilot").isolation_config_homes
+           == [("COPILOT_HOME", ".copilot", None)],
+           "copilot masks user mcp-config.json + installed-plugins and mirrors COPILOT_HOME",
            failures, verbose)
+
+    # --disable-mcp-server enumeration: user config ($COPILOT_HOME else ~/.copilot) plus
+    # the workspace .mcp.json/.github/mcp.json/.vscode/mcp.json copilot discovers from the
+    # run cwd UPWARD (it walks ancestors) — this is what covers probes, judge runs,
+    # non-isolated runs, and scenario-seeded workspace configs.
+    import json as _json
+    _cop_home = _tmp.mkdtemp(prefix="ase-cophome-")
+    _cop_ws_root = _tmp.mkdtemp(prefix="ase-copws-")
+    _old_cop_home = os.environ.get("COPILOT_HOME")
+    try:
+        with open(os.path.join(_cop_home, "mcp-config.json"), "w") as fh:
+            _json.dump({"mcpServers": {"user-srv": {"command": "echo"}}}, fh)
+        ws = os.path.join(_cop_ws_root, "nested", "ws")
+        os.makedirs(os.path.join(ws, ".github"))
+        os.makedirs(os.path.join(ws, ".vscode"))
+        with open(os.path.join(ws, ".mcp.json"), "w") as fh:
+            _json.dump({"mcpServers": {"ws-srv": {}}}, fh)
+        with open(os.path.join(ws, ".github", "mcp.json"), "w") as fh:
+            _json.dump({"mcpServers": {"gh-srv": {}}}, fh)
+        with open(os.path.join(ws, ".vscode", "mcp.json"), "w") as fh:
+            _json.dump({"servers": {"vsc-srv": {}}}, fh)   # the .vscode key spelling
+        with open(os.path.join(_cop_ws_root, ".mcp.json"), "w") as fh:
+            _json.dump({"mcpServers": {"ancestor-srv": {}}}, fh)
+        os.environ["COPILOT_HOME"] = _cop_home
+        dargv = get_adapter("copilot").build_argv("do it", RunOptions(), cwd=ws)
+        disabled = [dargv[i + 1] for i, a in enumerate(dargv) if a == "--disable-mcp-server"]
+        _check("copilot.mcp_disable_enumeration",
+               {"user-srv", "ws-srv", "gh-srv", "vsc-srv", "ancestor-srv"} <= set(disabled),
+               f"user + workspace + ancestor servers all disabled by name: {disabled}",
+               failures, verbose)
+    finally:
+        if _old_cop_home is None:
+            os.environ.pop("COPILOT_HOME", None)
+        else:
+            os.environ["COPILOT_HOME"] = _old_cop_home
+        _sh.rmtree(_cop_home, ignore_errors=True)
+        _sh.rmtree(_cop_ws_root, ignore_errors=True)
 
     # A _FILE_TOOLS write must be counted ONCE by file_paths_touched(), not twice — Copilot
     # emits both a TOOL_CALL and a FILE_CHANGE for the same write, and file_paths_touched() reads
@@ -2089,12 +2465,15 @@ def run_selftest(verbose: bool = False) -> int:
 
     out = get_adapter("antigravity").parse(ANTIGRAVITY_RAW, "", 0)
     _check("antigravity.raw.final", out.final_text == ANTIGRAVITY_RAW, repr(out.final_text), failures, verbose)
-    # agy has no MCP flags at all — masking its file-based discovery config is its only MCP
-    # kill-switch (design, Phase 0).
+    # agy has no MCP flags at all — masking its file-based discovery configs (the global
+    # one AND each plugin's own mcp_config.json) is its only MCP kill-switch (design,
+    # Phase 0).
     _check("antigravity.mcp_config_mask_declared",
            get_adapter("antigravity").isolation_config_masks
-           == [".gemini/config/mcp_config.json"],
-           "antigravity declares its mcp_config.json for isolation masking",
+           == {".gemini/config/mcp_config.json": "{}"}
+           and get_adapter("antigravity").plugin_registry_config_masks
+           == {"mcp_config.json": "{}"},
+           "antigravity masks the global mcp_config.json and every plugin's own",
            failures, verbose)
 
     # judge JSON extraction (markdown fences, bare JSON, mixed text)
@@ -2436,6 +2815,8 @@ def run_selftest(verbose: bool = False) -> int:
     # undeclared repo skills read via the real on-disk checkout (workspace-escape leak)
     _check_leaked_skill_reads(failures, verbose)
     _check_workspace_relocation(failures, verbose)
+    # MCP hermeticity on the non-cell paths: masked-home overlay, probes, judge, fail-closed
+    _check_mcp_hermetic_paths(failures, verbose)
     _check_parallel_cell_idx(failures, verbose)
     _check_cell_crash_safety(failures, verbose)
 
