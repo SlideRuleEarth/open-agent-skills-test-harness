@@ -35,6 +35,13 @@ passes through untouched except its nested ``skills/``, which is mask-only (repo
 dropped, nothing re-added — a declared skill is already injected once via the primary skills
 dir above; duplicating it into every unrelated vendor plugin too would be redundant clutter).
 
+A **config-file mask** is a third leaf type: a HOME-relative *file* (e.g.
+``.copilot/mcp-config.json``) materialized as a real file with harness-supplied content
+instead of symlinked. The wholesale pass-through symlinks are exactly how per-user config
+the harness must neutralize — today, MCP server configs — would leak into "hermetic" runs;
+masking the file with ``{}`` (declare no servers) closes that channel while the rest of the
+CLI's config keeps passing through (see DESIGN_MCP_Support.md, Phase 0).
+
 The overlay is built from cheap symlinks — only the small *declared* skills are copied — so a
 35 MB codex log dir costs nothing, and an agent writing inside a declared skill mutates the copy,
 never its source. ``shutil.rmtree`` removes the overlay by unlinking the symlinks (and deleting
@@ -45,13 +52,22 @@ from __future__ import annotations
 
 import os
 import shutil
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 # Sentinels marking a node in the path tree as a leaf (built specially) rather than an
 # ancestor directory to recurse into: a plain *skills directory*, or a *plugin registry*
 # (one level deeper — see module docstring).
 _SKILLS_LEAF = object()
 _PLUGINS_LEAF = object()
+
+
+class _FileMaskLeaf:
+    """Leaf for a *config-file mask* (see module docstring): the node is a single file,
+    written with this content instead of symlinked to the real HOME's copy."""
+    __slots__ = ("content",)
+
+    def __init__(self, content: str):
+        self.content = content
 
 
 def _is_stale_repo_link(path: str, repo_root: Optional[str]) -> bool:
@@ -78,6 +94,7 @@ def build_isolated_home(
     real_home: Optional[str] = None,
     plugin_registry_subpaths: Iterable[str] = (),
     repo_root: Optional[str] = None,
+    config_file_masks: Optional[Mapping[str, str]] = None,
 ) -> str:
     """Build a symlink overlay of ``real_home`` at ``dest_home`` with masked skills dirs.
 
@@ -96,6 +113,10 @@ def build_isolated_home(
         masked even when their name is no longer in ``repo_skill_names`` — stale installs
         of renamed/removed skills (broken symlinks are masked too). None disables the
         target-based check; the name-based mask still applies.
+      config_file_masks: HOME-relative config *file* paths mapped to the content to
+        materialize them with (``"{}"`` to neutralize) instead of symlinking the real
+        file — written even when the real file doesn't exist, so a CLI can never fall
+        back to non-empty defaults (see module docstring).
 
     Raises OSError if a symlink can't be created (e.g. Windows without privilege); the caller
     should fall back to a non-isolated run.
@@ -104,10 +125,13 @@ def build_isolated_home(
     repo_skills = set(repo_skill_names or ())
     declared = [os.path.abspath(d) for d in (declared_skill_dirs or ()) if os.path.isdir(d)]
 
-    # Build a nested tree of "special" paths: name -> subtree(dict) | _SKILLS_LEAF | _PLUGINS_LEAF.
+    # Build a nested tree of "special" paths:
+    # name -> subtree(dict) | _SKILLS_LEAF | _PLUGINS_LEAF | _FileMaskLeaf.
     tree: dict = {}
     _insert_leaf(tree, skills_subpaths, _SKILLS_LEAF)
     _insert_leaf(tree, plugin_registry_subpaths, _PLUGINS_LEAF)
+    for sub, content in (config_file_masks or {}).items():
+        _insert_leaf(tree, [sub], _FileMaskLeaf(content))
 
     os.makedirs(dest_home, exist_ok=True)
     _overlay(real_home, dest_home, tree, repo_skills, declared, repo_root)
@@ -145,6 +169,8 @@ def _overlay(real_dir: str, dst_dir: str, tree: dict,
             _build_skills_dir(real_child, dst_child, repo_skills, declared, repo_root)
         elif node is _PLUGINS_LEAF:
             _mask_plugin_registry_dir(real_child, dst_child, repo_skills, repo_root)
+        elif isinstance(node, _FileMaskLeaf):
+            _write_mask_file(dst_child, node.content)
         else:
             _overlay(real_child, dst_child, node, repo_skills, declared, repo_root)
 
@@ -235,6 +261,16 @@ def _build_skills_dir(real_skills: str, dst_skills: str,
         # never the repo's skill source.
         shutil.copytree(src, os.path.join(dst_skills, name), dirs_exist_ok=True)
         placed.add(name)
+
+
+def _write_mask_file(path: str, content: str) -> None:
+    """Materialize one config-file mask: a real file with the supplied content, never a
+    symlink to the real HOME's copy. 0600 because the same mechanism that neutralizes with
+    ``{}`` today will materialize declared MCP configs — which can carry credentials — in a
+    later phase (DESIGN_MCP_Support.md §4)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(content)
 
 
 def _mask_plugin_registry_dir(real_dir: str, dst_dir: str, repo_skills: set,

@@ -148,6 +148,17 @@ def _check_isolation(failures, verbose):
                            "repo-skills-plugin", "plugin.json"), "w").close()
         os.makedirs(os.path.join(real, ".gemini", "config", "plugins",
                                   "other-plugin", "skills", "other-skill"))
+        # user-level MCP configs that leak through the overlay without a config-file mask:
+        # copilot's sits in ~/.copilot (a wholesale-symlinked dir), agy's in .gemini/config/
+        # (an overlay-real dir shared with the skills + plugins leaves above, so the file
+        # itself would pass through as a symlink).
+        user_mcp = '{"mcpServers":{"leaky":{"command":"evil"}}}'
+        os.makedirs(os.path.join(real, ".copilot"))
+        with open(os.path.join(real, ".copilot", "mcp-config.json"), "w") as fh:
+            fh.write(user_mcp)
+        open(os.path.join(real, ".copilot", "config.json"), "w").close()
+        with open(os.path.join(real, ".gemini", "config", "mcp_config.json"), "w") as fh:
+            fh.write(user_mcp)
         # the cell declares only skill-alpha (its source lives outside HOME, like skills_root)
         os.makedirs(os.path.join(declared_root, "skill-alpha"))
         # stale installs the name-based mask can't catch: a symlink into the checkout under a
@@ -169,6 +180,9 @@ def _check_isolation(failures, verbose):
             real,
             plugin_registry_subpaths=[".gemini/config/plugins"],
             repo_root=repo_checkout,
+            config_file_masks={".copilot/mcp-config.json": "{}",
+                               ".gemini/config/mcp_config.json": "{}",
+                               ".missing-cli/mcp.json": "{}"},  # real file absent
         )
 
         skills = os.path.join(dest, ".codex", "skills")
@@ -232,6 +246,38 @@ def _check_isolation(failures, verbose):
         other_names = sorted(os.listdir(other_plugin_skills)) if os.path.isdir(other_plugin_skills) else []
         _check("isolation.unrelated_plugin_untouched", other_names == ["other-skill"],
                f"vendor-only plugin left alone (got {other_names})", failures, verbose)
+
+        # config-file masks (MCP hermeticity, DESIGN_MCP_Support.md Phase 0): the masked file
+        # is a real neutral file, its siblings still pass through, a mask in a dir shared
+        # with skills/plugin leaves works, an absent real file is still materialized, and
+        # the user's real config is never modified.
+        cop_mask = os.path.join(dest, ".copilot", "mcp-config.json")
+        _check("isolation.mcp_mask_real_file",
+               os.path.isfile(cop_mask) and not os.path.islink(cop_mask)
+               and open(cop_mask).read() == "{}"
+               and (os.stat(cop_mask).st_mode & 0o777) == 0o600,
+               "masked mcp-config.json is a real 0600 file containing '{}', not a symlink",
+               failures, verbose)
+        _check("isolation.mcp_mask_sibling_passthrough",
+               os.path.islink(os.path.join(dest, ".copilot", "config.json")),
+               "masking one file keeps its siblings passing through as symlinks",
+               failures, verbose)
+        gem_mask = os.path.join(dest, ".gemini", "config", "mcp_config.json")
+        _check("isolation.mcp_mask_shared_ancestor",
+               os.path.isfile(gem_mask) and not os.path.islink(gem_mask)
+               and open(gem_mask).read() == "{}",
+               "mask works in a dir shared with skills + plugin-registry leaves",
+               failures, verbose)
+        missing_mask = os.path.join(dest, ".missing-cli", "mcp.json")
+        _check("isolation.mcp_mask_absent_file_created",
+               os.path.isfile(missing_mask) and open(missing_mask).read() == "{}",
+               "a mask whose real file doesn't exist is still materialized",
+               failures, verbose)
+        _check("isolation.mcp_mask_source_untouched",
+               open(os.path.join(real, ".copilot", "mcp-config.json")).read() == user_mcp
+               and open(os.path.join(real, ".gemini", "config",
+                                     "mcp_config.json")).read() == user_mcp,
+               "the real HOME's MCP configs are never modified", failures, verbose)
 
         # config mirrors must use a fresh temp dir, not dest/_cfg — which is a symlink to the
         # real HOME's _cfg here, so writing through it would escape the temp tree.
@@ -697,6 +743,12 @@ def _check_workspace_relocation(failures, verbose):
 
     def _fake_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides, agent_name, eval_name):
         seen["cwd"] = cwd
+        # the isolated HOME is deleted right after execute() returns, so the mask must be
+        # inspected here, while the agent would actually see it.
+        if opts.home:
+            mask = os.path.join(opts.home, ".fakecli", "mcp.json")
+            if os.path.isfile(mask) and not os.path.islink(mask):
+                seen["mask_content"] = open(mask).read()
         with open(os.path.join(cwd, "run.py"), "w") as f:
             f.write("print('hi')\n")
         rr = RunResult(
@@ -706,18 +758,26 @@ def _check_workspace_relocation(failures, verbose):
         )
         return ExecResult(result=rr, stdout="", stderr="")
 
+    # masks alone (no global skills dirs — _FakeAdapter declares none) must still trigger
+    # the HOME overlay: the MCP kill-switch can't depend on an adapter also declaring
+    # skills paths.
+    class _MaskingFakeAdapter(_FakeAdapter):
+        isolation_config_masks = [".fakecli/mcp.json"]
+
     runner_mod.execute = _fake_execute
     try:
         run_dir = os.path.join(repo_root, "artifacts", "run1")
         os.makedirs(run_dir)
         r = runner_mod.Runner.__new__(runner_mod.Runner)
-        r.agent, r.adapter, r.targets = "fake", _FakeAdapter(), [ModelTarget()]
+        r.agent, r.adapter, r.targets = "fake", _MaskingFakeAdapter(), [ModelTarget()]
         r.artifacts_root = os.path.join(repo_root, "artifacts")
         r.run_id, r.skills_root, r.judge = "run1", repo_root, None
         r.provision, r.command, r.auto_approve = False, "", True
         r.reasoning_effort = None
         r.jobs, r.isolated, r.progress = 1, True, None
         r._repo_skill_names, r.run_dir = set(), run_dir
+        # reached now that _MaskingFakeAdapter's config mask triggers the HOME overlay
+        r._repo_root = repo_root
 
         spec = EvalSpec(name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"),
                         assertions=[{"type": "file_exists", "path": "run.py"}])
@@ -737,6 +797,10 @@ def _check_workspace_relocation(failures, verbose):
         _check("relocate.temp_exec_dir_cleaned",
                cwd_used is not None and not os.path.isdir(cwd_used),
                "temp exec dir removed after copy-back", failures, verbose)
+        _check("relocate.mcp_mask_threaded_into_home",
+               seen.get("mask_content") == "{}",
+               f"adapter-declared config mask materialized as '{{}}' in the isolated HOME "
+               f"the agent ran with (got {seen.get('mask_content')!r})", failures, verbose)
         # assertion details recorded paths under the (now deleted) exec_ws tempdir — they
         # must be remapped onto the final cell workspace so assertions.json points at
         # files that still exist.
@@ -1872,6 +1936,17 @@ def run_selftest(verbose: bool = False) -> int:
            and "--sandbox" in pre and "workspace-write" in pre
            and "--full-auto" not in cargv and cargv[-1] == "do the task",
            f"non-interactive approval+sandbox before exec, prompt last: {cargv}", failures, verbose)
+    # MCP kill-switch (DESIGN_MCP_Support.md Phase 0): the isolated HOME symlinks ~/.codex
+    # wholesale, so without this override any [mcp_servers.*] in the user's real config.toml
+    # would load in every run — and in every model probe.
+    mcp_i = cargv.index("mcp_servers={}") if "mcp_servers={}" in cargv else -1
+    _check("codex.argv_mcp_killswitch",
+           mcp_i > 0 and cargv[mcp_i - 1] == "-c",
+           f"-c mcp_servers={{}} empties the MCP server table on runs: {cargv}",
+           failures, verbose)
+    pargv = get_adapter("codex")._probe_argv("gpt-5.4-mini")
+    _check("codex.probe_mcp_killswitch", "mcp_servers={}" in pargv,
+           f"-c mcp_servers={{}} also passed on model probes: {pargv}", failures, verbose)
     sf = EvalSpec(name="t", prompt="p", source_path="/r/skill/evals/e.yaml",
                   files=["a.json", "fixtures/in.json", {"x/a.json": "data/a.json"},
                          "../esc.json",
@@ -1962,6 +2037,12 @@ def run_selftest(verbose: bool = False) -> int:
     _check("copilot.no_output_schema",
            not get_adapter("copilot").supports_output_schema,
            "copilot has no native output schema support", failures, verbose)
+    # copilot has no "ignore user mcp-config" flag (--disable-builtin-mcps only covers the
+    # bundled GitHub server) — the mask is its only MCP kill-switch (design, Phase 0).
+    _check("copilot.mcp_config_mask_declared",
+           get_adapter("copilot").isolation_config_masks == [".copilot/mcp-config.json"],
+           "copilot declares its user mcp-config.json for isolation masking",
+           failures, verbose)
 
     # A _FILE_TOOLS write must be counted ONCE by file_paths_touched(), not twice — Copilot
     # emits both a TOOL_CALL and a FILE_CHANGE for the same write, and file_paths_touched() reads
@@ -2008,6 +2089,13 @@ def run_selftest(verbose: bool = False) -> int:
 
     out = get_adapter("antigravity").parse(ANTIGRAVITY_RAW, "", 0)
     _check("antigravity.raw.final", out.final_text == ANTIGRAVITY_RAW, repr(out.final_text), failures, verbose)
+    # agy has no MCP flags at all — masking its file-based discovery config is its only MCP
+    # kill-switch (design, Phase 0).
+    _check("antigravity.mcp_config_mask_declared",
+           get_adapter("antigravity").isolation_config_masks
+           == [".gemini/config/mcp_config.json"],
+           "antigravity declares its mcp_config.json for isolation masking",
+           failures, verbose)
 
     # judge JSON extraction (markdown fences, bare JSON, mixed text)
     print("judge verdict extraction:")

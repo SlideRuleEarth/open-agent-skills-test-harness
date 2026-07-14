@@ -61,6 +61,11 @@ class CopilotAdapter(Adapter):
     binary = "copilot"
     skills_subdir = ".agents/skills"
     global_skills_subpaths = [".agents/skills"]
+    # The user's real ~/.copilot/mcp-config.json loads through the symlinked HOME in every
+    # run — `--disable-builtin-mcps` (below) only disables the bundled GitHub server, and no
+    # "ignore user mcp-config" flag exists — so isolation materializes it as an empty config
+    # instead (DESIGN_MCP_Support.md, Phase 0). Non-isolated runs still leak it.
+    isolation_config_masks = [".copilot/mcp-config.json"]
     # `--reasoning-effort <level>` (verified 2026-07-08: choices none|low|medium|high|
     # xhigh|max — the harness only passes the typed cross-runner subset low|medium|high).
     supports_reasoning_effort = True

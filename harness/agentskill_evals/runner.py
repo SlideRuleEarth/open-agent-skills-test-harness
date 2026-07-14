@@ -298,7 +298,11 @@ class Runner:
         # relocation above): this tracks whether THIS cell's HOME-overlay skill masking actually
         # succeeded, which can independently fail (e.g. no symlink privileges) and fall back.
         home_isolated = False
-        if self.isolated and adapter.global_skills_subpaths:
+        # Config-file masks neutralize per-user config the overlay's wholesale symlinks would
+        # otherwise pass through — today that's MCP server configs ("{}" = declare no
+        # servers), keeping runs hermetically MCP-off (DESIGN_MCP_Support.md, Phase 0).
+        cfg_masks = {p: "{}" for p in getattr(adapter, "isolation_config_masks", [])}
+        if self.isolated and (adapter.global_skills_subpaths or cfg_masks):
             iso_home = tempfile.mkdtemp(prefix="ase-home-")
             seed_dirs = declared_dirs if self.provision else []
             try:
@@ -307,6 +311,7 @@ class Runner:
                     seed_dirs, os.path.expanduser("~"),
                     plugin_registry_subpaths=getattr(adapter, "global_plugin_registry_subpaths", []),
                     repo_root=self._repo_root,
+                    config_file_masks=cfg_masks,
                 )
                 cfg_root = None
                 for var, skills_sub in getattr(adapter, "isolation_config_homes", []):

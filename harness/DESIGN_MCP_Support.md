@@ -21,6 +21,7 @@ MCP is intentionally disabled today, but only the Claude adapter actually enforc
 - **antigravity** — **leaks** (latently). `<iso_home>/.gemini/config/mcp_config.json` is a symlink to the real file; benign today only because that file happens to be empty.
 
 Fixing this is Phase 0 and is worth doing regardless of the rest of this design.
+**Update: Phase 0 is implemented** — codex passes `-c mcp_servers={}` on every run and probe, and the isolation layer's new config-file masks materialize `~/.copilot/mcp-config.json` and `.gemini/config/mcp_config.json` as `{}` in the isolated HOME (see §8).
 
 ## 2. Per-CLI MCP capability survey
 
@@ -145,7 +146,7 @@ CLI-native keeps values off disk but is inconsistent (copilot/agy have nothing).
 
 ## 8. Phasing
 
-- **Phase 0 — hermetic hardening** (no schema change; fixes today's leaks): codex `-c mcp_servers={}`; isolation config-file masks for copilot `~/.copilot/mcp-config.json` and agy `.gemini/config/mcp_config.json`; selftest coverage.
+- **Phase 0 — hermetic hardening** (no schema change; fixes today's leaks): codex `-c mcp_servers={}`; isolation config-file masks for copilot `~/.copilot/mcp-config.json` and agy `.gemini/config/mcp_config.json`; selftest coverage. **Implemented** (`isolation.py` `config_file_masks`, adapters' `isolation_config_masks`, codex `build_argv`/`_probe_argv`).
 - **Phase 1 — schema + claude + codex**: `mcp_servers:` parse/validate/interpolate, secrets registry + redaction pass, scratch-dir plumbing, claude `--mcp-config` file, codex `-c` mapping + canonical tool naming in its parser, echo fixture + goldens + smoke scenario. Both CLIs' mechanisms fully verified; codex parsing is half-done already.
 - **Phase 2 — copilot**: `--additional-mcp-config @file`, per-server `tools`, `--secret-env-vars`, verify MCP tool naming in its JSON events, parser tweak if needed.
 - **Phase 3 — antigravity**: config materialization on the Phase-0 mask mechanism, `serverUrl`/`url` support, tool-name normalization; document the gaps (no tool gating; isolation required).

@@ -94,6 +94,12 @@ class Adapter(ABC):
     # so custom config homes keep their auth/config; if it can't be mirrored it is cleared so
     # it can't read the real skills and bypass isolation.
     isolation_config_homes: list[tuple[str, str]] = []
+    # HOME-relative config *files* the isolation overlay materializes with neutral content
+    # ("{}") instead of symlinking — the wholesale HOME symlinks otherwise pass the user's
+    # real MCP-server config straight into "hermetic" runs (e.g. ~/.copilot/mcp-config.json).
+    # Only adapters whose CLI lacks a flag-level MCP kill-switch need one; masks apply only
+    # under isolation.
+    isolation_config_masks: list[str] = []
 
     supports_output_schema: bool = False
     # True if build_argv maps RunOptions.reasoning_effort onto a native flag/config of this

@@ -63,6 +63,7 @@ class CodexAdapter(Adapter):
                 "exec", "--ephemeral", "--disable", "memories",
                 "-c", "memories.use_memories=false",
                 "-c", "memories.generate_memories=false",
+                "-c", "mcp_servers={}",
                 "--json", "-m", model, "say ok"]
 
     def _parse_probe_cost(self, output: str) -> ProbeResult:
@@ -93,6 +94,11 @@ class CodexAdapter(Adapter):
         argv += ["exec", "--ephemeral", "--disable", "memories",
                  "-c", "memories.use_memories=false",
                  "-c", "memories.generate_memories=false",
+                 # MCP kill-switch: the isolated HOME symlinks ~/.codex wholesale, so any
+                 # [mcp_servers.*] in the user's real config.toml would load in every run;
+                 # overriding the whole table keeps runs hermetically MCP-off
+                 # (DESIGN_MCP_Support.md, Phase 0).
+                 "-c", "mcp_servers={}",
                  "--json"]
         if opts.model:
             argv += ["-m", opts.model]

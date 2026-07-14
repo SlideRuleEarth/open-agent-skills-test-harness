@@ -100,6 +100,11 @@ class AntigravityAdapter(Adapter):
     # nested skills/ folder (`<plugin>/skills/<skill>/SKILL.md`) — a second skill-discovery
     # channel independent of global_skills_subpaths above (see module docstring).
     global_plugin_registry_subpaths = [".gemini/config/plugins"]
+    # agy has no MCP flags at all — server discovery is purely file-based via this config
+    # file, which the overlay would otherwise pass through as a symlink to the user's real
+    # one (.gemini/config/ is a real dir in the overlay, being an ancestor of the skills
+    # leaf above), so isolation materializes it as `{}` (DESIGN_MCP_Support.md, Phase 0).
+    isolation_config_masks = [".gemini/config/mcp_config.json"]
 
     # supports_reasoning_effort stays False: agy has no effort flag — thinking budget is
     # encoded in the model id's tier suffix instead (e.g. gemini-3.5-flash-medium, see
