@@ -240,28 +240,49 @@ def _mcp_server_names(path: str) -> list[str]:
 
 def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
     """The directory copilot reads its user config (``mcp-config.json``, ``config.json``)
-    from: ``$COPILOT_HOME`` when set, else ``<home>/.copilot`` where ``<home>`` is
-    copilot's Node ``os.homedir()``. On Windows that is ``%USERPROFILE%`` — NOT ``$HOME``
-    (a stray ``HOME`` on win32 would otherwise enumerate a different config than copilot
-    actually loads); everywhere else it is ``$HOME``. ``os.path.expanduser`` is the final
-    fallback for the same platform-appropriate result when neither var is set. A RELATIVE
-    home resolves against copilot's own process cwd (verified 1.0.64: ``copilot mcp
-    list`` with ``COPILOT_HOME=relhome`` reads ``<its cwd>/relhome``), so it is anchored
-    to the CHILD's ``cwd`` here — the harness's cwd would name a different config than
-    the run actually loads. ``cwd=None`` means the child inherits the harness's cwd
-    (direct calls, some probes), where the two coincide."""
+    from: ``$COPILOT_HOME`` when non-empty (an EMPTY value is unset to copilot too —
+    verified 1.0.64: ``COPILOT_HOME=""`` falls back to ``$HOME/.copilot``), else
+    ``<home>/.copilot`` where ``<home>`` is copilot's Node ``os.homedir()``. On Windows
+    that is ``%USERPROFILE%`` — NOT ``$HOME`` (a stray ``HOME`` on win32 would otherwise
+    enumerate a different config than copilot actually loads); everywhere else it is
+    ``$HOME``. Unlike ``COPILOT_HOME``, a home var that is PRESENT BUT EMPTY is preserved
+    — Node's ``homedir()`` returns ``""`` for it, making the ``.copilot`` join relative
+    (verified 1.0.64: ``copilot mcp list`` with ``HOME=""`` reads ``<its cwd>/.copilot``);
+    treating it as unset would enumerate the harness user's real home instead.
+    ``os.path.expanduser`` is the fallback only when the var is absent. A RELATIVE home
+    resolves against copilot's own process cwd (verified 1.0.64: ``COPILOT_HOME=relhome``
+    reads ``<its cwd>/relhome``), so it is anchored to the CHILD's ``cwd`` here — the
+    harness's cwd would name a different config than the run actually loads. ``cwd=None``
+    means the child inherits the harness's cwd (direct calls, some probes), where the two
+    coincide. On win32 a ROOTED-BUT-DRIVELESS home (``\\config``) is relative too — it
+    lands on the opener's current drive, so Python <=3.12 ``isabs()`` alone would let the
+    harness read it on ITS drive while copilot resolves it on the child's; the join below
+    anchors it to the child cwd's drive (ntpath keeps the root, takes the drive). A home
+    that still isn't fully drive-qualified after anchoring (``C:config`` drive-relative —
+    Windows resolves those against a per-drive cwd nobody here can know) fails closed."""
     explicit = env_map.get("COPILOT_HOME")
     if explicit:
         home = explicit
     else:
         if sys.platform == "win32":  # pragma: no cover — win32 only
-            base = env_map.get("USERPROFILE") or os.path.expanduser("~")
+            base = env_map.get("USERPROFILE")
         else:
-            base = env_map.get("HOME") or os.path.expanduser("~")
+            base = env_map.get("HOME")
+        if base is None:
+            base = os.path.expanduser("~")
         home = os.path.join(base, ".copilot")
-    if os.path.isabs(home):
+    if os.path.isabs(home) and (sys.platform != "win32" or os.path.splitdrive(home)[0]):
         return home
-    return os.path.normpath(os.path.join(os.path.abspath(cwd or os.getcwd()), home))
+    anchor = os.path.abspath(cwd or os.getcwd())
+    resolved = os.path.normpath(os.path.join(anchor, home))
+    if not os.path.isabs(resolved) or (
+            sys.platform == "win32" and not os.path.splitdrive(resolved)[0]):
+        raise RuntimeError(
+            f"copilot home {home!r} does not resolve to a drive-qualified absolute "
+            f"path against the child cwd {anchor!r} — the config copilot would load "
+            "cannot be named, failing closed rather than enumerating the wrong one."
+        )
+    return resolved
 
 
 # Plugin state lives in ~/.copilot/config.json: "installedPlugins" records carry an

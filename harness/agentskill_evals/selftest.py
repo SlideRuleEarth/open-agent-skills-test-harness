@@ -2941,6 +2941,22 @@ def run_selftest(verbose: bool = False) -> int:
                "rel-srv" in rdis,
                f"a relative COPILOT_HOME enumerates from the child's cwd, not the "
                f"harness's: {rdis}", failures, verbose)
+        # ...and a SET-BUT-EMPTY home var must enumerate <child cwd>/.copilot — Node's
+        # homedir() returns "" for a set-but-empty HOME, so copilot's ".copilot" join
+        # goes relative and resolves against its process cwd (verified 1.0.64: `copilot
+        # mcp list` with HOME="" reads <its cwd>/.copilot). Treating empty as unset
+        # would enumerate the harness user's real ~/.copilot instead — the wrong config.
+        cwd_cop_home = os.path.join(ws, ".copilot")
+        os.makedirs(cwd_cop_home)
+        with open(os.path.join(cwd_cop_home, "mcp-config.json"), "w") as fh:
+            _json.dump({"mcpServers": {"empty-home-srv": {"command": "echo"}}}, fh)
+        hargv = get_adapter("copilot").build_argv(
+            "do it", RunOptions(effective_env={"HOME": "", "USERPROFILE": ""}), cwd=ws)
+        hdis = [hargv[i + 1] for i, a in enumerate(hargv) if a == "--disable-mcp-server"]
+        _check("copilot.mcp_disable_empty_home_uses_child_cwd",
+               "empty-home-srv" in hdis,
+               f"a set-but-empty HOME enumerates <child cwd>/.copilot, as copilot "
+               f"does: {hdis}", failures, verbose)
     finally:
         if _old_cop_home is None:
             os.environ.pop("COPILOT_HOME", None)
@@ -2988,20 +3004,49 @@ def run_selftest(verbose: bool = False) -> int:
     # on Windows, $HOME elsewhere. A stray HOME on win32 must NOT redirect it. A RELATIVE
     # home resolves against copilot's own process cwd (verified 1.0.64), i.e. the CHILD's
     # cwd — resolving against the harness's cwd would enumerate a different config than
-    # the run loads.
+    # the run loads. A SET-BUT-EMPTY home var is preserved, not treated as unset — Node's
+    # homedir() returns "" for it, so copilot reads <its cwd>/.copilot (verified 1.0.64)
+    # — while an empty COPILOT_HOME IS unset to copilot (verified 1.0.64, falls back to
+    # $HOME/.copilot). On win32 a rooted-but-driveless home takes the child cwd's drive
+    # (where copilot resolves it) and a drive-relative one fails closed — its per-drive
+    # cwd is unknowable. Absolute fixtures are drive-qualified so they are fully absolute
+    # on win32 too.
     _win = sys.platform == "win32"
+    _dq = "C:" if _win else ""
+
+    def _cop_home_raises(env, cwd):
+        try:
+            copilot_mod._copilot_home(env, cwd)
+        except RuntimeError:
+            return True
+        return False
+
     _check("copilot.home_resolution",
-           copilot_mod._copilot_home({"COPILOT_HOME": "/custom"}) == "/custom"
+           copilot_mod._copilot_home({"COPILOT_HOME": _dq + "/custom"}) == _dq + "/custom"
            and copilot_mod._copilot_home(
-               {"USERPROFILE": "/u/prof", "HOME": "/u/home"})
-               == os.path.join("/u/prof" if _win else "/u/home", ".copilot")
-           and copilot_mod._copilot_home({"COPILOT_HOME": "rel-home"}, "/child/ws")
-               == os.path.normpath(os.path.join("/child/ws", "rel-home"))
+               {"USERPROFILE": _dq + "/u/prof", "HOME": _dq + "/u/home"})
+               == os.path.join(_dq + ("/u/prof" if _win else "/u/home"), ".copilot")
+           and copilot_mod._copilot_home({"COPILOT_HOME": "rel-home"}, _dq + "/child/ws")
+               == os.path.normpath(os.path.join(_dq + "/child/ws", "rel-home"))
            and copilot_mod._copilot_home({"USERPROFILE": "rel-base", "HOME": "rel-base"},
-                                         "/child/ws")
-               == os.path.normpath(os.path.join("/child/ws", "rel-base", ".copilot")),
-           "COPILOT_HOME wins; otherwise USERPROFILE on win32, HOME elsewhere; a "
-           "relative home resolves against the child's cwd, as copilot itself does",
+                                         _dq + "/child/ws")
+               == os.path.normpath(os.path.join(_dq + "/child/ws", "rel-base", ".copilot"))
+           and copilot_mod._copilot_home(
+               {"COPILOT_HOME": "", "USERPROFILE": _dq + "/u/prof",
+                "HOME": _dq + "/u/home"})
+               == os.path.join(_dq + ("/u/prof" if _win else "/u/home"), ".copilot")
+           and copilot_mod._copilot_home({"USERPROFILE": "", "HOME": ""},
+                                         _dq + "/child/ws")
+               == os.path.normpath(os.path.join(_dq + "/child/ws", ".copilot"))
+           and (not _win or (
+               copilot_mod._copilot_home({"COPILOT_HOME": "\\rooted"}, "D:\\child\\ws")
+                   == "D:\\rooted"
+               and _cop_home_raises({"COPILOT_HOME": "C:drive-rel"}, "D:\\child\\ws"))),
+           "COPILOT_HOME wins (empty = unset, as copilot treats it); otherwise "
+           "USERPROFILE on win32, HOME elsewhere, preserved even when empty; relative "
+           "homes — including the empty-home case — resolve against the child's cwd, "
+           "as copilot itself does; win32 driveless-rooted homes take the child cwd's "
+           "drive, drive-relative ones fail closed",
            failures, verbose)
     _check("copilot.odr_gate_off_non_win32",
            sys.platform == "win32" or copilot_mod._odr_registry_command() is None,
