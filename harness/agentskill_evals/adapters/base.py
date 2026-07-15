@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -44,6 +45,13 @@ class RunOptions:
     extra_args: list[str] = field(default_factory=list)  # raw flags appended verbatim
     home: Optional[str] = None           # isolated HOME for this run (see isolation.py); None = real HOME
     isolation_env: dict = field(default_factory=dict)  # config-home vars repointed at isolated mirrors
+    # The exact environment the subprocess will receive — set by exec.execute() (from
+    # os.environ + the scenario's env overrides + this adapter's env()) right before
+    # build_argv, so an adapter whose argv depends on ambient config state (codex
+    # enumerating MCP servers to disable) inspects the child's context, not the
+    # harness's. None outside execute() (direct build_argv calls); adapters fall back
+    # to os.environ then.
+    effective_env: Optional[dict] = None
 
 
 @dataclass
@@ -149,53 +157,79 @@ class Adapter(ABC):
         Returns a ProbeResult with acceptance status and cost information
         extracted from the CLI's output. Probes inherit the real environment except for
         MCP hermeticity: an adapter with config masks gets a throwaway mask-only HOME
-        overlay (auth/config/skills pass through; MCP configs neutralized), so probing
-        models never launches the user's real MCP servers.
+        overlay (auth/config/skills pass through; MCP configs neutralized), and every
+        probe runs in a fresh private (0700) temp workspace — never a shared dir like
+        the system temp root, whose planted ``.agents/mcp_config.json`` (world-writable
+        ``/tmp`` on Linux) would otherwise load as a workspace MCP config. Any failure
+        to establish that hermetic context fails the probe closed (model reported
+        unavailable) rather than probing with the user's real MCP servers live.
         """
-        argv = self._probe_argv(model)
-        if not argv:
-            return ProbeResult(accepted=True)
-        env = None
-        masked_home, iso_env = None, {}
+        import sys
+        # Fresh private workspace: the probe's cwd AND its workspace anchor (agy's
+        # --add-dir, copilot's workspace-config discovery root).
+        probe_ws = tempfile.mkdtemp(prefix="ase-probe-")
+        masked_home: Optional[str] = None
         try:
-            masked_home, iso_env = build_mcp_masked_home(self)
-        except OSError as exc:
-            # This runner's MCP-off depends on the overlay (it has masks) — probing with
-            # the real HOME would launch the user's real MCP servers, so fail closed:
-            # report the model unavailable rather than probe non-hermetically.
-            import sys
-            print(f"warning: [{self.name}] could not build the MCP-masking overlay for a "
-                  f"model probe ({exc}); skipping the probe (fail-closed).", file=sys.stderr)
-            return ProbeResult(accepted=False)
-        if masked_home:
-            env = self.env(dict(os.environ),
-                           RunOptions(home=masked_home, isolation_env=iso_env))
-        try:
-            r = subprocess.run(
-                argv, capture_output=True, text=True, env=env,
-                timeout=timeout, stdin=subprocess.DEVNULL,
-            )
-            combined = r.stderr + r.stdout
-            lower = combined.lower()
-            if "not available" in lower or "invalid model" in lower or "unknown model" in lower:
+            try:
+                masked_home, iso_env = build_mcp_masked_home(self)
+                env = dict(os.environ)
+                if masked_home:
+                    env = self.env(env, RunOptions(home=masked_home, isolation_env=iso_env))
+                argv = self._probe_argv_compat(model, cwd=probe_ws, env=env)
+            except Exception as exc:
+                # Overlay build failed, or the adapter couldn't guarantee a hermetic
+                # argv (codex unable to enumerate its MCP servers) — probing anyway
+                # would launch real MCP servers, so fail closed.
+                print(f"warning: [{self.name}] could not build a hermetic (MCP-off) "
+                      f"model probe ({exc}); skipping the probe (fail-closed).",
+                      file=sys.stderr)
                 return ProbeResult(accepted=False)
-            if r.returncode != 0:
+            if not argv:
+                return ProbeResult(accepted=True)
+            try:
+                r = subprocess.run(
+                    argv, capture_output=True, text=True, env=env, cwd=probe_ws,
+                    timeout=timeout, stdin=subprocess.DEVNULL,
+                )
+                combined = r.stderr + r.stdout
+                lower = combined.lower()
+                if "not available" in lower or "invalid model" in lower or "unknown model" in lower:
+                    return ProbeResult(accepted=False)
+                if r.returncode != 0:
+                    return ProbeResult(accepted=False)
+                return self._parse_probe_cost(combined)
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
                 return ProbeResult(accepted=False)
-            return self._parse_probe_cost(combined)
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return ProbeResult(accepted=False)
         finally:
             if masked_home:
                 shutil.rmtree(masked_home, ignore_errors=True)
+            shutil.rmtree(probe_ws, ignore_errors=True)
+
+    def _probe_argv_compat(self, model: str, *, cwd: str, env: dict) -> Optional[list[str]]:
+        """Call ``_probe_argv`` with the probe's execution context, tolerating out-of-tree
+        adapters that still override the pre-Phase-0 ``_probe_argv(self, model)`` shape."""
+        import inspect
+        params = inspect.signature(self._probe_argv).parameters
+        kwargs = {}
+        if "cwd" in params:
+            kwargs["cwd"] = cwd
+        if "env" in params:
+            kwargs["env"] = env
+        return self._probe_argv(model, **kwargs)
 
     def _parse_probe_cost(self, output: str) -> ProbeResult:
         """Extract cost info from probe output. Override per adapter."""
         return ProbeResult(accepted=True)
 
-    def _probe_argv(self, model: str) -> Optional[list[str]]:
+    def _probe_argv(self, model: str, *, cwd: Optional[str] = None,
+                    env: Optional[dict] = None) -> Optional[list[str]]:
         """Return the argv to probe whether *model* is accepted.
 
-        Override per adapter.  Return None to skip probing.
+        Override per adapter.  Return None to skip probing. ``cwd`` is the fresh private
+        workspace the probe subprocess runs in and ``env`` its exact environment — an
+        adapter whose argv depends on them (agy's --add-dir anchor, codex/copilot MCP
+        enumeration) must use these, not the harness's own context. Overrides may keep
+        the legacy ``(self, model)`` shape; ``_probe_argv_compat`` adapts the call.
         """
         return None
 

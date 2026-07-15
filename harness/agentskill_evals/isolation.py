@@ -174,12 +174,16 @@ def _validate_mask_subpath(sub: str) -> None:
     """Masks are opened for writing (O_TRUNC) at the joined path — an absolute,
     drive-anchored, or ``..``-traversing subpath would clobber a file outside the overlay.
     Checked platform-independently (``C:evil.json`` is drive-relative on Windows even
-    though POSIX ``isabs`` says no)."""
+    though POSIX ``isabs`` says no). Empty and dot-only paths (``""``, ``"."``, ``"./"``)
+    are rejected too: they name no file, so ``_insert_leaf`` would silently discard the
+    mask — an adapter typo would quietly leave the real config live."""
     s = str(sub)
     parts = s.replace("\\", "/").split("/")
     if (os.path.isabs(s) or s.startswith(("/", "\\")) or os.path.splitdrive(s)[0]
             or (len(s) >= 2 and s[0].isalpha() and s[1] == ":") or ".." in parts):
         raise ValueError(f"config mask path must be HOME-relative without '..': {sub!r}")
+    if not [p for p in parts if p not in ("", ".")]:
+        raise ValueError(f"config mask path names no file: {sub!r}")
 
 
 def _insert_leaf(tree: dict, subpaths: Iterable[str], leaf: object) -> None:

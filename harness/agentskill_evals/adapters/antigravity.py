@@ -115,13 +115,24 @@ class AntigravityAdapter(Adapter):
     # isolation is the ONLY MCP-off mechanism on this runner: non-isolated runs can't be
     # made hermetic (the runner warns) and an overlay failure fails closed.
     plugin_registry_config_masks = {"mcp_config.json": '{"mcpServers": {}}'}
-    # agy also discovers MCP configs from the RUN WORKSPACE via --add-dir (verified 1.1.1:
-    # {workspace}/.agents/mcp_config.json and .agents/plugins/*/mcp_config.json load) —
-    # outside the HOME overlay's reach, so the runner neutralizes any *seeded* ones.
-    # A config the agent itself writes mid-run is out of scope (discovery happens at
-    # session start).
-    workspace_config_masks = {".agents/mcp_config.json": '{"mcpServers": {}}',
-                              ".agents/plugins/*/mcp_config.json": '{"mcpServers": {}}'}
+    # agy also discovers MCP configs from the RUN WORKSPACE via --add-dir — outside the
+    # HOME overlay's reach, so the runner neutralizes any *seeded* ones. It recognizes
+    # FOUR customization roots (verified 1.1.1: a sentinel stdio server in each launched
+    # at session start): .agents/, .agent/, _agents/, and _agent/. Per root, three
+    # channels: the root's own mcp_config.json, every in-root plugin's
+    # plugins/<name>/mcp_config.json, and plugins.json — which registers EXTERNAL plugin
+    # directories by path (entries/inherits schema, per the embedded json_configs.md;
+    # verified 1.1.1: an external dir registered from a workspace plugins.json launched
+    # its MCP server), so the registration file itself must be neutralized. Ancestors of
+    # the workspace are NOT scanned (verified 1.1.1), and a config the agent itself
+    # writes mid-run is out of scope (discovery happens at session start).
+    workspace_config_masks = {
+        f"{root}/{rel}": content
+        for root in (".agents", ".agent", "_agents", "_agent")
+        for rel, content in (("mcp_config.json", '{"mcpServers": {}}'),
+                             ("plugins/*/mcp_config.json", '{"mcpServers": {}}'),
+                             ("plugins.json", "{}"))
+    }
 
     # supports_reasoning_effort stays False: agy has no effort flag — thinking budget is
     # encoded in the model id's tier suffix instead (e.g. gemini-3.5-flash-medium, see
@@ -153,14 +164,20 @@ class AntigravityAdapter(Adapter):
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return None
 
-    def _probe_argv(self, model: str):
+    def _probe_argv(self, model: str, *, cwd: Optional[str] = None,
+                    env: Optional[dict] = None):
         # --add-dir: without it a bare `agy -p` operates against the fixed, shared
         # ~/.gemini/antigravity-cli/scratch dir and leaves state there (see module
-        # docstring); the system temp dir is a harmless, non-registering anchor for a
-        # trivial "say ok" probe. --output-format json keeps the probe's output shape
-        # consistent with real runs.
+        # docstring). The anchor must be the probe's fresh PRIVATE workspace
+        # (probe_model creates one and passes it as cwd) — never a shared dir like the
+        # system temp root, where anyone's planted .agents/mcp_config.json (or .agent/,
+        # _agents/, _agent/, their plugins/, plugins.json) would load as workspace MCP
+        # config; /tmp is world-writable on Linux. agy does not scan the anchor's
+        # ancestors (verified 1.1.1), so a fresh empty 0700 dir is hermetic.
+        # --output-format json keeps the probe's output shape consistent with real runs.
+        anchor = os.path.abspath(cwd) if cwd else tempfile.mkdtemp(prefix="ase-probe-agy-")
         return [self.binary, "-p", "say ok", "--dangerously-skip-permissions",
-                "--output-format", "json", "--add-dir", tempfile.gettempdir(),
+                "--output-format", "json", "--add-dir", anchor,
                 "--model", model]
 
     def format_skill(self, skill: str) -> str:

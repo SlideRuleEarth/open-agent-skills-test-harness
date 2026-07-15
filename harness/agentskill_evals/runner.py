@@ -974,8 +974,11 @@ def _apply_workspace_config_masks(adapter, workspace: str) -> list[str]:
     workspace itself (agy's ``.agents/mcp_config.json``), which no HOME overlay or CLI
     flag reaches. Only *existing* files are touched: pre-creating a config would pollute
     the workspace the agent sees and the archived artifacts. A seeded symlink resolving
-    outside the workspace is skipped — its target must not be overwritten. Returns the
-    workspace-relative paths neutralized."""
+    outside the workspace is *neutralized*, not skipped: every escaping symlink component
+    is unlinked (never followed for the write — the outside target must not be touched)
+    and the path is rebuilt as a real file with the neutral content, so the CLI can't
+    read the outside config through the link. Returns the workspace-relative paths
+    neutralized."""
     masked: list[str] = []
     ws_real = os.path.realpath(workspace)
     for pattern, content in (getattr(adapter, "workspace_config_masks", {}) or {}).items():
@@ -983,10 +986,37 @@ def _apply_workspace_config_masks(adapter, workspace: str) -> list[str]:
         for path in glob.glob(full_pattern):
             if not os.path.isfile(path):
                 continue
-            real = os.path.realpath(path)
-            if real != ws_real and not real.startswith(ws_real + os.sep):
-                continue
+            if not _unlink_escaping_symlinks(workspace, ws_real, path):
+                continue  # couldn't make the path safely writable — leave it unmatched
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(content)
             masked.append(os.path.relpath(path, workspace))
     return sorted(masked)
+
+
+def _unlink_escaping_symlinks(workspace: str, ws_real: str, path: str) -> bool:
+    """Make ``path`` (a glob match under ``workspace``) safe to rewrite in place: unlink
+    every symlink component under the workspace that resolves outside it (the final file
+    or any intermediate directory), so a subsequent write lands inside the workspace
+    instead of following a seeded link out. Symlinks resolving *within* the workspace
+    are left alone. Returns False when containment can't be established."""
+    rel = os.path.relpath(path, workspace)
+    if rel == os.curdir or rel.startswith(os.pardir + os.sep) or rel == os.pardir:
+        return False
+    parts = rel.split(os.sep)
+    for _ in range(len(parts) + 1):
+        cur = workspace
+        escaping = None
+        for part in parts:
+            cur = os.path.join(cur, part)
+            if os.path.islink(cur):
+                real = os.path.realpath(cur)
+                if real != ws_real and not real.startswith(ws_real + os.sep):
+                    escaping = cur
+                    break
+        if escaping is None:
+            real = os.path.realpath(path)
+            return real == ws_real or real.startswith(ws_real + os.sep)
+        os.unlink(escaping)
+    return False  # pragma: no cover — more escapes than path components can't happen

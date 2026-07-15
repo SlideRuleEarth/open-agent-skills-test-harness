@@ -6,6 +6,7 @@ subprocess/timeout/error handling in one place so adapters stay pure.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import signal
 import subprocess
@@ -33,7 +34,6 @@ def execute(
     agent_name: str | None = None,
     eval_name: str = "",
 ) -> ExecResult:
-    argv = adapter.build_argv(prompt, opts, cwd=cwd)
     # Apply the eval/scenario env first, then let adapter.env() layer isolation on top — so an
     # isolated run's HOME / XDG / config-home vars can't be overridden by an eval's `env:`.
     base = dict(os.environ)
@@ -46,8 +46,21 @@ def execute(
         eval_name=eval_name,
         prompt=prompt,
         workdir=cwd,
-        argv=argv,
     )
+
+    # env is computed BEFORE argv on purpose: an adapter whose argv depends on ambient
+    # state (codex enumerates MCP servers to disable them by name) must see the child's
+    # exact context — same cwd, same env (a scenario's `env: {CODEX_HOME: ...}` override,
+    # an isolated run's repointed HOME) — or it enumerates the wrong config. An argv
+    # construction failure is a failed run (fail closed), not a crash: an adapter raises
+    # when it can't guarantee a hermetic invocation (e.g. MCP servers it can't enumerate).
+    opts = dataclasses.replace(opts, effective_env=env)
+    try:
+        argv = adapter.build_argv(prompt, opts, cwd=cwd)
+    except Exception as exc:
+        rr.error = f"could not construct a hermetic invocation: {exc}"
+        return ExecResult(rr, "", "")
+    rr.argv = argv
 
     if not adapter.is_available():
         rr.error = f"{adapter.binary!r} not found on PATH"
