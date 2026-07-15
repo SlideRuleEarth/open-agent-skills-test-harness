@@ -37,6 +37,29 @@ _KNOWN_USAGE_KEYS = {"input_tokens", "output_tokens", "reasoning_tokens", "total
 # `-c mcp_servers.<name>...` dotted path.
 _BARE_KEY_RE = re.compile(r"[A-Za-z0-9_-]+\Z")
 
+# extra_args tokens that reach past the verified MCP-off state (see build_argv): `-c`/
+# `--config` overrides appended after the kill-switch outrank it (verified 0.140.0: the
+# later of two duplicate `-c mcp_servers.<n>.enabled=` overrides wins), `--profile`/`-p`
+# and `--cd`/`-C` change WHICH configuration codex resolves (per-profile config files;
+# trusted-project discovery follows the effective cwd), and `--enable` re-opens feature
+# channels (`plugins` is its own MCP channel, invisible to `mcp list` enumeration). The
+# long forms are matched exact or `--flag=value`; the short forms exact or with an
+# attached value (`-cKEY=VAL` parses, verified 0.140.0).
+_CONFIG_CHANNEL_LONG = ("--config", "--profile", "--cd", "--enable")
+_CONFIG_CHANNEL_SHORT = ("-c", "-p", "-C")
+
+
+def _config_channel_token(extra_args: list[str]) -> Optional[str]:
+    """The first extra_args token that opens a codex configuration channel, or None.
+    A token that merely LOOKS like one (e.g. a value following some unrelated flag) is
+    reported too — that false positive fails closed, the safe direction."""
+    for tok in extra_args:
+        if any(tok == f or tok.startswith(f + "=") for f in _CONFIG_CHANNEL_LONG):
+            return tok
+        if any(tok.startswith(f) for f in _CONFIG_CHANNEL_SHORT):
+            return tok
+    return None
+
 
 class CodexAdapter(Adapter):
     name = "codex"
@@ -227,6 +250,20 @@ class CodexAdapter(Adapter):
         return _validate_mcp_list_json(data)
 
     def build_argv(self, prompt: str, opts: RunOptions, *, cwd: str) -> list[str]:
+        # extra_args ride at the END of argv (below), after the MCP kill-switch overrides
+        # are built and POST-VERIFIED — a config-channel token there would outrank or
+        # sidestep the verified MCP-off state (see _CONFIG_CHANNEL_LONG/_SHORT). Standard
+        # runner cells never populate extra_args; a programmatic caller passing one of
+        # these fails closed here (exec.execute() records a failed run), checked first so
+        # a doomed invocation never spends the enumeration/post-verify subprocesses.
+        bad = _config_channel_token(opts.extra_args)
+        if bad is not None:
+            raise RuntimeError(
+                f"extra_args token {bad!r} opens a codex configuration channel "
+                "(-c/--config, --profile/-p, --cd/-C, --enable) after the MCP "
+                "kill-switch overrides were verified — failing closed rather than "
+                "running with an unverifiable MCP state."
+            )
         argv = [self.binary]
         if opts.auto_approve:
             # Non-interactive parity with the deprecated `--full-auto`: never prompt for

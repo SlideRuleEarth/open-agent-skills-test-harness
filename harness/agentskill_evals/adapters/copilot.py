@@ -238,21 +238,30 @@ def _mcp_server_names(path: str) -> list[str]:
     return names
 
 
-def _copilot_home(env_map: Mapping[str, str]) -> str:
+def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
     """The directory copilot reads its user config (``mcp-config.json``, ``config.json``)
     from: ``$COPILOT_HOME`` when set, else ``<home>/.copilot`` where ``<home>`` is
     copilot's Node ``os.homedir()``. On Windows that is ``%USERPROFILE%`` — NOT ``$HOME``
     (a stray ``HOME`` on win32 would otherwise enumerate a different config than copilot
     actually loads); everywhere else it is ``$HOME``. ``os.path.expanduser`` is the final
-    fallback for the same platform-appropriate result when neither var is set."""
+    fallback for the same platform-appropriate result when neither var is set. A RELATIVE
+    home resolves against copilot's own process cwd (verified 1.0.64: ``copilot mcp
+    list`` with ``COPILOT_HOME=relhome`` reads ``<its cwd>/relhome``), so it is anchored
+    to the CHILD's ``cwd`` here — the harness's cwd would name a different config than
+    the run actually loads. ``cwd=None`` means the child inherits the harness's cwd
+    (direct calls, some probes), where the two coincide."""
     explicit = env_map.get("COPILOT_HOME")
     if explicit:
-        return explicit
-    if sys.platform == "win32":  # pragma: no cover — win32 only
-        base = env_map.get("USERPROFILE") or os.path.expanduser("~")
+        home = explicit
     else:
-        base = env_map.get("HOME") or os.path.expanduser("~")
-    return os.path.join(base, ".copilot")
+        if sys.platform == "win32":  # pragma: no cover — win32 only
+            base = env_map.get("USERPROFILE") or os.path.expanduser("~")
+        else:
+            base = env_map.get("HOME") or os.path.expanduser("~")
+        home = os.path.join(base, ".copilot")
+    if os.path.isabs(home):
+        return home
+    return os.path.normpath(os.path.join(os.path.abspath(cwd or os.getcwd()), home))
 
 
 # Plugin state lives in ~/.copilot/config.json: "installedPlugins" records carry an
@@ -338,14 +347,16 @@ class CopilotAdapter(Adapter):
         helpers). Resolution uses the *child's* env (``env``; exec.execute() passes the
         exact subprocess environment) so a scenario's ``env: {COPILOT_HOME: ...}``
         override or an isolated run's repointed HOME enumerates the config the child
-        will actually read. Riding on argv makes this cover every invocation the same
+        will actually read — a relative home anchoring to the child's ``cwd``, where
+        copilot itself resolves it (see _copilot_home). Riding on argv makes this cover
+        every invocation the same
         way — cells (including a scenario-seeded workspace config), model probes, judge
         runs, and non-isolated runs — with the isolation masks as the second layer.
         Plugin-declared servers can't be enumerated here (their names live inside each
         plugin's definition); those are covered by the installed-plugins isolation mask
         and remain a documented gap for non-isolated runs."""
         env_map: Mapping[str, str] = env if env is not None else os.environ
-        home = _copilot_home(env_map)
+        home = _copilot_home(env_map, cwd)
         names = _mcp_server_names(os.path.join(home, "mcp-config.json"))
         if cwd:
             d = os.path.abspath(cwd)

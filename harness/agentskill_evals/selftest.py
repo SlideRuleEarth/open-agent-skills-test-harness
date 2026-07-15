@@ -2567,6 +2567,33 @@ def run_selftest(verbose: bool = False) -> int:
                and _flag_pair(get_adapter("codex")._probe_argv("m"), "--disable", "plugins"),
                "--disable plugins on runs and probes closes the plugin MCP channel",
                failures, verbose)
+        # extra_args ride AFTER the kill-switch overrides and their post-verify, where a
+        # config-channel token would outrank the verified MCP-off state (verified
+        # 0.140.0: the later of two duplicate `-c mcp_servers.<n>.enabled=` overrides
+        # wins) or switch which configuration loads (--profile/-p per-profile configs,
+        # --cd/-C project discovery, --enable plugins re-opening the plugin channel).
+        # build_argv fails closed on every spelling — separate value, attached short
+        # form, --flag=value — while neutral extra_args still pass through verbatim.
+        ok_argv = get_adapter("codex").build_argv(
+            "p", RunOptions(extra_args=["--skip-git-repo-check"]), cwd="/tmp")
+        _leaked = []
+        for _extras in (["-c", "mcp_servers.x.enabled=true"],
+                        ["-cmcp_servers.x.enabled=true"],
+                        ["--config", "mcp_servers.x.enabled=true"],
+                        ["--config=mcp_servers.x.enabled=true"],
+                        ["--enable", "plugins"],
+                        ["--profile", "work"], ["-p", "work"],
+                        ["--cd", "/elsewhere"], ["-C", "/elsewhere"]):
+            try:
+                get_adapter("codex").build_argv(
+                    "p", RunOptions(extra_args=_extras), cwd="/tmp")
+                _leaked.append(_extras)
+            except RuntimeError:
+                pass
+        _check("codex.extra_args_config_channels_fail_closed",
+               "--skip-git-repo-check" in ok_argv and not _leaked,
+               f"config-channel extra_args fail closed in every spelling; neutral ones "
+               f"pass through: leaked={_leaked}", failures, verbose)
     finally:
         CodexAdapter._configured_mcp_server_names = orig_enum
         CodexAdapter._verify_all_mcp_disabled = orig_verify
@@ -2898,6 +2925,22 @@ def run_selftest(verbose: bool = False) -> int:
                "user-srv" in edis,
                f"a COPILOT_HOME set only in the child's effective env still enumerates "
                f"its servers: {edis}", failures, verbose)
+        # ...and a RELATIVE COPILOT_HOME must resolve against the CHILD's cwd — copilot
+        # resolves it against its own process cwd (verified 1.0.64: `copilot mcp list`
+        # with COPILOT_HOME=relhome reads <its cwd>/relhome), so anchoring to the
+        # harness's cwd would enumerate a different config than the run actually loads
+        # (direct and `isolated: false` runs; isolation clears/repoints the var).
+        rel_cop_home = os.path.join(ws, "rel-cop-home")
+        os.makedirs(rel_cop_home)
+        with open(os.path.join(rel_cop_home, "mcp-config.json"), "w") as fh:
+            _json.dump({"mcpServers": {"rel-srv": {"command": "echo"}}}, fh)
+        rargv = get_adapter("copilot").build_argv(
+            "do it", RunOptions(effective_env={"COPILOT_HOME": "rel-cop-home"}), cwd=ws)
+        rdis = [rargv[i + 1] for i, a in enumerate(rargv) if a == "--disable-mcp-server"]
+        _check("copilot.mcp_disable_relative_home_uses_child_cwd",
+               "rel-srv" in rdis,
+               f"a relative COPILOT_HOME enumerates from the child's cwd, not the "
+               f"harness's: {rdis}", failures, verbose)
     finally:
         if _old_cop_home is None:
             os.environ.pop("COPILOT_HOME", None)
@@ -2942,14 +2985,23 @@ def run_selftest(verbose: bool = False) -> int:
            "wrapped entries are unwrapped and astral chars sanitize per UTF-16 unit "
            "(→ __), matching copilot", failures, verbose)
     # copilot's user config home is $COPILOT_HOME, else Node os.homedir() — %USERPROFILE%
-    # on Windows, $HOME elsewhere. A stray HOME on win32 must NOT redirect it.
+    # on Windows, $HOME elsewhere. A stray HOME on win32 must NOT redirect it. A RELATIVE
+    # home resolves against copilot's own process cwd (verified 1.0.64), i.e. the CHILD's
+    # cwd — resolving against the harness's cwd would enumerate a different config than
+    # the run loads.
     _win = sys.platform == "win32"
     _check("copilot.home_resolution",
            copilot_mod._copilot_home({"COPILOT_HOME": "/custom"}) == "/custom"
            and copilot_mod._copilot_home(
                {"USERPROFILE": "/u/prof", "HOME": "/u/home"})
-               == os.path.join("/u/prof" if _win else "/u/home", ".copilot"),
-           "COPILOT_HOME wins; otherwise USERPROFILE on win32, HOME elsewhere",
+               == os.path.join("/u/prof" if _win else "/u/home", ".copilot")
+           and copilot_mod._copilot_home({"COPILOT_HOME": "rel-home"}, "/child/ws")
+               == os.path.normpath(os.path.join("/child/ws", "rel-home"))
+           and copilot_mod._copilot_home({"USERPROFILE": "rel-base", "HOME": "rel-base"},
+                                         "/child/ws")
+               == os.path.normpath(os.path.join("/child/ws", "rel-base", ".copilot")),
+           "COPILOT_HOME wins; otherwise USERPROFILE on win32, HOME elsewhere; a "
+           "relative home resolves against the child's cwd, as copilot itself does",
            failures, verbose)
     _check("copilot.odr_gate_off_non_win32",
            sys.platform == "win32" or copilot_mod._odr_registry_command() is None,
