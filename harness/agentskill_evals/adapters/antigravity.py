@@ -125,12 +125,18 @@ class AntigravityAdapter(Adapter):
     # verified 1.1.1: an external dir registered from a workspace plugins.json launched
     # its MCP server), so the registration file itself must be neutralized. Ancestors of
     # the workspace are NOT scanned (verified 1.1.1), and a config the agent itself
-    # writes mid-run is out of scope (discovery happens at session start).
+    # writes mid-run is out of scope (discovery happens at session start). The plugins
+    # channel is masked with BOTH a `plugins/*/` and a `plugins/.*/` glob: Python's glob
+    # excludes dot-leading names from `*`, but agy discovers DOT-prefixed plugin dirs too
+    # (verified: a `plugins/.hidden/mcp_config.json` launched its server), so the
+    # dot-inclusive companion pattern is required to reach them (glob's `.*` never matches
+    # `.`/`..` — scandir-based — so it's exactly the hidden-name complement of `*`).
     workspace_config_masks = {
         f"{root}/{rel}": content
         for root in (".agents", ".agent", "_agents", "_agent")
         for rel, content in (("mcp_config.json", '{"mcpServers": {}}'),
                              ("plugins/*/mcp_config.json", '{"mcpServers": {}}'),
+                             ("plugins/.*/mcp_config.json", '{"mcpServers": {}}'),
                              ("plugins.json", "{}"))
     }
 

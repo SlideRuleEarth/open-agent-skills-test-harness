@@ -1238,6 +1238,12 @@ def _check_mcp_hermetic_paths(failures, verbose):
         with open(os.path.join(ws, ".agents", "plugins", "p1", "mcp_config.json"), "w") as fh:
             fh.write('{"mcpServers":{"plug":{}}}')
         open(os.path.join(ws, ".agents", "plugins", "p1", "plugin.json"), "w").close()
+        # a DOT-prefixed plugin dir: Python's glob excludes it from `*`, but agy discovers
+        # it — so the dot-inclusive `plugins/.*/` companion pattern must reach it.
+        os.makedirs(os.path.join(ws, ".agents", "plugins", ".hidden"))
+        with open(os.path.join(ws, ".agents", "plugins", ".hidden",
+                               "mcp_config.json"), "w") as fh:
+            fh.write('{"mcpServers":{"hidden":{}}}')
         target = os.path.join(outside, "victim.json")
         with open(target, "w") as fh:
             fh.write("outside")
@@ -1249,13 +1255,17 @@ def _check_mcp_hermetic_paths(failures, verbose):
             workspace_config_masks = {
                 ".agents/mcp_config.json": '{"mcpServers": {}}',
                 ".agents/plugins/*/mcp_config.json": '{"mcpServers": {}}',
+                ".agents/plugins/.*/mcp_config.json": '{"mcpServers": {}}',
             }
 
         masked = _apply_workspace_config_masks(_WsCli(), ws)
         neutral = '{"mcpServers": {}}'
         evil_path = os.path.join(ws, ".agents", "plugins", "evil", "mcp_config.json")
+        hidden_path = os.path.join(ws, ".agents", "plugins", ".hidden",
+                                   "mcp_config.json")
         _check("mcp_wsmask.seeded_neutralized",
                masked == [os.path.join(".agents", "mcp_config.json"),
+                          os.path.join(".agents", "plugins", ".hidden", "mcp_config.json"),
                           os.path.join(".agents", "plugins", "evil", "mcp_config.json"),
                           os.path.join(".agents", "plugins", "p1", "mcp_config.json")]
                and open(os.path.join(ws, ".agents", "mcp_config.json")).read() == neutral
@@ -1263,6 +1273,12 @@ def _check_mcp_hermetic_paths(failures, verbose):
                                      "mcp_config.json")).read() == neutral,
                f"seeded workspace MCP configs (direct + per-plugin glob) neutralized: "
                f"{masked}", failures, verbose)
+        # a DOT-prefixed plugin's config must be neutralized too (glob's `*` skips it —
+        # the `.*` companion is what reaches it).
+        _check("mcp_wsmask.dot_plugin_neutralized",
+               open(hidden_path).read() == neutral,
+               "a dot-prefixed plugin dir's mcp_config.json is neutralized via the "
+               "dot-inclusive glob", failures, verbose)
         # an outside-pointing symlink is NEUTRALIZED — unlinked and replaced with a real
         # neutral file (a skipped-but-live link would keep the outside config loadable) —
         # while its outside target is never written through.
@@ -2468,22 +2484,28 @@ def run_selftest(verbose: bool = False) -> int:
     _check("codex.command", cmds == ["npm install"], f"commands={cmds}", failures, verbose)
     _check("codex.file", "package.json" in paths, f"paths={paths}", failures, verbose)
     _check("codex.final", out.final_text == "Created demo-app.", repr(out.final_text), failures, verbose)
-    cargv = get_adapter("codex").build_argv("do the task", RunOptions(model="gpt-5.4-mini"), cwd="/tmp")
-    pre = cargv[:cargv.index("exec")]  # top-level flags precede the exec subcommand
-    _check("codex.argv",
-           "--ask-for-approval" in pre and "never" in pre
-           and "--sandbox" in pre and "workspace-write" in pre
-           and "--full-auto" not in cargv and cargv[-1] == "do the task",
-           f"non-interactive approval+sandbox before exec, prompt last: {cargv}", failures, verbose)
     # MCP kill-switch (DESIGN_MCP_Support.md Phase 0): the isolated HOME symlinks ~/.codex
     # wholesale, so any [mcp_servers.*] in the user's real config.toml loads in every run —
     # and `-c mcp_servers={}` does NOT clear it (verified 0.140.0: -c deep-merges with the
     # persisted table). Every configured server must be disabled BY NAME, on runs and on
-    # model probes alike. The enumerator is patched so this check never depends on (or
-    # reads) the machine's real ~/.codex.
+    # model probes alike. The enumerator is patched so these argv-shape checks never depend
+    # on (or read) the machine's real ~/.codex, and the post-verify — which would otherwise
+    # spawn a real codex — is stubbed to a no-op here (its own fail-closed behavior is
+    # exercised separately below with a mocked subprocess).
     from .adapters.codex import CodexAdapter
     orig_enum = CodexAdapter._configured_mcp_server_names
+    orig_verify = CodexAdapter._verify_all_mcp_disabled
+    CodexAdapter._verify_all_mcp_disabled = lambda self, *a, **k: None
     try:
+        CodexAdapter._configured_mcp_server_names = \
+            lambda self, cwd=None, env=None: []
+        cargv = get_adapter("codex").build_argv("do the task", RunOptions(model="gpt-5.4-mini"), cwd="/tmp")
+        pre = cargv[:cargv.index("exec")]  # top-level flags precede the exec subcommand
+        _check("codex.argv",
+               "--ask-for-approval" in pre and "never" in pre
+               and "--sandbox" in pre and "workspace-write" in pre
+               and "--full-auto" not in cargv and cargv[-1] == "do the task",
+               f"non-interactive approval+sandbox before exec, prompt last: {cargv}", failures, verbose)
         CodexAdapter._configured_mcp_server_names = \
             lambda self, cwd=None, env=None: ["user_srv", "other-srv"]
         kargv = get_adapter("codex").build_argv("do the task", RunOptions(), cwd="/tmp")
@@ -2534,29 +2556,33 @@ def run_selftest(verbose: bool = False) -> int:
                seen_ctx.get("cwd") == "/the/child/ws" and seen_ctx.get("env") == child_env,
                f"build_argv hands the child's cwd + effective env to the MCP enumerator: "
                f"{seen_ctx}", failures, verbose)
+        # `--disable plugins` must ride on every codex invocation: plugins can ship
+        # .mcp.json servers that never appear in config.toml (verified — enumeration can't
+        # see them, and a -c disable for a non-config name breaks the run with "invalid
+        # transport"). Enumerator is [] here so the probe builds cleanly.
+        CodexAdapter._configured_mcp_server_names = \
+            lambda self, cwd=None, env=None: []
+        _check("codex.argv_plugins_disabled",
+               _flag_pair(cargv, "--disable", "plugins")
+               and _flag_pair(get_adapter("codex")._probe_argv("m"), "--disable", "plugins"),
+               "--disable plugins on runs and probes closes the plugin MCP channel",
+               failures, verbose)
     finally:
         CodexAdapter._configured_mcp_server_names = orig_enum
+        CodexAdapter._verify_all_mcp_disabled = orig_verify
 
-    # `--disable plugins` must ride on every codex invocation: plugins can ship .mcp.json
-    # servers that never appear in config.toml (verified — enumeration can't see them, and
-    # a -c disable for a non-config name breaks the run with "invalid transport").
-    _check("codex.argv_plugins_disabled",
-           _flag_pair(cargv, "--disable", "plugins")
-           and _flag_pair(get_adapter("codex")._probe_argv("m"), "--disable", "plugins"),
-           "--disable plugins on runs and probes closes the plugin MCP channel",
-           failures, verbose)
-
-    # the fallback enumerator: the TOP-LEVEL mcp_servers table only. Disabling a name
-    # codex doesn't actually load creates an incomplete top-level entry and kills the run
-    # ("invalid transport", verified) — and codex loads nothing from [profiles.*] tables
-    # without --profile (verified; the legacy `profile=` config key is rejected outright
-    # on 0.140.0), so `eps`/`gamma` must NOT appear. Requires a complete TOML parser:
-    # without one the fallback FAILS CLOSED (a hand-rolled scanner misses valid-TOML
-    # shapes like escaped quoted keys — under-enumeration leaves real servers live).
+    # The primary — and ONLY — MCP enumerator is codex itself (`codex --disable plugins
+    # mcp list --json`); the fixture config.toml drives the live cross-checks below. There
+    # is no offline fallback: a hand-parsed subset of one config.toml misses the
+    # system/managed layers codex reads, so any failure of the CLI enumeration FAILS
+    # CLOSED. Profiles never contribute (0.140.0 rejects the legacy `profile=` key and
+    # ignores inactive [profiles.*] tables), so `eps`/`gamma` must not appear in codex's
+    # own listing either.
     import os
     import shutil as _sh
     import subprocess as _sp
     import tempfile as _tmp
+    import types as _types
 
     import agentskill_evals.adapters.codex as codex_mod
     _codex_home = _tmp.mkdtemp(prefix="ase-codexhome-")
@@ -2572,29 +2598,31 @@ def run_selftest(verbose: bool = False) -> int:
         expected = ["alpha", "delta", "weird name.v2"]
         _cx_env = {**os.environ, "CODEX_HOME": _codex_home}
 
-        found_toml = codex_mod._parse_config_mcp_names(_codex_home)
-        _check("codex.mcp_enumeration_fallback",
-               found_toml == expected,
-               f"parser finds header + dotted-assignment servers, excludes profile tables "
-               f"and nested inline keys: {found_toml}", failures, verbose)
+        # a project .codex/config.toml above the cwd — used by the live trusted-project
+        # cross-check further down.
+        _proj = os.path.join(_codex_ws, "proj", "sub")
+        os.makedirs(os.path.join(_codex_ws, "proj", ".codex"))
+        os.makedirs(_proj)
+        with open(os.path.join(_codex_ws, "proj", ".codex", "config.toml"), "w") as fh:
+            fh.write('[mcp_servers.project_srv]\ncommand = "echo"\n')
 
-        orig_tomllib = codex_mod.tomllib
+        # NO offline fallback: any primary-enumeration failure fails CLOSED. Parsing only
+        # the global config.toml would miss codex's system/managed layers, and a later
+        # successful main invocation could then launch an un-disabled server.
+        _cli_down = CodexAdapter()
+        _cli_down._mcp_names_via_cli = lambda cwd=None, env=None: None
         try:
-            codex_mod.tomllib = None   # simulate 3.10 without the tomli backport
-            try:
-                codex_mod._parse_config_mcp_names(_codex_home)
-                no_toml_closed = False
-            except RuntimeError as exc:
-                no_toml_closed = "failing closed" in str(exc)
-        finally:
-            codex_mod.tomllib = orig_tomllib
-        _check("codex.mcp_no_toml_parser_fails_closed",
-               no_toml_closed,
-               "no TOML parser + a config present → RuntimeError, never a silent "
-               "under-enumeration", failures, verbose)
+            _cli_down._configured_mcp_server_names(cwd=_proj, env=_cx_env)
+            enum_closed = False
+        except RuntimeError as exc:
+            enum_closed = "failing closed" in str(exc)
+        _check("codex.mcp_enumeration_fails_closed", enum_closed,
+               "a failed `codex mcp list --json` raises (fail closed) instead of parsing "
+               "an incomplete offline view of config.toml that misses system/managed "
+               "layers", failures, verbose)
 
-        # `mcp list --json` output is validated strictly: schema drift must trigger the
-        # fallback, never read as an authoritative "no servers" (fail-open).
+        # `mcp list --json` output is validated strictly: schema drift must fail closed,
+        # never be read as an authoritative "no servers".
         _v = codex_mod._validate_mcp_list_json
         _check("codex.mcp_list_json_strict",
                _v([{"name": "s1", "enabled": True}, {"name": "s0"}]) == ["s0", "s1"]
@@ -2603,50 +2631,60 @@ def run_selftest(verbose: bool = False) -> int:
                and _v({"servers": [{"name": "s1"}]}) is None  # wrapped-object drift
                and _v([{"name": 7}]) is None             # non-string name
                and _v([{"no_name": "x"}]) is None,       # entry without a name
-               "only a list of {name: str} objects is authoritative; anything else "
-               "falls back", failures, verbose)
+               "only a list of {name: str} objects is authoritative; anything else fails "
+               "closed", failures, verbose)
 
-        # the offline fallback fails closed when a project .codex/config.toml exists on
-        # the ancestor walk: whether codex loads it depends on the project's TRUST state,
-        # which is unknowable offline — guessing either way breaks hermeticity or the run.
-        _proj = os.path.join(_codex_ws, "proj", "sub")
-        os.makedirs(os.path.join(_codex_ws, "proj", ".codex"))
-        os.makedirs(_proj)
-        with open(os.path.join(_codex_ws, "proj", ".codex", "config.toml"), "w") as fh:
-            fh.write('[mcp_servers.project_srv]\ncommand = "echo"\n')
-        _cli_down = CodexAdapter()
-        _cli_down._mcp_names_via_cli = lambda cwd=None, env=None: None
-        try:
-            _cli_down._configured_mcp_server_names(cwd=_proj, env=_cx_env)
-            proj_closed = False
-        except RuntimeError as exc:
-            proj_closed = "failing closed" in str(exc)
-        _check("codex.mcp_fallback_project_config_fails_closed",
-               proj_closed
-               and _cli_down._configured_mcp_server_names(cwd=_codex_home,
-                                                          env=_cx_env) == expected,
-               "CLI down + project config above cwd → RuntimeError; without one the "
-               "global-config fallback still answers", failures, verbose)
-
-        # fallback answers are never cached (a transient `mcp list` failure must not
-        # stick); CLI-confirmed answers are (keyed by home+cwd+config state).
-        calls = {"n": 0}
-
-        def _flaky_cli(cwd=None, env=None):
-            calls["n"] += 1
-            return None if calls["n"] == 1 else ["cli_srv"]
-
-        _flaky = CodexAdapter()
-        _flaky._mcp_names_via_cli = _flaky_cli
-        first = _flaky._configured_mcp_server_names(cwd=_codex_ws, env=_cx_env)
-        second = _flaky._configured_mcp_server_names(cwd=_codex_ws, env=_cx_env)
-        third = _flaky._configured_mcp_server_names(cwd=_codex_ws, env=_cx_env)
-        _check("codex.mcp_fallback_never_cached",
-               first == expected and second == ["cli_srv"] and third == ["cli_srv"]
-               and calls["n"] == 2,
-               f"fallback answer recomputed (call 2 hits the CLI again), CLI answer "
-               f"cached (call 3 doesn't): first={first}, calls={calls['n']}",
+        # post-verify recognizes an ENABLED server: an entry counts as enabled unless it
+        # carries `"enabled": false`; drift → None so the caller fails closed.
+        _en = codex_mod._enabled_mcp_names
+        _check("codex.mcp_enabled_names",
+               _en([{"name": "a", "enabled": False}, {"name": "b"}]) == {"b"}
+               and _en([{"name": "a", "enabled": False}]) == set()
+               and _en([]) == set()
+               and _en(None) is None
+               and _en([{"no_name": 1}]) is None,
+               "enabled unless `enabled: false`; unrecognized shape → None (fail closed)",
                failures, verbose)
+
+        # after the -c ...enabled=false overrides are applied, codex's OWN re-enumeration
+        # (same cwd/env, overrides in place) must show every server disabled — a
+        # higher-precedence managed/MDM layer can outrank -c, so a server still reported
+        # enabled (or an unreadable re-check) FAILS CLOSED. subprocess is stubbed via a
+        # namespace swap (no global monkeypatch of the real module).
+        _pv = CodexAdapter()
+
+        def _fake_all_disabled(argv, **kw):
+            return _types.SimpleNamespace(
+                returncode=0, stdout='[{"name": "user_srv", "enabled": false}]')
+
+        def _fake_still_enabled(argv, **kw):
+            return _types.SimpleNamespace(
+                returncode=0, stdout='[{"name": "user_srv", "enabled": true}]')
+
+        _real_cx_sp = codex_mod.subprocess
+        try:
+            codex_mod.subprocess = _types.SimpleNamespace(
+                run=_fake_all_disabled, DEVNULL=_sp.DEVNULL,
+                TimeoutExpired=_sp.TimeoutExpired)
+            pv_ok = True
+            try:
+                _pv._verify_all_mcp_disabled(
+                    ["-c", "mcp_servers.user_srv.enabled=false"], cwd="/tmp", env=_cx_env)
+            except RuntimeError:
+                pv_ok = False
+            codex_mod.subprocess.run = _fake_still_enabled
+            try:
+                _pv._verify_all_mcp_disabled(
+                    ["-c", "mcp_servers.user_srv.enabled=false"], cwd="/tmp", env=_cx_env)
+                pv_closed = False
+            except RuntimeError as exc:
+                pv_closed = "still enabled" in str(exc)
+        finally:
+            codex_mod.subprocess = _real_cx_sp
+        _check("codex.mcp_post_verify_fails_closed",
+               pv_ok and pv_closed,
+               "post-verify passes when the re-check confirms every server disabled, and "
+               "fails closed when a managed layer keeps one enabled", failures, verbose)
 
         # live cross-checks when the codex CLI is installed: its own effective-config
         # view (the primary enumerator at runtime) must match the fixture — and must
@@ -2891,6 +2929,28 @@ def run_selftest(verbose: bool = False) -> int:
            == ("odr.exe", ["serve"]),
            "name sanitize/de-collide (node-verified FNV-1a) + command-line split match "
            "copilot's ODR converter", failures, verbose)
+    # copilot reads `entry.server ?? entry` (a wrapped {"server": {...}} entry is
+    # unwrapped) and sanitizes per UTF-16 code UNIT, so an astral character (two surrogate
+    # units) becomes TWO underscores — Python's per-code-point re.sub would emit only one,
+    # disabling the wrong/no server.
+    _check("copilot.odr_name_resolution_wrapped_and_astral",
+           copilot_mod._odr_sanitize_name("x😀y") == "x__y"
+           and copilot_mod._odr_sanitize_name("a\u00e9b") == "a_b"   # BMP non-ASCII → one _
+           and copilot_mod._odr_resolved_names(
+               [{"server": {"name": "wrapped server"}}, {"name": "x😀y"}])
+           == ["wrapped_server", "x__y"],
+           "wrapped entries are unwrapped and astral chars sanitize per UTF-16 unit "
+           "(→ __), matching copilot", failures, verbose)
+    # copilot's user config home is $COPILOT_HOME, else Node os.homedir() — %USERPROFILE%
+    # on Windows, $HOME elsewhere. A stray HOME on win32 must NOT redirect it.
+    _win = sys.platform == "win32"
+    _check("copilot.home_resolution",
+           copilot_mod._copilot_home({"COPILOT_HOME": "/custom"}) == "/custom"
+           and copilot_mod._copilot_home(
+               {"USERPROFILE": "/u/prof", "HOME": "/u/home"})
+               == os.path.join("/u/prof" if _win else "/u/home", ".copilot"),
+           "COPILOT_HOME wins; otherwise USERPROFILE on win32, HOME elsewhere",
+           failures, verbose)
     _check("copilot.odr_gate_off_non_win32",
            sys.platform == "win32" or copilot_mod._odr_registry_command() is None,
            "off Windows the ODR gate reports no command (no registry to read)",
@@ -3000,15 +3060,18 @@ def run_selftest(verbose: bool = False) -> int:
     # can register EXTERNAL plugin dirs by absolute path), every registry plugin's own
     # mcp_config.json, and the workspace files it discovers via --add-dir. The workspace
     # channel spans FOUR customization roots (.agents/.agent/_agents/_agent — each
-    # verified 1.1.1 with a sentinel server launched at session start) × three files:
-    # the root's mcp_config.json, per-plugin plugins/*/mcp_config.json, and plugins.json
-    # (registers external plugin dirs; verified 1.1.1 that a workspace plugins.json
-    # entry's external mcp_config.json launches).
+    # verified 1.1.1 with a sentinel server launched at session start) × four files:
+    # the root's mcp_config.json, per-plugin plugins/*/mcp_config.json AND the
+    # dot-inclusive plugins/.*/mcp_config.json companion (Python's glob excludes
+    # dot-leading names from `*`, but agy discovers dot-prefixed plugin dirs too), and
+    # plugins.json (registers external plugin dirs; verified 1.1.1 that a workspace
+    # plugins.json entry's external mcp_config.json launches).
     _agy_ws_expected = {
         f"{root}/{rel}": content
         for root in (".agents", ".agent", "_agents", "_agent")
         for rel, content in (("mcp_config.json", '{"mcpServers": {}}'),
                              ("plugins/*/mcp_config.json", '{"mcpServers": {}}'),
+                             ("plugins/.*/mcp_config.json", '{"mcpServers": {}}'),
                              ("plugins.json", "{}"))
     }
     _check("antigravity.mcp_config_mask_declared",

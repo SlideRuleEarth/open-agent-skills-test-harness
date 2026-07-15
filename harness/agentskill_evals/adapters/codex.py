@@ -29,19 +29,6 @@ from typing import Any, Mapping, Optional
 from ..schema import EventKind, NormalizedEvent
 from .base import Adapter, ParseOutput, ProbeResult, RunOptions, extract_command, extract_path, iter_jsonl, try_load_json, warn_unknown_usage
 
-try:
-    import tomllib  # Python 3.11+
-except ModuleNotFoundError:  # pragma: no cover — Python 3.10
-    try:
-        import tomli as tomllib  # the 3.10 backport, if installed
-    except ModuleNotFoundError:
-        # No complete TOML parser available. The offline fallback FAILS CLOSED then
-        # (see _parse_config_mcp_names) — a hand-rolled scanner cannot be trusted to
-        # enumerate every server codex would load (escaped quoted keys, dotted keys in
-        # inline tables, ... all valid TOML), and an under-enumeration silently leaves
-        # real MCP servers live.
-        tomllib = None
-
 
 _KNOWN_USAGE_KEYS = {"input_tokens", "output_tokens", "reasoning_tokens", "total_tokens"}
 
@@ -123,9 +110,14 @@ class CodexAdapter(Adapter):
         0.140.0) — so callers pass the child's exact cwd/env (exec.execute() and
         probe_model() both do). Riding on argv (not the isolation overlay) makes this
         cover every invocation the same way: cells (isolated or not), model probes, and
-        judge runs."""
+        judge runs. A `-c enabled=false` (and `--disable plugins`) can still be OUTRANKED
+        by a higher-precedence managed/MDM configuration layer, so once the overrides are
+        built they are POST-VERIFIED against codex's own effective view — with the
+        overrides applied, in the same cwd/env — and the run fails closed if any server is
+        still enabled (see _verify_all_mcp_disabled)."""
         args: list[str] = []
-        for name in self._configured_mcp_server_names(cwd=cwd, env=env):
+        names = self._configured_mcp_server_names(cwd=cwd, env=env)
+        for name in names:
             if _BARE_KEY_RE.match(name):
                 args += ["-c", f"mcp_servers.{name}.enabled=false"]
             else:
@@ -138,52 +130,81 @@ class CodexAdapter(Adapter):
                       f"-c (non-bare TOML key); the run will fail closed rather than load "
                       f"it — rename the server in config.toml.", file=sys.stderr)
                 args += ["-c", f'mcp_servers."{name}".enabled=false']
+        if names:
+            # A managed/MDM config layer can outrank the -c overrides above (and
+            # `--disable plugins`); the only trustworthy check is codex's own post-override
+            # view, so confirm every server is actually disabled — fail closed otherwise.
+            self._verify_all_mcp_disabled(args, cwd=cwd, env=env)
         return args
 
-    # (home, cwd, global-config mtime, ancestor project-config states) -> names; adapters
-    # are singletons, so this caps the `codex mcp list` spawns at one per distinct config
-    # state instead of one per argv build. Only CLI-confirmed enumerations are cached —
-    # caching a fallback answer would let one transient `mcp list` failure stick for the
-    # rest of the process.
-    _mcp_names_cache: Optional[tuple] = None
+    def _verify_all_mcp_disabled(self, disable_args: list[str], cwd: Optional[str] = None,
+                                 env: Optional[Mapping[str, str]] = None) -> None:
+        """Re-run codex's own effective-config enumeration WITH the generated
+        `-c ...enabled=false` overrides and `--disable plugins` applied, in the child's
+        exact cwd and env, and confirm no server is still enabled. A higher-precedence
+        managed/MDM configuration can override a `-c` value (and the plugins feature
+        flag), so the pre-override enumeration alone doesn't prove hermeticity — only
+        codex's post-override view does. Any server still reported enabled, or any failure
+        to obtain that view (binary missing, non-zero exit, timeout, unrecognized shape),
+        raises RuntimeError so the invocation fails closed rather than launching an
+        un-disabled server."""
+        try:
+            r = subprocess.run(
+                [self.binary, *disable_args, "--disable", "plugins",
+                 "mcp", "list", "--json"],
+                capture_output=True, text=True, encoding="utf-8", timeout=15,
+                stdin=subprocess.DEVNULL, cwd=cwd,
+                env=dict(env) if env is not None else None,
+            )
+            if r.returncode != 0:
+                raise ValueError(f"`codex mcp list` exited with code {r.returncode}")
+            data = json.loads(r.stdout)
+        except (subprocess.TimeoutExpired, FileNotFoundError, NotADirectoryError,
+                OSError, ValueError) as exc:
+            raise RuntimeError(
+                "codex could not be re-checked after applying the MCP kill-switch "
+                f"overrides ({exc}) — failing closed rather than running without "
+                "confirming every server is disabled."
+            )
+        still_enabled = _enabled_mcp_names(data)
+        if still_enabled is None:
+            raise RuntimeError(
+                "codex's post-override `mcp list --json` returned an unrecognized shape — "
+                "cannot confirm its MCP servers are disabled, failing closed."
+            )
+        if still_enabled:
+            raise RuntimeError(
+                "these MCP servers are still enabled after the kill-switch overrides "
+                f"({', '.join(sorted(still_enabled))}) — a higher-precedence managed/MDM "
+                "configuration is overriding `-c ...enabled=false`; failing closed rather "
+                "than running with them live."
+            )
 
     def _configured_mcp_server_names(self, cwd: Optional[str] = None,
                                      env: Optional[Mapping[str, str]] = None) -> list[str]:
         """Server names codex will load from *configuration* (its plugin channel is closed
         separately by `--disable plugins`, and plugin-provided servers must NOT be disabled
         by name — they have no config.toml entry, so a `-c` disable would create an
-        incomplete one and break the run). Primary source: `codex --disable plugins mcp
-        list --json` run with the child's cwd and env — codex's own effective-config
-        resolution (trusted-project configs and future config layers included). When the
-        CLI can't answer, an offline fallback parses the global config — and FAILS CLOSED
-        (RuntimeError) whenever it couldn't possibly match codex's view: a project
-        `.codex/config.toml` exists on the ancestor walk (its trust state is unknowable
-        offline), or no complete TOML parser is available."""
-        env_map: Mapping[str, str] = env if env is not None else os.environ
-        home = env_map.get("CODEX_HOME") or os.path.join(
-            env_map.get("HOME") or os.path.expanduser("~"), ".codex")
-        try:
-            mtime = os.stat(os.path.join(home, "config.toml")).st_mtime_ns
-        except OSError:
-            mtime = None
-        project_states = _project_config_states(cwd)
-        key = (os.path.realpath(home),
-               os.path.realpath(cwd) if cwd else None, mtime, project_states)
-        if self._mcp_names_cache and self._mcp_names_cache[0] == key:
-            return self._mcp_names_cache[1]
-        names = self._mcp_names_via_cli(cwd=cwd, env=env_map)
-        if names is not None:
-            self._mcp_names_cache = (key, names)
-            return names
-        if project_states:
+        incomplete one and break the run). The sole source is codex itself:
+        `codex --disable plugins mcp list --json`, run with the child's exact cwd and env,
+        which is the only view that matches codex's effective resolution (trusted-project
+        configs, $CODEX_HOME, and the system/managed layers all included). There is no
+        offline fallback and no caching: a hand-parsed subset of one config.toml misses
+        the system/managed layers codex itself reads (so a later successful run could
+        still launch an un-disabled server), and the effective view depends on the full
+        execution context (resolved binary/PATH, git-root state, managed config) — more
+        than any cache key could capture — so a stale entry could disable the wrong set.
+        Any failure to positively enumerate therefore FAILS CLOSED (RuntimeError)."""
+        names = self._mcp_names_via_cli(cwd=cwd, env=env)
+        if names is None:
             raise RuntimeError(
-                "codex could not enumerate its MCP servers (`codex mcp list --json` "
-                f"failed) and a project config exists on the path above the run cwd "
-                f"({project_states[0][0]}) whose trust state the harness cannot resolve "
-                "offline — failing closed rather than guessing which MCP servers codex "
-                "would load."
+                "codex could not enumerate its MCP servers "
+                "(`codex --disable plugins mcp list --json` did not return a usable "
+                "list) — failing closed rather than running without a verified server "
+                "set (an offline config parse would miss the system/managed layers codex "
+                "itself reads)."
             )
-        return _parse_config_mcp_names(home)
+        return names
 
     def _mcp_names_via_cli(self, cwd: Optional[str] = None,
                            env: Optional[Mapping[str, str]] = None) -> Optional[list[str]]:
@@ -370,7 +391,7 @@ def _validate_mcp_list_json(data: Any) -> Optional[list[str]]:
     """Strictly validate `codex mcp list --json` output (verified 0.140.0: a JSON array
     of objects, each with a string ``name``). Any other shape — ``null``, an object like
     ``{"servers": [...]}``, an entry without a usable name — returns None so the caller
-    falls back instead of trusting schema drift as an authoritative "no servers"."""
+    FAILS CLOSED instead of trusting schema drift as an authoritative "no servers"."""
     if not isinstance(data, list):
         return None
     names: set[str] = set()
@@ -381,59 +402,22 @@ def _validate_mcp_list_json(data: Any) -> Optional[list[str]]:
     return sorted(names)
 
 
-def _project_config_states(cwd: Optional[str]) -> tuple:
-    """(path, mtime_ns) for every ``.codex/config.toml`` on the ancestor walk from *cwd*
-    — a superset of the project config codex may load (it resolves the project root via
-    git and loads the root's ``.codex/config.toml`` only for *trusted* projects, verified
-    0.140.0; the git root is always an ancestor of cwd). Used to key the enumeration
-    cache and to detect when the offline fallback couldn't possibly be complete."""
-    if not cwd:
-        return ()
-    states: list[tuple] = []
-    d = os.path.abspath(cwd)
-    while True:
-        p = os.path.join(d, ".codex", "config.toml")
-        try:
-            states.append((p, os.stat(p).st_mtime_ns))
-        except OSError:
-            pass
-        parent = os.path.dirname(d)
-        if parent == d:
-            break
-        d = parent
-    return tuple(states)
-
-
-def _parse_config_mcp_names(home: str) -> list[str]:
-    """Offline fallback enumerator when `codex mcp list` can't answer: server names in
-    the *top-level* ``mcp_servers`` table of the global config.toml — and nothing else.
-    Profiles don't contribute: 0.140.0 rejects the legacy ``profile = "x"`` config key
-    outright ("no longer supported; use --profile"), the harness never passes
-    ``--profile``, and ``[profiles.*]`` tables are ignored when inactive (all verified) —
-    while disabling a name codex doesn't load breaks the run (see _mcp_disable_args).
-    Project configs are the caller's problem (_configured_mcp_server_names fails closed
-    when any exist). Requires a complete TOML parser (tomllib, or the tomli backport on
-    3.10): hermeticity can't ride on a hand-rolled scanner that misses valid-TOML shapes
-    (escaped quoted keys, dotted keys in inline tables), so no parser → RuntimeError
-    (fail closed). An unreadable/absent config yields [] (codex loads nothing then);
-    an unparseable one too (codex itself refuses to run on it)."""
-    try:
-        with open(os.path.join(home, "config.toml"), "rb") as f:
-            text = f.read().decode("utf-8", "replace")
-    except OSError:
-        return []
-    if tomllib is None:
-        raise RuntimeError(
-            "codex could not enumerate its MCP servers (`codex mcp list --json` failed) "
-            "and no complete TOML parser is available for the offline fallback — "
-            "failing closed rather than under-enumerating. Use Python 3.11+ (tomllib) "
-            "or `pip install tomli`."
-        )
-    try:
-        servers = tomllib.loads(text).get("mcp_servers")
-    except tomllib.TOMLDecodeError:
-        return []
-    return sorted(str(k) for k in servers) if isinstance(servers, dict) else []
+def _enabled_mcp_names(data: Any) -> Optional[set[str]]:
+    """Names of servers codex still reports as ENABLED in `mcp list --json` output — an
+    entry counts as enabled unless it carries ``"enabled": false`` (a disabled server is
+    either omitted from the listing or present with that flag; either way it drops out).
+    Returns None for an unrecognized shape (``null``, a wrapped object, an entry without a
+    usable name) so the caller can fail closed — an empty set means every server is
+    confirmed disabled."""
+    if not isinstance(data, list):
+        return None
+    enabled: set[str] = set()
+    for s in data:
+        if not isinstance(s, dict) or not isinstance(s.get("name"), str) or not s["name"]:
+            return None
+        if s.get("enabled") is not False:
+            enabled.add(s["name"])
+    return enabled
 
 
 def _codex_changed_paths(item: dict) -> list[str]:

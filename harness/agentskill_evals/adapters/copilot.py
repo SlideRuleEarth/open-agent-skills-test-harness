@@ -68,18 +68,20 @@ _WORKSPACE_MCP_FILES = (".mcp.json", ".github/mcp.json", ".vscode/mcp.json")
 #
 # On win32, copilot additionally discovers MCP servers through the Windows MCP registry:
 # it reads the string value "Command" under HKLM\SOFTWARE\Microsoft\Windows\
-# CurrentVersion\Mcp, executes `<that command> mcp list`, parses the JSON `servers`
-# array from its stdout, and registers each named server — after sanitizing the name to
-# the charset [0-9a-zA-Z_./@-] (others become "_") and de-colliding duplicates by
-# appending an FNV-1a-32 hash of the original name (then _2, _3, ...). All of this is
-# read out of the 1.0.64 bundle (app.js, the "ODR load"/"ODR convert" pipeline); no
-# flag, env var, or setting turns it off. The helpers below reproduce that resolution
-# exactly so the resolved names can be fed to --disable-mcp-server; anything short of a
-# positive enumeration while the registry gate is on FAILS CLOSED (RuntimeError) — the
-# alternative is a run with un-disabled registry servers live. Over-enumerating is safe:
-# --disable-mcp-server tolerates names copilot doesn't load (verified 1.0.64), so
-# servers copilot itself would skip (no usable packages/remotes) are just disabled
-# no-ops.
+# CurrentVersion\Mcp, executes `<that command> mcp list` (from its own workspace, with
+# its child environment, UTF-8), parses the JSON `servers` array from its stdout, and
+# registers each named server — unwrapping `entry.server ?? entry`, then sanitizing the
+# name to the charset [0-9a-zA-Z_./@-] per UTF-16 code UNIT (others become "_"; an astral
+# char is two surrogate units → "__") and de-colliding duplicates by appending an
+# FNV-1a-32 hash of the original name (then _2, _3, ...). All of this is read out of the
+# 1.0.64 bundle (app.js, the "ODR load"/"ODR convert" pipeline); no flag, env var, or
+# setting turns it off. The helpers below reproduce that resolution exactly — including
+# the child cwd/env and per-UTF-16-unit sanitization — so the resolved names can be fed
+# to --disable-mcp-server; anything short of a positive enumeration while the registry
+# gate is on FAILS CLOSED (RuntimeError) — the alternative is a run with un-disabled
+# registry servers live. Over-enumerating is safe: --disable-mcp-server tolerates names
+# copilot doesn't load (verified 1.0.64), so servers copilot itself would skip (no usable
+# packages/remotes) are just disabled no-ops.
 _ODR_REGISTRY_SUBKEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Mcp"
 _ODR_NAME_BAD_CHARS = re.compile(r"[^0-9a-zA-Z_./@-]")
 
@@ -148,21 +150,42 @@ def _odr_fnv1a32(name: str) -> str:
     return format(h, "x")
 
 
+def _odr_sanitize_name(name: str) -> str:
+    """Sanitize a server name to copilot's charset exactly as the 1.0.64 bundle does — a
+    JS ``String.prototype.replace(/[^0-9a-zA-Z_.\\/@-]/g, "_")``, which iterates UTF-16
+    code UNITS, not Unicode code points. An astral character (U+10000+) is two surrogate
+    units, each outside the charset, so it becomes ``__`` (two underscores) — matching
+    copilot; Python's per-code-point ``re.sub`` would emit only one. Every allowed char is
+    ASCII (a single unit < 0x80), so a unit is kept iff it's ASCII and in the charset."""
+    raw = name.encode("utf-16-le")
+    out: list[str] = []
+    for i in range(0, len(raw), 2):
+        unit = raw[i] | (raw[i + 1] << 8)
+        ch = chr(unit)
+        out.append(ch if unit < 0x80 and not _ODR_NAME_BAD_CHARS.match(ch) else "_")
+    return "".join(out)
+
+
 def _odr_resolved_names(servers: list) -> list[str]:
     """The server names copilot would register from an ODR ``servers`` listing, in
     listing order: sanitize each entry's name, then de-collide with the FNV-1a suffix
     (of the ORIGINAL name) and _2/_3/... counters — mirroring the bundle's converter.
-    Unnamed/non-object entries are skipped there too (they don't join the collision
-    set)."""
+    Each entry is unwrapped ``entry.server ?? entry`` first (copilot accepts both a bare
+    ``{"name": ...}`` and a wrapped ``{"server": {"name": ...}}`` shape; nullish-
+    coalescing means only a null/absent ``server`` falls back to the entry itself), and
+    its ``name`` is read off that target. Unnamed/non-object entries are skipped there too
+    (they don't join the collision set)."""
     seen: set[str] = set()
     out: list[str] = []
     for entry in servers:
         if not isinstance(entry, dict):
             continue
-        name = entry.get("name")
+        wrapped = entry.get("server")
+        target = wrapped if wrapped is not None else entry
+        name = target.get("name") if isinstance(target, dict) else None
         if not isinstance(name, str) or not name:
             continue
-        resolved = _ODR_NAME_BAD_CHARS.sub("_", name)
+        resolved = _odr_sanitize_name(name)
         if resolved in seen:
             hashed = f"{resolved}_{_odr_fnv1a32(name)}"
             if hashed in seen:
@@ -213,6 +236,23 @@ def _mcp_server_names(path: str) -> list[str]:
             if isinstance(block, dict):
                 names.extend(str(k) for k in block)
     return names
+
+
+def _copilot_home(env_map: Mapping[str, str]) -> str:
+    """The directory copilot reads its user config (``mcp-config.json``, ``config.json``)
+    from: ``$COPILOT_HOME`` when set, else ``<home>/.copilot`` where ``<home>`` is
+    copilot's Node ``os.homedir()``. On Windows that is ``%USERPROFILE%`` — NOT ``$HOME``
+    (a stray ``HOME`` on win32 would otherwise enumerate a different config than copilot
+    actually loads); everywhere else it is ``$HOME``. ``os.path.expanduser`` is the final
+    fallback for the same platform-appropriate result when neither var is set."""
+    explicit = env_map.get("COPILOT_HOME")
+    if explicit:
+        return explicit
+    if sys.platform == "win32":  # pragma: no cover — win32 only
+        base = env_map.get("USERPROFILE") or os.path.expanduser("~")
+    else:
+        base = env_map.get("HOME") or os.path.expanduser("~")
+    return os.path.join(base, ".copilot")
 
 
 # Plugin state lives in ~/.copilot/config.json: "installedPlugins" records carry an
@@ -305,8 +345,7 @@ class CopilotAdapter(Adapter):
         plugin's definition); those are covered by the installed-plugins isolation mask
         and remain a documented gap for non-isolated runs."""
         env_map: Mapping[str, str] = env if env is not None else os.environ
-        home = env_map.get("COPILOT_HOME") or os.path.join(
-            env_map.get("HOME") or os.path.expanduser("~"), ".copilot")
+        home = _copilot_home(env_map)
         names = _mcp_server_names(os.path.join(home, "mcp-config.json"))
         if cwd:
             d = os.path.abspath(cwd)
@@ -317,17 +356,21 @@ class CopilotAdapter(Adapter):
                 if parent == d:
                     break
                 d = parent
-        names.extend(self._odr_mcp_server_names())
+        names.extend(self._odr_mcp_server_names(cwd=cwd, env=env_map))
         args: list[str] = []
         for name in dict.fromkeys(names):  # de-dupe, keep order
             args += ["--disable-mcp-server", name]
         return args
 
-    def _odr_mcp_server_names(self) -> list[str]:
+    def _odr_mcp_server_names(self, cwd: Optional[str] = None,
+                              env: Optional[Mapping[str, str]] = None) -> list[str]:
         """Resolved names of the Windows ODR registry servers, [] when the gate is off
-        (non-win32 or no registry command). While the gate is ON, any failure to
-        positively enumerate — unreadable registry, unparseable command line, the
-        command failing/timing out, output without a ``servers`` array — raises
+        (non-win32 or no registry command). The registry command is run the way copilot
+        runs it — from the child's workspace (``cwd``) with the child's environment
+        (``env``) and UTF-8 decoding — so a context-sensitive listing or a non-ASCII
+        server name resolves to exactly what copilot would register. While the gate is ON,
+        any failure to positively enumerate — unreadable registry, unparseable command
+        line, the command failing/timing out, output without a ``servers`` array — raises
         RuntimeError: those servers would otherwise load un-disabled, so the invocation
         fails closed instead (exec.execute() turns that into a failed run; probe_model
         into an unavailable model)."""
@@ -337,7 +380,9 @@ class CopilotAdapter(Adapter):
         try:  # pragma: no cover — needs a live ODR registry (win32); logic selftested via mocks
             exe, args = _split_odr_command(cmdline)
             r = subprocess.run([exe, *args, "mcp", "list"], capture_output=True,
-                               text=True, timeout=15, stdin=subprocess.DEVNULL)
+                               text=True, encoding="utf-8", timeout=15,
+                               stdin=subprocess.DEVNULL, cwd=cwd,
+                               env=dict(env) if env is not None else None)
             if r.returncode != 0:
                 raise ValueError(f"ODR command exited with code {r.returncode}")
             servers = _parse_odr_listing(r.stdout)
