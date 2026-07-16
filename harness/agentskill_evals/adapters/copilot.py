@@ -250,12 +250,17 @@ def _win_fully_qualified(path: str) -> bool:
       drive even with an empty tail, yet Python 3.10's ``ntpath.isabs`` wrongly reports
       such a bare share ROOT as relative, fixed in 3.11 — hence this predicate rather
       than ``isabs``);
-    * a DEVICE-NAMESPACE path — ``\\\\?\\...`` / ``\\\\.\\...`` — is fully qualified only
-      with a rooted tail (``\\\\?\\C:\\x``). ``splitdrive`` also hands back a bare
-      ``\\\\?\\C:`` as a complete "drive", but joining under it drops the separator
-      (``ntpath.join(r"\\\\?\\C:", "f")`` → ``\\\\?\\C:f``, no such path — Node joins
-      ``\\\\?\\C:\\f``), so treating it as qualified would enumerate a config file
-      copilot never reads;
+    * a DEVICE-NAMESPACE path — ``\\\\?\\...`` / ``\\\\.\\...`` — is fully qualified with
+      a rooted tail (``\\\\?\\C:\\x``), and so is a complete EXTENDED UNC share root
+      (``\\\\?\\UNC\\server\\share``): Python 3.11+ ``splitdrive`` returns the whole
+      share root as one "drive" with an empty tail (3.10 splits it as drive
+      ``\\\\?\\UNC`` + rooted tail, taking the rooted-tail arm), and ``ntpath.join``
+      inserts the separator under it exactly like Node — verified identical on
+      3.10–3.14. A bare drive-LETTER device form (``\\\\?\\C:``) is NOT qualified:
+      ``splitdrive`` hands it back as a complete "drive" too, but joining under it
+      drops the separator (``ntpath.join(r"\\\\?\\C:", "f")`` → ``\\\\?\\C:f``, no such
+      path — Node joins ``\\\\?\\C:\\f``), so treating it as qualified would enumerate
+      a config file copilot never reads;
     * a driveless path — rooted ``\\x`` or plain ``x`` — is NOT (it needs the current
       drive), and a drive-RELATIVE one — bare ``C:`` or ``C:x`` — is NOT (it resolves
       against that drive's own current directory).
@@ -264,10 +269,33 @@ def _win_fully_qualified(path: str) -> bool:
     if not drive:
         return False                       # driveless: \x or x — needs the current drive
     if drive[0] in "\\/":
-        if drive.replace("/", "\\")[:4] in ("\\\\?\\", "\\\\.\\"):
-            return tail[:1] in ("\\", "/")  # device namespace — needs a rooted tail
+        d = drive.replace("/", "\\")
+        if d[:4] in ("\\\\?\\", "\\\\.\\"):
+            if tail[:1] in ("\\", "/"):
+                return True                # rooted under a device drive: \\?\C:\x
+            # 3.11+ splitdrive returns a complete extended UNC share root as ONE
+            # drive with an empty tail; join still inserts the separator (the
+            # drive doesn't end in ":"), matching Node — accept exactly that.
+            parts = [p for p in d[4:].split("\\") if p]
+            return not tail and len(parts) >= 3 and parts[0].upper() == "UNC"
         return True                        # UNC share root \\server\share (and below)
     return tail[:1] in ("\\", "/")          # lettered X: — qualified only when rooted
+
+
+def _win_exe_has_extension(exe: str) -> bool:
+    """Mirror of libuv's ``name_has_ext`` test (``search_path`` in src/win/process.c,
+    verified against v1.51.0): the FIRST dot in the filename portion — everything after
+    the last ``\\``, ``/`` or ``:`` — followed by at least one character. Node/libuv only
+    tries the EXACT filename first when this holds (Node never sets
+    UV_PROCESS_WINDOWS_FILE_PATH_EXACT_NAME); an extensionless name is probed as
+    ``<name>.com`` then ``<name>.exe`` instead — never the exact file that CreateProcess
+    (which appends nothing to a command containing a path) executes. When it holds and
+    the exact file exists, both resolvers pick that same file; when the file is missing,
+    the harness's launch fails and the enumeration fails closed. Pure string logic so it
+    is unit-testable on any host; only consulted on win32."""
+    name = exe.replace("/", "\\").rpartition("\\")[2].rpartition(":")[2]
+    dot = name.find(".")
+    return dot != -1 and dot != len(name) - 1
 
 
 def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
@@ -467,10 +495,14 @@ class CopilotAdapter(Adapter):
         the HARNESS's application dir, cwd, and ambient PATH (the ``env=`` block is not
         consulted), while copilot's Node/libuv searches with the CHILD's PATH — so the
         two can execute DIFFERENT binaries and the harness would disable the wrong
-        listing's names while copilot loads the real one. While the gate is ON, any
-        failure to positively enumerate — unreadable registry, unparseable command line,
-        a non-qualified executable, the command failing/timing out, output without a
-        ``servers`` array — raises RuntimeError: those servers would otherwise load
+        listing's names while copilot loads the real one. On win32 it must also carry an
+        EXTENSION: even for a fully-qualified command, CreateProcess launches the exact
+        extensionless file while Node/libuv never tries an extensionless exact name,
+        probing ``<name>.com`` then ``<name>.exe`` instead (see
+        ``_win_exe_has_extension``) — again two different binaries. While the gate is ON,
+        any failure to positively enumerate — unreadable registry, unparseable command
+        line, a non-qualified or (win32) extensionless executable, the command
+        failing/timing out, output without a ``servers`` array — raises RuntimeError: those servers would otherwise load
         un-disabled, so the invocation fails closed instead (exec.execute() turns that
         into a failed run; probe_model into an unavailable model)."""
         cmdline = _odr_registry_command()
@@ -488,6 +520,14 @@ class CopilotAdapter(Adapter):
                     "PATH) could resolve and run DIFFERENT binaries, so this "
                     "enumeration can't be trusted to match what copilot loads; "
                     "failing closed."
+                )
+            if sys.platform == "win32" and not _win_exe_has_extension(exe):
+                raise RuntimeError(
+                    f"the ODR registry command's executable {exe!r} has no extension — "
+                    "CreateProcess (the harness) launches the exact extensionless file "
+                    "when the command carries a path, but copilot's Node/libuv skips an "
+                    "extensionless exact name and probes <name>.com then <name>.exe, so "
+                    "the two could run DIFFERENT binaries; failing closed."
                 )
             r = subprocess.run([exe, *args, "mcp", "list"], capture_output=True,
                                text=True, encoding="utf-8", timeout=15,

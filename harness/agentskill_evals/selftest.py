@@ -3027,13 +3027,21 @@ def run_selftest(verbose: bool = False) -> int:
     # drive-relative, and device-namespace logic (the heart of three path findings) is
     # verified off-win32 too. splitdrive returns a bare \\?\C: (and the \\?\C:.copilot a
     # naive join of it would produce) as a complete "drive" with an empty tail on every
-    # supported Python, so these fixtures are version-stable.
+    # supported Python, so these fixtures are version-stable. The extended-UNC share
+    # root is stable too: 3.10 splits it as drive \\?\UNC + rooted tail, 3.11+ as one
+    # whole-share "drive" with an empty tail — the predicate accepts both shapes
+    # (joins under it insert the separator, matching Node, verified 3.10–3.14).
     _check("copilot.win_fully_qualified",
            copilot_mod._win_fully_qualified("C:\\Users\\me")
            and copilot_mod._win_fully_qualified("\\\\server\\share")       # bare UNC ROOT
            and copilot_mod._win_fully_qualified("\\\\server\\share\\sub")
            and copilot_mod._win_fully_qualified("//server/share")
            and copilot_mod._win_fully_qualified("\\\\?\\C:\\Users\\me")    # rooted device path
+           and copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv\\share")  # extended UNC root
+           and copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv\\share\\sub")
+           and copilot_mod._win_fully_qualified("\\\\.\\UNC\\srv\\share")
+           and copilot_mod._win_fully_qualified("\\\\?\\unc\\srv\\share")  # case-insensitive
+           and copilot_mod._win_fully_qualified("//?/UNC/srv/share")
            and not copilot_mod._win_fully_qualified("\\\\?\\C:")           # bare device drive
            and not copilot_mod._win_fully_qualified("\\\\.\\C:")
            and not copilot_mod._win_fully_qualified("//?/C:")
@@ -3044,9 +3052,11 @@ def run_selftest(verbose: bool = False) -> int:
            and not copilot_mod._win_fully_qualified("relpath"),
            "win32 fully-qualified predicate: lettered-drive-with-root, complete UNC "
            "shares (incl. the bare share root ntpath.isabs mis-reports on 3.10, fixed "
-           "in 3.11), and rooted device-namespace paths qualify; driveless, "
-           "drive-relative, and bare device-namespace drives (whose joins drop the "
-           "separator — \\\\?\\C:f, a path copilot never reads) do not",
+           "in 3.11), rooted device-namespace paths, and complete extended-UNC share "
+           "roots (\\\\?\\UNC\\srv\\share — one whole-share drive with an empty tail "
+           "on 3.11+) qualify; driveless, drive-relative, and bare drive-letter device "
+           "forms (whose joins drop the separator — \\\\?\\C:f, a path copilot never "
+           "reads) do not",
            failures, verbose)
 
     # copilot's user config home is $COPILOT_HOME, else Node os.homedir() — %USERPROFILE%
@@ -3059,8 +3069,10 @@ def run_selftest(verbose: bool = False) -> int:
     # back to $HOME/.copilot). win32 (via _win_fully_qualified): a rooted-but-driveless home
     # takes the child cwd's drive (where copilot resolves it), a complete UNC root is
     # accepted as-is, and both a drive-relative home (bare "D:"/"C:x" — per-drive cwd
-    # unknowable) and an absent/empty/<3-char %USERPROFILE% (libuv would use
-    # GetUserProfileDirectoryW, unnameable here) fail closed. Absolute fixtures are
+    # unknowable) and an absent or present-but-<3-char %USERPROFILE% fail closed —
+    # libuv resolves only an ABSENT one via GetUserProfileDirectoryW (the real profile
+    # dir, unnameable from the env); a present short/empty one is a UV_ENOENT ERROR
+    # that Node's homedir() surfaces as a throw. Absolute fixtures are
     # drive-qualified so they are fully absolute on win32 too.
     _win = sys.platform == "win32"
     _dq = "C:" if _win else ""
@@ -3101,6 +3113,10 @@ def run_selftest(verbose: bool = False) -> int:
                # copilot reads), from COPILOT_HOME and via a USERPROFILE join alike
                and copilot_mod._copilot_home({"COPILOT_HOME": "\\\\?\\C:\\real"},
                                              "D:\\child\\ws") == "\\\\?\\C:\\real"
+               # a complete EXTENDED UNC share root is accepted as-is on every Python
+               # (3.11+ splitdrive returns it whole with an empty tail; joins match Node)
+               and copilot_mod._copilot_home({"COPILOT_HOME": "\\\\?\\UNC\\srv\\share"},
+                                             "D:\\child\\ws") == "\\\\?\\UNC\\srv\\share"
                and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:"}, "D:\\child\\ws")
                and _cop_home_raises({"USERPROFILE": "\\\\?\\C:"}, "D:\\child\\ws")
                # drive-relative homes fail closed — different drive AND same drive as cwd
@@ -3119,8 +3135,9 @@ def run_selftest(verbose: bool = False) -> int:
            "USERPROFILE on win32, HOME elsewhere; a POSIX empty HOME resolves to the "
            "child cwd, relative homes resolve against the child's cwd as copilot does; "
            "win32 driveless-rooted homes take the child cwd's drive, complete UNC roots "
-           "and rooted device paths are accepted, and drive-relative homes, bare device "
-           "drives, plus absent/short USERPROFILE fail closed",
+           "(incl. the extended \\\\?\\UNC form) and rooted device paths are accepted, "
+           "and drive-relative homes, bare drive-letter device forms, plus absent/short "
+           "USERPROFILE fail closed",
            failures, verbose)
     _check("copilot.odr_gate_off_non_win32",
            sys.platform == "win32" or copilot_mod._odr_registry_command() is None,
@@ -3200,6 +3217,35 @@ def run_selftest(verbose: bool = False) -> int:
                odr_rel_closed and odr_relq_closed,
                "a bare/relative ODR executable (quoted or not) raises before launching — "
                "harness and copilot could resolve different binaries", failures, verbose)
+
+        # ...and even a FULLY-QUALIFIED executable is rejected on win32 when it lacks an
+        # extension: CreateProcess (the harness) runs the exact extensionless file, but
+        # Node/libuv never tries an extensionless exact name — it probes <name>.com then
+        # <name>.exe — so the two could run different binaries. The predicate mirrors
+        # libuv's name_has_ext exactly (FIRST dot in the filename portion, nonempty
+        # remainder — a leading dot counts, a dot only in a directory doesn't) and is
+        # pure string logic, asserted on every host; the call-site raise is win32-only.
+        ext_ok = (copilot_mod._win_exe_has_extension("C:\\bin\\odr.exe")
+                  and copilot_mod._win_exe_has_extension("C:/bin/odr.exe")
+                  and copilot_mod._win_exe_has_extension("C:\\bin\\odr.foo.exe")
+                  and copilot_mod._win_exe_has_extension("C:\\bin\\.odr")
+                  and copilot_mod._win_exe_has_extension("C:\\bin.d\\o.exe")
+                  and not copilot_mod._win_exe_has_extension("C:\\bin\\odr")
+                  and not copilot_mod._win_exe_has_extension("C:\\bin\\odr.")
+                  and not copilot_mod._win_exe_has_extension("C:\\bin.d\\odr"))
+        if sys.platform == "win32":  # pragma: no cover — the raise is win32-gated
+            copilot_mod._odr_registry_command = lambda: 'C:\\bin\\odr serve'
+            try:
+                get_adapter("copilot")._odr_mcp_server_names()
+                ext_ok = False
+            except RuntimeError as exc:
+                ext_ok = ext_ok and ("no extension" in str(exc)
+                                     and "failing closed" in str(exc))
+        _check("copilot.odr_extensionless_exe_fails_closed", ext_ok,
+               "libuv's name_has_ext is mirrored exactly, and an extensionless win32 "
+               "ODR executable raises before launching — CreateProcess would run the "
+               "exact file while Node/libuv runs <name>.com/<name>.exe",
+               failures, verbose)
 
         copilot_mod._odr_registry_command = lambda: None
         _check("copilot.odr_gate_off_no_disables",
