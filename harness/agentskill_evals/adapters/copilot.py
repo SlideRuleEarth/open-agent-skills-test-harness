@@ -247,8 +247,15 @@ def _win_fully_qualified(path: str) -> bool:
     * a lettered drive WITH a root — ``C:\\x`` — is fully qualified;
     * a complete UNC share — ``\\\\server\\share`` and anything below it — is fully
       qualified (``ntpath.splitdrive`` returns the whole ``\\\\server\\share`` as the
-      drive even with an empty tail, yet Python <=3.12 ``ntpath.isabs`` wrongly reports
-      such a bare share ROOT as relative — hence this predicate rather than ``isabs``);
+      drive even with an empty tail, yet Python 3.10's ``ntpath.isabs`` wrongly reports
+      such a bare share ROOT as relative, fixed in 3.11 — hence this predicate rather
+      than ``isabs``);
+    * a DEVICE-NAMESPACE path — ``\\\\?\\...`` / ``\\\\.\\...`` — is fully qualified only
+      with a rooted tail (``\\\\?\\C:\\x``). ``splitdrive`` also hands back a bare
+      ``\\\\?\\C:`` as a complete "drive", but joining under it drops the separator
+      (``ntpath.join(r"\\\\?\\C:", "f")`` → ``\\\\?\\C:f``, no such path — Node joins
+      ``\\\\?\\C:\\f``), so treating it as qualified would enumerate a config file
+      copilot never reads;
     * a driveless path — rooted ``\\x`` or plain ``x`` — is NOT (it needs the current
       drive), and a drive-RELATIVE one — bare ``C:`` or ``C:x`` — is NOT (it resolves
       against that drive's own current directory).
@@ -256,8 +263,10 @@ def _win_fully_qualified(path: str) -> bool:
     drive, tail = ntpath.splitdrive(path)
     if not drive:
         return False                       # driveless: \x or x — needs the current drive
-    if drive[0] in "\\/":                   # UNC share root \\server\share (and below)
-        return True
+    if drive[0] in "\\/":
+        if drive.replace("/", "\\")[:4] in ("\\\\?\\", "\\\\.\\"):
+            return tail[:1] in ("\\", "/")  # device namespace — needs a rooted tail
+        return True                        # UNC share root \\server\share (and below)
     return tail[:1] in ("\\", "/")          # lettered X: — qualified only when rooted
 
 
@@ -275,11 +284,13 @@ def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
       ``""`` for it, making the ``.copilot`` join relative (verified 1.0.64: ``copilot mcp
       list`` with ``HOME=""`` reads ``<its cwd>/.copilot``); ``os.path.expanduser`` is the
       fallback only when ``$HOME`` is absent.
-    * win32: libuv's ``uv_os_homedir`` REJECTS an absent OR empty/<3-char ``%USERPROFILE%``
-      and falls back to ``GetUserProfileDirectoryW`` — the real profile directory, never a
-      cwd-relative path (Windows has no POSIX empty-``HOME`` behaviour). The harness can't
-      name that API's result, so an absent/short ``USERPROFILE`` fails closed rather than
-      enumerate the wrong (or the harness user's real) config.
+    * win32: an ABSENT ``%USERPROFILE%`` makes libuv's ``uv_os_homedir`` fall back to
+      ``GetUserProfileDirectoryW`` — the real profile directory, resolved from the process
+      token, not this env. A PRESENT but empty/<3-char value is different: ``uv_os_homedir``
+      returns ``UV_ENOENT`` as an ERROR (no fallback), which Node's ``os.homedir()``
+      surfaces as a thrown system error. Neither is ever a cwd-relative path (Windows has
+      no POSIX empty-``HOME`` behaviour), and neither names a config this harness could
+      enumerate — so both fail closed.
 
     Resolution of a non-fully-qualified home: a RELATIVE home resolves against copilot's
     own process cwd (verified 1.0.64: ``COPILOT_HOME=relhome`` reads ``<its cwd>/relhome``),
@@ -290,7 +301,9 @@ def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
     home (bare ``C:`` or ``C:x``) is rejected outright: it resolves against that drive's
     per-drive current directory, which nobody here can know and which copilot does NOT
     equate to the child cwd (verified: ``COPILOT_HOME="D:"`` persists to ``D:\\`` root, not
-    ``<cwd>``), so the config it loads can't be named — fail closed."""
+    ``<cwd>``), so the config it loads can't be named — fail closed. A bare device-
+    namespace drive (``\\\\?\\C:``) is rejected the same way — joins under it name paths
+    copilot never reads (see ``_win_fully_qualified``)."""
     explicit = env_map.get("COPILOT_HOME")
     if explicit:
         home = explicit
@@ -298,10 +311,11 @@ def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
         base = env_map.get("USERPROFILE")
         if base is None or len(base) < 3:
             raise RuntimeError(
-                f"copilot home base USERPROFILE={base!r} is absent or too short for "
-                "libuv's homedir() on win32 (it would fall back to "
-                "GetUserProfileDirectoryW — the real profile dir); the config copilot "
-                "loads can't be named, failing closed."
+                f"copilot home base USERPROFILE={base!r}: on win32 libuv's homedir() "
+                "resolves an ABSENT value via GetUserProfileDirectoryW (the real "
+                "profile dir, from the process token, not this env) and ERRORS on a "
+                "present-but-<3-char one (Node os.homedir() throws); either way the "
+                "config copilot loads can't be named from the env, failing closed."
             )
         home = os.path.join(base, ".copilot")
     else:
@@ -314,9 +328,12 @@ def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
         return home
     if sys.platform == "win32" and ntpath.splitdrive(home)[0]:  # pragma: no cover — win32
         raise RuntimeError(
-            f"copilot home {home!r} is drive-relative on win32 — its per-drive current "
-            "directory is unknowable and copilot would not resolve it against the child "
-            "cwd, so the config it loads can't be named; failing closed."
+            f"copilot home {home!r} is drive-relative or a bare device-namespace drive "
+            "on win32 — a drive-relative path resolves against that drive's own current "
+            "directory (unknowable here, and copilot would not resolve it against the "
+            "child cwd), and joining under a bare \\\\?\\X: drops the separator, naming "
+            "a path copilot never reads; the config it loads can't be named, failing "
+            "closed."
         )
     anchor = os.path.abspath(cwd or os.getcwd())
     resolved = os.path.normpath(os.path.join(anchor, home))
@@ -444,17 +461,34 @@ class CopilotAdapter(Adapter):
         (non-win32 or no registry command). The registry command is run the way copilot
         runs it — from the child's workspace (``cwd``) with the child's environment
         (``env``) and UTF-8 decoding — so a context-sensitive listing or a non-ASCII
-        server name resolves to exactly what copilot would register. While the gate is ON,
-        any failure to positively enumerate — unreadable registry, unparseable command
-        line, the command failing/timing out, output without a ``servers`` array — raises
-        RuntimeError: those servers would otherwise load un-disabled, so the invocation
-        fails closed instead (exec.execute() turns that into a failed run; probe_model
-        into an unavailable model)."""
+        server name resolves to exactly what copilot would register. The command's
+        executable must be a FULLY QUALIFIED path: a bare/relative name (``odr.exe``)
+        resolves through the launcher's own search rules — Python/CreateProcess searches
+        the HARNESS's application dir, cwd, and ambient PATH (the ``env=`` block is not
+        consulted), while copilot's Node/libuv searches with the CHILD's PATH — so the
+        two can execute DIFFERENT binaries and the harness would disable the wrong
+        listing's names while copilot loads the real one. While the gate is ON, any
+        failure to positively enumerate — unreadable registry, unparseable command line,
+        a non-qualified executable, the command failing/timing out, output without a
+        ``servers`` array — raises RuntimeError: those servers would otherwise load
+        un-disabled, so the invocation fails closed instead (exec.execute() turns that
+        into a failed run; probe_model into an unavailable model)."""
         cmdline = _odr_registry_command()
         if not cmdline:
             return []
         try:  # pragma: no cover — needs a live ODR registry (win32); logic selftested via mocks
             exe, args = _split_odr_command(cmdline)
+            fully_qualified = (_win_fully_qualified if sys.platform == "win32"
+                               else os.path.isabs)
+            if not fully_qualified(exe):
+                raise RuntimeError(
+                    f"the ODR registry command's executable {exe!r} is not a fully-"
+                    "qualified path — the harness (CreateProcess search: its own dirs "
+                    "and ambient PATH) and copilot (Node/libuv search: the child's "
+                    "PATH) could resolve and run DIFFERENT binaries, so this "
+                    "enumeration can't be trusted to match what copilot loads; "
+                    "failing closed."
+                )
             r = subprocess.run([exe, *args, "mcp", "list"], capture_output=True,
                                text=True, encoding="utf-8", timeout=15,
                                stdin=subprocess.DEVNULL, cwd=cwd,

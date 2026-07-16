@@ -3023,20 +3023,30 @@ def run_selftest(verbose: bool = False) -> int:
            "wrapped entries are unwrapped and astral chars sanitize per UTF-16 unit "
            "(→ __), matching copilot", failures, verbose)
     # The Windows fully-qualified predicate copilot home resolution leans on. Runs on every
-    # host because _win_fully_qualified uses ntpath explicitly — so the UNC-root and
-    # drive-relative logic (the heart of two path findings) is verified off-win32 too.
+    # host because _win_fully_qualified uses ntpath explicitly — so the UNC-root,
+    # drive-relative, and device-namespace logic (the heart of three path findings) is
+    # verified off-win32 too. splitdrive returns a bare \\?\C: (and the \\?\C:.copilot a
+    # naive join of it would produce) as a complete "drive" with an empty tail on every
+    # supported Python, so these fixtures are version-stable.
     _check("copilot.win_fully_qualified",
            copilot_mod._win_fully_qualified("C:\\Users\\me")
            and copilot_mod._win_fully_qualified("\\\\server\\share")       # bare UNC ROOT
            and copilot_mod._win_fully_qualified("\\\\server\\share\\sub")
            and copilot_mod._win_fully_qualified("//server/share")
+           and copilot_mod._win_fully_qualified("\\\\?\\C:\\Users\\me")    # rooted device path
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:")           # bare device drive
+           and not copilot_mod._win_fully_qualified("\\\\.\\C:")
+           and not copilot_mod._win_fully_qualified("//?/C:")
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:.copilot")   # its misjoin artifact
            and not copilot_mod._win_fully_qualified("\\rooted")            # driveless-rooted
            and not copilot_mod._win_fully_qualified("C:")                  # bare drive
            and not copilot_mod._win_fully_qualified("C:x")                 # drive-relative
            and not copilot_mod._win_fully_qualified("relpath"),
-           "win32 fully-qualified predicate: lettered-drive-with-root and complete UNC "
-           "shares qualify (incl. the bare share root ntpath.isabs mis-reports on <=3.12); "
-           "driveless and drive-relative paths do not",
+           "win32 fully-qualified predicate: lettered-drive-with-root, complete UNC "
+           "shares (incl. the bare share root ntpath.isabs mis-reports on 3.10, fixed "
+           "in 3.11), and rooted device-namespace paths qualify; driveless, "
+           "drive-relative, and bare device-namespace drives (whose joins drop the "
+           "separator — \\\\?\\C:f, a path copilot never reads) do not",
            failures, verbose)
 
     # copilot's user config home is $COPILOT_HOME, else Node os.homedir() — %USERPROFILE%
@@ -3086,11 +3096,19 @@ def run_selftest(verbose: bool = False) -> int:
                # complete UNC root accepted as-is (not anchored, not rejected)
                and copilot_mod._copilot_home({"COPILOT_HOME": "\\\\srv\\share"},
                                              "D:\\child\\ws") == "\\\\srv\\share"
+               # rooted device-namespace home accepted; a BARE device drive fails closed
+               # (its joins drop the separator — \\?\C:mcp-config.json is not a path
+               # copilot reads), from COPILOT_HOME and via a USERPROFILE join alike
+               and copilot_mod._copilot_home({"COPILOT_HOME": "\\\\?\\C:\\real"},
+                                             "D:\\child\\ws") == "\\\\?\\C:\\real"
+               and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:"}, "D:\\child\\ws")
+               and _cop_home_raises({"USERPROFILE": "\\\\?\\C:"}, "D:\\child\\ws")
                # drive-relative homes fail closed — different drive AND same drive as cwd
                and _cop_home_raises({"COPILOT_HOME": "C:drive-rel"}, "D:\\child\\ws")
                and _cop_home_raises({"COPILOT_HOME": "D:"}, "D:\\child\\ws")
                and _cop_home_raises({"COPILOT_HOME": "D:sub"}, "D:\\child\\ws")
-               # absent / empty / <3-char %USERPROFILE% fail closed (libuv → profile API)
+               # absent %USERPROFILE% (libuv → GetUserProfileDirectoryW) and a present
+               # but <3-char one (libuv errors, Node homedir() throws) both fail closed
                and _cop_home_raises({}, "D:\\child\\ws")
                and _cop_home_raises({"USERPROFILE": ""}, "D:\\child\\ws")
                and _cop_home_raises({"USERPROFILE": "C:"}, "D:\\child\\ws")
@@ -3101,8 +3119,8 @@ def run_selftest(verbose: bool = False) -> int:
            "USERPROFILE on win32, HOME elsewhere; a POSIX empty HOME resolves to the "
            "child cwd, relative homes resolve against the child's cwd as copilot does; "
            "win32 driveless-rooted homes take the child cwd's drive, complete UNC roots "
-           "are accepted, and drive-relative homes plus absent/empty USERPROFILE fail "
-           "closed",
+           "and rooted device paths are accepted, and drive-relative homes, bare device "
+           "drives, plus absent/short USERPROFILE fail closed",
            failures, verbose)
     _check("copilot.odr_gate_off_non_win32",
            sys.platform == "win32" or copilot_mod._odr_registry_command() is None,
@@ -3123,8 +3141,13 @@ def run_selftest(verbose: bool = False) -> int:
         odr_names = get_adapter("copilot")._odr_mcp_server_names()
         empty_home = _tmp.mkdtemp(prefix="ase-odr-home-")
         try:
+            # A full os.environ copy: the mocked listing subprocess needs a real process
+            # environment (win32 python won't start without SystemRoot & co), and
+            # COPILOT_HOME (absolute on every platform) pins the user config to the empty
+            # fixture — a bare HOME would fail closed on win32, where copilot ignores it
+            # and an absent USERPROFILE can't name a home.
             oargv = get_adapter("copilot")._mcp_disable_args(
-                None, env={"HOME": empty_home})
+                None, env={**os.environ, "COPILOT_HOME": empty_home})
             odis = [oargv[i + 1] for i, a in enumerate(oargv)
                     if a == "--disable-mcp-server"]
         finally:
@@ -3154,6 +3177,29 @@ def run_selftest(verbose: bool = False) -> int:
                odr_closed and odr_shape_closed,
                "a failing ODR command or a drifted output shape raises (run fails "
                "closed) instead of reading as 'no servers'", failures, verbose)
+
+        # ...and a NON-fully-qualified registry executable must fail closed too, WITHOUT
+        # being launched: Python/CreateProcess resolves a bare name via the HARNESS's
+        # application dir + ambient PATH (the env= block is not consulted), while
+        # copilot's Node/libuv resolves it via the CHILD's PATH — two different binaries
+        # could run, and the harness would disable the wrong listing's names.
+        copilot_mod._odr_registry_command = lambda: 'odr.exe serve'
+        try:
+            get_adapter("copilot")._odr_mcp_server_names()
+            odr_rel_closed = False
+        except RuntimeError as exc:
+            odr_rel_closed = ("fully-qualified" in str(exc)
+                              and "failing closed" in str(exc))
+        copilot_mod._odr_registry_command = lambda: '"odr host.exe" --flag'
+        try:
+            get_adapter("copilot")._odr_mcp_server_names()
+            odr_relq_closed = False
+        except RuntimeError as exc:
+            odr_relq_closed = "fully-qualified" in str(exc)
+        _check("copilot.odr_relative_command_fails_closed",
+               odr_rel_closed and odr_relq_closed,
+               "a bare/relative ODR executable (quoted or not) raises before launching — "
+               "harness and copilot could resolve different binaries", failures, verbose)
 
         copilot_mod._odr_registry_command = lambda: None
         _check("copilot.odr_gate_off_no_disables",
