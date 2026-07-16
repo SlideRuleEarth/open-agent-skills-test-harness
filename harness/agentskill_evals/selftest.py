@@ -3038,6 +3038,12 @@ def run_selftest(verbose: bool = False) -> int:
     # except a BARE \\.\ (or \\?\) root or an INCOMPLETE extended-UNC root, which
     # 3.10/3.11 (bare) and 3.11 (trailing-sep UNC) join with a DOUBLED separator vs
     # Node's single one, and at which no config can live on any version: fail closed.
+    # Ordinary UNC roots must be COMPLETE (server AND share): Node joins a bare \\ into
+    # \mcp-config.json, resolved from the child drive's root — a real file copilot
+    # loads — while the harness's join names nothing. And a TERMINAL-COLON root
+    # (\\?\foo:, \\srv\share:) is rejected everywhere: splitdrive returns it whole as
+    # a drive ending in ":", so ntpath.join GLUES the child name on where Node inserts
+    # the separator, and no normalization reconverges a colon glue.
     _check("copilot.win_fully_qualified",
            # ACCEPT: drive-with-root, complete UNC shares, and safe device paths
            copilot_mod._win_fully_qualified("C:\\Users\\me")
@@ -3059,6 +3065,9 @@ def run_selftest(verbose: bool = False) -> int:
                "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}\\sub")
            and copilot_mod._win_fully_qualified("\\\\.\\C:\\a\\..\\b")     # \\.\ normalizes -> converges
            and copilot_mod._win_fully_qualified("\\\\.\\C:/real")         # \\.\ fwd slash -> converges
+           # colon segments with a ROOTED tail join like Node on every version
+           and copilot_mod._win_fully_qualified("\\\\srv\\share:\\sub")
+           and copilot_mod._win_fully_qualified("\\\\?\\foo:\\x")
            # REJECT: unrooted device drives (both namespaces), noncanonical literal \\?\,
            # and any nonliteral //?/ spelling
            and not copilot_mod._win_fully_qualified("\\\\?\\C:")           # bare device drive
@@ -3076,6 +3085,23 @@ def run_selftest(verbose: bool = False) -> int:
            and not copilot_mod._win_fully_qualified("\\\\?\\UNC\\")
            and not copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv")
            and not copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv\\")
+           # incomplete ORDINARY UNC roots: no volume exists without server AND share —
+           # Node joins a bare \\ into \mcp-config.json, resolved from the CHILD's
+           # current-drive root (a real file copilot loads), while the harness's
+           # three-separator/incomplete-UNC join names nothing; \\srv\ joins with a
+           # doubled separator on 3.10/3.11
+           and not copilot_mod._win_fully_qualified("\\\\")
+           and not copilot_mod._win_fully_qualified("\\\\srv")
+           and not copilot_mod._win_fully_qualified("\\\\srv\\")
+           and not copilot_mod._win_fully_qualified("//")
+           and not copilot_mod._win_fully_qualified("//srv/")
+           # terminal-colon roots: splitdrive returns the whole root as a drive ending
+           # in ":", so ntpath.join GLUES the child name on (\\?\foo:mcp-config.json)
+           # where Node inserts the separator — in the device namespaces AND ordinary UNC
+           and not copilot_mod._win_fully_qualified("\\\\?\\foo:")
+           and not copilot_mod._win_fully_qualified("\\\\.\\foo:")
+           and not copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv\\share:")
+           and not copilot_mod._win_fully_qualified("\\\\srv\\share:")
            and not copilot_mod._win_fully_qualified("\\\\?\\C:.copilot")   # drive-relative device
            and not copilot_mod._win_fully_qualified("\\\\?\\C:\\a\\..\\b") # literal \\?\ + '..'
            and not copilot_mod._win_fully_qualified("\\\\?\\C:/real")      # literal \\?\ + '/'
@@ -3090,14 +3116,18 @@ def run_selftest(verbose: bool = False) -> int:
            and not copilot_mod._win_fully_qualified("C:")                  # bare drive
            and not copilot_mod._win_fully_qualified("C:x")                 # drive-relative
            and not copilot_mod._win_fully_qualified("relpath"),
-           "win32 fully-qualified predicate: lettered-drive-with-root, complete UNC "
+           "win32 fully-qualified predicate: lettered-drive-with-root, COMPLETE UNC "
            "shares (incl. the bare share root ntpath.isabs mis-reports on 3.10, fixed in "
            "3.11), canonical literal \\\\?\\ device paths (rooted drive, volume-GUID root, "
            "COMPLETE extended-UNC share — each with an optional single trailing "
-           "separator), and ANY non-bare \\\\.\\ path (Windows normalizes it in both "
-           "processes) qualify; unrooted device drives in either namespace, bare "
-           "namespace roots and incomplete extended-UNC roots (their joins can DOUBLE "
-           "the separator vs Node's), noncanonical literal \\\\?\\ paths (a '/' "
+           "separator), and \\\\.\\ paths outside the shared rejections (Windows "
+           "normalizes them in both processes) qualify; unrooted device drives in either "
+           "namespace, bare namespace roots and incomplete extended-UNC roots (their "
+           "joins can DOUBLE the separator vs Node's), incomplete ordinary UNC roots "
+           "(\\\\, \\\\srv, \\\\srv\\ — Node resolves a bare \\\\ from the child drive's "
+           "root while the harness's join names nothing), terminal-colon roots "
+           "(ntpath.join GLUES the child name on where Node inserts the separator), "
+           "noncanonical literal \\\\?\\ paths (a '/' "
            "or a '.'/'..'/internal-or-repeated-empty segment), and every nonliteral //?/ "
            "spelling (copilot folds it to a literal \\\\?\\ that skips normalization while "
            "the harness's stays Win32-normalized) fail closed",
@@ -3181,6 +3211,12 @@ def run_selftest(verbose: bool = False) -> int:
                and _cop_home_raises({"COPILOT_HOME": "\\\\?\\"}, "D:\\child\\ws")
                and _cop_home_raises({"COPILOT_HOME": "\\\\?\\UNC\\srv\\"},
                                     "D:\\child\\ws")
+               # incomplete ORDINARY UNC and terminal-colon roots fail closed too
+               # (Node resolves a bare \\ from the child drive's root; a colon root
+               # glues in ntpath.join where Node inserts the separator)
+               and _cop_home_raises({"COPILOT_HOME": "\\\\"}, "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "\\\\srv\\"}, "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "\\\\?\\foo:"}, "D:\\child\\ws")
                # a drive-relative device form, a NONCANONICAL literal \\?\ home, and any
                # nonliteral //?/ spelling fail closed — copilot's Node resolver
                # canonicalizes/folds-to-literal (its open then skips normalization) while
@@ -3208,11 +3244,87 @@ def run_selftest(verbose: bool = False) -> int:
            "child cwd, relative homes resolve against the child's cwd as copilot does; "
            "win32 driveless-rooted homes take the child cwd's drive, complete UNC roots "
            "(incl. the extended \\\\?\\UNC form), canonical literal \\\\?\\ device paths "
-           "(rooted, volume-GUID, one trailing sep ok), and any non-bare \\\\.\\ path are "
-           "accepted, and drive-relative homes, bare/drive-relative device drives, bare "
-           "or incomplete namespace roots, noncanonical literal-\\\\?\\ paths, nonliteral "
+           "(rooted, volume-GUID, one trailing sep ok), and \\\\.\\ paths outside the "
+           "shared rejections are accepted, and drive-relative homes, bare/drive-"
+           "relative device drives, bare or incomplete namespace and ordinary-UNC "
+           "roots, terminal-colon roots, noncanonical literal-\\\\?\\ paths, nonliteral "
            "//?/ spellings, plus absent/short USERPROFILE fail closed",
            failures, verbose)
+
+    # The win32 arm above only runs on Windows and there is no Windows CI — so the
+    # explicit-COPILOT_HOME device/UNC fixtures are ALSO exercised on every host by
+    # shimming the module-local `sys` (platform reads "win32", everything else
+    # delegates — same technique as the ODR extension check). Only these fixtures are
+    # portable: an ACCEPTED explicit home returns early through the pure-ntpath
+    # predicate and a REJECTED one raises on ntpath tests, neither touching os.path
+    # (posixpath on this host); the absent/short-USERPROFILE raises also fire before
+    # any join. The USERPROFILE .copilot join and cwd anchoring DO go through os.path,
+    # so those assertions stay win32-only above.
+    _real_sys_home = copilot_mod.sys
+
+    class _Win32SysHome:
+        platform = "win32"
+
+        def __getattr__(self, _n):
+            return getattr(_real_sys_home, _n)
+
+    def _shim_accepts(home):
+        return copilot_mod._copilot_home({"COPILOT_HOME": home}, "D:\\child\\ws") == home
+
+    copilot_mod.sys = _Win32SysHome()
+    try:
+        home_shim_ok = (
+            _shim_accepts("\\\\srv\\share")
+            and _shim_accepts("\\\\?\\C:\\real")
+            and _shim_accepts("\\\\?\\C:\\")
+            and _shim_accepts("\\\\.\\C:\\a\\..\\b")
+            and _shim_accepts("\\\\?\\UNC\\srv\\share")
+            and _shim_accepts("\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}")
+            # drive-relative and unrooted/noncanonical/nonliteral device forms
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:.copilot"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:\\a\\..\\b"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:/real"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "//?/C:/real"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "C:drive-rel"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "D:"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "D:sub"}, "D:\\child\\ws")
+            # bare/incomplete device-namespace roots
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\.\\"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "//?/"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\UNC"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\UNC\\"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\UNC\\srv"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\UNC\\srv\\"}, "D:\\child\\ws")
+            # bare/incomplete ORDINARY UNC roots — Node joins a bare \\ into
+            # \mcp-config.json, resolved from the CHILD drive's root, while the
+            # harness's join names nothing (on 3.10 splitdrive returns an EMPTY
+            # drive for \\ and \\srv; the two-separator prefix test still rejects)
+            and _cop_home_raises({"COPILOT_HOME": "\\\\"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\srv"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\srv\\"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "//srv/"}, "D:\\child\\ws")
+            # terminal-colon roots — ntpath.join GLUES where Node inserts the sep
+            and _cop_home_raises({"COPILOT_HOME": "\\\\srv\\share:"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\foo:"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\.\\foo:"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\UNC\\srv\\share:"},
+                                 "D:\\child\\ws")
+            # absent/short USERPROFILE raises fire before any os.path join
+            and _cop_home_raises({}, "D:\\child\\ws")
+            and _cop_home_raises({"USERPROFILE": ""}, "D:\\child\\ws")
+            and _cop_home_raises({"USERPROFILE": "C:"}, "D:\\child\\ws")
+        )
+    finally:
+        copilot_mod.sys = _real_sys_home
+    _check("copilot.home_device_paths_cross_host", home_shim_ok,
+           "the win32 _copilot_home accept/reject decisions for explicit device, UNC, "
+           "and drive-relative COPILOT_HOME values (pure-ntpath paths that never touch "
+           "os.path) hold on every host via the sys shim — incl. bare/incomplete "
+           "namespace and ordinary-UNC roots, terminal-colon roots, and absent/short "
+           "USERPROFILE failing closed", failures, verbose)
+
     _check("copilot.odr_gate_off_non_win32",
            sys.platform == "win32" or copilot_mod._odr_registry_command() is None,
            "off Windows the ODR gate reports no command (no registry to read)",

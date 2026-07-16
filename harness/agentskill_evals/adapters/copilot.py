@@ -252,11 +252,21 @@ def _win_fully_qualified(path: str) -> bool:
     not just win32:
 
     * a lettered drive WITH a root — ``C:\\x`` — is fully qualified;
-    * a complete UNC share — ``\\\\server\\share`` and anything below it — is fully
+    * a COMPLETE UNC share — ``\\\\server\\share`` and anything below it — is fully
       qualified (``ntpath.splitdrive`` returns the whole ``\\\\server\\share`` as the
       drive even with an empty tail, yet Python 3.10's ``ntpath.isabs`` wrongly reports
       such a bare share ROOT as relative, fixed in 3.11 — hence this predicate rather
-      than ``isabs``);
+      than ``isabs``). An INCOMPLETE one — separator-only ``\\\\`` or server-only
+      ``\\\\server`` / ``\\\\server\\`` — is NOT: no UNC volume exists without BOTH
+      server and share, Node joins a bare ``\\\\`` into ``\\mcp-config.json`` (resolved
+      from the CHILD's current-drive root — e.g. ``D:\\mcp-config.json``, a real file
+      copilot loads) while the harness's join makes a three-separator or
+      incomplete-UNC string that names nothing, and 3.10/3.11 join ``\\\\server\\``
+      with a DOUBLED separator. A terminal-COLON share root (``\\\\srv\\share:``) is
+      also rejected: splitdrive returns it whole as a drive ending in ``:``, so
+      ``ntpath.join`` GLUES the child name on (``\\\\srv\\share:mcp-config.json``, all
+      supported Pythons) where Node inserts the separator. Fail closed on all of
+      these, on every version;
     * a DEVICE-NAMESPACE path — ``\\\\?\\...`` (question) / ``\\\\.\\...`` (dot). Windows
       skips path normalization ONLY after an EXACT literal ``\\\\?\\`` prefix, so what
       qualifies differs by namespace:
@@ -292,6 +302,15 @@ def _win_fully_qualified(path: str) -> bool:
       copilot could open but the harness never enumerates. Even on versions where a
       join coincides, no directory (so no config) can live at these roots — fail
       closed on every version.
+
+      A TERMINAL-COLON device root — ``\\\\?\\foo:`` / ``\\\\.\\foo:``, or
+      ``\\\\?\\UNC\\srv\\share:`` — is rejected in BOTH namespaces: splitdrive
+      returns the whole root as a drive ending in ``:``, so ``ntpath.join`` GLUES
+      the child name on (``\\\\?\\foo:mcp-config.json``) where Node inserts the
+      separator (``\\\\?\\foo:\\mcp-config.json``) — and no normalization ever
+      reconverges a colon glue, so even the ``\\\\.\\`` namespace diverges. (A colon
+      segment ROOTED below — ``\\\\?\\foo:\\x`` — joins identically to Node on every
+      version and stays acceptable.)
     * a driveless path — rooted ``\\x`` or plain ``x`` — is NOT (it needs the current
       drive), and a drive-RELATIVE one — bare ``C:`` or ``C:x`` — is NOT (it resolves
       against that drive's own current directory).
@@ -320,6 +339,15 @@ def _win_fully_qualified(path: str) -> bool:
             if (len(body) >= 2 and body[0].isalpha() and body[1] == ":"
                     and (len(body) == 2 or body[2] != "\\")):
                 return False
+            # A TERMINAL-COLON device root (\\?\foo:, \\.\foo:, \\?\UNC\srv\share:):
+            # splitdrive returns the whole root as a drive ending in ":", so
+            # ntpath.join GLUES the child name on (\\?\foo:mcp-config.json) where Node
+            # inserts the separator — and no normalization reconverges a colon glue,
+            # so BOTH namespaces reject. (\\?\UNC\srv\share: glues on 3.11+ only;
+            # rejection is uniform — fail closed. A colon segment rooted below, e.g.
+            # \\?\foo:\x, joins identically to Node on every version and passes.)
+            if body[-1] == ":":
+                return False
             # Normalization divergence is a \\?\-ONLY hazard: Windows skips normalization
             # only after an EXACT literal \\?\ prefix. copilot's Node resolver folds a
             # forward-slash //?/ prefix to a literal \\?\ one (whose open then skips
@@ -345,7 +373,22 @@ def _win_fully_qualified(path: str) -> bool:
                 if segs[0].upper() == "UNC" and len(segs) < 3:
                     return False
             return True
-        return True                        # UNC share root \\server\share (and below)
+        # Ordinary UNC: only a COMPLETE \\server\share root (and below) qualifies.
+        # 3.11+ splitdrive returns separator-only (\\) and server-only (\\server)
+        # forms as a "drive" too, and 3.10 does the same for \\server\ — but no UNC
+        # volume exists without BOTH server and share: Node joins a bare \\ into
+        # \mcp-config.json, resolved from the CHILD's current-drive root (a real
+        # file copilot loads) while the harness's three-separator/incomplete-UNC
+        # join names nothing, and \\server\ joins with a DOUBLED separator on
+        # 3.10/3.11. Fail closed below server+share.
+        if len([p for p in d[2:].split("\\") if p]) < 2:
+            return False
+        # A terminal-COLON share root (\\srv\share:) GLUES in ntpath.join — the
+        # whole root is a drive ending in ":", so no separator is inserted
+        # (\\srv\share:mcp-config.json, all supported Pythons) where Node inserts
+        # one. A colon root with a rooted tail (\\srv\share:\sub) joins like Node
+        # everywhere and passes.
+        return bool(tail) or not d.endswith(":")
     return tail[:1] in ("\\", "/")          # lettered X: — qualified only when rooted
 
 
@@ -400,10 +443,16 @@ def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
     namespace drive (``\\\\?\\C:`` / ``\\\\.\\C:``), a bare or incomplete namespace root
     (``\\\\?\\``, ``\\\\.\\``, ``\\\\?\\UNC\\server\\`` — some Pythons join them with a
     DOUBLED separator where Node's single-separator spelling names an object the harness
-    never enumerates), and an unsafe ``\\\\?\\`` device path — a nonliteral ``//?/``
-    spelling, or a noncanonical literal one (a ``/`` or a
-    ``.``/``..``/internal-or-repeated-empty segment) that copilot's Node resolver
-    canonicalizes but ``ntpath.join`` does not — are rejected the same way; an
+    never enumerates), an INCOMPLETE ordinary UNC root (``\\\\``, ``\\\\srv``,
+    ``\\\\srv\\`` — Node resolves a bare ``\\\\`` from the CHILD's current-drive root,
+    e.g. ``D:\\mcp-config.json``, while the harness's join names nothing; caught here by
+    the two-separator prefix even on 3.10, where splitdrive returns an EMPTY drive for
+    ``\\\\``/``\\\\srv`` and the plain drive test would fall through to cwd anchoring),
+    a terminal-colon root (``\\\\?\\foo:``, ``\\\\srv\\share:`` — ``ntpath.join`` GLUES
+    the child name on where Node inserts the separator), and an unsafe ``\\\\?\\``
+    device path — a nonliteral ``//?/`` spelling, or a noncanonical literal one (a
+    ``/`` or a ``.``/``..``/internal-or-repeated-empty segment) that copilot's Node
+    resolver canonicalizes but ``ntpath.join`` does not — are rejected the same way; an
     otherwise-noncanonical ``\\\\.\\`` device path is exempt (Windows normalizes it
     identically in both processes). See ``_win_fully_qualified``."""
     explicit = env_map.get("COPILOT_HOME")
@@ -428,14 +477,26 @@ def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
     fully_qualified = _win_fully_qualified if sys.platform == "win32" else os.path.isabs
     if fully_qualified(home):
         return home
-    if sys.platform == "win32" and ntpath.splitdrive(home)[0]:  # pragma: no cover — win32
+    if sys.platform == "win32" and (
+            ntpath.splitdrive(home)[0]
+            # 3.10 splitdrive returns an EMPTY drive for \\ and \\srv — without this
+            # prefix test they would fall through to cwd anchoring, which copilot
+            # (resolving them in the UNC namespace / at the child drive's root)
+            # does not do.
+            or home.replace("/", "\\").startswith("\\\\")):
         raise RuntimeError(
-            f"copilot home {home!r} is drive-relative, a bare or incomplete device-"
-            "namespace root or drive, or an unsafe \\\\?\\ device path on win32 — a "
+            f"copilot home {home!r} is drive-relative, a bare or incomplete UNC or "
+            "device-namespace root or drive, a terminal-colon root, or an unsafe "
+            "\\\\?\\ device path on win32 — a "
             "drive-relative path resolves against that drive's own current directory "
             "(unknowable here, and copilot would not resolve it against the child cwd); "
-            "joining under a bare \\\\?\\X: drops the separator while a bare/incomplete "
-            "namespace root (\\\\?\\, \\\\?\\UNC\\srv\\) can DOUBLE it vs Node's join; "
+            "an incomplete UNC root (\\\\, \\\\srv, \\\\srv\\) is resolved by copilot "
+            "in the UNC namespace or from the child drive's ROOT while the harness's "
+            "join names something else; joining under a bare \\\\?\\X: drops the "
+            "separator, a bare/incomplete "
+            "namespace root (\\\\?\\, \\\\?\\UNC\\srv\\) can DOUBLE it vs Node's join, "
+            "and a terminal-colon root (\\\\?\\foo:, \\\\srv\\share:) GLUES the child "
+            "name on where Node inserts the separator; "
             "and under \\\\?\\ (which Windows opens without "
             "normalizing) a nonliteral //?/ spelling or a noncanonical literal one (a "
             "'/', or a '.'/'..'/internal-or-repeated-empty segment) is canonicalized by "
