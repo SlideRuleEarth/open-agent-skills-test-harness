@@ -10,6 +10,7 @@ import dataclasses
 import os
 import signal
 import subprocess
+import sys
 from dataclasses import dataclass
 
 from .adapters.base import Adapter, RunOptions
@@ -39,6 +40,12 @@ def execute(
     base = dict(os.environ)
     if env_overrides:
         base.update(env_overrides)
+    # ...then fold case-colliding keys on Windows BEFORE isolation/enumeration see them:
+    # process.env is case-insensitive there, so a scenario `env: {copilot_home: ...}` that
+    # dodges isolation's case-sensitive `COPILOT_HOME` pop would still be read by the child
+    # as COPILOT_HOME, escaping the overlay (see _fold_env_keys_case_insensitive).
+    if sys.platform == "win32":  # pragma: no cover — win32 only
+        base = _fold_env_keys_case_insensitive(base)
     env = adapter.env(base, opts)
 
     rr = RunResult(
@@ -132,6 +139,29 @@ def execute(
         rr.error = f"{adapter.binary} exited with code {code}: {tail}"
 
     return ExecResult(rr, stdout, stderr)
+
+
+def _fold_env_keys_case_insensitive(env: dict[str, str]) -> dict[str, str]:
+    """Collapse keys that differ only in case into a single uppercase key.
+
+    Applied to the child env on Windows only (see the ``sys.platform`` gate at the call
+    site), but kept platform-independent so it is unit-testable on any host. Windows
+    ``process.env`` lookups are case-insensitive (Node documents this), and the env block
+    CreateProcess hands a child is effectively case-folded. Python's ``os.environ`` already
+    uppercases its keys on Windows, but a scenario's ``env:`` overrides do not — so
+    ``env: {copilot_home: C:\\real}`` merges in as a distinct lowercase key. Isolation's
+    ``env.pop("COPILOT_HOME")`` (base.py) and copilot's ``env_map.get("COPILOT_HOME")``
+    enumeration both match the canonical uppercase name and would MISS it, while the child's
+    Node reads it as ``COPILOT_HOME`` and loads the un-isolated home — an isolation escape.
+    Folding every key to uppercase (last assignment wins in ``env``'s insertion order, so a
+    scenario override applied after ``os.environ`` takes effect, and isolation then
+    mirrors/clears it like any ``COPILOT_HOME``) keeps the harness's view of config-home
+    vars identical to the child's. Not applied off win32, where environment variables are
+    genuinely case-sensitive and the child treats a lowercase key as its own variable."""
+    canon: dict[str, str] = {}
+    for k, v in env.items():
+        canon[k.upper()] = v
+    return canon
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:

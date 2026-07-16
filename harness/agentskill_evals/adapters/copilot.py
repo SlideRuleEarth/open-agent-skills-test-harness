@@ -34,6 +34,7 @@ Verified against copilot 1.0.63 on 2026-06-22.
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import re
 import subprocess
@@ -238,49 +239,92 @@ def _mcp_server_names(path: str) -> list[str]:
     return names
 
 
+def _win_fully_qualified(path: str) -> bool:
+    """Windows semantics for "needs no current-directory OR current-drive context to
+    resolve" — i.e. what the OS treats as an absolute path. Uses ``ntpath`` explicitly so
+    the predicate is correct (and unit-testable) on any host, not just win32:
+
+    * a lettered drive WITH a root — ``C:\\x`` — is fully qualified;
+    * a complete UNC share — ``\\\\server\\share`` and anything below it — is fully
+      qualified (``ntpath.splitdrive`` returns the whole ``\\\\server\\share`` as the
+      drive even with an empty tail, yet Python <=3.12 ``ntpath.isabs`` wrongly reports
+      such a bare share ROOT as relative — hence this predicate rather than ``isabs``);
+    * a driveless path — rooted ``\\x`` or plain ``x`` — is NOT (it needs the current
+      drive), and a drive-RELATIVE one — bare ``C:`` or ``C:x`` — is NOT (it resolves
+      against that drive's own current directory).
+    """
+    drive, tail = ntpath.splitdrive(path)
+    if not drive:
+        return False                       # driveless: \x or x — needs the current drive
+    if drive[0] in "\\/":                   # UNC share root \\server\share (and below)
+        return True
+    return tail[:1] in ("\\", "/")          # lettered X: — qualified only when rooted
+
+
 def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
     """The directory copilot reads its user config (``mcp-config.json``, ``config.json``)
     from: ``$COPILOT_HOME`` when non-empty (an EMPTY value is unset to copilot too —
     verified 1.0.64: ``COPILOT_HOME=""`` falls back to ``$HOME/.copilot``), else
-    ``<home>/.copilot`` where ``<home>`` is copilot's Node ``os.homedir()``. On Windows
-    that is ``%USERPROFILE%`` — NOT ``$HOME`` (a stray ``HOME`` on win32 would otherwise
-    enumerate a different config than copilot actually loads); everywhere else it is
-    ``$HOME``. Unlike ``COPILOT_HOME``, a home var that is PRESENT BUT EMPTY is preserved
-    — Node's ``homedir()`` returns ``""`` for it, making the ``.copilot`` join relative
-    (verified 1.0.64: ``copilot mcp list`` with ``HOME=""`` reads ``<its cwd>/.copilot``);
-    treating it as unset would enumerate the harness user's real home instead.
-    ``os.path.expanduser`` is the fallback only when the var is absent. A RELATIVE home
-    resolves against copilot's own process cwd (verified 1.0.64: ``COPILOT_HOME=relhome``
-    reads ``<its cwd>/relhome``), so it is anchored to the CHILD's ``cwd`` here — the
-    harness's cwd would name a different config than the run actually loads. ``cwd=None``
-    means the child inherits the harness's cwd (direct calls, some probes), where the two
-    coincide. On win32 a ROOTED-BUT-DRIVELESS home (``\\config``) is relative too — it
-    lands on the opener's current drive, so Python <=3.12 ``isabs()`` alone would let the
-    harness read it on ITS drive while copilot resolves it on the child's; the join below
-    anchors it to the child cwd's drive (ntpath keeps the root, takes the drive). A home
-    that still isn't fully drive-qualified after anchoring (``C:config`` drive-relative —
-    Windows resolves those against a per-drive cwd nobody here can know) fails closed."""
+    ``<home>/.copilot`` where ``<home>`` is copilot's Node ``os.homedir()``.
+
+    ``os.homedir()`` is ``$HOME`` on POSIX and ``%USERPROFILE%`` on Windows — a stray
+    ``HOME`` on win32 must not redirect it. The two platforms treat a missing/empty base
+    differently, mirrored here from Node/libuv:
+
+    * POSIX: a PRESENT-BUT-EMPTY ``$HOME`` is preserved — Node's ``homedir()`` returns
+      ``""`` for it, making the ``.copilot`` join relative (verified 1.0.64: ``copilot mcp
+      list`` with ``HOME=""`` reads ``<its cwd>/.copilot``); ``os.path.expanduser`` is the
+      fallback only when ``$HOME`` is absent.
+    * win32: libuv's ``uv_os_homedir`` REJECTS an absent OR empty/<3-char ``%USERPROFILE%``
+      and falls back to ``GetUserProfileDirectoryW`` — the real profile directory, never a
+      cwd-relative path (Windows has no POSIX empty-``HOME`` behaviour). The harness can't
+      name that API's result, so an absent/short ``USERPROFILE`` fails closed rather than
+      enumerate the wrong (or the harness user's real) config.
+
+    Resolution of a non-fully-qualified home: a RELATIVE home resolves against copilot's
+    own process cwd (verified 1.0.64: ``COPILOT_HOME=relhome`` reads ``<its cwd>/relhome``),
+    so it is anchored to the CHILD's ``cwd`` here (``cwd=None`` = the child inherits the
+    harness's cwd, where the two coincide). On win32 a ROOTED-BUT-DRIVELESS home
+    (``\\config``) is anchored the same way — the join takes the child cwd's drive (ntpath
+    keeps the root, supplies the drive), where copilot resolves it. But a DRIVE-RELATIVE
+    home (bare ``C:`` or ``C:x``) is rejected outright: it resolves against that drive's
+    per-drive current directory, which nobody here can know and which copilot does NOT
+    equate to the child cwd (verified: ``COPILOT_HOME="D:"`` persists to ``D:\\`` root, not
+    ``<cwd>``), so the config it loads can't be named — fail closed."""
     explicit = env_map.get("COPILOT_HOME")
     if explicit:
         home = explicit
+    elif sys.platform == "win32":  # pragma: no cover — win32 only
+        base = env_map.get("USERPROFILE")
+        if base is None or len(base) < 3:
+            raise RuntimeError(
+                f"copilot home base USERPROFILE={base!r} is absent or too short for "
+                "libuv's homedir() on win32 (it would fall back to "
+                "GetUserProfileDirectoryW — the real profile dir); the config copilot "
+                "loads can't be named, failing closed."
+            )
+        home = os.path.join(base, ".copilot")
     else:
-        if sys.platform == "win32":  # pragma: no cover — win32 only
-            base = env_map.get("USERPROFILE")
-        else:
-            base = env_map.get("HOME")
+        base = env_map.get("HOME")
         if base is None:
             base = os.path.expanduser("~")
-        home = os.path.join(base, ".copilot")
-    if os.path.isabs(home) and (sys.platform != "win32" or os.path.splitdrive(home)[0]):
+        home = os.path.join(base, ".copilot")  # empty $HOME preserved → relative join
+    fully_qualified = _win_fully_qualified if sys.platform == "win32" else os.path.isabs
+    if fully_qualified(home):
         return home
+    if sys.platform == "win32" and ntpath.splitdrive(home)[0]:  # pragma: no cover — win32
+        raise RuntimeError(
+            f"copilot home {home!r} is drive-relative on win32 — its per-drive current "
+            "directory is unknowable and copilot would not resolve it against the child "
+            "cwd, so the config it loads can't be named; failing closed."
+        )
     anchor = os.path.abspath(cwd or os.getcwd())
     resolved = os.path.normpath(os.path.join(anchor, home))
-    if not os.path.isabs(resolved) or (
-            sys.platform == "win32" and not os.path.splitdrive(resolved)[0]):
+    if not fully_qualified(resolved):
         raise RuntimeError(
-            f"copilot home {home!r} does not resolve to a drive-qualified absolute "
-            f"path against the child cwd {anchor!r} — the config copilot would load "
-            "cannot be named, failing closed rather than enumerating the wrong one."
+            f"copilot home {home!r} does not resolve to a fully-qualified path against "
+            f"the child cwd {anchor!r} — the config copilot would load cannot be named, "
+            "failing closed rather than enumerating the wrong one."
         )
     return resolved
 

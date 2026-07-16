@@ -1369,6 +1369,25 @@ def _check_mcp_hermetic_paths(failures, verbose):
            f"an argv-construction failure becomes a failed run (nothing executed): "
            f"{ex_closed.result.error!r}", failures, verbose)
 
+    # On Windows process.env is case-insensitive, so a scenario `env: {copilot_home: ...}`
+    # that dodges isolation's case-sensitive COPILOT_HOME pop would still be read by the
+    # child as COPILOT_HOME — an isolation escape. execute() folds keys to a single
+    # uppercase form (win32-gated at the call site) before isolation runs; the fold itself
+    # is pure and checked on every host. Composing it with copilot's isolation env() shows
+    # the escape is closed: the folded COPILOT_HOME is popped (unmirrored → isolated home).
+    from .exec import _fold_env_keys_case_insensitive as _fold
+    folded = _fold({"COPILOT_HOME": "C:\\real", "copilot_home": "C:\\evil",
+                    "Path": "/p", "PATH": "/q"})
+    iso_env = get_adapter("copilot").env(
+        _fold({"copilot_home": "C:\\evil", "HOME": "/h"}), RunOptions(home="/iso"))
+    _check("mcp_exec.win_env_case_fold_closes_isolation_escape",
+           folded == {"COPILOT_HOME": "C:\\evil", "PATH": "/q"}   # one key each, last wins
+           and "copilot_home" not in iso_env and "COPILOT_HOME" not in iso_env
+           and iso_env.get("HOME") == "/iso",
+           f"case-colliding env keys fold to one uppercase key (last-wins) so isolation's "
+           f"COPILOT_HOME pop can't be dodged by a lowercase alias: {folded}, "
+           f"iso COPILOT_HOME={iso_env.get('COPILOT_HOME')!r}", failures, verbose)
+
 
 def _check_parallel_cell_idx(failures, verbose):
     """Under --jobs>1, each future submitted to the pool must carry its OWN cell_idx/total —
@@ -2946,17 +2965,20 @@ def run_selftest(verbose: bool = False) -> int:
         # goes relative and resolves against its process cwd (verified 1.0.64: `copilot
         # mcp list` with HOME="" reads <its cwd>/.copilot). Treating empty as unset
         # would enumerate the harness user's real ~/.copilot instead — the wrong config.
-        cwd_cop_home = os.path.join(ws, ".copilot")
-        os.makedirs(cwd_cop_home)
-        with open(os.path.join(cwd_cop_home, "mcp-config.json"), "w") as fh:
-            _json.dump({"mcpServers": {"empty-home-srv": {"command": "echo"}}}, fh)
-        hargv = get_adapter("copilot").build_argv(
-            "do it", RunOptions(effective_env={"HOME": "", "USERPROFILE": ""}), cwd=ws)
-        hdis = [hargv[i + 1] for i, a in enumerate(hargv) if a == "--disable-mcp-server"]
-        _check("copilot.mcp_disable_empty_home_uses_child_cwd",
-               "empty-home-srv" in hdis,
-               f"a set-but-empty HOME enumerates <child cwd>/.copilot, as copilot "
-               f"does: {hdis}", failures, verbose)
+        # POSIX-only: this empty-base-is-relative behaviour is Node/libuv's POSIX rule;
+        # on win32 libuv REJECTS an empty %USERPROFILE% (fail closed — see home_resolution).
+        if os.name != "nt":
+            cwd_cop_home = os.path.join(ws, ".copilot")
+            os.makedirs(cwd_cop_home)
+            with open(os.path.join(cwd_cop_home, "mcp-config.json"), "w") as fh:
+                _json.dump({"mcpServers": {"empty-home-srv": {"command": "echo"}}}, fh)
+            hargv = get_adapter("copilot").build_argv(
+                "do it", RunOptions(effective_env={"HOME": ""}), cwd=ws)
+            hdis = [hargv[i + 1] for i, a in enumerate(hargv) if a == "--disable-mcp-server"]
+            _check("copilot.mcp_disable_empty_home_uses_child_cwd",
+                   "empty-home-srv" in hdis,
+                   f"a set-but-empty HOME enumerates <child cwd>/.copilot, as copilot "
+                   f"does: {hdis}", failures, verbose)
     finally:
         if _old_cop_home is None:
             os.environ.pop("COPILOT_HOME", None)
@@ -3000,17 +3022,36 @@ def run_selftest(verbose: bool = False) -> int:
            == ["wrapped_server", "x__y"],
            "wrapped entries are unwrapped and astral chars sanitize per UTF-16 unit "
            "(→ __), matching copilot", failures, verbose)
+    # The Windows fully-qualified predicate copilot home resolution leans on. Runs on every
+    # host because _win_fully_qualified uses ntpath explicitly — so the UNC-root and
+    # drive-relative logic (the heart of two path findings) is verified off-win32 too.
+    _check("copilot.win_fully_qualified",
+           copilot_mod._win_fully_qualified("C:\\Users\\me")
+           and copilot_mod._win_fully_qualified("\\\\server\\share")       # bare UNC ROOT
+           and copilot_mod._win_fully_qualified("\\\\server\\share\\sub")
+           and copilot_mod._win_fully_qualified("//server/share")
+           and not copilot_mod._win_fully_qualified("\\rooted")            # driveless-rooted
+           and not copilot_mod._win_fully_qualified("C:")                  # bare drive
+           and not copilot_mod._win_fully_qualified("C:x")                 # drive-relative
+           and not copilot_mod._win_fully_qualified("relpath"),
+           "win32 fully-qualified predicate: lettered-drive-with-root and complete UNC "
+           "shares qualify (incl. the bare share root ntpath.isabs mis-reports on <=3.12); "
+           "driveless and drive-relative paths do not",
+           failures, verbose)
+
     # copilot's user config home is $COPILOT_HOME, else Node os.homedir() — %USERPROFILE%
     # on Windows, $HOME elsewhere. A stray HOME on win32 must NOT redirect it. A RELATIVE
     # home resolves against copilot's own process cwd (verified 1.0.64), i.e. the CHILD's
     # cwd — resolving against the harness's cwd would enumerate a different config than
-    # the run loads. A SET-BUT-EMPTY home var is preserved, not treated as unset — Node's
-    # homedir() returns "" for it, so copilot reads <its cwd>/.copilot (verified 1.0.64)
-    # — while an empty COPILOT_HOME IS unset to copilot (verified 1.0.64, falls back to
-    # $HOME/.copilot). On win32 a rooted-but-driveless home takes the child cwd's drive
-    # (where copilot resolves it) and a drive-relative one fails closed — its per-drive
-    # cwd is unknowable. Absolute fixtures are drive-qualified so they are fully absolute
-    # on win32 too.
+    # the run loads. POSIX: a SET-BUT-EMPTY $HOME is preserved, not treated as unset —
+    # Node's homedir() returns "" for it, so copilot reads <its cwd>/.copilot (verified
+    # 1.0.64); an empty COPILOT_HOME IS unset to copilot everywhere (verified 1.0.64, falls
+    # back to $HOME/.copilot). win32 (via _win_fully_qualified): a rooted-but-driveless home
+    # takes the child cwd's drive (where copilot resolves it), a complete UNC root is
+    # accepted as-is, and both a drive-relative home (bare "D:"/"C:x" — per-drive cwd
+    # unknowable) and an absent/empty/<3-char %USERPROFILE% (libuv would use
+    # GetUserProfileDirectoryW, unnameable here) fail closed. Absolute fixtures are
+    # drive-qualified so they are fully absolute on win32 too.
     _win = sys.platform == "win32"
     _dq = "C:" if _win else ""
 
@@ -3035,18 +3076,33 @@ def run_selftest(verbose: bool = False) -> int:
                {"COPILOT_HOME": "", "USERPROFILE": _dq + "/u/prof",
                 "HOME": _dq + "/u/home"})
                == os.path.join(_dq + ("/u/prof" if _win else "/u/home"), ".copilot")
-           and copilot_mod._copilot_home({"USERPROFILE": "", "HOME": ""},
-                                         _dq + "/child/ws")
-               == os.path.normpath(os.path.join(_dq + "/child/ws", ".copilot"))
+           # POSIX empty-$HOME is preserved (→ <cwd>/.copilot); win32 handles empty
+           # %USERPROFILE% by failing closed, asserted in the win32 block below.
+           and (_win or copilot_mod._copilot_home({"HOME": ""}, "/child/ws")
+                        == os.path.normpath(os.path.join("/child/ws", ".copilot")))
            and (not _win or (
                copilot_mod._copilot_home({"COPILOT_HOME": "\\rooted"}, "D:\\child\\ws")
                    == "D:\\rooted"
-               and _cop_home_raises({"COPILOT_HOME": "C:drive-rel"}, "D:\\child\\ws"))),
+               # complete UNC root accepted as-is (not anchored, not rejected)
+               and copilot_mod._copilot_home({"COPILOT_HOME": "\\\\srv\\share"},
+                                             "D:\\child\\ws") == "\\\\srv\\share"
+               # drive-relative homes fail closed — different drive AND same drive as cwd
+               and _cop_home_raises({"COPILOT_HOME": "C:drive-rel"}, "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "D:"}, "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "D:sub"}, "D:\\child\\ws")
+               # absent / empty / <3-char %USERPROFILE% fail closed (libuv → profile API)
+               and _cop_home_raises({}, "D:\\child\\ws")
+               and _cop_home_raises({"USERPROFILE": ""}, "D:\\child\\ws")
+               and _cop_home_raises({"USERPROFILE": "C:"}, "D:\\child\\ws")
+               and copilot_mod._copilot_home({"USERPROFILE": "C:\\Users\\me"},
+                                             "D:\\child\\ws")
+                   == os.path.join("C:\\Users\\me", ".copilot"))),
            "COPILOT_HOME wins (empty = unset, as copilot treats it); otherwise "
-           "USERPROFILE on win32, HOME elsewhere, preserved even when empty; relative "
-           "homes — including the empty-home case — resolve against the child's cwd, "
-           "as copilot itself does; win32 driveless-rooted homes take the child cwd's "
-           "drive, drive-relative ones fail closed",
+           "USERPROFILE on win32, HOME elsewhere; a POSIX empty HOME resolves to the "
+           "child cwd, relative homes resolve against the child's cwd as copilot does; "
+           "win32 driveless-rooted homes take the child cwd's drive, complete UNC roots "
+           "are accepted, and drive-relative homes plus absent/empty USERPROFILE fail "
+           "closed",
            failures, verbose)
     _check("copilot.odr_gate_off_non_win32",
            sys.platform == "win32" or copilot_mod._odr_registry_command() is None,
