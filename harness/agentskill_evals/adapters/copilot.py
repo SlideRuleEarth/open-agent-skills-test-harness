@@ -252,31 +252,30 @@ def _win_fully_qualified(path: str) -> bool:
       drive even with an empty tail, yet Python 3.10's ``ntpath.isabs`` wrongly reports
       such a bare share ROOT as relative, fixed in 3.11 — hence this predicate rather
       than ``isabs``);
-    * a DEVICE-NAMESPACE path — ``\\\\?\\...`` / ``\\\\.\\...`` — is fully qualified when
-      it is a ROOTED drive form (``\\\\?\\C:\\x``), a volume-GUID root
-      (``\\\\?\\Volume{...}``), or a complete extended-UNC share root
-      (``\\\\?\\UNC\\server\\share``): ``ntpath.join`` inserts the separator under each
-      exactly like Node — verified identical on 3.10–3.14. Two device shapes are NOT
-      qualified:
+    * a DEVICE-NAMESPACE path — ``\\\\?\\...`` (question) / ``\\\\.\\...`` (dot). Windows
+      skips path normalization ONLY after an EXACT literal ``\\\\?\\`` prefix, so what
+      qualifies differs by namespace:
 
-        - an UNROOTED drive-LETTER form — a bare ``\\\\?\\C:`` or a drive-relative
-          ``\\\\?\\C:.copilot`` (``splitdrive`` hands each back as a complete "drive"
-          with an empty tail on every supported Python) — because joining under it drops
-          the separator after the ``:`` (``ntpath.join(r"\\\\?\\C:", "f")`` →
-          ``\\\\?\\C:f``, no such path — Node joins ``\\\\?\\C:\\f``) or glues on a tail
-          copilot resolves against ``C:``'s own current directory, so it names a config
-          copilot never reads;
-        - a NONCANONICAL path under a LITERAL ``\\\\?\\`` / ``\\\\.\\`` prefix — one
-          carrying a ``/`` or a ``.``/``..``/empty (duplicate-separator) segment
-          (``\\\\?\\C:\\a\\..\\b``, ``\\\\?\\C:/b``, ``\\\\?\\UNC\\srv/share``) — because
-          copilot's Node resolver NORMALIZES the home string (folding ``/``→``\\``,
-          collapsing ``.``/``..``/duplicate separators) before appending the filename,
-          while ``ntpath.join`` preserves it verbatim and Windows itself does NOT
-          normalize after an EXACT ``\\\\?\\`` prefix — so the harness would open a
-          different (often nonexistent) file than copilot, leaving its servers live. (A
-          FORWARD-slash prefix, ``//?/...``, is not literal: Windows normalizes it on
-          open, so the two reconverge and it stays acceptable.) Only already-canonical
-          literal-prefix device paths qualify; the rest fail closed.
+        - under ``\\\\?\\`` only an EXACT literal, already-CANONICAL prefix qualifies — a
+          rooted drive form (``\\\\?\\C:\\x``), a volume-GUID root
+          (``\\\\?\\Volume{...}``), or a complete extended-UNC share root
+          (``\\\\?\\UNC\\server\\share``), each optionally with ONE trailing separator.
+          copilot's Node resolver canonicalizes the home (folding ``/``→``\\``, collapsing
+          ``.``/``..``/duplicate separators) and folds a forward-slash ``//?/`` spelling to
+          a literal ``\\\\?\\`` one — whose open then SKIPS normalization — while the
+          harness keeps its spelling, which Windows DOES normalize (trailing periods
+          trimmed, ``..`` collapsed); the two would then read different files. So a
+          noncanonical literal ``\\\\?\\`` (a ``/``, or a ``.``/``..``/internal-or-repeated-
+          empty segment) and ANY nonliteral ``//?/`` spelling fail closed;
+        - under ``\\\\.\\`` Windows normalizes on open in BOTH processes (it does not
+          skip), so a noncanonical or forward-slash spelling reconverges — no canonicality
+          is required.
+
+      An UNROOTED drive-LETTER form — bare ``\\\\?\\C:`` / ``\\\\.\\C:`` or drive-relative
+      ``\\\\?\\C:.copilot`` — is rejected in BOTH namespaces: ``ntpath.join`` drops the
+      separator after the ``:`` (``ntpath.join(r"\\\\?\\C:", "f")`` → ``\\\\?\\C:f``, no
+      such path — Node joins ``\\\\?\\C:\\f``) or glues on a tail copilot resolves against
+      ``C:``'s own current directory, naming a config copilot never reads.
     * a driveless path — rooted ``\\x`` or plain ``x`` — is NOT (it needs the current
       drive), and a drive-RELATIVE one — bare ``C:`` or ``C:x`` — is NOT (it resolves
       against that drive's own current directory).
@@ -291,25 +290,31 @@ def _win_fully_qualified(path: str) -> bool:
             # regardless of where splitdrive draws the drive/tail line (3.10 vs 3.11+
             # split extended-UNC and device roots differently).
             body = path.replace("/", "\\")[4:]
-            # A LITERAL \\?\ / \\.\ prefix (exact backslashes) makes Windows skip
-            # normalization when the harness OPENS the joined file, yet copilot's Node
-            # resolver still NORMALIZES the home string first — so a noncanonical
-            # literal-prefix home ("/" anywhere, or a "."/".."/empty segment) makes the
-            # harness read a different file than copilot; reject it (fail closed). A
-            # forward-slash prefix (//?/...) is normalized by Windows on open, so it
-            # reconverges and is left to the checks below.
-            if path[:4] in ("\\\\?\\", "\\\\.\\") and (
-                    "/" in path or any(s in ("", ".", "..") for s in body.split("\\"))):
-                return False
-            # UNROOTED drive-LETTER form (bare \\?\C: or drive-relative \\?\C:.copilot):
-            # ntpath.join drops the separator after the ":" (\\?\C:<name>) or glues on a
-            # tail copilot resolves against C:'s own current directory — never a path
-            # copilot reads.
+            # UNROOTED drive-LETTER form (bare \\?\C: / \\.\C: or drive-relative
+            # \\?\C:.copilot): ntpath.join drops the separator after the ":"
+            # (\\?\C:<name>) or glues on a tail copilot resolves against C:'s own current
+            # directory — never a path copilot reads. Rejected for BOTH namespaces (a
+            # join artifact, not a normalization one).
             if (len(body) >= 2 and body[0].isalpha() and body[1] == ":"
                     and (len(body) == 2 or body[2] != "\\")):
                 return False
-            # rooted drive form \\?\C:\x, volume-GUID root \\?\Volume{...}, extended-UNC
-            # share root \\?\UNC\server\share — join inserts the separator, matching Node.
+            # Normalization divergence is a \\?\-ONLY hazard: Windows skips normalization
+            # only after an EXACT literal \\?\ prefix. copilot's Node resolver folds a
+            # forward-slash //?/ prefix to a literal \\?\ one (whose open then skips
+            # normalization) and canonicalizes the string, while the harness keeps its
+            # spelling — so under \\?\ a nonliteral //?/ prefix, OR a noncanonical literal
+            # one (a "/", or a "."/".."/internal-or-repeated-empty segment; one trailing
+            # separator is fine), makes the two read different files. \\.\ never skips
+            # normalization, so Windows normalizes it identically in both and it
+            # reconverges — no canonicality required there.
+            if d[:4] == "\\\\?\\":
+                if path[:4] != "\\\\?\\" or "/" in path:
+                    return False
+                segs = body.split("\\")
+                if segs and segs[-1] == "":
+                    segs = segs[:-1]        # one trailing separator is join-stable
+                if any(s in ("", ".", "..") for s in segs):
+                    return False
             return True
         return True                        # UNC share root \\server\share (and below)
     return tail[:1] in ("\\", "/")          # lettered X: — qualified only when rooted
@@ -363,11 +368,12 @@ def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
     per-drive current directory, which nobody here can know and which copilot does NOT
     equate to the child cwd (verified: ``COPILOT_HOME="D:"`` persists to ``D:\\`` root, not
     ``<cwd>``), so the config it loads can't be named — fail closed. A bare device-
-    namespace drive (``\\\\?\\C:``) and a noncanonical device path (one with a ``/`` or a
-    ``.``/``..``/duplicate-separator segment under a literal ``\\\\?\\`` prefix, which
-    copilot's Node resolver normalizes but ``ntpath.join`` preserves verbatim) are
-    rejected the same way — their joins name a path copilot never reads (see
-    ``_win_fully_qualified``)."""
+    namespace drive (``\\\\?\\C:`` / ``\\\\.\\C:``) and an unsafe ``\\\\?\\`` device path —
+    a nonliteral ``//?/`` spelling, or a noncanonical literal one (a ``/`` or a
+    ``.``/``..``/internal-or-repeated-empty segment) that copilot's Node resolver
+    canonicalizes but ``ntpath.join`` does not — are rejected the same way; a ``\\\\.\\``
+    device path is exempt (Windows normalizes it identically in both processes). See
+    ``_win_fully_qualified``."""
     explicit = env_map.get("COPILOT_HOME")
     if explicit:
         home = explicit
@@ -393,12 +399,13 @@ def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
     if sys.platform == "win32" and ntpath.splitdrive(home)[0]:  # pragma: no cover — win32
         raise RuntimeError(
             f"copilot home {home!r} is drive-relative, a bare device-namespace drive, or "
-            "a noncanonical device path on win32 — a drive-relative path resolves against "
-            "that drive's own current directory (unknowable here, and copilot would not "
-            "resolve it against the child cwd); joining under a bare \\\\?\\X: drops the "
-            "separator; and a noncanonical literal-prefix \\\\?\\ path (a '/', or a "
-            "'.'/'..'/duplicate-separator segment) is normalized by copilot's Node "
-            "resolver but preserved verbatim by ntpath.join, so the two would read "
+            "an unsafe \\\\?\\ device path on win32 — a drive-relative path resolves "
+            "against that drive's own current directory (unknowable here, and copilot "
+            "would not resolve it against the child cwd); joining under a bare \\\\?\\X: "
+            "drops the separator; and under \\\\?\\ (which Windows opens without "
+            "normalizing) a nonliteral //?/ spelling or a noncanonical literal one (a "
+            "'/', or a '.'/'..'/internal-or-repeated-empty segment) is canonicalized by "
+            "copilot's Node resolver but not by ntpath.join, so the two would read "
             "different files; the config copilot loads can't be named, failing closed."
         )
     anchor = os.path.abspath(cwd or os.getcwd())

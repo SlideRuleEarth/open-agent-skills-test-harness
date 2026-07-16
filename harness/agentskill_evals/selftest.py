@@ -3023,55 +3023,67 @@ def run_selftest(verbose: bool = False) -> int:
            "wrapped entries are unwrapped and astral chars sanitize per UTF-16 unit "
            "(→ __), matching copilot", failures, verbose)
     # The Windows fully-qualified predicate copilot home resolution leans on. Runs on every
-    # host because _win_fully_qualified uses ntpath explicitly — so the UNC-root,
-    # drive-relative, device-namespace, volume-GUID, and noncanonical logic (the heart of
-    # the path findings) is verified off-win32 too. splitdrive returns a bare \\?\C: (and
-    # the \\?\C:.copilot a naive join of it would produce) as a complete "drive" with an
-    # empty tail on every supported Python, so these fixtures are version-stable. The
-    # extended-UNC share root is stable too: 3.10 splits it as drive \\?\UNC + rooted tail,
-    # 3.11+ as one whole-share "drive" with an empty tail — the predicate accepts both
-    # shapes. A volume-GUID root \\?\Volume{...} and a rooted device path join with the
-    # separator (matching Node, verified 3.10–3.14) and qualify; a NONCANONICAL literal
-    # \\?\ path (a '/', or a '.'/'..'/dup-separator segment, which copilot's Node resolver
-    # normalizes but ntpath.join preserves verbatim) does NOT — while a forward-slash //?/
-    # prefix, which Windows normalizes on open, reconverges and still qualifies.
+    # host because _win_fully_qualified uses ntpath explicitly — so the UNC-root, device-
+    # namespace, volume-GUID, and canonicality logic (the heart of the path findings) is
+    # verified off-win32 too. splitdrive returns a bare \\?\C: (and \\?\C:.copilot) as a
+    # complete "drive" with an empty tail on every supported Python, so these fixtures are
+    # version-stable (asserted on 3.10–3.14). Windows skips path normalization ONLY after
+    # an EXACT literal \\?\ prefix, so under \\?\ only an already-canonical literal prefix
+    # qualifies (a rooted drive, a volume-GUID root, or the extended-UNC share root — each
+    # with an optional single trailing separator); a noncanonical literal \\?\ (a '/' or a
+    # '.'/'..'/internal-or-repeated-empty segment) and ANY nonliteral //?/ spelling fail
+    # closed, because copilot's Node resolver canonicalizes/folds-to-literal (its open then
+    # skips normalization) while the harness's spelling is Win32-normalized, diverging. A
+    # \\.\ path is exempt — Windows normalizes it in both processes, so it reconverges.
     _check("copilot.win_fully_qualified",
+           # ACCEPT: drive-with-root, complete UNC shares, and safe device paths
            copilot_mod._win_fully_qualified("C:\\Users\\me")
            and copilot_mod._win_fully_qualified("\\\\server\\share")       # bare UNC ROOT
            and copilot_mod._win_fully_qualified("\\\\server\\share\\sub")
            and copilot_mod._win_fully_qualified("//server/share")
-           and copilot_mod._win_fully_qualified("\\\\?\\C:\\Users\\me")    # rooted device path
+           and copilot_mod._win_fully_qualified("\\\\?\\C:\\Users\\me")    # rooted literal \\?\
+           and copilot_mod._win_fully_qualified("\\\\?\\C:\\")             # drive root + trailing sep
            and copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv\\share")  # extended UNC root
+           and copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv\\share\\")
            and copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv\\share\\sub")
            and copilot_mod._win_fully_qualified("\\\\.\\UNC\\srv\\share")
            and copilot_mod._win_fully_qualified("\\\\?\\unc\\srv\\share")  # case-insensitive
-           and copilot_mod._win_fully_qualified("//?/UNC/srv/share")
            and copilot_mod._win_fully_qualified(                          # volume-GUID root
                "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}")
+           and copilot_mod._win_fully_qualified(                          # + trailing sep
+               "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}\\")
            and copilot_mod._win_fully_qualified(
                "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}\\sub")
-           and copilot_mod._win_fully_qualified("//?/C:/real")            # //?/ normalizes
+           and copilot_mod._win_fully_qualified("\\\\.\\C:\\a\\..\\b")     # \\.\ normalizes -> converges
+           and copilot_mod._win_fully_qualified("\\\\.\\C:/real")         # \\.\ fwd slash -> converges
+           # REJECT: unrooted device drives (both namespaces), noncanonical literal \\?\,
+           # and any nonliteral //?/ spelling
            and not copilot_mod._win_fully_qualified("\\\\?\\C:")           # bare device drive
            and not copilot_mod._win_fully_qualified("\\\\.\\C:")
            and not copilot_mod._win_fully_qualified("//?/C:")
-           and not copilot_mod._win_fully_qualified("\\\\?\\C:.copilot")   # its misjoin artifact
-           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\a\\..\\b") # literal + '..'
-           and not copilot_mod._win_fully_qualified("\\\\?\\C:/real")      # literal + '/'
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:.copilot")   # drive-relative device
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\a\\..\\b") # literal \\?\ + '..'
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:/real")      # literal \\?\ + '/'
            and not copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv/share")
-           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\a\\.")     # literal + '.'
-           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\a\\\\b")   # literal + dup sep
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\a\\.")     # literal \\?\ + '.'
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\a\\\\b")   # literal \\?\ internal dup sep
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\x\\\\")    # repeated trailing empty
+           and not copilot_mod._win_fully_qualified("//?/C:/real")        # nonliteral //?/
+           and not copilot_mod._win_fully_qualified("//?/C:/base./real")  # nonliteral //?/ + trailing period
+           and not copilot_mod._win_fully_qualified("//?/UNC/srv/share")  # nonliteral //?/
            and not copilot_mod._win_fully_qualified("\\rooted")            # driveless-rooted
            and not copilot_mod._win_fully_qualified("C:")                  # bare drive
            and not copilot_mod._win_fully_qualified("C:x")                 # drive-relative
            and not copilot_mod._win_fully_qualified("relpath"),
            "win32 fully-qualified predicate: lettered-drive-with-root, complete UNC "
-           "shares (incl. the bare share root ntpath.isabs mis-reports on 3.10, fixed "
-           "in 3.11), rooted device-namespace paths, volume-GUID roots, and complete "
-           "extended-UNC share roots qualify; driveless, drive-relative, bare "
-           "drive-letter device forms (whose joins drop the separator — \\\\?\\C:f), and "
-           "NONCANONICAL literal-\\\\?\\ paths (a '/' or a '.'/'..'/dup-separator segment "
-           "copilot's Node resolver would normalize) do not — but a forward-slash //?/ "
-           "prefix, normalized by Windows on open, still qualifies",
+           "shares (incl. the bare share root ntpath.isabs mis-reports on 3.10, fixed in "
+           "3.11), canonical literal \\\\?\\ device paths (rooted drive, volume-GUID root, "
+           "extended-UNC share — each with an optional single trailing separator), and "
+           "ANY \\\\.\\ path (Windows normalizes it in both processes) qualify; unrooted "
+           "device drives in either namespace, noncanonical literal \\\\?\\ paths (a '/' "
+           "or a '.'/'..'/internal-or-repeated-empty segment), and every nonliteral //?/ "
+           "spelling (copilot folds it to a literal \\\\?\\ that skips normalization while "
+           "the harness's stays Win32-normalized) fail closed",
            failures, verbose)
 
     # copilot's user config home is $COPILOT_HOME, else Node os.homedir() — %USERPROFILE%
@@ -3128,6 +3140,12 @@ def run_selftest(verbose: bool = False) -> int:
                # copilot reads), from COPILOT_HOME and via a USERPROFILE join alike
                and copilot_mod._copilot_home({"COPILOT_HOME": "\\\\?\\C:\\real"},
                                              "D:\\child\\ws") == "\\\\?\\C:\\real"
+               # a single trailing separator is join-stable, and a \\.\ device path (which
+               # Windows normalizes in both processes) is accepted even when noncanonical
+               and copilot_mod._copilot_home({"COPILOT_HOME": "\\\\?\\C:\\"},
+                                             "D:\\child\\ws") == "\\\\?\\C:\\"
+               and copilot_mod._copilot_home({"COPILOT_HOME": "\\\\.\\C:\\a\\..\\b"},
+                                             "D:\\child\\ws") == "\\\\.\\C:\\a\\..\\b"
                # a complete EXTENDED UNC share root is accepted as-is on every Python
                # (3.11+ splitdrive returns it whole with an empty tail; joins match Node)
                and copilot_mod._copilot_home({"COPILOT_HOME": "\\\\?\\UNC\\srv\\share"},
@@ -3141,14 +3159,16 @@ def run_selftest(verbose: bool = False) -> int:
                    == "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}"
                and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:"}, "D:\\child\\ws")
                and _cop_home_raises({"USERPROFILE": "\\\\?\\C:"}, "D:\\child\\ws")
-               # a drive-relative device form and a NONCANONICAL literal \\?\ home
-               # (copilot's Node resolver folds '/'→'\' or collapses '.'/'..', but
-               # ntpath.join preserves it verbatim) both fail closed
+               # a drive-relative device form, a NONCANONICAL literal \\?\ home, and any
+               # nonliteral //?/ spelling fail closed — copilot's Node resolver
+               # canonicalizes/folds-to-literal (its open then skips normalization) while
+               # the harness's spelling is Win32-normalized, so the two would diverge
                and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:.copilot"},
                                     "D:\\child\\ws")
                and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:\\a\\..\\b"},
                                     "D:\\child\\ws")
                and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:/real"}, "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "//?/C:/real"}, "D:\\child\\ws")
                # drive-relative homes fail closed — different drive AND same drive as cwd
                and _cop_home_raises({"COPILOT_HOME": "C:drive-rel"}, "D:\\child\\ws")
                and _cop_home_raises({"COPILOT_HOME": "D:"}, "D:\\child\\ws")
@@ -3165,10 +3185,11 @@ def run_selftest(verbose: bool = False) -> int:
            "USERPROFILE on win32, HOME elsewhere; a POSIX empty HOME resolves to the "
            "child cwd, relative homes resolve against the child's cwd as copilot does; "
            "win32 driveless-rooted homes take the child cwd's drive, complete UNC roots "
-           "(incl. the extended \\\\?\\UNC form), rooted device paths, and volume-GUID "
-           "roots are accepted, and drive-relative homes, bare/drive-relative device "
-           "forms, noncanonical literal-\\\\?\\ paths, plus absent/short USERPROFILE fail "
-           "closed",
+           "(incl. the extended \\\\?\\UNC form), canonical literal \\\\?\\ device paths "
+           "(rooted, volume-GUID, one trailing sep ok), and any \\\\.\\ path are accepted, "
+           "and drive-relative homes, bare/drive-relative device forms, noncanonical "
+           "literal-\\\\?\\ paths, nonliteral //?/ spellings, plus absent/short USERPROFILE "
+           "fail closed",
            failures, verbose)
     _check("copilot.odr_gate_off_non_win32",
            sys.platform == "win32" or copilot_mod._odr_registry_command() is None,
