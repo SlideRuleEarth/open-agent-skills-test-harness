@@ -3024,13 +3024,17 @@ def run_selftest(verbose: bool = False) -> int:
            "(→ __), matching copilot", failures, verbose)
     # The Windows fully-qualified predicate copilot home resolution leans on. Runs on every
     # host because _win_fully_qualified uses ntpath explicitly — so the UNC-root,
-    # drive-relative, and device-namespace logic (the heart of three path findings) is
-    # verified off-win32 too. splitdrive returns a bare \\?\C: (and the \\?\C:.copilot a
-    # naive join of it would produce) as a complete "drive" with an empty tail on every
-    # supported Python, so these fixtures are version-stable. The extended-UNC share
-    # root is stable too: 3.10 splits it as drive \\?\UNC + rooted tail, 3.11+ as one
-    # whole-share "drive" with an empty tail — the predicate accepts both shapes
-    # (joins under it insert the separator, matching Node, verified 3.10–3.14).
+    # drive-relative, device-namespace, volume-GUID, and noncanonical logic (the heart of
+    # the path findings) is verified off-win32 too. splitdrive returns a bare \\?\C: (and
+    # the \\?\C:.copilot a naive join of it would produce) as a complete "drive" with an
+    # empty tail on every supported Python, so these fixtures are version-stable. The
+    # extended-UNC share root is stable too: 3.10 splits it as drive \\?\UNC + rooted tail,
+    # 3.11+ as one whole-share "drive" with an empty tail — the predicate accepts both
+    # shapes. A volume-GUID root \\?\Volume{...} and a rooted device path join with the
+    # separator (matching Node, verified 3.10–3.14) and qualify; a NONCANONICAL literal
+    # \\?\ path (a '/', or a '.'/'..'/dup-separator segment, which copilot's Node resolver
+    # normalizes but ntpath.join preserves verbatim) does NOT — while a forward-slash //?/
+    # prefix, which Windows normalizes on open, reconverges and still qualifies.
     _check("copilot.win_fully_qualified",
            copilot_mod._win_fully_qualified("C:\\Users\\me")
            and copilot_mod._win_fully_qualified("\\\\server\\share")       # bare UNC ROOT
@@ -3042,21 +3046,32 @@ def run_selftest(verbose: bool = False) -> int:
            and copilot_mod._win_fully_qualified("\\\\.\\UNC\\srv\\share")
            and copilot_mod._win_fully_qualified("\\\\?\\unc\\srv\\share")  # case-insensitive
            and copilot_mod._win_fully_qualified("//?/UNC/srv/share")
+           and copilot_mod._win_fully_qualified(                          # volume-GUID root
+               "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}")
+           and copilot_mod._win_fully_qualified(
+               "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}\\sub")
+           and copilot_mod._win_fully_qualified("//?/C:/real")            # //?/ normalizes
            and not copilot_mod._win_fully_qualified("\\\\?\\C:")           # bare device drive
            and not copilot_mod._win_fully_qualified("\\\\.\\C:")
            and not copilot_mod._win_fully_qualified("//?/C:")
            and not copilot_mod._win_fully_qualified("\\\\?\\C:.copilot")   # its misjoin artifact
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\a\\..\\b") # literal + '..'
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:/real")      # literal + '/'
+           and not copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv/share")
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\a\\.")     # literal + '.'
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\a\\\\b")   # literal + dup sep
            and not copilot_mod._win_fully_qualified("\\rooted")            # driveless-rooted
            and not copilot_mod._win_fully_qualified("C:")                  # bare drive
            and not copilot_mod._win_fully_qualified("C:x")                 # drive-relative
            and not copilot_mod._win_fully_qualified("relpath"),
            "win32 fully-qualified predicate: lettered-drive-with-root, complete UNC "
            "shares (incl. the bare share root ntpath.isabs mis-reports on 3.10, fixed "
-           "in 3.11), rooted device-namespace paths, and complete extended-UNC share "
-           "roots (\\\\?\\UNC\\srv\\share — one whole-share drive with an empty tail "
-           "on 3.11+) qualify; driveless, drive-relative, and bare drive-letter device "
-           "forms (whose joins drop the separator — \\\\?\\C:f, a path copilot never "
-           "reads) do not",
+           "in 3.11), rooted device-namespace paths, volume-GUID roots, and complete "
+           "extended-UNC share roots qualify; driveless, drive-relative, bare "
+           "drive-letter device forms (whose joins drop the separator — \\\\?\\C:f), and "
+           "NONCANONICAL literal-\\\\?\\ paths (a '/' or a '.'/'..'/dup-separator segment "
+           "copilot's Node resolver would normalize) do not — but a forward-slash //?/ "
+           "prefix, normalized by Windows on open, still qualifies",
            failures, verbose)
 
     # copilot's user config home is $COPILOT_HOME, else Node os.homedir() — %USERPROFILE%
@@ -3117,8 +3132,23 @@ def run_selftest(verbose: bool = False) -> int:
                # (3.11+ splitdrive returns it whole with an empty tail; joins match Node)
                and copilot_mod._copilot_home({"COPILOT_HOME": "\\\\?\\UNC\\srv\\share"},
                                              "D:\\child\\ws") == "\\\\?\\UNC\\srv\\share"
+               # a volume-GUID root is accepted as-is (its join inserts the separator,
+               # matching Node — verified 3.10–3.14)
+               and copilot_mod._copilot_home(
+                   {"COPILOT_HOME":
+                    "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}"},
+                   "D:\\child\\ws")
+                   == "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}"
                and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:"}, "D:\\child\\ws")
                and _cop_home_raises({"USERPROFILE": "\\\\?\\C:"}, "D:\\child\\ws")
+               # a drive-relative device form and a NONCANONICAL literal \\?\ home
+               # (copilot's Node resolver folds '/'→'\' or collapses '.'/'..', but
+               # ntpath.join preserves it verbatim) both fail closed
+               and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:.copilot"},
+                                    "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:\\a\\..\\b"},
+                                    "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:/real"}, "D:\\child\\ws")
                # drive-relative homes fail closed — different drive AND same drive as cwd
                and _cop_home_raises({"COPILOT_HOME": "C:drive-rel"}, "D:\\child\\ws")
                and _cop_home_raises({"COPILOT_HOME": "D:"}, "D:\\child\\ws")
@@ -3135,9 +3165,10 @@ def run_selftest(verbose: bool = False) -> int:
            "USERPROFILE on win32, HOME elsewhere; a POSIX empty HOME resolves to the "
            "child cwd, relative homes resolve against the child's cwd as copilot does; "
            "win32 driveless-rooted homes take the child cwd's drive, complete UNC roots "
-           "(incl. the extended \\\\?\\UNC form) and rooted device paths are accepted, "
-           "and drive-relative homes, bare drive-letter device forms, plus absent/short "
-           "USERPROFILE fail closed",
+           "(incl. the extended \\\\?\\UNC form), rooted device paths, and volume-GUID "
+           "roots are accepted, and drive-relative homes, bare/drive-relative device "
+           "forms, noncanonical literal-\\\\?\\ paths, plus absent/short USERPROFILE fail "
+           "closed",
            failures, verbose)
     _check("copilot.odr_gate_off_non_win32",
            sys.platform == "win32" or copilot_mod._odr_registry_command() is None,
@@ -3224,7 +3255,8 @@ def run_selftest(verbose: bool = False) -> int:
         # <name>.exe — so the two could run different binaries. The predicate mirrors
         # libuv's name_has_ext exactly (FIRST dot in the filename portion, nonempty
         # remainder — a leading dot counts, a dot only in a directory doesn't) and is
-        # pure string logic, asserted on every host; the call-site raise is win32-only.
+        # pure string logic, asserted on every host; the call-site raise is win32-gated
+        # but exercised on every host below via a `sys` shim.
         ext_ok = (copilot_mod._win_exe_has_extension("C:\\bin\\odr.exe")
                   and copilot_mod._win_exe_has_extension("C:/bin/odr.exe")
                   and copilot_mod._win_exe_has_extension("C:\\bin\\odr.foo.exe")
@@ -3233,18 +3265,35 @@ def run_selftest(verbose: bool = False) -> int:
                   and not copilot_mod._win_exe_has_extension("C:\\bin\\odr")
                   and not copilot_mod._win_exe_has_extension("C:\\bin\\odr.")
                   and not copilot_mod._win_exe_has_extension("C:\\bin.d\\odr"))
-        if sys.platform == "win32":  # pragma: no cover — the raise is win32-gated
-            copilot_mod._odr_registry_command = lambda: 'C:\\bin\\odr serve'
-            try:
-                get_adapter("copilot")._odr_mcp_server_names()
-                ext_ok = False
-            except RuntimeError as exc:
-                ext_ok = ext_ok and ("no extension" in str(exc)
-                                     and "failing closed" in str(exc))
+        # The call-site raise is win32-gated, but there's no Windows CI — exercise it on
+        # every host by shimming the module-local `sys` so `platform` reads "win32" (all
+        # other attributes delegate to the real module). A FULLY-QUALIFIED but
+        # extensionless executable (C:\bin\odr) must raise BEFORE any launch.
+        _real_sys = copilot_mod.sys
+
+        class _Win32Sys:
+            platform = "win32"
+
+            def __getattr__(self, _n):
+                return getattr(_real_sys, _n)
+
+        copilot_mod._odr_registry_command = lambda: 'C:\\bin\\odr serve'
+        copilot_mod.sys = _Win32Sys()
+        try:
+            get_adapter("copilot")._odr_mcp_server_names()
+            ext_raise = "did not raise"
+        except RuntimeError as exc:
+            ext_raise = str(exc)
+        finally:
+            copilot_mod.sys = _real_sys
+        ext_ok = (ext_ok and "no extension" in ext_raise
+                  and "failing closed" in ext_raise)
         _check("copilot.odr_extensionless_exe_fails_closed", ext_ok,
-               "libuv's name_has_ext is mirrored exactly, and an extensionless win32 "
-               "ODR executable raises before launching — CreateProcess would run the "
-               "exact file while Node/libuv runs <name>.com/<name>.exe",
+               "libuv's name_has_ext is mirrored exactly, and an extensionless (but "
+               "fully-qualified) win32 ODR executable raises before launching — "
+               "CreateProcess would run the exact file while Node/libuv runs "
+               "<name>.com/<name>.exe (the win32 raise is exercised cross-host via a "
+               "sys shim)",
                failures, verbose)
 
         copilot_mod._odr_registry_command = lambda: None
