@@ -3034,7 +3034,10 @@ def run_selftest(verbose: bool = False) -> int:
     # '.'/'..'/internal-or-repeated-empty segment) and ANY nonliteral //?/ spelling fail
     # closed, because copilot's Node resolver canonicalizes/folds-to-literal (its open then
     # skips normalization) while the harness's spelling is Win32-normalized, diverging. A
-    # \\.\ path is exempt — Windows normalizes it in both processes, so it reconverges.
+    # \\.\ path is exempt — Windows normalizes it in both processes, so it reconverges —
+    # except a BARE \\.\ (or \\?\) root or an INCOMPLETE extended-UNC root, which
+    # 3.10/3.11 (bare) and 3.11 (trailing-sep UNC) join with a DOUBLED separator vs
+    # Node's single one, and at which no config can live on any version: fail closed.
     _check("copilot.win_fully_qualified",
            # ACCEPT: drive-with-root, complete UNC shares, and safe device paths
            copilot_mod._win_fully_qualified("C:\\Users\\me")
@@ -3061,6 +3064,18 @@ def run_selftest(verbose: bool = False) -> int:
            and not copilot_mod._win_fully_qualified("\\\\?\\C:")           # bare device drive
            and not copilot_mod._win_fully_qualified("\\\\.\\C:")
            and not copilot_mod._win_fully_qualified("//?/C:")
+           # bare namespace roots and incomplete extended-UNC roots: 3.10/3.11 join the
+           # bare forms — and 3.11 the trailing-sep UNC forms — with a DOUBLED separator
+           # (\\?\\mcp-config.json) where Node's single-separator join names a local
+           # DOS-device alias / share the harness never enumerates; no config can live
+           # at these roots on any version
+           and not copilot_mod._win_fully_qualified("\\\\?\\")
+           and not copilot_mod._win_fully_qualified("\\\\.\\")
+           and not copilot_mod._win_fully_qualified("//?/")
+           and not copilot_mod._win_fully_qualified("\\\\?\\UNC")
+           and not copilot_mod._win_fully_qualified("\\\\?\\UNC\\")
+           and not copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv")
+           and not copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv\\")
            and not copilot_mod._win_fully_qualified("\\\\?\\C:.copilot")   # drive-relative device
            and not copilot_mod._win_fully_qualified("\\\\?\\C:\\a\\..\\b") # literal \\?\ + '..'
            and not copilot_mod._win_fully_qualified("\\\\?\\C:/real")      # literal \\?\ + '/'
@@ -3078,9 +3093,11 @@ def run_selftest(verbose: bool = False) -> int:
            "win32 fully-qualified predicate: lettered-drive-with-root, complete UNC "
            "shares (incl. the bare share root ntpath.isabs mis-reports on 3.10, fixed in "
            "3.11), canonical literal \\\\?\\ device paths (rooted drive, volume-GUID root, "
-           "extended-UNC share — each with an optional single trailing separator), and "
-           "ANY \\\\.\\ path (Windows normalizes it in both processes) qualify; unrooted "
-           "device drives in either namespace, noncanonical literal \\\\?\\ paths (a '/' "
+           "COMPLETE extended-UNC share — each with an optional single trailing "
+           "separator), and ANY non-bare \\\\.\\ path (Windows normalizes it in both "
+           "processes) qualify; unrooted device drives in either namespace, bare "
+           "namespace roots and incomplete extended-UNC roots (their joins can DOUBLE "
+           "the separator vs Node's), noncanonical literal \\\\?\\ paths (a '/' "
            "or a '.'/'..'/internal-or-repeated-empty segment), and every nonliteral //?/ "
            "spelling (copilot folds it to a literal \\\\?\\ that skips normalization while "
            "the harness's stays Win32-normalized) fail closed",
@@ -3159,6 +3176,11 @@ def run_selftest(verbose: bool = False) -> int:
                    == "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}"
                and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:"}, "D:\\child\\ws")
                and _cop_home_raises({"USERPROFILE": "\\\\?\\C:"}, "D:\\child\\ws")
+               # a bare namespace root and an incomplete extended-UNC root fail closed
+               # (3.10/3.11 join them with a doubled separator vs Node's single one)
+               and _cop_home_raises({"COPILOT_HOME": "\\\\?\\"}, "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "\\\\?\\UNC\\srv\\"},
+                                    "D:\\child\\ws")
                # a drive-relative device form, a NONCANONICAL literal \\?\ home, and any
                # nonliteral //?/ spelling fail closed — copilot's Node resolver
                # canonicalizes/folds-to-literal (its open then skips normalization) while
@@ -3186,10 +3208,10 @@ def run_selftest(verbose: bool = False) -> int:
            "child cwd, relative homes resolve against the child's cwd as copilot does; "
            "win32 driveless-rooted homes take the child cwd's drive, complete UNC roots "
            "(incl. the extended \\\\?\\UNC form), canonical literal \\\\?\\ device paths "
-           "(rooted, volume-GUID, one trailing sep ok), and any \\\\.\\ path are accepted, "
-           "and drive-relative homes, bare/drive-relative device forms, noncanonical "
-           "literal-\\\\?\\ paths, nonliteral //?/ spellings, plus absent/short USERPROFILE "
-           "fail closed",
+           "(rooted, volume-GUID, one trailing sep ok), and any non-bare \\\\.\\ path are "
+           "accepted, and drive-relative homes, bare/drive-relative device drives, bare "
+           "or incomplete namespace roots, noncanonical literal-\\\\?\\ paths, nonliteral "
+           "//?/ spellings, plus absent/short USERPROFILE fail closed",
            failures, verbose)
     _check("copilot.odr_gate_off_non_win32",
            sys.platform == "win32" or copilot_mod._odr_registry_command() is None,
