@@ -28,7 +28,7 @@ Ephemeral events (`session.*`, `assistant.message_start/delta`,
 `assistant.reasoning_delta`) are streaming fragments — we skip them and parse
 only the non-ephemeral `assistant.message`, `tool.*`, and `result` events.
 
-Verified against copilot 1.0.63 on 2026-06-22.
+Verified against copilot 1.0.64 on 2026-07-17 (installed CLI + its app.js bundle).
 """
 
 from __future__ import annotations
@@ -65,6 +65,167 @@ _KNOWN_USAGE_KEYS = {
 # ancestor (copilot walks up, like git-root discovery — verified in the 1.0.64 bundle).
 _WORKSPACE_MCP_FILES = (".mcp.json", ".github/mcp.json", ".vscode/mcp.json")
 
+# --- Custom agents: an MCP channel --disable-mcp-server does NOT reach ----------------
+#
+# copilot 1.0.64 discovers custom-agent definitions (markdown with frontmatter) from
+# four sources: <config home>/agents, the .github/agents and .claude/agents convention
+# dirs walked from the working directory up to the git root, installed plugins, and —
+# when the working directory sits in a git repo with a GitHub remote and auth is
+# available — a REMOTE org/enterprise listing fetched from the Copilot API. Local files
+# are collected by a recursive **/*.md glob (symlinks followed, dot-entries skipped),
+# and both local frontmatter (`mcp-servers`) and remote listing entries can declare MCP
+# servers (all read out of the 1.0.64 bundle: the custom-agents loader and its remote
+# branch). Crucially, a selected agent's servers are started per name by the session's
+# initializeMcpHost via mcpHost.startServer(name, config) WITHOUT consulting the
+# disabledMcpServers set (that set only filters the base config's startServers), so
+# disabling by name cannot cover this channel — and no flag disables custom agents
+# (--no-custom-instructions does not; verified against 1.0.64 --help). What does exist:
+# the documented config setting `customAgents.defaultLocalOnly` (see `copilot help
+# config`) short-circuits the loader BEFORE the remote listing. Consequently the
+# harness neutralizes on disk what it can (isolation masks <home>/agents to an empty
+# dir and forces defaultLocalOnly into the sanitized config.json) and FAILS CLOSED in
+# _mcp_disable_args on what it can't: any discoverable local agent file, or a git-repo
+# cwd whose enumerable config does not provably opt out of remote discovery.
+_WORKSPACE_AGENT_DIRS = (".github/agents", ".claude/agents")
+
+
+def _agent_definition_files(root: str) -> list[str]:
+    """Custom-agent definition files under one agents dir: every *.md at any depth.
+    copilot's loader globs **/*.md under each source dir (symlinks followed, dot
+    entries skipped, case-sensitive); this walk is a SUPERSET — dot entries and
+    case-insensitive ``.md`` included — since over-detection only fail-closes more,
+    never less. An absent root contributes nothing (copilot's glob catch treats it
+    as empty); an unreadable one raises — absence can't be proven there."""
+    out: list[str] = []
+    seen: set[str] = set()
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        real = os.path.realpath(d)
+        if real in seen:            # symlink cycles terminate (copilot's glob
+            continue                # dedupes realpaths the same way)
+        seen.add(real)
+        try:
+            entries = list(os.scandir(d))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as exc:
+            raise RuntimeError(
+                f"custom-agent dir {d!r} exists but can't be read ({exc}) — whether "
+                "copilot would discover agent files there can't be verified; "
+                "failing closed."
+            )
+        for ent in entries:
+            try:
+                is_dir = ent.is_dir()
+            except OSError:
+                is_dir = False
+            if is_dir:
+                stack.append(ent.path)
+            elif ent.name.lower().endswith(".md"):
+                out.append(ent.path)
+    return sorted(out)
+
+
+def _nearest_git_root(cwd: str) -> Optional[str]:
+    """The first ancestor of ``cwd`` (inclusive) containing a ``.git`` entry — dir or
+    file (worktrees use a file) — or None. This is the boundary copilot's convention
+    walk stops at, and the trigger for its remote custom-agents listing (a git repo
+    is a precondition; the harness doesn't parse remotes — git config resolution
+    spans include directives and worktree indirection it can't replicate provably,
+    so ANY repo counts, the conservative direction)."""
+    d = os.path.abspath(cwd)
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _custom_agent_files(home: str, cwd: Optional[str]) -> list[str]:
+    """Every LOCAL custom-agent definition file discoverable for a run:
+    ``<home>/agents`` plus the ``.github/agents`` / ``.claude/agents`` convention
+    dirs of the run cwd and its ancestors up to the nearest git root (inclusive) —
+    copilot's own walk boundary. Without a git root every ancestor is checked (the
+    bundle's boundary resolution for repo-less dirs isn't provable, so the walk is
+    conservative there). Unlike the workspace MCP-config walk — where an
+    over-approximation just adds harmless disables — agent detection FAILS runs
+    closed, so this walk mirrors copilot's boundary instead of over-walking to the
+    filesystem root (a ~/.claude/agents outside the repo must not kill in-repo
+    runs copilot would never read it for)."""
+    dirs = [os.path.join(home, "agents")]
+    if cwd:
+        d = os.path.abspath(cwd)
+        while True:
+            for rel in _WORKSPACE_AGENT_DIRS:
+                dirs.append(os.path.join(d, *rel.split("/")))
+            if os.path.exists(os.path.join(d, ".git")):
+                break
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    files: list[str] = []
+    for dpath in dirs:
+        files.extend(_agent_definition_files(dpath))
+    return files
+
+
+def _load_copilot_config(path: str) -> Optional[Any]:
+    """``config.json`` parsed with copilot's JSONC-ish tolerance (full-line ``//``
+    comments stripped), or None when unreadable/unparseable."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    text = "\n".join(ln for ln in raw.splitlines() if not ln.lstrip().startswith("//"))
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def _remote_agents_opted_out(home: str) -> bool:
+    """True iff the config copilot will read provably disables remote custom-agent
+    discovery: ``customAgents.defaultLocalOnly`` (documented in ``copilot help
+    config``), the ONLY off-switch — the 1.0.64 loader short-circuits before its
+    org/enterprise listing when it is set; no flag or env var exists. The isolation
+    sanitizer injects it, so masked-home runs always pass this test; a missing or
+    unreadable config proves nothing and reads as not-opted-out."""
+    data = _load_copilot_config(os.path.join(home, "config.json"))
+    agents_cfg = data.get("customAgents") if isinstance(data, dict) else None
+    return isinstance(agents_cfg, dict) and agents_cfg.get("defaultLocalOnly") is True
+
+
+# extra_args tokens that reopen MCP/configuration channels after the disable set is
+# computed (all verified against the installed 1.0.64: --help lists the first three,
+# --config-dir is in the bundle but hidden from help): --additional-mcp-config merges
+# MORE servers into the session past the disable set; --agent selects a custom agent
+# whose frontmatter mcp-servers start OUTSIDE that set (see the custom-agents comment
+# above); --plugin-dir loads a plugin — whose definition can declare mcpServers — from
+# an arbitrary dir; --config-dir repoints the whole config home away from the one this
+# adapter enumerated; -C changes copilot's working directory BEFORE any discovery,
+# invalidating the cwd the workspace/agent walks used. Long forms match exact or
+# --flag=value; -C exact or with an attached value (-Cdir).
+_CONFIG_CHANNEL_LONG = ("--additional-mcp-config", "--agent", "--plugin-dir",
+                        "--config-dir")
+_CONFIG_CHANNEL_SHORT = ("-C",)
+
+
+def _config_channel_token(extra_args: list[str]) -> Optional[str]:
+    """The first extra_args token that opens a copilot configuration channel, or None.
+    A token that merely LOOKS like one (e.g. a value following some unrelated flag) is
+    reported too — that false positive fails closed, the safe direction."""
+    for tok in extra_args:
+        if any(tok == f or tok.startswith(f + "=") for f in _CONFIG_CHANNEL_LONG):
+            return tok
+        if any(tok.startswith(f) for f in _CONFIG_CHANNEL_SHORT):
+            return tok
+    return None
+
 # --- Windows ODR (On-Device Registry) MCP discovery -----------------------------------
 #
 # On win32, copilot additionally discovers MCP servers through the Windows MCP registry:
@@ -92,6 +253,37 @@ _WORKSPACE_MCP_FILES = (".mcp.json", ".github/mcp.json", ".vscode/mcp.json")
 _ODR_REGISTRY_SUBKEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Mcp"
 _ODR_NAME_BAD_CHARS = re.compile(r"[^0-9a-zA-Z_./@-]")
 
+# ECMAScript whitespace — the exact set /\s/ tests AND String.prototype.trim() strips
+# (identical by spec: WhiteSpace ∪ LineTerminator; verified identical by exhaustive
+# code-point sweep under node v24, the runtime copilot ships on). It differs from
+# Python's str whitespace in both directions: U+001C–U+001F and U+0085 are
+# Python-space but NOT JS-space (they glue into a JS token), while U+FEFF is JS-space
+# but NOT Python-space (a BOM-prefixed registry value trims clean in copilot). The
+# bundle's ODR pipeline trims the registry value and splits the command line with
+# these semantics, so the harness must use this set — str.split(None)/isspace() would
+# hand the same fully-qualified executable different ARGUMENTS than copilot passes,
+# enumerating a different listing.
+_JS_WS = ("\t\n\x0b\x0c\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+          "\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+_JS_WS_SET = frozenset(_JS_WS)
+# JS LineTerminator — what `.` in the bundle's unquoted-branch regex can NOT match.
+_JS_LT = "\n\r\u2028\u2029"
+# Mirror of the bundle's /^([^\s]+)\s*(.*)$/ with the JS classes made explicit:
+# first token = maximal non-JS-ws run, then a JS-ws run, then a remainder free of
+# LineTerminators, anchored to the true end (\Z — JS `$` without /m). A command line
+# this can't match (a line terminator interrupting the tail) makes copilot's parser
+# throw, which its ODR loader catches and treats as "no ODR servers".
+_ODR_UNQUOTED_RE = re.compile(
+    "^([^{ws}]+)[{ws}]*([^{lt}]*)\\Z".format(ws=re.escape(_JS_WS),
+                                             lt=re.escape(_JS_LT)))
+
+
+def _js_trim(s: str) -> str:
+    """String.prototype.trim() — strips exactly the ECMAScript whitespace set from
+    both ends (str.strip(chars) with the explicit set; NOT str.strip(), whose
+    Python set diverges — see _JS_WS)."""
+    return s.strip(_JS_WS)
+
 
 def _odr_registry_command() -> Optional[str]:
     """The ODR command line from the registry, or None when the gate is off (non-win32,
@@ -118,33 +310,50 @@ def _odr_registry_command() -> Optional[str]:
             f"cannot read the Windows MCP registry key (HKLM\\{_ODR_REGISTRY_SUBKEY}): "
             f"{exc} — its servers can't be enumerated, failing closed."
         )
-    if not isinstance(value, str) or not value.strip():
+    # JS-trim, not str.strip(): the bundle does `value?.trim()` then a falsy test, so
+    # a value of only U+FEFF reads as gate-OFF exactly as it does for copilot, while
+    # one of only U+001C (Python-blank, JS-nonblank) keeps the gate ON — copilot then
+    # fails to launch it and loads nothing; the harness fails closed downstream on the
+    # unqualified executable, the conservative side of the same no-servers outcome.
+    if not isinstance(value, str) or not _js_trim(value):
         return None  # empty command → copilot logs "command line not found" and skips
-    return value.strip()
+    return _js_trim(value)
 
 
 def _split_odr_command(cmdline: str) -> tuple[str, list[str]]:
     """Split the registry command line the way copilot does (1.0.64 bundle): a leading
     double-quoted token or the first whitespace-delimited token is the executable; the
-    rest splits on unquoted whitespace with bare quote toggling (no escapes)."""
-    s = cmdline.strip()
+    rest splits on unquoted whitespace with bare quote toggling (no escapes).
+
+    "Whitespace" is ECMAScript whitespace throughout (``_JS_WS`` — the class the
+    bundle's ``/\\s/`` tests and its ``trim()`` calls strip), NOT Python's: with
+    ``str.split(None)``/``isspace()`` a command like ``C:\\odr.exe<U+001C>arg`` would
+    hand the harness a different (exe, args) split than copilot's — same executable,
+    different listing. The unquoted branch mirrors the bundle's
+    ``/^([^\\s]+)\\s*(.*)$/`` exactly (``_ODR_UNQUOTED_RE``): a line terminator
+    interrupting the tail makes that regex fail, which copilot's ODR loader catches
+    and treats as "no ODR servers" — here it raises instead (the caller fails
+    closed: conservative, since copilot provably loads nothing there)."""
+    s = _js_trim(cmdline)
     if not s:
         raise ValueError("empty ODR command line")
     if s.startswith('"'):
         end = s.find('"', 1)
         if end < 0:
             raise ValueError("unterminated quote in ODR command line")
-        exe, rest = s[1:end], s[end + 1:].strip()
+        exe, rest = s[1:end], _js_trim(s[end + 1:])
     else:
-        parts = s.split(None, 1)
-        exe, rest = parts[0], (parts[1].strip() if len(parts) > 1 else "")
+        m = _ODR_UNQUOTED_RE.match(s)
+        if m is None:
+            raise ValueError("unparseable ODR command line (line terminator in tail)")
+        exe, rest = m.group(1), _js_trim(m.group(2))
     args: list[str] = []
     buf, in_quote = "", False
     for ch in rest:
         if ch == '"':
             in_quote = not in_quote
             continue
-        if not in_quote and ch.isspace():
+        if not in_quote and ch in _JS_WS_SET:
             if buf:
                 args.append(buf)
                 buf = ""
@@ -257,11 +466,14 @@ def _mcp_server_names(path: str) -> list[str]:
 def _win_fully_qualified(path: str) -> bool:
     """Windows semantics for "needs no current-directory OR current-drive context to
     resolve" — i.e. what the OS treats as an absolute path — AND, for the device-
-    namespace forms, "the child path ``ntpath.join`` builds OPENS the same file copilot's
-    Node resolver opens". Under an exact ``\\\\?\\`` prefix (whose open SKIPS Win32
+    namespace forms, "the child path ``ntpath.join`` builds OPENS the same file
+    copilot's path resolver opens". (1.0.64 resolves paths in NATIVE code, no longer
+    Node's ``path.win32`` itself, but with the same join/normalization semantics —
+    "Node's join"/"Node inserts" here and below are shorthand for that shared
+    behavior.) Under an exact ``\\\\?\\`` prefix (whose open SKIPS Win32
     normalization) that requires byte-identical join strings; under ``\\\\.\\`` (always
     normalized on open, in both processes) the joins need only reconverge at open — the
-    accepted ``\\\\.\\C:\\a\\..\\b`` keeps its ``..`` in the harness's join where Node's
+    accepted ``\\\\.\\C:\\a\\..\\b`` keeps its ``..`` in the harness's join where the
     resolver collapses it, and Windows normalization makes both name the same file. Uses
     ``ntpath`` explicitly so the predicate is correct (and unit-testable) on any host,
     not just win32:
@@ -290,7 +502,7 @@ def _win_fully_qualified(path: str) -> bool:
           rooted drive form (``\\\\?\\C:\\x``), a volume-GUID root
           (``\\\\?\\Volume{...}``), or a complete extended-UNC share root
           (``\\\\?\\UNC\\server\\share``), each optionally with ONE trailing separator.
-          copilot's Node resolver canonicalizes the home (folding ``/``→``\\``, collapsing
+          copilot's path resolver canonicalizes the home (folding ``/``→``\\``, collapsing
           ``.``/``..``/duplicate separators) and folds a forward-slash ``//?/`` spelling to
           a literal ``\\\\?\\`` one — whose open then SKIPS normalization — while the
           harness keeps its spelling, which Windows DOES normalize (trailing periods
@@ -376,7 +588,7 @@ def _win_fully_qualified(path: str) -> bool:
             if body[-1] == ":":
                 return False
             # Normalization divergence is a \\?\-ONLY hazard: Windows skips normalization
-            # only after an EXACT literal \\?\ prefix. copilot's Node resolver folds a
+            # only after an EXACT literal \\?\ prefix. copilot's path resolver folds a
             # forward-slash //?/ prefix to a literal \\?\ one (whose open then skips
             # normalization) and canonicalizes the string, while the harness keeps its
             # spelling — so under \\?\ a nonliteral //?/ prefix, OR a noncanonical literal
@@ -514,7 +726,7 @@ def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
             raise RuntimeError(
                 f"copilot home base USERPROFILE={base!r} is one whole splitdrive "
                 "\"drive\" ending in ':' — ntpath.join GLUES '.copilot' straight onto "
-                "it (\\\\?\\foo:.copilot) where copilot's Node resolver inserts the "
+                "it (\\\\?\\foo:.copilot) where copilot's path resolver inserts the "
                 "separator (\\\\?\\foo:\\.copilot), and no normalization reconverges "
                 "a colon glue — the harness would enumerate a different config than "
                 "copilot loads; failing closed."
@@ -551,7 +763,7 @@ def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
             "and under \\\\?\\ (which Windows opens without "
             "normalizing) a nonliteral //?/ spelling or a noncanonical literal one (a "
             "'/', or a '.'/'..'/internal-or-repeated-empty segment) is canonicalized by "
-            "copilot's Node resolver but not by ntpath.join, so the two would read "
+            "copilot's path resolver but not by ntpath.join, so the two would read "
             "different files; the config copilot loads can't be named, failing closed."
         )
     anchor = os.path.abspath(cwd or os.getcwd())
@@ -572,24 +784,26 @@ _COPILOT_PLUGIN_STATE_KEYS = ("installedPlugins", "enabledPlugins")
 
 
 def _sanitized_copilot_config(real_path: str) -> str:
-    """Sanitizing mask for ~/.copilot/config.json: keep everything (auth tokens, settings)
-    but drop the plugin registrations. The file is JSONC-ish — full-line ``//`` comments
-    above/inside the JSON — so strip those before parsing. Unreadable/unparseable → "{}"
-    (fail closed: no plugins can load; auth loss surfaces loudly rather than servers
-    silently loading)."""
-    try:
-        with open(real_path, "r", encoding="utf-8") as f:
-            raw = f.read()
-    except OSError:
-        return "{}"
-    text = "\n".join(ln for ln in raw.splitlines() if not ln.lstrip().startswith("//"))
-    try:
-        data = json.loads(text)
-    except ValueError:
-        return "{}"
-    if isinstance(data, dict):
-        for key in _COPILOT_PLUGIN_STATE_KEYS:
-            data.pop(key, None)
+    """Sanitizing mask for ~/.copilot/config.json: keep everything (auth tokens,
+    settings), drop the plugin registrations, and FORCE
+    ``customAgents.defaultLocalOnly`` — the documented setting (``copilot help
+    config``) that is the only off-switch for remote custom-agent discovery, whose
+    org/enterprise listings can carry MCP servers outside the --disable-mcp-server
+    set (see the custom-agents comment at the top of this module). The file is
+    JSONC-ish — full-line ``//`` comments above/inside the JSON — handled by
+    ``_load_copilot_config``. Unreadable/unparseable → the same neutral-but-hermetic
+    shape (fail closed: no plugins, no remote agents; auth loss surfaces loudly
+    rather than servers silently loading)."""
+    data = _load_copilot_config(real_path)
+    if not isinstance(data, dict):
+        data = {}
+    for key in _COPILOT_PLUGIN_STATE_KEYS:
+        data.pop(key, None)
+    agents_cfg = data.get("customAgents")
+    if not isinstance(agents_cfg, dict):
+        agents_cfg = {}
+    agents_cfg["defaultLocalOnly"] = True
+    data["customAgents"] = agents_cfg
     return json.dumps(data, indent=2)
 
 
@@ -613,8 +827,14 @@ class CopilotAdapter(Adapter):
     # documented gap). On Windows the same argv layer enumerates the ODR registry servers
     # (HKLM\...\CurrentVersion\Mcp) via copilot's own resolution pipeline and disables
     # them too — or fails closed when they can't be enumerated (see _odr_mcp_server_names).
+    # Custom agents are one more channel — their frontmatter mcp-servers start OUTSIDE
+    # the --disable-mcp-server set (see the module comment): agents/ is masked to an
+    # empty dir, the sanitized config.json gets customAgents.defaultLocalOnly forced
+    # (kills remote agent discovery), and _mcp_disable_args fails closed on any local
+    # agent file the masks can't reach (workspace convention dirs, non-isolated homes).
     isolation_config_masks = {".copilot/mcp-config.json": '{"mcpServers": {}}',
                               ".copilot/installed-plugins": None,
+                              ".copilot/agents": None,
                               ".copilot/config.json": _sanitized_copilot_config}
     # COPILOT_HOME replaces ~/.copilot wholesale (verified in 1.0.64's bundle) — without
     # mirroring it, a set var would bypass the masks above.
@@ -655,9 +875,14 @@ class CopilotAdapter(Adapter):
         runs, and non-isolated runs — with the isolation masks as the second layer.
         Plugin-declared servers can't be enumerated here (their names live inside each
         plugin's definition); those are covered by the installed-plugins isolation mask
-        and remain a documented gap for non-isolated runs. On win32 the harness must
-        itself be a 64-BIT process; a 32-bit one fails closed up front (WOW64
-        redirection — see the inline comment)."""
+        and remain a documented gap for non-isolated runs. Custom-agent servers can't
+        be DISABLED here at all — a selected agent's mcp-servers start outside the
+        --disable-mcp-server set (module comment) — so any discoverable local agent
+        file, and a git-repo cwd whose config doesn't provably opt out of remote agent
+        discovery (customAgents.defaultLocalOnly — injected into the sanitized
+        config.json, so masked-home runs pass), fail closed instead. On win32 the
+        harness must itself be a 64-BIT process; a 32-bit one fails closed up front
+        (WOW64 redirection — see the inline comment)."""
         # A 32-bit harness process on win32 shares neither filesystem nor default-
         # registry views with copilot's 64-bit process: the WOW64 redirector remaps
         # C:\Windows\System32 (file reads AND the ODR command launch) to SysWOW64, and
@@ -676,6 +901,40 @@ class CopilotAdapter(Adapter):
             )
         env_map: Mapping[str, str] = env if env is not None else os.environ
         home = _copilot_home(env_map, cwd)
+        # Custom agents (module comment): their mcp-servers start OUTSIDE the
+        # --disable-mcp-server set and no flag disables agents, so presence of any
+        # LOCAL agent definition — or the possibility of a REMOTE org/enterprise
+        # listing (git-repo cwd, config not provably opted out) — fails closed
+        # before anything is enumerated.
+        agent_files = _custom_agent_files(home, cwd)
+        if agent_files:
+            shown = ", ".join(agent_files[:4]) + (", ..." if len(agent_files) > 4
+                                                  else "")
+            raise RuntimeError(
+                f"custom-agent definition file(s) [{shown}] are discoverable by "
+                "copilot (under <config home>/agents, or a .github/agents / "
+                ".claude/agents dir between the run cwd and its git root): agent "
+                "frontmatter can declare mcp-servers, and a selected agent's "
+                "servers are started per name OUTSIDE the --disable-mcp-server set "
+                "(1.0.64 bundle: initializeMcpHost calls mcpHost.startServer for "
+                "each agent server without consulting disabledMcpServers), with no "
+                "flag to disable custom agents — MCP hermeticity can't be enforced; "
+                "failing closed. Remove or relocate the agent files for harness "
+                "runs (isolation already masks <home>/agents to an empty dir)."
+            )
+        if cwd and _nearest_git_root(cwd) and not _remote_agents_opted_out(home):
+            raise RuntimeError(
+                f"the run cwd {cwd!r} sits inside a git repository and the config "
+                "copilot will read does not set customAgents.defaultLocalOnly: for "
+                "a GitHub-remoted repo with auth, copilot lists org/enterprise "
+                "custom agents remotely, and those can carry mcp-servers that "
+                "start OUTSIDE the --disable-mcp-server set (1.0.64 bundle) with "
+                "no flag to disable the listing — MCP hermeticity can't be "
+                "verified; failing closed. Isolated runs get the opt-out injected "
+                "into the sanitized config.json automatically; for a non-isolated "
+                'run set {"customAgents": {"defaultLocalOnly": true}} in the real '
+                "config.json."
+            )
         names = _mcp_server_names(os.path.join(home, "mcp-config.json"))
         if cwd:
             d = os.path.abspath(cwd)
@@ -781,6 +1040,24 @@ class CopilotAdapter(Adapter):
         return f"/{skill}"
 
     def build_argv(self, prompt: str, opts: RunOptions, *, cwd: str) -> list[str]:
+        # extra_args ride at the END of argv (below), appended verbatim — a
+        # configuration-channel token there would inject MCP servers or reroute
+        # config discovery AFTER _mcp_disable_args computed its disable set (see
+        # _CONFIG_CHANNEL_LONG/_SHORT). Standard runner cells never populate
+        # extra_args; a programmatic caller passing one of these fails closed here
+        # (exec.execute() records a failed run), checked FIRST so a doomed
+        # invocation never spends the enumeration.
+        bad = _config_channel_token(opts.extra_args)
+        if bad is not None:
+            raise RuntimeError(
+                f"extra_args token {bad!r} opens a copilot configuration channel "
+                "(--additional-mcp-config injects MCP servers past the disable "
+                "set, --agent selects a custom agent whose mcp-servers start "
+                "outside it, --plugin-dir loads plugin-declared servers, "
+                "--config-dir repoints the enumerated config home, -C moves "
+                "discovery to another cwd) — the run would not be provably "
+                "MCP-hermetic; failing closed."
+            )
         argv = [self.binary, "-p", prompt, *self._HERMETIC,
                 *self._mcp_disable_args(cwd, env=opts.effective_env),
                 "--output-format", "json"]

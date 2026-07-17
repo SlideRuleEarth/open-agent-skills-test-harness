@@ -2239,6 +2239,7 @@ def _check_reasoning_effort(failures, verbose):
     different models at different efforts."""
     import os
     import shutil
+    import sys
     import tempfile
 
     import agentskill_evals.runner as runner_mod
@@ -2248,6 +2249,15 @@ def _check_reasoning_effort(failures, verbose):
                        _spec_from_raw, load_scenario, parse_model_target)
 
     print("reasoning effort:")
+
+    # A REAL 32-bit win32 harness fails every copilot _mcp_disable_args call closed
+    # by design (the WOW64 gate) — copilot's positive argv-mapping checks can't run
+    # there and are skipped (the gate itself is asserted in the copilot section).
+    # The copilot calls also pin COPILOT_HOME to a nonexistent dir so they never
+    # read — or fail closed on — this machine's real ~/.copilot (config, agents).
+    _cop_wow64 = sys.platform == "win32" and sys.maxsize <= 2**32
+    _cop_env = {"COPILOT_HOME": os.path.join(tempfile.gettempdir(),
+                                             "ase-no-such-copilot-home")}
 
     # --- per-adapter argv mapping ---
     argv = get_adapter("claude").build_argv("p", RunOptions(reasoning_effort="high"), cwd="/tmp")
@@ -2261,11 +2271,14 @@ def _check_reasoning_effort(failures, verbose):
            and argv[-1] == "p",
            f"codex maps to -c model_reasoning_effort, before the positional prompt: {argv}",
            failures, verbose)
-    argv = get_adapter("copilot").build_argv("p", RunOptions(reasoning_effort="medium"), cwd="/tmp")
-    _check("effort.copilot_flag",
-           "--reasoning-effort" in argv
-           and argv[argv.index("--reasoning-effort") + 1] == "medium",
-           f"copilot maps to --reasoning-effort: {argv}", failures, verbose)
+    if not _cop_wow64:
+        argv = get_adapter("copilot").build_argv(
+            "p", RunOptions(reasoning_effort="medium", effective_env=_cop_env),
+            cwd="/tmp")
+        _check("effort.copilot_flag",
+               "--reasoning-effort" in argv
+               and argv[argv.index("--reasoning-effort") + 1] == "medium",
+               f"copilot maps to --reasoning-effort: {argv}", failures, verbose)
     for name in ("claude", "codex", "copilot"):
         _check(f"effort.{name}_supported_declared",
                get_adapter(name).supports_reasoning_effort,
@@ -2280,8 +2293,10 @@ def _check_reasoning_effort(failures, verbose):
            f"antigravity argv unchanged when effort set: {ag_effort}", failures, verbose)
 
     # --- unset keeps every argv unchanged (existing behavior preserved) ---
-    for name in ("claude", "codex", "copilot"):
-        plain = get_adapter(name).build_argv("p", RunOptions(), cwd="/tmp")
+    for name in ("claude", "codex") if _cop_wow64 else ("claude", "codex", "copilot"):
+        opts = (RunOptions(effective_env=_cop_env) if name == "copilot"
+                else RunOptions())
+        plain = get_adapter(name).build_argv("p", opts, cwd="/tmp")
         _check(f"effort.{name}_absent_when_unset",
                not any("effort" in a for a in plain),
                f"{name} argv carries no effort token when unset: {plain}", failures, verbose)
@@ -2844,16 +2859,48 @@ def run_selftest(verbose: bool = False) -> int:
            not any(e.kind == EventKind.SESSION_START and "skills_loaded" in str(e.raw)
                    for e in out.events),
            "ephemeral session events skipped", failures, verbose)
-    cargv = get_adapter("copilot").build_argv("do the task", RunOptions(model="auto"), cwd="/tmp")
-    _check("copilot.argv",
-           cargv[0] == "copilot" and "-p" in cargv and "--output-format" in cargv
-           and "json" in cargv and "--allow-all" in cargv and "--model" in cargv
-           and cargv[-1] != "do the task",
-           f"copilot argv: {cargv}", failures, verbose)
-    cargv_dt = get_adapter("copilot").build_argv("judge", RunOptions(disable_tools=True), cwd="/tmp")
-    _check("copilot.disable_tools",
-           "--available-tools" in cargv_dt and cargv_dt[cargv_dt.index("--available-tools") + 1] == "",
-           f"disable_tools → --available-tools '': {cargv_dt}", failures, verbose)
+    import sys
+
+    # A REAL 32-bit win32 harness fails every copilot _mcp_disable_args call closed
+    # by design (the WOW64 gate, asserted below via a shim AND — on such a host —
+    # natively here). The positive argv/enumeration checks in this section can't run
+    # there: they get architecture-aware skips instead of crashing the suite. The
+    # argv-shape calls also pin COPILOT_HOME to a nonexistent dir so they never
+    # read — or fail closed on — this machine's real ~/.copilot (config, agents).
+    _cop_wow64 = sys.platform == "win32" and sys.maxsize <= 2**32
+    _cop_env = {"COPILOT_HOME": os.path.join(_tmp.gettempdir(),
+                                             "ase-no-such-copilot-home")}
+    if _cop_wow64:
+        try:
+            get_adapter("copilot").build_argv(
+                "do the task", RunOptions(model="auto", effective_env=_cop_env),
+                cwd="/tmp")
+            _wow64_msg = "did not raise"
+        except RuntimeError as exc:
+            _wow64_msg = str(exc)
+        _check("copilot.argv_32bit_win32_fails_closed",
+               "32-bit" in _wow64_msg and "failing closed" in _wow64_msg,
+               f"a real 32-bit win32 harness fails copilot argv construction closed "
+               f"(WOW64 gate); positive argv checks skipped: {_wow64_msg}",
+               failures, verbose)
+    else:
+        cargv = get_adapter("copilot").build_argv(
+            "do the task",
+            RunOptions(model="auto", effective_env=_cop_env,
+                       extra_args=["--banner"]),  # neutral extra_args pass through
+            cwd="/tmp")
+        _check("copilot.argv",
+               cargv[0] == "copilot" and "-p" in cargv and "--output-format" in cargv
+               and "json" in cargv and "--allow-all" in cargv and "--model" in cargv
+               and "--banner" in cargv and cargv[-1] != "do the task",
+               f"copilot argv: {cargv}", failures, verbose)
+        cargv_dt = get_adapter("copilot").build_argv(
+            "judge", RunOptions(disable_tools=True, effective_env=_cop_env),
+            cwd="/tmp")
+        _check("copilot.disable_tools",
+               "--available-tools" in cargv_dt
+               and cargv_dt[cargv_dt.index("--available-tools") + 1] == "",
+               f"disable_tools → --available-tools '': {cargv_dt}", failures, verbose)
     _check("copilot.no_output_schema",
            not get_adapter("copilot").supports_output_schema,
            "copilot has no native output schema support", failures, verbose)
@@ -2867,15 +2914,21 @@ def run_selftest(verbose: bool = False) -> int:
     _check("copilot.mcp_config_mask_declared",
            _cop_masks.get(".copilot/mcp-config.json") == '{"mcpServers": {}}'
            and _cop_masks.get(".copilot/installed-plugins", "x") is None
+           and _cop_masks.get(".copilot/agents", "x") is None
            and callable(_cop_masks.get(".copilot/config.json"))
            and get_adapter("copilot").isolation_config_homes
            == [("COPILOT_HOME", ".copilot", None)],
-           "copilot masks mcp-config.json (valid empty shape), installed-plugins, and "
+           "copilot masks mcp-config.json (valid empty shape), installed-plugins, "
+           "agents/ (frontmatter mcp-servers start outside --disable-mcp-server), and "
            "sanitizes config.json; COPILOT_HOME mirrored", failures, verbose)
 
     # the config.json sanitizer: plugin records there carry an absolute cache_path the
     # loader follows even when installed-plugins/ is masked empty (verified 1.0.64) — they
-    # must go; auth/settings must stay; the file's JSONC comment lines must not break it.
+    # must go; auth/settings must stay; the file's JSONC comment lines must not break it;
+    # and customAgents.defaultLocalOnly must come out FORCED true — the documented setting
+    # (`copilot help config`) that is the only off-switch for remote custom-agent
+    # discovery, whose org/enterprise listings can carry mcp-servers outside the
+    # --disable-mcp-server set (1.0.64 bundle).
     import json as _json
     from .adapters.copilot import _sanitized_copilot_config
     _san_dir = _tmp.mkdtemp(prefix="ase-copcfg-")
@@ -2888,104 +2941,234 @@ def run_selftest(verbose: bool = False) -> int:
                      '  "copilotTokens": {"github.com": "tok-KEEP"},\n'
                      '  "installedPlugins": [{"name": "linear", "enabled": true,'
                      ' "cache_path": "/real/plugins/linear"}],\n'
-                     '  "enabledPlugins": {"linear": true}\n'
+                     '  "enabledPlugins": {"linear": true},\n'
+                     '  "customAgents": {"defaultLocalOnly": false, "keep": 1}\n'
                      '}\n')
         sanitized = _json.loads(_sanitized_copilot_config(cfg_path))
         _check("copilot.config_sanitizer",
                sanitized.get("copilotTokens") == {"github.com": "tok-KEEP"}
                and "installedPlugins" not in sanitized
-               and "enabledPlugins" not in sanitized,
-               f"plugin registrations dropped, auth kept, JSONC comments handled: "
-               f"{sorted(sanitized)}", failures, verbose)
+               and "enabledPlugins" not in sanitized
+               and sanitized.get("customAgents") == {"defaultLocalOnly": True,
+                                                     "keep": 1},
+               f"plugin registrations dropped, auth kept, JSONC comments handled, "
+               f"defaultLocalOnly forced true over an explicit false (sibling keys "
+               f"kept): {sorted(sanitized)}", failures, verbose)
         _check("copilot.config_sanitizer_fail_closed",
-               _sanitized_copilot_config(os.path.join(_san_dir, "nope.json")) == "{}",
-               "an unreadable config.json sanitizes to {} (no plugins can load)",
+               _json.loads(_sanitized_copilot_config(os.path.join(_san_dir, "nope.json")))
+               == {"customAgents": {"defaultLocalOnly": True}},
+               "an unreadable config.json sanitizes to the neutral-but-hermetic shape "
+               "(no plugins can load, remote agents opted out)",
                failures, verbose)
     finally:
         _sh.rmtree(_san_dir, ignore_errors=True)
 
-    # --disable-mcp-server enumeration: user config ($COPILOT_HOME else ~/.copilot) plus
-    # the workspace .mcp.json/.github/mcp.json/.vscode/mcp.json copilot discovers from the
-    # run cwd UPWARD (it walks ancestors) — this is what covers probes, judge runs,
-    # non-isolated runs, and scenario-seeded workspace configs.
-    import json as _json
-    _cop_home = _tmp.mkdtemp(prefix="ase-cophome-")
-    _cop_ws_root = _tmp.mkdtemp(prefix="ase-copws-")
-    _old_cop_home = os.environ.get("COPILOT_HOME")
-    try:
-        with open(os.path.join(_cop_home, "mcp-config.json"), "w") as fh:
-            _json.dump({"mcpServers": {"user-srv": {"command": "echo"}}}, fh)
-        ws = os.path.join(_cop_ws_root, "nested", "ws")
-        os.makedirs(os.path.join(ws, ".github"))
-        os.makedirs(os.path.join(ws, ".vscode"))
-        with open(os.path.join(ws, ".mcp.json"), "w") as fh:
-            _json.dump({"mcpServers": {"ws-srv": {}}}, fh)
-        with open(os.path.join(ws, ".github", "mcp.json"), "w") as fh:
-            _json.dump({"mcpServers": {"gh-srv": {}}}, fh)
-        with open(os.path.join(ws, ".vscode", "mcp.json"), "w") as fh:
-            _json.dump({"servers": {"vsc-srv": {}}}, fh)   # the .vscode key spelling
-        with open(os.path.join(_cop_ws_root, ".mcp.json"), "w") as fh:
-            _json.dump({"mcpServers": {"ancestor-srv": {}}}, fh)
-        os.environ["COPILOT_HOME"] = _cop_home
-        dargv = get_adapter("copilot").build_argv("do it", RunOptions(), cwd=ws)
-        disabled = [dargv[i + 1] for i, a in enumerate(dargv) if a == "--disable-mcp-server"]
-        _check("copilot.mcp_disable_enumeration",
-               {"user-srv", "ws-srv", "gh-srv", "vsc-srv", "ancestor-srv"} <= set(disabled),
-               f"user + workspace + ancestor servers all disabled by name: {disabled}",
-               failures, verbose)
-        # ...and the user config must resolve from the CHILD's env, not the harness's:
-        # a scenario's `env: {COPILOT_HOME: ...}` override reaches build_argv through
-        # opts.effective_env (exec.execute() sets it), with no os.environ involvement.
-        os.environ.pop("COPILOT_HOME", None)
-        eargv = get_adapter("copilot").build_argv(
-            "do it", RunOptions(effective_env={"COPILOT_HOME": _cop_home}), cwd=None)
-        edis = [eargv[i + 1] for i, a in enumerate(eargv) if a == "--disable-mcp-server"]
-        _check("copilot.mcp_disable_uses_child_env",
-               "user-srv" in edis,
-               f"a COPILOT_HOME set only in the child's effective env still enumerates "
-               f"its servers: {edis}", failures, verbose)
-        # ...and a RELATIVE COPILOT_HOME must resolve against the CHILD's cwd — copilot
-        # resolves it against its own process cwd (verified 1.0.64: `copilot mcp list`
-        # with COPILOT_HOME=relhome reads <its cwd>/relhome), so anchoring to the
-        # harness's cwd would enumerate a different config than the run actually loads
-        # (direct and `isolated: false` runs; isolation clears/repoints the var).
-        rel_cop_home = os.path.join(ws, "rel-cop-home")
-        os.makedirs(rel_cop_home)
-        with open(os.path.join(rel_cop_home, "mcp-config.json"), "w") as fh:
-            _json.dump({"mcpServers": {"rel-srv": {"command": "echo"}}}, fh)
-        rargv = get_adapter("copilot").build_argv(
-            "do it", RunOptions(effective_env={"COPILOT_HOME": "rel-cop-home"}), cwd=ws)
-        rdis = [rargv[i + 1] for i, a in enumerate(rargv) if a == "--disable-mcp-server"]
-        _check("copilot.mcp_disable_relative_home_uses_child_cwd",
-               "rel-srv" in rdis,
-               f"a relative COPILOT_HOME enumerates from the child's cwd, not the "
-               f"harness's: {rdis}", failures, verbose)
-        # ...and a SET-BUT-EMPTY home var must enumerate <child cwd>/.copilot — Node's
-        # homedir() returns "" for a set-but-empty HOME, so copilot's ".copilot" join
-        # goes relative and resolves against its process cwd (verified 1.0.64: `copilot
-        # mcp list` with HOME="" reads <its cwd>/.copilot). Treating empty as unset
-        # would enumerate the harness user's real ~/.copilot instead — the wrong config.
-        # POSIX-only: this empty-base-is-relative behaviour is Node/libuv's POSIX rule;
-        # on win32 libuv REJECTS an empty %USERPROFILE% (fail closed — see home_resolution).
-        if os.name != "nt":
-            cwd_cop_home = os.path.join(ws, ".copilot")
-            os.makedirs(cwd_cop_home)
-            with open(os.path.join(cwd_cop_home, "mcp-config.json"), "w") as fh:
-                _json.dump({"mcpServers": {"empty-home-srv": {"command": "echo"}}}, fh)
-            hargv = get_adapter("copilot").build_argv(
-                "do it", RunOptions(effective_env={"HOME": ""}), cwd=ws)
-            hdis = [hargv[i + 1] for i, a in enumerate(hargv) if a == "--disable-mcp-server"]
-            _check("copilot.mcp_disable_empty_home_uses_child_cwd",
-                   "empty-home-srv" in hdis,
-                   f"a set-but-empty HOME enumerates <child cwd>/.copilot, as copilot "
-                   f"does: {hdis}", failures, verbose)
-    finally:
-        if _old_cop_home is None:
+    # The whole enumeration block below builds positive copilot argv — skipped on a
+    # real 32-bit win32 harness, where _mcp_disable_args fails closed by design
+    # (see copilot.argv_32bit_win32_fails_closed above).
+    if not _cop_wow64:
+        # --disable-mcp-server enumeration: user config ($COPILOT_HOME else ~/.copilot) plus
+        # the workspace .mcp.json/.github/mcp.json/.vscode/mcp.json copilot discovers from the
+        # run cwd UPWARD (it walks ancestors) — this is what covers probes, judge runs,
+        # non-isolated runs, and scenario-seeded workspace configs.
+        import json as _json
+        _cop_home = _tmp.mkdtemp(prefix="ase-cophome-")
+        _cop_ws_root = _tmp.mkdtemp(prefix="ase-copws-")
+        _old_cop_home = os.environ.get("COPILOT_HOME")
+        try:
+            with open(os.path.join(_cop_home, "mcp-config.json"), "w") as fh:
+                _json.dump({"mcpServers": {"user-srv": {"command": "echo"}}}, fh)
+            ws = os.path.join(_cop_ws_root, "nested", "ws")
+            os.makedirs(os.path.join(ws, ".github"))
+            os.makedirs(os.path.join(ws, ".vscode"))
+            with open(os.path.join(ws, ".mcp.json"), "w") as fh:
+                _json.dump({"mcpServers": {"ws-srv": {}}}, fh)
+            with open(os.path.join(ws, ".github", "mcp.json"), "w") as fh:
+                _json.dump({"mcpServers": {"gh-srv": {}}}, fh)
+            with open(os.path.join(ws, ".vscode", "mcp.json"), "w") as fh:
+                _json.dump({"servers": {"vsc-srv": {}}}, fh)   # the .vscode key spelling
+            with open(os.path.join(_cop_ws_root, ".mcp.json"), "w") as fh:
+                _json.dump({"mcpServers": {"ancestor-srv": {}}}, fh)
+            os.environ["COPILOT_HOME"] = _cop_home
+            dargv = get_adapter("copilot").build_argv("do it", RunOptions(), cwd=ws)
+            disabled = [dargv[i + 1] for i, a in enumerate(dargv) if a == "--disable-mcp-server"]
+            _check("copilot.mcp_disable_enumeration",
+                   {"user-srv", "ws-srv", "gh-srv", "vsc-srv", "ancestor-srv"} <= set(disabled),
+                   f"user + workspace + ancestor servers all disabled by name: {disabled}",
+                   failures, verbose)
+            # ...and the user config must resolve from the CHILD's env, not the harness's:
+            # a scenario's `env: {COPILOT_HOME: ...}` override reaches build_argv through
+            # opts.effective_env (exec.execute() sets it), with no os.environ involvement.
             os.environ.pop("COPILOT_HOME", None)
-        else:
-            os.environ["COPILOT_HOME"] = _old_cop_home
-        _sh.rmtree(_cop_home, ignore_errors=True)
-        _sh.rmtree(_cop_ws_root, ignore_errors=True)
+            eargv = get_adapter("copilot").build_argv(
+                "do it", RunOptions(effective_env={"COPILOT_HOME": _cop_home}), cwd=None)
+            edis = [eargv[i + 1] for i, a in enumerate(eargv) if a == "--disable-mcp-server"]
+            _check("copilot.mcp_disable_uses_child_env",
+                   "user-srv" in edis,
+                   f"a COPILOT_HOME set only in the child's effective env still enumerates "
+                   f"its servers: {edis}", failures, verbose)
+            # ...and a RELATIVE COPILOT_HOME must resolve against the CHILD's cwd — copilot
+            # resolves it against its own process cwd (verified 1.0.64: `copilot mcp list`
+            # with COPILOT_HOME=relhome reads <its cwd>/relhome), so anchoring to the
+            # harness's cwd would enumerate a different config than the run actually loads
+            # (direct and `isolated: false` runs; isolation clears/repoints the var).
+            rel_cop_home = os.path.join(ws, "rel-cop-home")
+            os.makedirs(rel_cop_home)
+            with open(os.path.join(rel_cop_home, "mcp-config.json"), "w") as fh:
+                _json.dump({"mcpServers": {"rel-srv": {"command": "echo"}}}, fh)
+            rargv = get_adapter("copilot").build_argv(
+                "do it", RunOptions(effective_env={"COPILOT_HOME": "rel-cop-home"}), cwd=ws)
+            rdis = [rargv[i + 1] for i, a in enumerate(rargv) if a == "--disable-mcp-server"]
+            _check("copilot.mcp_disable_relative_home_uses_child_cwd",
+                   "rel-srv" in rdis,
+                   f"a relative COPILOT_HOME enumerates from the child's cwd, not the "
+                   f"harness's: {rdis}", failures, verbose)
+            # ...and a SET-BUT-EMPTY home var must enumerate <child cwd>/.copilot — Node's
+            # homedir() returns "" for a set-but-empty HOME, so copilot's ".copilot" join
+            # goes relative and resolves against its process cwd (verified 1.0.64: `copilot
+            # mcp list` with HOME="" reads <its cwd>/.copilot). Treating empty as unset
+            # would enumerate the harness user's real ~/.copilot instead — the wrong config.
+            # POSIX-only: this empty-base-is-relative behaviour is Node/libuv's POSIX rule;
+            # on win32 libuv REJECTS an empty %USERPROFILE% (fail closed — see home_resolution).
+            if os.name != "nt":
+                cwd_cop_home = os.path.join(ws, ".copilot")
+                os.makedirs(cwd_cop_home)
+                with open(os.path.join(cwd_cop_home, "mcp-config.json"), "w") as fh:
+                    _json.dump({"mcpServers": {"empty-home-srv": {"command": "echo"}}}, fh)
+                hargv = get_adapter("copilot").build_argv(
+                    "do it", RunOptions(effective_env={"HOME": ""}), cwd=ws)
+                hdis = [hargv[i + 1] for i, a in enumerate(hargv) if a == "--disable-mcp-server"]
+                _check("copilot.mcp_disable_empty_home_uses_child_cwd",
+                       "empty-home-srv" in hdis,
+                       f"a set-but-empty HOME enumerates <child cwd>/.copilot, as copilot "
+                       f"does: {hdis}", failures, verbose)
+        finally:
+            if _old_cop_home is None:
+                os.environ.pop("COPILOT_HOME", None)
+            else:
+                os.environ["COPILOT_HOME"] = _old_cop_home
+            _sh.rmtree(_cop_home, ignore_errors=True)
+            _sh.rmtree(_cop_ws_root, ignore_errors=True)
+
+    # Custom agents are an MCP channel --disable-mcp-server does NOT reach: a selected
+    # agent's frontmatter mcp-servers are started per name by initializeMcpHost without
+    # consulting disabledMcpServers, and no flag disables custom agents (1.0.64 bundle).
+    # So _mcp_disable_args must FAIL CLOSED on any discoverable local agent file —
+    # <home>/agents plus .github/agents / .claude/agents from the run cwd up to the
+    # nearest git root (inclusive), copilot's own walk boundary — and, in a git-repo
+    # cwd, on a config that doesn't provably opt out of the REMOTE org/enterprise
+    # agents listing (customAgents.defaultLocalOnly, which the sanitizer injects).
+    if not _cop_wow64:
+        _ag_dir = _tmp.mkdtemp(prefix="ase-copagents-")
+        try:
+            _ag_home = os.path.join(_ag_dir, "home")
+            _ag_repo = os.path.join(_ag_dir, "repo")
+            _ag_ws = os.path.join(_ag_repo, "ws")
+            os.makedirs(_ag_home)
+            os.makedirs(_ag_ws)
+            _ag_env = {"COPILOT_HOME": _ag_home}
+
+            def _cop_agents_err(cwd):
+                try:
+                    get_adapter("copilot").build_argv(
+                        "p", RunOptions(effective_env=_ag_env), cwd=cwd)
+                    return ""
+                except RuntimeError as exc:
+                    return str(exc)
+
+            ag_clean = _cop_agents_err(_ag_ws) == ""      # empty tree builds fine
+            os.makedirs(os.path.join(_ag_home, "agents", "nested"))
+            open(os.path.join(_ag_home, "agents", "readme.txt"), "w").close()
+            ag_nonmd = _cop_agents_err(_ag_ws) == ""      # only *.md is an agent
+            # case-insensitive superset of copilot's *.md glob, at any depth
+            open(os.path.join(_ag_home, "agents", "nested", "Helper.MD"), "w").close()
+            _e = _cop_agents_err(_ag_ws)
+            ag_home_md = "custom-agent" in _e and "failing closed" in _e
+            _sh.rmtree(os.path.join(_ag_home, "agents"))
+            os.makedirs(os.path.join(_ag_repo, ".github", "agents"))
+            open(os.path.join(_ag_repo, ".github", "agents", "x.md"), "w").close()
+            ag_github = "custom-agent" in _cop_agents_err(_ag_ws)
+            _sh.rmtree(os.path.join(_ag_repo, ".github"))
+            os.makedirs(os.path.join(_ag_repo, ".claude", "agents"))
+            open(os.path.join(_ag_repo, ".claude", "agents", "x.agent.md"), "w").close()
+            ag_claude = "custom-agent" in _cop_agents_err(_ag_ws)
+            _sh.rmtree(os.path.join(_ag_repo, ".claude"))
+            _check("copilot.custom_agents_fail_closed",
+                   ag_clean and ag_nonmd and ag_home_md and ag_github and ag_claude,
+                   "any *.md under <home>/agents (recursive, case-insensitive) or a "
+                   ".github/agents / .claude/agents dir on the cwd walk fails closed "
+                   "(their mcp-servers start outside --disable-mcp-server); empty "
+                   "dirs and non-md files don't", failures, verbose)
+
+            # remote agents: a git-repo cwd requires the defaultLocalOnly opt-out —
+            # and the walk must stop at the git root exactly as copilot's does (an
+            # agent file ABOVE it is not copilot's to discover).
+            os.makedirs(os.path.join(_ag_repo, ".git"))
+            os.makedirs(os.path.join(_ag_dir, ".claude", "agents"))
+            open(os.path.join(_ag_dir, ".claude", "agents", "above.md"), "w").close()
+            with open(os.path.join(_ag_home, "config.json"), "w") as fh:
+                fh.write('{"customAgents": {"defaultLocalOnly": true}}')
+            ag_boundary = _cop_agents_err(_ag_ws) == ""   # boundary + opt-out → runs
+            os.remove(os.path.join(_ag_home, "config.json"))
+            _e = _cop_agents_err(_ag_ws)
+            ag_remote = "defaultLocalOnly" in _e and "failing closed" in _e
+            _sh.rmtree(os.path.join(_ag_repo, ".git"))
+            with open(os.path.join(_ag_repo, ".git"), "w") as fh:
+                fh.write("gitdir: /elsewhere\n")           # worktree-style .git FILE
+            ag_gitfile = "defaultLocalOnly" in _cop_agents_err(_ag_ws)
+            _check("copilot.remote_agents_fail_closed",
+                   ag_boundary and ag_remote and ag_gitfile,
+                   "a git-repo cwd (dir or worktree-file .git) without the "
+                   "customAgents.defaultLocalOnly opt-out fails closed — remote "
+                   "org/enterprise agents can carry mcp-servers outside the disable "
+                   "set; with the opt-out (as the sanitizer injects) it runs, and "
+                   "the agent walk stops at the git root exactly like copilot's",
+                   failures, verbose)
+        finally:
+            _sh.rmtree(_ag_dir, ignore_errors=True)
+
+    # extra_args configuration channels fail closed (mirrors the codex vet): each
+    # spelling raises BEFORE enumeration (proven by stubbing the enumerator to a
+    # sentinel), neutral tokens reach enumeration untouched. Arch-independent — the
+    # vet precedes even the WOW64 gate.
+    _CopAd = type(get_adapter("copilot"))
+    _orig_cop_disable = _CopAd._mcp_disable_args
+
+    def _sentinel_disable(self, cwd, env=None):
+        raise AssertionError("enumeration ran before the extra_args vet")
+
+    _CopAd._mcp_disable_args = _sentinel_disable
+    try:
+        _cop_leaked = []
+        for _extras in (["--additional-mcp-config", '{"mcpServers":{"x":{}}}'],
+                        ["--additional-mcp-config=@/x/mcp.json"],
+                        ["--agent", "helper"], ["--agent=helper"],
+                        ["--plugin-dir", "/x/plug"], ["--plugin-dir=/x/plug"],
+                        ["--config-dir", "/x/cfg"], ["--config-dir=/x/cfg"],
+                        ["-C", "/elsewhere"], ["-C/elsewhere"]):
+            try:
+                get_adapter("copilot").build_argv(
+                    "p", RunOptions(extra_args=_extras), cwd="/tmp")
+                _cop_leaked.append(_extras)
+            except RuntimeError as exc:
+                if "configuration channel" not in str(exc):
+                    _cop_leaked.append(_extras)      # raised, but not by the vet
+        try:
+            get_adapter("copilot").build_argv(
+                "p", RunOptions(extra_args=["--banner"]), cwd="/tmp")
+            _cop_neutral = "enumeration-skipped"     # sentinel must have fired
+        except AssertionError:
+            _cop_neutral = "vet-passed"
+        except RuntimeError:
+            _cop_neutral = "vetoed"
+    finally:
+        _CopAd._mcp_disable_args = _orig_cop_disable
+    _check("copilot.extra_args_config_channels_fail_closed",
+           not _cop_leaked and _cop_neutral == "vet-passed",
+           f"config-channel extra_args (--additional-mcp-config/--agent/--plugin-dir/"
+           f"--config-dir, =value and attached -C forms) raise before enumeration; "
+           f"neutral tokens reach it: leaked={_cop_leaked}, neutral={_cop_neutral}",
+           failures, verbose)
 
     # Windows ODR registry servers (design §2): copilot discovers MCP servers via a
     # registry-advertised command's `mcp list` output and registers them under names
@@ -3022,6 +3205,49 @@ def run_selftest(verbose: bool = False) -> int:
            == ["wrapped_server", "x__y"],
            "wrapped entries are unwrapped and astral chars sanitize per UTF-16 unit "
            "(→ __), matching copilot", failures, verbose)
+    # The ODR command line is trimmed and split with ECMAScript whitespace, not
+    # Python's — /\s/ and String.trim() exclude U+001C–U+001F and U+0085 (Python-space,
+    # so str.split(None) would split there and hand the same executable DIFFERENT
+    # arguments than copilot passes) and include U+FEFF (not Python-space, so a
+    # BOM-wrapped value would not trim). Expectations below are byte-identical to the
+    # bundle's split function replayed under node v24 (the runtime copilot ships on).
+    # The unquoted branch mirrors copilot's /^([^\s]+)\s*(.*)$/: a line terminator
+    # directly after the first token is consumed by \s*, but one interrupting the
+    # tail fails the regex — copilot then skips ODR entirely (its loader catches);
+    # the harness raises and fails closed there, the conservative side.
+
+    def _cop_split_raises(cmdline):
+        try:
+            copilot_mod._split_odr_command(cmdline)
+        except ValueError:
+            return True
+        return False
+
+    _check("copilot.odr_split_js_whitespace",
+           copilot_mod._split_odr_command("C:\\odr.exe\u001carg")
+           == ("C:\\odr.exe\u001carg", [])
+           and copilot_mod._split_odr_command("C:\\odr.exe\u0085arg")
+           == ("C:\\odr.exe\u0085arg", [])
+           and copilot_mod._split_odr_command("C:\\odr.exe\u001farg")
+           == ("C:\\odr.exe\u001farg", [])
+           and copilot_mod._split_odr_command("\ufeffC:\\odr\\host.exe mcp-src\ufeff")
+           == ("C:\\odr\\host.exe", ["mcp-src"])
+           and copilot_mod._split_odr_command("C:\\odr.exe\u00a0--flag\u3000x")
+           == ("C:\\odr.exe", ["--flag", "x"])
+           and copilot_mod._split_odr_command("C:\\odr.exe a\u001cb c")
+           == ("C:\\odr.exe", ["a\u001cb", "c"])
+           and copilot_mod._split_odr_command("exe\ncd") == ("exe", ["cd"])
+           and copilot_mod._split_odr_command('"C:\\exe" a\nb')
+           == ("C:\\exe", ["a", "b"])
+           and copilot_mod._split_odr_command('"C:\\exe"\ufeffa') == ("C:\\exe", ["a"])
+           and copilot_mod._split_odr_command("C:\\odr.exe\u2028x")
+           == ("C:\\odr.exe", ["x"])
+           and _cop_split_raises("exe a\nb")
+           and _cop_split_raises("C:\\odr.exe a\u2028b"),
+           "ODR splitting uses the exact ECMAScript whitespace class (U+001C/U+0085 "
+           "glue, U+FEFF/NBSP/U+3000 separate or trim, quoted branch tolerates "
+           "newlines, LT-interrupted unquoted tails fail closed) — node-replay "
+           "verified", failures, verbose)
     # The Windows fully-qualified predicate copilot home resolution leans on. Runs on every
     # host because _win_fully_qualified uses ntpath explicitly — so the UNC-root, device-
     # namespace, volume-GUID, and canonicality logic (the heart of the path findings) is
@@ -3422,6 +3648,14 @@ def run_selftest(verbose: bool = False) -> int:
         reg_cmd = copilot_mod._odr_registry_command()          # value → stripped
         _fake_winreg._value = "   "
         reg_blank = copilot_mod._odr_registry_command()        # blank value → gate off
+        # the value is trimmed with ECMAScript trim(), matching the bundle's
+        # `value?.trim()` falsy test: a lone U+FEFF (JS-space, not Python-space)
+        # reads gate-OFF exactly as it does for copilot, and a BOM-wrapped command
+        # trims clean
+        _fake_winreg._value = "\ufeff"
+        reg_bom_blank = copilot_mod._odr_registry_command()    # JS-blank → gate off
+        _fake_winreg._value = "\ufeff C:\\odr\\host.exe mcp-src \ufeff"
+        reg_bom_cmd = copilot_mod._odr_registry_command()      # BOM-wrapped → trimmed
         _fake_winreg._raise = FileNotFoundError("no key")
         reg_absent = copilot_mod._odr_registry_command()       # absent key → gate off
         _fake_winreg._raise = PermissionError("denied")
@@ -3438,9 +3672,11 @@ def run_selftest(verbose: bool = False) -> int:
             sys.modules["winreg"] = _saved_winreg
     _check("copilot.odr_registry_64bit_view",
            reg_cmd == "C:\\odr\\host.exe mcp-src"
-           and reg_blank is None and reg_absent is None
+           and reg_blank is None and reg_bom_blank is None
+           and reg_bom_cmd == "C:\\odr\\host.exe mcp-src"
+           and reg_absent is None
            and "failing closed" in reg_denied
-           and len(_reg_calls) == 4
+           and len(_reg_calls) == 6
            and all(root is _fake_winreg.HKEY_LOCAL_MACHINE
                    and sub == copilot_mod._ODR_REGISTRY_SUBKEY
                    and reserved == 0
@@ -3450,9 +3686,10 @@ def run_selftest(verbose: bool = False) -> int:
            "the ODR registry key is opened with copilot 1.0.64's exact access mask — "
            "KEY_READ | KEY_WOW64_64KEY, the 64-bit view from any harness bitness, "
            "never the WOW6432Node default a 32-bit process would read (where an "
-           "absent key would fake the gate 'off'); a missing key or blank value "
-           "still reads as gate-off and an unreadable key fails closed (stubbed "
-           "winreg + sys shim)", failures, verbose)
+           "absent key would fake the gate 'off'); a missing key or blank/JS-blank "
+           "(U+FEFF) value still reads as gate-off, a BOM-wrapped command JS-trims "
+           "clean, and an unreadable key fails closed (stubbed winreg + sys shim)",
+           failures, verbose)
 
     # A 32-bit harness process on win32 can't prove MCP hermeticity at all — the WOW64
     # file-system redirector remaps System32 (the ODR command launch included) to
@@ -3497,23 +3734,26 @@ def run_selftest(verbose: bool = False) -> int:
                      " {\"name\": \"plain\"}]}')\n")
         copilot_mod._odr_registry_command = lambda: f'"{sys.executable}" "{listing}"'
         odr_names = get_adapter("copilot")._odr_mcp_server_names()
-        empty_home = _tmp.mkdtemp(prefix="ase-odr-home-")
-        try:
-            # A full os.environ copy: the mocked listing subprocess needs a real process
-            # environment (win32 python won't start without SystemRoot & co), and
-            # COPILOT_HOME (absolute on every platform) pins the user config to the empty
-            # fixture — a bare HOME would fail closed on win32, where copilot ignores it
-            # and an absent USERPROFILE can't name a home.
-            oargv = get_adapter("copilot")._mcp_disable_args(
-                None, env={**os.environ, "COPILOT_HOME": empty_home})
-            odis = [oargv[i + 1] for i, a in enumerate(oargv)
-                    if a == "--disable-mcp-server"]
-        finally:
-            _sh.rmtree(empty_home, ignore_errors=True)
-        _check("copilot.odr_servers_disabled",
-               odr_names == ["reg_srv", "plain"] and odis == ["reg_srv", "plain"],
+        odr_disabled_ok = odr_names == ["reg_srv", "plain"]
+        if not _cop_wow64:   # _mcp_disable_args itself fails closed on real 32-bit win32
+            empty_home = _tmp.mkdtemp(prefix="ase-odr-home-")
+            try:
+                # A full os.environ copy: the mocked listing subprocess needs a real
+                # process environment (win32 python won't start without SystemRoot &
+                # co), and COPILOT_HOME (absolute on every platform) pins the user
+                # config to the empty fixture — a bare HOME would fail closed on
+                # win32, where copilot ignores it and an absent USERPROFILE can't
+                # name a home.
+                oargv = get_adapter("copilot")._mcp_disable_args(
+                    None, env={**os.environ, "COPILOT_HOME": empty_home})
+                odis = [oargv[i + 1] for i, a in enumerate(oargv)
+                        if a == "--disable-mcp-server"]
+            finally:
+                _sh.rmtree(empty_home, ignore_errors=True)
+            odr_disabled_ok = odr_disabled_ok and odis == ["reg_srv", "plain"]
+        _check("copilot.odr_servers_disabled", odr_disabled_ok,
                f"registry-advertised servers are enumerated via the ODR command and "
-               f"disabled under their resolved names: {odis}", failures, verbose)
+               f"disabled under their resolved names: {odr_names}", failures, verbose)
 
         # while the gate is ON, an enumeration failure must fail CLOSED — a run with
         # un-disabled registry servers is exactly what Phase 0 forbids.
