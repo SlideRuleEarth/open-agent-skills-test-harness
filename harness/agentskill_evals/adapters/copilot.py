@@ -82,30 +82,45 @@ _WORKSPACE_MCP_FILES = (".mcp.json", ".github/mcp.json", ".vscode/mcp.json")
 # gate is on FAILS CLOSED (RuntimeError) — the alternative is a run with un-disabled
 # registry servers live. Over-enumerating is safe: --disable-mcp-server tolerates names
 # copilot doesn't load (verified 1.0.64), so servers copilot itself would skip (no usable
-# packages/remotes) are just disabled no-ops.
+# packages/remotes) are just disabled no-ops. Bitness matters twice: the registry read
+# carries copilot's exact KEY_READ|KEY_WOW64_64KEY access mask (the 64-bit view from any
+# harness bitness — a 32-bit default would read WOW6432Node, where an absent key would
+# fake the gate "off"), and a 32-bit harness process fails closed outright in
+# _mcp_disable_args, because the WOW64 file-system redirector would still remap a
+# System32-homed command executable at launch (System32 → SysWOW64) while 64-bit
+# copilot runs the real one.
 _ODR_REGISTRY_SUBKEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Mcp"
 _ODR_NAME_BAD_CHARS = re.compile(r"[^0-9a-zA-Z_./@-]")
 
 
 def _odr_registry_command() -> Optional[str]:
     """The ODR command line from the registry, or None when the gate is off (non-win32,
-    key/value absent). An unreadable key with the gate possibly on raises RuntimeError."""
+    key/value absent). An unreadable key with the gate possibly on raises RuntimeError.
+
+    The key is opened with copilot's exact access mask — ``KEY_READ | KEY_WOW64_64KEY``,
+    read out of the 1.0.64 native helper — so this reads the 64-BIT registry view no
+    matter the harness's own bitness. A 32-bit process's DEFAULT view is the redirected
+    WOW6432Node one, where the key can be absent (the gate would read "off") while the
+    64-bit view copilot queries is populated; the explicit view flag removes that
+    divergence from the read itself (32-bit Windows, with its single view, ignores the
+    flag). Exercised cross-host in the selftest via a stubbed ``winreg``."""
     if sys.platform != "win32":
         return None
-    import winreg  # pragma: no cover — win32 only
-    try:  # pragma: no cover
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _ODR_REGISTRY_SUBKEY) as key:
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _ODR_REGISTRY_SUBKEY, 0,
+                            winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
             value, _type = winreg.QueryValueEx(key, "Command")
-    except FileNotFoundError:  # pragma: no cover
+    except FileNotFoundError:
         return None  # no key/value → copilot skips ODR entirely
-    except OSError as exc:  # pragma: no cover
+    except OSError as exc:
         raise RuntimeError(
             f"cannot read the Windows MCP registry key (HKLM\\{_ODR_REGISTRY_SUBKEY}): "
             f"{exc} — its servers can't be enumerated, failing closed."
         )
-    if not isinstance(value, str) or not value.strip():  # pragma: no cover
+    if not isinstance(value, str) or not value.strip():
         return None  # empty command → copilot logs "command line not found" and skips
-    return value.strip()  # pragma: no cover
+    return value.strip()
 
 
 def _split_odr_command(cmdline: str) -> tuple[str, list[str]]:
@@ -294,23 +309,30 @@ def _win_fully_qualified(path: str) -> bool:
 
       A BARE namespace root — ``\\\\?\\`` / ``\\\\.\\`` alone — or an INCOMPLETE
       extended-UNC root — ``\\\\?\\UNC`` or ``\\\\?\\UNC\\server``, with or without a
-      trailing separator — is likewise rejected: Python 3.10/3.11 join the bare roots
-      with a DOUBLED separator (``\\\\?\\\\mcp-config.json``) and 3.11 does the same
-      under the trailing-separator UNC forms (the separator lands inside splitdrive's
-      drive and join appends another), while Node produces the single-separator
-      spelling — which under an exact ``\\\\?\\`` names a local DOS-device alias
-      copilot could open but the harness never enumerates. Even on versions where a
-      join coincides, no directory (so no config) can live at these roots — fail
-      closed on every version.
+      trailing separator — is likewise rejected. On Python 3.10/3.11 that is a PROVEN
+      join divergence: they join the bare roots with a DOUBLED separator
+      (``\\\\?\\\\mcp-config.json``) and 3.11 does the same under the
+      trailing-separator UNC forms (the separator lands inside splitdrive's drive and
+      join appends another), while Node produces the single-separator spelling — which
+      under an exact ``\\\\?\\`` names a local DOS-device alias copilot could open but
+      the harness never enumerates. On the versions where the joins coincide (3.12+),
+      the rejection is CONSERVATIVE — one uniform version-stable rule instead of a
+      per-version accept, at no cost, since a home at a bare device-namespace or
+      share-less extended-UNC root is no real profile directory.
 
-      A TERMINAL-COLON device root — ``\\\\?\\foo:`` / ``\\\\.\\foo:``, or
-      ``\\\\?\\UNC\\srv\\share:`` — is rejected in BOTH namespaces: splitdrive
-      returns the whole root as a drive ending in ``:``, so ``ntpath.join`` GLUES
-      the child name on (``\\\\?\\foo:mcp-config.json``) where Node inserts the
-      separator (``\\\\?\\foo:\\mcp-config.json``) — and no normalization ever
-      reconverges a colon glue, so even the ``\\\\.\\`` namespace diverges. (A colon
-      segment ROOTED below — ``\\\\?\\foo:\\x`` — joins identically to Node on every
-      version and stays acceptable.)
+      A TERMINAL-COLON body end is rejected in BOTH namespaces — one test, two cases.
+      A whole-drive colon root (``\\\\?\\foo:`` / ``\\\\.\\foo:`` on every version;
+      ``\\\\?\\UNC\\srv\\share:`` on 3.11+) is a PROVEN divergence: splitdrive
+      returns it whole as a drive ending in ``:``, so ``ntpath.join`` GLUES the child
+      name on (``\\\\?\\foo:mcp-config.json``) where Node inserts the separator
+      (``\\\\?\\foo:\\mcp-config.json``) — and no normalization ever reconverges a
+      colon glue, so even the ``\\\\.\\`` namespace diverges. A colon-terminal body
+      PAST a rooted drive (``\\\\?\\C:\\dir:`` — splitdrive: drive ``\\\\?\\C:``,
+      rooted tail, every version) joins with an inserted separator exactly like Node
+      (verified 3.10–3.14) and is rejected CONSERVATIVELY: a terminal-colon component
+      is NTFS stream syntax, never a directory, so the uniform test loses nothing.
+      (A colon segment with a ROOTED tail below it — ``\\\\?\\foo:\\x`` — joins
+      identically to Node on every version and stays acceptable.)
     * a driveless path — rooted ``\\x`` or plain ``x`` — is NOT (it needs the current
       drive), and a drive-RELATIVE one — bare ``C:`` or ``C:x`` — is NOT (it resolves
       against that drive's own current directory).
@@ -327,8 +349,9 @@ def _win_fully_qualified(path: str) -> bool:
             body = path.replace("/", "\\")[4:]
             # A BARE namespace root (\\?\ or \\.\ alone): 3.10/3.11 joins DOUBLE the
             # separator (\\?\\mcp-config.json) where Node's single-separator join names
-            # a local DOS-device alias the harness never enumerates, and no directory
-            # lives at the namespace root on any version. Rejected for BOTH namespaces.
+            # a local DOS-device alias the harness never enumerates — PROVEN divergence
+            # there; on 3.12+ the joins coincide and the rejection is CONSERVATIVE (one
+            # uniform version-stable rule — no real profile lives at a namespace root).
             if not body:
                 return False
             # UNROOTED drive-LETTER form (bare \\?\C: / \\.\C: or drive-relative
@@ -339,13 +362,17 @@ def _win_fully_qualified(path: str) -> bool:
             if (len(body) >= 2 and body[0].isalpha() and body[1] == ":"
                     and (len(body) == 2 or body[2] != "\\")):
                 return False
-            # A TERMINAL-COLON device root (\\?\foo:, \\.\foo:, \\?\UNC\srv\share:):
-            # splitdrive returns the whole root as a drive ending in ":", so
-            # ntpath.join GLUES the child name on (\\?\foo:mcp-config.json) where Node
-            # inserts the separator — and no normalization reconverges a colon glue,
-            # so BOTH namespaces reject. (\\?\UNC\srv\share: glues on 3.11+ only;
-            # rejection is uniform — fail closed. A colon segment rooted below, e.g.
-            # \\?\foo:\x, joins identically to Node on every version and passes.)
+            # A TERMINAL-COLON body end — one test, two cases. A whole-drive colon
+            # root (\\?\foo:, \\.\foo: on every version; \\?\UNC\srv\share: on 3.11+)
+            # is a PROVEN divergence: splitdrive returns it whole as a drive ending in
+            # ":", so ntpath.join GLUES the child name on (\\?\foo:mcp-config.json)
+            # where Node inserts the separator, and no normalization reconverges a
+            # colon glue — BOTH namespaces diverge. A colon-terminal body past a
+            # rooted drive (\\?\C:\dir:, rooted-tail splitdrive on every version)
+            # joins exactly like Node and is rejected CONSERVATIVELY — a terminal-
+            # colon component is NTFS stream syntax, never a directory, so the
+            # uniform test loses nothing. (A colon segment with a ROOTED tail below
+            # it, e.g. \\?\foo:\x, joins identically to Node and passes.)
             if body[-1] == ":":
                 return False
             # Normalization divergence is a \\?\-ONLY hazard: Windows skips normalization
@@ -386,8 +413,9 @@ def _win_fully_qualified(path: str) -> bool:
         # A terminal-COLON share root (\\srv\share:) GLUES in ntpath.join — the
         # whole root is a drive ending in ":", so no separator is inserted
         # (\\srv\share:mcp-config.json, all supported Pythons) where Node inserts
-        # one. A colon root with a rooted tail (\\srv\share:\sub) joins like Node
-        # everywhere and passes.
+        # one. Any non-empty tail joins like Node everywhere and passes — a colon
+        # root with a rooted tail (\\srv\share:\sub) and a tail merely ENDING in
+        # ":" (\\srv\share\dir: — inserted separator, verified 3.10–3.14) alike.
         return bool(tail) or not d.endswith(":")
     return tail[:1] in ("\\", "/")          # lettered X: — qualified only when rooted
 
@@ -428,7 +456,12 @@ def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
       returns ``UV_ENOENT`` as an ERROR (no fallback), which Node's ``os.homedir()``
       surfaces as a thrown system error. Neither is ever a cwd-relative path (Windows has
       no POSIX empty-``HOME`` behaviour), and neither names a config this harness could
-      enumerate — so both fail closed.
+      enumerate — so both fail closed. The RAW value is also vetted BEFORE the
+      ``.copilot`` join: one that ``ntpath.splitdrive`` returns whole as a drive ending
+      in ``:`` (``\\\\?\\foo:``, ``\\\\srv\\share:`` — and ``\\\\?\\UNC\\srv\\share:``
+      on the versions whose splitdrive absorbs it whole) makes ``ntpath.join`` GLUE the
+      name on (``\\\\?\\foo:.copilot``) where Node inserts the separator, and the glued
+      string would then pass the fully-qualified predicate — fail closed instead.
 
     Resolution of a non-fully-qualified home: a RELATIVE home resolves against copilot's
     own process cwd (verified 1.0.64: ``COPILOT_HOME=relhome`` reads ``<its cwd>/relhome``),
@@ -467,6 +500,24 @@ def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
                 "profile dir, from the process token, not this env) and ERRORS on a "
                 "present-but-<3-char one (Node os.homedir() throws); either way the "
                 "config copilot loads can't be named from the env, failing closed."
+            )
+        # Vet the RAW base BEFORE the join: when splitdrive returns the whole value as
+        # a drive ending in ":" (\\?\foo:, \\.\foo:, \\srv\share: on every version;
+        # \\?\UNC\srv\share: on 3.11+, whose splitdrive absorbs it whole — 3.10 keeps
+        # a rooted tail and INSERTS like Node), ntpath.join GLUES ".copilot" straight
+        # on (\\?\foo:.copilot) where Node inserts the separator (\\?\foo:\.copilot).
+        # The glued string is itself a device path the fully-qualified predicate
+        # accepts, so without this pre-join test the harness would enumerate a
+        # different config than copilot loads.
+        b_drive, b_tail = ntpath.splitdrive(base)
+        if b_drive.endswith(":") and not b_tail:
+            raise RuntimeError(
+                f"copilot home base USERPROFILE={base!r} is one whole splitdrive "
+                "\"drive\" ending in ':' — ntpath.join GLUES '.copilot' straight onto "
+                "it (\\\\?\\foo:.copilot) where copilot's Node resolver inserts the "
+                "separator (\\\\?\\foo:\\.copilot), and no normalization reconverges "
+                "a colon glue — the harness would enumerate a different config than "
+                "copilot loads; failing closed."
             )
         home = os.path.join(base, ".copilot")
     else:
@@ -604,7 +655,25 @@ class CopilotAdapter(Adapter):
         runs, and non-isolated runs — with the isolation masks as the second layer.
         Plugin-declared servers can't be enumerated here (their names live inside each
         plugin's definition); those are covered by the installed-plugins isolation mask
-        and remain a documented gap for non-isolated runs."""
+        and remain a documented gap for non-isolated runs. On win32 the harness must
+        itself be a 64-BIT process; a 32-bit one fails closed up front (WOW64
+        redirection — see the inline comment)."""
+        # A 32-bit harness process on win32 shares neither filesystem nor default-
+        # registry views with copilot's 64-bit process: the WOW64 redirector remaps
+        # C:\Windows\System32 (file reads AND the ODR command launch) to SysWOW64, and
+        # the default registry view to WOW6432Node. The registry READ is pinned to the
+        # 64-bit view (KEY_WOW64_64KEY — _odr_registry_command), but launches and file
+        # reads have no such per-call escape, so nothing enumerated below would be
+        # provably what copilot sees — fail closed before enumerating anything.
+        if sys.platform == "win32" and sys.maxsize <= 2**32:
+            raise RuntimeError(
+                "the harness is running as a 32-bit process on win32: WOW64 "
+                "redirection gives it different filesystem (System32 → SysWOW64) and "
+                "default-registry views than copilot's 64-bit process, so the configs "
+                "it reads and the ODR registry command it launches are not provably "
+                "the ones copilot sees — MCP hermeticity can't be verified; failing "
+                "closed. Run the harness under a 64-bit Python."
+            )
         env_map: Mapping[str, str] = env if env is not None else os.environ
         home = _copilot_home(env_map, cwd)
         names = _mcp_server_names(os.path.join(home, "mcp-config.json"))
@@ -644,7 +713,10 @@ class CopilotAdapter(Adapter):
         line, a non-qualified or (win32) extensionless executable, the command
         failing/timing out, output without a ``servers`` array — raises RuntimeError: those servers would otherwise load
         un-disabled, so the invocation fails closed instead (exec.execute() turns that
-        into a failed run; probe_model into an unavailable model)."""
+        into a failed run; probe_model into an unavailable model). Bitness is settled
+        before this runs: a 32-bit harness fails closed in ``_mcp_disable_args`` — the
+        WOW64 file-system redirector would remap a System32-homed executable to its
+        SysWOW64 mirror at the launch below while 64-bit copilot runs the real one."""
         cmdline = _odr_registry_command()
         if not cmdline:
             return []
@@ -669,6 +741,10 @@ class CopilotAdapter(Adapter):
                     "extensionless exact name and probes <name>.com then <name>.exe, so "
                     "the two could run DIFFERENT binaries; failing closed."
                 )
+            # The harness is a 64-bit process here (32-bit failed closed upstream), so
+            # CreateProcess resolves a System32-homed exe to the REAL System32 exactly
+            # as copilot's 64-bit Node/libuv does — under WOW64 this same launch would
+            # silently run the SysWOW64 mirror instead.
             r = subprocess.run([exe, *args, "mcp", "list"], capture_output=True,
                                text=True, encoding="utf-8", timeout=15,
                                stdin=subprocess.DEVNULL, cwd=cwd,

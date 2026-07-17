@@ -3037,13 +3037,19 @@ def run_selftest(verbose: bool = False) -> int:
     # \\.\ path is exempt — Windows normalizes it in both processes, so it reconverges —
     # except a BARE \\.\ (or \\?\) root or an INCOMPLETE extended-UNC root, which
     # 3.10/3.11 (bare) and 3.11 (trailing-sep UNC) join with a DOUBLED separator vs
-    # Node's single one, and at which no config can live on any version: fail closed.
+    # Node's single one (PROVEN divergence there; on 3.12+ the joins coincide and the
+    # rejection is CONSERVATIVE — one uniform version-stable rule): fail closed.
     # Ordinary UNC roots must be COMPLETE (server AND share): Node joins a bare \\ into
     # \mcp-config.json, resolved from the child drive's root — a real file copilot
-    # loads — while the harness's join names nothing. And a TERMINAL-COLON root
-    # (\\?\foo:, \\srv\share:) is rejected everywhere: splitdrive returns it whole as
-    # a drive ending in ":", so ntpath.join GLUES the child name on where Node inserts
-    # the separator, and no normalization reconverges a colon glue.
+    # loads — while the harness's join names nothing. A TERMINAL-COLON body end is
+    # rejected everywhere, two cases under one test: a WHOLE-DRIVE colon root
+    # (\\?\foo:, \\srv\share:) is a PROVEN glue — splitdrive returns it whole as a
+    # drive ending in ":", so ntpath.join GLUES the child name on where Node inserts
+    # the separator, and no normalization reconverges a colon glue — while a colon-
+    # terminal DEVICE body past a rooted drive (\\?\C:\dir:) joins exactly like Node
+    # on every version and is rejected CONSERVATIVELY (stream syntax, never a
+    # directory). The ordinary-UNC arm only rejects the whole-drive form: a UNC tail
+    # merely ending in ":" (\\srv\share\dir:) joins like Node and passes.
     _check("copilot.win_fully_qualified",
            # ACCEPT: drive-with-root, complete UNC shares, and safe device paths
            copilot_mod._win_fully_qualified("C:\\Users\\me")
@@ -3065,9 +3071,11 @@ def run_selftest(verbose: bool = False) -> int:
                "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}\\sub")
            and copilot_mod._win_fully_qualified("\\\\.\\C:\\a\\..\\b")     # \\.\ normalizes -> converges
            and copilot_mod._win_fully_qualified("\\\\.\\C:/real")         # \\.\ fwd slash -> converges
-           # colon segments with a ROOTED tail join like Node on every version
+           # colon segments with a ROOTED tail — and an ordinary-UNC tail merely
+           # ENDING in ":" — join like Node on every version
            and copilot_mod._win_fully_qualified("\\\\srv\\share:\\sub")
            and copilot_mod._win_fully_qualified("\\\\?\\foo:\\x")
+           and copilot_mod._win_fully_qualified("\\\\srv\\share\\dir:")
            # REJECT: unrooted device drives (both namespaces), noncanonical literal \\?\,
            # and any nonliteral //?/ spelling
            and not copilot_mod._win_fully_qualified("\\\\?\\C:")           # bare device drive
@@ -3095,13 +3103,19 @@ def run_selftest(verbose: bool = False) -> int:
            and not copilot_mod._win_fully_qualified("\\\\srv\\")
            and not copilot_mod._win_fully_qualified("//")
            and not copilot_mod._win_fully_qualified("//srv/")
-           # terminal-colon roots: splitdrive returns the whole root as a drive ending
-           # in ":", so ntpath.join GLUES the child name on (\\?\foo:mcp-config.json)
-           # where Node inserts the separator — in the device namespaces AND ordinary UNC
+           # whole-drive terminal-colon roots: splitdrive returns the root as a drive
+           # ending in ":", so ntpath.join GLUES the child name on
+           # (\\?\foo:mcp-config.json) where Node inserts the separator — PROVEN
+           # divergence, in the device namespaces AND ordinary UNC
            and not copilot_mod._win_fully_qualified("\\\\?\\foo:")
            and not copilot_mod._win_fully_qualified("\\\\.\\foo:")
            and not copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv\\share:")
            and not copilot_mod._win_fully_qualified("\\\\srv\\share:")
+           # ...while a colon-terminal DEVICE body past a rooted drive joins exactly
+           # like Node on every version (verified 3.10–3.14) and is rejected
+           # CONSERVATIVELY — a terminal-colon component is NTFS stream syntax,
+           # never a directory
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\dir:")
            and not copilot_mod._win_fully_qualified("\\\\?\\C:.copilot")   # drive-relative device
            and not copilot_mod._win_fully_qualified("\\\\?\\C:\\a\\..\\b") # literal \\?\ + '..'
            and not copilot_mod._win_fully_qualified("\\\\?\\C:/real")      # literal \\?\ + '/'
@@ -3125,8 +3139,10 @@ def run_selftest(verbose: bool = False) -> int:
            "namespace, bare namespace roots and incomplete extended-UNC roots (their "
            "joins can DOUBLE the separator vs Node's), incomplete ordinary UNC roots "
            "(\\\\, \\\\srv, \\\\srv\\ — Node resolves a bare \\\\ from the child drive's "
-           "root while the harness's join names nothing), terminal-colon roots "
-           "(ntpath.join GLUES the child name on where Node inserts the separator), "
+           "root while the harness's join names nothing), terminal-colon body ends "
+           "(whole-drive roots GLUE in ntpath.join where Node inserts the separator — "
+           "proven; a colon-terminal device body past a rooted drive, \\\\?\\C:\\dir:, "
+           "joins like Node and is rejected conservatively as stream syntax), "
            "noncanonical literal \\\\?\\ paths (a '/' "
            "or a '.'/'..'/internal-or-repeated-empty segment), and every nonliteral //?/ "
            "spelling (copilot folds it to a literal \\\\?\\ that skips normalization while "
@@ -3236,6 +3252,22 @@ def run_selftest(verbose: bool = False) -> int:
                and _cop_home_raises({}, "D:\\child\\ws")
                and _cop_home_raises({"USERPROFILE": ""}, "D:\\child\\ws")
                and _cop_home_raises({"USERPROFILE": "C:"}, "D:\\child\\ws")
+               # the RAW %USERPROFILE% is vetted BEFORE the .copilot join: a value
+               # splitdrive returns whole as a drive ending in ":" would GLUE the
+               # join (\\?\foo:.copilot vs Node's \\?\foo:\.copilot) — fail closed
+               and _cop_home_raises({"USERPROFILE": "\\\\?\\foo:"}, "D:\\child\\ws")
+               and _cop_home_raises({"USERPROFILE": "\\\\.\\foo:"}, "D:\\child\\ws")
+               and _cop_home_raises({"USERPROFILE": "\\\\srv\\share:"},
+                                    "D:\\child\\ws")
+               # \\?\UNC\srv\share: splits whole (→ glue → raise) on 3.11+ only;
+               # 3.10 keeps a rooted tail and INSERTS the separator exactly like
+               # Node — the byte-identical join is accepted there
+               and (_cop_home_raises({"USERPROFILE": "\\\\?\\UNC\\srv\\share:"},
+                                     "D:\\child\\ws")
+                    if sys.version_info >= (3, 11) else
+                    copilot_mod._copilot_home(
+                        {"USERPROFILE": "\\\\?\\UNC\\srv\\share:"}, "D:\\child\\ws")
+                    == "\\\\?\\UNC\\srv\\share:\\.copilot")
                and copilot_mod._copilot_home({"USERPROFILE": "C:\\Users\\me"},
                                              "D:\\child\\ws")
                    == os.path.join("C:\\Users\\me", ".copilot"))),
@@ -3248,7 +3280,9 @@ def run_selftest(verbose: bool = False) -> int:
            "shared rejections are accepted, and drive-relative homes, bare/drive-"
            "relative device drives, bare or incomplete namespace and ordinary-UNC "
            "roots, terminal-colon roots, noncanonical literal-\\\\?\\ paths, nonliteral "
-           "//?/ spellings, plus absent/short USERPROFILE fail closed",
+           "//?/ spellings, plus absent/short USERPROFILE fail closed; a RAW "
+           "USERPROFILE that is one whole colon-terminal drive is vetted before the "
+           ".copilot join (it would GLUE where Node inserts the separator)",
            failures, verbose)
 
     # The win32 arm above only runs on Windows and there is no Windows CI — so the
@@ -3257,9 +3291,10 @@ def run_selftest(verbose: bool = False) -> int:
     # delegates — same technique as the ODR extension check). Only these fixtures are
     # portable: an ACCEPTED explicit home returns early through the pure-ntpath
     # predicate and a REJECTED one raises on ntpath tests, neither touching os.path
-    # (posixpath on this host); the absent/short-USERPROFILE raises also fire before
-    # any join. The USERPROFILE .copilot join and cwd anchoring DO go through os.path,
-    # so those assertions stay win32-only above.
+    # (posixpath on this host); the absent/short-USERPROFILE raises and the raw-
+    # USERPROFILE whole-drive-colon vet (pure ntpath on the raw value) also fire
+    # BEFORE any join. The USERPROFILE .copilot join itself and cwd anchoring DO go
+    # through os.path, so those assertions stay win32-only above.
     _real_sys_home = copilot_mod.sys
 
     class _Win32SysHome:
@@ -3315,6 +3350,17 @@ def run_selftest(verbose: bool = False) -> int:
             and _cop_home_raises({}, "D:\\child\\ws")
             and _cop_home_raises({"USERPROFILE": ""}, "D:\\child\\ws")
             and _cop_home_raises({"USERPROFILE": "C:"}, "D:\\child\\ws")
+            # ...and so does the raw-USERPROFILE whole-drive-colon vet: these would
+            # GLUE the .copilot join (\\?\foo:.copilot vs Node's \\?\foo:\.copilot)
+            and _cop_home_raises({"USERPROFILE": "\\\\?\\foo:"}, "D:\\child\\ws")
+            and _cop_home_raises({"USERPROFILE": "\\\\.\\foo:"}, "D:\\child\\ws")
+            and _cop_home_raises({"USERPROFILE": "\\\\srv\\share:"}, "D:\\child\\ws")
+            # 3.11+ splitdrive absorbs \\?\UNC\srv\share: whole → pre-join raise
+            # (portable); 3.10 keeps a rooted tail and INSERTS like Node — that
+            # accept runs through os.path.join, so it stays win32-only above
+            and (sys.version_info < (3, 11)
+                 or _cop_home_raises({"USERPROFILE": "\\\\?\\UNC\\srv\\share:"},
+                                     "D:\\child\\ws"))
         )
     finally:
         copilot_mod.sys = _real_sys_home
@@ -3322,12 +3368,121 @@ def run_selftest(verbose: bool = False) -> int:
            "the win32 _copilot_home accept/reject decisions for explicit device, UNC, "
            "and drive-relative COPILOT_HOME values (pure-ntpath paths that never touch "
            "os.path) hold on every host via the sys shim — incl. bare/incomplete "
-           "namespace and ordinary-UNC roots, terminal-colon roots, and absent/short "
-           "USERPROFILE failing closed", failures, verbose)
+           "namespace and ordinary-UNC roots, terminal-colon roots, absent/short "
+           "USERPROFILE, and raw whole-drive-colon USERPROFILE bases (vetted before "
+           "the .copilot join they would GLUE) failing closed", failures, verbose)
 
     _check("copilot.odr_gate_off_non_win32",
            sys.platform == "win32" or copilot_mod._odr_registry_command() is None,
            "off Windows the ODR gate reports no command (no registry to read)",
+           failures, verbose)
+
+    # The ODR registry read must pin the 64-BIT view: copilot 1.0.64's native helper
+    # opens the key with KEY_READ | KEY_WOW64_64KEY, while a 32-bit process's DEFAULT
+    # view is the redirected WOW6432Node one — there the key can be absent (the gate
+    # would read "off") while copilot's 64-bit view is populated. No Windows CI, so
+    # `winreg` is stubbed into sys.modules (the function imports it lazily) and the
+    # module-local `sys` shimmed to win32; the stub records the access mask OpenKey
+    # receives and drives the blank-value/absent/denied arms too.
+    _fake_winreg = type(sys)("winreg")   # a real module object, no importlib involved
+    _fake_winreg.HKEY_LOCAL_MACHINE = object()
+    _fake_winreg.KEY_READ = 0x20019          # the real winreg constants
+    _fake_winreg.KEY_WOW64_64KEY = 0x0100
+    _fake_winreg._value = "  C:\\odr\\host.exe mcp-src  "
+    _fake_winreg._raise = None
+    _reg_calls = []
+
+    class _FakeRegKey:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def _fake_openkey(root, sub, reserved=0, access=None):
+        _reg_calls.append((root, sub, reserved, access))
+        if _fake_winreg._raise is not None:
+            raise _fake_winreg._raise
+        return _FakeRegKey()
+
+    _fake_winreg.OpenKey = _fake_openkey
+    _fake_winreg.QueryValueEx = lambda _key, _name: (_fake_winreg._value, 1)
+    _real_sys_reg = copilot_mod.sys
+
+    class _Win32SysReg:
+        platform = "win32"
+
+        def __getattr__(self, _n):
+            return getattr(_real_sys_reg, _n)
+
+    _saved_winreg = sys.modules.get("winreg")
+    sys.modules["winreg"] = _fake_winreg
+    copilot_mod.sys = _Win32SysReg()
+    try:
+        reg_cmd = copilot_mod._odr_registry_command()          # value → stripped
+        _fake_winreg._value = "   "
+        reg_blank = copilot_mod._odr_registry_command()        # blank value → gate off
+        _fake_winreg._raise = FileNotFoundError("no key")
+        reg_absent = copilot_mod._odr_registry_command()       # absent key → gate off
+        _fake_winreg._raise = PermissionError("denied")
+        try:
+            copilot_mod._odr_registry_command()
+            reg_denied = "did not raise"
+        except RuntimeError as exc:
+            reg_denied = str(exc)
+    finally:
+        copilot_mod.sys = _real_sys_reg
+        if _saved_winreg is None:
+            sys.modules.pop("winreg", None)
+        else:
+            sys.modules["winreg"] = _saved_winreg
+    _check("copilot.odr_registry_64bit_view",
+           reg_cmd == "C:\\odr\\host.exe mcp-src"
+           and reg_blank is None and reg_absent is None
+           and "failing closed" in reg_denied
+           and len(_reg_calls) == 4
+           and all(root is _fake_winreg.HKEY_LOCAL_MACHINE
+                   and sub == copilot_mod._ODR_REGISTRY_SUBKEY
+                   and reserved == 0
+                   and access == (_fake_winreg.KEY_READ
+                                  | _fake_winreg.KEY_WOW64_64KEY)
+                   for root, sub, reserved, access in _reg_calls),
+           "the ODR registry key is opened with copilot 1.0.64's exact access mask — "
+           "KEY_READ | KEY_WOW64_64KEY, the 64-bit view from any harness bitness, "
+           "never the WOW6432Node default a 32-bit process would read (where an "
+           "absent key would fake the gate 'off'); a missing key or blank value "
+           "still reads as gate-off and an unreadable key fails closed (stubbed "
+           "winreg + sys shim)", failures, verbose)
+
+    # A 32-bit harness process on win32 can't prove MCP hermeticity at all — the WOW64
+    # file-system redirector remaps System32 (the ODR command launch included) to
+    # SysWOW64, so what it reads and launches is not what 64-bit copilot sees. The
+    # gate must fire FIRST: env={} would raise the absent-USERPROFILE error later if
+    # it were mis-ordered. Cross-host via a shim whose maxsize reads 32-bit.
+    _real_sys32 = copilot_mod.sys
+
+    class _Win32Sys32Bit:
+        platform = "win32"
+        maxsize = 2**31 - 1
+
+        def __getattr__(self, _n):
+            return getattr(_real_sys32, _n)
+
+    copilot_mod.sys = _Win32Sys32Bit()
+    try:
+        get_adapter("copilot")._mcp_disable_args("D:\\child\\ws", env={})
+        bits_raise = "did not raise"
+    except RuntimeError as exc:
+        bits_raise = str(exc)
+    finally:
+        copilot_mod.sys = _real_sys32
+    _check("copilot.win32_32bit_harness_fails_closed",
+           "32-bit" in bits_raise and "WOW64" in bits_raise
+           and "failing closed" in bits_raise,
+           "on win32 a 32-bit harness fails closed before enumerating anything — "
+           "WOW64 redirection gives it different filesystem (System32 → SysWOW64) "
+           "and default-registry views than copilot's 64-bit process (bitness shim, "
+           "cross-host; the raise precedes even the USERPROFILE checks)",
            failures, verbose)
 
     _odr_dir = _tmp.mkdtemp(prefix="ase-odr-")
