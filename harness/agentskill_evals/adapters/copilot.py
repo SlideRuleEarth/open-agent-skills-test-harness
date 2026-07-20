@@ -36,7 +36,6 @@ from __future__ import annotations
 import json
 import ntpath
 import os
-import subprocess
 import sys
 from typing import Any, Mapping, Optional
 
@@ -79,7 +78,7 @@ _WORKSPACE_MCP_FILES = (".mcp.json", ".github/mcp.json", ".vscode/mcp.json")
 _BUILTIN_MCP_SERVERS = ("github-mcp-server", "playwright", "bluebird",
                         "computer-use")
 
-# --- Custom agents: an MCP channel --disable-mcp-server does NOT reach ----------------
+# --- Custom agents: an MCP channel --disable-mcp-server cannot be AIMED at ------------
 #
 # copilot 1.0.64 discovers custom-agent definitions (markdown with frontmatter) from
 # four sources: <config home>/agents, the .github/agents and .claude/agents convention
@@ -100,8 +99,8 @@ _BUILTIN_MCP_SERVERS = ("github-mcp-server", "playwright", "bluebird",
 # config`) short-circuits the loader BEFORE the remote listing. Consequently the
 # harness neutralizes on disk what it can (isolation masks <home>/agents to an empty
 # dir and forces defaultLocalOnly into the sanitized config.json) and FAILS CLOSED in
-# _mcp_disable_args on what it can't: any discoverable local agent file, or a git-repo
-# cwd whose enumerable config does not provably opt out of remote discovery.
+# _mcp_disable_args on what it can't: any discoverable local agent file, and any run
+# whose enumerable config does not provably opt out of remote discovery.
 _WORKSPACE_AGENT_DIRS = (".github/agents", ".claude/agents")
 
 
@@ -143,88 +142,33 @@ def _agent_definition_files(root: str) -> list[str]:
     return sorted(out)
 
 
-# How long the harness waits for the child-context `git rev-parse` probe below.
-# Discovery is a handful of stats; anything slower is a sick git (network-mounted
-# cwd, a hung credential helper) and times out into the "unknowable" branch.
-_GIT_DISCOVERY_TIMEOUT_S = 10.0
-
-# Repository state as GIT ITSELF resolves it, not as a marker-file heuristic guesses.
-# _GIT_UNKNOWN is the fail-closed answer: the harness could not get an authoritative
-# reading, so no boundary may be trusted.
-_GIT_UNKNOWN = "unknown"
-_GIT_NO_REPO = "no-repo"
-_GIT_REPO = "repo"
-
-
-def _child_git_root(cwd: str,
-                    env_map: Mapping[str, str]) -> tuple[str, Optional[str]]:
-    """Run copilot's OWN repo probe — ``git rev-parse --show-toplevel``, in the child's
-    cwd with the child's environment — and report ``(state, root)``:
-
-    * ``(_GIT_UNKNOWN, None)`` — git could not be run, timed out, or failed for a
-      reason other than "no repository" (a broken install, ``GIT_DIR`` pointing at a
-      bare repo, ``safe.directory`` refusal). Nothing about the run is provable;
-      callers must treat a repo as possible and its boundary as nonexistent.
-    * ``(_GIT_NO_REPO, None)`` — git proved there is no repository here, so copilot
-      takes its repo-less path (no remote agent listing; the convention walk stops at
-      the child's OS home).
-    * ``(_GIT_REPO, root)`` — the symlink-resolved work-tree root copilot will use.
-
-    Asking git is the ONLY way to get this right. A ``.git``-marker walk mis-answers in
-    both directions: an empty or partial ``.git/`` is not a repository (git walks past
-    it to the real parent repo, so stopping there misses the parent's agent dirs), a
-    ``.git`` FILE may be a dangling gitlink, ``GIT_DIR``/``GIT_WORK_TREE``/
-    ``GIT_COMMON_DIR`` — including the present-but-EMPTY spellings, which SUPPRESS
-    discovery — move or abolish the root outright, and ``GIT_CEILING_DIRECTORIES``
-    hides a lexical parent repo. Running the real thing with the real env reproduces
-    every one of those rules by construction.
-
-    Only the message locale is pinned (``LC_ALL=C``/``LANGUAGE=``) so the "no
-    repository" reading is a stable string; locale does not affect discovery."""
-    probe_env = dict(env_map)
-    probe_env["LC_ALL"] = "C"
-    probe_env["LANGUAGE"] = ""
-    try:
-        proc = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                              cwd=cwd, env=probe_env, capture_output=True,
-                              text=True, timeout=_GIT_DISCOVERY_TIMEOUT_S)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return (_GIT_UNKNOWN, None)
-    if proc.returncode == 0:
-        top = (proc.stdout or "").strip()
-        if not top:
-            return (_GIT_UNKNOWN, None)
-        try:
-            return (_GIT_REPO, os.path.realpath(top))
-        except OSError:
-            return (_GIT_UNKNOWN, None)
-    # Non-zero: only git's own "not a git repository" wording proves absence. Every
-    # other failure (dubious ownership, a GIT_DIR that is bare, a broken install)
-    # leaves the question open and must not license a boundary.
-    if "not a git repository" in (proc.stderr or "").lower():
-        return (_GIT_NO_REPO, None)
-    return (_GIT_UNKNOWN, None)
-
-
 def _child_os_home(env_map: Mapping[str, str]) -> Optional[str]:
-    """The boundary copilot's convention-dir walk stops at for a REPO-LESS run — Node's
-    ``os.homedir()`` (``$HOME`` on POSIX, ``%USERPROFILE%`` on win32), which copilot
-    passes RAW to its convention-dir collector — or None when that value cannot be
-    proven equivalent to a physical ancestor of the walk. None → the walk runs to the
-    filesystem root (over-approximation, the safe direction).
+    """The boundary copilot's convention-dir walk stops at — Node's ``os.homedir()``
+    (``$HOME`` on POSIX, ``%USERPROFILE%`` on win32), which copilot passes RAW to its
+    convention-dir collector — or None when that value cannot be proven to name the
+    same directory the walk compares against. None → the walk runs to the filesystem
+    root (over-approximation, the safe direction).
+
+    This is a PURE function of the child's environment: no second process, nothing that
+    could answer the harness and copilot differently (see _custom_agent_files).
 
     The value is usable as a boundary only when it is set, non-empty, absolute, and
-    already canonical:
+    spelled EXACTLY as ``realpath`` renders it — the same canonical form the walk's
+    ``realpath``/``dirname`` chain produces:
 
     * UNSET → Node falls back to an OS lookup (``getpwuid`` / ``GetUserProfileDirectory``)
-      that the harness cannot mirror from the child's env alone.
+      the harness cannot mirror from the child's env alone.
     * present but EMPTY → libuv's ``uv_os_getenv`` returns it verbatim; ``os.homedir()``
       is ``""``, which matches no ancestor, so copilot walks to the root. Substituting
-      the account home (the old behaviour) would stop the harness EARLY of copilot.
+      the account home would stop the harness EARLY of copilot.
     * RELATIVE → likewise never matches an absolute ancestor; copilot walks to the root.
-    * non-CANONICAL (``realpath`` differs, e.g. a symlinked home) → copilot compares its
-      raw value while this walk is over physical paths, so the two can never be shown to
-      stop in the same place.
+    * any other spelling — a TRAILING SEPARATOR (``/home/u/``), a symlinked path, a
+      differing case — → Node keeps it verbatim and copilot's collector then fails to
+      match its own walk and climbs PAST the home, so the harness must not stop there
+      either. Comparing against ``realpath`` (not ``normpath``, which silently eats the
+      trailing separator) is what makes the trailing-slash spelling fail closed; a
+      filesystem root such as ``/`` or ``C:\\`` survives because ``realpath`` returns it
+      with its separator intact.
 
     Every rejected case yields None, i.e. a walk at least as wide as copilot's — which
     is also why plain ``os.path.isabs`` is good enough here despite the win32 UNC quirk
@@ -237,38 +181,38 @@ def _child_os_home(env_map: Mapping[str, str]) -> Optional[str]:
         real = os.path.realpath(h)
     except OSError:
         return None
-    return real if real == os.path.normpath(h) else None
+    return real if real == h else None
 
 
-def _custom_agent_files(home: str, cwd: Optional[str], env_map: Mapping[str, str],
-                        git: Optional[tuple[str, Optional[str]]] = None) -> list[str]:
+def _custom_agent_files(home: str, cwd: Optional[str],
+                        env_map: Mapping[str, str]) -> list[str]:
     """Every LOCAL custom-agent definition file discoverable for a run:
     ``<home>/agents`` plus the ``.github/agents`` / ``.claude/agents`` convention
-    dirs of the PHYSICAL run cwd and its ancestors up to copilot's own walk boundary.
+    dirs of the PHYSICAL run cwd (``os.path.realpath`` — a cwd symlinked into a tree
+    finds the dirs copilot's own physical walk would) and its ancestors, stopping at
+    the child's OS home (inclusive) when — and only when — ``_child_os_home`` can prove
+    that value names the same directory the walk compares against. Otherwise the walk
+    runs to the filesystem root.
 
-    The boundary is taken from git itself (``_child_git_root`` — the same
-    ``git rev-parse --show-toplevel`` probe copilot runs, in the child's context), never
-    from a ``.git``-marker guess: the repo root (inclusive) for a repo run, the child's
-    OS home (inclusive, and only when provably equivalent — ``_child_os_home``) for a
-    proven repo-less run, and NO boundary at all when git's answer is unknowable — the
-    walk then runs to the filesystem root. The cwd is symlink-resolved
-    (``os.path.realpath``) so a cwd symlinked into a repo subtree finds the agent dirs
-    git and copilot would.
+    That home bound is the ONLY narrowing applied, and it is deliberately the only one
+    that CAN be: it is computed from the child's environment alone. copilot's real walk
+    also stops at the git root when the cwd is in a repository, but the harness must not
+    use that. Learning it means EXECUTING git, and copilot executes git AGAIN when it
+    launches — two independent executions that a stateful or slow wrapper, a different
+    resolved binary, or a differing timeout can answer differently. Narrowing a security
+    scan on the first execution's answer would let copilot walk FARTHER than the harness
+    looked and start local agent MCP servers the harness never saw. This is exactly the
+    two-execution gap the Windows ODR gate refuses to bet on (_assert_odr_gate_off), and
+    it gets the same answer here: don't bet. Skipping the git bound only ever WIDENS the
+    scan — copilot's git root, when there is one, lies at or below the point this walk
+    reaches — so the result is a superset of what copilot reads in every case.
 
-    Unlike the workspace MCP-config walk — where an over-approximation just adds
-    harmless disables — agent detection FAILS runs closed, so bounding at copilot's real
-    boundary instead of always over-walking to the filesystem root keeps a
-    ``.claude/agents`` ABOVE the repo or the home — which copilot never reads — from
-    killing otherwise-valid runs. Every uncertainty still resolves toward the wider
-    walk. ``git`` is ``_child_git_root``'s answer when the caller already has one (one
-    probe per invocation); it is computed here otherwise."""
-    boundary: Optional[str] = None
-    if cwd:
-        state, root = git if git is not None else _child_git_root(cwd, env_map)
-        if state == _GIT_REPO:
-            boundary = root
-        elif state == _GIT_NO_REPO:
-            boundary = _child_os_home(env_map)
+    Unlike the workspace MCP-config walk — where an over-approximation just adds harmless
+    disables — agent detection FAILS runs closed, which is why the home bound is worth
+    proving: it keeps a ``.claude/agents`` ABOVE the child's home, which copilot never
+    reads, from killing otherwise-valid runs. Every uncertainty still resolves toward the
+    wider walk."""
+    boundary = _child_os_home(env_map)
     dirs = [os.path.join(home, "agents")]
     if cwd:
         d = os.path.realpath(cwd)
@@ -994,11 +938,14 @@ class CopilotAdapter(Adapter):
         Plugin-declared servers can't be enumerated here (their names live inside each
         plugin's definition); those are covered by the installed-plugins isolation mask
         and remain a documented gap for non-isolated runs. Custom-agent servers can't
-        be DISABLED here at all — a selected agent's mcp-servers start outside the
-        --disable-mcp-server set (module comment) — so any discoverable local agent
-        file, and a git-repo cwd whose config doesn't provably opt out of remote agent
+        be disabled here at all: startServerOnce would honor the disable set, but their
+        NAMES are unenumerable — local frontmatter plus REMOTE org/enterprise listings
+        the harness cannot read (module comment) — so any discoverable local agent
+        file, and any run whose config doesn't provably opt out of remote agent
         discovery (customAgents.defaultLocalOnly — injected into the sanitized
-        config.json, so masked-home runs pass), fail closed instead. On win32 the
+        config.json, so masked-home runs pass), fail closed instead. The opt-out is
+        required unconditionally rather than only for a git-repo cwd: deciding that
+        would take a git execution the harness cannot bind to copilot's own. On win32 the
         harness must itself be a 64-BIT process; a 32-bit one fails closed up front
         (WOW64 redirection — see the inline comment)."""
         # A 32-bit harness process on win32 shares neither filesystem nor default-
@@ -1020,47 +967,51 @@ class CopilotAdapter(Adapter):
             )
         env_map: Mapping[str, str] = env if env is not None else os.environ
         home = _copilot_home(env_map, cwd)
-        # Custom agents (module comment): their mcp-servers start OUTSIDE the
-        # --disable-mcp-server set and no flag disables agents, so presence of any
-        # LOCAL agent definition — or the possibility of a REMOTE org/enterprise
-        # listing (git-repo cwd, config not provably opted out) — fails closed
-        # before anything is enumerated.
-        git = _child_git_root(cwd, env_map) if cwd else (_GIT_NO_REPO, None)
-        agent_files = _custom_agent_files(home, cwd, env_map, git)
+        # Custom agents (module comment): the harness cannot enumerate their
+        # mcp-server names, so presence of any LOCAL agent definition — or the
+        # possibility of a REMOTE org/enterprise listing — fails closed before
+        # anything is enumerated.
+        agent_files = _custom_agent_files(home, cwd, env_map)
         if agent_files:
             shown = ", ".join(agent_files[:4]) + (", ..." if len(agent_files) > 4
                                                   else "")
             raise RuntimeError(
                 f"custom-agent definition file(s) [{shown}] are discoverable by "
                 "copilot (under <config home>/agents, or a .github/agents / "
-                ".claude/agents dir on the walk from the run cwd up to the repo root "
-                "git reports — the child's OS home for a repo-less run): agent "
-                "frontmatter can declare mcp-servers whose names the harness can't "
-                "enumerate (local frontmatter plus unreadable REMOTE org/enterprise "
-                "listings), so it has nothing reliable to add to --disable-mcp-server "
-                "even though copilot's startServerOnce would honor that set, with no "
-                "flag to disable custom agents — MCP hermeticity can't be enforced; "
-                "failing closed. Remove or relocate the agent files for harness "
-                "runs (isolation already masks <home>/agents to an empty dir)."
+                ".claude/agents dir on the walk from the run cwd up to the child's "
+                "OS home): agent frontmatter can declare mcp-servers whose names the "
+                "harness can't enumerate (local frontmatter plus unreadable REMOTE "
+                "org/enterprise listings), so it has nothing reliable to add to "
+                "--disable-mcp-server even though copilot's startServerOnce would "
+                "honor that set, with no flag to disable custom agents — MCP "
+                "hermeticity can't be enforced; failing closed. Remove or relocate "
+                "the agent files for harness runs (isolation already masks "
+                "<home>/agents to an empty dir)."
             )
-        # A repo cwd is what unlocks the REMOTE org/enterprise listing. Only git's own
-        # proof of absence (_GIT_NO_REPO) clears this gate; an unknowable answer is
-        # treated as a repo, like every other uncertainty here.
-        if (cwd and git[0] != _GIT_NO_REPO
-                and not _remote_agents_opted_out(home)):
+        # The REMOTE org/enterprise listing is unlocked by a git-repo cwd — but whether
+        # THIS cwd is one is not a question the harness may answer for itself. Finding
+        # out means executing git, and copilot executes git again at launch: two
+        # independent executions a stateful wrapper, a slow one, or a differently
+        # resolved binary can answer differently, and the answer here would CLEAR a
+        # security gate. Same two-execution gap as the Windows ODR command, same
+        # verdict (_assert_odr_gate_off): don't bet on it. The opt-out is therefore
+        # required UNCONDITIONALLY — it is a fact the harness reads directly out of the
+        # config copilot will read, and it is what actually disables the listing.
+        if not _remote_agents_opted_out(home):
             raise RuntimeError(
-                f"the run cwd {cwd!r} sits inside a git repository, or git could not "
-                "prove it does not (`git rev-parse --show-toplevel` in the child's "
-                "context), and the config copilot will read does not set "
+                "the config copilot will read does not set "
                 "customAgents.defaultLocalOnly: for a GitHub-remoted repo with "
                 "auth, copilot lists org/enterprise custom agents remotely, and "
-                "those can carry mcp-servers that start OUTSIDE the "
-                "--disable-mcp-server set (1.0.64 bundle) with no flag to disable "
-                "the listing — MCP hermeticity can't be verified; failing closed. "
-                "Isolated runs get the opt-out injected into the sanitized "
-                'config.json automatically; for a non-isolated run set '
-                '{"customAgents": {"defaultLocalOnly": true}} in the real '
-                "config.json."
+                "those can carry mcp-servers whose names the harness cannot "
+                "enumerate (1.0.64 bundle) with no flag to disable the listing — MCP "
+                "hermeticity can't be verified; failing closed. The opt-out is "
+                "required for every run, not just an in-repo one: proving this cwd is "
+                "outside a repository would mean running git here while copilot runs "
+                "it again at launch, and two independent executions can disagree — a "
+                "gap no cwd/env matching closes. Isolated runs get the opt-out "
+                "injected into the sanitized config.json automatically; for a "
+                'non-isolated run set {"customAgents": {"defaultLocalOnly": true}} '
+                "in the real config.json."
             )
         # Built-in / feature-gated in-process servers are seeded unconditionally:
         # --disable-builtin-mcps documents only github-mcp-server in 1.0.64, while
@@ -1135,7 +1086,8 @@ class CopilotAdapter(Adapter):
         # extra_args ride at the END of argv (below), appended verbatim — a
         # configuration-channel token there would inject MCP servers or reroute
         # config discovery AFTER _mcp_disable_args computed its disable set (see
-        # _CONFIG_CHANNEL_LONG/_SHORT). Standard runner cells never populate
+        # _CONFIG_CHANNEL_LONG and the combined-short-cluster rule in
+        # _config_channel_token). Standard runner cells never populate
         # extra_args; a programmatic caller passing one of these fails closed here
         # (exec.execute() records a failed run), checked FIRST so a doomed
         # invocation never spends the enumeration.
@@ -1144,11 +1096,13 @@ class CopilotAdapter(Adapter):
             raise RuntimeError(
                 f"extra_args token {bad!r} opens a copilot configuration channel "
                 "(--additional-mcp-config injects MCP servers past the disable "
-                "set, --agent selects a custom agent whose mcp-servers start "
-                "outside it, --plugin-dir loads plugin-declared servers, "
-                "--config-dir repoints the enumerated config home, -C moves "
-                "discovery to another cwd) — the run would not be provably "
-                "MCP-hermetic; failing closed."
+                "set, --agent selects a custom agent whose mcp-server NAMES the "
+                "harness cannot enumerate, --plugin-dir loads plugin-declared "
+                "servers, --config-dir repoints the enumerated config home, "
+                "--prefer-version runs a different cached CLI build than the 1.0.64 "
+                "this enumeration is built on, -C moves discovery to another cwd — "
+                "the last also in combined short clusters like -sC/tmp) — the run "
+                "would not be provably MCP-hermetic; failing closed."
             )
         argv = [self.binary, "-p", prompt, *self._HERMETIC,
                 *self._mcp_disable_args(cwd, env=opts.effective_env),
