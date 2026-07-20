@@ -138,6 +138,19 @@ def execute(
         tail = _tail(stderr) or _tail(stdout) or "(no stderr)"
         rr.error = f"{adapter.binary} exited with code {code}: {tail}"
 
+    # build_argv decided hermeticity by READING state the child then read again for
+    # itself; the launch window sits between those two reads, and the child runs code
+    # inside it (copilot execs `git rev-parse` before it globs custom-agent dirs). So the
+    # state is re-read now that the child is gone, and an adapter that finds it moved
+    # fails the run — see Adapter.verify_post_run. Detection, not prevention: a server
+    # started inside the window already ran. It is appended, never substituted, so a
+    # timeout or a nonzero exit keeps its own diagnosis alongside.
+    try:
+        adapter.verify_post_run(argv, opts, cwd=cwd)
+    except Exception as exc:
+        rr.error = ((rr.error + "; " if rr.error else "")
+                    + f"MCP hermeticity was not confirmed after the run: {exc}")
+
     return ExecResult(rr, stdout, stderr)
 
 

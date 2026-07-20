@@ -123,6 +123,45 @@ def _cop_child_env(**over):
     return dict(over)
 
 
+# Monkeypatches installed on IMPORTED modules, newest last, as (module, attr, original).
+# The suite patches adapter internals to drive checks that can't be driven any other way
+# (scoping the agent scan to fixture roots, stubbing the Windows ODR registry reader), and
+# those patches span hundreds of checks — far too wide to wrap each in its own try/finally
+# without burying the checks in indentation. So each install registers its undo here and
+# run_selftest restores whatever is left in ONE outer finally: a check that raises can no
+# longer leave a stub bolted onto an adapter, which in an embedding process (the suite is
+# importable, not just a CLI entry point) would silently weaken every later adapter call.
+# The inline restores stay where the patch's real scope ends and deregister as they go, so
+# on the happy path the net has nothing left to do.
+_MODULE_PATCHES: list[tuple] = []
+
+
+def _patch_module_attr(mod, name, value):
+    """Set ``mod.name = value``, register the undo on _MODULE_PATCHES, and return the
+    original for an inline restore."""
+    orig = getattr(mod, name)
+    _MODULE_PATCHES.append((mod, name, orig))
+    setattr(mod, name, value)
+    return orig
+
+
+def _unpatch_module_attr(mod, name, orig):
+    """Restore ``mod.name`` and drop its entry from the net (most recent first)."""
+    setattr(mod, name, orig)
+    for i in range(len(_MODULE_PATCHES) - 1, -1, -1):
+        if _MODULE_PATCHES[i][0] is mod and _MODULE_PATCHES[i][1] == name:
+            del _MODULE_PATCHES[i]
+            break
+
+
+def _restore_module_patches():
+    """Undo every still-installed patch, newest first. A no-op once the inline restores
+    have run; the safety net when an exception skipped them."""
+    while _MODULE_PATCHES:
+        mod, name, orig = _MODULE_PATCHES.pop()
+        setattr(mod, name, orig)
+
+
 def _cop_scope_agent_scan(roots):
     """Scope copilot's custom-agent FILE scan to ``roots``; returns the original function
     so the caller can restore it in a ``finally``. ``roots`` is read at CALL time, so a
@@ -149,14 +188,13 @@ def _cop_scope_agent_scan(roots):
             return orig(d)
         return []
 
-    _m._agent_definition_files = scoped
-    return orig
+    return _patch_module_attr(_m, "_agent_definition_files", scoped)
 
 
 def _cop_restore_agent_scan(orig):
     """Undo _cop_scope_agent_scan."""
     import agentskill_evals.adapters.copilot as _m
-    _m._agent_definition_files = orig
+    _unpatch_module_attr(_m, "_agent_definition_files", orig)
 
 
 def _cop_private_fixture(prefix: str):
@@ -1440,6 +1478,41 @@ def _check_mcp_hermetic_paths(failures, verbose):
            f"an argv-construction failure becomes a failed run (nothing executed): "
            f"{ex_closed.result.error!r}", failures, verbose)
 
+    # build_argv reads the state that decides hermeticity BEFORE launch; the child reads
+    # it again AFTER, and runs code in between (copilot execs git before globbing its
+    # agent dirs). Nothing can make that window empty — the discovery paths climb to `/`
+    # and the config home belongs to the child — so execute() re-checks once the child is
+    # gone and an adapter that finds the state moved fails the run. The default hook has
+    # no preflight state to re-check and stays a no-op.
+    class _LateLeakCli(Adapter):
+        name = "lateleak"
+        binary = sys.executable
+
+        def build_argv(self, prompt, opts, *, cwd):
+            return [sys.executable, "-c", "pass"]
+
+        def parse(self, stdout, stderr, exit_code, *, opts=None):
+            return ParseOutput()
+
+        def verify_post_run(self, argv, opts, *, cwd):
+            raise RuntimeError("late.md appeared during the launch window")
+
+    ex_late = _execute(_LateLeakCli(), "p", RunOptions(), cwd="/tmp", timeout=60)
+    _check("mcp_exec.post_run_leak_fails_the_run",
+           ex_late.result.exit_code == 0
+           and "hermeticity was not confirmed after the run"
+               in (ex_late.result.error or "")
+           and "late.md" in (ex_late.result.error or ""),
+           f"a clean-exiting run whose hermeticity premise broke during launch is "
+           f"still FAILED (detection, not prevention): {ex_late.result.error!r}",
+           failures, verbose)
+    _check("mcp_exec.post_run_default_is_noop",
+           Adapter.verify_post_run(spy, ["x"], RunOptions(), cwd="/tmp") is None
+           and not (_execute(spy, "p", RunOptions(), cwd="/tmp", timeout=5)
+                    .result.error or "").startswith("MCP hermeticity"),
+           "an adapter with no preflight state to re-check is unaffected by the "
+           "post-run hook", failures, verbose)
+
     # On Windows process.env is case-insensitive, so a scenario `env: {copilot_home: ...}`
     # that dodges isolation's case-sensitive COPILOT_HOME pop would still be read by the
     # child as COPILOT_HOME — an isolation escape. execute() folds keys to a single
@@ -2331,8 +2404,8 @@ def _check_reasoning_effort(failures, verbose):
     import agentskill_evals.adapters.copilot as _cop_mod_eff
     _cop_wow64 = sys.platform == "win32" and sys.maxsize <= 2**32
     _cop_eff_priv, _cop_eff_cwd, _cop_env = _cop_private_fixture("ase-copeff-")
-    _odr_real_eff = _cop_mod_eff._odr_registry_command
-    _cop_mod_eff._odr_registry_command = lambda: None
+    _odr_real_eff = _patch_module_attr(_cop_mod_eff, "_odr_registry_command",
+                                       lambda: None)
     # ...and scope the (unbounded) custom-agent walk to this fixture's own tree, so an
     # ambient agents dir in a shared ancestor can't fail these argv checks closed
     _defs_real_eff = _cop_scope_agent_scan([_cop_eff_priv])
@@ -2383,7 +2456,7 @@ def _check_reasoning_effort(failures, verbose):
                    f"{name} argv carries no effort token when unset: {plain}",
                    failures, verbose)
     finally:
-        _cop_mod_eff._odr_registry_command = _odr_real_eff
+        _unpatch_module_attr(_cop_mod_eff, "_odr_registry_command", _odr_real_eff)
         _cop_restore_agent_scan(_defs_real_eff)
         shutil.rmtree(_cop_eff_priv, ignore_errors=True)
 
@@ -2554,6 +2627,21 @@ def _check_api_compat(failures, verbose):
 
 
 def run_selftest(verbose: bool = False) -> int:
+    """Run the suite, then restore any adapter patch a raising check left installed.
+
+    The checks themselves live in _run_selftest_checks. This wrapper exists only so the
+    module-patch net (_MODULE_PATCHES) has ONE unconditional finally: the patches it
+    guards span most of the copilot section, and an exception escaping mid-section used
+    to leave e.g. a scoped _agent_definition_files bolted onto the adapter for the rest
+    of the process — harmless for the CLI, which exits, but this module is importable and
+    an embedding process would keep making adapter calls against the stub."""
+    try:
+        return _run_selftest_checks(verbose=verbose)
+    finally:
+        _restore_module_patches()
+
+
+def _run_selftest_checks(verbose: bool = False) -> int:
     failures: list[str] = []
 
     # cost_str formatting
@@ -2985,8 +3073,8 @@ def run_selftest(verbose: bool = False) -> int:
     # copilot.odr_gate_on_fails_closed), which would otherwise crash these checks.
     # Restored at the ODR-specific checks below.
     import agentskill_evals.adapters.copilot as copilot_mod
-    _odr_real_cop = copilot_mod._odr_registry_command
-    copilot_mod._odr_registry_command = lambda: None
+    _odr_real_cop = _patch_module_attr(copilot_mod, "_odr_registry_command",
+                                       lambda: None)
     if _cop_wow64:
         try:
             get_adapter("copilot").build_argv(
@@ -3567,7 +3655,27 @@ def run_selftest(verbose: bool = False) -> int:
             _hb_cop = os.path.join(_hb_home, ".copilot")
             os.makedirs(_hb_cwd)
             os.makedirs(_hb_cop)
-            os.makedirs(os.path.join(_hb_repo, ".git"))   # the repo copilot would find
+            # The repository whose root is copilot's boundary here. Nothing on the code
+            # path under test consults git — that is the whole point of the check — so
+            # the fixture only needs this GEOMETRY. Build a real repo anyway when a
+            # working git is available, so the fixture IS the scenario it describes
+            # rather than merely resembling it; an empty `.git` would not satisfy
+            # `git rev-parse` and must not be labelled as though it would. When git is
+            # missing or broken (the suite never depends on it) an inert marker dir
+            # stands in and the check runs identically.
+            _hb_git_env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
+                           "GIT_CONFIG_SYSTEM": os.devnull}
+            _hb_real_repo = False
+            if _sh.which("git"):
+                try:
+                    _hb_real_repo = (_sp.run(["git", "init", "-q", _hb_repo],
+                                             capture_output=True, env=_hb_git_env,
+                                             timeout=60).returncode == 0
+                                     and os.path.isdir(os.path.join(_hb_repo, ".git")))
+                except (OSError, ValueError, _sp.SubprocessError):
+                    _hb_real_repo = False
+            if not _hb_real_repo:      # synthetic stand-in: geometry only
+                os.makedirs(os.path.join(_hb_repo, ".git"), exist_ok=True)
             with open(os.path.join(_hb_cop, "config.json"), "w") as fh:
                 fh.write('{"customAgents": {"defaultLocalOnly": true}}')
 
@@ -3617,6 +3725,76 @@ def run_selftest(verbose: bool = False) -> int:
                    verbose)
         finally:
             _sh.rmtree(_hb_root, ignore_errors=True)
+
+    # The launch window. _mcp_disable_args reads the agent dirs and MCP configs before
+    # launch; copilot reads them again for itself at startup, and execs `git rev-parse`
+    # (child PATH) for its convention-dir boundary BEFORE it globs the agent dirs.
+    # Whatever answers for git there can plant an agent file or a config entry that
+    # copilot then discovers and the disable set never named. Neither closing move
+    # exists: the discovery paths are every ancestor up to `/` plus a config home the
+    # child owns and can rewrite (isolation's empty agents/ mask included — same uid),
+    # and copilot's git can't be bound to a binary the harness trusts more, because the
+    # harness would resolve the same PATH to find one. So it is DETECTED instead:
+    # verify_post_run re-runs the enumeration after the child exits and fails the run if
+    # the answer moved. Re-executing the scan is sound in this direction only — it can
+    # add failures, never clear a gate (contrast the git preflight this branch refuses).
+    if not _cop_wow64:
+        _pr_root = os.path.realpath(_tmp.mkdtemp(prefix="ase-coppr-"))
+        _cop_scan_roots.append(_pr_root)
+        try:
+            _pr_cwd = os.path.join(_pr_root, "ws")
+            _pr_cop = os.path.join(_pr_root, ".copilot")
+            os.makedirs(_pr_cwd)
+            os.makedirs(_pr_cop)
+            _pr_cfg = os.path.join(_pr_cop, "mcp-config.json")
+            with open(os.path.join(_pr_cop, "config.json"), "w") as fh:
+                fh.write('{"customAgents": {"defaultLocalOnly": true}}')
+            with open(_pr_cfg, "w") as fh:
+                fh.write('{"mcpServers": {"early": {"command": "x"}}}')
+            _pr_env = _cop_child_env(COPILOT_HOME=_pr_cop, HOME=_pr_root,
+                                     USERPROFILE=_pr_root)
+            _pr_opts = RunOptions(effective_env=_pr_env)
+            _pr_cop_ad = get_adapter("copilot")
+            _pr_argv = _pr_cop_ad.build_argv("p", _pr_opts, cwd=_pr_cwd)
+
+            def _pr_err():
+                try:
+                    return ("" if _pr_cop_ad.verify_post_run(
+                        _pr_argv, _pr_opts, cwd=_pr_cwd) is None else "returned")
+                except RuntimeError as exc:
+                    return str(exc)
+
+            # nothing moved: the re-check is a clean no-op, so the failures below are
+            # the planted state and not a re-check that fails on everything
+            pr_clean = _pr_err() == ""
+            # a server configured AFTER argv was built is not in the launched disable
+            # set — copilot loads its config at startup, inside the window
+            with open(_pr_cfg, "w") as fh:
+                fh.write('{"mcpServers": {"early": {"command": "x"},'
+                         ' "late": {"command": "y"}}}')
+            pr_late_server = _pr_err()
+            # ...and an agent file planted in the window fails closed the same way,
+            # through the enumeration's own agent gate (config restored first, so the
+            # server arm above can't be what fires here)
+            with open(_pr_cfg, "w") as fh:
+                fh.write('{"mcpServers": {"early": {"command": "x"}}}')
+            os.makedirs(os.path.join(_pr_cwd, ".github", "agents"))
+            open(os.path.join(_pr_cwd, ".github", "agents", "late.md"), "w").close()
+            pr_late_agent = _pr_err()
+            _check("copilot.post_run_recheck_catches_launch_window",
+                   pr_clean
+                   and "late" in pr_late_server
+                   and "not provably MCP-hermetic" in pr_late_server
+                   and "early" not in pr_late_server.split("are configured now")[0]
+                   and "late.md" in pr_late_agent
+                   and "no longer" in pr_late_agent,
+                   f"state that moves between argv construction and the child's own "
+                   f"read is caught after the run — a late server names itself, a late "
+                   f"agent file fails the re-check closed: "
+                   f"server={pr_late_server[:60]!r} agent={pr_late_agent[:60]!r}",
+                   failures, verbose)
+        finally:
+            _sh.rmtree(_pr_root, ignore_errors=True)
 
     # extra_args configuration channels fail closed (mirrors the codex vet): each
     # spelling raises BEFORE enumeration (proven by stubbing the enumerator to a
@@ -4037,7 +4215,7 @@ def run_selftest(verbose: bool = False) -> int:
     # themselves — restore the real registry reader now. (The agent-scan scope stays
     # installed: the ODR build arm below still runs a full _mcp_disable_args in the
     # private fixture, and the agent walk precedes the gate inside it.)
-    copilot_mod._odr_registry_command = _odr_real_cop
+    _unpatch_module_attr(copilot_mod, "_odr_registry_command", _odr_real_cop)
 
     _check("copilot.odr_gate_off_non_win32",
            sys.platform == "win32" or copilot_mod._odr_registry_command() is None,
@@ -4178,9 +4356,9 @@ def run_selftest(verbose: bool = False) -> int:
     # two-execution gap is exactly what this replaces.) _assert_odr_gate_off raises
     # directly, and the whole _mcp_disable_args build fails closed through it, so no
     # cell/probe/judge argv is produced with un-disabled ODR servers live.
-    _odr_saved_cmd = copilot_mod._odr_registry_command
+    _odr_saved_cmd = _patch_module_attr(copilot_mod, "_odr_registry_command",
+                                        lambda: "C:\\odr\\host.exe mcp-src")
     try:
-        copilot_mod._odr_registry_command = lambda: "C:\\odr\\host.exe mcp-src"
         try:
             get_adapter("copilot")._assert_odr_gate_off()
             odr_assert_closed = ""
@@ -4217,7 +4395,7 @@ def run_selftest(verbose: bool = False) -> int:
                "with no registry command the ODR gate is a no-op — nothing fails "
                "and enumeration proceeds on the non-ODR channels", failures, verbose)
     finally:
-        copilot_mod._odr_registry_command = _odr_saved_cmd
+        _unpatch_module_attr(copilot_mod, "_odr_registry_command", _odr_saved_cmd)
         _cop_restore_agent_scan(_defs_real_cop)     # last copilot argv check
         _sh.rmtree(_cop_priv, ignore_errors=True)   # private argv fixture
 

@@ -193,6 +193,20 @@ def _custom_agent_files(home: str, cwd: Optional[str]) -> list[str]:
     return files
 
 
+def _disabled_server_names(argv: list[str]) -> set[str]:
+    """The MCP server names an argv actually disables. Both spellings are read
+    (``--disable-mcp-server x`` and ``--disable-mcp-server=x``): the harness only emits
+    the two-token form, but this also parses argv it did not build (verify_post_run
+    re-reads the argv that was launched)."""
+    names: set[str] = set()
+    for i, tok in enumerate(argv):
+        if tok == "--disable-mcp-server" and i + 1 < len(argv):
+            names.add(argv[i + 1])
+        elif tok.startswith("--disable-mcp-server="):
+            names.add(tok.split("=", 1)[1])
+    return names
+
+
 def _jsonc_strip(text: str) -> str:
     """Reduce copilot's accepted JSONC to strict JSON: replace ``//`` line comments
     (full-line AND inline) and ``/* */`` block comments with a SINGLE SPACE, and drop
@@ -854,6 +868,11 @@ class CopilotAdapter(Adapter):
     # dir, the sanitized config.json gets customAgents.defaultLocalOnly forced (kills
     # remote agent discovery), and _mcp_disable_args fails closed on any local agent
     # file the masks can't reach (workspace convention dirs, non-isolated homes).
+    # Every one of those layers reads state BEFORE launch, while copilot reads it again
+    # for itself AFTER launch — and execs git in between. verify_post_run closes the
+    # report on that window by re-running the enumeration once the child has exited: it
+    # cannot stop a server that started, but a run that passes never had its premise
+    # broken underneath it.
     isolation_config_masks = {".copilot/mcp-config.json": '{"mcpServers": {}}',
                               ".copilot/installed-plugins": None,
                               ".copilot/agents": None,
@@ -1084,6 +1103,61 @@ class CopilotAdapter(Adapter):
             argv += ["--available-tools", ""]
         argv += opts.extra_args
         return argv
+
+    def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str) -> None:
+        """Re-run the enumeration ``argv`` was built from; fail the run if it moved.
+
+        _mcp_disable_args reads the agent dirs and MCP configs BEFORE launch; copilot
+        reads them again FOR ITSELF at startup. Between those two reads copilot runs
+        code: 1.0.64 execs ``git rev-parse`` (resolved on the CHILD's PATH) to pick its
+        convention-dir boundary, and only then globs the agent dirs and loads
+        mcp-config.json. Whatever answers for ``git`` there can create an agent file or
+        add a server entry in that window — copilot discovers it, and the disable set
+        computed a moment earlier does not name it.
+
+        Neither escape the reviewer's finding suggests is available. The discovery paths
+        cannot be made immutable: they are every ancestor of the cwd up to ``/`` plus a
+        config home the child owns (isolation masks ``<home>/agents`` to an empty dir,
+        but the child runs as the same uid and can write into it, and can chmod back
+        anything the harness locks). And copilot's git cannot be bound to a binary the
+        harness trusts, because the harness has no more trustworthy git to bind it to —
+        it would resolve the same PATH and get the same answer.
+
+        What is available is to READ AGAIN once the window has closed. A leak inside it
+        then costs a failed run instead of passing silently, which is the guarantee this
+        adapter can actually keep: not "no server ever started", but "no run reported
+        clean had its hermeticity premise broken". Re-executing the scan is sound in the
+        direction it is used — unlike the git preflight this branch refuses (which would
+        CLEAR a gate on the first of two executions), a second scan can only ADD
+        failures, never bless a run.
+
+        The whole enumeration is re-run, not just the agent scan: the same window is
+        open on mcp-config.json and the workspace configs, where a late entry is a
+        directly-named server the launched argv never disabled.
+
+        Known false positive: an eval whose own task writes a custom-agent definition
+        into the workspace tree fails here. That file appeared after copilot's glob and
+        so never loaded — but the harness cannot date it against a glob it did not
+        observe, and this scan errs toward the loud answer like every other one on this
+        path. Relocate such fixtures outside the discovery tree.
+        """
+        try:
+            after = _disabled_server_names(
+                self._mcp_disable_args(cwd, env=opts.effective_env))
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "the invocation was built while MCP hermeticity was enforceable, but "
+                f"re-checking after the run it no longer is: {exc}"
+            ) from None
+        new = sorted(after - _disabled_server_names(argv))
+        if new:
+            raise RuntimeError(
+                f"MCP server(s) {', '.join(new)} are configured now but were not when "
+                "the invocation was built, so the launched --disable-mcp-server set "
+                "does not name them: copilot reads its config at startup, after it "
+                "execs git for its agent-dir boundary, so a server added in that "
+                "window loads un-disabled. This run is not provably MCP-hermetic."
+            )
 
     def parse(self, stdout: str, stderr: str, exit_code: int,
                *, opts: Optional[RunOptions] = None) -> ParseOutput:

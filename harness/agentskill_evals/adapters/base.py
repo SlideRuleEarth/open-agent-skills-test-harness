@@ -279,6 +279,21 @@ class Adapter(ABC):
         """
         raise NotImplementedError
 
+    def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str) -> None:
+        """Re-assert, after the child has exited, the premise ``argv`` was built on.
+
+        ``build_argv`` reads filesystem state — config files, agent definitions — to
+        decide what the invocation must disable. The child reads that same state AGAIN
+        when it launches, and the two reads are separated by the launch window. An
+        adapter whose hermeticity rests on the first read re-runs it here and raises if
+        the answer moved; exec.execute() turns the raise into a failed run.
+
+        This is DETECTION, not prevention: it cannot un-start a server the child already
+        launched. What it buys is that a leak inside that window becomes a loud failure
+        instead of a silently-passing run. Default: no preflight state to re-check.
+        """
+        return None
+
     def env(self, base_env: dict[str, str], opts: RunOptions) -> dict[str, str]:
         """Mutate/extend the subprocess environment.
 
