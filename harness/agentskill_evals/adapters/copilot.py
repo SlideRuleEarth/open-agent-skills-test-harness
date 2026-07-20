@@ -88,10 +88,12 @@ _BUILTIN_MCP_SERVERS = ("github-mcp-server", "playwright", "bluebird",
 # are collected by a recursive **/*.md glob (symlinks followed, dot-entries skipped),
 # and both local frontmatter (`mcp-servers`) and remote listing entries can declare MCP
 # servers (all read out of the 1.0.64 bundle: the custom-agents loader and its remote
-# branch). Crucially, a selected agent's servers are started per name by the session's
-# initializeMcpHost via mcpHost.startServer(name, config) WITHOUT consulting the
-# disabledMcpServers set (that set only filters the base config's startServers), so
-# disabling by name cannot cover this channel — and no flag disables custom agents
+# branch). copilot's startServerOnce DOES consult the session disabledMcpServers set,
+# but the harness can't populate it for this channel: the agent-declared server NAMES
+# live inside agent frontmatter and — worse — inside REMOTE org/enterprise listings the
+# harness cannot read at all, so it has nothing reliable to add to --disable-mcp-server
+# (parsing local frontmatter would still miss every remote entry). Disabling by name
+# therefore cannot cover this channel — and no flag disables custom agents
 # (--no-custom-instructions does not; verified against 1.0.64 --help). What does exist:
 # the documented config setting `customAgents.defaultLocalOnly` (see `copilot help
 # config`) short-circuits the loader BEFORE the remote listing. Consequently the
@@ -153,20 +155,54 @@ def _git_env_repo(env_map: Mapping[str, str]) -> bool:
     return any(env_map.get(v) for v in _GIT_ENV_VARS)
 
 
+def _is_git_root(d: str) -> bool:
+    """True when git would treat ``d`` as a repository root — the semantics copilot's
+    ``git rev-parse`` uses, not a bare "a ``.git`` name exists" test:
+
+    * ``d/.git`` is a FILE → a gitlink/worktree pointer (``gitdir: ...``); git treats
+      ``d`` as a work tree. Counted (even a bogus pointer is git's to reject, and the
+      fail-closed direction is safe).
+    * ``d/.git`` is a DIRECTORY → a real repo only if it has a ``HEAD`` (git always
+      writes one). An EMPTY or partial ``.git/`` is NOT a repository — git ignores it
+      and keeps walking UP to the real parent repo — so counting it would stop the
+      walk early and MISS what copilot reads above it. HEAD-gated to match git.
+    """
+    dotgit = os.path.join(d, ".git")
+    if os.path.isfile(dotgit):
+        return True
+    return os.path.isdir(dotgit) and os.path.isfile(os.path.join(dotgit, "HEAD"))
+
+
+def _child_os_home(env_map: Mapping[str, str]) -> Optional[str]:
+    """The child's OS home directory, realpath-resolved, or None when unknowable —
+    the boundary copilot's convention-dir walk stops at for a REPO-LESS run (Node's
+    ``os.homedir()``: ``$HOME`` on POSIX, ``%USERPROFILE%`` on win32; an empty value
+    falls back to the account home, i.e. ``expanduser('~')``). None → the walk runs to
+    the filesystem root (over-approximation, the safe direction)."""
+    key = "USERPROFILE" if sys.platform == "win32" else "HOME"
+    h = env_map.get(key) or os.path.expanduser("~")
+    if not h or h == "~":
+        return None
+    try:
+        return os.path.realpath(h)
+    except OSError:
+        return None
+
+
 def _nearest_git_root(cwd: str) -> Optional[str]:
-    """The first ancestor of ``cwd`` (inclusive) containing a ``.git`` entry — dir
-    or file (worktrees use a file) — or None. A conservative approximation of what
-    copilot actually does (it runs ``git rev-parse --show-toplevel`` in the child
-    context): the harness counts ANY ``.git`` entry, valid repository or not,
-    because replicating git's own discovery provably — config include directives,
-    worktree/commondir indirection, ceiling dirs — isn't feasible, and the error
-    direction is safe: a ``.git`` entry git would reject only makes the harness
-    fail closed where copilot would have found no repo (loading nothing remote).
-    The inverse direction — a repo git finds that no ``.git`` entry reveals — is
-    covered by ``_git_env_repo`` (GIT_DIR & co in the child env)."""
-    d = os.path.abspath(cwd)
+    """The first ancestor of the PHYSICAL ``cwd`` (inclusive) that git would treat as a
+    repository root (see ``_is_git_root``), or None. copilot resolves its repo with
+    ``git rev-parse --show-toplevel`` in the child context, which operates on the
+    symlink-resolved path and applies git's own root semantics — so this walks
+    ``os.path.realpath(cwd)`` (a cwd symlinked into a repo subtree finds the physical
+    repo's ``.git``, which an ``abspath`` lexical walk would miss) and HEAD-gates ``.git``
+    dirs (an empty nested ``.git/`` is not a boundary; git walks past it). The residual
+    approximation is safe in the fail-closed direction, and the inverse — a repo git
+    finds via ``GIT_DIR`` & co that no ``.git`` entry reveals — is covered by
+    ``_git_env_repo``."""
+    d = os.path.realpath(cwd)
     while True:
-        if os.path.exists(os.path.join(d, ".git")):
+        if _is_git_root(d):
             return d
         parent = os.path.dirname(d)
         if parent == d:
@@ -178,24 +214,27 @@ def _custom_agent_files(home: str, cwd: Optional[str],
                         env_map: Mapping[str, str]) -> list[str]:
     """Every LOCAL custom-agent definition file discoverable for a run:
     ``<home>/agents`` plus the ``.github/agents`` / ``.claude/agents`` convention
-    dirs of the run cwd and its ancestors up to the nearest git root (inclusive) —
-    copilot's own walk boundary. Without a git root every ancestor is checked (the
-    bundle's boundary resolution for repo-less dirs isn't provable, so the walk is
-    conservative there), and likewise when the child env redirects git discovery
-    (``_git_env_repo``) — the real boundary is then wherever ``git rev-parse``
-    lands, unknowable here. Unlike the workspace MCP-config walk — where an
-    over-approximation just adds harmless disables — agent detection FAILS runs
-    closed, so this walk mirrors copilot's boundary instead of over-walking to the
-    filesystem root (a ~/.claude/agents outside the repo must not kill in-repo
-    runs copilot would never read it for)."""
+    dirs of the PHYSICAL run cwd and its ancestors up to copilot's own walk boundary —
+    the nearest git root (inclusive), or, for a repo-less run, the child's OS home
+    (inclusive). The cwd is symlink-resolved (``os.path.realpath``) so a cwd symlinked
+    into a repo subtree finds the agent dirs git/copilot would; the git boundary is
+    HEAD-gated (``_is_git_root`` — an empty nested ``.git/`` is NOT a boundary, git
+    walks past it). Only when the child env redirects git discovery
+    (``_git_env_repo`` — GIT_DIR & co) is the real boundary unknowable; the walk then
+    runs to the filesystem root (conservative). Unlike the workspace MCP-config walk —
+    where an over-approximation just adds harmless disables — agent detection FAILS
+    runs closed, so bounding at copilot's boundary (git root / home) instead of always
+    over-walking to the filesystem root keeps a ``.claude/agents`` ABOVE the repo or
+    the home — which copilot never reads — from killing otherwise-valid runs."""
     boundary_unknown = _git_env_repo(env_map)
+    child_home = None if boundary_unknown else _child_os_home(env_map)
     dirs = [os.path.join(home, "agents")]
     if cwd:
-        d = os.path.abspath(cwd)
+        d = os.path.realpath(cwd)
         while True:
             for rel in _WORKSPACE_AGENT_DIRS:
                 dirs.append(os.path.join(d, *rel.split("/")))
-            if not boundary_unknown and os.path.exists(os.path.join(d, ".git")):
+            if not boundary_unknown and (_is_git_root(d) or d == child_home):
                 break
             parent = os.path.dirname(d)
             if parent == d:
@@ -208,14 +247,19 @@ def _custom_agent_files(home: str, cwd: Optional[str],
 
 
 def _jsonc_strip(text: str) -> str:
-    """Reduce copilot's accepted JSONC to strict JSON: remove ``//`` line comments
-    (full-line AND inline), ``/* */`` block comments, and trailing commas before a
-    closing ``}``/``]`` — all string-aware, so ``//`` or ``/*`` or ``,]`` INSIDE a
-    string value stays data. This is the grammar copilot 1.0.64 actually accepts,
-    live-verified via ``copilot mcp list`` against fixture configs: all three
-    comment styles and trailing commas parse; JSON5 forms (unquoted keys, single
-    quotes) do NOT — copilot errors out on them, so this transform deliberately
-    leaves them to fail json.loads."""
+    """Reduce copilot's accepted JSONC to strict JSON: replace ``//`` line comments
+    (full-line AND inline) and ``/* */`` block comments with a SINGLE SPACE, and drop
+    trailing commas before a closing ``}``/``]`` — all string-aware, so ``//`` or
+    ``/*`` or ``,]`` INSIDE a string value stays data. A comment becomes whitespace,
+    not nothing: it is a token separator, so ``tr/*x*/ue`` must NOT collapse into
+    ``true`` (copilot's parser reduces that malformed value to ``{}`` — reading it as
+    ``true`` here would let a comment fabricate an opt-out). An UNTERMINATED block
+    comment (no closing ``*/`` before EOF) raises ValueError, exactly as copilot's own
+    parser errors on it. This is the grammar copilot 1.0.64 actually accepts,
+    live-verified via ``copilot mcp list`` against fixture configs: all three comment
+    styles and trailing commas parse; JSON5 forms (unquoted keys, single quotes) do
+    NOT — copilot errors out on them, so this transform deliberately leaves them to
+    fail json.loads."""
     out: list[str] = []
     i, n = 0, len(text)
     in_str = False
@@ -239,12 +283,16 @@ def _jsonc_strip(text: str) -> str:
         if c == "/" and i + 1 < n and text[i + 1] == "/":
             while i < n and text[i] not in "\r\n":
                 i += 1
+            out.append(" ")          # comment → token-separating whitespace
             continue
         if c == "/" and i + 1 < n and text[i + 1] == "*":
             i += 2
             while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
                 i += 1
+            if i + 1 >= n:           # no closing */ before EOF
+                raise ValueError("unterminated block comment in JSONC")
             i += 2
+            out.append(" ")          # comment → token-separating whitespace
             continue
         if c == ",":
             # trailing comma iff only whitespace/comments sit between it and }/]
@@ -272,8 +320,13 @@ def _jsonc_strip(text: str) -> str:
 
 
 def _jsonc_loads(text: str) -> Any:
-    """json.loads over copilot-compatible JSONC (see _jsonc_strip). Raises
-    ValueError exactly where copilot's own parser errors out."""
+    """json.loads over copilot-compatible JSONC (see _jsonc_strip). A single leading
+    UTF-8 BOM is consumed first — copilot accepts a BOM-prefixed config while
+    ``json.loads`` rejects one, so a valid BOM-prefixed mcp-config.json / config.json
+    must not fail closed (or, for config.json, discard auth). Raises ValueError
+    exactly where copilot's own parser errors out."""
+    if text[:1] == chr(0xFEFF):     # one leading UTF-8 BOM
+        text = text[1:]
     return json.loads(_jsonc_strip(text))
 
 
@@ -307,27 +360,38 @@ def _remote_agents_opted_out(home: str) -> bool:
 
 # extra_args tokens that reopen MCP/configuration channels after the disable set is
 # computed (all verified against the installed 1.0.64: --help lists the first three,
-# --config-dir is in the bundle but hidden from help): --additional-mcp-config merges
-# MORE servers into the session past the disable set; --agent selects a custom agent
-# whose frontmatter mcp-servers start OUTSIDE that set (see the custom-agents comment
-# above); --plugin-dir loads a plugin — whose definition can declare mcpServers — from
-# an arbitrary dir; --config-dir repoints the whole config home away from the one this
-# adapter enumerated; -C changes copilot's working directory BEFORE any discovery,
-# invalidating the cwd the workspace/agent walks used. Long forms match exact or
-# --flag=value; -C exact or with an attached value (-Cdir).
+# --config-dir and --prefer-version are in the bundle but hidden from help):
+# --additional-mcp-config merges MORE servers into the session past the disable set;
+# --agent selects a custom agent whose frontmatter mcp-servers start OUTSIDE that set
+# (see the custom-agents comment above); --plugin-dir loads a plugin — whose definition
+# can declare mcpServers — from an arbitrary dir; --config-dir repoints the whole config
+# home away from the one this adapter enumerated; --prefer-version can select a
+# DIFFERENT cached CLI version, past which the 1.0.64-specific safety assumptions this
+# adapter computed no longer hold; -C changes copilot's working directory BEFORE any
+# discovery, invalidating the cwd the workspace/agent walks used. Long forms match exact
+# or --flag=value; -C matches its own token AND any combined short-option cluster
+# carrying it (see _config_channel_token).
 _CONFIG_CHANNEL_LONG = ("--additional-mcp-config", "--agent", "--plugin-dir",
-                        "--config-dir")
-_CONFIG_CHANNEL_SHORT = ("-C",)
+                        "--config-dir", "--prefer-version")
 
 
 def _config_channel_token(extra_args: list[str]) -> Optional[str]:
     """The first extra_args token that opens a copilot configuration channel, or None.
     A token that merely LOOKS like one (e.g. a value following some unrelated flag) is
-    reported too — that false positive fails closed, the safe direction."""
+    reported too — that false positive fails closed, the safe direction.
+
+    The cwd flag ``-C`` is matched inside combined SHORT-option clusters, not only as a
+    leading ``-C``: copilot 1.0.64 accepts ``-sC/tmp`` (== ``-s -C /tmp``), where ``C``
+    consumes the rest as the new cwd, so a rule keyed on a leading ``-C`` would miss it
+    and let copilot change directory AFTER the workspace/agent walks ran. Any
+    single-dash token (not ``--`` long-opt, not a bare ``-``) containing ``C`` is
+    rejected; a stray ``C`` that is really a value character over-matches into a
+    fail-closed, the safe direction."""
     for tok in extra_args:
         if any(tok == f or tok.startswith(f + "=") for f in _CONFIG_CHANNEL_LONG):
             return tok
-        if any(tok.startswith(f) for f in _CONFIG_CHANNEL_SHORT):
+        if (tok.startswith("-") and not tok.startswith("--")
+                and len(tok) > 1 and "C" in tok[1:]):
             return tok
     return None
 
@@ -343,13 +407,15 @@ def _config_channel_token(extra_args: list[str]) -> Optional[str]:
 # names, but copilot runs the command a SECOND, independent time — a stateful or
 # time-varying command can hand the two processes different listings, leaving a server
 # enabled that the harness never saw, and no cwd/env/bitness matching closes that gap.
-# What remains is gate DETECTION, which must still be exact: the value is read with
-# copilot's KEY_READ|KEY_WOW64_64KEY access mask (the 64-bit registry view from any
-# harness bitness — a 32-bit default would read WOW6432Node, where an absent key would
-# fake the gate "off"), and blank-vs-populated is judged with the same ECMAScript
-# trim()+falsy test copilot applies. A 32-bit harness process still fails closed
-# outright in _mcp_disable_args (WOW64 file-system redirection desyncs everything
-# else it reads from 64-bit copilot's view).
+# What remains is gate DETECTION: the value is read with KEY_QUERY_VALUE|
+# KEY_WOW64_64KEY — the query-only access level copilot's RegGetValueW uses (NOT the
+# broader KEY_READ, which a query-only ACL would deny, making the harness reject a host
+# copilot reads fine) plus the 64-bit view flag matching copilot's read (a 32-bit
+# default would read WOW6432Node, where an absent key would fake the gate "off") — and
+# blank-vs-populated is judged with the same ECMAScript trim()+falsy test copilot
+# applies. A 32-bit harness process still fails closed outright in _mcp_disable_args
+# (WOW64 file-system redirection desyncs the config FILES it reads from 64-bit
+# copilot's view).
 _ODR_REGISTRY_SUBKEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Mcp"
 
 # ECMAScript whitespace — the exact set /\s/ tests AND String.prototype.trim() strips
@@ -376,19 +442,26 @@ def _odr_registry_command() -> Optional[str]:
     """The ODR command line from the registry, or None when the gate is off (non-win32,
     key/value absent). An unreadable key with the gate possibly on raises RuntimeError.
 
-    The key is opened with copilot's exact access mask — ``KEY_READ | KEY_WOW64_64KEY``,
-    read out of the 1.0.64 native helper — so this reads the 64-BIT registry view no
-    matter the harness's own bitness. A 32-bit process's DEFAULT view is the redirected
-    WOW6432Node one, where the key can be absent (the gate would read "off") while the
-    64-bit view copilot queries is populated; the explicit view flag removes that
-    divergence from the read itself (32-bit Windows, with its single view, ignores the
-    flag). Exercised cross-host in the selftest via a stubbed ``winreg``."""
+    The key is opened with ``KEY_QUERY_VALUE | KEY_WOW64_64KEY`` — the QUERY-ONLY
+    access level copilot's native helper uses (it calls ``RegGetValueW``, which opens
+    with ``KEY_QUERY_VALUE``), NOT the broader ``KEY_READ`` (which also demands
+    ENUMERATE_SUB_KEYS/NOTIFY/READ_CONTROL): a host whose ACL grants copilot query-only
+    access would make a ``KEY_READ`` open fail and the harness reject the host where
+    copilot reads the gate fine. The ``KEY_WOW64_64KEY`` view flag matches copilot's
+    64-bit-view read so this reads the 64-BIT registry view no matter the harness's own
+    bitness — a 32-bit process's DEFAULT view is the redirected WOW6432Node one, where
+    the key can be absent (the gate would read "off") while the 64-bit view copilot
+    queries is populated; 32-bit Windows, with its single view, ignores the flag.
+    (copilot's ``RegGetValueW`` also pins ``REG_SZ``/``REG_EXPAND_SZ`` with
+    no-expansion; ``QueryValueEx`` here does not auto-expand ``REG_EXPAND_SZ`` either,
+    so the raw value matches.) Exercised cross-host in the selftest via a stubbed
+    ``winreg``."""
     if sys.platform != "win32":
         return None
     import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _ODR_REGISTRY_SUBKEY, 0,
-                            winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+                            winreg.KEY_QUERY_VALUE | winreg.KEY_WOW64_64KEY) as key:
             value, _type = winreg.QueryValueEx(key, "Command")
     except FileNotFoundError:
         return None  # no key/value → copilot skips ODR entirely
@@ -399,9 +472,9 @@ def _odr_registry_command() -> Optional[str]:
         )
     # JS-trim, not str.strip(): the bundle does `value?.trim()` then a falsy test, so
     # a value of only U+FEFF reads as gate-OFF exactly as it does for copilot, while
-    # one of only U+001C (Python-blank, JS-nonblank) keeps the gate ON — copilot then
-    # fails to launch it and loads nothing; the harness fails closed downstream on the
-    # unqualified executable, the conservative side of the same no-servers outcome.
+    # one of only U+001C (Python-blank, JS-nonblank) keeps the gate ON — this returns
+    # that command and _assert_odr_gate_off then fails the run closed, the conservative
+    # side of the same no-servers outcome (copilot itself would fail to launch it).
     if not isinstance(value, str) or not _js_trim(value):
         return None  # empty command → copilot logs "command line not found" and skips
     return _js_trim(value)
@@ -410,12 +483,15 @@ def _odr_registry_command() -> Optional[str]:
 def _mcp_server_names(path: str) -> list[str]:
     """Server names declared in one WORKSPACE MCP config — ``{"mcpServers": {...}}``
     or the legacy ``{"servers": {...}}`` spelling. STRICT JSON on purpose:
-    workspace files do not get the user file's JSONC tolerance (live-verified
-    1.0.64 — a trailing comma makes ``copilot mcp list`` silently ignore the
-    workspace file), and an unreadable/invalid file → [] is exact parity with
-    copilot's own warn-and-treat-as-empty workspace loader."""
+    workspace files do not get the user file's JSONC (comment/trailing-comma)
+    tolerance (live-verified 1.0.64 — a trailing comma makes ``copilot mcp list``
+    silently ignore the workspace file), and an unreadable/invalid file → [] is exact
+    parity with copilot's own warn-and-treat-as-empty workspace loader. Read with
+    ``utf-8-sig`` so a leading BOM is consumed rather than failing the parse — a
+    BOM-prefixed workspace file left unparsed would MISS its servers (over-enumeration
+    here is harmless, under-enumeration leaks)."""
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
     except (OSError, ValueError):
         return []
@@ -886,19 +962,20 @@ class CopilotAdapter(Adapter):
         (WOW64 redirection — see the inline comment)."""
         # A 32-bit harness process on win32 shares neither filesystem nor default-
         # registry views with copilot's 64-bit process: the WOW64 redirector remaps
-        # C:\Windows\System32 (file reads AND the ODR command launch) to SysWOW64, and
-        # the default registry view to WOW6432Node. The registry READ is pinned to the
-        # 64-bit view (KEY_WOW64_64KEY — _odr_registry_command), but launches and file
-        # reads have no such per-call escape, so nothing enumerated below would be
-        # provably what copilot sees — fail closed before enumerating anything.
+        # C:\Windows\System32 file reads to SysWOW64, and the default registry view to
+        # WOW6432Node. The registry READ is pinned to the 64-bit view (KEY_WOW64_64KEY
+        # — _odr_registry_command), but the config FILES this method reads have no such
+        # per-call escape, so nothing enumerated below would be provably what copilot
+        # sees — fail closed before enumerating anything. (The ODR command is copilot's
+        # to launch, not the harness's; the harness only reads the gate value.)
         if sys.platform == "win32" and sys.maxsize <= 2**32:
             raise RuntimeError(
                 "the harness is running as a 32-bit process on win32: WOW64 "
                 "redirection gives it different filesystem (System32 → SysWOW64) and "
-                "default-registry views than copilot's 64-bit process, so the configs "
-                "it reads and the ODR registry command it launches are not provably "
-                "the ones copilot sees — MCP hermeticity can't be verified; failing "
-                "closed. Run the harness under a 64-bit Python."
+                "default-registry views than copilot's 64-bit process, so the config "
+                "files it reads are not provably the ones copilot sees — MCP "
+                "hermeticity can't be verified; failing closed. Run the harness under "
+                "a 64-bit Python."
             )
         env_map: Mapping[str, str] = env if env is not None else os.environ
         home = _copilot_home(env_map, cwd)
@@ -915,10 +992,10 @@ class CopilotAdapter(Adapter):
                 f"custom-agent definition file(s) [{shown}] are discoverable by "
                 "copilot (under <config home>/agents, or a .github/agents / "
                 ".claude/agents dir between the run cwd and its git root): agent "
-                "frontmatter can declare mcp-servers, and a selected agent's "
-                "servers are started per name OUTSIDE the --disable-mcp-server set "
-                "(1.0.64 bundle: initializeMcpHost calls mcpHost.startServer for "
-                "each agent server without consulting disabledMcpServers), with no "
+                "frontmatter can declare mcp-servers whose names the harness can't "
+                "enumerate (local frontmatter plus unreadable REMOTE org/enterprise "
+                "listings), so it has nothing reliable to add to --disable-mcp-server "
+                "even though copilot's startServerOnce would honor that set, with no "
                 "flag to disable custom agents — MCP hermeticity can't be enforced; "
                 "failing closed. Remove or relocate the agent files for harness "
                 "runs (isolation already masks <home>/agents to an empty dir)."
@@ -948,8 +1025,8 @@ class CopilotAdapter(Adapter):
         names = list(_BUILTIN_MCP_SERVERS)
         names.extend(_user_mcp_server_names(os.path.join(home, "mcp-config.json")))
         if cwd:
-            d = os.path.abspath(cwd)
-            while True:
+            d = os.path.realpath(cwd)   # physical path: a symlinked cwd resolves to the
+            while True:                 # real repo tree copilot's discovery walks
                 for rel in _WORKSPACE_MCP_FILES:
                     names.extend(_mcp_server_names(os.path.join(d, *rel.split("/"))))
                 parent = os.path.dirname(d)

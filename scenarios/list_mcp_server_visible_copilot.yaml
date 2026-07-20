@@ -1,0 +1,29 @@
+# list_mcp_server_visible_copilot.yaml — hermeticity check: with MCP off, the agent
+# must see NO MCP servers. One runner per file (a `target:` pins a single runner).
+# Run:  agentskill-evals run --config scenarios/list_mcp_server_visible_copilot.yaml
+# Dry:  agentskill-evals run --config scenarios/list_mcp_server_visible_copilot.yaml --dry-run
+
+name: list_mcp_server_visible_copilot
+description: >
+  Hermeticity check for the copilot runner: ask the agent to list visible MCP servers;
+  a hermetic (MCP-off) run must report none.
+
+target:
+  runner: copilot
+  model:
+    - claude-haiku-4.5
+
+skills:
+
+assertions:
+  - { type: no_error }
+
+# The judge rejects a leak: a hermetic run exposes no MCP servers, so any server the
+# agent reports visible is a hermeticity failure. `no_error` alone cannot catch this.
+rubric:
+  - The response reports that NO MCP servers are visible or available to the agent (naming any specific MCP server is a failure).
+
+judge: true
+
+prompt: |
+  List any skills and any MCP servers that are visible to you.  If you don't see any, say so.

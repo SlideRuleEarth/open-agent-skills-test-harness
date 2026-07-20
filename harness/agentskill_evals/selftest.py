@@ -3166,6 +3166,57 @@ def run_selftest(verbose: bool = False) -> int:
             _sh.rmtree(_jc_home, ignore_errors=True)
             _sh.rmtree(_jc_ws, ignore_errors=True)
 
+    # JSONC grammar edges that must fail the SAFE way (copilot_mod pure helpers):
+    #  - a comment is TOKEN-SEPARATING whitespace, not deletion: `tr/*x*/ue` must NOT
+    #    collapse to `true` (copilot reduces that malformed config to {}). Reading it as
+    #    `true` would let a comment FABRICATE customAgents.defaultLocalOnly and green-
+    #    light a repo run whose remote-agent listing is still live.
+    #  - an UNTERMINATED block comment raises (copilot's parser errors too).
+    #  - a leading UTF-8 BOM is consumed (copilot accepts a BOM-prefixed config; strict
+    #    json.loads rejects one — failing a valid mcp-config.json closed, or dropping
+    #    auth from a BOM-prefixed config.json).
+    _bom = chr(0xFEFF)
+
+    def _jsonc_raises(s):
+        try:
+            copilot_mod._jsonc_loads(s)
+            return False
+        except ValueError:
+            return True
+
+    jsonc_comment_ws = _jsonc_raises('{"customAgents":{"defaultLocalOnly":tr/*x*/ue}}')
+    jsonc_unterminated = (_jsonc_raises('{"a": 1 /* no close')
+                          and _jsonc_raises('{"a": 1 /* no close *'))
+    jsonc_bom_ok = (copilot_mod._jsonc_loads(_bom + '{"a": 1}') == {"a": 1}
+                    and copilot_mod._jsonc_loads(_bom + '// c\n{"a": 2}') == {"a": 2})
+    _optdir = _tmp.mkdtemp(prefix="ase-copopt-")
+    try:
+        # the security payoff: the comment-glued opt-out must NOT read as opted-out...
+        with open(os.path.join(_optdir, "config.json"), "w") as fh:
+            fh.write('{"customAgents":{"defaultLocalOnly":tr/*x*/ue}}')
+        opt_not_fabricated = copilot_mod._remote_agents_opted_out(_optdir) is False
+        # ...while a genuine BOM-prefixed opt-out still does
+        with open(os.path.join(_optdir, "config.json"), "w", encoding="utf-8") as fh:
+            fh.write(_bom + '{"customAgents": {"defaultLocalOnly": true}}')
+        opt_bom_ok = copilot_mod._remote_agents_opted_out(_optdir) is True
+        # a BOM-prefixed WORKSPACE file (strict JSON) still enumerates its servers —
+        # utf-8-sig consumes the BOM; leaving it would MISS the server (a leak)
+        with open(os.path.join(_optdir, ".mcp.json"), "w", encoding="utf-8") as fh:
+            fh.write(_bom + '{"mcpServers": {"ws-bom": {"command": "true"}}}')
+        ws_bom_ok = "ws-bom" in copilot_mod._mcp_server_names(
+            os.path.join(_optdir, ".mcp.json"))
+    finally:
+        _sh.rmtree(_optdir, ignore_errors=True)
+    _check("copilot.jsonc_grammar_edges",
+           jsonc_comment_ws and jsonc_unterminated and jsonc_bom_ok
+           and opt_not_fabricated and opt_bom_ok and ws_bom_ok,
+           "JSONC comments are token-separating whitespace (tr/*x*/ue does NOT become "
+           "true, so a comment can't fabricate customAgents.defaultLocalOnly — the "
+           "opt-out reads False), an unterminated block comment raises, and a leading "
+           "UTF-8 BOM is consumed for user JSONC (a BOM-prefixed opt-out still reads "
+           "True) and strict workspace files (BOM-prefixed servers still enumerated)",
+           failures, verbose)
+
     # Custom agents are an MCP channel --disable-mcp-server does NOT reach: a selected
     # agent's frontmatter mcp-servers are started per name by initializeMcpHost without
     # consulting disabledMcpServers, and no flag disables custom agents (1.0.64 bundle).
@@ -3218,8 +3269,11 @@ def run_selftest(verbose: bool = False) -> int:
 
             # remote agents: a git-repo cwd requires the defaultLocalOnly opt-out —
             # and the walk must stop at the git root exactly as copilot's does (an
-            # agent file ABOVE it is not copilot's to discover).
+            # agent file ABOVE it is not copilot's to discover). The .git dir needs a
+            # HEAD to count as a repo root (git ignores an empty .git/, so does the
+            # harness — see copilot.git_root_semantics below).
             os.makedirs(os.path.join(_ag_repo, ".git"))
+            open(os.path.join(_ag_repo, ".git", "HEAD"), "w").close()
             os.makedirs(os.path.join(_ag_dir, ".claude", "agents"))
             open(os.path.join(_ag_dir, ".claude", "agents", "above.md"), "w").close()
             with open(os.path.join(_ag_home, "config.json"), "w") as fh:
@@ -3269,6 +3323,95 @@ def run_selftest(verbose: bool = False) -> int:
         finally:
             _sh.rmtree(_ag_dir, ignore_errors=True)
 
+    # git-root SEMANTICS + physical cwd: copilot resolves its repo with `git rev-parse`,
+    # which (a) operates on the symlink-resolved path and (b) ignores a HEADless .git/,
+    # walking up to the real parent repo. A lexical abspath walk that treats ANY .git
+    # entry as a boundary stops early at an empty nested .git/ (MISSING agent files
+    # copilot reads above it) and never resolves a symlinked cwd into the physical repo
+    # (finding neither its .git nor its agent/MCP files) — both under-detections.
+    if not _cop_wow64:
+        _gs_root = _tmp.mkdtemp(prefix="ase-copgs-")
+        try:
+            _gs_home = os.path.join(_gs_root, "home")
+            os.makedirs(_gs_home)
+            _gs_env = {"COPILOT_HOME": _gs_home}
+
+            def _gs_err(cwd):
+                try:
+                    get_adapter("copilot").build_argv(
+                        "p", RunOptions(effective_env=_gs_env), cwd=cwd)
+                    return ""
+                except RuntimeError as exc:
+                    return str(exc)
+
+            # real repo root (HEAD) with an agent dir just under it; cwd is a subdir
+            # holding an EMPTY nested .git/ (no HEAD) — git walks through it to the root.
+            _gs_repo = os.path.join(_gs_root, "repo")
+            _gs_sub = os.path.join(_gs_repo, "sub")
+            os.makedirs(os.path.join(_gs_repo, ".git"))
+            open(os.path.join(_gs_repo, ".git", "HEAD"), "w").close()
+            os.makedirs(os.path.join(_gs_repo, ".github", "agents"))
+            open(os.path.join(_gs_repo, ".github", "agents", "mid.md"), "w").close()
+            os.makedirs(os.path.join(_gs_sub, ".git"))         # EMPTY nested .git/
+            empty_git_walks_through = "custom-agent" in _gs_err(_gs_sub)
+            # a cwd SYMLINKED into the repo subtree must resolve to the physical path
+            _gs_link = os.path.join(_gs_root, "link")
+            os.symlink(_gs_sub, _gs_link)
+            symlink_resolves = "custom-agent" in _gs_err(_gs_link)
+            # and the empty .git alone (agent file removed) is NOT a repo boundary — the
+            # remote-agents gate stays OFF, so a repo-less clean build succeeds
+            os.remove(os.path.join(_gs_repo, ".github", "agents", "mid.md"))
+            _gs_lone = os.path.join(_gs_root, "lone", "sub")
+            os.makedirs(os.path.join(_gs_lone, ".git"))        # empty .git/, no HEAD above
+            empty_git_not_repo = _gs_err(_gs_lone) == ""
+            _check("copilot.git_root_semantics",
+                   empty_git_walks_through and symlink_resolves and empty_git_not_repo,
+                   "an empty nested .git/ is not a boundary (the walk continues to the "
+                   "real HEAD-bearing parent repo and finds its agent files) nor a repo "
+                   "on its own (the remote-agents gate stays off), and a cwd symlinked "
+                   "into a repo subtree resolves to the physical path where git/copilot "
+                   "discover the same .git and agent files", failures, verbose)
+        finally:
+            _sh.rmtree(_gs_root, ignore_errors=True)
+
+    # repo-less convention-dir walk BOUNDARY: copilot stops at the child's OS home, so
+    # an unrelated .github/agents / .claude/agents ABOVE home must not fail an otherwise
+    # valid run (a HOME-anchored bound, not a walk to the filesystem root).
+    if not _cop_wow64:
+        _hb_root = _tmp.mkdtemp(prefix="ase-cophb-")
+        try:
+            _hb_home = os.path.join(_hb_root, "home")
+            _hb_cwd = os.path.join(_hb_home, "proj", "ws")
+            _hb_cop = os.path.join(_hb_home, ".copilot")
+            os.makedirs(_hb_cwd)
+            os.makedirs(_hb_cop)
+            _hb_env = {"HOME": _hb_home, "USERPROFILE": _hb_home,
+                       "COPILOT_HOME": _hb_cop}
+
+            def _hb_err(cwd):
+                try:
+                    get_adapter("copilot").build_argv(
+                        "p", RunOptions(effective_env=_hb_env), cwd=cwd)
+                    return ""
+                except RuntimeError as exc:
+                    return str(exc)
+
+            # agent dir ABOVE home (in _hb_root) — copilot never walks past home → clean
+            os.makedirs(os.path.join(_hb_root, ".claude", "agents"))
+            open(os.path.join(_hb_root, ".claude", "agents", "above_home.md"), "w").close()
+            hb_above_home_clean = _hb_err(_hb_cwd) == ""
+            # agent dir AT home is within the walk (inclusive) → fails closed
+            os.makedirs(os.path.join(_hb_home, ".github", "agents"))
+            open(os.path.join(_hb_home, ".github", "agents", "at_home.md"), "w").close()
+            hb_at_home_closed = "custom-agent" in _hb_err(_hb_cwd)
+            _check("copilot.repoless_agent_walk_home_boundary",
+                   hb_above_home_clean and hb_at_home_closed,
+                   "a repo-less run bounds the convention-dir walk at the child's OS "
+                   "home (copilot's boundary): an agent dir ABOVE home doesn't fail the "
+                   "run, one AT home does", failures, verbose)
+        finally:
+            _sh.rmtree(_hb_root, ignore_errors=True)
+
     # extra_args configuration channels fail closed (mirrors the codex vet): each
     # spelling raises BEFORE enumeration (proven by stubbing the enumerator to a
     # sentinel), neutral tokens reach enumeration untouched. Arch-independent — the
@@ -3287,7 +3430,14 @@ def run_selftest(verbose: bool = False) -> int:
                         ["--agent", "helper"], ["--agent=helper"],
                         ["--plugin-dir", "/x/plug"], ["--plugin-dir=/x/plug"],
                         ["--config-dir", "/x/cfg"], ["--config-dir=/x/cfg"],
-                        ["-C", "/elsewhere"], ["-C/elsewhere"]):
+                        # hidden --prefer-version selects a DIFFERENT cached CLI version,
+                        # past which the 1.0.64-specific assumptions no longer hold
+                        ["--prefer-version", "1.0.63"], ["--prefer-version=1.0.63"],
+                        # -C plus COMBINED short-option clusters carrying it: copilot
+                        # accepts -sC/tmp (== -s -C /tmp), which a leading-'-C' rule
+                        # would miss
+                        ["-C", "/elsewhere"], ["-C/elsewhere"],
+                        ["-sC/tmp"], ["-abC/tmp"]):
             try:
                 get_adapter("copilot").build_argv(
                     "p", RunOptions(extra_args=_extras), cwd="/tmp")
@@ -3295,22 +3445,26 @@ def run_selftest(verbose: bool = False) -> int:
             except RuntimeError as exc:
                 if "configuration channel" not in str(exc):
                     _cop_leaked.append(_extras)      # raised, but not by the vet
-        try:
-            get_adapter("copilot").build_argv(
-                "p", RunOptions(extra_args=["--banner"]), cwd="/tmp")
-            _cop_neutral = "enumeration-skipped"     # sentinel must have fired
-        except AssertionError:
-            _cop_neutral = "vet-passed"
-        except RuntimeError:
-            _cop_neutral = "vetoed"
+        # a short cluster WITHOUT the cwd flag is neutral and must reach enumeration
+        _cop_neutral = None
+        for _neutral in (["--banner"], ["-vs"]):
+            try:
+                get_adapter("copilot").build_argv(
+                    "p", RunOptions(extra_args=_neutral), cwd="/tmp")
+                _cop_neutral = "enumeration-skipped"     # sentinel must have fired
+            except AssertionError:
+                _cop_neutral = _cop_neutral or "vet-passed"
+            except RuntimeError:
+                _cop_neutral = "vetoed"
     finally:
         _CopAd._mcp_disable_args = _orig_cop_disable
     _check("copilot.extra_args_config_channels_fail_closed",
            not _cop_leaked and _cop_neutral == "vet-passed",
            f"config-channel extra_args (--additional-mcp-config/--agent/--plugin-dir/"
-           f"--config-dir, =value and attached -C forms) raise before enumeration; "
-           f"neutral tokens reach it: leaked={_cop_leaked}, neutral={_cop_neutral}",
-           failures, verbose)
+           f"--config-dir/--prefer-version, =value forms, and -C in attached AND "
+           f"combined short-cluster forms like -sC/tmp) raise before enumeration; "
+           f"neutral tokens incl. C-free short clusters reach it: leaked={_cop_leaked}, "
+           f"neutral={_cop_neutral}", failures, verbose)
 
     # Windows ODR registry gate (design §2): copilot discovers MCP servers via a
     # registry-advertised command's `mcp list` output. The harness does NOT
@@ -3682,16 +3836,20 @@ def run_selftest(verbose: bool = False) -> int:
            "off Windows the ODR gate reports no command (no registry to read)",
            failures, verbose)
 
-    # The ODR registry read must pin the 64-BIT view: copilot 1.0.64's native helper
-    # opens the key with KEY_READ | KEY_WOW64_64KEY, while a 32-bit process's DEFAULT
-    # view is the redirected WOW6432Node one — there the key can be absent (the gate
-    # would read "off") while copilot's 64-bit view is populated. No Windows CI, so
+    # The ODR registry read must pin the 64-BIT view AND request only query access:
+    # copilot 1.0.64's native helper calls RegGetValueW (opens with KEY_QUERY_VALUE)
+    # with the 64-bit-view flag, so the harness uses KEY_QUERY_VALUE | KEY_WOW64_64KEY —
+    # NOT the broader KEY_READ (a query-only ACL would deny KEY_READ and make the harness
+    # reject a host copilot reads fine). A 32-bit process's DEFAULT view is the redirected
+    # WOW6432Node one — there the key can be absent (the gate would read "off") while
+    # copilot's 64-bit view is populated. No Windows CI, so
     # `winreg` is stubbed into sys.modules (the function imports it lazily) and the
     # module-local `sys` shimmed to win32; the stub records the access mask OpenKey
     # receives and drives the blank-value/absent/denied arms too.
     _fake_winreg = type(sys)("winreg")   # a real module object, no importlib involved
     _fake_winreg.HKEY_LOCAL_MACHINE = object()
     _fake_winreg.KEY_READ = 0x20019          # the real winreg constants
+    _fake_winreg.KEY_QUERY_VALUE = 0x0001    # query-only — what copilot's RegGetValueW uses
     _fake_winreg.KEY_WOW64_64KEY = 0x0100
     _fake_winreg._value = "  C:\\odr\\host.exe mcp-src  "
     _fake_winreg._raise = None
@@ -3759,22 +3917,25 @@ def run_selftest(verbose: bool = False) -> int:
            and all(root is _fake_winreg.HKEY_LOCAL_MACHINE
                    and sub == copilot_mod._ODR_REGISTRY_SUBKEY
                    and reserved == 0
-                   and access == (_fake_winreg.KEY_READ
+                   and access == (_fake_winreg.KEY_QUERY_VALUE
                                   | _fake_winreg.KEY_WOW64_64KEY)
                    for root, sub, reserved, access in _reg_calls),
-           "the ODR registry key is opened with copilot 1.0.64's exact access mask — "
-           "KEY_READ | KEY_WOW64_64KEY, the 64-bit view from any harness bitness, "
-           "never the WOW6432Node default a 32-bit process would read (where an "
-           "absent key would fake the gate 'off'); a missing key or blank/JS-blank "
-           "(U+FEFF) value still reads as gate-off, a BOM-wrapped command JS-trims "
-           "clean, and an unreadable key fails closed (stubbed winreg + sys shim)",
+           "the ODR registry key is opened with KEY_QUERY_VALUE | KEY_WOW64_64KEY — the "
+           "query-only access copilot's RegGetValueW uses (never the broader KEY_READ, "
+           "which a query-only ACL would deny, making the harness reject a host copilot "
+           "reads fine) plus the 64-bit view from any harness bitness (never the "
+           "WOW6432Node default a 32-bit process would read, where an absent key would "
+           "fake the gate 'off'); a missing key or blank/JS-blank (U+FEFF) value still "
+           "reads as gate-off, a BOM-wrapped command JS-trims clean, and an unreadable "
+           "key fails closed (stubbed winreg + sys shim)",
            failures, verbose)
 
     # A 32-bit harness process on win32 can't prove MCP hermeticity at all — the WOW64
-    # file-system redirector remaps System32 (the ODR command launch included) to
-    # SysWOW64, so what it reads and launches is not what 64-bit copilot sees. The
-    # gate must fire FIRST: env={} would raise the absent-USERPROFILE error later if
-    # it were mis-ordered. Cross-host via a shim whose maxsize reads 32-bit.
+    # file-system redirector remaps System32 config-file reads to SysWOW64, so the
+    # files it reads are not what 64-bit copilot sees (the ODR command is copilot's to
+    # launch, not the harness's). The bitness check must fire FIRST: env={} would raise
+    # the absent-USERPROFILE error later if it were mis-ordered. Cross-host via a shim
+    # whose maxsize reads 32-bit.
     _real_sys32 = copilot_mod.sys
 
     class _Win32Sys32Bit:
