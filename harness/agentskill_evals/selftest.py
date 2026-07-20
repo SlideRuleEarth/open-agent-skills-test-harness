@@ -116,6 +116,75 @@ def _flag_pair(argv, flag, value) -> bool:
                for i, a in enumerate(argv))
 
 
+def _git_available() -> bool:
+    """True when a usable ``git`` is on PATH. The copilot adapter resolves a run's repo
+    by running copilot's OWN probe (``git rev-parse --show-toplevel``), so the checks
+    that exercise repo boundaries need the real binary; they are skipped without it."""
+    import subprocess
+    try:
+        return subprocess.run(["git", "--version"], capture_output=True,
+                              timeout=30).returncode == 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def _git_init(path: str) -> bool:
+    """Create a REAL repository at ``path``. Fixtures cannot fake one with a hand-made
+    ``.git/`` any more: the adapter asks git itself, and git rejects a directory whose
+    ``.git`` lacks a valid HEAD/objects/refs — walking PAST it to the true parent repo.
+    Global/system config is neutralized so a developer's gitconfig can't alter the
+    result."""
+    import os
+    import subprocess
+    env = {"PATH": os.environ.get("PATH", os.defpath),
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    try:
+        return subprocess.run(["git", "init", "-q", path], capture_output=True,
+                              env=env, timeout=60).returncode == 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def _cop_child_env(**over):
+    """A child env for copilot build_argv fixtures: ``PATH`` (the adapter runs copilot's
+    own child-context ``git rev-parse`` probe, and every real run's env carries PATH)
+    plus whatever the caller pins on top."""
+    import os
+    env = {"PATH": os.environ.get("PATH", os.defpath)}
+    env.update(over)
+    return env
+
+
+def _cop_private_fixture(prefix: str):
+    """``(root, cwd, env)`` for copilot argv fixtures that must not depend on ANYTHING
+    ambient. copilot's custom-agent discovery walks ``.github/agents`` / ``.claude/agents``
+    from the run cwd upward to the child's OS home, so a fixture that runs in a SHARED
+    cwd (``/tmp``) with an UNPINNED home lets a stray ``$TMPDIR/.claude/agents`` or
+    ``~/.claude/agents`` on the developer's machine fail the run closed and crash the
+    suite. This pins all three ends of that walk:
+
+    * ``cwd`` is a freshly created private directory,
+    * ``HOME``/``USERPROFILE`` is its (realpath-resolved, so it compares equal to the
+      physical walk) private parent — the walk therefore covers exactly two empty dirs,
+    * ``COPILOT_HOME`` is a private config home carrying only the
+      ``customAgents.defaultLocalOnly`` opt-out the isolation sanitizer injects, so the
+      remote-agents gate is satisfied without reading this machine's real ~/.copilot.
+
+    ``PATH`` rides along because the adapter runs copilot's child-context
+    ``git rev-parse`` probe; a real run's env always has it."""
+    import os
+    import tempfile as _t
+    root = os.path.realpath(_t.mkdtemp(prefix=prefix))
+    cwd = os.path.join(root, "ws")
+    chome = os.path.join(root, "copilot-home")
+    os.makedirs(cwd)
+    os.makedirs(chome)
+    with open(os.path.join(chome, "config.json"), "w") as fh:
+        fh.write('{"customAgents": {"defaultLocalOnly": true}}')
+    env = _cop_child_env(COPILOT_HOME=chome, HOME=root, USERPROFILE=root)
+    return root, cwd, env
+
+
 def _check_isolation(failures, verbose):
     """Validate the HOME overlay: declared skills present, undeclared masked, vendor kept,
     auth/config passed through, missing ancestors built, plugin-registry skills masked
@@ -2259,8 +2328,7 @@ def _check_reasoning_effort(failures, verbose):
     # (where every copilot argv fails closed by design) can still run them.
     import agentskill_evals.adapters.copilot as _cop_mod_eff
     _cop_wow64 = sys.platform == "win32" and sys.maxsize <= 2**32
-    _cop_env = {"COPILOT_HOME": os.path.join(tempfile.gettempdir(),
-                                             "ase-no-such-copilot-home")}
+    _cop_eff_priv, _cop_eff_cwd, _cop_env = _cop_private_fixture("ase-copeff-")
     _odr_real_eff = _cop_mod_eff._odr_registry_command
     _cop_mod_eff._odr_registry_command = lambda: None
 
@@ -2280,7 +2348,7 @@ def _check_reasoning_effort(failures, verbose):
         if not _cop_wow64:
             argv = get_adapter("copilot").build_argv(
                 "p", RunOptions(reasoning_effort="medium", effective_env=_cop_env),
-                cwd="/tmp")
+                cwd=_cop_eff_cwd)
             _check("effort.copilot_flag",
                    "--reasoning-effort" in argv
                    and argv[argv.index("--reasoning-effort") + 1] == "medium",
@@ -2303,13 +2371,15 @@ def _check_reasoning_effort(failures, verbose):
         for name in ("claude", "codex") if _cop_wow64 else ("claude", "codex", "copilot"):
             opts = (RunOptions(effective_env=_cop_env) if name == "copilot"
                     else RunOptions())
-            plain = get_adapter(name).build_argv("p", opts, cwd="/tmp")
+            plain = get_adapter(name).build_argv(
+                "p", opts, cwd=_cop_eff_cwd if name == "copilot" else "/tmp")
             _check(f"effort.{name}_absent_when_unset",
                    not any("effort" in a for a in plain),
                    f"{name} argv carries no effort token when unset: {plain}",
                    failures, verbose)
     finally:
         _cop_mod_eff._odr_registry_command = _odr_real_eff
+        shutil.rmtree(_cop_eff_priv, ignore_errors=True)
 
     # --- spec load: normalization + typed validation ---
     s = _spec_from_raw({"prompt": "p", "reasoning_effort": " HIGH "}, "/x.yaml")
@@ -2874,12 +2944,14 @@ def run_selftest(verbose: bool = False) -> int:
     # A REAL 32-bit win32 harness fails every copilot _mcp_disable_args call closed
     # by design (the WOW64 gate, asserted below via a shim AND — on such a host —
     # natively here). The positive argv/enumeration checks in this section can't run
-    # there: they get architecture-aware skips instead of crashing the suite. The
-    # argv-shape calls also pin COPILOT_HOME to a nonexistent dir so they never
-    # read — or fail closed on — this machine's real ~/.copilot (config, agents).
+    # there: they get architecture-aware skips instead of crashing the suite. Every
+    # argv-shape call runs in a PRIVATE fixture (_cop_private_fixture: private cwd,
+    # pinned HOME/USERPROFILE, private COPILOT_HOME) so none of them reads this
+    # machine's real ~/.copilot or lets an ambient agents dir above a shared cwd
+    # decide the result.
     _cop_wow64 = sys.platform == "win32" and sys.maxsize <= 2**32
-    _cop_env = {"COPILOT_HOME": os.path.join(_tmp.gettempdir(),
-                                             "ase-no-such-copilot-home")}
+    _cop_git = _git_available()
+    _cop_priv, _cop_cwd, _cop_env = _cop_private_fixture("ase-copargv-")
     # The ODR gate is stubbed OFF for every positive argv/enumeration check in this
     # section: on a 64-bit Windows host whose live ODR registry is populated the
     # adapter fails EVERY invocation closed by design (asserted separately in
@@ -2892,7 +2964,7 @@ def run_selftest(verbose: bool = False) -> int:
         try:
             get_adapter("copilot").build_argv(
                 "do the task", RunOptions(model="auto", effective_env=_cop_env),
-                cwd="/tmp")
+                cwd=_cop_cwd)
             _wow64_msg = "did not raise"
         except RuntimeError as exc:
             _wow64_msg = str(exc)
@@ -2906,7 +2978,7 @@ def run_selftest(verbose: bool = False) -> int:
             "do the task",
             RunOptions(model="auto", effective_env=_cop_env,
                        extra_args=["--banner"]),  # neutral extra_args pass through
-            cwd="/tmp")
+            cwd=_cop_cwd)
         _check("copilot.argv",
                cargv[0] == "copilot" and "-p" in cargv and "--output-format" in cargv
                and "json" in cargv and "--allow-all" in cargv and "--model" in cargv
@@ -2920,7 +2992,7 @@ def run_selftest(verbose: bool = False) -> int:
                          "computer-use"}
         _cargv_dis = {cargv[i + 1] for i, a in enumerate(cargv)
                       if a == "--disable-mcp-server"}
-        _pargv = get_adapter("copilot")._probe_argv("m", cwd="/tmp", env=_cop_env)
+        _pargv = get_adapter("copilot")._probe_argv("m", cwd=_cop_cwd, env=_cop_env)
         _pargv_dis = {_pargv[i + 1] for i, a in enumerate(_pargv)
                       if a == "--disable-mcp-server"}
         _check("copilot.builtin_mcps_disabled_by_name",
@@ -2930,7 +3002,7 @@ def run_selftest(verbose: bool = False) -> int:
                f"probe={sorted(_pargv_dis)})", failures, verbose)
         cargv_dt = get_adapter("copilot").build_argv(
             "judge", RunOptions(disable_tools=True, effective_env=_cop_env),
-            cwd="/tmp")
+            cwd=_cop_cwd)
         _check("copilot.disable_tools",
                "--available-tools" in cargv_dt
                and cargv_dt[cargv_dt.index("--available-tools") + 1] == "",
@@ -3019,12 +3091,21 @@ def run_selftest(verbose: bool = False) -> int:
         # what covers probes, judge runs, non-isolated runs, and scenario-seeded
         # workspace configs.
         import json as _json
-        _cop_home = _tmp.mkdtemp(prefix="ase-cophome-")
-        _cop_ws_root = _tmp.mkdtemp(prefix="ase-copws-")
+        # realpath: HOME is pinned to _cop_ws_root below and the custom-agent walk
+        # compares PHYSICAL paths, so a /var → /private/var tmpdir must be resolved or
+        # the boundary never matches and the walk climbs into shared ancestors.
+        _cop_home = os.path.realpath(_tmp.mkdtemp(prefix="ase-cophome-"))
+        _cop_ws_root = os.path.realpath(_tmp.mkdtemp(prefix="ase-copws-"))
         _old_cop_home = os.environ.get("COPILOT_HOME")
+        _old_home_pins = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
         try:
             with open(os.path.join(_cop_home, "mcp-config.json"), "w") as fh:
                 _json.dump({"mcpServers": {"user-srv": {"command": "echo"}}}, fh)
+            # every config home here carries the remote-agents opt-out the sanitizer
+            # injects, so these MCP-enumeration checks never trip the custom-agent gate
+            _cop_optout = '{"customAgents": {"defaultLocalOnly": true}}'
+            with open(os.path.join(_cop_home, "config.json"), "w") as fh:
+                fh.write(_cop_optout)
             ws = os.path.join(_cop_ws_root, "nested", "ws")
             os.makedirs(os.path.join(ws, ".github"))
             os.makedirs(os.path.join(ws, ".vscode"))
@@ -3038,7 +3119,15 @@ def run_selftest(verbose: bool = False) -> int:
                 _json.dump({"servers": {"vsc-srv": {}}}, fh)
             with open(os.path.join(_cop_ws_root, ".mcp.json"), "w") as fh:
                 _json.dump({"mcpServers": {"ancestor-srv": {}}}, fh)
+            # The custom-agent walk climbs from the cwd to the git root (else the
+            # child's OS home). Making ws a REAL repo pins that boundary AT the cwd and
+            # pinning HOME pins it at the fixture root — either way this block reads
+            # only its own private tree, never an ambient ~/.claude/agents or a planted
+            # $TMPDIR/.claude/agents. (The MCP-config walk is unbounded by design, so
+            # ancestor-srv is still enumerated.)
+            _git_init(ws)
             os.environ["COPILOT_HOME"] = _cop_home
+            os.environ["HOME"] = os.environ["USERPROFILE"] = _cop_ws_root
             dargv = get_adapter("copilot").build_argv("do it", RunOptions(), cwd=ws)
             disabled = [dargv[i + 1] for i, a in enumerate(dargv) if a == "--disable-mcp-server"]
             _check("copilot.mcp_disable_enumeration",
@@ -3050,7 +3139,8 @@ def run_selftest(verbose: bool = False) -> int:
             # opts.effective_env (exec.execute() sets it), with no os.environ involvement.
             os.environ.pop("COPILOT_HOME", None)
             eargv = get_adapter("copilot").build_argv(
-                "do it", RunOptions(effective_env={"COPILOT_HOME": _cop_home}), cwd=None)
+                "do it", RunOptions(effective_env=_cop_child_env(
+                    COPILOT_HOME=_cop_home)), cwd=None)
             edis = [eargv[i + 1] for i, a in enumerate(eargv) if a == "--disable-mcp-server"]
             _check("copilot.mcp_disable_uses_child_env",
                    "user-srv" in edis,
@@ -3065,8 +3155,12 @@ def run_selftest(verbose: bool = False) -> int:
             os.makedirs(rel_cop_home)
             with open(os.path.join(rel_cop_home, "mcp-config.json"), "w") as fh:
                 _json.dump({"mcpServers": {"rel-srv": {"command": "echo"}}}, fh)
+            with open(os.path.join(rel_cop_home, "config.json"), "w") as fh:
+                fh.write(_cop_optout)
             rargv = get_adapter("copilot").build_argv(
-                "do it", RunOptions(effective_env={"COPILOT_HOME": "rel-cop-home"}), cwd=ws)
+                "do it", RunOptions(effective_env=_cop_child_env(
+                    COPILOT_HOME="rel-cop-home", HOME=_cop_ws_root,
+                    USERPROFILE=_cop_ws_root)), cwd=ws)
             rdis = [rargv[i + 1] for i, a in enumerate(rargv) if a == "--disable-mcp-server"]
             _check("copilot.mcp_disable_relative_home_uses_child_cwd",
                    "rel-srv" in rdis,
@@ -3079,13 +3173,18 @@ def run_selftest(verbose: bool = False) -> int:
             # would enumerate the harness user's real ~/.copilot instead — the wrong config.
             # POSIX-only: this empty-base-is-relative behaviour is Node/libuv's POSIX rule;
             # on win32 libuv REJECTS an empty %USERPROFILE% (fail closed — see home_resolution).
-            if os.name != "nt":
+            # Needs a real git: an empty HOME leaves the custom-agent walk UNBOUNDED
+            # (Node keeps "", which matches no ancestor), so only the repo boundary git
+            # reports for ws keeps this check off shared TMPDIR ancestors.
+            if os.name != "nt" and _cop_git:
                 cwd_cop_home = os.path.join(ws, ".copilot")
                 os.makedirs(cwd_cop_home)
                 with open(os.path.join(cwd_cop_home, "mcp-config.json"), "w") as fh:
                     _json.dump({"mcpServers": {"empty-home-srv": {"command": "echo"}}}, fh)
+                with open(os.path.join(cwd_cop_home, "config.json"), "w") as fh:
+                    fh.write(_cop_optout)
                 hargv = get_adapter("copilot").build_argv(
-                    "do it", RunOptions(effective_env={"HOME": ""}), cwd=ws)
+                    "do it", RunOptions(effective_env=_cop_child_env(HOME="")), cwd=ws)
                 hdis = [hargv[i + 1] for i, a in enumerate(hargv) if a == "--disable-mcp-server"]
                 _check("copilot.mcp_disable_empty_home_uses_child_cwd",
                        "empty-home-srv" in hdis,
@@ -3096,6 +3195,11 @@ def run_selftest(verbose: bool = False) -> int:
                 os.environ.pop("COPILOT_HOME", None)
             else:
                 os.environ["COPILOT_HOME"] = _old_cop_home
+            for _k, _v in _old_home_pins.items():
+                if _v is None:
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _v
             _sh.rmtree(_cop_home, ignore_errors=True)
             _sh.rmtree(_cop_ws_root, ignore_errors=True)
 
@@ -3108,12 +3212,21 @@ def run_selftest(verbose: bool = False) -> int:
     # existing-but-unparseable one fails closed; WORKSPACE files stay strict (also
     # live-verified: a trailing comma makes copilot silently ignore the file).
     if not _cop_wow64:
-        _jc_home = _tmp.mkdtemp(prefix="ase-copjsonc-")
-        _jc_ws = _tmp.mkdtemp(prefix="ase-copjsoncws-")
+        _jc_home = os.path.realpath(_tmp.mkdtemp(prefix="ase-copjsonc-"))
+        # the workspace is a private dir INSIDE the pinned HOME below, so the
+        # custom-agent walk covers this fixture's own tree only (see _cop_child_env)
+        _jc_root = os.path.realpath(_tmp.mkdtemp(prefix="ase-copjsoncws-"))
+        _jc_ws = os.path.join(_jc_root, "ws")
+        os.makedirs(_jc_ws)
         try:
+            with open(os.path.join(_jc_home, "config.json"), "w") as fh:
+                fh.write('{"customAgents": {"defaultLocalOnly": true}}')
+
             def _jc_disables():
                 a = get_adapter("copilot").build_argv(
-                    "p", RunOptions(effective_env={"COPILOT_HOME": _jc_home}),
+                    "p", RunOptions(effective_env=_cop_child_env(
+                        COPILOT_HOME=_jc_home, HOME=_jc_root,
+                        USERPROFILE=_jc_root)),
                     cwd=_jc_ws)
                 return [a[i + 1] for i, t in enumerate(a)
                         if t == "--disable-mcp-server"]
@@ -3164,7 +3277,7 @@ def run_selftest(verbose: bool = False) -> int:
                    failures, verbose)
         finally:
             _sh.rmtree(_jc_home, ignore_errors=True)
-            _sh.rmtree(_jc_ws, ignore_errors=True)
+            _sh.rmtree(_jc_root, ignore_errors=True)
 
     # JSONC grammar edges that must fail the SAFE way (copilot_mod pure helpers):
     #  - a comment is TOKEN-SEPARATING whitespace, not deletion: `tr/*x*/ue` must NOT
@@ -3218,27 +3331,41 @@ def run_selftest(verbose: bool = False) -> int:
            failures, verbose)
 
     # Custom agents are an MCP channel --disable-mcp-server does NOT reach: a selected
-    # agent's frontmatter mcp-servers are started per name by initializeMcpHost without
-    # consulting disabledMcpServers, and no flag disables custom agents (1.0.64 bundle).
-    # So _mcp_disable_args must FAIL CLOSED on any discoverable local agent file —
-    # <home>/agents plus .github/agents / .claude/agents from the run cwd up to the
-    # nearest git root (inclusive), copilot's own walk boundary — and, in a git-repo
-    # cwd, on a config that doesn't provably opt out of the REMOTE org/enterprise
-    # agents listing (customAgents.defaultLocalOnly, which the sanitizer injects).
-    if not _cop_wow64:
-        _ag_dir = _tmp.mkdtemp(prefix="ase-copagents-")
+    # agent's frontmatter mcp-servers are started per name outside the harness's
+    # disable set, and no flag disables custom agents (1.0.64 bundle). So
+    # _mcp_disable_args must FAIL CLOSED on any discoverable local agent file —
+    # <home>/agents plus .github/agents / .claude/agents from the run cwd up to
+    # copilot's own walk boundary — and, in a git-repo cwd, on a config that doesn't
+    # provably opt out of the REMOTE org/enterprise agents listing
+    # (customAgents.defaultLocalOnly, which the sanitizer injects).
+    #
+    # That boundary now comes from GIT ITSELF: the adapter runs copilot's own probe,
+    # `git rev-parse --show-toplevel`, in the child's cwd with the child's env. These
+    # fixtures therefore need REAL repositories (a hand-made .git/ proves nothing to
+    # git) and are skipped without a usable git binary.
+    if not _cop_wow64 and _cop_git:
+        # realpath: HOME below is the repo-less walk boundary and the walk compares
+        # PHYSICAL paths, so an unresolved /var → /private/var tmpdir would never match
+        _ag_dir = os.path.realpath(_tmp.mkdtemp(prefix="ase-copagents-"))
         try:
             _ag_home = os.path.join(_ag_dir, "home")
             _ag_repo = os.path.join(_ag_dir, "repo")
             _ag_ws = os.path.join(_ag_repo, "ws")
+            _ag_plain = os.path.join(_ag_dir, "plain", "ws")   # never inside a repo
             os.makedirs(_ag_home)
             os.makedirs(_ag_ws)
-            _ag_env = {"COPILOT_HOME": _ag_home}
+            os.makedirs(_ag_plain)
+            # HOME pinned to the fixture root: a repo-less walk stops THERE instead of
+            # climbing into shared TMPDIR ancestors, so nothing ambient can decide
+            # these checks (see _cop_child_env).
+            _ag_env = _cop_child_env(COPILOT_HOME=_ag_home, HOME=_ag_dir,
+                                     USERPROFILE=_ag_dir)
 
-            def _cop_agents_err(cwd):
+            def _cop_agents_err(cwd, **extra_env):
                 try:
                     get_adapter("copilot").build_argv(
-                        "p", RunOptions(effective_env=_ag_env), cwd=cwd)
+                        "p", RunOptions(effective_env={**_ag_env, **extra_env}),
+                        cwd=cwd)
                     return ""
                 except RuntimeError as exc:
                     return str(exc)
@@ -3267,74 +3394,74 @@ def run_selftest(verbose: bool = False) -> int:
                    "(their mcp-servers start outside --disable-mcp-server); empty "
                    "dirs and non-md files don't", failures, verbose)
 
-            # remote agents: a git-repo cwd requires the defaultLocalOnly opt-out —
-            # and the walk must stop at the git root exactly as copilot's does (an
-            # agent file ABOVE it is not copilot's to discover). The .git dir needs a
-            # HEAD to count as a repo root (git ignores an empty .git/, so does the
-            # harness — see copilot.git_root_semantics below).
-            os.makedirs(os.path.join(_ag_repo, ".git"))
-            open(os.path.join(_ag_repo, ".git", "HEAD"), "w").close()
+            # Remote agents: a git-repo cwd requires the defaultLocalOnly opt-out, and
+            # the walk must stop at the root GIT REPORTS — an agent file above it is not
+            # copilot's to discover. `above.md` sits between the repo root and the home,
+            # so it is IN the walk exactly when the repo boundary is absent.
+            _ag_git_ok = _git_init(_ag_repo)
             os.makedirs(os.path.join(_ag_dir, ".claude", "agents"))
             open(os.path.join(_ag_dir, ".claude", "agents", "above.md"), "w").close()
-            with open(os.path.join(_ag_home, "config.json"), "w") as fh:
+            _ag_optout = os.path.join(_ag_home, "config.json")
+            with open(_ag_optout, "w") as fh:
                 fh.write('{"customAgents": {"defaultLocalOnly": true}}')
             ag_boundary = _cop_agents_err(_ag_ws) == ""   # boundary + opt-out → runs
-            os.remove(os.path.join(_ag_home, "config.json"))
+            # A present-but-EMPTY GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR SUPPRESSES git
+            # discovery: copilot's own rev-parse fails, so it takes the repo-less path
+            # and walks PAST this repo root toward the home — where above.md lives.
+            # A .git-marker walk (any earlier revision) stopped at the lexical repo and
+            # MISSED it; the child-context probe reproduces git's behaviour exactly.
+            ag_empty_gitdir = "custom-agent" in _cop_agents_err(_ag_ws, GIT_DIR="")
+            # GIT_CEILING_DIRECTORIES hides a lexical parent repo the same way.
+            ag_ceiling = "custom-agent" in _cop_agents_err(
+                _ag_ws, GIT_CEILING_DIRECTORIES=_ag_repo)
+            _sh.rmtree(os.path.join(_ag_dir, ".claude"))
+            os.remove(_ag_optout)
             _e = _cop_agents_err(_ag_ws)
             ag_remote = "defaultLocalOnly" in _e and "failing closed" in _e
-            _sh.rmtree(os.path.join(_ag_repo, ".git"))
-            with open(os.path.join(_ag_repo, ".git"), "w") as fh:
-                fh.write("gitdir: /elsewhere\n")           # worktree-style .git FILE
-            ag_gitfile = "defaultLocalOnly" in _cop_agents_err(_ag_ws)
-            # GIT_DIR / GIT_WORK_TREE / GIT_COMMON_DIR in the CHILD env redirect git's
-            # OWN discovery: copilot resolves its repo via `git rev-parse`, so it can
-            # land in a repo no .git-entry walk from the cwd would reveal. Those must
-            # fail closed too (and the agent walk then has no knowable boundary).
-            # Clear the .git FILE and the above-root agent first so the ONLY repo
-            # signal is the env var.
-            os.remove(os.path.join(_ag_repo, ".git"))
-            _sh.rmtree(os.path.join(_ag_dir, ".claude"))
-
-            def _cop_agents_err_env(cwd, extra_env):
-                try:
-                    get_adapter("copilot").build_argv(
-                        "p", RunOptions(effective_env={**_ag_env, **extra_env}),
-                        cwd=cwd)
-                    return ""
-                except RuntimeError as exc:
-                    return str(exc)
-
-            ag_no_git = _cop_agents_err(_ag_ws) == ""      # no .git, no git-env → runs
-            ag_gitenv = all(
-                "defaultLocalOnly" in _cop_agents_err_env(_ag_ws, {v: "/some/gitdir"})
-                for v in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"))
+            # ...and with the repo HIDDEN from git, the remote-agents gate stays OFF:
+            # copilot cannot list org agents for a repo its own rev-parse never finds.
+            ag_ceiling_no_gate = _cop_agents_err(
+                _ag_ws, GIT_CEILING_DIRECTORIES=_ag_repo) == ""
+            # A cwd git proves is repo-less runs clean...
+            ag_no_git = _cop_agents_err(_ag_plain) == ""
+            # ...but GIT_DIR pointing at a REAL repo elsewhere puts the run in one that
+            # no .git walk from this cwd could ever reveal — the gate must fire.
+            _ag_other = os.path.join(_ag_dir, "other")
+            _ag_other_ok = _git_init(_ag_other)
+            ag_gitenv = "defaultLocalOnly" in _cop_agents_err(
+                _ag_plain, GIT_DIR=os.path.join(_ag_other, ".git"))
             _check("copilot.remote_agents_fail_closed",
-                   ag_boundary and ag_remote and ag_gitfile and ag_no_git
-                   and ag_gitenv,
-                   "a git-repo cwd — a .git dir/worktree-file, OR GIT_DIR/"
-                   "GIT_WORK_TREE/GIT_COMMON_DIR in the child env (each redirects "
-                   "git's own repo discovery, so copilot's `git rev-parse` can find a "
-                   "repo no .git walk reveals) — without the customAgents."
-                   "defaultLocalOnly opt-out fails closed: remote org/enterprise "
-                   "agents can carry mcp-servers outside the disable set. With the "
-                   "opt-out (as the sanitizer injects) it runs, the agent walk stops "
-                   "at the git root like copilot's, and a cwd with neither signal "
-                   "runs clean", failures, verbose)
+                   _ag_git_ok and _ag_other_ok and ag_boundary and ag_remote
+                   and ag_empty_gitdir and ag_ceiling and ag_ceiling_no_gate
+                   and ag_no_git and ag_gitenv,
+                   "the repo question is answered by copilot's OWN probe (`git "
+                   "rev-parse --show-toplevel`, child cwd + child env), so: a repo cwd "
+                   "without the customAgents.defaultLocalOnly opt-out fails closed "
+                   "(remote org/enterprise agents can carry mcp-servers outside the "
+                   "disable set); with the opt-out it runs and the agent walk stops at "
+                   "the root git reports; an empty GIT_DIR or a GIT_CEILING_DIRECTORIES "
+                   "that SUPPRESSES discovery makes it repo-less — the walk then "
+                   "correctly continues PAST the lexical repo to the home boundary and "
+                   "catches agent files a .git-marker walk would have missed, while the "
+                   "remote gate stays off; a GIT_DIR naming a real repo elsewhere fires "
+                   "the gate for a cwd no .git walk would flag", failures, verbose)
         finally:
             _sh.rmtree(_ag_dir, ignore_errors=True)
 
-    # git-root SEMANTICS + physical cwd: copilot resolves its repo with `git rev-parse`,
-    # which (a) operates on the symlink-resolved path and (b) ignores a HEADless .git/,
-    # walking up to the real parent repo. A lexical abspath walk that treats ANY .git
-    # entry as a boundary stops early at an empty nested .git/ (MISSING agent files
-    # copilot reads above it) and never resolves a symlinked cwd into the physical repo
-    # (finding neither its .git nor its agent/MCP files) — both under-detections.
-    if not _cop_wow64:
-        _gs_root = _tmp.mkdtemp(prefix="ase-copgs-")
+    # git-root SEMANTICS + physical cwd. copilot resolves its repo with `git rev-parse`,
+    # which (a) operates on the symlink-resolved path and (b) ignores a .git/ that isn't
+    # a valid repository — an EMPTY one, or one carrying only a HEAD — walking up to the
+    # real parent repo. A marker walk that treats any .git entry (or any .git/HEAD) as a
+    # boundary stops early there and MISSES the agent files copilot reads above it, and
+    # a lexical walk never resolves a symlinked cwd into the physical repo. Both are
+    # under-detections; asking git removes the class.
+    if not _cop_wow64 and _cop_git:
+        _gs_root = os.path.realpath(_tmp.mkdtemp(prefix="ase-copgs-"))
         try:
             _gs_home = os.path.join(_gs_root, "home")
             os.makedirs(_gs_home)
-            _gs_env = {"COPILOT_HOME": _gs_home}
+            _gs_env = _cop_child_env(COPILOT_HOME=_gs_home, HOME=_gs_root,
+                                     USERPROFILE=_gs_root)
 
             def _gs_err(cwd):
                 try:
@@ -3344,71 +3471,96 @@ def run_selftest(verbose: bool = False) -> int:
                 except RuntimeError as exc:
                     return str(exc)
 
-            # real repo root (HEAD) with an agent dir just under it; cwd is a subdir
-            # holding an EMPTY nested .git/ (no HEAD) — git walks through it to the root.
+            # a REAL repo with an agent dir just under its root; the cwd is a subdir
+            # holding a .git/ that git REJECTS (HEAD only, no objects/refs) — git walks
+            # straight through it to the real root, and so must the harness
             _gs_repo = os.path.join(_gs_root, "repo")
             _gs_sub = os.path.join(_gs_repo, "sub")
-            os.makedirs(os.path.join(_gs_repo, ".git"))
-            open(os.path.join(_gs_repo, ".git", "HEAD"), "w").close()
+            _gs_repo_ok = _git_init(_gs_repo)
             os.makedirs(os.path.join(_gs_repo, ".github", "agents"))
             open(os.path.join(_gs_repo, ".github", "agents", "mid.md"), "w").close()
-            os.makedirs(os.path.join(_gs_sub, ".git"))         # EMPTY nested .git/
-            empty_git_walks_through = "custom-agent" in _gs_err(_gs_sub)
+            os.makedirs(os.path.join(_gs_sub, ".git"))
+            open(os.path.join(_gs_sub, ".git", "HEAD"), "w").close()   # HEAD-only: NOT a repo
+            head_only_git_walks_through = "custom-agent" in _gs_err(_gs_sub)
             # a cwd SYMLINKED into the repo subtree must resolve to the physical path
+            # (Windows may forbid creating the link at all — skip rather than fail)
+            symlink_resolves = True
             _gs_link = os.path.join(_gs_root, "link")
-            os.symlink(_gs_sub, _gs_link)
-            symlink_resolves = "custom-agent" in _gs_err(_gs_link)
-            # and the empty .git alone (agent file removed) is NOT a repo boundary — the
-            # remote-agents gate stays OFF, so a repo-less clean build succeeds
+            try:
+                os.symlink(_gs_sub, _gs_link, target_is_directory=True)
+            except (OSError, NotImplementedError, AttributeError):
+                _gs_link = None
+            if _gs_link is not None:
+                symlink_resolves = "custom-agent" in _gs_err(_gs_link)
+            # and a rejected .git alone is NOT a repo boundary: with the agent file gone
+            # the run is repo-less, bounded at the pinned home, and builds clean
             os.remove(os.path.join(_gs_repo, ".github", "agents", "mid.md"))
             _gs_lone = os.path.join(_gs_root, "lone", "sub")
-            os.makedirs(os.path.join(_gs_lone, ".git"))        # empty .git/, no HEAD above
-            empty_git_not_repo = _gs_err(_gs_lone) == ""
+            os.makedirs(os.path.join(_gs_lone, ".git"))
+            open(os.path.join(_gs_lone, ".git", "HEAD"), "w").close()
+            head_only_git_not_repo = _gs_err(_gs_lone) == ""
             _check("copilot.git_root_semantics",
-                   empty_git_walks_through and symlink_resolves and empty_git_not_repo,
-                   "an empty nested .git/ is not a boundary (the walk continues to the "
-                   "real HEAD-bearing parent repo and finds its agent files) nor a repo "
-                   "on its own (the remote-agents gate stays off), and a cwd symlinked "
-                   "into a repo subtree resolves to the physical path where git/copilot "
-                   "discover the same .git and agent files", failures, verbose)
+                   _gs_repo_ok and head_only_git_walks_through and symlink_resolves
+                   and head_only_git_not_repo,
+                   "a .git/ git rejects (HEAD only, no objects/refs) is neither a walk "
+                   "boundary — the walk continues to the real parent repo and finds its "
+                   "agent files — nor a repository on its own (the remote-agents gate "
+                   "stays off), and a cwd symlinked into a repo subtree resolves to the "
+                   "physical path where git and copilot discover the same root",
+                   failures, verbose)
         finally:
             _sh.rmtree(_gs_root, ignore_errors=True)
 
-    # repo-less convention-dir walk BOUNDARY: copilot stops at the child's OS home, so
-    # an unrelated .github/agents / .claude/agents ABOVE home must not fail an otherwise
-    # valid run (a HOME-anchored bound, not a walk to the filesystem root).
-    if not _cop_wow64:
-        _hb_root = _tmp.mkdtemp(prefix="ase-cophb-")
+    # repo-less convention-dir walk BOUNDARY: copilot stops at the child's OS home, so an
+    # unrelated .github/agents / .claude/agents ABOVE home must not fail an otherwise
+    # valid run. That shortcut is only sound when the home value is PROVABLY the physical
+    # ancestor the walk compares against — Node hands copilot the RAW env value, keeping
+    # an empty or relative one verbatim, and neither matches any absolute ancestor, so
+    # copilot walks to the filesystem root. The harness must do the same rather than
+    # substitute the account home (which would stop EARLY of copilot: an under-detection).
+    if not _cop_wow64 and _cop_git:
+        _hb_root = os.path.realpath(_tmp.mkdtemp(prefix="ase-cophb-"))
         try:
             _hb_home = os.path.join(_hb_root, "home")
             _hb_cwd = os.path.join(_hb_home, "proj", "ws")
             _hb_cop = os.path.join(_hb_home, ".copilot")
             os.makedirs(_hb_cwd)
             os.makedirs(_hb_cop)
-            _hb_env = {"HOME": _hb_home, "USERPROFILE": _hb_home,
-                       "COPILOT_HOME": _hb_cop}
 
-            def _hb_err(cwd):
+            def _hb_err(**home_env):
+                env = _cop_child_env(COPILOT_HOME=_hb_cop, HOME=_hb_home,
+                                     USERPROFILE=_hb_home)
+                env.update(home_env)
                 try:
                     get_adapter("copilot").build_argv(
-                        "p", RunOptions(effective_env=_hb_env), cwd=cwd)
+                        "p", RunOptions(effective_env=env), cwd=_hb_cwd)
                     return ""
                 except RuntimeError as exc:
                     return str(exc)
 
-            # agent dir ABOVE home (in _hb_root) — copilot never walks past home → clean
+            # agent dir ABOVE home (in _hb_root) — copilot never walks past a real home
             os.makedirs(os.path.join(_hb_root, ".claude", "agents"))
             open(os.path.join(_hb_root, ".claude", "agents", "above_home.md"), "w").close()
-            hb_above_home_clean = _hb_err(_hb_cwd) == ""
+            hb_above_home_clean = _hb_err() == ""
+            # ...but an EMPTY home var is kept verbatim by Node, matches no ancestor, and
+            # leaves copilot walking to the root — the same file IS then in scope
+            hb_empty_home_closed = "custom-agent" in _hb_err(HOME="", USERPROFILE="")
+            # ...and so is a RELATIVE one
+            hb_rel_home_closed = "custom-agent" in _hb_err(HOME="home",
+                                                           USERPROFILE="home")
             # agent dir AT home is within the walk (inclusive) → fails closed
             os.makedirs(os.path.join(_hb_home, ".github", "agents"))
             open(os.path.join(_hb_home, ".github", "agents", "at_home.md"), "w").close()
-            hb_at_home_closed = "custom-agent" in _hb_err(_hb_cwd)
+            hb_at_home_closed = "custom-agent" in _hb_err()
             _check("copilot.repoless_agent_walk_home_boundary",
-                   hb_above_home_clean and hb_at_home_closed,
+                   hb_above_home_clean and hb_at_home_closed and hb_empty_home_closed
+                   and hb_rel_home_closed,
                    "a repo-less run bounds the convention-dir walk at the child's OS "
-                   "home (copilot's boundary): an agent dir ABOVE home doesn't fail the "
-                   "run, one AT home does", failures, verbose)
+                   "home only when that value is provably the physical ancestor: an "
+                   "agent dir ABOVE an absolute home doesn't fail the run, one AT it "
+                   "does, and an EMPTY or RELATIVE home (which Node keeps verbatim, so "
+                   "copilot walks to the filesystem root) drops the boundary entirely "
+                   "instead of substituting the account home", failures, verbose)
         finally:
             _sh.rmtree(_hb_root, ignore_errors=True)
 
@@ -3986,7 +4138,7 @@ def run_selftest(verbose: bool = False) -> int:
         odr_build_closed = ""
         if not _cop_wow64:
             try:
-                get_adapter("copilot")._mcp_disable_args("/tmp", env=_cop_env)
+                get_adapter("copilot")._mcp_disable_args(_cop_cwd, env=_cop_env)
             except RuntimeError as exc:
                 odr_build_closed = str(exc)
         _check("copilot.odr_gate_on_fails_closed",
@@ -4009,6 +4161,7 @@ def run_selftest(verbose: bool = False) -> int:
                "and enumeration proceeds on the non-ODR channels", failures, verbose)
     finally:
         copilot_mod._odr_registry_command = _odr_saved_cmd
+        _sh.rmtree(_cop_priv, ignore_errors=True)   # private argv fixture
 
     # A _FILE_TOOLS write must be counted ONCE by file_paths_touched(), not twice — Copilot
     # emits both a TOOL_CALL and a FILE_CHANGE for the same write, and file_paths_touched() reads

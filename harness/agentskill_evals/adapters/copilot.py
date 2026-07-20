@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import ntpath
 import os
+import subprocess
 import sys
 from typing import Any, Mapping, Optional
 
@@ -142,99 +143,139 @@ def _agent_definition_files(root: str) -> list[str]:
     return sorted(out)
 
 
-# Env vars that redirect git's own repository discovery. copilot finds its repo by
-# running `git rev-parse --show-toplevel` with the CHILD's environment, so any of
-# these being set means the repo (and its GitHub remote) can live somewhere no
-# .git-entry walk from the cwd would find.
-_GIT_ENV_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
+# How long the harness waits for the child-context `git rev-parse` probe below.
+# Discovery is a handful of stats; anything slower is a sick git (network-mounted
+# cwd, a hung credential helper) and times out into the "unknowable" branch.
+_GIT_DISCOVERY_TIMEOUT_S = 10.0
+
+# Repository state as GIT ITSELF resolves it, not as a marker-file heuristic guesses.
+# _GIT_UNKNOWN is the fail-closed answer: the harness could not get an authoritative
+# reading, so no boundary may be trusted.
+_GIT_UNKNOWN = "unknown"
+_GIT_NO_REPO = "no-repo"
+_GIT_REPO = "repo"
 
 
-def _git_env_repo(env_map: Mapping[str, str]) -> bool:
-    """True when the child env redirects git discovery (see _GIT_ENV_VARS) — the
-    harness then treats a repo as POSSIBLE with an unknowable root."""
-    return any(env_map.get(v) for v in _GIT_ENV_VARS)
+def _child_git_root(cwd: str,
+                    env_map: Mapping[str, str]) -> tuple[str, Optional[str]]:
+    """Run copilot's OWN repo probe — ``git rev-parse --show-toplevel``, in the child's
+    cwd with the child's environment — and report ``(state, root)``:
 
+    * ``(_GIT_UNKNOWN, None)`` — git could not be run, timed out, or failed for a
+      reason other than "no repository" (a broken install, ``GIT_DIR`` pointing at a
+      bare repo, ``safe.directory`` refusal). Nothing about the run is provable;
+      callers must treat a repo as possible and its boundary as nonexistent.
+    * ``(_GIT_NO_REPO, None)`` — git proved there is no repository here, so copilot
+      takes its repo-less path (no remote agent listing; the convention walk stops at
+      the child's OS home).
+    * ``(_GIT_REPO, root)`` — the symlink-resolved work-tree root copilot will use.
 
-def _is_git_root(d: str) -> bool:
-    """True when git would treat ``d`` as a repository root — the semantics copilot's
-    ``git rev-parse`` uses, not a bare "a ``.git`` name exists" test:
+    Asking git is the ONLY way to get this right. A ``.git``-marker walk mis-answers in
+    both directions: an empty or partial ``.git/`` is not a repository (git walks past
+    it to the real parent repo, so stopping there misses the parent's agent dirs), a
+    ``.git`` FILE may be a dangling gitlink, ``GIT_DIR``/``GIT_WORK_TREE``/
+    ``GIT_COMMON_DIR`` — including the present-but-EMPTY spellings, which SUPPRESS
+    discovery — move or abolish the root outright, and ``GIT_CEILING_DIRECTORIES``
+    hides a lexical parent repo. Running the real thing with the real env reproduces
+    every one of those rules by construction.
 
-    * ``d/.git`` is a FILE → a gitlink/worktree pointer (``gitdir: ...``); git treats
-      ``d`` as a work tree. Counted (even a bogus pointer is git's to reject, and the
-      fail-closed direction is safe).
-    * ``d/.git`` is a DIRECTORY → a real repo only if it has a ``HEAD`` (git always
-      writes one). An EMPTY or partial ``.git/`` is NOT a repository — git ignores it
-      and keeps walking UP to the real parent repo — so counting it would stop the
-      walk early and MISS what copilot reads above it. HEAD-gated to match git.
-    """
-    dotgit = os.path.join(d, ".git")
-    if os.path.isfile(dotgit):
-        return True
-    return os.path.isdir(dotgit) and os.path.isfile(os.path.join(dotgit, "HEAD"))
+    Only the message locale is pinned (``LC_ALL=C``/``LANGUAGE=``) so the "no
+    repository" reading is a stable string; locale does not affect discovery."""
+    probe_env = dict(env_map)
+    probe_env["LC_ALL"] = "C"
+    probe_env["LANGUAGE"] = ""
+    try:
+        proc = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                              cwd=cwd, env=probe_env, capture_output=True,
+                              text=True, timeout=_GIT_DISCOVERY_TIMEOUT_S)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return (_GIT_UNKNOWN, None)
+    if proc.returncode == 0:
+        top = (proc.stdout or "").strip()
+        if not top:
+            return (_GIT_UNKNOWN, None)
+        try:
+            return (_GIT_REPO, os.path.realpath(top))
+        except OSError:
+            return (_GIT_UNKNOWN, None)
+    # Non-zero: only git's own "not a git repository" wording proves absence. Every
+    # other failure (dubious ownership, a GIT_DIR that is bare, a broken install)
+    # leaves the question open and must not license a boundary.
+    if "not a git repository" in (proc.stderr or "").lower():
+        return (_GIT_NO_REPO, None)
+    return (_GIT_UNKNOWN, None)
 
 
 def _child_os_home(env_map: Mapping[str, str]) -> Optional[str]:
-    """The child's OS home directory, realpath-resolved, or None when unknowable —
-    the boundary copilot's convention-dir walk stops at for a REPO-LESS run (Node's
-    ``os.homedir()``: ``$HOME`` on POSIX, ``%USERPROFILE%`` on win32; an empty value
-    falls back to the account home, i.e. ``expanduser('~')``). None → the walk runs to
-    the filesystem root (over-approximation, the safe direction)."""
+    """The boundary copilot's convention-dir walk stops at for a REPO-LESS run — Node's
+    ``os.homedir()`` (``$HOME`` on POSIX, ``%USERPROFILE%`` on win32), which copilot
+    passes RAW to its convention-dir collector — or None when that value cannot be
+    proven equivalent to a physical ancestor of the walk. None → the walk runs to the
+    filesystem root (over-approximation, the safe direction).
+
+    The value is usable as a boundary only when it is set, non-empty, absolute, and
+    already canonical:
+
+    * UNSET → Node falls back to an OS lookup (``getpwuid`` / ``GetUserProfileDirectory``)
+      that the harness cannot mirror from the child's env alone.
+    * present but EMPTY → libuv's ``uv_os_getenv`` returns it verbatim; ``os.homedir()``
+      is ``""``, which matches no ancestor, so copilot walks to the root. Substituting
+      the account home (the old behaviour) would stop the harness EARLY of copilot.
+    * RELATIVE → likewise never matches an absolute ancestor; copilot walks to the root.
+    * non-CANONICAL (``realpath`` differs, e.g. a symlinked home) → copilot compares its
+      raw value while this walk is over physical paths, so the two can never be shown to
+      stop in the same place.
+
+    Every rejected case yields None, i.e. a walk at least as wide as copilot's — which
+    is also why plain ``os.path.isabs`` is good enough here despite the win32 UNC quirk
+    the home resolver works around: an under-reported "relative" only widens the walk."""
     key = "USERPROFILE" if sys.platform == "win32" else "HOME"
-    h = env_map.get(key) or os.path.expanduser("~")
-    if not h or h == "~":
+    h = env_map.get(key)
+    if not h or not os.path.isabs(h):
         return None
     try:
-        return os.path.realpath(h)
+        real = os.path.realpath(h)
     except OSError:
         return None
+    return real if real == os.path.normpath(h) else None
 
 
-def _nearest_git_root(cwd: str) -> Optional[str]:
-    """The first ancestor of the PHYSICAL ``cwd`` (inclusive) that git would treat as a
-    repository root (see ``_is_git_root``), or None. copilot resolves its repo with
-    ``git rev-parse --show-toplevel`` in the child context, which operates on the
-    symlink-resolved path and applies git's own root semantics — so this walks
-    ``os.path.realpath(cwd)`` (a cwd symlinked into a repo subtree finds the physical
-    repo's ``.git``, which an ``abspath`` lexical walk would miss) and HEAD-gates ``.git``
-    dirs (an empty nested ``.git/`` is not a boundary; git walks past it). The residual
-    approximation is safe in the fail-closed direction, and the inverse — a repo git
-    finds via ``GIT_DIR`` & co that no ``.git`` entry reveals — is covered by
-    ``_git_env_repo``."""
-    d = os.path.realpath(cwd)
-    while True:
-        if _is_git_root(d):
-            return d
-        parent = os.path.dirname(d)
-        if parent == d:
-            return None
-        d = parent
-
-
-def _custom_agent_files(home: str, cwd: Optional[str],
-                        env_map: Mapping[str, str]) -> list[str]:
+def _custom_agent_files(home: str, cwd: Optional[str], env_map: Mapping[str, str],
+                        git: Optional[tuple[str, Optional[str]]] = None) -> list[str]:
     """Every LOCAL custom-agent definition file discoverable for a run:
     ``<home>/agents`` plus the ``.github/agents`` / ``.claude/agents`` convention
-    dirs of the PHYSICAL run cwd and its ancestors up to copilot's own walk boundary —
-    the nearest git root (inclusive), or, for a repo-less run, the child's OS home
-    (inclusive). The cwd is symlink-resolved (``os.path.realpath``) so a cwd symlinked
-    into a repo subtree finds the agent dirs git/copilot would; the git boundary is
-    HEAD-gated (``_is_git_root`` — an empty nested ``.git/`` is NOT a boundary, git
-    walks past it). Only when the child env redirects git discovery
-    (``_git_env_repo`` — GIT_DIR & co) is the real boundary unknowable; the walk then
-    runs to the filesystem root (conservative). Unlike the workspace MCP-config walk —
-    where an over-approximation just adds harmless disables — agent detection FAILS
-    runs closed, so bounding at copilot's boundary (git root / home) instead of always
-    over-walking to the filesystem root keeps a ``.claude/agents`` ABOVE the repo or
-    the home — which copilot never reads — from killing otherwise-valid runs."""
-    boundary_unknown = _git_env_repo(env_map)
-    child_home = None if boundary_unknown else _child_os_home(env_map)
+    dirs of the PHYSICAL run cwd and its ancestors up to copilot's own walk boundary.
+
+    The boundary is taken from git itself (``_child_git_root`` — the same
+    ``git rev-parse --show-toplevel`` probe copilot runs, in the child's context), never
+    from a ``.git``-marker guess: the repo root (inclusive) for a repo run, the child's
+    OS home (inclusive, and only when provably equivalent — ``_child_os_home``) for a
+    proven repo-less run, and NO boundary at all when git's answer is unknowable — the
+    walk then runs to the filesystem root. The cwd is symlink-resolved
+    (``os.path.realpath``) so a cwd symlinked into a repo subtree finds the agent dirs
+    git and copilot would.
+
+    Unlike the workspace MCP-config walk — where an over-approximation just adds
+    harmless disables — agent detection FAILS runs closed, so bounding at copilot's real
+    boundary instead of always over-walking to the filesystem root keeps a
+    ``.claude/agents`` ABOVE the repo or the home — which copilot never reads — from
+    killing otherwise-valid runs. Every uncertainty still resolves toward the wider
+    walk. ``git`` is ``_child_git_root``'s answer when the caller already has one (one
+    probe per invocation); it is computed here otherwise."""
+    boundary: Optional[str] = None
+    if cwd:
+        state, root = git if git is not None else _child_git_root(cwd, env_map)
+        if state == _GIT_REPO:
+            boundary = root
+        elif state == _GIT_NO_REPO:
+            boundary = _child_os_home(env_map)
     dirs = [os.path.join(home, "agents")]
     if cwd:
         d = os.path.realpath(cwd)
         while True:
             for rel in _WORKSPACE_AGENT_DIRS:
                 dirs.append(os.path.join(d, *rel.split("/")))
-            if not boundary_unknown and (_is_git_root(d) or d == child_home):
+            if boundary is not None and d == boundary:
                 break
             parent = os.path.dirname(d)
             if parent == d:
@@ -984,14 +1025,16 @@ class CopilotAdapter(Adapter):
         # LOCAL agent definition — or the possibility of a REMOTE org/enterprise
         # listing (git-repo cwd, config not provably opted out) — fails closed
         # before anything is enumerated.
-        agent_files = _custom_agent_files(home, cwd, env_map)
+        git = _child_git_root(cwd, env_map) if cwd else (_GIT_NO_REPO, None)
+        agent_files = _custom_agent_files(home, cwd, env_map, git)
         if agent_files:
             shown = ", ".join(agent_files[:4]) + (", ..." if len(agent_files) > 4
                                                   else "")
             raise RuntimeError(
                 f"custom-agent definition file(s) [{shown}] are discoverable by "
                 "copilot (under <config home>/agents, or a .github/agents / "
-                ".claude/agents dir between the run cwd and its git root): agent "
+                ".claude/agents dir on the walk from the run cwd up to the repo root "
+                "git reports — the child's OS home for a repo-less run): agent "
                 "frontmatter can declare mcp-servers whose names the harness can't "
                 "enumerate (local frontmatter plus unreadable REMOTE org/enterprise "
                 "listings), so it has nothing reliable to add to --disable-mcp-server "
@@ -1000,12 +1043,15 @@ class CopilotAdapter(Adapter):
                 "failing closed. Remove or relocate the agent files for harness "
                 "runs (isolation already masks <home>/agents to an empty dir)."
             )
-        if (cwd and (_git_env_repo(env_map) or _nearest_git_root(cwd))
+        # A repo cwd is what unlocks the REMOTE org/enterprise listing. Only git's own
+        # proof of absence (_GIT_NO_REPO) clears this gate; an unknowable answer is
+        # treated as a repo, like every other uncertainty here.
+        if (cwd and git[0] != _GIT_NO_REPO
                 and not _remote_agents_opted_out(home)):
             raise RuntimeError(
-                f"the run cwd {cwd!r} sits inside a git repository (a .git entry, "
-                "or GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR in the child env) and the "
-                "config copilot will read does not set "
+                f"the run cwd {cwd!r} sits inside a git repository, or git could not "
+                "prove it does not (`git rev-parse --show-toplevel` in the child's "
+                "context), and the config copilot will read does not set "
                 "customAgents.defaultLocalOnly: for a GitHub-remoted repo with "
                 "auth, copilot lists org/enterprise custom agents remotely, and "
                 "those can carry mcp-servers that start OUTSIDE the "
