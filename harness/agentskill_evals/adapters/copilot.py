@@ -36,8 +36,6 @@ from __future__ import annotations
 import json
 import ntpath
 import os
-import re
-import subprocess
 import sys
 from typing import Any, Mapping, Optional
 
@@ -61,9 +59,24 @@ _KNOWN_USAGE_KEYS = {
     "premiumRequests", "totalApiDurationMs", "sessionDurationMs", "codeChanges",
 }
 
-# Workspace-level MCP config files copilot discovers, checked in the run cwd and every
-# ancestor (copilot walks up, like git-root discovery — verified in the 1.0.64 bundle).
+# Workspace-level MCP config candidates. This is a deliberate CONSERVATIVE SUPERSET
+# of what copilot 1.0.64 discovers, not CLI parity: the bundle's candidate list is
+# only .mcp.json and .github/mcp.json (`.vscode/mcp.json` was removed in 1.0.64),
+# the FIRST existing candidate per directory wins, and the walk runs from the cwd to
+# the git root (repo-less runs read the cwd only). The harness checks every
+# candidate — the removed .vscode file and legacy "servers" key spelling included —
+# in the cwd and EVERY ancestor, because over-enumerating only adds harmless
+# disables (--disable-mcp-server tolerates names copilot doesn't load, verified
+# 1.0.64) while under-enumerating would leave a server live.
 _WORKSPACE_MCP_FILES = (".mcp.json", ".github/mcp.json", ".vscode/mcp.json")
+
+# Built-in / feature-gated in-process MCP servers named in the 1.0.64 bundle.
+# --disable-builtin-mcps' own help covers only github-mcp-server, and the
+# staff-feature-gated computer-use can be switched on via config
+# `enabledMcpServers` — so each name is ALSO disabled explicitly on every argv
+# (over-disabling is a no-op for servers that never load).
+_BUILTIN_MCP_SERVERS = ("github-mcp-server", "playwright", "bluebird",
+                        "computer-use")
 
 # --- Custom agents: an MCP channel --disable-mcp-server does NOT reach ----------------
 #
@@ -127,13 +140,30 @@ def _agent_definition_files(root: str) -> list[str]:
     return sorted(out)
 
 
+# Env vars that redirect git's own repository discovery. copilot finds its repo by
+# running `git rev-parse --show-toplevel` with the CHILD's environment, so any of
+# these being set means the repo (and its GitHub remote) can live somewhere no
+# .git-entry walk from the cwd would find.
+_GIT_ENV_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
+
+
+def _git_env_repo(env_map: Mapping[str, str]) -> bool:
+    """True when the child env redirects git discovery (see _GIT_ENV_VARS) — the
+    harness then treats a repo as POSSIBLE with an unknowable root."""
+    return any(env_map.get(v) for v in _GIT_ENV_VARS)
+
+
 def _nearest_git_root(cwd: str) -> Optional[str]:
-    """The first ancestor of ``cwd`` (inclusive) containing a ``.git`` entry — dir or
-    file (worktrees use a file) — or None. This is the boundary copilot's convention
-    walk stops at, and the trigger for its remote custom-agents listing (a git repo
-    is a precondition; the harness doesn't parse remotes — git config resolution
-    spans include directives and worktree indirection it can't replicate provably,
-    so ANY repo counts, the conservative direction)."""
+    """The first ancestor of ``cwd`` (inclusive) containing a ``.git`` entry — dir
+    or file (worktrees use a file) — or None. A conservative approximation of what
+    copilot actually does (it runs ``git rev-parse --show-toplevel`` in the child
+    context): the harness counts ANY ``.git`` entry, valid repository or not,
+    because replicating git's own discovery provably — config include directives,
+    worktree/commondir indirection, ceiling dirs — isn't feasible, and the error
+    direction is safe: a ``.git`` entry git would reject only makes the harness
+    fail closed where copilot would have found no repo (loading nothing remote).
+    The inverse direction — a repo git finds that no ``.git`` entry reveals — is
+    covered by ``_git_env_repo`` (GIT_DIR & co in the child env)."""
     d = os.path.abspath(cwd)
     while True:
         if os.path.exists(os.path.join(d, ".git")):
@@ -144,24 +174,28 @@ def _nearest_git_root(cwd: str) -> Optional[str]:
         d = parent
 
 
-def _custom_agent_files(home: str, cwd: Optional[str]) -> list[str]:
+def _custom_agent_files(home: str, cwd: Optional[str],
+                        env_map: Mapping[str, str]) -> list[str]:
     """Every LOCAL custom-agent definition file discoverable for a run:
     ``<home>/agents`` plus the ``.github/agents`` / ``.claude/agents`` convention
     dirs of the run cwd and its ancestors up to the nearest git root (inclusive) —
     copilot's own walk boundary. Without a git root every ancestor is checked (the
     bundle's boundary resolution for repo-less dirs isn't provable, so the walk is
-    conservative there). Unlike the workspace MCP-config walk — where an
+    conservative there), and likewise when the child env redirects git discovery
+    (``_git_env_repo``) — the real boundary is then wherever ``git rev-parse``
+    lands, unknowable here. Unlike the workspace MCP-config walk — where an
     over-approximation just adds harmless disables — agent detection FAILS runs
     closed, so this walk mirrors copilot's boundary instead of over-walking to the
     filesystem root (a ~/.claude/agents outside the repo must not kill in-repo
     runs copilot would never read it for)."""
+    boundary_unknown = _git_env_repo(env_map)
     dirs = [os.path.join(home, "agents")]
     if cwd:
         d = os.path.abspath(cwd)
         while True:
             for rel in _WORKSPACE_AGENT_DIRS:
                 dirs.append(os.path.join(d, *rel.split("/")))
-            if os.path.exists(os.path.join(d, ".git")):
+            if not boundary_unknown and os.path.exists(os.path.join(d, ".git")):
                 break
             parent = os.path.dirname(d)
             if parent == d:
@@ -173,17 +207,88 @@ def _custom_agent_files(home: str, cwd: Optional[str]) -> list[str]:
     return files
 
 
+def _jsonc_strip(text: str) -> str:
+    """Reduce copilot's accepted JSONC to strict JSON: remove ``//`` line comments
+    (full-line AND inline), ``/* */`` block comments, and trailing commas before a
+    closing ``}``/``]`` — all string-aware, so ``//`` or ``/*`` or ``,]`` INSIDE a
+    string value stays data. This is the grammar copilot 1.0.64 actually accepts,
+    live-verified via ``copilot mcp list`` against fixture configs: all three
+    comment styles and trailing commas parse; JSON5 forms (unquoted keys, single
+    quotes) do NOT — copilot errors out on them, so this transform deliberately
+    leaves them to fail json.loads."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    in_str = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] not in "\r\n":
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        if c == ",":
+            # trailing comma iff only whitespace/comments sit between it and }/]
+            j = i + 1
+            while j < n:
+                cj = text[j]
+                if cj in " \t\r\n":
+                    j += 1
+                elif cj == "/" and j + 1 < n and text[j + 1] == "/":
+                    while j < n and text[j] not in "\r\n":
+                        j += 1
+                elif cj == "/" and j + 1 < n and text[j + 1] == "*":
+                    j += 2
+                    while j + 1 < n and not (text[j] == "*" and text[j + 1] == "/"):
+                        j += 1
+                    j += 2
+                else:
+                    break
+            if j < n and text[j] in "}]":
+                i += 1              # drop the comma; the gap is consumed next passes
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _jsonc_loads(text: str) -> Any:
+    """json.loads over copilot-compatible JSONC (see _jsonc_strip). Raises
+    ValueError exactly where copilot's own parser errors out."""
+    return json.loads(_jsonc_strip(text))
+
+
 def _load_copilot_config(path: str) -> Optional[Any]:
-    """``config.json`` parsed with copilot's JSONC-ish tolerance (full-line ``//``
-    comments stripped), or None when unreadable/unparseable."""
+    """``config.json`` parsed with copilot's JSONC tolerance — line/inline/block
+    comments and trailing commas (the same live-verified grammar the user
+    mcp-config.json gets, see _jsonc_strip) — or None when unreadable/unparseable
+    (copilot's config loader treats an unparseable file as empty)."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = f.read()
     except OSError:
         return None
-    text = "\n".join(ln for ln in raw.splitlines() if not ln.lstrip().startswith("//"))
     try:
-        return json.loads(text)
+        return _jsonc_loads(raw)
     except ValueError:
         return None
 
@@ -230,52 +335,34 @@ def _config_channel_token(extra_args: list[str]) -> Optional[str]:
 #
 # On win32, copilot additionally discovers MCP servers through the Windows MCP registry:
 # it reads the string value "Command" under HKLM\SOFTWARE\Microsoft\Windows\
-# CurrentVersion\Mcp, executes `<that command> mcp list` (from its own workspace, with
-# its child environment, UTF-8), parses the JSON `servers` array from its stdout, and
-# registers each named server — unwrapping `entry.server ?? entry`, then sanitizing the
-# name to the charset [0-9a-zA-Z_./@-] per UTF-16 code UNIT (others become "_"; an astral
-# char is two surrogate units → "__") and de-colliding duplicates by appending an
-# FNV-1a-32 hash of the original name (then _2, _3, ...). All of this is read out of the
-# 1.0.64 bundle (app.js, the "ODR load"/"ODR convert" pipeline); no flag, env var, or
-# setting turns it off. The helpers below reproduce that resolution exactly — including
-# the child cwd/env and per-UTF-16-unit sanitization — so the resolved names can be fed
-# to --disable-mcp-server; anything short of a positive enumeration while the registry
-# gate is on FAILS CLOSED (RuntimeError) — the alternative is a run with un-disabled
-# registry servers live. Over-enumerating is safe: --disable-mcp-server tolerates names
-# copilot doesn't load (verified 1.0.64), so servers copilot itself would skip (no usable
-# packages/remotes) are just disabled no-ops. Bitness matters twice: the registry read
-# carries copilot's exact KEY_READ|KEY_WOW64_64KEY access mask (the 64-bit view from any
+# CurrentVersion\Mcp, executes `<that command> mcp list` itself, parses the JSON
+# `servers` array from its stdout, and registers each named server (1.0.64 bundle, the
+# "ODR load"/"ODR convert" pipeline); no flag, env var, or setting turns the mechanism
+# off. The harness therefore treats a POPULATED gate as un-hermetic and FAILS CLOSED:
+# earlier revisions executed the registry command too and pre-disabled the resolved
+# names, but copilot runs the command a SECOND, independent time — a stateful or
+# time-varying command can hand the two processes different listings, leaving a server
+# enabled that the harness never saw, and no cwd/env/bitness matching closes that gap.
+# What remains is gate DETECTION, which must still be exact: the value is read with
+# copilot's KEY_READ|KEY_WOW64_64KEY access mask (the 64-bit registry view from any
 # harness bitness — a 32-bit default would read WOW6432Node, where an absent key would
-# fake the gate "off"), and a 32-bit harness process fails closed outright in
-# _mcp_disable_args, because the WOW64 file-system redirector would still remap a
-# System32-homed command executable at launch (System32 → SysWOW64) while 64-bit
-# copilot runs the real one.
+# fake the gate "off"), and blank-vs-populated is judged with the same ECMAScript
+# trim()+falsy test copilot applies. A 32-bit harness process still fails closed
+# outright in _mcp_disable_args (WOW64 file-system redirection desyncs everything
+# else it reads from 64-bit copilot's view).
 _ODR_REGISTRY_SUBKEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Mcp"
-_ODR_NAME_BAD_CHARS = re.compile(r"[^0-9a-zA-Z_./@-]")
 
 # ECMAScript whitespace — the exact set /\s/ tests AND String.prototype.trim() strips
 # (identical by spec: WhiteSpace ∪ LineTerminator; verified identical by exhaustive
 # code-point sweep under node v24, the runtime copilot ships on). It differs from
 # Python's str whitespace in both directions: U+001C–U+001F and U+0085 are
-# Python-space but NOT JS-space (they glue into a JS token), while U+FEFF is JS-space
-# but NOT Python-space (a BOM-prefixed registry value trims clean in copilot). The
-# bundle's ODR pipeline trims the registry value and splits the command line with
-# these semantics, so the harness must use this set — str.split(None)/isspace() would
-# hand the same fully-qualified executable different ARGUMENTS than copilot passes,
-# enumerating a different listing.
+# Python-space but NOT JS-space, while U+FEFF is JS-space but NOT Python-space. The
+# bundle judges the registry value with `value?.trim()` then a falsy test, so the
+# gate-on/gate-off decision must use this set: with str.strip(), a value of only
+# U+FEFF would read gate-ON here while copilot reads it blank (gate off), and one
+# of only U+001C the reverse.
 _JS_WS = ("\t\n\x0b\x0c\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
           "\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
-_JS_WS_SET = frozenset(_JS_WS)
-# JS LineTerminator — what `.` in the bundle's unquoted-branch regex can NOT match.
-_JS_LT = "\n\r\u2028\u2029"
-# Mirror of the bundle's /^([^\s]+)\s*(.*)$/ with the JS classes made explicit:
-# first token = maximal non-JS-ws run, then a JS-ws run, then a remainder free of
-# LineTerminators, anchored to the true end (\Z — JS `$` without /m). A command line
-# this can't match (a line terminator interrupting the tail) makes copilot's parser
-# throw, which its ODR loader catches and treats as "no ODR servers".
-_ODR_UNQUOTED_RE = re.compile(
-    "^([^{ws}]+)[{ws}]*([^{lt}]*)\\Z".format(ws=re.escape(_JS_WS),
-                                             lt=re.escape(_JS_LT)))
 
 
 def _js_trim(s: str) -> str:
@@ -320,135 +407,13 @@ def _odr_registry_command() -> Optional[str]:
     return _js_trim(value)
 
 
-def _split_odr_command(cmdline: str) -> tuple[str, list[str]]:
-    """Split the registry command line the way copilot does (1.0.64 bundle): a leading
-    double-quoted token or the first whitespace-delimited token is the executable; the
-    rest splits on unquoted whitespace with bare quote toggling (no escapes).
-
-    "Whitespace" is ECMAScript whitespace throughout (``_JS_WS`` — the class the
-    bundle's ``/\\s/`` tests and its ``trim()`` calls strip), NOT Python's: with
-    ``str.split(None)``/``isspace()`` a command like ``C:\\odr.exe<U+001C>arg`` would
-    hand the harness a different (exe, args) split than copilot's — same executable,
-    different listing. The unquoted branch mirrors the bundle's
-    ``/^([^\\s]+)\\s*(.*)$/`` exactly (``_ODR_UNQUOTED_RE``): a line terminator
-    interrupting the tail makes that regex fail, which copilot's ODR loader catches
-    and treats as "no ODR servers" — here it raises instead (the caller fails
-    closed: conservative, since copilot provably loads nothing there)."""
-    s = _js_trim(cmdline)
-    if not s:
-        raise ValueError("empty ODR command line")
-    if s.startswith('"'):
-        end = s.find('"', 1)
-        if end < 0:
-            raise ValueError("unterminated quote in ODR command line")
-        exe, rest = s[1:end], _js_trim(s[end + 1:])
-    else:
-        m = _ODR_UNQUOTED_RE.match(s)
-        if m is None:
-            raise ValueError("unparseable ODR command line (line terminator in tail)")
-        exe, rest = m.group(1), _js_trim(m.group(2))
-    args: list[str] = []
-    buf, in_quote = "", False
-    for ch in rest:
-        if ch == '"':
-            in_quote = not in_quote
-            continue
-        if not in_quote and ch in _JS_WS_SET:
-            if buf:
-                args.append(buf)
-                buf = ""
-            continue
-        buf += ch
-    if buf:
-        args.append(buf)
-    return exe, args
-
-
-def _odr_fnv1a32(name: str) -> str:
-    """FNV-1a 32-bit over UTF-16 code units, hex — byte-for-byte the collision suffix
-    copilot computes (JS charCodeAt + Math.imul, unsigned at the end)."""
-    h = 2166136261
-    raw = name.encode("utf-16-le")
-    for i in range(0, len(raw), 2):
-        h ^= raw[i] | (raw[i + 1] << 8)
-        h = (h * 16777619) & 0xFFFFFFFF
-    return format(h, "x")
-
-
-def _odr_sanitize_name(name: str) -> str:
-    """Sanitize a server name to copilot's charset exactly as the 1.0.64 bundle does — a
-    JS ``String.prototype.replace(/[^0-9a-zA-Z_.\\/@-]/g, "_")``, which iterates UTF-16
-    code UNITS, not Unicode code points. An astral character (U+10000+) is two surrogate
-    units, each outside the charset, so it becomes ``__`` (two underscores) — matching
-    copilot; Python's per-code-point ``re.sub`` would emit only one. Every allowed char is
-    ASCII (a single unit < 0x80), so a unit is kept iff it's ASCII and in the charset."""
-    raw = name.encode("utf-16-le")
-    out: list[str] = []
-    for i in range(0, len(raw), 2):
-        unit = raw[i] | (raw[i + 1] << 8)
-        ch = chr(unit)
-        out.append(ch if unit < 0x80 and not _ODR_NAME_BAD_CHARS.match(ch) else "_")
-    return "".join(out)
-
-
-def _odr_resolved_names(servers: list) -> list[str]:
-    """The server names copilot would register from an ODR ``servers`` listing, in
-    listing order: sanitize each entry's name, then de-collide with the FNV-1a suffix
-    (of the ORIGINAL name) and _2/_3/... counters — mirroring the bundle's converter.
-    Each entry is unwrapped ``entry.server ?? entry`` first (copilot accepts both a bare
-    ``{"name": ...}`` and a wrapped ``{"server": {"name": ...}}`` shape; nullish-
-    coalescing means only a null/absent ``server`` falls back to the entry itself), and
-    its ``name`` is read off that target. Unnamed/non-object entries are skipped there too
-    (they don't join the collision set)."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for entry in servers:
-        if not isinstance(entry, dict):
-            continue
-        wrapped = entry.get("server")
-        target = wrapped if wrapped is not None else entry
-        name = target.get("name") if isinstance(target, dict) else None
-        if not isinstance(name, str) or not name:
-            continue
-        resolved = _odr_sanitize_name(name)
-        if resolved in seen:
-            hashed = f"{resolved}_{_odr_fnv1a32(name)}"
-            if hashed in seen:
-                n = 2
-                while f"{hashed}_{n}" in seen:
-                    n += 1
-                hashed = f"{hashed}_{n}"
-            resolved = hashed
-        seen.add(resolved)
-        out.append(resolved)
-    return out
-
-
-def _parse_odr_listing(stdout: str) -> list:
-    """The ``servers`` array from the ODR command's stdout — direct JSON, else the
-    first-``{``-to-last-``}`` slice (copilot tolerates banners the same way)."""
-    text = (stdout or "").strip()
-    if not text:
-        raise ValueError("empty ODR listing output")
-    data: Any = None
-    try:
-        data = json.loads(text)
-    except ValueError:
-        start, end = text.find("{"), text.rfind("}")
-        if start >= 0 and end > start:
-            data = json.loads(text[start:end + 1])
-    if not isinstance(data, dict):
-        raise ValueError("ODR listing output is not a JSON object")
-    servers = data.get("servers")
-    if not isinstance(servers, list):
-        raise ValueError("ODR listing output missing 'servers' array")
-    return servers
-
-
 def _mcp_server_names(path: str) -> list[str]:
-    """Server names declared in one MCP config JSON — ``{"mcpServers": {...}}`` (copilot's
-    user/workspace format) or ``{"servers": {...}}`` (the .vscode/mcp.json format).
-    Unreadable or invalid → [] (copilot would reject such a file too)."""
+    """Server names declared in one WORKSPACE MCP config — ``{"mcpServers": {...}}``
+    or the legacy ``{"servers": {...}}`` spelling. STRICT JSON on purpose:
+    workspace files do not get the user file's JSONC tolerance (live-verified
+    1.0.64 — a trailing comma makes ``copilot mcp list`` silently ignore the
+    workspace file), and an unreadable/invalid file → [] is exact parity with
+    copilot's own warn-and-treat-as-empty workspace loader."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -460,6 +425,44 @@ def _mcp_server_names(path: str) -> list[str]:
             block = data.get(key)
             if isinstance(block, dict):
                 names.extend(str(k) for k in block)
+    return names
+
+
+def _user_mcp_server_names(path: str) -> list[str]:
+    """Server names from the USER mcp-config.json (``$COPILOT_HOME`` else
+    ``~/.copilot``). copilot 1.0.64 parses THIS file as JSONC — line, inline, and
+    block comments plus trailing commas, all live-verified via ``copilot mcp
+    list`` (three JSONC-declared fixture servers listed) — so the strict parser
+    the workspace files get would silently MISS servers a JSONC-only user config
+    declares. A file that exists but doesn't parse (or can't be read) fails
+    closed: live-verified, copilot itself errors out on such a file ('Failed to
+    read configuration ... mcpServers: Required' for garbage and for the JSON5
+    forms its parser rejects), and enumerating nothing where copilot would load
+    something is exactly the hole Phase 0 forbids. Only an ABSENT file is no
+    servers."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise RuntimeError(
+            f"user MCP config {path!r} exists but can't be read ({exc}) — its "
+            "servers can't be enumerated; failing closed."
+        )
+    try:
+        data = _jsonc_loads(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"user MCP config {path!r} exists but does not parse as the JSONC "
+            f"copilot accepts ({exc}) — its servers can't be enumerated (copilot "
+            "1.0.64 itself errors out on such a file); failing closed."
+        )
+    names: list[str] = []
+    if isinstance(data, dict):
+        block = data.get("mcpServers")
+        if isinstance(block, dict):
+            names.extend(str(k) for k in block)
     return names
 
 
@@ -632,22 +635,6 @@ def _win_fully_qualified(path: str) -> bool:
     return tail[:1] in ("\\", "/")          # lettered X: — qualified only when rooted
 
 
-def _win_exe_has_extension(exe: str) -> bool:
-    """Mirror of libuv's ``name_has_ext`` test (``search_path`` in src/win/process.c,
-    verified against v1.51.0): the FIRST dot in the filename portion — everything after
-    the last ``\\``, ``/`` or ``:`` — followed by at least one character. Node/libuv only
-    tries the EXACT filename first when this holds (Node never sets
-    UV_PROCESS_WINDOWS_FILE_PATH_EXACT_NAME); an extensionless name is probed as
-    ``<name>.com`` then ``<name>.exe`` instead — never the exact file that CreateProcess
-    (which appends nothing to a command containing a path) executes. When it holds and
-    the exact file exists, both resolvers pick that same file; when the file is missing,
-    the harness's launch fails and the enumeration fails closed. Pure string logic so it
-    is unit-testable on any host; only consulted on win32."""
-    name = exe.replace("/", "\\").rpartition("\\")[2].rpartition(":")[2]
-    dot = name.find(".")
-    return dot != -1 and dot != len(name) - 1
-
-
 def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
     """The directory copilot reads its user config (``mcp-config.json``, ``config.json``)
     from: ``$COPILOT_HOME`` when non-empty (an EMPTY value is unset to copilot too —
@@ -777,27 +764,33 @@ def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
     return resolved
 
 
-# Plugin state lives in ~/.copilot/config.json: "installedPlugins" records carry an
-# absolute cache_path the loader follows even when installed-plugins/ is masked empty
-# (verified 1.0.64 — an empty mirrored plugin dir still exposed a plugin's MCP server).
-_COPILOT_PLUGIN_STATE_KEYS = ("installedPlugins", "enabledPlugins")
+# Config keys the sanitizer drops. Plugin state lives in ~/.copilot/config.json:
+# "installedPlugins" records carry an absolute cache_path the loader follows even
+# when installed-plugins/ is masked empty (verified 1.0.64 — an empty mirrored
+# plugin dir still exposed a plugin's MCP server). "enabledMcpServers" switches on
+# feature-gated built-in servers (the staff-gated computer-use in 1.0.64) that
+# --disable-builtin-mcps does not cover — those are also disabled by name via
+# _BUILTIN_MCP_SERVERS, this strip is the config-side half.
+_COPILOT_CONFIG_STRIP_KEYS = ("installedPlugins", "enabledPlugins",
+                              "enabledMcpServers")
 
 
 def _sanitized_copilot_config(real_path: str) -> str:
     """Sanitizing mask for ~/.copilot/config.json: keep everything (auth tokens,
-    settings), drop the plugin registrations, and FORCE
+    settings), drop the plugin registrations and the built-in-server enablement
+    list (``_COPILOT_CONFIG_STRIP_KEYS``), and FORCE
     ``customAgents.defaultLocalOnly`` — the documented setting (``copilot help
     config``) that is the only off-switch for remote custom-agent discovery, whose
     org/enterprise listings can carry MCP servers outside the --disable-mcp-server
     set (see the custom-agents comment at the top of this module). The file is
-    JSONC-ish — full-line ``//`` comments above/inside the JSON — handled by
-    ``_load_copilot_config``. Unreadable/unparseable → the same neutral-but-hermetic
-    shape (fail closed: no plugins, no remote agents; auth loss surfaces loudly
-    rather than servers silently loading)."""
+    JSONC — line/inline/block comments and trailing commas, the live-verified
+    grammar — handled by ``_load_copilot_config``. Unreadable/unparseable → the
+    same neutral-but-hermetic shape (fail closed: no plugins, no remote agents;
+    auth loss surfaces loudly rather than servers silently loading)."""
     data = _load_copilot_config(real_path)
     if not isinstance(data, dict):
         data = {}
-    for key in _COPILOT_PLUGIN_STATE_KEYS:
+    for key in _COPILOT_CONFIG_STRIP_KEYS:
         data.pop(key, None)
     agents_cfg = data.get("customAgents")
     if not isinstance(agents_cfg, dict):
@@ -822,11 +815,15 @@ class CopilotAdapter(Adapter):
     # skills/agents are unavailable in isolated runs. mcp-config.json is replaced with the
     # empty shape copilot actually accepts: bare "{}" fails validation with "mcpServers:
     # Required" (verified 1.0.64), which would kill the run before execution.
-    # _mcp_disable_args additionally disables every *enumerable* server by name on argv,
-    # which also covers probes, judge runs, and non-isolated runs (where plugins remain a
-    # documented gap). On Windows the same argv layer enumerates the ODR registry servers
-    # (HKLM\...\CurrentVersion\Mcp) via copilot's own resolution pipeline and disables
-    # them too — or fails closed when they can't be enumerated (see _odr_mcp_server_names).
+    # _mcp_disable_args additionally disables every *enumerable* server by name on argv
+    # — the built-in/feature-gated names unconditionally (--disable-builtin-mcps'
+    # help names only github-mcp-server; see _BUILTIN_MCP_SERVERS), the user config
+    # with copilot's live-verified JSONC grammar, and the workspace configs — which
+    # also covers probes, judge runs, and non-isolated runs (where plugins remain a
+    # documented gap). On Windows the same argv layer FAILS CLOSED whenever the ODR
+    # registry gate (HKLM\...\CurrentVersion\Mcp) is populated: copilot executes the
+    # registry command itself, so pre-enumerating its listing cannot be sound (see
+    # _assert_odr_gate_off).
     # Custom agents are one more channel — their frontmatter mcp-servers start OUTSIDE
     # the --disable-mcp-server set (see the module comment): agents/ is masked to an
     # empty dir, the sanitized config.json gets customAgents.defaultLocalOnly forced
@@ -861,11 +858,15 @@ class CopilotAdapter(Adapter):
 
     def _mcp_disable_args(self, cwd: Optional[str],
                           env: Optional[Mapping[str, str]] = None) -> list[str]:
-        """``--disable-mcp-server <name>`` for every enumerable server: the user config
-        ($COPILOT_HOME else ~/.copilot, mcp-config.json), the workspace configs copilot
-        discovers from the run cwd upward, and — on Windows — the ODR registry servers
-        (enumerated the same way copilot does, or failing closed; see the module-level
-        helpers). Resolution uses the *child's* env (``env``; exec.execute() passes the
+        """``--disable-mcp-server <name>`` for every enumerable server: the built-in /
+        feature-gated in-process servers (``_BUILTIN_MCP_SERVERS`` — unconditionally,
+        since --disable-builtin-mcps names only github-mcp-server in 1.0.64), the user
+        config ($COPILOT_HOME else ~/.copilot, mcp-config.json, parsed as copilot's
+        JSONC), and the workspace configs copilot discovers from the run cwd upward. On
+        Windows the ODR registry gate is NOT enumerated — a populated gate fails the
+        whole invocation closed instead (``_assert_odr_gate_off``: copilot runs the
+        registry command itself, so a harness re-execution can't prove it sees the same
+        listing). Resolution uses the *child's* env (``env``; exec.execute() passes the
         exact subprocess environment) so a scenario's ``env: {COPILOT_HOME: ...}``
         override or an isolated run's repointed HOME enumerates the config the child
         will actually read — a relative home anchoring to the child's ``cwd``, where
@@ -906,7 +907,7 @@ class CopilotAdapter(Adapter):
         # LOCAL agent definition — or the possibility of a REMOTE org/enterprise
         # listing (git-repo cwd, config not provably opted out) — fails closed
         # before anything is enumerated.
-        agent_files = _custom_agent_files(home, cwd)
+        agent_files = _custom_agent_files(home, cwd, env_map)
         if agent_files:
             shown = ", ".join(agent_files[:4]) + (", ..." if len(agent_files) > 4
                                                   else "")
@@ -922,20 +923,30 @@ class CopilotAdapter(Adapter):
                 "failing closed. Remove or relocate the agent files for harness "
                 "runs (isolation already masks <home>/agents to an empty dir)."
             )
-        if cwd and _nearest_git_root(cwd) and not _remote_agents_opted_out(home):
+        if (cwd and (_git_env_repo(env_map) or _nearest_git_root(cwd))
+                and not _remote_agents_opted_out(home)):
             raise RuntimeError(
-                f"the run cwd {cwd!r} sits inside a git repository and the config "
-                "copilot will read does not set customAgents.defaultLocalOnly: for "
-                "a GitHub-remoted repo with auth, copilot lists org/enterprise "
-                "custom agents remotely, and those can carry mcp-servers that "
-                "start OUTSIDE the --disable-mcp-server set (1.0.64 bundle) with "
-                "no flag to disable the listing — MCP hermeticity can't be "
-                "verified; failing closed. Isolated runs get the opt-out injected "
-                "into the sanitized config.json automatically; for a non-isolated "
-                'run set {"customAgents": {"defaultLocalOnly": true}} in the real '
+                f"the run cwd {cwd!r} sits inside a git repository (a .git entry, "
+                "or GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR in the child env) and the "
+                "config copilot will read does not set "
+                "customAgents.defaultLocalOnly: for a GitHub-remoted repo with "
+                "auth, copilot lists org/enterprise custom agents remotely, and "
+                "those can carry mcp-servers that start OUTSIDE the "
+                "--disable-mcp-server set (1.0.64 bundle) with no flag to disable "
+                "the listing — MCP hermeticity can't be verified; failing closed. "
+                "Isolated runs get the opt-out injected into the sanitized "
+                'config.json automatically; for a non-isolated run set '
+                '{"customAgents": {"defaultLocalOnly": true}} in the real '
                 "config.json."
             )
-        names = _mcp_server_names(os.path.join(home, "mcp-config.json"))
+        # Built-in / feature-gated in-process servers are seeded unconditionally:
+        # --disable-builtin-mcps documents only github-mcp-server in 1.0.64, while
+        # the bundle special-cases github-mcp-server, playwright, bluebird, AND the
+        # staff-feature-gated computer-use — which config `enabledMcpServers`
+        # (sanitized away under isolation) can switch on. Explicit names cost
+        # nothing: --disable-mcp-server tolerates servers that never load.
+        names = list(_BUILTIN_MCP_SERVERS)
+        names.extend(_user_mcp_server_names(os.path.join(home, "mcp-config.json")))
         if cwd:
             d = os.path.abspath(cwd)
             while True:
@@ -945,82 +956,40 @@ class CopilotAdapter(Adapter):
                 if parent == d:
                     break
                 d = parent
-        names.extend(self._odr_mcp_server_names(cwd=cwd, env=env_map))
+        self._assert_odr_gate_off()
         args: list[str] = []
         for name in dict.fromkeys(names):  # de-dupe, keep order
             args += ["--disable-mcp-server", name]
         return args
 
-    def _odr_mcp_server_names(self, cwd: Optional[str] = None,
-                              env: Optional[Mapping[str, str]] = None) -> list[str]:
-        """Resolved names of the Windows ODR registry servers, [] when the gate is off
-        (non-win32 or no registry command). The registry command is run the way copilot
-        runs it — from the child's workspace (``cwd``) with the child's environment
-        (``env``) and UTF-8 decoding — so a context-sensitive listing or a non-ASCII
-        server name resolves to exactly what copilot would register. The command's
-        executable must be a FULLY QUALIFIED path: a bare/relative name (``odr.exe``)
-        resolves through the launcher's own search rules — Python/CreateProcess searches
-        the HARNESS's application dir, cwd, and ambient PATH (the ``env=`` block is not
-        consulted), while copilot's Node/libuv searches with the CHILD's PATH — so the
-        two can execute DIFFERENT binaries and the harness would disable the wrong
-        listing's names while copilot loads the real one. On win32 it must also carry an
-        EXTENSION: even for a fully-qualified command, CreateProcess launches the exact
-        extensionless file while Node/libuv never tries an extensionless exact name,
-        probing ``<name>.com`` then ``<name>.exe`` instead (see
-        ``_win_exe_has_extension``) — again two different binaries. While the gate is ON,
-        any failure to positively enumerate — unreadable registry, unparseable command
-        line, a non-qualified or (win32) extensionless executable, the command
-        failing/timing out, output without a ``servers`` array — raises RuntimeError: those servers would otherwise load
-        un-disabled, so the invocation fails closed instead (exec.execute() turns that
-        into a failed run; probe_model into an unavailable model). Bitness is settled
-        before this runs: a 32-bit harness fails closed in ``_mcp_disable_args`` — the
-        WOW64 file-system redirector would remap a System32-homed executable to its
-        SysWOW64 mirror at the launch below while 64-bit copilot runs the real one."""
+    def _assert_odr_gate_off(self) -> None:
+        """Fail closed when the Windows ODR registry gate is ON (no-op when off:
+        non-win32, or key/value absent/blank under copilot's own trim+falsy test).
+
+        copilot executes the registry-advertised command ITSELF to discover MCP
+        servers. Earlier revisions executed it here too and pre-disabled the
+        resolved names, but the two executions are independent: a stateful or
+        time-varying command can hand the harness listing A and copilot listing B,
+        leaving B's servers enabled — no cwd/env/bitness matching closes a
+        two-execution gap, and nothing prevents or intercepts copilot's own ODR
+        load (no flag, env var, or setting — 1.0.64 bundle). So a populated gate
+        means MCP hermeticity cannot be proven for ANY invocation on this host:
+        RuntimeError (exec.execute() turns that into a failed run; probe_model
+        into an unavailable model)."""
         cmdline = _odr_registry_command()
         if not cmdline:
-            return []
-        try:  # pragma: no cover — needs a live ODR registry (win32); logic selftested via mocks
-            exe, args = _split_odr_command(cmdline)
-            fully_qualified = (_win_fully_qualified if sys.platform == "win32"
-                               else os.path.isabs)
-            if not fully_qualified(exe):
-                raise RuntimeError(
-                    f"the ODR registry command's executable {exe!r} is not a fully-"
-                    "qualified path — the harness (CreateProcess search: its own dirs "
-                    "and ambient PATH) and copilot (Node/libuv search: the child's "
-                    "PATH) could resolve and run DIFFERENT binaries, so this "
-                    "enumeration can't be trusted to match what copilot loads; "
-                    "failing closed."
-                )
-            if sys.platform == "win32" and not _win_exe_has_extension(exe):
-                raise RuntimeError(
-                    f"the ODR registry command's executable {exe!r} has no extension — "
-                    "CreateProcess (the harness) launches the exact extensionless file "
-                    "when the command carries a path, but copilot's Node/libuv skips an "
-                    "extensionless exact name and probes <name>.com then <name>.exe, so "
-                    "the two could run DIFFERENT binaries; failing closed."
-                )
-            # The harness is a 64-bit process here (32-bit failed closed upstream), so
-            # CreateProcess resolves a System32-homed exe to the REAL System32 exactly
-            # as copilot's 64-bit Node/libuv does — under WOW64 this same launch would
-            # silently run the SysWOW64 mirror instead.
-            r = subprocess.run([exe, *args, "mcp", "list"], capture_output=True,
-                               text=True, encoding="utf-8", timeout=15,
-                               stdin=subprocess.DEVNULL, cwd=cwd,
-                               env=dict(env) if env is not None else None)
-            if r.returncode != 0:
-                raise ValueError(f"ODR command exited with code {r.returncode}")
-            servers = _parse_odr_listing(r.stdout)
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(
-                "the Windows MCP registry (HKLM\\SOFTWARE\\Microsoft\\Windows\\"
-                "CurrentVersion\\Mcp) advertises MCP servers but they could not be "
-                f"enumerated ({exc}) — failing closed rather than running with "
-                "un-disabled registry servers live."
-            )
-        return _odr_resolved_names(servers)
+            return
+        raise RuntimeError(
+            "the Windows MCP registry gate is ON (HKLM\\SOFTWARE\\Microsoft\\"
+            f"Windows\\CurrentVersion\\Mcp advertises the ODR command {cmdline!r}): "
+            "copilot executes that command itself to discover MCP servers, and a "
+            "second, independent execution by the harness could be handed a "
+            "DIFFERENT listing (stateful or time-varying commands), so "
+            "pre-enumerating names to disable cannot prove hermeticity — and no "
+            "flag, env var, or setting prevents copilot's own ODR load; failing "
+            "closed. Clear the registry value (or run on a host without it) for "
+            "harness runs."
+        )
 
     def _parse_probe_cost(self, output: str) -> ProbeResult:
         import json as _json
