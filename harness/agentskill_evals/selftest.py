@@ -2804,10 +2804,29 @@ def run_selftest(verbose: bool = False) -> int:
                    via_cli == expected,
                    f"`codex --disable plugins mcp list --json` agrees on the fixture: "
                    f"{via_cli}", failures, verbose)
+            # This check needs a WORKING git, and `which` only proves a file exists —
+            # a broken install, an ownership/format refusal, or a shim answering for
+            # `git` all fail at run time. Treat that as "can't run this check" and skip
+            # it; a fixture that can't build its own precondition must never crash the
+            # suite (`check=True` here used to take every other check down with it).
+            # Global/system git config is neutralized so a developer's init template or
+            # hooks can't shape the fixture repo.
+            _troot = os.path.join(_codex_ws, "proj")
+            _git_env = {**_cx_env, "GIT_CONFIG_GLOBAL": os.devnull,
+                        "GIT_CONFIG_SYSTEM": os.devnull}
+            _git_ok = False
             if _sh.which("git"):
-                _troot = os.path.join(_codex_ws, "proj")
-                _sp.run(["git", "init", "-q", _troot], check=True,
-                        capture_output=True, env=_cx_env)
+                try:
+                    # a clean exit is not proof: verify the repo the check needs
+                    # actually exists (a stand-in answering for `git` can exit 0
+                    # having created nothing)
+                    _git_ok = (_sp.run(["git", "init", "-q", _troot],
+                                       capture_output=True, env=_git_env,
+                                       timeout=60).returncode == 0
+                               and os.path.isdir(os.path.join(_troot, ".git")))
+                except (OSError, ValueError, _sp.SubprocessError):
+                    _git_ok = False
+            if _git_ok:
                 with open(os.path.join(_codex_home, "config.toml"), "a") as fh:
                     fh.write(f'\n[projects."{os.path.realpath(_troot)}"]\n'
                              f'trust_level = "trusted"\n')
@@ -2821,7 +2840,7 @@ def run_selftest(verbose: bool = False) -> int:
                        f"inside its tree (even a subdir) and not from outside: "
                        f"in={in_proj}, out={outside}", failures, verbose)
             elif verbose:
-                print("  [skipped — git not installed] "
+                print("  [skipped — no working git] "
                       "codex.mcp_enumeration_trusted_project_by_cwd")
         elif verbose:
             print("  [skipped — codex CLI not installed] codex.mcp_enumeration_via_cli")
