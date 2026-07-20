@@ -82,9 +82,12 @@ _BUILTIN_MCP_SERVERS = ("github-mcp-server", "playwright", "bluebird",
 #
 # copilot 1.0.64 discovers custom-agent definitions (markdown with frontmatter) from
 # four sources: <config home>/agents, the .github/agents and .claude/agents convention
-# dirs walked from the working directory up to the git root, installed plugins, and —
-# when the working directory sits in a git repo with a GitHub remote and auth is
-# available — a REMOTE org/enterprise listing fetched from the Copilot API. Local files
+# dirs walked UP from the working directory to a boundary that is the git root when git
+# discovery finds a repo and the OS home ONLY when it does not (an either/or, not the
+# nearer of the two — read out of the 1.0.64 bundle: `boundary = found ? gitRoot :
+# os.homedir()`, so a home NESTED IN a repo is walked straight past), installed
+# plugins, and — when the working directory sits in a git repo with a GitHub remote
+# and auth is available — a REMOTE org/enterprise listing fetched from the Copilot API. Local files
 # are collected by a recursive **/*.md glob (symlinks followed, dot-entries skipped),
 # and both local frontmatter (`mcp-servers`) and remote listing entries can declare MCP
 # servers (all read out of the 1.0.64 bundle: the custom-agents loader and its remote
@@ -142,85 +145,44 @@ def _agent_definition_files(root: str) -> list[str]:
     return sorted(out)
 
 
-def _child_os_home(env_map: Mapping[str, str]) -> Optional[str]:
-    """The boundary copilot's convention-dir walk stops at — Node's ``os.homedir()``
-    (``$HOME`` on POSIX, ``%USERPROFILE%`` on win32), which copilot passes RAW to its
-    convention-dir collector — or None when that value cannot be proven to name the
-    same directory the walk compares against. None → the walk runs to the filesystem
-    root (over-approximation, the safe direction).
-
-    This is a PURE function of the child's environment: no second process, nothing that
-    could answer the harness and copilot differently (see _custom_agent_files).
-
-    The value is usable as a boundary only when it is set, non-empty, absolute, and
-    spelled EXACTLY as ``realpath`` renders it — the same canonical form the walk's
-    ``realpath``/``dirname`` chain produces:
-
-    * UNSET → Node falls back to an OS lookup (``getpwuid`` / ``GetUserProfileDirectory``)
-      the harness cannot mirror from the child's env alone.
-    * present but EMPTY → libuv's ``uv_os_getenv`` returns it verbatim; ``os.homedir()``
-      is ``""``, which matches no ancestor, so copilot walks to the root. Substituting
-      the account home would stop the harness EARLY of copilot.
-    * RELATIVE → likewise never matches an absolute ancestor; copilot walks to the root.
-    * any other spelling — a TRAILING SEPARATOR (``/home/u/``), a symlinked path, a
-      differing case — → Node keeps it verbatim and copilot's collector then fails to
-      match its own walk and climbs PAST the home, so the harness must not stop there
-      either. Comparing against ``realpath`` (not ``normpath``, which silently eats the
-      trailing separator) is what makes the trailing-slash spelling fail closed; a
-      filesystem root such as ``/`` or ``C:\\`` survives because ``realpath`` returns it
-      with its separator intact.
-
-    Every rejected case yields None, i.e. a walk at least as wide as copilot's — which
-    is also why plain ``os.path.isabs`` is good enough here despite the win32 UNC quirk
-    the home resolver works around: an under-reported "relative" only widens the walk."""
-    key = "USERPROFILE" if sys.platform == "win32" else "HOME"
-    h = env_map.get(key)
-    if not h or not os.path.isabs(h):
-        return None
-    try:
-        real = os.path.realpath(h)
-    except OSError:
-        return None
-    return real if real == h else None
-
-
-def _custom_agent_files(home: str, cwd: Optional[str],
-                        env_map: Mapping[str, str]) -> list[str]:
+def _custom_agent_files(home: str, cwd: Optional[str]) -> list[str]:
     """Every LOCAL custom-agent definition file discoverable for a run:
     ``<home>/agents`` plus the ``.github/agents`` / ``.claude/agents`` convention
     dirs of the PHYSICAL run cwd (``os.path.realpath`` — a cwd symlinked into a tree
-    finds the dirs copilot's own physical walk would) and its ancestors, stopping at
-    the child's OS home (inclusive) when — and only when — ``_child_os_home`` can prove
-    that value names the same directory the walk compares against. Otherwise the walk
-    runs to the filesystem root.
+    finds the dirs copilot's own physical walk would) and EVERY ancestor up to the
+    filesystem root. No boundary is applied, because none can be computed soundly.
 
-    That home bound is the ONLY narrowing applied, and it is deliberately the only one
-    that CAN be: it is computed from the child's environment alone. copilot's real walk
-    also stops at the git root when the cwd is in a repository, but the harness must not
-    use that. Learning it means EXECUTING git, and copilot executes git AGAIN when it
-    launches — two independent executions that a stateful or slow wrapper, a different
-    resolved binary, or a differing timeout can answer differently. Narrowing a security
-    scan on the first execution's answer would let copilot walk FARTHER than the harness
-    looked and start local agent MCP servers the harness never saw. This is exactly the
-    two-execution gap the Windows ODR gate refuses to bet on (_assert_odr_gate_off), and
-    it gets the same answer here: don't bet. Skipping the git bound only ever WIDENS the
-    scan — copilot's git root, when there is one, lies at or below the point this walk
-    reaches — so the result is a superset of what copilot reads in every case.
+    copilot stops that walk at a boundary its own loader picks per run: ``boundary =
+    gitDiscovery(cwd).found ? gitRoot : os.homedir()`` (1.0.64 bundle). Neither arm is
+    usable here.
 
-    Unlike the workspace MCP-config walk — where an over-approximation just adds harmless
-    disables — agent detection FAILS runs closed, which is why the home bound is worth
-    proving: it keeps a ``.claude/agents`` ABOVE the child's home, which copilot never
-    reads, from killing otherwise-valid runs. Every uncertainty still resolves toward the
-    wider walk."""
-    boundary = _child_os_home(env_map)
+    * The git root is unusable because learning it means EXECUTING git, and copilot
+      executes git AGAIN when it launches — two independent executions that a stateful
+      or slow wrapper, a different resolved binary, or a differing timeout can answer
+      differently. Narrowing a security scan on the first execution's answer would let
+      copilot walk FARTHER than the harness looked and start local agent MCP servers
+      the harness never saw. This is the same two-execution gap the Windows ODR gate
+      refuses to bet on (_assert_odr_gate_off), and it gets the same answer: don't bet.
+    * The OS home is unusable because the boundary is an EITHER/OR, not the nearer of
+      the two. When the child's home sits INSIDE a repository — ``HOME=/repo/home`` with
+      cwd ``/repo/home/ws`` — copilot's boundary is ``/repo`` and its walk goes straight
+      past the home to read ``/repo/.github/agents``. Stopping the harness at the home
+      would miss exactly that file, and ``defaultLocalOnly`` does not save the run: it
+      suppresses only REMOTE agents, so the missed local agent still brings its own
+      mcp-servers up. Deciding whether the home is the real boundary means deciding
+      whether git discovery succeeds — the execution above, again.
+
+    So the walk runs to the root. The cost is over-detection: a ``.github/agents`` above
+    the child's home, which copilot would never read, fails runs closed. That is the
+    direction this scan is required to err in — unlike the workspace MCP-config walk,
+    where an over-approximation just adds harmless disables, a MISSED agent file is a
+    silent MCP leak."""
     dirs = [os.path.join(home, "agents")]
     if cwd:
         d = os.path.realpath(cwd)
         while True:
             for rel in _WORKSPACE_AGENT_DIRS:
                 dirs.append(os.path.join(d, *rel.split("/")))
-            if boundary is not None and d == boundary:
-                break
             parent = os.path.dirname(d)
             if parent == d:
                 break
@@ -347,9 +309,9 @@ def _remote_agents_opted_out(home: str) -> bool:
 # computed (all verified against the installed 1.0.64: --help lists the first three,
 # --config-dir and --prefer-version are in the bundle but hidden from help):
 # --additional-mcp-config merges MORE servers into the session past the disable set;
-# --agent selects a custom agent whose frontmatter mcp-servers start OUTSIDE that set
-# (see the custom-agents comment above); --plugin-dir loads a plugin — whose definition
-# can declare mcpServers — from an arbitrary dir; --config-dir repoints the whole config
+# --agent selects a custom agent whose frontmatter mcp-servers the disable set cannot
+# NAME (see the custom-agents comment above); --plugin-dir loads a plugin — whose
+# definition can declare mcpServers — from an arbitrary dir; --config-dir repoints the whole config
 # home away from the one this adapter enumerated; --prefer-version can select a
 # DIFFERENT cached CLI version, past which the 1.0.64-specific safety assumptions this
 # adapter computed no longer hold; -C changes copilot's working directory BEFORE any
@@ -842,9 +804,9 @@ def _sanitized_copilot_config(real_path: str) -> str:
     list (``_COPILOT_CONFIG_STRIP_KEYS``), and FORCE
     ``customAgents.defaultLocalOnly`` — the documented setting (``copilot help
     config``) that is the only off-switch for remote custom-agent discovery, whose
-    org/enterprise listings can carry MCP servers outside the --disable-mcp-server
-    set (see the custom-agents comment at the top of this module). The file is
-    JSONC — line/inline/block comments and trailing commas, the live-verified
+    org/enterprise listings can carry MCP servers whose names --disable-mcp-server
+    has no way to learn (see the custom-agents comment at the top of this module).
+    The file is JSONC — line/inline/block comments and trailing commas, the live-verified
     grammar — handled by ``_load_copilot_config``. Unreadable/unparseable → the
     same neutral-but-hermetic shape (fail closed: no plugins, no remote agents;
     auth loss surfaces loudly rather than servers silently loading)."""
@@ -885,11 +847,13 @@ class CopilotAdapter(Adapter):
     # registry gate (HKLM\...\CurrentVersion\Mcp) is populated: copilot executes the
     # registry command itself, so pre-enumerating its listing cannot be sound (see
     # _assert_odr_gate_off).
-    # Custom agents are one more channel — their frontmatter mcp-servers start OUTSIDE
-    # the --disable-mcp-server set (see the module comment): agents/ is masked to an
-    # empty dir, the sanitized config.json gets customAgents.defaultLocalOnly forced
-    # (kills remote agent discovery), and _mcp_disable_args fails closed on any local
-    # agent file the masks can't reach (workspace convention dirs, non-isolated homes).
+    # Custom agents are one more channel, and the one --disable-mcp-server cannot be
+    # AIMED at: startServerOnce does honor the disable set, but agent-declared server
+    # NAMES are unenumerable — local frontmatter plus REMOTE org/enterprise listings the
+    # harness cannot read (see the module comment). So agents/ is masked to an empty
+    # dir, the sanitized config.json gets customAgents.defaultLocalOnly forced (kills
+    # remote agent discovery), and _mcp_disable_args fails closed on any local agent
+    # file the masks can't reach (workspace convention dirs, non-isolated homes).
     isolation_config_masks = {".copilot/mcp-config.json": '{"mcpServers": {}}',
                               ".copilot/installed-plugins": None,
                               ".copilot/agents": None,
@@ -971,15 +935,18 @@ class CopilotAdapter(Adapter):
         # mcp-server names, so presence of any LOCAL agent definition — or the
         # possibility of a REMOTE org/enterprise listing — fails closed before
         # anything is enumerated.
-        agent_files = _custom_agent_files(home, cwd, env_map)
+        agent_files = _custom_agent_files(home, cwd)
         if agent_files:
             shown = ", ".join(agent_files[:4]) + (", ..." if len(agent_files) > 4
                                                   else "")
             raise RuntimeError(
                 f"custom-agent definition file(s) [{shown}] are discoverable by "
                 "copilot (under <config home>/agents, or a .github/agents / "
-                ".claude/agents dir on the walk from the run cwd up to the child's "
-                "OS home): agent frontmatter can declare mcp-servers whose names the "
+                ".claude/agents dir on the walk from the run cwd up to the "
+                "filesystem root — copilot's own walk stops at the git root, or at "
+                "the OS home when the cwd is in no repo, but which of those applies "
+                "can only be learned by running git, so the harness scans wider): "
+                "agent frontmatter can declare mcp-servers whose names the "
                 "harness can't enumerate (local frontmatter plus unreadable REMOTE "
                 "org/enterprise listings), so it has nothing reliable to add to "
                 "--disable-mcp-server even though copilot's startServerOnce would "
