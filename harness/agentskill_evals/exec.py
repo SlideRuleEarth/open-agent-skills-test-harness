@@ -142,11 +142,13 @@ def execute(
     # itself; the launch window sits between those two reads, and the child runs code
     # inside it (copilot execs `git rev-parse` before it globs custom-agent dirs). So the
     # state is re-read now that the child is gone, and an adapter that finds it moved
-    # fails the run — see Adapter.verify_post_run. Detection, not prevention: a server
-    # started inside the window already ran. It is appended, never substituted, so a
-    # timeout or a nonzero exit keeps its own diagnosis alongside.
+    # fails the run — see Adapter.verify_post_run. The child's output goes with it: state
+    # that was changed and then changed BACK inside the window re-reads clean, and only
+    # the child's own report of the servers it brought up still shows it. Detection, not
+    # prevention: a server started inside the window already ran. It is appended, never
+    # substituted, so a timeout or a nonzero exit keeps its own diagnosis alongside.
     try:
-        adapter.verify_post_run(argv, opts, cwd=cwd)
+        adapter.verify_post_run(argv, opts, cwd=cwd, stdout=stdout, stderr=stderr)
     except Exception as exc:
         rr.error = ((rr.error + "; " if rr.error else "")
                     + f"MCP hermeticity was not confirmed after the run: {exc}")

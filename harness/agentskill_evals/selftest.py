@@ -1494,7 +1494,7 @@ def _check_mcp_hermetic_paths(failures, verbose):
         def parse(self, stdout, stderr, exit_code, *, opts=None):
             return ParseOutput()
 
-        def verify_post_run(self, argv, opts, *, cwd):
+        def verify_post_run(self, argv, opts, *, cwd, stdout="", stderr=""):
             raise RuntimeError("late.md appeared during the launch window")
 
     ex_late = _execute(_LateLeakCli(), "p", RunOptions(), cwd="/tmp", timeout=60)
@@ -1512,6 +1512,38 @@ def _check_mcp_hermetic_paths(failures, verbose):
                     .result.error or "").startswith("MCP hermeticity"),
            "an adapter with no preflight state to re-check is unaffected by the "
            "post-run hook", failures, verbose)
+
+    # execute() is not the only place the harness spawns an agent CLI: probe_model runs
+    # one per candidate model, against the same discovery paths, with the same launch
+    # window — and it does NOT go through execute(). It has to run the verifier itself,
+    # and a probe it can't clear must come back unavailable rather than merely un-audited.
+    class _LateLeakProbe(_LateLeakCli):
+        name = "lateleakprobe"
+
+        def _probe_argv(self, model, *, cwd=None, env=None):
+            return [sys.executable, "-c", "pass"]
+
+    _pv_ran: list = []
+
+    class _CleanProbe(_LateLeakProbe):
+        name = "cleanprobe"
+
+        def verify_post_run(self, argv, opts, *, cwd, stdout="", stderr=""):
+            # also pins WHAT the probe hands the verifier: its own fresh workspace and
+            # the env its argv was built from, not the harness's ambient context
+            _pv_ran.append((cwd, isinstance(opts.effective_env, dict)))
+
+    with contextlib.redirect_stderr(io.StringIO()):
+        _pv_leak = _LateLeakProbe().probe_model("m", timeout=30)
+        _pv_ok = _CleanProbe().probe_model("m", timeout=30)
+    _check("mcp_probe.probe_runs_the_post_run_verifier",
+           _pv_leak.accepted is False and _pv_ok.accepted is True
+           and len(_pv_ran) == 1 and os.path.isabs(_pv_ran[0][0])
+           and _pv_ran[0][1] and not os.path.exists(_pv_ran[0][0]),
+           f"a model probe is verified after it runs like any other child and fails "
+           f"closed when it can't be cleared, against the probe's own workspace and "
+           f"env: leak_accepted={_pv_leak.accepted} clean_accepted={_pv_ok.accepted} "
+           f"saw={_pv_ran!r}", failures, verbose)
 
     # On Windows process.env is case-insensitive, so a scenario `env: {copilot_home: ...}`
     # that dodges isolation's case-sensitive COPILOT_HOME pop would still be read by the
@@ -3137,12 +3169,18 @@ def _run_selftest_checks(verbose: bool = False) -> int:
            and _cop_masks.get(".copilot/installed-plugins", "x") is None
            and _cop_masks.get(".copilot/agents", "x") is None
            and callable(_cop_masks.get(".copilot/config.json"))
+           # settings.json takes the SAME sanitizer: 1.0.64 migrates user settings
+           # between the two files at startup, so a key stripped from one would ride
+           # back in through the other, which the overlay symlinks unless declared here
+           and _cop_masks.get(".copilot/settings.json")
+               is _cop_masks.get(".copilot/config.json")
            and get_adapter("copilot").isolation_config_homes
            == [("COPILOT_HOME", ".copilot", None)],
            "copilot masks mcp-config.json (valid empty shape), installed-plugins, "
            "agents/ (--disable-mcp-server cannot be AIMED at frontmatter mcp-servers: "
            "the names are unenumerable), and "
-           "sanitizes config.json; COPILOT_HOME mirrored", failures, verbose)
+           "sanitizes config.json AND settings.json (copilot moves keys between them); "
+           "COPILOT_HOME mirrored", failures, verbose)
 
     # the config.json sanitizer: plugin records there carry an absolute cache_path the
     # loader follows even when installed-plugins/ is masked empty (verified 1.0.64) — they
@@ -3443,6 +3481,53 @@ def _run_selftest_checks(verbose: bool = False) -> int:
             os.path.join(_optdir, ".mcp.json"))
     finally:
         _sh.rmtree(_optdir, ignore_errors=True)
+
+    # The opt-out lives in EITHER of copilot's two settings files, because 1.0.64 moves
+    # it between them: a value written into config.json is applied for that run and then
+    # migrated into settings.json (verified live against the installed CLI — the
+    # harness's own injected opt-out came back out of config.json and appeared intact in
+    # a settings.json copilot created). Reading only config.json makes the opt-out
+    # evaporate after the first run that touches the home, which strands non-isolated
+    # users in a loop: set the documented key, copilot relocates it, the next run fails
+    # closed telling them to set the key they already set. Which file WINS when the two
+    # disagree is decided in a native module, not readable JS — so a disagreement is not
+    # guessed at, it fails closed.
+    _twodir = _tmp.mkdtemp(prefix="ase-coptwo-")
+    try:
+        _tw_cfg = os.path.join(_twodir, "config.json")
+        _tw_set = os.path.join(_twodir, "settings.json")
+        _tw_on = '{"customAgents": {"defaultLocalOnly": true}}'
+        _tw_off = '{"customAgents": {"defaultLocalOnly": false}}'
+
+        def _tw(cfg, settings):
+            for p, body in ((_tw_cfg, cfg), (_tw_set, settings)):
+                if body is None:
+                    if os.path.exists(p):
+                        os.remove(p)
+                else:
+                    with open(p, "w") as fh:
+                        fh.write(body)
+            return copilot_mod._remote_agents_opted_out(_twodir)
+
+        # the migrated shape: config.json no longer carries it, settings.json does
+        tw_settings_only = _tw(None, _tw_on) is True
+        tw_config_only = _tw(_tw_on, None) is True
+        tw_both = _tw(_tw_on, _tw_on) is True
+        # neither set, and an explicit false, are not opted out
+        tw_neither = _tw(None, None) is False
+        tw_false = _tw(_tw_off, None) is False and _tw(None, _tw_off) is False
+        # disagreement fails closed in BOTH directions — no precedence is assumed
+        tw_conflict = _tw(_tw_on, _tw_off) is False and _tw(_tw_off, _tw_on) is False
+    finally:
+        _sh.rmtree(_twodir, ignore_errors=True)
+    _check("copilot.opt_out_read_from_both_settings_files",
+           tw_settings_only and tw_config_only and tw_both and tw_neither
+           and tw_false and tw_conflict,
+           "the remote-agent opt-out counts from config.json OR settings.json — copilot "
+           "migrates it between them at startup, so reading one file loses it after the "
+           "first run — while an explicit false, a missing key, and any DISAGREEMENT "
+           "between the two files (precedence being decided in a native module the "
+           "harness cannot read) all fail closed", failures, verbose)
     _check("copilot.jsonc_grammar_edges",
            jsonc_comment_ws and jsonc_unterminated and jsonc_bom_ok
            and opt_not_fabricated and opt_bom_ok and ws_bom_ok,
@@ -3655,27 +3740,13 @@ def _run_selftest_checks(verbose: bool = False) -> int:
             _hb_cop = os.path.join(_hb_home, ".copilot")
             os.makedirs(_hb_cwd)
             os.makedirs(_hb_cop)
-            # The repository whose root is copilot's boundary here. Nothing on the code
-            # path under test consults git — that is the whole point of the check — so
-            # the fixture only needs this GEOMETRY. Build a real repo anyway when a
-            # working git is available, so the fixture IS the scenario it describes
-            # rather than merely resembling it; an empty `.git` would not satisfy
-            # `git rev-parse` and must not be labelled as though it would. When git is
-            # missing or broken (the suite never depends on it) an inert marker dir
-            # stands in and the check runs identically.
-            _hb_git_env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
-                           "GIT_CONFIG_SYSTEM": os.devnull}
-            _hb_real_repo = False
-            if _sh.which("git"):
-                try:
-                    _hb_real_repo = (_sp.run(["git", "init", "-q", _hb_repo],
-                                             capture_output=True, env=_hb_git_env,
-                                             timeout=60).returncode == 0
-                                     and os.path.isdir(os.path.join(_hb_repo, ".git")))
-                except (OSError, ValueError, _sp.SubprocessError):
-                    _hb_real_repo = False
-            if not _hb_real_repo:      # synthetic stand-in: geometry only
-                os.makedirs(os.path.join(_hb_repo, ".git"), exist_ok=True)
+            # SYNTHETIC GEOMETRY, deliberately: a marker dir standing where copilot's
+            # boundary would be. The code under test never runs git — it walks to `/`
+            # precisely BECAUSE it refuses to trust a git it would have to execute — so a
+            # real repository would exercise nothing this doesn't, while costing an
+            # ambient subprocess (and its timeout) on every suite run. Nothing below reads
+            # `.git`; it marks the spot for the reader.
+            os.makedirs(os.path.join(_hb_repo, ".git"), exist_ok=True)
             with open(os.path.join(_hb_cop, "config.json"), "w") as fh:
                 fh.write('{"customAgents": {"defaultLocalOnly": true}}')
 
@@ -3793,6 +3864,58 @@ def _run_selftest_checks(verbose: bool = False) -> int:
                    f"agent file fails the re-check closed: "
                    f"server={pr_late_server[:60]!r} agent={pr_late_agent[:60]!r}",
                    failures, verbose)
+
+            # ...but re-reading state cannot catch a change that is UNDONE before the
+            # child exits: plant, let copilot load the server, restore the original bytes,
+            # and the post-run read is byte-identical to the pre-run one. The only witness
+            # left is copilot itself, which streams the status of every configured server.
+            # So the fixture below restores the clean state — the re-check above is now a
+            # no-op again, proving these arms fire on the STREAM and nothing else.
+            _sh.rmtree(os.path.join(_pr_cwd, ".github"))
+
+            def _pr_out(*events):
+                try:
+                    return ("" if _pr_cop_ad.verify_post_run(
+                        _pr_argv, _pr_opts, cwd=_pr_cwd,
+                        stdout="\n".join(_json.dumps(e) for e in events)) is None
+                        else "returned")
+                except RuntimeError as exc:
+                    return str(exc)
+
+            def _pr_loaded(*servers):
+                return {"type": "session.mcp_servers_loaded", "ephemeral": True,
+                        "data": {"servers": [{"name": n, "status": s}
+                                             for n, s in servers]}}
+
+            # the shape a real hermetic run emits, verbatim from 1.0.64 under the
+            # harness's flags: configured, listed, and disabled
+            pr_disabled_ok = _pr_out(_pr_loaded(("github-mcp-server", "disabled")),
+                                     {"type": "assistant.turn_end", "data": {}}) == ""
+            # the ABA case: nothing on disk moved, but copilot says it brought one up
+            pr_aba = _pr_out(_pr_loaded(("github-mcp-server", "disabled"),
+                                        ("planted", "connected")))
+            # a server that goes live LATER, after the loaded event said disabled
+            pr_changed = _pr_out(
+                _pr_loaded(("planted", "disabled")),
+                {"type": "session.mcp_server_status_changed", "ephemeral": True,
+                 "data": {"serverName": "planted", "status": "connected"}})
+            # `failed` still spawned the process, and a status a later version invents is
+            # not assumed inert — the allowlist is {disabled, not_configured}
+            pr_failed = _pr_out(_pr_loaded(("planted", "failed")))
+            pr_unknown = _pr_out(_pr_loaded(("planted", "quantum-superposed")))
+            # noise on stdout must not crash the reader or invent servers
+            pr_noise_ok = _pr_out({"type": "result", "exitCode": 0}) == "" and _pr_err() == ""
+            _check("copilot.post_run_stream_evidence_catches_reverted_leak",
+                   pr_disabled_ok and pr_noise_ok
+                   and all("planted" in r and "event stream" in r
+                           for r in (pr_aba, pr_changed, pr_failed, pr_unknown))
+                   and "github-mcp-server" not in pr_aba,
+                   f"a leak reverted before the child exits reads back clean on disk and "
+                   f"is caught anyway, because copilot's own event stream already named "
+                   f"the server it brought up (and a disabled one is not a leak): "
+                   f"disabled_ok={pr_disabled_ok} aba={pr_aba[:60]!r} "
+                   f"changed={bool(pr_changed)} failed={bool(pr_failed)} "
+                   f"unknown={bool(pr_unknown)}", failures, verbose)
         finally:
             _sh.rmtree(_pr_root, ignore_errors=True)
 

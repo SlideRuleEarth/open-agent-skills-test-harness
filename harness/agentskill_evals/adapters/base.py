@@ -175,6 +175,8 @@ class Adapter(ABC):
                 env = dict(os.environ)
                 if masked_home:
                     env = self.env(env, RunOptions(home=masked_home, isolation_env=iso_env))
+                probe_opts = RunOptions(home=masked_home, isolation_env=iso_env or {},
+                                        effective_env=env)
                 argv = self._probe_argv_compat(model, cwd=probe_ws, env=env)
             except Exception as exc:
                 # Overlay build failed, or the adapter couldn't guarantee a hermetic
@@ -191,6 +193,14 @@ class Adapter(ABC):
                     argv, capture_output=True, text=True, env=env, cwd=probe_ws,
                     timeout=timeout, stdin=subprocess.DEVNULL,
                 )
+                # A probe launches the same CLI against the same discovery paths as a real
+                # run, so it has the same launch window — and it is NOT routed through
+                # exec.execute(), which is where runs get their post-run check. Verify it
+                # here or a probe is the one un-audited child the harness spawns. Failing
+                # closed costs at most a model reported unavailable; not checking would let
+                # a probe start an MCP server and still report the model fine.
+                self.verify_post_run(argv, probe_opts, cwd=probe_ws,
+                                     stdout=r.stdout, stderr=r.stderr)
                 combined = r.stderr + r.stdout
                 lower = combined.lower()
                 if "not available" in lower or "invalid model" in lower or "unknown model" in lower:
@@ -199,6 +209,14 @@ class Adapter(ABC):
                     return ProbeResult(accepted=False)
                 return self._parse_probe_cost(combined)
             except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                return ProbeResult(accepted=False)
+            except Exception as exc:
+                # verify_post_run said the probe was not provably MCP-hermetic. The model
+                # may well be fine, but reporting it available would bless a child whose
+                # hermeticity broke — same fail-closed call as the argv-build failure above.
+                print(f"warning: [{self.name}] the model probe for {model!r} ran but its "
+                      f"MCP hermeticity could not be confirmed afterwards ({exc}); "
+                      f"reporting the model unavailable (fail-closed).", file=sys.stderr)
                 return ProbeResult(accepted=False)
         finally:
             if masked_home:
@@ -279,18 +297,32 @@ class Adapter(ABC):
         """
         raise NotImplementedError
 
-    def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str) -> None:
+    def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str,
+                        stdout: str = "", stderr: str = "") -> None:
         """Re-assert, after the child has exited, the premise ``argv`` was built on.
 
         ``build_argv`` reads filesystem state — config files, agent definitions — to
         decide what the invocation must disable. The child reads that same state AGAIN
         when it launches, and the two reads are separated by the launch window. An
         adapter whose hermeticity rests on the first read re-runs it here and raises if
-        the answer moved; exec.execute() turns the raise into a failed run.
+        the answer moved; the caller turns the raise into a failed run.
+
+        Two independent kinds of evidence are available, and an adapter that can use both
+        should, because they fail in opposite directions:
+
+        * The STATE the premise was read from, re-read now. Catches a change that
+          outlived the run — but a change that is reverted before the child exits leaves
+          this read looking exactly like the clean case (the ABA problem).
+        * The child's OWN ACCOUNT of what it did, in ``stdout``/``stderr``. An agent CLI
+          that reports which MCP servers it brought up is testifying about behaviour, not
+          about files, so reverting the files afterwards does not retract it. This is the
+          only evidence that survives a transient change; it is not sufficient alone,
+          because a child killed on timeout may never have reported anything.
 
         This is DETECTION, not prevention: it cannot un-start a server the child already
         launched. What it buys is that a leak inside that window becomes a loud failure
-        instead of a silently-passing run. Default: no preflight state to re-check.
+        instead of a silently-passing run. Called by exec.execute() for eval runs and by
+        probe_model for model probes. Default: no preflight state to re-check.
         """
         return None
 

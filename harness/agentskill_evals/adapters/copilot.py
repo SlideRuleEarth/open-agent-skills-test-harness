@@ -207,6 +207,53 @@ def _disabled_server_names(argv: list[str]) -> set[str]:
     return names
 
 
+# MCP host statuses that mean copilot did NOT bring the server up. 1.0.64's enum is
+# connected | failed | needs-auth | pending | disabled | not_configured; everything
+# outside this set counts as brought-up, including `failed` (a stdio server that failed
+# to initialize still had its command spawned) and any status a later version invents.
+_INERT_MCP_STATUSES = {"disabled", "not_configured"}
+
+
+def _live_mcp_servers(stdout: str) -> list[str]:
+    """The MCP servers copilot's own event stream says it brought up, as ``name (status)``.
+
+    ``--output-format json`` streams two ephemeral events that describe the MCP host:
+    ``session.mcp_servers_loaded`` (emitted right after initializeMcpHost(), one entry per
+    CONFIGURED server with its status — a disabled one is listed as ``disabled``, not
+    omitted) and ``session.mcp_server_status_changed`` (a later transition, e.g. a server
+    that connects mid-run). Both are read here; ``parse`` skips them only because they are
+    ephemeral streaming fragments, not because they are absent.
+
+    This is the one piece of evidence a launch-window leak cannot take back. Every other
+    check the adapter makes reads the filesystem, so a change that is reverted before the
+    child exits reads back clean — but copilot has already said, in its own output, which
+    servers it started. Verified against 1.0.64: with the harness's flags the sole entry
+    reports ``{"name": "github-mcp-server", "status": "disabled"}`` and never transitions,
+    while dropping --disable-builtin-mcps yields ``connected`` plus a status_changed event.
+
+    Absence proves nothing (a child killed on timeout may report nothing at all), which is
+    why this supplements the state re-check rather than replacing it.
+    """
+    live: dict[str, str] = {}
+
+    def note(name: object, status: object) -> None:
+        if isinstance(name, str) and name and str(status) not in _INERT_MCP_STATUSES:
+            live[name] = str(status)
+
+    for obj in iter_jsonl(stdout):
+        etype = obj.get("type")
+        data = obj.get("data") or {}
+        if etype == "session.mcp_servers_loaded":
+            servers = data.get("servers")
+            if isinstance(servers, list):
+                for srv in servers:
+                    if isinstance(srv, dict):
+                        note(srv.get("name"), srv.get("status"))
+        elif etype == "session.mcp_server_status_changed":
+            note(data.get("serverName"), data.get("status"))
+    return [f"{n} ({live[n]})" for n in sorted(live)]
+
+
 def _jsonc_strip(text: str) -> str:
     """Reduce copilot's accepted JSONC to strict JSON: replace ``//`` line comments
     (full-line AND inline) and ``/* */`` block comments with a SINGLE SPACE, and drop
@@ -307,16 +354,39 @@ def _load_copilot_config(path: str) -> Optional[Any]:
         return None
 
 
+# The two files copilot resolves user settings from. `customAgents` is a USER setting,
+# and 1.0.64 MIGRATES it between them at startup: a value written into config.json is
+# applied for that run and then moved into settings.json (verified live — the harness's
+# own injected opt-out came back out of config.json and appeared, intact, in a
+# settings.json copilot created). Reading only config.json therefore sees the opt-out
+# vanish after the first run that touches the home: harmless under isolation, which
+# rebuilds the home each time, but it strands NON-isolated users in a loop where they set
+# the documented key, copilot relocates it, and every later run fails closed telling them
+# to set the key they already set. Both files are read for that reason.
+_COPILOT_SETTINGS_FILES = ("config.json", "settings.json")
+
+
 def _remote_agents_opted_out(home: str) -> bool:
-    """True iff the config copilot will read provably disables remote custom-agent
+    """True iff the settings copilot will read provably disable remote custom-agent
     discovery: ``customAgents.defaultLocalOnly`` (documented in ``copilot help
     config``), the ONLY off-switch — the 1.0.64 loader short-circuits before its
     org/enterprise listing when it is set; no flag or env var exists. The isolation
     sanitizer injects it, so masked-home runs always pass this test; a missing or
-    unreadable config proves nothing and reads as not-opted-out."""
-    data = _load_copilot_config(os.path.join(home, "config.json"))
-    agents_cfg = data.get("customAgents") if isinstance(data, dict) else None
-    return isinstance(agents_cfg, dict) and agents_cfg.get("defaultLocalOnly") is True
+    unreadable config proves nothing and reads as not-opted-out.
+
+    Both of copilot's settings files count (see _COPILOT_SETTINGS_FILES), and a
+    DISAGREEMENT between them fails closed: which one wins is decided inside a native
+    module (``stateMigrateSettingsFromConfig``), not in readable JS, so the harness
+    declines to guess a precedence it cannot verify. Opted out means set somewhere and
+    contradicted nowhere.
+    """
+    seen: list[object] = []
+    for name in _COPILOT_SETTINGS_FILES:
+        data = _load_copilot_config(os.path.join(home, name))
+        agents_cfg = data.get("customAgents") if isinstance(data, dict) else None
+        if isinstance(agents_cfg, dict) and "defaultLocalOnly" in agents_cfg:
+            seen.append(agents_cfg["defaultLocalOnly"])
+    return bool(seen) and all(v is True for v in seen)
 
 
 # extra_args tokens that reopen MCP/configuration channels after the disable set is
@@ -870,13 +940,22 @@ class CopilotAdapter(Adapter):
     # file the masks can't reach (workspace convention dirs, non-isolated homes).
     # Every one of those layers reads state BEFORE launch, while copilot reads it again
     # for itself AFTER launch — and execs git in between. verify_post_run closes the
-    # report on that window by re-running the enumeration once the child has exited: it
-    # cannot stop a server that started, but a run that passes never had its premise
-    # broken underneath it.
+    # report on that window once the child has exited, from both sides: it re-runs the
+    # enumeration (catching a change that outlived the run) and reads copilot's own
+    # session.mcp_servers_loaded stream (catching one that was reverted before exit,
+    # which no amount of re-reading the filesystem could). It cannot stop a server that
+    # started, but a run that passes never had its premise broken underneath it.
+    # settings.json is masked with the SAME sanitizer as config.json because 1.0.64 moves
+    # user settings between the two files at startup (verified live: an injected
+    # customAgents opt-out left config.json and reappeared in a settings.json copilot
+    # created). Whatever `enabledPlugins` / `enabledMcpServers` / `customAgents` the strip
+    # removes from one file would otherwise ride back in through the other, which the
+    # overlay symlinks wholesale unless it is declared here.
     isolation_config_masks = {".copilot/mcp-config.json": '{"mcpServers": {}}',
                               ".copilot/installed-plugins": None,
                               ".copilot/agents": None,
-                              ".copilot/config.json": _sanitized_copilot_config}
+                              ".copilot/config.json": _sanitized_copilot_config,
+                              ".copilot/settings.json": _sanitized_copilot_config}
     # COPILOT_HOME replaces ~/.copilot wholesale (verified in 1.0.64's bundle) — without
     # mirroring it, a set var would bypass the masks above.
     isolation_config_homes = [("COPILOT_HOME", ".copilot", None)]
@@ -1104,8 +1183,10 @@ class CopilotAdapter(Adapter):
         argv += opts.extra_args
         return argv
 
-    def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str) -> None:
-        """Re-run the enumeration ``argv`` was built from; fail the run if it moved.
+    def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str,
+                        stdout: str = "", stderr: str = "") -> None:
+        """Audit the finished run two ways: what copilot SAID it loaded, and whether the
+        state the disable set was computed from still says the same thing.
 
         _mcp_disable_args reads the agent dirs and MCP configs BEFORE launch; copilot
         reads them again FOR ITSELF at startup. Between those two reads copilot runs
@@ -1115,7 +1196,7 @@ class CopilotAdapter(Adapter):
         add a server entry in that window — copilot discovers it, and the disable set
         computed a moment earlier does not name it.
 
-        Neither escape the reviewer's finding suggests is available. The discovery paths
+        Neither escape the original finding suggests is available. The discovery paths
         cannot be made immutable: they are every ancestor of the cwd up to ``/`` plus a
         config home the child owns (isolation masks ``<home>/agents`` to an empty dir,
         but the child runs as the same uid and can write into it, and can chmod back
@@ -1123,13 +1204,29 @@ class CopilotAdapter(Adapter):
         harness trusts, because the harness has no more trustworthy git to bind it to —
         it would resolve the same PATH and get the same answer.
 
-        What is available is to READ AGAIN once the window has closed. A leak inside it
-        then costs a failed run instead of passing silently, which is the guarantee this
-        adapter can actually keep: not "no server ever started", but "no run reported
-        clean had its hermeticity premise broken". Re-executing the scan is sound in the
-        direction it is used — unlike the git preflight this branch refuses (which would
-        CLEAR a gate on the first of two executions), a second scan can only ADD
-        failures, never bless a run.
+        So the window is audited rather than closed, from two directions:
+
+        1. THE CHILD'S OWN REPORT (_live_mcp_servers). Copilot streams
+           session.mcp_servers_loaded / session.mcp_server_status_changed naming every
+           configured server and its status. Any server not reported inert was brought
+           up, and no later edit to the filesystem retracts that. This is what catches
+           the ABA shape the state re-check structurally cannot: plant an agent file or
+           a config entry, let copilot load it and start the server, restore the original
+           bytes before exit. The re-read below then sees exactly the clean state it saw
+           before — but copilot has already testified, in the output the harness
+           captured, that the server was live.
+        2. THE STATE, RE-READ. Catches a change that outlived the run, and covers the
+           case report (1) cannot make: a child killed on timeout, or one that died
+           before its MCP host initialized, emits no such event, and absence of the event
+           is not evidence of absence of a server.
+
+        Neither is sufficient alone; a leak now has to survive both, which means being
+        reverted before exit AND never appearing in copilot's own event stream. A shim
+        answering for ``git`` outside the process can do the first and not the second.
+
+        Re-executing the enumeration is sound in the direction it is used — unlike the
+        git preflight this branch refuses (which would CLEAR a gate on the first of two
+        executions), a second scan can only ADD failures, never bless a run.
 
         The whole enumeration is re-run, not just the agent scan: the same window is
         open on mcp-config.json and the workspace configs, where a late entry is a
@@ -1141,6 +1238,15 @@ class CopilotAdapter(Adapter):
         observe, and this scan errs toward the loud answer like every other one on this
         path. Relocate such fixtures outside the discovery tree.
         """
+        live = _live_mcp_servers(stdout)
+        if live:
+            raise RuntimeError(
+                f"copilot's own event stream reports MCP server(s) {', '.join(live)} as "
+                "brought up during this run, but a hermetic invocation leaves every "
+                "configured server 'disabled'. The state on disk may read clean now — a "
+                "config or agent file planted inside the launch window and reverted "
+                "before exit would — but the run itself was not MCP-hermetic."
+            )
         try:
             after = _disabled_server_names(
                 self._mcp_disable_args(cwd, env=opts.effective_env))
