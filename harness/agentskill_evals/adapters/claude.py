@@ -22,7 +22,8 @@ import json
 from typing import Any, Optional
 
 from ..schema import EventKind, NormalizedEvent
-from .base import Adapter, ParseOutput, ProbeResult, RunOptions, extract_command, extract_path, iter_jsonl, warn_unknown_usage
+from .base import (Adapter, ParseOutput, ProbeResult, RunOptions, VersionProvenance,
+                   extract_command, extract_path, iter_jsonl, warn_unknown_usage)
 
 _FILE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Create"}
 _READ_TOOLS = {"Read", "View"}
@@ -38,6 +39,113 @@ _KNOWN_RESULT_KEYS = {
     "permission_denials", "stop_reason", "terminal_reason", "api_error_status",
     "fast_mode_state", "uuid",
 }
+
+
+# --- CLI version provenance (see base.VersionProvenance) ---------------------------
+#
+# 2.1.113: verified 2026-07-21. Three things were actually checked, because a constant
+#          that blesses an unknown state is worse than no constant:
+#            * `--strict-mcp-config` still exists and still means what the argument here
+#              rests on — `--help` describes it as "Only use MCP servers from
+#              --mcp-config, ignoring all other MCP configurations". That single flag
+#              carries this adapter's whole MCP argument, so it is the marker worth
+#              auditing; there is no per-version channel inventory to go stale because
+#              this adapter never enumerates channels.
+#            * The witness below holds live: six captured 2.1.113 runs all report
+#              `mcp_servers: []` in their init event.
+#            * The parser contract: the `result` events of those same six runs carry no
+#              key outside _KNOWN_RESULT_KEYS.
+_VERIFIED_VERSIONS = ("2.1.113",)
+_VERIFIED_ON = "2026-07-21"
+
+# Builds found to actively break an assumption. Empty is the normal state.
+_DENIED_VERSIONS: dict[str, str] = {}
+
+_PROVENANCE = VersionProvenance(
+    agent="claude",
+    verified=_VERIFIED_VERSIONS,
+    verified_on=_VERIFIED_ON,
+    denied=_DENIED_VERSIONS,
+    analysis="MCP hermeticity + parser analysis",
+    witness_held=(
+        "  The runtime witness held: the CLI reported an empty MCP server list, so "
+        "--strict-mcp-config did what this adapter relies on it for. That does NOT cover "
+        "a discovery channel the flag stopped governing: if a newer build grew a server "
+        "source outside --mcp-config's reach, the list would be empty for the wrong "
+        "reason and look identical here."),
+    witness_absent=(
+        "  This run reported no MCP server list at all — it did not complete far enough "
+        "to emit its init event, which is allowed but proves nothing about its MCP host. "
+        "So --strict-mcp-config was NOT confirmed effective here."),
+    clear_hint=(
+        "To clear it: confirm `claude --help` still documents --strict-mcp-config as "
+        "ignoring all MCP configuration outside --mcp-config, then add the version to "
+        "_VERIFIED_VERSIONS in adapters/claude.py."),
+)
+
+
+def _stream_cli_version(stdout: str) -> Optional[str]:
+    """The CLI version that actually EXECUTED, read out of the child's own stream.
+
+    Claude states this directly: the ``system``/``init`` event carries
+    ``claude_code_version`` as a first-class scalar the CLI writes about itself. That is
+    the whole reason this is trustworthy — it needs no second execution, so it cannot
+    disagree with what ran, unlike a preflight ``claude --version`` which resolves its own
+    code path and can honestly report a build the real invocation never used.
+
+    It is also structural, not prose: nothing a model emits and nothing the workspace
+    contains reaches this field, so it cannot be forged by an assistant message or by a
+    repo laid out to look like a version string. (Copilot has to reconstruct its version
+    from skill paths and pays for that in care; here there is nothing to reconstruct.)
+
+    Returns None when the event is absent or malformed — both mean the version is unknown,
+    which warns rather than fails. Must not raise: this runs inside verify_post_run, where
+    anything raised is reported as an MCP hermeticity failure, and malformed telemetry is
+    not one.
+    """
+    for obj in iter_jsonl(stdout):
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") != "system" or obj.get("subtype") != "init":
+            continue
+        version = obj.get("claude_code_version")
+        if isinstance(version, str) and version:
+            return version
+    return None
+
+
+def _mcp_witness(stdout: str, exit_code: int) -> tuple[Optional[str], list[str], bool]:
+    """Check the run's own account of its MCP host. Returns (violation, live, witnessed).
+
+    The init event lists ``mcp_servers``; under ``--strict-mcp-config`` with no
+    ``--mcp-config`` passed, a hermetic run reports that list empty. Reading it from the
+    run being judged is what makes this immune to the ABA problem that any
+    inspect-the-disk-afterwards check has: a config planted inside the launch window and
+    reverted before exit leaves the filesystem looking clean, but the CLI already loaded
+    it and says so here.
+
+    A run that did not complete normally is EXCUSED (witnessed=False) rather than failed:
+    a crash before the init event is not evidence of a leak. That distinction is why
+    `witnessed` is threaded into the drift warning — claiming the witness held on a run
+    that never produced one would be the notice inventing its own evidence.
+    """
+    for obj in iter_jsonl(stdout):
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") != "system" or obj.get("subtype") != "init":
+            continue
+        servers = obj.get("mcp_servers")
+        if not isinstance(servers, list):
+            # The field this contract is read from is gone or reshaped. On a run that
+            # otherwise completed, that is a contract violation rather than a clean
+            # result: "no servers found" and "the field moved" are indistinguishable
+            # outcomes, and only one of them is safe.
+            return ("the init event carries no `mcp_servers` list", [], False)
+        live = [str(s.get("name") if isinstance(s, dict) else s) for s in servers]
+        return (None, live, True)
+    if exit_code == 0:
+        return ("the run completed but emitted no system/init event", [], False)
+    return (None, [], False)
 
 
 class ClaudeAdapter(Adapter):
@@ -111,6 +219,41 @@ class ClaudeAdapter(Adapter):
             argv += ["--tools", ""]  # reasoning-only (judge mode)
         argv += opts.extra_args
         return argv
+
+    def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str,
+                        stdout: str = "", stderr: str = "", exit_code: int = 0) -> None:
+        """Confirm from the run's own stream that it was MCP-hermetic, and record which
+        build produced that evidence.
+
+        Ordered the same way as copilot's, and for the same reasons. The denylist runs
+        FIRST because it covers exactly what the runtime evidence cannot: a defect that
+        leaves the witness perfectly intact fires no runtime check at all. The drift
+        warning runs LAST, only on a run that cleared every gate, so a genuine hermeticity
+        failure is never buried under a version notice.
+        """
+        version = _stream_cli_version(stdout)
+        _PROVENANCE.check_denied(version)
+        broken, live, witnessed = _mcp_witness(stdout, exit_code)
+        if broken is not None:
+            raise RuntimeError(
+                f"claude's MCP witness does not hold: {broken}. The run finished normally, "
+                "and that stream is where the ABA-immune half of this audit gets its "
+                "evidence — a hermetic run on a build this adapter understands always "
+                "reports its MCP server list. A witness that is missing or reshaped yields "
+                "'no servers found', which reads exactly like a clean run, so it is "
+                "refused instead: the run's hermeticity is unwitnessed rather than "
+                "confirmed; failing closed."
+            )
+        if live:
+            raise RuntimeError(
+                f"claude reports MCP server(s) {', '.join(sorted(live))} loaded during "
+                "this run, but --strict-mcp-config with no --mcp-config should leave that "
+                "list empty. Either the flag no longer governs every server source, or "
+                "something in this invocation supplied one. The state on disk may read "
+                "clean now — a config planted inside the launch window and reverted "
+                "before exit would — but the run itself was not MCP-hermetic."
+            )
+        _PROVENANCE.warn_drift(version, witnessed=witnessed)
 
     def parse(self, stdout: str, stderr: str, exit_code: int,
                *, opts: Optional[RunOptions] = None) -> ParseOutput:

@@ -27,10 +27,58 @@ import sys
 from typing import Any, Mapping, Optional
 
 from ..schema import EventKind, NormalizedEvent
-from .base import Adapter, ParseOutput, ProbeResult, RunOptions, extract_command, extract_path, iter_jsonl, try_load_json, warn_unknown_usage
+from .base import (Adapter, ParseOutput, ProbeResult, RunOptions, VersionProvenance,
+                   extract_command, extract_path, iter_jsonl, try_load_json,
+                   warn_unknown_usage)
 
 
 _KNOWN_USAGE_KEYS = {"input_tokens", "output_tokens", "reasoning_tokens", "total_tokens"}
+
+# --- CLI version provenance (see base.VersionProvenance) ---------------------------
+#
+# 0.140.0: the build every finding in this file was established against; confirmed the
+#          installed build on 2026-07-21 (`codex --version` -> codex-cli 0.140.0, and a
+#          rollout written by a live run recorded cli_version 0.140.0).
+_VERIFIED_VERSIONS = ("0.140.0",)
+_VERIFIED_ON = "2026-07-21"
+
+# Why there is no version to read, established by experiment on 2026-07-21 rather than
+# assumed — and worth stating precisely, because it is a trade-off this harness CHOSE
+# rather than a limitation codex imposes:
+#
+#   * `codex exec --json` names no version anywhere in its stream. A complete successful
+#     run emits exactly four events — thread.started (thread_id only), turn.started,
+#     item.completed, turn.completed — and none carries one.
+#   * codex DOES record it, in the rollout file's `session_meta.cli_version`, keyed by an
+#     `id` equal to the stream's thread_id. That would qualify: it is written by the run
+#     being judged, so it has the same epistemics as any other run telemetry.
+#   * But `--ephemeral`, which this adapter passes deliberately for isolation, suppresses
+#     the rollout entirely. Verified both directions: with `--ephemeral` no rollout file
+#     appears for the run's thread_id; without it one does, carrying cli_version.
+#
+# So the version is purchasable only by giving up the isolation `--ephemeral` buys, and
+# that is the wrong trade — hermeticity is the property under test, provenance is the
+# audit trail for it. A `codex --version` probe is not an alternative: the standing rule
+# is that a fact learned by executing the program again may not clear a security decision,
+# and since a probe could only ever be allowed to WARN, it buys nothing over this.
+_VERSION_UNREADABLE = (
+    "`codex exec --json` emits no version in its stream, and the one place codex records "
+    "it (session_meta.cli_version in the rollout file) is suppressed by the `--ephemeral` "
+    "flag this adapter passes for isolation"
+)
+
+_PROVENANCE = VersionProvenance(
+    agent="codex",
+    verified=_VERIFIED_VERSIONS,
+    verified_on=_VERIFIED_ON,
+    unreadable=_VERSION_UNREADABLE,
+    analysis="MCP hermeticity analysis",
+    clear_hint=(
+        "There is nothing to clear per-run. Check `codex --version` against the list "
+        "above out of band; if it differs, re-establish the findings in adapters/codex.py "
+        "(each is marked with the version it was verified on) and update "
+        "_VERIFIED_VERSIONS."),
+)
 
 # What `codex mcp add` accepts as a server name (verified 0.140.0: "use letters, numbers,
 # '-', '_'") — exactly the TOML bare-key charset, so any addable name works in an unquoted
@@ -295,6 +343,22 @@ class CodexAdapter(Adapter):
         argv += opts.extra_args
         argv += [prompt]  # prompt is positional and must come last
         return argv
+
+    def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str,
+                        stdout: str = "", stderr: str = "", exit_code: int = 0) -> None:
+        """Record that this run's codex build is, and will remain, unidentifiable.
+
+        There is no denylist check here and there cannot be one: every tier that keys off
+        a version needs a version, and this adapter has none to give. VersionProvenance
+        refuses at import time to hold a denylist alongside ``unreadable`` for exactly that
+        reason — a denied entry that can never match looks identical to a denylist with
+        nothing in it.
+
+        The MCP argument itself is unaffected: it rests on the pre-launch enumeration and
+        its post-verify re-check in ``_verify_all_mcp_disabled``, which are evidence about
+        this run's configuration rather than about which build read it.
+        """
+        _PROVENANCE.warn_drift(None)
 
     def parse(self, stdout: str, stderr: str, exit_code: int,
                *, opts: Optional[RunOptions] = None) -> ParseOutput:

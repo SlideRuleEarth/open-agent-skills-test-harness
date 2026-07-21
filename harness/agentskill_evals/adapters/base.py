@@ -19,7 +19,7 @@ import shutil
 import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from ..isolation import build_mcp_masked_home, config_home_entries
 from ..schema import NormalizedEvent
@@ -401,6 +401,173 @@ class Adapter(ABC):
         than to the stream itself needs it to locate that side-channel.
         """
         raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# CLI version provenance
+# ---------------------------------------------------------------------------
+#
+# Every adapter here encodes findings about a CLI that ships on its own schedule and
+# rewrites its own executable in place. Provenance kept only in prose comments rots
+# silently: the copilot adapter was verified against 1.0.64 and was running against
+# 1.0.72 four days later with nothing noticing, so its safety argument had been eight
+# minor versions stale without a single signal. This turns that into dated, actionable
+# drift.
+#
+# Three tiers, and it matters WHICH of them are prevention (none of them are):
+#
+#   1. contract violation  -> fail   (the adapter's own runtime evidence; not this code)
+#   2. denylisted version  -> fail   (post-run DETECTION; see check_denied)
+#   3. unrecognized version-> warn once per process, run proceeds
+#
+# The standing rule this code exists inside: a fact learned by executing a program the
+# harness independently executes again may not CLEAR a security decision. Version
+# telemetry may WARN; only the runtime contract may PASS a run. That is why nothing here
+# ever returns "safe" — it only ever adds a failure or a warning.
+
+# Warned (agent, version) pairs, so the drift notice fires once per process rather than
+# once per cell — a warning repeated on every cell of a model matrix is one nobody reads.
+# Keyed by AGENT as well as version: a global key would let the first runner in a mixed
+# matrix silence every other runner's notice.
+_WARNED_VERSIONS: set[tuple[str, str]] = set()
+
+
+@dataclass(frozen=True)
+class VersionProvenance:
+    """Which builds of one CLI an adapter's analysis has actually been checked against.
+
+    Provenance as queryable data rather than prose. The dated findings stay in comments
+    where they explain themselves; this is the source of truth the code acts on.
+
+    ``unreadable`` is the interesting field. Not every CLI states its version in the
+    telemetry of the run being judged, and where it does not, the honest answer is that
+    the harness does not know what ran — never a version recovered by executing the CLI
+    a second time. A ``--version`` probe resolves its own code path and can truthfully
+    report a build the real invocation never used, so it cannot clear anything; and since
+    it can only ever be used to warn, it buys nothing a blanket "unknown" does not.
+    """
+
+    agent: str
+    # Builds this adapter's analysis has actually been checked against, oldest first.
+    verified: tuple[str, ...]
+    verified_on: str            # ISO date of the most recent verification
+    # What to tell the operator to do about a drift warning. Per-CLI because the audit
+    # that clears one is per-CLI.
+    clear_hint: str
+    # What was verified, named precisely in the warning. "the MCP hermeticity analysis"
+    # tells a reader which claim just went stale; "the analysis" makes them go and find
+    # out. Worth a field because the whole point of the notice is to be actionable.
+    analysis: str = "analysis"
+    # Builds found to actively BREAK an assumption, mapped to what broke. Empty is the
+    # normal state. This tier exists for defects the runtime contract CANNOT see — a
+    # build that breaks, say, plugin masking leaves the MCP witness perfectly intact, so
+    # no runtime check ever fires and the failure has to be recorded here by hand.
+    denied: Mapping[str, str] = field(default_factory=dict)
+    # The two halves of "what this run's runtime evidence does and does not cover",
+    # chosen by the `witnessed` argument to warn_drift. Two strings rather than one
+    # because a run that did not complete normally is EXCUSED from producing evidence,
+    # and a notice that claims the evidence held anyway is inventing the very check it
+    # is warning about — the sentence a reader would quote to justify shipping.
+    witness_held: str = ""
+    witness_absent: str = ""
+    # Set when the run's own telemetry cannot state the executing version at all. The
+    # string is the REASON, and it is printed: "we don't know" is only actionable if it
+    # says why, and whether that is a property of the CLI or a trade-off this harness
+    # chose is exactly what a maintainer needs in order to revisit it.
+    unreadable: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        # A denylist on an adapter that can never learn the version is dead code that
+        # LOOKS like a control. `check_denied` is reached with None on every such run, so
+        # every entry silently fails to fire — and the person who added the entry has no
+        # way to tell, because a denylist that never matches looks exactly like a
+        # denylist with nothing to match. Refuse at import time instead.
+        if self.unreadable is not None and self.denied:
+            raise ValueError(
+                f"{self.agent}: this adapter declares that the executing version cannot "
+                f"be read from a run ({self.unreadable}), but also lists denied versions "
+                f"{sorted(self.denied)}. Those entries can never fire — the denylist is "
+                "only ever consulted with a version read from the run's own telemetry. "
+                "Either find a version source in the run's output, or record the broken "
+                "build somewhere a human reads rather than somewhere that looks enforced."
+            )
+        if not self.verified and self.unreadable is None:
+            raise ValueError(
+                f"{self.agent}: no verified versions recorded, so every run would warn "
+                "and the warning would carry no baseline to compare against."
+            )
+
+    def check_denied(self, version: Optional[str]) -> None:
+        """Fail a run that turns out to have executed a build KNOWN to break an assumption.
+
+        POST-RUN DETECTION, NOT PREVENTION, and the distinction is not pedantic: by the
+        time this fires the CLI has already run to completion. If the denylisted defect
+        is that a build silently loads an MCP server, that server was reachable for the
+        whole run and whatever it did is already done. What this buys is that the run is
+        reported as FAILED rather than passing — the result never enters the record as
+        evidence — not that the build was kept away from anything.
+
+        It cannot be moved earlier, and that is a property of these CLIs rather than a
+        shortcut taken here: the executing version is knowable only from the run's own
+        output (package metadata names a version a self-rewriting executable no longer
+        is), and the standing rule bars clearing a security decision with a fact learned
+        by executing the same program a second time. A pre-launch gate would be guessing
+        with more ceremony.
+        """
+        if version is None or version not in self.denied:
+            return
+        raise RuntimeError(
+            f"this run executed {self.agent} {version}, which is on this adapter's "
+            f"denylist: {self.denied[version]}. A defect recorded here is one the "
+            "runtime contract cannot see, so no runtime check catches it — the run is "
+            "failed by version instead. Note this is detection AFTER the fact: the "
+            "version is only readable from the run's own output, so the CLI has already "
+            "executed and any side effect of that defect has already happened; what is "
+            "prevented is the RESULT counting. Pin a different CLI build before running "
+            "again."
+        )
+
+    def warn_drift(self, version: Optional[str], *, witnessed: bool = False) -> None:
+        """Warn once per version that a run executed a build the analysis has not been
+        checked against. A WARNING, not a failure — and deliberately so.
+
+        What a newer build can do, and what nothing at runtime can see, is introduce a
+        discovery channel that was never enumerated because no code was ever written to
+        enumerate it. You cannot detect the absence of a check you never wrote. The
+        message says that explicitly, because the danger is a green run being read as
+        covering it.
+        """
+        import sys
+
+        if version is not None and version in self.verified:
+            return
+        key = (self.agent, version or "")
+        if key in _WARNED_VERSIONS:
+            return
+        _WARNED_VERSIONS.add(key)
+
+        if self.unreadable is not None:
+            # Not drift — a standing limitation. Phrased as one, because "could not be
+            # determined" invites the reader to go look for the version, and here there
+            # is nothing to find.
+            print(
+                f"warning: [{self.agent}] this harness cannot tell which {self.agent} "
+                f"build executed: {self.unreadable}. The {self.analysis} was verified "
+                f"against {'/'.join(self.verified)} ({self.verified_on}); whether THIS "
+                "run used one of those is unknown and cannot be established after the "
+                "fact.\n"
+                f"  {self.clear_hint}",
+                file=sys.stderr)
+            return
+
+        ran = f"CLI {version}" if version else "a CLI whose version could not be determined"
+        established = self.witness_held if witnessed else self.witness_absent
+        print(
+            f"warning: [{self.agent}] this run executed {ran}; the {self.analysis} was "
+            f"verified against {'/'.join(self.verified)} ({self.verified_on}).\n"
+            + (established + "\n" if established else "")
+            + f"  {self.clear_hint}",
+            file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------

@@ -2374,6 +2374,315 @@ def _check_exec_timeout_group_kill(failures, verbose):
     _check_exec_process_tree_handles(failures, verbose)
 
 
+def _check_version_provenance_shared(failures, verbose):
+    """The tiers, the warn-once bookkeeping and the "no version source" case, in base.py.
+
+    These are the parts every adapter shares, so a defect here is a defect in all four at
+    once. Two of them are the kind that fail SILENTLY, which is why they get arms rather
+    than trust: a denylist that can never match looks exactly like an empty denylist, and
+    a warn-once key that forgets the agent looks exactly like a matrix that had nothing to
+    warn about.
+    """
+    import io
+    import sys
+
+    from .adapters import base as _b
+
+    print("version provenance (shared):")
+
+    # --- a denylist an adapter can never enforce is refused at construction -----------
+    # The trap: check_denied() is reached with None on every run of an adapter that has no
+    # version source, so every denied entry silently fails to fire. Whoever added the entry
+    # gets no signal — a denylist that never matches is indistinguishable from one with
+    # nothing to match. This has to be a construction error or it is nothing.
+    unenforceable = ""
+    try:
+        _b.VersionProvenance(agent="ghost", verified=("1.0.0",), verified_on="2026-01-01",
+                             clear_hint="h", unreadable="no source in the stream",
+                             denied={"6.6.6": "loads a server silently"})
+    except ValueError as exc:
+        unenforceable = str(exc)
+    # ...and the same declaration WITHOUT the denylist is fine, so the arm is pinning the
+    # combination rather than just "unreadable adapters cannot be built".
+    built_ok = True
+    try:
+        _b.VersionProvenance(agent="ghost", verified=("1.0.0",), verified_on="2026-01-01",
+                             clear_hint="h", unreadable="no source in the stream")
+    except ValueError:
+        built_ok = False
+    _check("provenance.unenforceable_denylist_is_refused",
+           "can never fire" in unenforceable and built_ok,
+           f"declaring a denylist alongside `unreadable` raises at construction "
+           f"({unenforceable[:60]!r}), because such entries are reached only with a "
+           f"version that never arrives; the same adapter without a denylist builds fine",
+           failures, verbose)
+
+    # --- warn-once is keyed PER ADAPTER ---------------------------------------------
+    # A global key would mean the first runner in a mixed matrix silences every other
+    # runner's notice — each would be a different CLI with a different unverified build,
+    # and only one of them would ever be reported.
+    a = _b.VersionProvenance(agent="agent_a", verified=("1.0.0",), verified_on="d",
+                             clear_hint="hint A")
+    b = _b.VersionProvenance(agent="agent_b", verified=("1.0.0",), verified_on="d",
+                             clear_hint="hint B")
+    saved_warned = set(_b._WARNED_VERSIONS)
+    saved_err = sys.stderr
+    try:
+        _b._WARNED_VERSIONS.clear()
+        sys.stderr = io.StringIO()
+        a.warn_drift("9.9.9")
+        b.warn_drift("9.9.9")      # same version, different agent -> must still warn
+        a.warn_drift("9.9.9")      # repeat of a already-warned pair -> silent
+        mixed = sys.stderr.getvalue()
+    finally:
+        sys.stderr = saved_err
+        _b._WARNED_VERSIONS.clear()
+        _b._WARNED_VERSIONS.update(saved_warned)
+    _check("provenance.warn_once_is_keyed_per_adapter",
+           mixed.count("warning:") == 2
+           and "agent_a" in mixed and "agent_b" in mixed,
+           f"two runners on the same unverified version each warn once ("
+           f"{mixed.count('warning:')} warnings), rather than the first one silencing "
+           f"the second — the key is (agent, version), not version", failures, verbose)
+
+    # --- the "no version source" notice -------------------------------------------
+    # It must not read as drift ("you are on an unverified build"), because there is no
+    # build to name and nothing for the reader to go and look up. It must say WHY, or
+    # "unknown" is unactionable, and it must not claim any runtime evidence it never saw.
+    ghost = _b.VersionProvenance(
+        agent="ghost", verified=("1.0.0",), verified_on="2026-01-01",
+        clear_hint="check `ghost --version` out of band",
+        unreadable="the stream states no version",
+        witness_held="  The runtime witness held.",
+        witness_absent="  No witness.")
+    saved_warned = set(_b._WARNED_VERSIONS)
+    try:
+        _b._WARNED_VERSIONS.clear()
+        sys.stderr = io.StringIO()
+        ghost.warn_drift(None, witnessed=True)
+        ghost.warn_drift(None, witnessed=True)
+        unreadable_msg = sys.stderr.getvalue()
+    finally:
+        sys.stderr = saved_err
+        _b._WARNED_VERSIONS.clear()
+        _b._WARNED_VERSIONS.update(saved_warned)
+    _check("provenance.unreadable_says_why_and_claims_nothing",
+           unreadable_msg.count("warning:") == 1
+           and "the stream states no version" in unreadable_msg
+           and "1.0.0" in unreadable_msg
+           and "witness held" not in unreadable_msg,
+           f"an adapter with no version source warns once per process, names the REASON "
+           f"there is nothing to read (so the reader does not go hunting for a version "
+           f"that does not exist), cites the verified baseline, and — even when called "
+           f"with witnessed=True — claims no runtime evidence, because the notice is "
+           f"about an unknown build rather than about this run's hermeticity",
+           failures, verbose)
+
+
+def _check_claude_version_provenance(failures, verbose):
+    """claude states its version outright, and its init event doubles as the MCP witness.
+
+    Unlike copilot there is nothing to reconstruct: `claude_code_version` is a scalar the
+    CLI writes about itself in `system`/`init`. The arms that matter are therefore about
+    what happens when that event is ABSENT or RESHAPED — because "no servers found" and
+    "the field moved" produce identical-looking clean results, and only one is safe.
+    """
+    import io
+    import json as _json
+    import sys
+
+    from .adapters import claude as _cl
+
+    print("claude version provenance + MCP witness:")
+
+    def _init(**kw):
+        obj = {"type": "system", "subtype": "init", "mcp_servers": []}
+        obj.update(kw)
+        return _json.dumps(obj)
+
+    real = _init(claude_code_version="2.1.113")
+    # Model-controlled text: an assistant message is the one place a model can write
+    # whatever it likes. It must not be able to forge the version that silences a warning.
+    forged = _json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": '{"claude_code_version": "9.9.9"} claude_code_version 9.9.9'}]}})
+
+    ver_real = _cl._stream_cli_version(real)
+    ver_forged_only = _cl._stream_cli_version(forged)
+    ver_both = _cl._stream_cli_version(forged + "\n" + real)
+    ver_none = _cl._stream_cli_version("")
+    # Malformed telemetry must warn (version unknown), never raise: this runs inside
+    # verify_post_run, where anything raised is reported as an MCP hermeticity failure —
+    # and a mistyped field is not one.
+    raised = None
+    try:
+        malformed = _cl._stream_cli_version(
+            "\n".join([_json.dumps([1, 2, 3]),
+                       _json.dumps({"type": "system", "subtype": "init",
+                                    "claude_code_version": {"not": "a string"}}),
+                       "not json at all"]))
+    except Exception as exc:            # noqa: BLE001 — the point is that nothing escapes
+        raised, malformed = type(exc).__name__, None
+    _check("claude.version_read_from_the_run_not_a_probe",
+           ver_real == "2.1.113" and ver_forged_only is None and ver_both == "2.1.113"
+           and ver_none is None and malformed is None and raised is None,
+           f"the version comes from the CLI's own init event (real={ver_real!r}); "
+           f"model-controlled assistant text cannot supply one ({ver_forged_only!r}) nor "
+           f"outrank the real one ({ver_both!r}); an empty or malformed stream resolves to "
+           f"unknown ({ver_none!r}/{malformed!r}) rather than raising ({raised!r}), since a "
+           f"raise here would be reported as an MCP hermeticity failure", failures, verbose)
+
+    # --- the witness -----------------------------------------------------------------
+    ok = _cl._mcp_witness(real, 0)
+    live = _cl._mcp_witness(_init(claude_code_version="2.1.113",
+                                  mcp_servers=[{"name": "leaky"}]), 0)
+    # The field renamed/reshaped out from under the check, on a run that completed: this
+    # is the ABA-shaped failure — it yields an empty server list, which reads exactly like
+    # a hermetic run.
+    reshaped = _cl._mcp_witness(
+        _json.dumps({"type": "system", "subtype": "init", "mcpServers": []}), 0)
+    # A run that never got as far as its init event is EXCUSED, not failed — a crash is
+    # not evidence of a leak. But it is also not evidence of hermeticity, hence witnessed
+    # is False and the drift notice must not claim otherwise.
+    crashed = _cl._mcp_witness("", 1)
+    completed_silently = _cl._mcp_witness("", 0)
+    _check("claude.mcp_witness_fails_closed",
+           ok == (None, [], True)
+           and live[0] is None and live[1] == ["leaky"]
+           and reshaped[0] is not None and reshaped[2] is False
+           and crashed == (None, [], False)
+           and completed_silently[0] is not None,
+           f"a hermetic run witnesses an empty server list {ok}; a loaded server is "
+           f"surfaced {live}; a RESHAPED field fails closed rather than reading as clean "
+           f"{reshaped[0]!r}; a run that died before its init event is excused {crashed} "
+           f"while one that exited 0 with no witness at all is not "
+           f"{completed_silently[0]!r}", failures, verbose)
+
+    # --- the tiers, end to end through verify_post_run --------------------------------
+    from .adapters import base as _b
+    saved_denied = dict(_cl._DENIED_VERSIONS)
+    saved_warned = set(_b._WARNED_VERSIONS)
+    saved_err = sys.stderr
+    adapter = _cl.ClaudeAdapter()
+    try:
+        _cl._DENIED_VERSIONS.clear()
+        _cl._DENIED_VERSIONS["6.6.6"] = "loads MCP servers past --strict-mcp-config"
+        denied = ""
+        try:
+            adapter.verify_post_run([], None, cwd=".",
+                                    stdout=_init(claude_code_version="6.6.6"), exit_code=0)
+        except RuntimeError as exc:
+            denied = str(exc)
+        # A verified build that witnessed clean is entirely silent.
+        _b._WARNED_VERSIONS.clear()
+        sys.stderr = io.StringIO()
+        adapter.verify_post_run([], None, cwd=".", stdout=real, exit_code=0)
+        quiet = sys.stderr.getvalue()
+        # An unverified build warns once and does not claim evidence it lacks.
+        sys.stderr = io.StringIO()
+        adapter.verify_post_run([], None, cwd=".",
+                                stdout=_init(claude_code_version="9.9.9"), exit_code=0)
+        adapter.verify_post_run([], None, cwd=".",
+                                stdout=_init(claude_code_version="9.9.9"), exit_code=0)
+        warned = sys.stderr.getvalue()
+        # A live server fails the run outright.
+        leaked = ""
+        try:
+            adapter.verify_post_run([], None, cwd=".",
+                                    stdout=_init(claude_code_version="2.1.113",
+                                                 mcp_servers=[{"name": "leaky"}]),
+                                    exit_code=0)
+        except RuntimeError as exc:
+            leaked = str(exc)
+        # A run that died before its init event is excused from the witness — so it
+        # reaches the drift notice with NO MCP evidence at all. Claiming "the runtime
+        # witness held" there would be the notice inventing the very check it is warning
+        # about, which is the sentence a reader would quote to justify shipping.
+        _b._WARNED_VERSIONS.clear()
+        sys.stderr = io.StringIO()
+        adapter.verify_post_run([], None, cwd=".", stdout="", exit_code=1)
+        unwitnessed = sys.stderr.getvalue()
+    finally:
+        sys.stderr = saved_err
+        _cl._DENIED_VERSIONS.clear()
+        _cl._DENIED_VERSIONS.update(saved_denied)
+        _b._WARNED_VERSIONS.clear()
+        _b._WARNED_VERSIONS.update(saved_warned)
+    _check("claude.version_tiers",
+           "denylist" in denied and "AFTER the fact" in denied
+           and quiet == ""
+           and warned.count("warning:") == 1 and "9.9.9" in warned
+           and "strict-mcp-config" in warned
+           and "witness held" in warned
+           and "leaky" in leaked and "not MCP-hermetic" in leaked
+           and "witness held" not in unwitnessed
+           and "no MCP server list at all" in unwitnessed,
+           f"a denylisted build fails the run by name and says plainly that this is "
+           f"detection after the CLI already ran; a verified build that witnessed clean "
+           f"is silent; an unverified one warns ONCE per process and names the flag the "
+           f"whole argument rests on; a run that actually loaded a server fails outright; "
+           f"and a run that never produced a witness says so rather than claiming one "
+           f"held — a security notice that overstates its own evidence is worse than none",
+           failures, verbose)
+
+
+def _check_unreadable_version_adapters(failures, verbose):
+    """codex and antigravity cannot know which build ran — and say so rather than guess.
+
+    Both were checked empirically (see the constants in each adapter). The risk this arm
+    guards is not that they report the wrong version; it is that someone later "fixes" the
+    warning by wiring in a `--version` probe, which would report a build the run may never
+    have used, or adds a denylist entry that silently never fires.
+    """
+    import io
+    import sys
+
+    from .adapters import antigravity as _ag
+    from .adapters import base as _b
+    from .adapters import codex as _cx
+
+    print("codex/antigravity version provenance:")
+
+    saved_warned = set(_b._WARNED_VERSIONS)
+    saved_err = sys.stderr
+    try:
+        _b._WARNED_VERSIONS.clear()
+        sys.stderr = io.StringIO()
+        _cx.CodexAdapter().verify_post_run([], None, cwd=".", stdout="", exit_code=0)
+        _cx.CodexAdapter().verify_post_run([], None, cwd=".", stdout="", exit_code=0)
+        _ag.AntigravityAdapter().verify_post_run([], None, cwd=".", stdout="", exit_code=0)
+        both = sys.stderr.getvalue()
+    finally:
+        sys.stderr = saved_err
+        _b._WARNED_VERSIONS.clear()
+        _b._WARNED_VERSIONS.update(saved_warned)
+
+    _check("codex_antigravity.version_unreadable_is_stated_not_guessed",
+           both.count("warning:") == 2
+           and "--ephemeral" in both and "0.140.0" in both
+           and "1.1.1" in both
+           and _cx._PROVENANCE.unreadable is not None
+           and _ag._PROVENANCE.unreadable is not None
+           and not _cx._PROVENANCE.denied and not _ag._PROVENANCE.denied,
+           f"each warns once per process ({both.count('warning:')} total) and names why "
+           f"there is no version to read — codex's points at the `--ephemeral` flag this "
+           f"harness itself passes, which is the actionable part: the version is "
+           f"purchasable only by giving up the isolation it buys. Neither carries a "
+           f"denylist, which VersionProvenance would reject as unenforceable anyway",
+           failures, verbose)
+
+    # antigravity's constant must track the build its CHANNEL INVENTORY was established
+    # against (1.1.1), not the newer build that merely happens to be installed (1.1.2) —
+    # listing the latter because it "seems fine" is the constant blessing an unknown
+    # state, which is the prose-rot failure it was introduced to stop.
+    _check("antigravity.constant_tracks_the_verified_build_not_the_installed_one",
+           _ag._VERIFIED_VERSIONS == ("1.1.1",)
+           and "1.1.2" not in _ag._VERIFIED_VERSIONS,
+           f"antigravity records {_ag._VERIFIED_VERSIONS} — the build whose customization "
+           f"roots and plugin mcp_config channel were confirmed with live sentinel "
+           f"servers — so the newer installed build warns instead of being silently "
+           f"blessed", failures, verbose)
+
+
 def _check_copilot_version_provenance(failures, verbose):
     """Version drift is MESSAGED, never gated on — and the version is read from the run.
 
@@ -5965,6 +6274,9 @@ def _run_selftest_checks(verbose: bool = False) -> int:
 
     # CLI version drift: read from the run, tiered, and auditable
     _check_copilot_version_provenance(failures, verbose)
+    _check_version_provenance_shared(failures, verbose)
+    _check_claude_version_provenance(failures, verbose)
+    _check_unreadable_version_adapters(failures, verbose)
 
     # report inlining is capped per file; the judge's skip behavior is unchanged
     _check_inline_truncation(failures, verbose)
