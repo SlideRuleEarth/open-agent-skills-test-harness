@@ -74,50 +74,18 @@ def execute(
         return ExecResult(rr, "", "")
 
     try:
-        # start_new_session puts the agent in its OWN process group: agent CLIs spawn
-        # children (shell tool commands, MCP servers), and subprocess.run's timeout kill
-        # only reaches the direct child — orphaned grandchildren would keep burning API
-        # budget and keep writing into the workspace while the runner relocates it.
-        # Killing the whole group on timeout reaps them too.
-        proc = subprocess.Popen(
-            argv,
-            cwd=cwd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            stdin=subprocess.DEVNULL,  # non-interactive: agents that probe stdin (e.g. codex
-                                       # exec) get immediate EOF instead of blocking forever
-            start_new_session=hasattr(os, "killpg"),
-        )
+        stdout, stderr, code, timed_out = run_captured(
+            argv, cwd=cwd, env=env, timeout=timeout)
     except FileNotFoundError:
         rr.error = f"{adapter.binary!r} not found on PATH"
         return ExecResult(rr, "", "")
     except Exception as exc:  # pragma: no cover - defensive
         rr.error = f"exec failed: {exc}"
         return ExecResult(rr, "", "")
-
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        code = proc.returncode
-    except subprocess.TimeoutExpired:
-        _kill_process_group(proc)
-        try:
-            # The group is dead, so the pipes close and this returns quickly with all
-            # output accumulated so far (communicate() retried after a timeout loses none).
-            stdout, stderr = proc.communicate(timeout=10)
-        except (subprocess.TimeoutExpired, ValueError, OSError):  # pragma: no cover
-            proc.kill()
-            stdout, stderr = "", ""
-        stdout = stdout or ""
-        stderr = (stderr or "") + f"\n[timeout after {timeout}s]"
+    if timed_out:
+        stderr += f"\n[timeout after {timeout}s]"
         rr.timed_out = True
         rr.error = f"timed out after {timeout}s"
-        code = -9
-    except Exception as exc:  # pragma: no cover - defensive
-        _kill_process_group(proc)
-        rr.error = f"exec failed: {exc}"
-        return ExecResult(rr, "", "")
 
     rr.exit_code = code
     try:
@@ -179,13 +147,70 @@ def _fold_env_keys_case_insensitive(env: dict[str, str]) -> dict[str, str]:
     return canon
 
 
+def run_captured(argv: list[str], *, cwd: str, env: dict[str, str],
+                 timeout: int) -> tuple[str, str, int, bool]:
+    """Run *argv* to completion in its OWN process group, capturing stdout/stderr.
+
+    Returns ``(stdout, stderr, exit_code, timed_out)``; on timeout the whole group is
+    SIGKILLed, the output accumulated so far is returned, and the code is -9. Raises only
+    what spawning can raise (FileNotFoundError / OSError) — the caller decides what a
+    failure to start means.
+
+    The process group is the point. Agent CLIs spawn children (shell tool commands, MCP
+    servers), and the timeout kill that ``subprocess.run`` performs reaches only the
+    direct child: orphaned grandchildren keep burning API budget and keep writing into the
+    workspace while the runner relocates it — and, for an MCP server, keep RUNNING past
+    the run the harness is auditing. Every place the harness launches an agent goes
+    through here so no launch path can quietly lack that guarantee; model probes used to
+    call ``subprocess.run`` directly and leaked exactly those grandchildren.
+    """
+    proc = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        stdin=subprocess.DEVNULL,  # non-interactive: agents that probe stdin (e.g. codex
+                                   # exec) get immediate EOF instead of blocking forever
+        start_new_session=hasattr(os, "killpg"),
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return (stdout or ""), (stderr or ""), proc.returncode, False
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        try:
+            # The group is dead, so the pipes close and this returns quickly with all
+            # output accumulated so far (communicate() retried after a timeout loses none).
+            stdout, stderr = proc.communicate(timeout=10)
+        except (subprocess.TimeoutExpired, ValueError, OSError):  # pragma: no cover
+            proc.kill()
+            stdout, stderr = "", ""
+        return (stdout or ""), (stderr or ""), -9, True
+    except BaseException:  # pragma: no cover - defensive
+        # Never leave the group running because the wait was interrupted (KeyboardInterrupt
+        # included) — the orphan outlives the harness otherwise.
+        _kill_process_group(proc)
+        raise
+
+
 def _kill_process_group(proc: subprocess.Popen) -> None:
     """SIGKILL the agent's whole process group (POSIX); fall back to killing just the
-    direct child where process groups aren't available (Windows) or the group is gone."""
+    direct child where process groups aren't available (Windows) or the group is gone.
+
+    Never the HARNESS's own group. That is only possible if the child was spawned without
+    ``start_new_session``, which run_captured always passes — but the failure mode is
+    severe enough to guard rather than assume: the group SIGKILL would then reach this
+    process and everything above it, taking down the whole run (and, under the self-test,
+    the shell that launched it — observed while mutation-testing exactly that change).
+    Killing just the child is the correct degradation; it is what Windows already does."""
     if hasattr(os, "killpg"):
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            return
+            pgid = os.getpgid(proc.pid)
+            if pgid != os.getpgid(0):
+                os.killpg(pgid, signal.SIGKILL)
+                return
         except (ProcessLookupError, PermissionError, OSError):
             pass
     try:

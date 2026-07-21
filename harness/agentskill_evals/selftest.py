@@ -1545,6 +1545,62 @@ def _check_mcp_hermetic_paths(failures, verbose):
            f"env: leak_accepted={_pv_leak.accepted} clean_accepted={_pv_ok.accepted} "
            f"saw={_pv_ran!r}", failures, verbose)
 
+    # A probe that TIMES OUT is the case that used to escape entirely: subprocess.run's
+    # kill reaches only the direct child, and the verifier was inside the try block the
+    # TimeoutExpired jumped out of. So the harness would leave a grandchild running — an
+    # MCP server, in the real case — and report the model unavailable without ever
+    # checking what the child had done. Both halves are pinned here: the group is reaped,
+    # and the verifier still runs on whatever output was captured before the kill.
+    import shutil as _psh
+    import tempfile as _pt
+    import time as _ptime
+
+    _pt_dir = _pt.mkdtemp(prefix="ase-probetimeout-")
+    _pt_tick = os.path.join(_pt_dir, "tick")
+    _pt_seen: list = []
+    try:
+        # the child outlives the timeout and leaves a grandchild ticking a file behind it
+        _pt_grandchild = (
+            "import time\n"
+            "while True:\n"
+            f"    open({_pt_tick!r}, 'a').write('.')\n"
+            "    time.sleep(0.05)\n"
+        )
+        _pt_child = (
+            "import subprocess, sys, time\n"
+            f"subprocess.Popen([sys.executable, '-c', {_pt_grandchild!r}])\n"
+            "sys.stdout.write('partial output before the kill\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(30)\n"
+        )
+
+        class _TimeoutProbe(_LateLeakCli):
+            name = "timeoutprobe"
+
+            def _probe_argv(self, model, *, cwd=None, env=None):
+                return [sys.executable, "-c", _pt_child]
+
+            def verify_post_run(self, argv, opts, *, cwd, stdout="", stderr=""):
+                _pt_seen.append(stdout)
+
+        _pt_res = _TimeoutProbe().probe_model("m", timeout=2)
+        # the grandchild must have really started, or the reaping arm proves nothing
+        _pt_started = os.path.exists(_pt_tick)
+        _pt_before = os.path.getsize(_pt_tick) if _pt_started else -1
+        _ptime.sleep(0.6)
+        _pt_after = os.path.getsize(_pt_tick) if _pt_started else -2
+    finally:
+        _psh.rmtree(_pt_dir, ignore_errors=True)
+    _check("mcp_probe.timed_out_probe_is_verified_and_reaped",
+           _pt_res.accepted is False and _pt_started and _pt_before == _pt_after
+           and len(_pt_seen) == 1 and "partial output" in _pt_seen[0],
+           f"a probe killed on timeout still goes through the post-run verifier — with "
+           f"the output captured before the kill, the only account the child ever gave — "
+           f"and its whole process group dies with it instead of orphaning an MCP server "
+           f"past the check meant to prove none started: accepted={_pt_res.accepted} "
+           f"grandchild_started={_pt_started} ticks {_pt_before}->{_pt_after} "
+           f"verifier_calls={len(_pt_seen)}", failures, verbose)
+
     # On Windows process.env is case-insensitive, so a scenario `env: {copilot_home: ...}`
     # that dodges isolation's case-sensitive COPILOT_HOME pop would still be read by the
     # child as COPILOT_HOME — an isolation escape. execute() folds keys to a single
@@ -3518,16 +3574,35 @@ def _run_selftest_checks(verbose: bool = False) -> int:
         tw_false = _tw(_tw_off, None) is False and _tw(None, _tw_off) is False
         # disagreement fails closed in BOTH directions — no precedence is assumed
         tw_conflict = _tw(_tw_on, _tw_off) is False and _tw(_tw_off, _tw_on) is False
+        # A PRESENT customAgents that does not itself say defaultLocalOnly:true is a
+        # contradiction, whatever shape it has. The migration moves the whole key across,
+        # so {"customAgents": {}} beside a settings.json opt-out overwrites the opt-out
+        # with {} — judging the subkey's presence instead of the key's read that as clean.
+        tw_empty = all(
+            _tw(body, _tw_on) is False and _tw(_tw_on, body) is False
+            for body in ('{"customAgents": {}}',
+                         '{"customAgents": null}',
+                         '{"customAgents": []}',
+                         '{"customAgents": "local"}',
+                         '{"customAgents": {"other": true}}',
+                         '{"customAgents": {"defaultLocalOnly": "true"}}',
+                         '{"customAgents": {"defaultLocalOnly": 1}}')
+        )
+        # an UNRELATED key is not a contradiction — the other file still speaks
+        tw_unrelated = _tw('{"theme": "dark"}', _tw_on) is True
     finally:
         _sh.rmtree(_twodir, ignore_errors=True)
     _check("copilot.opt_out_read_from_both_settings_files",
            tw_settings_only and tw_config_only and tw_both and tw_neither
-           and tw_false and tw_conflict,
+           and tw_false and tw_conflict and tw_empty and tw_unrelated,
            "the remote-agent opt-out counts from config.json OR settings.json — copilot "
            "migrates it between them at startup, so reading one file loses it after the "
            "first run — while an explicit false, a missing key, and any DISAGREEMENT "
            "between the two files (precedence being decided in a native module the "
-           "harness cannot read) all fail closed", failures, verbose)
+           "harness cannot read) all fail closed; a customAgents key that is PRESENT but "
+           "does not itself set defaultLocalOnly:true (empty object, wrong type, truthy "
+           "non-true) contradicts the other file, because the migration transports the "
+           "whole key", failures, verbose)
     _check("copilot.jsonc_grammar_edges",
            jsonc_comment_ws and jsonc_unterminated and jsonc_bom_ok
            and opt_not_fabricated and opt_bom_ok and ws_bom_ok,
@@ -3904,7 +3979,10 @@ def _run_selftest_checks(verbose: bool = False) -> int:
             pr_failed = _pr_out(_pr_loaded(("planted", "failed")))
             pr_unknown = _pr_out(_pr_loaded(("planted", "quantum-superposed")))
             # noise on stdout must not crash the reader or invent servers
-            pr_noise_ok = _pr_out({"type": "result", "exitCode": 0}) == "" and _pr_err() == ""
+            pr_noise_ok = (_pr_out(_pr_loaded(("github-mcp-server", "disabled")),
+                                   {"type": "assistant.idle", "data": {}},
+                                   {"type": "result", "exitCode": 0}) == ""
+                           and _pr_err() == "")
             _check("copilot.post_run_stream_evidence_catches_reverted_leak",
                    pr_disabled_ok and pr_noise_ok
                    and all("planted" in r and "event stream" in r
@@ -3916,6 +3994,40 @@ def _run_selftest_checks(verbose: bool = False) -> int:
                    f"disabled_ok={pr_disabled_ok} aba={pr_aba[:60]!r} "
                    f"changed={bool(pr_changed)} failed={bool(pr_failed)} "
                    f"unknown={bool(pr_unknown)}", failures, verbose)
+
+            # The stream arms above are only as good as the event still existing. The CLI
+            # version cannot be read (npm metadata disagrees with the binary the updater
+            # rewrote in place) or pinned (a bare `copilot --version` resolves its app.js
+            # through a writable version cache the harness's own --no-auto-update argv
+            # bypasses), so the CONTRACT is required instead of a version: a run that
+            # emitted its own end-of-session `result` without ever naming an MCP host has
+            # lost the witness, and silently returning "no live servers" would read exactly
+            # like a clean run.
+            pr_gap = _pr_out({"type": "assistant.turn_end", "data": {}},
+                             {"type": "result", "exitCode": 0})
+            # renamed event == the drift this is here to catch
+            pr_renamed = _pr_out({"type": "session.mcp_servers_ready",
+                                  "data": {"servers": []}},
+                                 {"type": "result", "exitCode": 0})
+            # ...but a child that never finished is not blamed for a report it never had
+            # the chance to make: no `result`, no requirement (the state re-read, which
+            # covers exactly that case, has already run above)
+            pr_incomplete = _pr_out({"type": "assistant.turn_end", "data": {}}) == ""
+            pr_empty_stream = _pr_out() == ""
+            # an empty server LIST still satisfies the contract — the event is the witness,
+            # not its contents
+            pr_empty_list = _pr_out(_pr_loaded(), {"type": "result", "exitCode": 0}) == ""
+            _check("copilot.post_run_requires_the_mcp_witness_event",
+                   "result" in pr_gap and "session.mcp_servers_loaded" in pr_gap
+                   and bool(pr_renamed) and pr_incomplete and pr_empty_stream
+                   and pr_empty_list,
+                   f"a completed run that never reported an MCP host fails closed rather "
+                   f"than passing on absent evidence (this is the version gate, the "
+                   f"version itself being neither readable nor pinnable), while an "
+                   f"unfinished run and an empty server list are not penalized: "
+                   f"gap={pr_gap[:70]!r} renamed={bool(pr_renamed)} "
+                   f"incomplete={pr_incomplete} empty_stream={pr_empty_stream} "
+                   f"empty_list={pr_empty_list}", failures, verbose)
         finally:
             _sh.rmtree(_pr_root, ignore_errors=True)
 
@@ -3938,8 +4050,17 @@ def _run_selftest_checks(verbose: bool = False) -> int:
                         ["--plugin-dir", "/x/plug"], ["--plugin-dir=/x/plug"],
                         ["--config-dir", "/x/cfg"], ["--config-dir=/x/cfg"],
                         # hidden --prefer-version selects a DIFFERENT cached CLI version,
-                        # past which the 1.0.64-specific assumptions no longer hold
+                        # past which this adapter's assumptions no longer hold
                         ["--prefer-version", "1.0.63"], ["--prefer-version=1.0.63"],
+                        # --output-format adds no server: it BLINDS the audit. extra_args
+                        # are appended last and copilot takes the last value for a
+                        # repeated option, so a trailing `text` turns off the JSON stream
+                        # verify_post_run reads its ABA-immune evidence from — after
+                        # which a reverted launch-window leak is invisible again
+                        ["--output-format", "text"], ["--output-format=text"],
+                        # even re-stating the value the harness itself passes: the point
+                        # is that this option must not be caller-controlled at all
+                        ["--output-format", "json"],
                         # -C plus COMBINED short-option clusters carrying it: copilot
                         # accepts -sC/tmp (== -s -C /tmp), which a leading-'-C' rule
                         # would miss
@@ -3952,9 +4073,17 @@ def _run_selftest_checks(verbose: bool = False) -> int:
             except RuntimeError as exc:
                 if "configuration channel" not in str(exc):
                     _cop_leaked.append(_extras)      # raised, but not by the vet
-        # a short cluster WITHOUT the cwd flag is neutral and must reach enumeration
+            except AssertionError:
+                # the sentinel fired: the vet passed this token through to enumeration.
+                # Caught rather than allowed to propagate so a regression is reported as
+                # THIS check failing, instead of aborting the suite with a traceback that
+                # names no check (which is how a dropped token first showed up here).
+                _cop_leaked.append(_extras)
+        # a short cluster WITHOUT the cwd flag is neutral and must reach enumeration;
+        # -s/--silent is one of them — live-verified NOT to suppress the MCP events, so
+        # blocking it would be a false positive the witness does not need
         _cop_neutral = None
-        for _neutral in (["--banner"], ["-vs"]):
+        for _neutral in (["--banner"], ["-vs"], ["-s"], ["--silent"]):
             try:
                 get_adapter("copilot").build_argv(
                     "p", RunOptions(extra_args=_neutral), cwd="/tmp")
@@ -3968,10 +4097,11 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _check("copilot.extra_args_config_channels_fail_closed",
            not _cop_leaked and _cop_neutral == "vet-passed",
            f"config-channel extra_args (--additional-mcp-config/--agent/--plugin-dir/"
-           f"--config-dir/--prefer-version, =value forms, and -C in attached AND "
-           f"combined short-cluster forms like -sC/tmp) raise before enumeration; "
-           f"neutral tokens incl. C-free short clusters reach it: leaked={_cop_leaked}, "
-           f"neutral={_cop_neutral}", failures, verbose)
+           f"--config-dir/--prefer-version, the audit-blinding --output-format, =value "
+           f"forms, and -C in attached AND combined short-cluster forms like -sC/tmp) "
+           f"raise before enumeration; neutral tokens incl. -s/--silent and C-free short "
+           f"clusters reach it: leaked={_cop_leaked}, neutral={_cop_neutral}",
+           failures, verbose)
 
     # Windows ODR registry gate (design §2): copilot discovers MCP servers via a
     # registry-advertised command's `mcp list` output. The harness does NOT

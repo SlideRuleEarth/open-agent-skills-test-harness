@@ -254,6 +254,58 @@ def _live_mcp_servers(stdout: str) -> list[str]:
     return [f"{n} ({live[n]})" for n in sorted(live)]
 
 
+def _mcp_witness_gap(stdout: str) -> bool:
+    """True when copilot ran to COMPLETION under the JSON contract and yet never reported
+    its MCP host — i.e. the evidence _live_mcp_servers reads was silently not there.
+
+    This is the version gate, and it is deliberately not a version NUMBER. The obvious
+    check — read ``copilot --version`` before launching and refuse builds this adapter was
+    not verified against — cannot be built soundly here, for two independently fatal
+    reasons, both established against the installed CLI rather than reasoned about:
+
+    * The version reported is not the version that runs. The npm package advertises
+      1.0.63 in its metadata while the executable it resolves to (a ~150 MB
+      single-executable-application under ``node_modules/@github/copilot-darwin-arm64``)
+      had been REWRITTEN IN PLACE by copilot's own updater; the run it performs loads its
+      app root out of ``~/Library/Caches/copilot/pkg/<platform>/<version>/`` (visible in
+      the child's own ``session.skills_loaded`` paths). No file the harness can read
+      states the version that will execute.
+    * A preflight probe and the real run resolve their code DIFFERENTLY. Absent
+      ``--no-auto-update``, the loader scans writable cache roots
+      (``$COPILOT_CACHE_HOME/pkg``, ``$COPILOT_HOME/pkg``, ``~/.cache/copilot/pkg``,
+      ``~/.copilot/pkg``) and imports the app.js under the HIGHEST version-shaped
+      directory name — verified by planting a ``9.9.9/app.js`` in a cache root and
+      watching copilot execute it. A bare ``copilot --version`` therefore goes through
+      that scan; this adapter's argv, which carries ``--no-auto-update``, does not, and
+      the two can execute different code. That flag is in ``_HERMETIC`` for what looked
+      like a bandwidth reason and turns out to be load-bearing: it pins the run to the
+      binary's own app root, out of reach of anything writable that a launch-window
+      neighbour could plant. (The same plant is NOT loaded once the flag is present.)
+
+    So the version is unreadable and unpinnable from outside, and the branch's standing
+    rule applies anyway: a fact learned by executing a program copilot independently
+    executes again may not CLEAR a security decision.
+
+    What is checkable is the thing a version gate was wanted for. The audit's ABA-immune
+    witness depends on one stream contract — ``session.mcp_servers_loaded`` naming every
+    configured server — and a build that renames or drops that event would make
+    _live_mcp_servers return an empty list, which reads exactly like a clean run. Requiring
+    the event to be PRESENT converts that silent degradation into a loud failure, without
+    executing anything twice: the evidence comes from the run being judged. The
+    requirement is conditioned on copilot's own ``result`` event, its end-of-session
+    marker, so a child killed on timeout or one that died before its MCP host initialized
+    is not blamed for a report it never had the chance to make.
+    """
+    completed = reported = False
+    for obj in iter_jsonl(stdout):
+        etype = obj.get("type")
+        if etype == "result":
+            completed = True
+        elif etype == "session.mcp_servers_loaded":
+            reported = True
+    return completed and not reported
+
+
 def _jsonc_strip(text: str) -> str:
     """Reduce copilot's accepted JSONC to strict JSON: replace ``//`` line comments
     (full-line AND inline) and ``/* */`` block comments with a SINGLE SPACE, and drop
@@ -379,14 +431,34 @@ def _remote_agents_opted_out(home: str) -> bool:
     module (``stateMigrateSettingsFromConfig``), not in readable JS, so the harness
     declines to guess a precedence it cannot verify. Opted out means set somewhere and
     contradicted nowhere.
+
+    A file CONTRADICTS the opt-out whenever it carries a ``customAgents`` key that does
+    not itself resolve to ``defaultLocalOnly is True`` — including the empty object and
+    any non-dict value. Requiring the subkey to be PRESENT before counting the file was
+    the earlier rule and it had a hole: ``config.json: {"customAgents": {}}`` alongside
+    ``settings.json: {"customAgents": {"defaultLocalOnly": true}}`` read as opted out
+    here, while the startup migration moves config.json's whole ``customAgents`` object
+    across and the surviving value is ``{}`` — remote discovery back on, preflight
+    satisfied. The migration transports the KEY, so the key's presence is what has to be
+    judged, not the subkey's.
+
+    That strictness costs real runs nothing, which was checked rather than assumed: a live
+    isolated run starts with the sanitizer's opt-out in BOTH files and ends with the key
+    REMOVED from config.json (not left as an empty object) and intact in settings.json —
+    so the migration never produces the contradicting shape this now rejects. Worth
+    re-checking on a CLI upgrade: a migration that emptied the key instead of deleting it
+    would fail every isolated run closed, loudly, which is the direction to fail but a
+    bad afternoon.
     """
-    seen: list[object] = []
+    seen: list[bool] = []
     for name in _COPILOT_SETTINGS_FILES:
         data = _load_copilot_config(os.path.join(home, name))
-        agents_cfg = data.get("customAgents") if isinstance(data, dict) else None
-        if isinstance(agents_cfg, dict) and "defaultLocalOnly" in agents_cfg:
-            seen.append(agents_cfg["defaultLocalOnly"])
-    return bool(seen) and all(v is True for v in seen)
+        if not isinstance(data, dict) or "customAgents" not in data:
+            continue  # says nothing about custom agents; the other file may still speak
+        agents_cfg = data["customAgents"]
+        seen.append(isinstance(agents_cfg, dict)
+                    and agents_cfg.get("defaultLocalOnly") is True)
+    return bool(seen) and all(seen)
 
 
 # extra_args tokens that reopen MCP/configuration channels after the disable set is
@@ -402,14 +474,25 @@ def _remote_agents_opted_out(home: str) -> bool:
 # discovery, invalidating the cwd the workspace/agent walks used. Long forms match exact
 # or --flag=value; -C matches its own token AND any combined short-option cluster
 # carrying it (see _config_channel_token).
+#
+# --output-format is in the list for a different reason: it does not add a server, it
+# blinds the WITNESS. build_argv sets `--output-format json` and verify_post_run reads
+# copilot's session.mcp_servers_loaded events out of that stream — the only evidence a
+# launch-window leak cannot revert. extra_args ride at the end of argv and copilot's
+# parser takes the LAST value for a repeated option, so a trailing `--output-format text`
+# silently wins (verified live on the installed build: the run printed plain prose and
+# emitted zero JSON events, and verify_post_run's stream check then sees an empty stream
+# and passes). `-s/--silent` was tested the same way and does NOT suppress the events, so
+# it stays allowed.
 _CONFIG_CHANNEL_LONG = ("--additional-mcp-config", "--agent", "--plugin-dir",
-                        "--config-dir", "--prefer-version")
+                        "--config-dir", "--prefer-version", "--output-format")
 
 
 def _config_channel_token(extra_args: list[str]) -> Optional[str]:
-    """The first extra_args token that opens a copilot configuration channel, or None.
-    A token that merely LOOKS like one (e.g. a value following some unrelated flag) is
-    reported too — that false positive fails closed, the safe direction.
+    """The first extra_args token that opens a copilot configuration channel — or
+    suppresses the output channel the post-run audit reads — or None. A token that merely
+    LOOKS like one (e.g. a value following some unrelated flag) is reported too — that
+    false positive fails closed, the safe direction.
 
     The cwd flag ``-C`` is matched inside combined SHORT-option clusters, not only as a
     leading ``-C``: copilot 1.0.64 accepts ``-sC/tmp`` (== ``-s -C /tmp``), where ``C``
@@ -883,17 +966,20 @@ _COPILOT_CONFIG_STRIP_KEYS = ("installedPlugins", "enabledPlugins",
 
 
 def _sanitized_copilot_config(real_path: str) -> str:
-    """Sanitizing mask for ~/.copilot/config.json: keep everything (auth tokens,
-    settings), drop the plugin registrations and the built-in-server enablement
+    """Sanitizing mask for BOTH of copilot's user-settings files, ~/.copilot/config.json
+    and ~/.copilot/settings.json (see _COPILOT_SETTINGS_FILES): keep everything (auth
+    tokens, settings), drop the plugin registrations and the built-in-server enablement
     list (``_COPILOT_CONFIG_STRIP_KEYS``), and FORCE
     ``customAgents.defaultLocalOnly`` — the documented setting (``copilot help
     config``) that is the only off-switch for remote custom-agent discovery, whose
     org/enterprise listings can carry MCP servers whose names --disable-mcp-server
     has no way to learn (see the custom-agents comment at the top of this module).
-    The file is JSONC — line/inline/block comments and trailing commas, the live-verified
-    grammar — handled by ``_load_copilot_config``. Unreadable/unparseable → the
-    same neutral-but-hermetic shape (fail closed: no plugins, no remote agents;
-    auth loss surfaces loudly rather than servers silently loading)."""
+    Either file is JSONC — line/inline/block comments and trailing commas, the
+    live-verified grammar — handled by ``_load_copilot_config``. Unreadable/unparseable →
+    the same neutral-but-hermetic shape (fail closed: no plugins, no remote agents; auth
+    loss surfaces loudly rather than servers silently loading). Both files get this same
+    treatment because copilot MOVES user settings between them at startup: masking one
+    would let the other reintroduce exactly the keys stripped here."""
     data = _load_copilot_config(real_path)
     if not isinstance(data, dict):
         data = {}
@@ -966,6 +1052,14 @@ class CopilotAdapter(Adapter):
     # Hermetic flags — memory is already off in -p mode; these block the
     # remaining state channels (custom instructions / AGENTS.md, built-in
     # MCP servers, remote control, auto-update downloads).
+    # --no-auto-update carries more weight than its name suggests and must not be
+    # dropped: without it copilot's loader picks the app.js it executes by scanning
+    # WRITABLE cache roots ($COPILOT_CACHE_HOME/pkg, $COPILOT_HOME/pkg,
+    # ~/.cache/copilot/pkg, ~/.copilot/pkg) and importing whichever version-shaped
+    # directory sorts highest — a planted 9.9.9/app.js runs, as arbitrary code inside the
+    # child, ahead of every MCP flag on this argv. With the flag the run is pinned to the
+    # binary's own app root and the plant is ignored (both halves verified live). See
+    # _mcp_witness_gap for why the resulting build still cannot be identified by version.
     _HERMETIC = [
         "--no-custom-instructions",
         "--disable-builtin-mcps",
@@ -1159,14 +1253,17 @@ class CopilotAdapter(Adapter):
         bad = _config_channel_token(opts.extra_args)
         if bad is not None:
             raise RuntimeError(
-                f"extra_args token {bad!r} opens a copilot configuration channel "
+                f"extra_args token {bad!r} opens a copilot configuration channel, or "
+                "closes the output channel the post-run audit reads "
                 "(--additional-mcp-config injects MCP servers past the disable "
                 "set, --agent selects a custom agent whose mcp-server NAMES the "
                 "harness cannot enumerate, --plugin-dir loads plugin-declared "
                 "servers, --config-dir repoints the enumerated config home, "
-                "--prefer-version runs a different cached CLI build than the 1.0.64 "
-                "this enumeration is built on, -C moves discovery to another cwd — "
-                "the last also in combined short clusters like -sC/tmp) — the run "
+                "--prefer-version runs a different cached CLI build than the one "
+                "this enumeration is built on, --output-format overrides the JSON "
+                "stream verify_post_run reads its evidence from, -C moves discovery "
+                "to another cwd — the last also in combined short clusters "
+                "like -sC/tmp) — the run "
                 "would not be provably MCP-hermetic; failing closed."
             )
         argv = [self.binary, "-p", prompt, *self._HERMETIC,
@@ -1224,6 +1321,12 @@ class CopilotAdapter(Adapter):
         reverted before exit AND never appearing in copilot's own event stream. A shim
         answering for ``git`` outside the process can do the first and not the second.
 
+        Direction (1) is only as good as the stream contract it reads, and the CLI version
+        that contract belongs to can neither be read nor pinned from outside the run (see
+        _mcp_witness_gap). So the contract is checked instead of the version: a run that
+        reported its own completion without ever reporting an MCP host has silently lost
+        the witness, and is refused before either direction is consulted.
+
         Re-executing the enumeration is sound in the direction it is used — unlike the
         git preflight this branch refuses (which would CLEAR a gate on the first of two
         executions), a second scan can only ADD failures, never bless a run.
@@ -1238,6 +1341,18 @@ class CopilotAdapter(Adapter):
         observe, and this scan errs toward the loud answer like every other one on this
         path. Relocate such fixtures outside the discovery tree.
         """
+        if _mcp_witness_gap(stdout):
+            raise RuntimeError(
+                "copilot ran to completion (it emitted its own 'result' event) without "
+                "ever reporting an MCP host: no session.mcp_servers_loaded event reached "
+                "the harness. That event is where the ABA-immune half of this audit gets "
+                "its evidence, and a hermetic run on a build this adapter understands "
+                "always emits it (naming at least the built-in server as 'disabled'). Its "
+                "absence means the stream contract no longer holds — most likely a CLI "
+                "build that renamed or dropped it, which the version cannot be checked "
+                "for (see _mcp_witness_gap) — so the run's hermeticity is unwitnessed "
+                "rather than confirmed; failing closed."
+            )
         live = _live_mcp_servers(stdout)
         if live:
             raise RuntimeError(

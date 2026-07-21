@@ -16,7 +16,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -188,36 +187,46 @@ class Adapter(ABC):
                 return ProbeResult(accepted=False)
             if not argv:
                 return ProbeResult(accepted=True)
+            # Spawned through exec.run_captured, not subprocess.run, for the process
+            # GROUP: a probe launches the same CLI the same way a run does, so it can
+            # spawn the same grandchildren, and subprocess.run's timeout kill reaches only
+            # the direct child — a probe that timed out used to leave an MCP server alive
+            # behind it, outliving the very check meant to establish it never started one.
             try:
-                r = subprocess.run(
-                    argv, capture_output=True, text=True, env=env, cwd=probe_ws,
-                    timeout=timeout, stdin=subprocess.DEVNULL,
-                )
-                # A probe launches the same CLI against the same discovery paths as a real
-                # run, so it has the same launch window — and it is NOT routed through
-                # exec.execute(), which is where runs get their post-run check. Verify it
-                # here or a probe is the one un-audited child the harness spawns. Failing
-                # closed costs at most a model reported unavailable; not checking would let
-                # a probe start an MCP server and still report the model fine.
-                self.verify_post_run(argv, probe_opts, cwd=probe_ws,
-                                     stdout=r.stdout, stderr=r.stderr)
-                combined = r.stderr + r.stdout
-                lower = combined.lower()
-                if "not available" in lower or "invalid model" in lower or "unknown model" in lower:
-                    return ProbeResult(accepted=False)
-                if r.returncode != 0:
-                    return ProbeResult(accepted=False)
-                return self._parse_probe_cost(combined)
-            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                from ..exec import run_captured
+                out, err, code, timed_out = run_captured(
+                    argv, cwd=probe_ws, env=env, timeout=timeout)
+            except (FileNotFoundError, OSError):
+                # Could not start at all: no child, so nothing to audit.
                 return ProbeResult(accepted=False)
+            # Verify EVERY child that started, timeout included, and in its own exception
+            # scope. A probe is otherwise the one un-audited child the harness spawns: it
+            # is not routed through exec.execute(), where runs get their post-run check,
+            # yet it has the same launch window. The timeout path needs it MOST — the
+            # child was killed mid-flight, so it is the likeliest to have left a config or
+            # agent change behind, and the likeliest to have said nothing about it.
+            # Keeping this separate from the spawn scope above also stops a verifier
+            # OSError from being silently reclassified as an ordinary model rejection.
+            try:
+                self.verify_post_run(argv, probe_opts, cwd=probe_ws,
+                                     stdout=out, stderr=err)
             except Exception as exc:
-                # verify_post_run said the probe was not provably MCP-hermetic. The model
-                # may well be fine, but reporting it available would bless a child whose
-                # hermeticity broke — same fail-closed call as the argv-build failure above.
+                # Not provably MCP-hermetic. The model may well be fine, but reporting it
+                # available would bless a child whose hermeticity broke — the same
+                # fail-closed call as the argv-build failure above.
                 print(f"warning: [{self.name}] the model probe for {model!r} ran but its "
                       f"MCP hermeticity could not be confirmed afterwards ({exc}); "
                       f"reporting the model unavailable (fail-closed).", file=sys.stderr)
                 return ProbeResult(accepted=False)
+            if timed_out:
+                return ProbeResult(accepted=False)
+            combined = err + out
+            lower = combined.lower()
+            if "not available" in lower or "invalid model" in lower or "unknown model" in lower:
+                return ProbeResult(accepted=False)
+            if code != 0:
+                return ProbeResult(accepted=False)
+            return self._parse_probe_cost(combined)
         finally:
             if masked_home:
                 shutil.rmtree(masked_home, ignore_errors=True)
