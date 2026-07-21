@@ -47,6 +47,43 @@ class ChildSpawned(Exception):
         self.stderr = stderr
 
 
+class UnsupportedPlatform(OSError):
+    """Raised INSTEAD of spawning, on a platform where the harness cannot contain the
+    process tree it is about to create.
+
+    Deliberately an ``OSError``: every caller of ``run_captured`` already treats that as
+    "the child could not be started at all", which is exactly what happened, and gets the
+    fail-closed handling it already has — the run reports an error, a model probe reports
+    the model unavailable. A new exception type would have needed each of those call
+    sites to learn about it first, and the one that forgot would have been the one that
+    kept running.
+    """
+
+
+def _unsupported_platform() -> Optional[str]:
+    """Why this platform cannot be used, or None if it can.
+
+    Windows: a Job Object is the only thing that reliably kills a process tree there, and
+    it can only be assigned once ``CreateProcess`` has returned, while the OS associates a
+    member's FUTURE children only. A grandchild started in that window is outside the job
+    permanently — and an agent whose first act is starting an MCP server lands in it every
+    time, not occasionally. Creating the process already in the job
+    (``PROC_THREAD_ATTRIBUTE_JOB_LIST``) is what closes this, and stdlib ``Popen`` cannot
+    express it (CPython honours ``STARTUPINFO.lpAttributeList`` for ``handle_list`` and
+    nothing else), so it needs a bespoke ``CreateProcess`` or a job-resident launcher
+    shim, plus a Windows host to verify on. Until then the harness cannot make the
+    guarantee the rest of its hermeticity argument is built on, and says so here rather
+    than shipping one platform's silent exception to it.
+    """
+    if sys.platform == "win32":  # pragma: no cover — win32 only; stubbed in the selftest
+        return ("this harness cannot contain a process tree on Windows, so it will not "
+                "launch an agent there: a Job Object can only be assigned after "
+                "CreateProcess returns, and a grandchild spawned in that window — an MCP "
+                "server most of all — is outside the job for good. Nothing was launched. "
+                "Run on macOS or Linux, or under WSL")
+    return None
+
+
 def execute(
     adapter: Adapter,
     prompt: str,
@@ -201,13 +238,20 @@ def run_captured(argv: list[str], *, cwd: str, env: dict[str, str],
     The group is swept on EVERY return, not only on timeout — see ``_ProcessTree.close``.
     A clean exit says the agent finished, never that its descendants did.
 
-    Raises ``ChildSpawned`` if the tree could not be contained at launch — which on
-    Windows is EVERY run, because assignment-after-CreateProcess cannot contain a
-    grandchild spawned in the launch window (see ``_ProcessTree.contained``). A child the
-    harness cannot guarantee it can kill is a failed run, not a quietly weaker one, and
-    "the harness has no Windows support yet" is a far better thing to ship than a
-    hermeticity guarantee that is unsound on one platform and says nothing about it.
+    Raises ``UnsupportedPlatform`` — BEFORE spawning anything — on a platform whose
+    process trees this cannot contain, which today means Windows. Refusing after the
+    ``Popen`` would refuse nothing: the race being avoided is a grandchild started in the
+    first instants of the child's life, so a check that runs once the child is already
+    running has let the thing it is guarding against happen. The only sound Windows
+    refusal is one that never calls ``Popen``.
+
+    Raises ``ChildSpawned`` if a launch that WAS expected to be containable turns out not
+    to be. A child the harness cannot guarantee it can kill is a failed run, not a quietly
+    weaker one.
     """
+    unsupported = _unsupported_platform()
+    if unsupported is not None:  # pragma: no cover — win32 only; stubbed in the selftest
+        raise UnsupportedPlatform(unsupported)
     proc = subprocess.Popen(
         argv,
         cwd=cwd,
@@ -312,7 +356,9 @@ def _win32_assign_job(proc: subprocess.Popen) -> Optional[int]:
     are Windows-only code that cannot be verified without a Windows host.
 
     So this job does NOT make a run containable — ``_ProcessTree.contained`` is False on
-    win32 and ``run_captured`` refuses the run. What the job is still worth is the kill:
+    win32 and ``run_captured`` refuses BEFORE spawning at all (``_unsupported_platform``;
+    refusing afterwards would already have allowed the launch-window grandchild it is
+    meant to prevent). What the job is still worth is the kill:
     it is the only mechanism that reaches a grandchild whose parent has already exited, so
     it is what sweeps the child that did start before the run is failed. Keeping the call
     sequence correct and tested also means the follow-up that adds job-at-creation changes
@@ -342,19 +388,19 @@ def _win32_assign_job(proc: subprocess.Popen) -> Optional[int]:
                 wintypes.HANDLE(job), _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
                 ctypes.byref(_kill_on_close_limits()),
                 ctypes.sizeof(_JOBOBJECT_EXTENDED_LIMIT_INFORMATION)):
-            return _win32_close(k32, job)
+            return _win32_abandon(k32, job)
         if not k32.AssignProcessToJobObject(wintypes.HANDLE(job),
                                             wintypes.HANDLE(int(handle))):
-            return _win32_close(k32, job)
+            return _win32_abandon(k32, job)
         member = wintypes.BOOL(0)
         if not k32.IsProcessInJob(wintypes.HANDLE(int(handle)), wintypes.HANDLE(job),
                                   ctypes.byref(member)) or not member.value:
-            return _win32_close(k32, job)
+            return _win32_abandon(k32, job)
         return int(job)
     except Exception:
         if job:  # pragma: no cover — win32 only
             try:
-                _win32_close(_win32_kernel32(), job)
+                _win32_abandon(_win32_kernel32(), job)
             except Exception:
                 pass
         return None
@@ -374,14 +420,24 @@ def _win32_close_handle(k32, job: int) -> bool:  # pragma: no cover — win32 on
         return False
 
 
-def _win32_close(k32, job: int) -> None:  # pragma: no cover — win32 only
-    """Close a job handle and report the failure as None, so every abandon path in
-    ``_win32_assign_job`` is one statement and none of them can leak the handle."""
-    _win32_close_handle(k32, job)
+def _win32_abandon(k32, job: int) -> None:  # pragma: no cover — win32 only
+    """Give up on a half-built job: empty it, release it, and report failure as None.
+
+    TERMINATES rather than merely closing, because "the setup failed" does not mean the
+    job is empty. Assignment can succeed and the membership re-read still fail it, so the
+    child may well be inside — and the two steps that fail earliest are exactly the ones
+    that leave no safety net: a job whose kill-on-close limit was REJECTED cannot fall
+    back on kill-on-close, since that is the step that failed. Closing alone would then
+    abandon a job with a live child in it and no mechanism left to reach it.
+
+    The sweep's success is not returned because no caller can act on it: the assignment
+    has failed either way, and the run is refused either way. What matters is that the
+    attempt is made in the right order."""
+    _win32_sweep_job(job, k32)
     return None
 
 
-def _win32_sweep_job(job: int) -> bool:  # pragma: no cover — win32 only
+def _win32_sweep_job(job: int, k32=None) -> bool:  # pragma: no cover — win32 only
     """Terminate everything in *job*, then release the handle. True only if BOTH worked.
 
     Order matters: terminate first, close second. Closing a kill-on-close job is *also* a
@@ -389,11 +445,14 @@ def _win32_sweep_job(job: int) -> bool:  # pragma: no cover — win32 only
     the one failure it would need to survive. Terminating first makes the close pure
     hygiene — and it is still checked, because a handle that would not close is evidence
     the kernel disagrees about the state of this job, which is not a thing to shrug at
-    while claiming the tree is dead."""
-    try:
-        k32 = _win32_kernel32()
-    except Exception:
-        return False
+    while claiming the tree is dead.
+
+    *k32* lets a caller that already holds the handle pass it in rather than reopening."""
+    if k32 is None:
+        try:
+            k32 = _win32_kernel32()
+        except Exception:
+            return False
     try:
         k32.TerminateJobObject.restype = wintypes.BOOL
         terminated = bool(k32.TerminateJobObject(wintypes.HANDLE(job), 1))
@@ -484,21 +543,15 @@ class _ProcessTree:
         """Whether a kill here reaches EVERY process this launch created — including one
         the child spawned before the harness got a chance to act.
 
-        WINDOWS IS NEVER CONTAINED, and that is not a stub: it is what the mechanism
-        actually provides. The job is assigned after ``CreateProcess`` has already
-        returned, so a grandchild spawned inside that window is not a job member and
-        ``TerminateJobObject`` does not reach it. Windows associates *future* children of a
-        member, never past ones. So the job contains the tree in every case except the one
-        that needs no window at all to happen: an MCP server started as the first thing the
-        child does. Reporting that as containment would be the same fail-open this class
-        exists to remove, one platform over.
+        WINDOWS IS NEVER CONTAINED, for the reason in ``_unsupported_platform`` — and a
+        successful job assignment must not be allowed to say otherwise, because the job is
+        genuinely useful for killing and genuinely insufficient for containing.
 
-        Closing it needs job-at-creation (``PROC_THREAD_ATTRIBUTE_JOB_LIST``, unreachable
-        through stdlib ``Popen`` — see ``_win32_assign_job``) or a job-resident launcher
-        shim, plus a Windows host to verify on. Until then the honest answer is that the
-        harness cannot make its process-tree guarantee on Windows, so it refuses to claim
-        it: ``run_captured`` fails the run. The job is still created and still terminated,
-        because it is the best sweep available for the child that did start."""
+        This is the BACKSTOP, not the gate. The gate is ``_unsupported_platform``, checked
+        before ``Popen`` runs, because a containment check that happens after the child
+        exists has already let the launch-window grandchild start — refusing at that point
+        refuses nothing. This property exists so that a future path which constructs a
+        tree some other way cannot quietly inherit a guarantee that was never true."""
         if sys.platform == "win32":  # pragma: no cover — win32 only
             return False
         return self._pgid is not None

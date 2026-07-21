@@ -532,7 +532,15 @@ def _version_sort_key(version: str) -> tuple[int, tuple[int, ...], int, str]:
     containing ``-`` treated as a prerelease and sorting before its release
     (``1.0.73-beta.1`` < ``1.0.73``, and equally ``1.0.73-`` < ``1.0.73``), and the raw
     name as the final tiebreak. Ordering matters because callers report the newest bundle
-    as the interesting one."""
+    as the interesting one.
+
+    The final tiebreak is APPROXIMATE and nothing may be gated on it: the loader breaks
+    those ties with JavaScript ``localeCompare``, which is locale-aware, while this is
+    Python's code-point comparison. They agree on the version-shaped names that occur in
+    practice and can disagree on arbitrary ones. Every bundle found is audited and
+    reported, so the order is presentation — it decides which bundle is *described* as the
+    newest, never which one is checked or skipped. Anything that selects rather than sorts
+    would need the real collation."""
     m = re.match(r"(\d+)\.(\d+)\.(\d+)", version)
     if not m:
         return (0, (0, 0, 0), 0, version)

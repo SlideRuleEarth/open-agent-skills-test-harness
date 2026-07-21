@@ -34,7 +34,11 @@ Job-at-creation via `PROC_THREAD_ATTRIBUTE_JOB_LIST` is unreachable through stdl
 `Popen` (CPython honours `lpAttributeList` for `handle_list` and nothing else), so
 closing it needs a bespoke `CreateProcess` or a launcher shim, plus a Windows host to
 verify on — neither of which exists yet. Rather than ship a guarantee that is silently
-unsound on one platform, `exec.run_captured` fails every win32 run closed. The Job Object
+unsound on one platform, `exec.run_captured` refuses win32 **before it spawns anything**
+(`UnsupportedPlatform`, an `OSError` subclass so existing callers fail closed on it
+unchanged). Refusing after the `Popen` would refuse nothing — the grandchild being
+guarded against starts in the child's first instants, so a check that runs once the child
+exists has already let it happen. The Job Object
 code stays in place, correct and tested against a stubbed kernel32, because it is still
 the right sweep for the child that did start and because the follow-up that adds
 job-at-creation should change one predicate rather than start from nothing.

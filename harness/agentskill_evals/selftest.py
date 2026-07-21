@@ -2884,15 +2884,22 @@ def _check_exec_process_tree_handles(failures, verbose):
             "verify_call": ({"CreateJobObjectW": 4242, "IsProcessInJob": 0}, 1),
             "not_a_member": ({"CreateJobObjectW": 4242}, 0),
         }
-        fail_closed, leaked = [], []
+        fail_closed, leaked, unswept = [], [], []
         for label, (rets, member) in failure_modes.items():
             calls.clear()
             exec_mod._win32_kernel32 = lambda r=rets, m=member: _FakeK32(r, member=m)
             if exec_mod._win32_assign_job(_FakeProc()) is not None:
                 fail_closed.append(label)
+            names = [c[0] for c in calls]
             # a job that was created but abandoned must not leak its handle
-            if label != "create" and not any(c[0] == "CloseHandle" for c in calls):
+            if label != "create" and "CloseHandle" not in names:
                 leaked.append(label)
+            # ...and must be EMPTIED before it is released, because a failed setup does
+            # not mean an empty job: `assign` may have succeeded and only the membership
+            # re-read failed, and the `limit` case is worst — the step that failed IS
+            # kill-on-close, so closing the handle kills nothing. Terminate, then close.
+            if label != "create" and names[-2:] != ["TerminateJobObject", "CloseHandle"]:
+                unswept.append(label)
 
         # --- kill() terminates the JOB, not just the direct child ----------------
         calls.clear()
@@ -2962,15 +2969,18 @@ def _check_exec_process_tree_handles(failures, verbose):
 
         _check("exec.win32_job_object_kills_the_tree",
                assigned and info_class_ok and flag_ok and not fail_closed
-               and not leaked and job_killed and terminate_checked,
+               and not leaked and not unswept and job_killed and terminate_checked,
                f"the Windows path puts the child in a Job Object (so a grandchild whose "
                f"parent already exited is still terminated — no process groups there, and "
                f"taskkill /T walks links an exited parent no longer has), requires the "
                f"kill-on-close limit, re-reads membership from the kernel, abandons the "
-               f"job on ANY failed step rather than running uncontained, and treats a "
+               f"job on ANY failed step rather than running uncontained, EMPTIES it "
+               f"before releasing it (a failed setup does not mean an empty job, and the "
+               f"limit failure is precisely the loss of kill-on-close), and treats a "
                f"false TerminateJobObject as a failure rather than a kill: "
                f"assigned={assigned} info_class={info_class_ok} flag={flag_ok} "
                f"failed_open={fail_closed or 'none'} leaked_handles={leaked or 'none'} "
+               f"abandoned_unswept={unswept or 'none'} "
                f"job_killed={job_killed} terminate_checked={terminate_checked}",
                failures, verbose)
 
@@ -3015,57 +3025,65 @@ def _check_exec_process_tree_handles(failures, verbose):
                f"is killed and audited (raised={type(uncontained_err).__name__} "
                f"child_killed={uncontained_proc.killed})", failures, verbose)
 
-        # --- Windows is uncontainable, so Windows runs fail — every one of them ---
+        # --- Windows is uncontainable, so nothing is LAUNCHED there ---------------
         # The job can only be assigned once CreateProcess has returned, and Windows
         # associates a member's FUTURE children only. A grandchild spawned inside that
         # window is therefore never in the job and survives TerminateJobObject — and "the
         # agent immediately starts an MCP server" needs no unlucky timing to land there.
-        # A successful job assignment must NOT be allowed to read as containment; nor may
-        # a working process group, which is why this runs with _HAS_KILLPG left ON. Until
-        # job-at-creation lands (PROC_THREAD_ATTRIBUTE_JOB_LIST, unreachable through
-        # stdlib Popen) the harness cannot make its guarantee here, so it declines to
-        # claim it rather than shipping one platform's silent exception to it.
-        win_proc = _FakeProc()
+        #
+        # So the refusal has to come BEFORE the spawn. An earlier revision of this fix
+        # rejected win32 just after Popen and was rejected in review for exactly the right
+        # reason: by then the child exists, and the launch-window grandchild it is meant
+        # to prevent has already had its chance. Spawning and then killing is not a
+        # refusal. The assertion is therefore that Popen is NEVER CONSTRUCTED — hence a
+        # shim whose only behaviour is to fail the arm if anyone calls it.
+        popen_calls = []
 
-        class _WinPopen(_NeverCommunicates):
+        class _MustNotSpawn:
             def __init__(self, *a, **k):
-                self.pid, self.returncode, self._handle = 4321, None, 7
-
-            def kill(self):
-                win_proc.killed = True
+                popen_calls.append(a)
+                raise AssertionError("run_captured must not spawn on an unsupported "
+                                     "platform")
 
         shim_w = type(exec_mod)("subprocess_shim_win32")
         shim_w.PIPE, shim_w.DEVNULL = exec_mod.subprocess.PIPE, exec_mod.subprocess.DEVNULL
         shim_w.TimeoutExpired = exec_mod.subprocess.TimeoutExpired
-        shim_w.Popen = _WinPopen
+        shim_w.Popen = _MustNotSpawn
         fake_sys = type(exec_mod)("sys_shim")
         fake_sys.platform = "win32"      # exec.py reads sys ONLY for .platform
         saved_sys, exec_mod.sys = exec_mod.sys, fake_sys
         saved_sub3, exec_mod.subprocess = exec_mod.subprocess, shim_w
         try:
-            calls.clear()
-            # the job ASSIGNS cleanly here: containment must not follow from that
-            exec_mod._win32_kernel32 = lambda: _FakeK32({"CreateJobObjectW": 4242})
             win_err = None
             try:
                 exec_mod.run_captured(["x"], cwd=".", env={}, timeout=1)
             except BaseException as exc:     # noqa: BLE001 — the type IS the assertion
                 win_err = exc
-            win_calls = [c[0] for c in calls]
+            # the BACKSTOP, exercised directly: even handed a job that assigned cleanly
+            # AND a working process group, a tree on win32 must not report containment,
+            # so no future caller can inherit a guarantee that was never true here.
+            exec_mod._win32_kernel32 = lambda: _FakeK32({"CreateJobObjectW": 4242})
+            backstop = exec_mod._ProcessTree(_FakeProc())
+            backstop_contained = backstop.contained
         finally:
             exec_mod.sys = saved_sys
             exec_mod.subprocess = saved_sub3
-        _check("exec.win32_runs_fail_closed",
-               isinstance(win_err, ChildSpawned)
-               and "cannot be contained" in str(win_err)
-               and "CreateProcess returns" in str(win_err)
-               and "TerminateJobObject" in win_calls,
-               f"a Windows run is refused even though the Job Object assigned cleanly and "
-               f"a process group was available, because assignment-after-CreateProcess "
-               f"cannot reach a grandchild spawned in the launch window — and the child "
-               f"that did start is swept through the job on the way out: "
-               f"raised={type(win_err).__name__} kernel32={win_calls} "
-               f"reason={str(win_err)[-90:]!r}", failures, verbose)
+        # An OSError subclass, so every existing caller's "could not start at all" path
+        # handles it fail-closed without having to learn a new type first.
+        _check("exec.win32_is_refused_before_launch",
+               isinstance(win_err, exec_mod.UnsupportedPlatform)
+               and isinstance(win_err, OSError)
+               and not popen_calls
+               and "Nothing was launched" in str(win_err)
+               and backstop_contained is False,
+               f"a Windows run is refused WITHOUT SPAWNING — the race is a grandchild "
+               f"started in the child's first instants, so a check that runs once the "
+               f"child exists has already let it happen — and the refusal is an OSError "
+               f"subclass so existing callers fail closed on it unchanged; a job that "
+               f"assigns cleanly still never reads as containment: "
+               f"raised={type(win_err).__name__} popen_calls={len(popen_calls)} "
+               f"contained_backstop={backstop_contained} "
+               f"reason={str(win_err)[:70]!r}", failures, verbose)
 
         # --- ChildSpawned: a post-spawn failure is NOT a failure to spawn --------
         # run_captured must distinguish them, because they demand opposite handling: a
