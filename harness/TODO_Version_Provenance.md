@@ -207,6 +207,37 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   failing an arm — a red signal, but the wrong one, and it hid the fact that the arm never
   proved the fail-closed behaviour it claimed to.
 
+- **codex's stream witness is presence-only, and that changes which check carries the
+  argument.** Established live with a sentinel stdio MCP server rather than reasoned from
+  the event list. Three findings, each of which moved the design:
+
+  * codex emits **no event at all** when it starts an MCP server. The sentinel was
+    launched and exchanged `initialize`/`tools/list` while the stream stayed at its usual
+    four events. copilot's `session.mcp_servers_loaded` positively witnesses the *absence*
+    of a leak; codex has no equivalent, so absence of evidence is exactly that.
+  * The only MCP trace is an `mcp_tool_call` item, which appears **only if the model
+    actually called a tool**. Presence proves a leak and cannot be retracted by a later
+    edit; absence proves nothing. So for codex the re-enumeration half carries the load,
+    and the stream half is a partial backstop for the ABA case — the reverse of copilot,
+    where the witness is the stronger half.
+  * **`--ask-for-approval never` does not prevent MCP servers from being launched.** It
+    cancelled the sentinel's tool *call* ("user cancelled MCP tool call") while the server
+    process ran as the agent for the whole session. Any reasoning that treats the approval
+    policy as an MCP control is wrong; the `-c ...enabled=false` overrides are what
+    actually stop the process starting (verified: with them, the sentinel never ran).
+
+  A useful side effect for Phase 1: the item shape is
+  `{"type": "mcp_tool_call", "server": ..., "tool": ..., "status": ...}` — `server` and
+  `tool` as separate fields, not a canonical `mcp__server__tool` string, which is what
+  `adapters/codex.py`'s parser has to synthesize.
+
+- **An arm that asserts a message can be pinning a crash instead of a refusal.** Removing
+  codex's `opts is None` guard raises `AttributeError: 'NoneType' object has no attribute
+  'effective_env'` — whose text contains `effective_env`, so a message-only assertion goes
+  green on the broken code. The arm now asserts the exception *type* too. Worth writing
+  down because it generalizes: when a guard's failure message quotes the same identifier
+  the unguarded crash does, only the type distinguishes them.
+
 ## Still open
 
 - **agy has a candidate in-band version source that is not yet usable.**
@@ -216,10 +247,10 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   isolated HOME actually containing it rather than the real one (unverified); and it is a
   free-form log the agent's own activity also writes into, so a naive scan reads a channel
   model-controlled text can reach — the forgery hazard copilot had to design around.
-- **codex has no post-run config re-check.** Its MCP verification is entirely pre-launch
-  (`_verify_all_mcp_disabled` from `build_argv`). Copilot re-enumerates *after* the run to
-  close the launch-window race, where a server added between argv construction and startup
-  loads un-disabled. codex is exposed to the same race and does not check for it. This is
-  independent of provenance and probably wants its own change.
+- ~~**codex has no post-run config re-check.**~~ **Done.** `CodexAdapter.verify_post_run`
+  now re-enumerates codex's effective view after the run and fails any run where a server
+  is configured that the launched `-c ...enabled=false` set did not name, plus reads the
+  run's own stream for `mcp_tool_call` items. See "codex's stream witness is
+  presence-only" below for why those two halves are not equal partners here.
 - The two `DESIGN_MCP_Support.md` §9 probes (claude `--allowedTools` gating, codex TOML
   array/inline-table values via `-c`) remain deferred, then Phase 1.

@@ -2737,14 +2737,22 @@ def _check_unreadable_version_adapters(failures, verbose):
 
     print("codex/antigravity version provenance:")
 
+    # codex's verify_post_run now also re-checks MCP state, which shells out to the real
+    # binary; stub the enumeration so this arm tests provenance only (the re-check has its
+    # own arms below).
+    class _QuietCodex(_cx.CodexAdapter):
+        def _mcp_disable_args(self, cwd=None, env=None):
+            return []
+
+    opts = _cx.RunOptions()
     saved_warned = set(_b._WARNED_VERSIONS)
     saved_err = sys.stderr
     try:
         _b._WARNED_VERSIONS.clear()
         sys.stderr = io.StringIO()
-        _cx.CodexAdapter().verify_post_run([], None, cwd=".", stdout="", exit_code=0)
-        _cx.CodexAdapter().verify_post_run([], None, cwd=".", stdout="", exit_code=0)
-        _ag.AntigravityAdapter().verify_post_run([], None, cwd=".", stdout="", exit_code=0)
+        _QuietCodex().verify_post_run([], opts, cwd=".", stdout="", exit_code=0)
+        _QuietCodex().verify_post_run([], opts, cwd=".", stdout="", exit_code=0)
+        _ag.AntigravityAdapter().verify_post_run([], opts, cwd=".", stdout="", exit_code=0)
         both = sys.stderr.getvalue()
     finally:
         sys.stderr = saved_err
@@ -2776,6 +2784,165 @@ def _check_unreadable_version_adapters(failures, verbose):
            f"roots and plugin mcp_config channel were confirmed with live sentinel "
            f"servers — so the newer installed build warns instead of being silently "
            f"blessed", failures, verbose)
+
+
+def _check_codex_post_run_mcp_recheck(failures, verbose):
+    """codex closes the launch window it used to leave open.
+
+    Everything codex verified before this ran from build_argv — `_verify_all_mcp_disabled`
+    is post-*enumeration*, pre-*launch*, despite the name. A server added to config between
+    building argv and codex reading its config at startup was never named on the disable
+    set and loaded live, with nothing checking afterwards. copilot has closed this window
+    since Phase 0.
+
+    The two halves are deliberately unequal and the arms pin that: codex's stream evidence
+    is presence-only (it emits nothing when a server *starts* — verified live against a
+    sentinel stdio server it launched silently), so re-enumeration carries the load.
+    """
+    import json as _json
+
+    print("codex post-run MCP re-check:")
+
+    from .adapters import codex as _cx
+
+    opts = _cx.RunOptions()
+
+    def _adapter(enumerated):
+        """A codex adapter whose post-run enumeration reports `enumerated`."""
+        class _Stub(_cx.CodexAdapter):
+            def _mcp_disable_args(self, cwd=None, env=None):
+                if enumerated is None:
+                    raise RuntimeError("`codex mcp list --json` did not return a list")
+                return [t for n in enumerated
+                        for t in ("-c", f"mcp_servers.{n}.enabled=false")]
+        return _Stub()
+
+    def _run(adapter, argv, stdout=""):
+        try:
+            adapter.verify_post_run(argv, opts, cwd=".", stdout=stdout, exit_code=0)
+        except RuntimeError as exc:
+            return str(exc)
+        return ""
+
+    launched = ["-c", "mcp_servers.known.enabled=false"]
+
+    # Nothing moved: the same server set is configured now as at launch.
+    clean = _run(_adapter(["known"]), launched)
+    # A server appeared in the launch window — configured now, not disabled on the argv
+    # that actually ran. This is the defect the whole check exists for.
+    appeared = _run(_adapter(["known", "sneaky"]), launched)
+    # Enumeration itself stopped working after the run: hermeticity is no longer
+    # ESTABLISHABLE, which is not the same as established, so it fails closed.
+    unenumerable = _run(_adapter(None), launched)
+    # A server that vanished before the check is not a violation — it is the ABA case the
+    # stream half exists for, and re-enumeration honestly cannot see it. Pinned so nobody
+    # "fixes" it into a false positive.
+    vanished = _run(_adapter([]), launched)
+
+    _check("codex.post_run_reenumeration_closes_the_launch_window",
+           clean == "" and "sneaky" in appeared and "not provably MCP-hermetic" in appeared
+           and "no longer is" in unenumerable and vanished == "",
+           f"a run whose configured server set is unchanged passes; one where a server "
+           f"appeared after argv was built fails, naming it; an enumeration that stops "
+           f"working post-run fails closed rather than assuming the earlier check still "
+           f"holds; and a server REMOVED during the run is not reported, because "
+           f"re-enumeration genuinely cannot see it — that blind spot is the stream "
+           f"half's job", failures, verbose)
+
+    # --- the stream half: presence proves a leak, absence proves nothing --------------
+    # Shapes taken verbatim from a live codex 0.140.0 run against a sentinel stdio server.
+    leak = "\n".join([
+        _json.dumps({"type": "item.started", "item": {
+            "id": "item_1", "type": "mcp_tool_call", "server": "sentinel",
+            "tool": "sentinel_ping", "status": "in_progress"}}),
+        _json.dumps({"type": "item.completed", "item": {
+            "id": "item_1", "type": "mcp_tool_call", "server": "sentinel",
+            "tool": "sentinel_ping", "status": "failed",
+            "error": {"message": "user cancelled MCP tool call"}}}),
+    ])
+    # A call the approval policy REFUSED still proves the server was live and reachable —
+    # verified: this is exactly what the sentinel run produced.
+    streamed = _run(_adapter(["known"]), launched, stdout=leak)
+    calls = _cx._mcp_tool_calls(leak)
+    # ONLY the failed completion, with no preceding item.started. The distinction is not
+    # academic: the sentinel run produced exactly this outcome (the approval policy
+    # cancelled the call), and a check that counted only successful calls would report a
+    # clean run while a server had been live and reachable for the whole session. With
+    # both events present an arm cannot tell the two rules apart — the started event
+    # carries it either way — so this fixture is what makes the claim testable.
+    refused_only = _cx._mcp_tool_calls(_json.dumps({
+        "type": "item.completed", "item": {
+            "id": "item_1", "type": "mcp_tool_call", "server": "sentinel",
+            "tool": "sentinel_ping", "status": "failed",
+            "error": {"message": "user cancelled MCP tool call"}}}))
+    # Deduped across item.started/item.completed rather than reported twice.
+    native_only = _cx._mcp_tool_calls(_json.dumps({"type": "item.completed", "item": {
+        "type": "command_execution", "command": "ls"}}))
+    # Malformed telemetry must not raise: this runs inside verify_post_run, where a raise
+    # is reported as an MCP hermeticity failure, and a mistyped item is not one.
+    raised = None
+    try:
+        malformed = _cx._mcp_tool_calls(
+            "\n".join([_json.dumps([1, 2]), _json.dumps({"item": "not-a-dict"}),
+                       "not json"]))
+    except Exception as exc:  # noqa: BLE001 — the point is that nothing escapes
+        raised, malformed = type(exc).__name__, None
+
+    _check("codex.stream_reports_mcp_tool_calls_as_leaks",
+           calls == ["sentinel/sentinel_ping"] and "sentinel/sentinel_ping" in streamed
+           and "not MCP-hermetic" in streamed
+           and refused_only == ["sentinel/sentinel_ping"]
+           and native_only == [] and malformed == [] and raised is None,
+           f"an mcp_tool_call in the run's own stream fails the run even though the "
+           f"config re-reads clean ({calls}) — testimony a later edit cannot retract — and "
+           f"a call the approval policy REFUSED still counts, since the server was live to "
+           f"refuse it; native tool items are not leaks ({native_only}); malformed "
+           f"telemetry yields no leak report ({malformed!r}) rather than raising "
+           f"({raised!r})", failures, verbose)
+
+    # --- the re-check must run in the CHILD's context, not the harness's --------------
+    # Enumerating with the harness's own cwd/env can resolve a different server set
+    # entirely (trusted-project configs, $CODEX_HOME), so a missing RunOptions is a
+    # fail-closed condition rather than a silent fallback to os.environ.
+    # The EXCEPTION TYPE is asserted, not just the message. Removing the guard yields an
+    # AttributeError whose text also contains "effective_env", so a message-only assertion
+    # passes on the broken code — the arm would then be pinning the crash rather than the
+    # deliberate refusal. Every caller of verify_post_run treats RuntimeError as "this run
+    # is not provably hermetic"; an AttributeError is an unhandled bug.
+    no_opts_type, no_opts = "", ""
+    try:
+        _adapter(["known"]).verify_post_run(launched, None, cwd=".", stdout="")
+    except Exception as exc:  # noqa: BLE001 — the type is exactly what is under test
+        no_opts_type, no_opts = type(exc).__name__, str(exc)
+    _check("codex.post_run_recheck_requires_the_childs_context",
+           no_opts_type == "RuntimeError" and "effective_env" in no_opts,
+           f"re-checking without the RunOptions the invocation was built from fails "
+           f"closed with a deliberate RuntimeError ({no_opts_type}), rather than quietly "
+           f"enumerating against the harness's environment — which resolves a different "
+           f"set of servers than the run saw — or crashing with an AttributeError that "
+           f"no caller is prepared to read as a hermeticity failure", failures, verbose)
+
+    # --- argv spellings the comparison depends on ------------------------------------
+    # Under-counting what argv disabled makes a correctly-disabled server read as "new",
+    # failing hermetic runs. codex accepts all four spellings (verified 0.140.0), so all
+    # four have to be read back.
+    spellings = [
+        _cx._disabled_server_names(["-c", "mcp_servers.a.enabled=false"]),
+        _cx._disabled_server_names(["-cmcp_servers.a.enabled=false"]),
+        _cx._disabled_server_names(["--config", "mcp_servers.a.enabled=false"]),
+        _cx._disabled_server_names(["--config=mcp_servers.a.enabled=false"]),
+    ]
+    quoted = _cx._disabled_server_names(["-c", 'mcp_servers."odd name".enabled=false'])
+    unrelated = _cx._disabled_server_names(
+        ["-c", 'model_reasoning_effort="low"', "-c", "memories.use_memories=false"])
+    _check("codex.disable_argv_is_read_back_in_every_spelling",
+           all(s == {"a"} for s in spellings) and quoted == {"odd name"}
+           and unrelated == set(),
+           f"all four `-c`/`--config` spellings codex accepts are read back "
+           f"({[sorted(s) for s in spellings]}), including the quoted-key form "
+           f"({sorted(quoted)}); unrelated overrides contribute nothing "
+           f"({sorted(unrelated)}). Under-counting here would fail hermetic runs by "
+           f"reading a disabled server as newly appeared", failures, verbose)
 
 
 def _check_copilot_version_provenance(failures, verbose):
@@ -6372,6 +6539,7 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _check_version_provenance_shared(failures, verbose)
     _check_claude_version_provenance(failures, verbose)
     _check_unreadable_version_adapters(failures, verbose)
+    _check_codex_post_run_mcp_recheck(failures, verbose)
 
     # report inlining is capped per file; the judge's skip behavior is unchanged
     _check_inline_truncation(failures, verbose)
