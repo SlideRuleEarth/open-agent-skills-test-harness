@@ -2410,6 +2410,39 @@ def _check_version_provenance_shared(failures, verbose):
                              clear_hint="h", unreadable="no source in the stream")
     except ValueError:
         built_ok = False
+    # --- an UNKNOWN version is a denial too, once anything is denylisted --------------
+    # Review found this hole: check_denied used to return successfully whenever the version
+    # was None, so a run that completed normally, produced a good MCP witness and stated no
+    # version passed — while excluding nothing. "Could not read the version" is not
+    # evidence the version was fine, and the denylist tier covers exactly the defects the
+    # witness cannot see, so a clean witness says nothing about it either.
+    armed = _b.VersionProvenance(agent="armed", verified=("1.0.0",), verified_on="d",
+                                 clear_hint="h", denied={"6.6.6": "loads a server"})
+    unarmed = _b.VersionProvenance(agent="unarmed", verified=("1.0.0",), verified_on="d",
+                                   clear_hint="h")
+
+    def _denied_msg(prov, version, completed):
+        try:
+            prov.check_denied(version, completed=completed)
+        except RuntimeError as exc:
+            return str(exc)
+        return ""
+
+    unknown_completed = _denied_msg(armed, None, True)
+    unknown_crashed = _denied_msg(armed, None, False)
+    unknown_no_denylist = _denied_msg(unarmed, None, True)
+    known_good = _denied_msg(armed, "1.0.0", True)
+    _check("provenance.unknown_version_fails_closed_when_anything_is_denied",
+           "never stated which" in unknown_completed
+           and unknown_crashed == "" and unknown_no_denylist == "" and known_good == "",
+           f"a COMPLETED run that states no version fails closed while any build is "
+           f"denylisted, since nothing about it excludes those builds; a run that crashed "
+           f"before emitting telemetry does not ({unknown_crashed == ''}), because failing "
+           f"it by version would report 'denylisted build' for what is a crash; and with "
+           f"an empty denylist an unknown version is merely unknown "
+           f"({unknown_no_denylist == ''}), which keeps every adapter's normal state quiet",
+           failures, verbose)
+
     _check("provenance.unenforceable_denylist_is_refused",
            "can never fire" in unenforceable and built_ok,
            f"declaring a denylist alongside `unreadable` raises at construction "
@@ -2545,10 +2578,47 @@ def _check_claude_version_provenance(failures, verbose):
     # is False and the drift notice must not claim otherwise.
     crashed = _cl._mcp_witness("", 1)
     completed_silently = _cl._mcp_witness("", 0)
+    # --- evidence arriving AFTER the first init event still counts -------------------
+    # Review reproduced both halves of this: a stream whose opening init reported an empty
+    # server list and whose second reported a live one passed verification, and the version
+    # reader took whichever build the stream OPENED with. An adapter that reads only the
+    # start of a stream can be told anything by the rest of it.
+    two_inits_live = _init(claude_code_version="2.1.113") + "\n" + _init(
+        claude_code_version="2.1.113", mcp_servers=[{"name": "late"}])
+    two_inits_reshaped = _init(claude_code_version="2.1.113") + "\n" + _json.dumps(
+        {"type": "system", "subtype": "init", "mcp_servers": "not-a-list"})
+    late = _cl._mcp_witness(two_inits_live, 0)
+    late_reshaped = _cl._mcp_witness(two_inits_reshaped, 0)
+    # Disagreeing versions resolve to unknown rather than to the first one seen — a stream
+    # that tells two stories about what ran has established neither.
+    ver_disagree = _cl._stream_cli_version(
+        _init(claude_code_version="2.1.113") + "\n" + _init(claude_code_version="9.9.9"))
+    ver_repeat = _cl._stream_cli_version(
+        _init(claude_code_version="2.1.113") + "\n" + _init(claude_code_version="2.1.113"))
+    late_leak = ""
+    try:
+        _cl.ClaudeAdapter().verify_post_run([], None, cwd=".", stdout=two_inits_live,
+                                            exit_code=0)
+    except RuntimeError as exc:
+        late_leak = str(exc)
+    _check("claude.evidence_after_the_first_init_still_counts",
+           late[1] == ["late"] and late_reshaped[0] is not None
+           and ver_disagree is None and ver_repeat == "2.1.113"
+           and "late" in late_leak,
+           f"a server named by a LATER init event is still reported {late[1]} and still "
+           f"fails the run, rather than the check having made up its mind on the first "
+           f"event; a reshaped list anywhere is a violation ({late_reshaped[0]!r}); and "
+           f"disagreeing versions resolve to unknown ({ver_disagree!r}) while a repeated "
+           f"identical one does not ({ver_repeat!r})", failures, verbose)
+
     _check("claude.mcp_witness_fails_closed",
            ok == (None, [], True)
            and live[0] is None and live[1] == ["leaky"]
-           and reshaped[0] is not None and reshaped[2] is False
+           # The message must NAME the reshape, not merely be non-empty: a fallback path
+           # ("no init event at all") also yields a violation here, so `is not None` alone
+           # passes for the wrong reason and would survive the field-check being removed.
+           and reshaped[0] is not None and "mcp_servers" in reshaped[0]
+           and reshaped[2] is False
            and crashed == (None, [], False)
            and completed_silently[0] is not None,
            f"a hermetic run witnesses an empty server list {ok}; a loaded server is "
@@ -2593,13 +2663,34 @@ def _check_claude_version_provenance(failures, verbose):
                                     exit_code=0)
         except RuntimeError as exc:
             leaked = str(exc)
+        # END TO END, the reviewer's reproduction: a run that COMPLETED with a clean
+        # witness but stated no version must fail closed while anything is denylisted.
+        # Testing check_denied directly is not enough — the defect that got shipped was in
+        # verify_post_run's wiring, and a `completed=False` hardcoded here would restore it
+        # while every isolated arm stayed green (confirmed by mutation R4).
+        no_version_completed = ""
+        try:
+            adapter.verify_post_run(
+                [], None, cwd=".",
+                stdout=_json.dumps({"type": "system", "subtype": "init",
+                                    "mcp_servers": []}), exit_code=0)
+        except RuntimeError as exc:
+            no_version_completed = str(exc)
         # A run that died before its init event is excused from the witness — so it
         # reaches the drift notice with NO MCP evidence at all. Claiming "the runtime
         # witness held" there would be the notice inventing the very check it is warning
-        # about, which is the sentence a reader would quote to justify shipping.
+        # about, which is the sentence a reader would quote to justify shipping. It must
+        # also NOT be failed by version: no telemetry here means a crash, not a denied
+        # build. Guarded so that a defect making it raise is reported as an arm failure
+        # rather than crashing the selftest — a crash is a red signal of the wrong kind,
+        # and it hides which arm was supposed to catch it.
         _b._WARNED_VERSIONS.clear()
         sys.stderr = io.StringIO()
-        adapter.verify_post_run([], None, cwd=".", stdout="", exit_code=1)
+        crashed_run_raised = ""
+        try:
+            adapter.verify_post_run([], None, cwd=".", stdout="", exit_code=1)
+        except RuntimeError as exc:
+            crashed_run_raised = str(exc)
         unwitnessed = sys.stderr.getvalue()
     finally:
         sys.stderr = saved_err
@@ -2614,14 +2705,18 @@ def _check_claude_version_provenance(failures, verbose):
            and "strict-mcp-config" in warned
            and "witness held" in warned
            and "leaky" in leaked and "not MCP-hermetic" in leaked
+           and "never stated which" in no_version_completed
+           and crashed_run_raised == ""
            and "witness held" not in unwitnessed
            and "no MCP server list at all" in unwitnessed,
            f"a denylisted build fails the run by name and says plainly that this is "
            f"detection after the CLI already ran; a verified build that witnessed clean "
            f"is silent; an unverified one warns ONCE per process and names the flag the "
            f"whole argument rests on; a run that actually loaded a server fails outright; "
-           f"and a run that never produced a witness says so rather than claiming one "
-           f"held — a security notice that overstates its own evidence is worse than none",
+           f"a COMPLETED run that states no version fails closed through verify_post_run "
+           f"while a crashed one does not; and a run that never produced a witness says so "
+           f"rather than claiming one held — a security notice that overstates its own "
+           f"evidence is worse than none",
            failures, verbose)
 
 

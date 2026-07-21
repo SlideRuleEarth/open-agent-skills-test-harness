@@ -388,7 +388,7 @@ _PROVENANCE = VersionProvenance(
 _WARNED_VERSIONS = _base_warned_versions
 
 
-def _check_cli_version_denied(version: Optional[str]) -> None:
+def _check_cli_version_denied(version: Optional[str], *, completed: bool = False) -> None:
     """Fail a run that executed a build KNOWN to break a hermeticity assumption.
 
     Post-run detection, not prevention — see ``VersionProvenance.check_denied``. Worth
@@ -398,11 +398,12 @@ def _check_cli_version_denied(version: Optional[str]) -> None:
     binary will resolve, and a preflight probe resolves its app root by a different path
     than the real argv, so it can honestly report a version the run does not use.
 
-    It runs BEFORE the contract evidence because it covers precisely what that evidence
-    cannot: a defect that leaves the MCP witness perfectly intact (broken plugin masking,
-    say) fires no runtime check at all.
+    It is reported BEFORE the contract evidence because it covers precisely what that
+    evidence cannot: a defect that leaves the MCP witness perfectly intact (broken plugin
+    masking, say) fires no runtime check at all. *completed* comes from that same witness
+    and decides whether an UNKNOWN version fails closed — see check_denied.
     """
-    _PROVENANCE.check_denied(version)
+    _PROVENANCE.check_denied(version, completed=completed)
 
 
 def _warn_cli_version_drift(version: Optional[str], *, agent: str = "copilot",
@@ -1793,9 +1794,13 @@ class CopilotAdapter(Adapter):
         # A build KNOWN to break an assumption is refused first: that is the one tier the
         # runtime contract cannot reach, since such a defect leaves the witness intact.
         # Everything after this point is contract evidence, which is version-independent.
+        # The witness is computed before the denylist check but raised after it: the check
+        # needs to know whether the run got far enough to be judged (an unknown version
+        # fails closed on a completed run once anything is denylisted), while a denial
+        # still has to be reported ahead of any contract failure found on the same run.
         version = _stream_cli_version(stdout)
-        _check_cli_version_denied(version)
         broken, live, witnessed = _mcp_witness(stdout, exit_code)
+        _check_cli_version_denied(version, completed=witnessed)
         if broken is not None:
             raise RuntimeError(
                 f"copilot's MCP witness does not hold: {broken}. The run finished "

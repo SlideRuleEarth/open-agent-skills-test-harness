@@ -98,11 +98,21 @@ def _stream_cli_version(stdout: str) -> Optional[str]:
     repo laid out to look like a version string. (Copilot has to reconstruct its version
     from skill paths and pays for that in care; here there is nothing to reconstruct.)
 
-    Returns None when the event is absent or malformed — both mean the version is unknown,
-    which warns rather than fails. Must not raise: this runs inside verify_post_run, where
-    anything raised is reported as an MCP hermeticity failure, and malformed telemetry is
-    not one.
+    EVERY init event is read, not just the first. Stopping at the first was a real defect
+    (found in review): a stream carrying a second init event could state a different
+    version, and taking the leading one would report whichever build the stream *opened*
+    with rather than resolving the disagreement. Distinct versions therefore collapse to
+    None — the same rule copilot applies to its app-root paths — because a stream that
+    tells two stories about what ran has not established either.
+
+    Returns None when the event is absent, malformed, or self-contradictory: all of them
+    mean the version is unknown, which warns, and additionally FAILS the run when the
+    adapter has a non-empty denylist that the unknown version cannot be excluded from
+    (see VersionProvenance.check_denied). Must not raise: this runs inside verify_post_run,
+    where anything raised is reported as an MCP hermeticity failure, and malformed
+    telemetry is not one.
     """
+    seen: set[str] = set()
     for obj in iter_jsonl(stdout):
         if not isinstance(obj, dict):
             continue
@@ -110,8 +120,8 @@ def _stream_cli_version(stdout: str) -> Optional[str]:
             continue
         version = obj.get("claude_code_version")
         if isinstance(version, str) and version:
-            return version
-    return None
+            seen.add(version)
+    return seen.pop() if len(seen) == 1 else None
 
 
 def _mcp_witness(stdout: str, exit_code: int) -> tuple[Optional[str], list[str], bool]:
@@ -128,7 +138,18 @@ def _mcp_witness(stdout: str, exit_code: int) -> tuple[Optional[str], list[str],
     a crash before the init event is not evidence of a leak. That distinction is why
     `witnessed` is threaded into the drift warning — claiming the witness held on a run
     that never produced one would be the notice inventing its own evidence.
+
+    EVERY init event is examined and their server lists are UNIONED, rather than trusting
+    the first. Returning at the first one was a real defect (found in review): a stream
+    whose opening init reported an empty list and whose second reported a live server
+    passed verification, because the evidence that mattered arrived after the check had
+    already made up its mind. An adapter that reads only the start of a stream can be
+    told anything by the rest of it, so a server named anywhere counts as loaded, and a
+    reshaped list anywhere is a violation.
     """
+    violation: Optional[str] = None
+    live: list[str] = []
+    witnessed = False
     for obj in iter_jsonl(stdout):
         if not isinstance(obj, dict):
             continue
@@ -140,8 +161,20 @@ def _mcp_witness(stdout: str, exit_code: int) -> tuple[Optional[str], list[str],
             # otherwise completed, that is a contract violation rather than a clean
             # result: "no servers found" and "the field moved" are indistinguishable
             # outcomes, and only one of them is safe.
-            return ("the init event carries no `mcp_servers` list", [], False)
-        live = [str(s.get("name") if isinstance(s, dict) else s) for s in servers]
+            if violation is None:
+                violation = "an init event carries no `mcp_servers` list"
+            continue
+        witnessed = True
+        for s in servers:
+            name = str(s.get("name") if isinstance(s, dict) else s)
+            if name not in live:
+                live.append(name)
+    if violation is not None:
+        # Report the violation, but hand back whatever servers WERE named: a stream that
+        # both reshaped one event and loaded a server in another should not lose the
+        # second fact to the first.
+        return (violation, live, False)
+    if witnessed:
         return (None, live, True)
     if exit_code == 0:
         return ("the run completed but emitted no system/init event", [], False)
@@ -225,15 +258,22 @@ class ClaudeAdapter(Adapter):
         """Confirm from the run's own stream that it was MCP-hermetic, and record which
         build produced that evidence.
 
-        Ordered the same way as copilot's, and for the same reasons. The denylist runs
-        FIRST because it covers exactly what the runtime evidence cannot: a defect that
-        leaves the witness perfectly intact fires no runtime check at all. The drift
+        Ordered the same way as copilot's, and for the same reasons. The denylist is
+        REPORTED first because it covers exactly what the runtime evidence cannot: a
+        defect that leaves the witness perfectly intact fires no runtime check at all, so
+        a denial must not be masked by a contract failure found on the same run. The drift
         warning runs LAST, only on a run that cleared every gate, so a genuine hermeticity
         failure is never buried under a version notice.
+
+        The witness is COMPUTED before the denylist check but RAISED after it. That split
+        looks fussy and is load-bearing: check_denied needs to know whether the run got far
+        enough to be judged (an unknown version fails closed on a completed run once
+        anything is denylisted, but must not on a crash), while the reporting order above
+        still has to put a denial ahead of a contract failure.
         """
         version = _stream_cli_version(stdout)
-        _PROVENANCE.check_denied(version)
         broken, live, witnessed = _mcp_witness(stdout, exit_code)
+        _PROVENANCE.check_denied(version, completed=witnessed)
         if broken is not None:
             raise RuntimeError(
                 f"claude's MCP witness does not hold: {broken}. The run finished normally, "

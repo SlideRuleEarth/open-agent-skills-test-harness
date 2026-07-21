@@ -497,8 +497,9 @@ class VersionProvenance:
                 "and the warning would carry no baseline to compare against."
             )
 
-    def check_denied(self, version: Optional[str]) -> None:
-        """Fail a run that turns out to have executed a build KNOWN to break an assumption.
+    def check_denied(self, version: Optional[str], *, completed: bool = False) -> None:
+        """Fail a run that executed a build KNOWN to break an assumption — or that cannot
+        show it did not.
 
         POST-RUN DETECTION, NOT PREVENTION, and the distinction is not pedantic: by the
         time this fires the CLI has already run to completion. If the denylisted defect
@@ -513,19 +514,47 @@ class VersionProvenance:
         is), and the standing rule bars clearing a security decision with a fact learned
         by executing the same program a second time. A pre-launch gate would be guessing
         with more ceremony.
+
+        **An unknown version is a denial too, once anything is on the list.** Review found
+        the hole: this used to return successfully whenever ``version`` was None, so a run
+        that completed normally, produced a perfectly good MCP witness, and stated no
+        version passed — even though nothing about it excluded a denied build. "We could
+        not read the version" is not evidence that the version was fine, and the denylist
+        tier exists precisely for defects the runtime contract cannot see, so the witness
+        holding says nothing about it either. The two conditions are deliberately narrow:
+
+        * ``self.denied`` must be non-empty. With an empty denylist there is nothing to
+          exclude, so an unknown version is merely unknown and warns as before — which
+          keeps the normal state of every adapter here quiet.
+        * ``completed`` must be True. A run that died before emitting its telemetry has no
+          version for an uninteresting reason, and failing it *by version* would report
+          "denylisted build" for what is actually a crash — mislabelling the failure and
+          sending the reader after the wrong thing. Callers derive this from the same
+          witness they use elsewhere, so it means "the CLI ran far enough to be judged".
         """
-        if version is None or version not in self.denied:
-            return
-        raise RuntimeError(
-            f"this run executed {self.agent} {version}, which is on this adapter's "
-            f"denylist: {self.denied[version]}. A defect recorded here is one the "
-            "runtime contract cannot see, so no runtime check catches it — the run is "
-            "failed by version instead. Note this is detection AFTER the fact: the "
-            "version is only readable from the run's own output, so the CLI has already "
-            "executed and any side effect of that defect has already happened; what is "
-            "prevented is the RESULT counting. Pin a different CLI build before running "
-            "again."
-        )
+        if version is not None and version in self.denied:
+            raise RuntimeError(
+                f"this run executed {self.agent} {version}, which is on this adapter's "
+                f"denylist: {self.denied[version]}. A defect recorded here is one the "
+                "runtime contract cannot see, so no runtime check catches it — the run is "
+                "failed by version instead. Note this is detection AFTER the fact: the "
+                "version is only readable from the run's own output, so the CLI has "
+                "already executed and any side effect of that defect has already "
+                "happened; what is prevented is the RESULT counting. Pin a different CLI "
+                "build before running again."
+            )
+        if version is None and self.denied and completed:
+            raise RuntimeError(
+                f"this run completed but never stated which {self.agent} build executed, "
+                f"and this adapter denylists {len(self.denied)} build(s) "
+                f"({', '.join(sorted(self.denied))}). An unreadable version cannot show "
+                "the run avoided them, and the denylist covers exactly the defects the "
+                "runtime contract cannot see — so a clean witness is not evidence about "
+                "this either. Failing closed: the alternative is passing a run that may "
+                "have executed a build already known to be broken. If the version simply "
+                "moved in this build's telemetry, fix the reader in this adapter rather "
+                "than removing the check."
+            )
 
     def warn_drift(self, version: Optional[str], *, witnessed: bool = False) -> None:
         """Warn once per version that a run executed a build the analysis has not been
