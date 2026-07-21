@@ -17,6 +17,7 @@ Results stream to artifacts/<run_id>/ and a summary table is returned for the CL
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
@@ -31,7 +32,7 @@ from .adapters import get_adapter
 from .adapters.base import RunOptions
 from .assertions import AssertionContext, AssertionResult, run_assertion
 from .exec import execute
-from .isolation import build_isolated_home
+from .isolation import build_isolated_home, config_home_entries, reroot_config_masks
 from .judge import Judge
 from .progress import Progress
 from .schema import EventKind, RunResult
@@ -161,6 +162,14 @@ class Runner:
 
     def run(self, specs: list[EvalSpec]) -> list[CellResult]:
         os.makedirs(self.run_dir, exist_ok=True)
+        if not self.isolated and (getattr(self.adapter, "isolation_config_masks", None)
+                                  or getattr(self.adapter, "plugin_registry_config_masks", None)):
+            # This runner's MCP-off guarantee lives in the isolation overlay's config masks
+            # (it has no complete CLI-level kill-switch) — surface the exposure once, up
+            # front, instead of letting a non-isolated run silently load real MCP servers.
+            print(f"warning: [{self.agent}] running with isolation off — the user's real "
+                  f"MCP configuration (user config/plugins) is NOT masked on this runner; "
+                  f"MCP hermeticity is not guaranteed for this run.", file=sys.stderr)
         cells = [
             (target, spec)
             for spec in specs
@@ -286,6 +295,13 @@ class Runner:
         if self.provision and declared_dirs:
             adapter.provision_skills(exec_ws, declared_dirs)
         self._seed_files(exec_ws, spec)
+        # 2b) neutralize seeded MCP configs a CLI discovers from the workspace itself
+        # (e.g. agy's .agents/mcp_config.json) — the HOME overlay can't reach these, and
+        # runners with workspace_config_masks have no CLI-level disable either.
+        for rel in _apply_workspace_config_masks(adapter, exec_ws):
+            print(f"warning: [{self.agent}] {spec.name!r}: seeded workspace file {rel!r} "
+                  f"is an MCP config this runner would load — neutralized (MCP is "
+                  f"hermetically off; no `mcp_servers:` support yet).", file=sys.stderr)
 
         # 3) render prompt (fill {skill}/{skills} for this adapter)
         prompt = self._render_prompt(spec)
@@ -298,7 +314,13 @@ class Runner:
         # relocation above): this tracks whether THIS cell's HOME-overlay skill masking actually
         # succeeded, which can independently fail (e.g. no symlink privileges) and fall back.
         home_isolated = False
-        if self.isolated and adapter.global_skills_subpaths:
+        # Config masks neutralize per-user config the overlay's wholesale symlinks would
+        # otherwise pass through — today that's MCP server configs ("{}" = declare no
+        # servers; None = empty dir), keeping runs hermetically MCP-off
+        # (DESIGN_MCP_Support.md, Phase 0).
+        cfg_masks = dict(getattr(adapter, "isolation_config_masks", {}) or {})
+        plugin_cfg_masks = dict(getattr(adapter, "plugin_registry_config_masks", {}) or {})
+        if self.isolated and (adapter.global_skills_subpaths or cfg_masks or plugin_cfg_masks):
             iso_home = tempfile.mkdtemp(prefix="ase-home-")
             seed_dirs = declared_dirs if self.provision else []
             try:
@@ -307,19 +329,39 @@ class Runner:
                     seed_dirs, os.path.expanduser("~"),
                     plugin_registry_subpaths=getattr(adapter, "global_plugin_registry_subpaths", []),
                     repo_root=self._repo_root,
+                    config_file_masks=cfg_masks,
+                    plugin_config_masks=plugin_cfg_masks,
                 )
                 cfg_root = None
-                for var, skills_sub in getattr(adapter, "isolation_config_homes", []):
+                for var, replaces, skills_sub in config_home_entries(adapter):
                     custom = os.environ.get(var)
                     if custom and os.path.isdir(custom):
                         if cfg_root is None:
                             cfg_root = tempfile.mkdtemp(prefix="cfg-", dir=iso_home)
                         mirror = os.path.join(cfg_root, _safe(var))
-                        build_isolated_home(mirror, [skills_sub], self._repo_skill_names,
-                                            seed_dirs, custom, repo_root=self._repo_root)
+                        # the custom home stands in for one HOME subdir (e.g. $COPILOT_HOME
+                        # for ~/.copilot), so the masks under that subdir apply inside it —
+                        # otherwise pointing the var elsewhere would bypass them.
+                        build_isolated_home(mirror, [skills_sub] if skills_sub else [],
+                                            self._repo_skill_names,
+                                            seed_dirs, custom, repo_root=self._repo_root,
+                                            config_file_masks=reroot_config_masks(
+                                                cfg_masks, replaces))
                         iso_env[var] = mirror
                 home_isolated = True
             except OSError as exc:
+                if cfg_masks or plugin_cfg_masks:
+                    # This runner's MCP hermeticity lives in the overlay (no CLI-level
+                    # kill-switch) — running against the real HOME would load the user's
+                    # real MCP servers, so fail this cell instead of falling open. An
+                    # explicit `isolated: false` run is the documented opt-out.
+                    shutil.rmtree(iso_home, ignore_errors=True)
+                    raise RuntimeError(
+                        f"HOME-overlay isolation failed ({exc}) and {self.agent} depends "
+                        f"on it to keep MCP hermetically off — failing closed rather than "
+                        f"running with the user's real MCP servers loaded. Run with "
+                        f"isolated: false to explicitly accept a non-hermetic run."
+                    ) from exc
                 print(f"warning: [{self.agent}] skill isolation unavailable ({exc}); "
                       "running non-isolated.", file=sys.stderr)
                 shutil.rmtree(iso_home, ignore_errors=True)
@@ -924,3 +966,57 @@ def _prepare_workspace(path: str) -> None:
         else:
             os.unlink(path)
     os.makedirs(path, exist_ok=False)
+
+
+def _apply_workspace_config_masks(adapter, workspace: str) -> list[str]:
+    """Overwrite seeded workspace files matching the adapter's ``workspace_config_masks``
+    globs with their neutral content — MCP configs some CLIs discover from the run
+    workspace itself (agy's ``.agents/mcp_config.json``), which no HOME overlay or CLI
+    flag reaches. Only *existing* files are touched: pre-creating a config would pollute
+    the workspace the agent sees and the archived artifacts. A seeded symlink resolving
+    outside the workspace is *neutralized*, not skipped: every escaping symlink component
+    is unlinked (never followed for the write — the outside target must not be touched)
+    and the path is rebuilt as a real file with the neutral content, so the CLI can't
+    read the outside config through the link. Returns the workspace-relative paths
+    neutralized."""
+    masked: list[str] = []
+    ws_real = os.path.realpath(workspace)
+    for pattern, content in (getattr(adapter, "workspace_config_masks", {}) or {}).items():
+        full_pattern = os.path.join(glob.escape(workspace), *pattern.split("/"))
+        for path in glob.glob(full_pattern):
+            if not os.path.isfile(path):
+                continue
+            if not _unlink_escaping_symlinks(workspace, ws_real, path):
+                continue  # couldn't make the path safely writable — leave it unmatched
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            masked.append(os.path.relpath(path, workspace))
+    return sorted(masked)
+
+
+def _unlink_escaping_symlinks(workspace: str, ws_real: str, path: str) -> bool:
+    """Make ``path`` (a glob match under ``workspace``) safe to rewrite in place: unlink
+    every symlink component under the workspace that resolves outside it (the final file
+    or any intermediate directory), so a subsequent write lands inside the workspace
+    instead of following a seeded link out. Symlinks resolving *within* the workspace
+    are left alone. Returns False when containment can't be established."""
+    rel = os.path.relpath(path, workspace)
+    if rel == os.curdir or rel.startswith(os.pardir + os.sep) or rel == os.pardir:
+        return False
+    parts = rel.split(os.sep)
+    for _ in range(len(parts) + 1):
+        cur = workspace
+        escaping = None
+        for part in parts:
+            cur = os.path.join(cur, part)
+            if os.path.islink(cur):
+                real = os.path.realpath(cur)
+                if real != ws_real and not real.startswith(ws_real + os.sep):
+                    escaping = cur
+                    break
+        if escaping is None:
+            real = os.path.realpath(path)
+            return real == ws_real or real.startswith(ws_real + os.sep)
+        os.unlink(escaping)
+    return False  # pragma: no cover — more escapes than path components can't happen

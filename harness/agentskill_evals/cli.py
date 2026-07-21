@@ -513,7 +513,7 @@ def cmd_run(args) -> int:
     if isolated:
         managed = {"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
                    "XDG_CACHE_HOME", "XDG_STATE_HOME"}
-        managed.update(v for v, _ in getattr(get_adapter(agent), "isolation_config_homes", []))
+        managed.update(v for v, *_ in getattr(get_adapter(agent), "isolation_config_homes", []))
         for s in specs:
             clash = sorted(set(s.env) & managed)
             if clash:
@@ -860,6 +860,65 @@ def cmd_selftest(args) -> int:
     return run_selftest(verbose=args.verbose)
 
 
+def cmd_verify_copilot_channels(args) -> int:
+    """Audit installed copilot bundles against the MCP discovery channels the adapter
+    neutralizes, so clearing a new CLI build is a minute's work instead of an afternoon
+    of reverse-engineering.
+
+    WHAT THIS PROVES, AND WHAT IT CANNOT. Each marker stands for a channel the adapter
+    disables or masks. A marker that has GONE means the assumption behind that defence no
+    longer holds in this build and the finding has to be re-established — that is the
+    silent-degradation case, and it is what this catches.
+
+    It CANNOT tell you the build is safe. A version that added a NEW discovery channel
+    shows every existing marker present and passes clean, because no marker exists for a
+    channel nobody has written code for yet. Detecting that needs a human reading the
+    bundle. Passing here is a precondition for adding a version to _VERIFIED_VERSIONS, not
+    a substitute for that reading.
+    """
+    from .adapters.copilot import (
+        _MCP_CHANNEL_MARKERS, _VERIFIED_ON, _VERIFIED_VERSIONS, audit_channel_markers,
+        find_cli_bundles,
+    )
+
+    bundles = find_cli_bundles()
+    if args.only_version:
+        bundles = [b for b in bundles if b[0] == args.only_version]
+    if not bundles:
+        which = f" matching {args.only_version}" if args.only_version else ""
+        print(f"no copilot app bundle{which} found in any known cache root.\n"
+              "Nothing to audit — install/run the CLI once so it populates its app root.",
+              file=sys.stderr)
+        return 1
+
+    print(f"adapter verified against: {', '.join(_VERIFIED_VERSIONS)} ({_VERIFIED_ON})")
+    print(f"{len(_MCP_CHANNEL_MARKERS)} channel marker(s) per bundle\n")
+    why = dict(_MCP_CHANNEL_MARKERS)
+    worst = 0
+    for version, app_js in bundles:
+        known = version in _VERIFIED_VERSIONS
+        results = audit_channel_markers(app_js)
+        missing = [m for m, present in results.items() if not present]
+        tag = "verified" if known else "NOT in _VERIFIED_VERSIONS"
+        print(f"copilot {version}  [{tag}]\n  {app_js}")
+        if missing:
+            worst = max(worst, 2)
+            for m in missing:
+                print(f"  MISSING  {m}  — {why[m]}")
+            print(f"  => {len(missing)} channel assumption(s) no longer hold in this "
+                  f"build; re-establish them before trusting it.")
+        else:
+            print(f"  all {len(results)} markers present")
+            if not known:
+                worst = max(worst, 1)
+                print("  => no REMOVED assumptions. This does not rule out a channel this "
+                      "build ADDED — no marker exists for code nobody has written yet, so "
+                      "that still needs a human reading the bundle. Once read, add "
+                      f"{version!r} to _VERIFIED_VERSIONS in adapters/copilot.py.")
+        print()
+    return worst
+
+
 # ---------------------------------------------------------------------------
 # arg parsing
 # ---------------------------------------------------------------------------
@@ -954,6 +1013,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("selftest", help="test the adapter parsers against bundled fixtures")
     sp.add_argument("-v", "--verbose", action="store_true")
     sp.set_defaults(func=cmd_selftest)
+
+    sp = sub.add_parser("verify-copilot-channels",
+                        help="audit an installed copilot build against the MCP "
+                             "discovery channels the adapter neutralizes")
+    sp.add_argument("--version", dest="only_version",
+                    help="audit only this bundle version (default: all discovered)")
+    sp.set_defaults(func=cmd_verify_copilot_channels)
 
     return p
 

@@ -110,6 +110,121 @@ def _check(name, cond, msg, failures, verbose):
         failures.append(name)
 
 
+def _flag_pair(argv, flag, value) -> bool:
+    """True if argv contains ``flag`` immediately followed by ``value``."""
+    return any(a == flag and i + 1 < len(argv) and argv[i + 1] == value
+               for i, a in enumerate(argv))
+
+
+def _cop_child_env(**over):
+    """The child env for a copilot build_argv fixture. build_argv resolves everything it
+    needs from this mapping and the filesystem — it spawns NO subprocess — so a fixture
+    env is exactly the keys it pins, nothing ambient."""
+    return dict(over)
+
+
+# Monkeypatches installed on IMPORTED modules, newest last, as (module, attr, original).
+# The suite patches adapter internals to drive checks that can't be driven any other way
+# (scoping the agent scan to fixture roots, stubbing the Windows ODR registry reader), and
+# those patches span hundreds of checks — far too wide to wrap each in its own try/finally
+# without burying the checks in indentation. So each install registers its undo here and
+# run_selftest restores whatever is left in ONE outer finally: a check that raises can no
+# longer leave a stub bolted onto an adapter, which in an embedding process (the suite is
+# importable, not just a CLI entry point) would silently weaken every later adapter call.
+# The inline restores stay where the patch's real scope ends and deregister as they go, so
+# on the happy path the net has nothing left to do.
+_MODULE_PATCHES: list[tuple] = []
+
+
+def _patch_module_attr(mod, name, value):
+    """Set ``mod.name = value``, register the undo on _MODULE_PATCHES, and return the
+    original for an inline restore."""
+    orig = getattr(mod, name)
+    _MODULE_PATCHES.append((mod, name, orig))
+    setattr(mod, name, value)
+    return orig
+
+
+def _unpatch_module_attr(mod, name, orig):
+    """Restore ``mod.name`` and drop its entry from the net (most recent first)."""
+    setattr(mod, name, orig)
+    for i in range(len(_MODULE_PATCHES) - 1, -1, -1):
+        if _MODULE_PATCHES[i][0] is mod and _MODULE_PATCHES[i][1] == name:
+            del _MODULE_PATCHES[i]
+            break
+
+
+def _restore_module_patches():
+    """Undo every still-installed patch, newest first. A no-op once the inline restores
+    have run; the safety net when an exception skipped them."""
+    while _MODULE_PATCHES:
+        mod, name, orig = _MODULE_PATCHES.pop()
+        setattr(mod, name, orig)
+
+
+def _cop_scope_agent_scan(roots):
+    """Scope copilot's custom-agent FILE scan to ``roots``; returns the original function
+    so the caller can restore it in a ``finally``. ``roots`` is read at CALL time, so a
+    fixture created later can append its own root to the same list.
+
+    Needed because the agent walk is UNBOUNDED: copilot stops it at its git root (or at
+    the OS home only when the cwd is in no repo), and the harness refuses to learn which
+    by executing git, so it visits every ancestor up to ``/``. A fixture under a shared
+    ``$TMPDIR`` therefore walks through directories other people write to, where one
+    stray ``.claude/agents/x.md`` would fail-close a build_argv call and crash the suite
+    — deciding checks that are about enumeration, home resolution, or argv mapping and
+    have nothing to do with agents.
+
+    What is masked is what unrelated ancestors CONTAIN, never which ancestors get
+    visited: the walk under test is untouched, and every check that asserts on agent
+    discovery plants its files inside a registered root."""
+    import os
+    import agentskill_evals.adapters.copilot as _m
+    orig = _m._agent_definition_files
+
+    def scoped(d):
+        rd = os.path.realpath(d)
+        if any(rd == r or rd.startswith(r + os.sep) for r in roots):
+            return orig(d)
+        return []
+
+    return _patch_module_attr(_m, "_agent_definition_files", scoped)
+
+
+def _cop_restore_agent_scan(orig):
+    """Undo _cop_scope_agent_scan."""
+    import agentskill_evals.adapters.copilot as _m
+    _unpatch_module_attr(_m, "_agent_definition_files", orig)
+
+
+def _cop_private_fixture(prefix: str):
+    """``(root, cwd, env)`` for copilot argv fixtures that must not depend on ANYTHING
+    ambient:
+
+    * ``cwd`` is a freshly created private directory,
+    * ``HOME``/``USERPROFILE`` is its realpath-resolved private parent, so home
+      resolution never falls back to this machine's real home,
+    * ``COPILOT_HOME`` is a private config home carrying only the
+      ``customAgents.defaultLocalOnly`` opt-out the isolation sanitizer injects, so the
+      remote-agents gate is satisfied without reading this machine's real ~/.copilot
+      (the opt-out is required for EVERY run, not just an in-repo one).
+
+    Pinning the home does NOT bound the custom-agent walk — nothing does; see
+    _cop_scope_agent_scan, which is what keeps a stray ``$TMPDIR/.claude/agents`` from
+    deciding these fixtures."""
+    import os
+    import tempfile as _t
+    root = os.path.realpath(_t.mkdtemp(prefix=prefix))
+    cwd = os.path.join(root, "ws")
+    chome = os.path.join(root, "copilot-home")
+    os.makedirs(cwd)
+    os.makedirs(chome)
+    with open(os.path.join(chome, "config.json"), "w") as fh:
+        fh.write('{"customAgents": {"defaultLocalOnly": true}}')
+    env = _cop_child_env(COPILOT_HOME=chome, HOME=root, USERPROFILE=root)
+    return root, cwd, env
+
+
 def _check_isolation(failures, verbose):
     """Validate the HOME overlay: declared skills present, undeclared masked, vendor kept,
     auth/config passed through, missing ancestors built, plugin-registry skills masked
@@ -148,6 +263,31 @@ def _check_isolation(failures, verbose):
                            "repo-skills-plugin", "plugin.json"), "w").close()
         os.makedirs(os.path.join(real, ".gemini", "config", "plugins",
                                   "other-plugin", "skills", "other-skill"))
+        # user-level MCP configs that leak through the overlay without a config-file mask:
+        # copilot's sits in ~/.copilot (a wholesale-symlinked dir), agy's in .gemini/config/
+        # (an overlay-real dir shared with the skills + plugins leaves above, so the file
+        # itself would pass through as a symlink).
+        user_mcp = '{"mcpServers":{"leaky":{"command":"evil"}}}'
+        os.makedirs(os.path.join(real, ".copilot"))
+        with open(os.path.join(real, ".copilot", "mcp-config.json"), "w") as fh:
+            fh.write(user_mcp)
+        open(os.path.join(real, ".copilot", "config.json"), "w").close()
+        with open(os.path.join(real, ".gemini", "config", "mcp_config.json"), "w") as fh:
+            fh.write(user_mcp)
+        # installed plugins can carry MCP servers of their own: copilot's whole
+        # installed-plugins dir is neutralized as an empty-dir mask; agy's per-plugin
+        # mcp_config.json is masked inside the plugin registry overlay.
+        os.makedirs(os.path.join(real, ".copilot", "installed-plugins", "mkt", "some-plugin"))
+        with open(os.path.join(real, ".copilot", "installed-plugins", "mkt", "some-plugin",
+                               "plugin.json"), "w") as fh:
+            fh.write('{"mcpServers":{"plug":{"command":"evil"}}}')
+        with open(os.path.join(real, ".gemini", "config", "plugins", "repo-skills-plugin",
+                               "mcp_config.json"), "w") as fh:
+            fh.write(user_mcp)
+        # a config that must be SANITIZED, not replaced — it mixes auth (keep) with
+        # plugin registrations (drop), like copilot's config.json.
+        with open(os.path.join(real, ".copilot", "state.json"), "w") as fh:
+            fh.write("auth+plugins")
         # the cell declares only skill-alpha (its source lives outside HOME, like skills_root)
         os.makedirs(os.path.join(declared_root, "skill-alpha"))
         # stale installs the name-based mask can't catch: a symlink into the checkout under a
@@ -169,6 +309,14 @@ def _check_isolation(failures, verbose):
             real,
             plugin_registry_subpaths=[".gemini/config/plugins"],
             repo_root=repo_checkout,
+            config_file_masks={".copilot/mcp-config.json": "{}",
+                               ".copilot/installed-plugins": None,   # dir mask
+                               # sanitizing (callable) mask: derives from the real content
+                               ".copilot/state.json":
+                                   lambda real: open(real).read().replace("plugins", "-"),
+                               ".gemini/config/mcp_config.json": "{}",
+                               ".missing-cli/mcp.json": "{}"},  # real file absent
+            plugin_config_masks={"mcp_config.json": "{}"},
         )
 
         skills = os.path.join(dest, ".codex", "skills")
@@ -232,6 +380,86 @@ def _check_isolation(failures, verbose):
         other_names = sorted(os.listdir(other_plugin_skills)) if os.path.isdir(other_plugin_skills) else []
         _check("isolation.unrelated_plugin_untouched", other_names == ["other-skill"],
                f"vendor-only plugin left alone (got {other_names})", failures, verbose)
+
+        # config-file masks (MCP hermeticity, DESIGN_MCP_Support.md Phase 0): the masked file
+        # is a real neutral file, its siblings still pass through, a mask in a dir shared
+        # with skills/plugin leaves works, an absent real file is still materialized, and
+        # the user's real config is never modified.
+        cop_mask = os.path.join(dest, ".copilot", "mcp-config.json")
+        _check("isolation.mcp_mask_real_file",
+               os.path.isfile(cop_mask) and not os.path.islink(cop_mask)
+               and open(cop_mask).read() == "{}"
+               and (os.stat(cop_mask).st_mode & 0o777) == 0o600,
+               "masked mcp-config.json is a real 0600 file containing '{}', not a symlink",
+               failures, verbose)
+        _check("isolation.mcp_mask_sibling_passthrough",
+               os.path.islink(os.path.join(dest, ".copilot", "config.json")),
+               "masking one file keeps its siblings passing through as symlinks",
+               failures, verbose)
+        gem_mask = os.path.join(dest, ".gemini", "config", "mcp_config.json")
+        _check("isolation.mcp_mask_shared_ancestor",
+               os.path.isfile(gem_mask) and not os.path.islink(gem_mask)
+               and open(gem_mask).read() == "{}",
+               "mask works in a dir shared with skills + plugin-registry leaves",
+               failures, verbose)
+        missing_mask = os.path.join(dest, ".missing-cli", "mcp.json")
+        _check("isolation.mcp_mask_absent_file_created",
+               os.path.isfile(missing_mask) and open(missing_mask).read() == "{}",
+               "a mask whose real file doesn't exist is still materialized",
+               failures, verbose)
+        _check("isolation.mcp_mask_source_untouched",
+               open(os.path.join(real, ".copilot", "mcp-config.json")).read() == user_mcp
+               and open(os.path.join(real, ".gemini", "config",
+                                     "mcp_config.json")).read() == user_mcp,
+               "the real HOME's MCP configs are never modified", failures, verbose)
+        plug_dir_mask = os.path.join(dest, ".copilot", "installed-plugins")
+        _check("isolation.mcp_dir_mask",
+               os.path.isdir(plug_dir_mask) and not os.path.islink(plug_dir_mask)
+               and os.listdir(plug_dir_mask) == [],
+               "a None-content mask materializes an empty real dir (installed plugins — "
+               "and their MCP servers — are gone)", failures, verbose)
+        _check("isolation.mcp_dir_mask_source_untouched",
+               os.path.isfile(os.path.join(real, ".copilot", "installed-plugins", "mkt",
+                                           "some-plugin", "plugin.json")),
+               "the real installed-plugins content is never modified", failures, verbose)
+        plug_mcp = os.path.join(dest, ".gemini", "config", "plugins",
+                                "repo-skills-plugin", "mcp_config.json")
+        _check("isolation.plugin_mcp_config_masked",
+               os.path.isfile(plug_mcp) and not os.path.islink(plug_mcp)
+               and open(plug_mcp).read() == "{}"
+               and open(os.path.join(real, ".gemini", "config", "plugins",
+                                     "repo-skills-plugin",
+                                     "mcp_config.json")).read() == user_mcp,
+               "a plugin's own mcp_config.json is masked inside the registry overlay; the "
+               "real one is untouched", failures, verbose)
+        san = os.path.join(dest, ".copilot", "state.json")
+        _check("isolation.callable_mask_sanitizes",
+               os.path.isfile(san) and not os.path.islink(san)
+               and open(san).read() == "auth+-"
+               and open(os.path.join(real, ".copilot", "state.json")).read()
+               == "auth+plugins",
+               "a callable mask derives sanitized content from the real file, which stays "
+               "untouched", failures, verbose)
+
+        # traversing/absolute/drive-anchored mask paths must be rejected — the mask is
+        # opened O_TRUNC at the joined path, so any of them would write outside the
+        # overlay ('C:evil.json' is drive-relative on Windows though POSIX isabs says no).
+        # Empty/dot-only paths name no file and would be SILENTLY discarded — an adapter
+        # typo would quietly leave the real config live, so they're errors too.
+        bad_dest = tempfile.mkdtemp(prefix="ase-badmask-")
+        try:
+            for bad in ("../evil.json", "/etc/evil.json", ".copilot/../../evil.json",
+                        "C:evil.json", "\\evil.json", "", ".", "./"):
+                try:
+                    build_isolated_home(bad_dest, [], (), (), real,
+                                        config_file_masks={bad: "{}"})
+                    ok = False
+                except ValueError:
+                    ok = True
+                _check(f"isolation.mask_path_rejected[{bad}]", ok,
+                       f"mask path {bad!r} raises ValueError", failures, verbose)
+        finally:
+            shutil.rmtree(bad_dest, ignore_errors=True)
 
         # config mirrors must use a fresh temp dir, not dest/_cfg — which is a symlink to the
         # real HOME's _cfg here, so writing through it would escape the temp tree.
@@ -697,6 +925,12 @@ def _check_workspace_relocation(failures, verbose):
 
     def _fake_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides, agent_name, eval_name):
         seen["cwd"] = cwd
+        # the isolated HOME is deleted right after execute() returns, so the mask must be
+        # inspected here, while the agent would actually see it.
+        if opts.home:
+            mask = os.path.join(opts.home, ".fakecli", "mcp.json")
+            if os.path.isfile(mask) and not os.path.islink(mask):
+                seen["mask_content"] = open(mask).read()
         with open(os.path.join(cwd, "run.py"), "w") as f:
             f.write("print('hi')\n")
         rr = RunResult(
@@ -706,18 +940,26 @@ def _check_workspace_relocation(failures, verbose):
         )
         return ExecResult(result=rr, stdout="", stderr="")
 
+    # masks alone (no global skills dirs — _FakeAdapter declares none) must still trigger
+    # the HOME overlay: the MCP kill-switch can't depend on an adapter also declaring
+    # skills paths.
+    class _MaskingFakeAdapter(_FakeAdapter):
+        isolation_config_masks = {".fakecli/mcp.json": "{}"}
+
     runner_mod.execute = _fake_execute
     try:
         run_dir = os.path.join(repo_root, "artifacts", "run1")
         os.makedirs(run_dir)
         r = runner_mod.Runner.__new__(runner_mod.Runner)
-        r.agent, r.adapter, r.targets = "fake", _FakeAdapter(), [ModelTarget()]
+        r.agent, r.adapter, r.targets = "fake", _MaskingFakeAdapter(), [ModelTarget()]
         r.artifacts_root = os.path.join(repo_root, "artifacts")
         r.run_id, r.skills_root, r.judge = "run1", repo_root, None
         r.provision, r.command, r.auto_approve = False, "", True
         r.reasoning_effort = None
         r.jobs, r.isolated, r.progress = 1, True, None
         r._repo_skill_names, r.run_dir = set(), run_dir
+        # reached now that _MaskingFakeAdapter's config mask triggers the HOME overlay
+        r._repo_root = repo_root
 
         spec = EvalSpec(name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"),
                         assertions=[{"type": "file_exists", "path": "run.py"}])
@@ -737,6 +979,10 @@ def _check_workspace_relocation(failures, verbose):
         _check("relocate.temp_exec_dir_cleaned",
                cwd_used is not None and not os.path.isdir(cwd_used),
                "temp exec dir removed after copy-back", failures, verbose)
+        _check("relocate.mcp_mask_threaded_into_home",
+               seen.get("mask_content") == "{}",
+               f"adapter-declared config mask materialized as '{{}}' in the isolated HOME "
+               f"the agent ran with (got {seen.get('mask_content')!r})", failures, verbose)
         # assertion details recorded paths under the (now deleted) exec_ws tempdir — they
         # must be remapped onto the final cell workspace so assertions.json points at
         # files that still exist.
@@ -749,6 +995,630 @@ def _check_workspace_relocation(failures, verbose):
     finally:
         runner_mod.execute = orig_execute
         shutil.rmtree(repo_root, ignore_errors=True)
+
+
+def _check_mcp_hermetic_paths(failures, verbose):
+    """MCP hermeticity must hold on every execution path, not just successful isolated
+    Runner cells (the Phase-0 review's finding 5): (1) build_mcp_masked_home neutralizes
+    the MCP configs — including per-plugin ones and a custom config-home env var — while
+    passing everything else through; (2) model probes run against that mask-only overlay;
+    (3) judge runs get the same overlay; (4) an overlay build failure on a runner whose
+    MCP-off depends on it fails the cell CLOSED instead of executing with the real HOME
+    (while runners with a CLI-level kill-switch keep the graceful non-isolated fallback)."""
+    import os
+    import shutil
+    import sys
+    import tempfile
+
+    from .adapters.base import Adapter, ParseOutput, ProbeResult
+    from .isolation import build_mcp_masked_home
+
+    print("MCP hermetic paths (masked-home overlay, probes, judge, fail-closed):")
+
+    # --- 1) build_mcp_masked_home against a fake real HOME + custom config home ---------
+    real = tempfile.mkdtemp(prefix="ase-mcpreal-")
+    custom = tempfile.mkdtemp(prefix="ase-mcpcustom-")
+    home = None
+    old_var = os.environ.get("FAKECLI_HOME")
+    try:
+        os.makedirs(os.path.join(real, ".fakecli", "plugins", "p1"))
+        with open(os.path.join(real, ".fakecli", "mcp.json"), "w") as fh:
+            fh.write('{"mcpServers":{"leaky":{}}}')
+        with open(os.path.join(real, ".fakecli", "plugins", "p1", "mcp_config.json"), "w") as fh:
+            fh.write('{"mcpServers":{"plug":{}}}')
+        open(os.path.join(real, ".fakecli", "plugins", "p1", "plugin.json"), "w").close()
+        open(os.path.join(real, ".fakecli", "auth.json"), "w").close()
+        with open(os.path.join(custom, "mcp.json"), "w") as fh:
+            fh.write('{"mcpServers":{"custom-leaky":{}}}')
+        open(os.path.join(custom, "auth.json"), "w").close()
+
+        class _MaskedCli:
+            isolation_config_masks = {".fakecli/mcp.json": "{}"}
+            plugin_registry_config_masks = {"mcp_config.json": "{}"}
+            global_plugin_registry_subpaths = [".fakecli/plugins"]
+            isolation_config_homes = [("FAKECLI_HOME", ".fakecli", None)]
+
+        os.environ["FAKECLI_HOME"] = custom
+        home, iso_env = build_mcp_masked_home(_MaskedCli(), real_home=real)
+        mask = os.path.join(home, ".fakecli", "mcp.json")
+        plug_mask = os.path.join(home, ".fakecli", "plugins", "p1", "mcp_config.json")
+        _check("mcp_masked_home.global_and_plugin_masked",
+               open(mask).read() == "{}" and not os.path.islink(mask)
+               and open(plug_mask).read() == "{}" and not os.path.islink(plug_mask),
+               "global + per-plugin MCP configs neutralized in the overlay",
+               failures, verbose)
+        _check("mcp_masked_home.everything_else_passes_through",
+               os.path.islink(os.path.join(home, ".fakecli", "auth.json"))
+               and os.path.islink(os.path.join(home, ".fakecli", "plugins", "p1",
+                                               "plugin.json")),
+               "auth/config/plugin metadata still pass through as symlinks",
+               failures, verbose)
+        mirror = iso_env.get("FAKECLI_HOME", "")
+        _check("mcp_masked_home.custom_home_mirrored",
+               bool(mirror) and mirror != custom
+               and open(os.path.join(mirror, "mcp.json")).read() == "{}"
+               and os.path.islink(os.path.join(mirror, "auth.json")),
+               f"a set custom config-home var is mirrored with re-rooted masks, not left "
+               f"pointing at the real config: {iso_env}", failures, verbose)
+
+        class _NoMaskCli:
+            pass
+        none_home, none_env = build_mcp_masked_home(_NoMaskCli(), real_home=real)
+        _check("mcp_masked_home.no_masks_no_overlay",
+               none_home is None and none_env == {},
+               "an adapter without masks gets no overlay (runs against the real HOME)",
+               failures, verbose)
+    finally:
+        if old_var is None:
+            os.environ.pop("FAKECLI_HOME", None)
+        else:
+            os.environ["FAKECLI_HOME"] = old_var
+        for d in (home, real, custom):
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
+
+    # --- 2) probe_model runs inside the mask-only overlay, in a fresh private workspace -
+    # _ProbeCli keeps the pre-Phase-0 `_probe_argv(self, model)` shape ON PURPOSE: it
+    # doubles as the out-of-tree compat check (_probe_argv_compat adapts the call).
+    class _ProbeCli(Adapter):
+        name = "probefake"
+        binary = sys.executable
+        isolation_config_masks = {".fakeprobe-mcp/mcp.json": "{}"}
+
+        def _probe_argv(self, model):
+            return [sys.executable, "-c",
+                    "import os; home=os.environ.get('HOME',''); print('PROBEHOME='+home); "
+                    "print('PROBECWD='+os.getcwd()); "
+                    "print('PROBEMASK='+open(os.path.join(home,'.fakeprobe-mcp','mcp.json'))"
+                    ".read())"]
+
+        def _parse_probe_cost(self, output):
+            self.probe_output = output
+            return ProbeResult(accepted=True)
+
+        def build_argv(self, prompt, opts, *, cwd):
+            return []
+
+        def parse(self, stdout, stderr, exit_code, *, opts=None):
+            return ParseOutput()
+
+    probe_cli = _ProbeCli()
+    pr = probe_cli.probe_model("any")
+    out = getattr(probe_cli, "probe_output", "")
+    real_home = os.path.abspath(os.path.expanduser("~"))
+    probed_home = next((ln[len("PROBEHOME="):] for ln in out.splitlines()
+                        if ln.startswith("PROBEHOME=")), "")
+    probed_cwd = next((ln[len("PROBECWD="):] for ln in out.splitlines()
+                       if ln.startswith("PROBECWD=")), "")
+    _check("mcp_probe.masked_home",
+           pr.accepted and "PROBEMASK={}" in out
+           and probed_home and os.path.abspath(probed_home) != real_home,
+           f"the probe subprocess saw a masked throwaway HOME, not the real one "
+           f"(home={probed_home!r}) — via a legacy (model)-only _probe_argv override",
+           failures, verbose)
+    # the probe must run in its own fresh private temp workspace — not the harness cwd
+    # and not the shared system temp ROOT itself, where anyone's planted workspace
+    # configs (.agents/mcp_config.json on agy) would load; /tmp is world-writable.
+    _check("mcp_probe.private_workspace",
+           probed_cwd
+           and os.path.basename(probed_cwd).startswith("ase-probe-")
+           and os.path.realpath(probed_cwd) != os.path.realpath(os.getcwd())
+           and os.path.realpath(probed_cwd) != os.path.realpath(tempfile.gettempdir())
+           and not os.path.isdir(probed_cwd),
+           f"probe ran in a fresh private workspace, deleted afterwards "
+           f"(cwd={probed_cwd!r})", failures, verbose)
+    _check("mcp_probe.overlay_cleaned",
+           not probed_home or not os.path.isdir(probed_home),
+           "the probe's mask-only overlay is deleted afterwards", failures, verbose)
+
+    # a NEW-style _probe_argv receives the probe workspace and env explicitly (agy needs
+    # cwd for --add-dir; codex/copilot need env for MCP enumeration).
+    class _CtxProbeCli(Adapter):
+        name = "ctxprobefake"
+        binary = sys.executable
+
+        def _probe_argv(self, model, *, cwd=None, env=None):
+            self.got_cwd, self.got_env = cwd, env
+            return [sys.executable, "-c", "print('ok')"]
+
+        def build_argv(self, prompt, opts, *, cwd):
+            return []
+
+        def parse(self, stdout, stderr, exit_code, *, opts=None):
+            return ParseOutput()
+
+    ctx_cli = _CtxProbeCli()
+    ctx_pr = ctx_cli.probe_model("any")
+    _check("mcp_probe.context_passed",
+           ctx_pr.accepted and getattr(ctx_cli, "got_cwd", None)
+           and os.path.basename(ctx_cli.got_cwd).startswith("ase-probe-")
+           and isinstance(getattr(ctx_cli, "got_env", None), dict),
+           f"new-style _probe_argv receives the probe workspace + exact env "
+           f"(cwd={getattr(ctx_cli, 'got_cwd', None)!r})", failures, verbose)
+
+    # --- 3) judge runs get the same overlay ---------------------------------------------
+    import agentskill_evals.judge as judge_mod
+    from .exec import ExecResult
+    from .schema import RunResult
+
+    seen: dict = {}
+    orig_execute = judge_mod.execute
+
+    def _fake_judge_execute(adapter, prompt, opts, *, cwd, timeout,
+                            agent_name=None, eval_name="", env_overrides=None):
+        seen["home"] = opts.home
+        if opts.home:
+            p = os.path.join(opts.home, ".copilot", "mcp-config.json")
+            if os.path.isfile(p) and not os.path.islink(p):
+                seen["mask"] = open(p).read()
+        rr = RunResult(agent=agent_name or "judge", eval_name=eval_name, prompt=prompt,
+                       workdir=cwd,
+                       final_text='{"items":[{"behavior":"b","pass":true,'
+                                  '"reason":"ok"}],"summary":"s"}')
+        return ExecResult(result=rr, stdout="", stderr="")
+
+    judge_mod.execute = _fake_judge_execute
+    try:
+        graded_rr = RunResult(agent="copilot", eval_name="e", prompt="p", workdir="/tmp")
+        j = judge_mod.Judge(agent="copilot")
+        ws = tempfile.mkdtemp(prefix="ase-judgews-")
+        try:
+            res = j(result=graded_rr, workdir=ws, spec=EvalSpec(name="e", prompt="p",
+                    source_path="/x.yaml"), rubric=["b"], cfg={})
+        finally:
+            shutil.rmtree(ws, ignore_errors=True)
+        _check("mcp_judge.masked_home",
+               seen.get("home") and seen.get("mask") == '{"mcpServers": {}}'
+               and res.verdict["items"][0]["pass"] is True,
+               f"a judge on a mask-dependent runner executes with the masked overlay "
+               f"(home={seen.get('home')!r}, mask={seen.get('mask')!r})", failures, verbose)
+        _check("mcp_judge.overlay_cleaned",
+               seen.get("home") and not os.path.isdir(seen["home"]),
+               "the judge's overlay is deleted afterwards", failures, verbose)
+    finally:
+        judge_mod.execute = orig_execute
+
+    # --- 4) overlay failure: fail closed with masks, graceful fallback without ----------
+    import agentskill_evals.runner as runner_mod
+    from .spec import ModelTarget
+
+    repo_root = tempfile.mkdtemp(prefix="ase-repo5-")
+    orig_run_execute = runner_mod.execute
+    orig_build = runner_mod.build_isolated_home
+
+    def _fake_run_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides,
+                          agent_name, eval_name):
+        with open(os.path.join(cwd, "ran.txt"), "w") as f:
+            f.write("ran\n")
+        rr = RunResult(agent=agent_name, eval_name=eval_name, prompt=prompt, workdir=cwd,
+                       final_text="done")
+        return ExecResult(result=rr, stdout="", stderr="")
+
+    def _broken_build(*a, **k):
+        raise OSError("symlinks unavailable")
+
+    class _MaskDependentCli(_FakeAdapter):
+        isolation_config_masks = {".fakecli/mcp.json": "{}"}
+
+    class _SkillsOnlyCli(_FakeAdapter):
+        global_skills_subpaths = [".fakecli/skills"]
+
+    runner_mod.execute = _fake_run_execute
+    runner_mod.build_isolated_home = _broken_build
+    try:
+        def _mk_runner(adapter):
+            run_dir = os.path.join(repo_root, "artifacts", adapter.__class__.__name__)
+            os.makedirs(run_dir, exist_ok=True)
+            r = runner_mod.Runner.__new__(runner_mod.Runner)
+            r.agent, r.adapter, r.targets = "fake", adapter, [ModelTarget()]
+            r.artifacts_root = os.path.join(repo_root, "artifacts")
+            r.run_id, r.skills_root, r.judge = "run1", repo_root, None
+            r.provision, r.command, r.auto_approve = False, "", True
+            r.reasoning_effort = None
+            r.jobs, r.isolated, r.progress = 1, True, None
+            r._repo_skill_names, r.run_dir = set(), run_dir
+            r._repo_root = repo_root
+            return r
+
+        import contextlib
+        import io
+        spec = EvalSpec(name="demo", prompt="hi",
+                        source_path=os.path.join(repo_root, "demo.yaml"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            cell_closed = _mk_runner(_MaskDependentCli())._run_cell(ModelTarget(), spec)
+        _check("mcp_failclosed.mask_dependent_cell_fails",
+               cell_closed.passed is False
+               and "failing closed" in (cell_closed.run_result.error or "")
+               and not os.path.isfile(os.path.join(cell_closed.artifacts_dir,
+                                                   "workspace", "ran.txt")),
+               f"overlay failure on a mask-dependent runner fails the cell without "
+               f"executing the agent: {cell_closed.run_result.error!r}", failures, verbose)
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            cell_open = _mk_runner(_SkillsOnlyCli())._run_cell(ModelTarget(), spec)
+        _check("mcp_failclosed.maskless_fallback_kept",
+               not cell_open.run_result.error
+               and os.path.isfile(os.path.join(cell_open.artifacts_dir,
+                                               "workspace", "ran.txt")),
+               f"a runner without masks keeps the graceful non-isolated fallback "
+               f"(error={cell_open.run_result.error!r})", failures, verbose)
+    finally:
+        runner_mod.execute = orig_run_execute
+        runner_mod.build_isolated_home = orig_build
+        shutil.rmtree(repo_root, ignore_errors=True)
+
+    # --- 5) probe/judge overlay failure also fails CLOSED -------------------------------
+    import contextlib
+    import io
+
+    import agentskill_evals.adapters.base as base_mod
+
+    def _broken_masked_home(adapter, real_home=None):
+        raise OSError("symlinks unavailable")
+
+    orig_masked = base_mod.build_mcp_masked_home
+    base_mod.build_mcp_masked_home = _broken_masked_home
+    try:
+        probe_cli2 = _ProbeCli()
+        with contextlib.redirect_stderr(io.StringIO()):
+            pr2 = probe_cli2.probe_model("any")
+        _check("mcp_probe.fail_closed",
+               pr2.accepted is False and not hasattr(probe_cli2, "probe_output"),
+               "an overlay failure skips the probe entirely (model reported unavailable) "
+               "instead of probing with the real HOME", failures, verbose)
+    finally:
+        base_mod.build_mcp_masked_home = orig_masked
+
+    judge_calls: list = []
+    orig_judge_masked = judge_mod.build_mcp_masked_home
+    orig_judge_exec = judge_mod.execute
+    judge_mod.build_mcp_masked_home = _broken_masked_home
+    judge_mod.execute = lambda *a, **k: judge_calls.append(1)
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            res2 = judge_mod.Judge(agent="copilot")(
+                result=RunResult(agent="copilot", eval_name="e", prompt="p", workdir="/tmp"),
+                workdir="/tmp", spec=EvalSpec(name="e", prompt="p", source_path="/x.yaml"),
+                rubric=["b1", "b2"], cfg={})
+        _check("mcp_judge.fail_closed",
+               not judge_calls and res2.verdict.get("judge_error") is True
+               and [it["pass"] for it in res2.verdict["items"]] == [False, False]
+               and "hermetically" in res2.verdict["items"][0]["reason"],
+               f"an overlay failure yields a judge-failed verdict without executing "
+               f"(calls={len(judge_calls)}): {res2.verdict.get('summary')!r}",
+               failures, verbose)
+    finally:
+        judge_mod.build_mcp_masked_home = orig_judge_masked
+        judge_mod.execute = orig_judge_exec
+
+    # --- 6) pre-Phase-0 out-of-tree adapters (2-tuple config homes) keep working --------
+    from .isolation import config_home_entries
+
+    class _LegacyCli(Adapter):
+        name = "legacy"
+        binary = "legacy-cli"
+        isolation_config_homes = [("LEGACY_HOME", "skills")]  # old (var, skills_sub) form
+
+        def build_argv(self, prompt, opts, *, cwd):
+            return []
+
+        def parse(self, stdout, stderr, exit_code, *, opts=None):
+            return ParseOutput()
+
+    legacy = _LegacyCli()
+    entries = config_home_entries(legacy)
+    legacy_env = legacy.env({"LEGACY_HOME": "/real", "HOME": "/old"},
+                            RunOptions(home="/iso"))
+    _check("mcp_compat.legacy_two_tuple",
+           entries == [("LEGACY_HOME", None, "skills")]
+           and legacy_env.get("HOME") == "/iso" and "LEGACY_HOME" not in legacy_env,
+           f"a 2-tuple isolation_config_homes adapter normalizes and env() still clears "
+           f"the unmirrored var: {entries}", failures, verbose)
+
+    # --- 7) workspace config masks (agy's --add-dir discovery channel) ------------------
+    from .runner import _apply_workspace_config_masks
+
+    ws = tempfile.mkdtemp(prefix="ase-wsmask-")
+    outside = tempfile.mkdtemp(prefix="ase-wsmask-out-")
+    try:
+        os.makedirs(os.path.join(ws, ".agents", "plugins", "p1"))
+        with open(os.path.join(ws, ".agents", "mcp_config.json"), "w") as fh:
+            fh.write('{"mcpServers":{"seeded":{}}}')
+        with open(os.path.join(ws, ".agents", "plugins", "p1", "mcp_config.json"), "w") as fh:
+            fh.write('{"mcpServers":{"plug":{}}}')
+        open(os.path.join(ws, ".agents", "plugins", "p1", "plugin.json"), "w").close()
+        # a DOT-prefixed plugin dir: Python's glob excludes it from `*`, but agy discovers
+        # it — so the dot-inclusive `plugins/.*/` companion pattern must reach it.
+        os.makedirs(os.path.join(ws, ".agents", "plugins", ".hidden"))
+        with open(os.path.join(ws, ".agents", "plugins", ".hidden",
+                               "mcp_config.json"), "w") as fh:
+            fh.write('{"mcpServers":{"hidden":{}}}')
+        target = os.path.join(outside, "victim.json")
+        with open(target, "w") as fh:
+            fh.write("outside")
+        os.makedirs(os.path.join(ws, ".agents", "plugins", "evil"))
+        os.symlink(target, os.path.join(ws, ".agents", "plugins", "evil",
+                                        "mcp_config.json"))
+
+        class _WsCli:
+            workspace_config_masks = {
+                ".agents/mcp_config.json": '{"mcpServers": {}}',
+                ".agents/plugins/*/mcp_config.json": '{"mcpServers": {}}',
+                ".agents/plugins/.*/mcp_config.json": '{"mcpServers": {}}',
+            }
+
+        masked = _apply_workspace_config_masks(_WsCli(), ws)
+        neutral = '{"mcpServers": {}}'
+        evil_path = os.path.join(ws, ".agents", "plugins", "evil", "mcp_config.json")
+        hidden_path = os.path.join(ws, ".agents", "plugins", ".hidden",
+                                   "mcp_config.json")
+        _check("mcp_wsmask.seeded_neutralized",
+               masked == [os.path.join(".agents", "mcp_config.json"),
+                          os.path.join(".agents", "plugins", ".hidden", "mcp_config.json"),
+                          os.path.join(".agents", "plugins", "evil", "mcp_config.json"),
+                          os.path.join(".agents", "plugins", "p1", "mcp_config.json")]
+               and open(os.path.join(ws, ".agents", "mcp_config.json")).read() == neutral
+               and open(os.path.join(ws, ".agents", "plugins", "p1",
+                                     "mcp_config.json")).read() == neutral,
+               f"seeded workspace MCP configs (direct + per-plugin glob) neutralized: "
+               f"{masked}", failures, verbose)
+        # a DOT-prefixed plugin's config must be neutralized too (glob's `*` skips it —
+        # the `.*` companion is what reaches it).
+        _check("mcp_wsmask.dot_plugin_neutralized",
+               open(hidden_path).read() == neutral,
+               "a dot-prefixed plugin dir's mcp_config.json is neutralized via the "
+               "dot-inclusive glob", failures, verbose)
+        # an outside-pointing symlink is NEUTRALIZED — unlinked and replaced with a real
+        # neutral file (a skipped-but-live link would keep the outside config loadable) —
+        # while its outside target is never written through.
+        _check("mcp_wsmask.symlink_escape_neutralized",
+               open(target).read() == "outside"
+               and not os.path.islink(evil_path)
+               and open(evil_path).read() == neutral,
+               "an escaping symlink is replaced by a neutral real file; its outside "
+               "target untouched", failures, verbose)
+        _check("mcp_wsmask.nothing_created",
+               os.path.getsize(os.path.join(ws, ".agents", "plugins", "p1",
+                                            "plugin.json")) == 0
+               and not os.path.exists(os.path.join(ws, ".mcp.json")),
+               "non-matching files untouched; absent configs are not pre-created",
+               failures, verbose)
+
+        # same for an escaping symlink on an INTERMEDIATE component: a seeded
+        # `.agents -> <outside dir>` must not leave the outside config discoverable
+        # through the link (glob matches through dir symlinks), nor be written through.
+        ws2 = tempfile.mkdtemp(prefix="ase-wsmask2-")
+        out2 = tempfile.mkdtemp(prefix="ase-wsmask2-out-")
+        try:
+            with open(os.path.join(out2, "mcp_config.json"), "w") as fh:
+                fh.write('{"mcpServers":{"outside":{}}}')
+            os.symlink(out2, os.path.join(ws2, ".agents"))
+            masked2 = _apply_workspace_config_masks(_WsCli(), ws2)
+            agents2 = os.path.join(ws2, ".agents")
+            _check("mcp_wsmask.dir_symlink_escape_neutralized",
+                   masked2 == [os.path.join(".agents", "mcp_config.json")]
+                   and not os.path.islink(agents2) and os.path.isdir(agents2)
+                   and open(os.path.join(agents2, "mcp_config.json")).read() == neutral
+                   and open(os.path.join(out2, "mcp_config.json")).read()
+                   == '{"mcpServers":{"outside":{}}}',
+                   "an escaping DIRECTORY symlink is unlinked and rebuilt as a real dir "
+                   "with the neutral config; the outside dir untouched",
+                   failures, verbose)
+        finally:
+            shutil.rmtree(ws2, ignore_errors=True)
+            shutil.rmtree(out2, ignore_errors=True)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+        shutil.rmtree(outside, ignore_errors=True)
+
+    # --- 8) exec.execute(): env before argv, argv failures fail closed ------------------
+    # An adapter whose argv depends on ambient config state (codex enumerating MCP
+    # servers) must see the CHILD's exact environment — os.environ + the scenario's
+    # `env:` overrides + isolation — so execute() computes env first and hands it over
+    # via opts.effective_env. And when an adapter can't guarantee a hermetic argv
+    # (RuntimeError from enumeration), the run must FAIL, not crash or proceed.
+    from .exec import execute as _execute
+
+    class _EnvSpyCli(Adapter):
+        name = "envspy"
+        binary = "definitely-not-installed-xyz"  # execute() bails before spawning
+
+        def build_argv(self, prompt, opts, *, cwd):
+            self.got_env, self.got_cwd = opts.effective_env, cwd
+            return ["x"]
+
+        def parse(self, stdout, stderr, exit_code, *, opts=None):
+            return ParseOutput()
+
+    spy = _EnvSpyCli()
+    _execute(spy, "p", RunOptions(), cwd="/tmp", timeout=5,
+             env_overrides={"SPY_CONFIG_HOME": "/scenario/override"})
+    _check("mcp_exec.effective_env_before_argv",
+           isinstance(getattr(spy, "got_env", None), dict)
+           and spy.got_env.get("SPY_CONFIG_HOME") == "/scenario/override"
+           and spy.got_cwd == "/tmp",
+           "build_argv sees the child's exact env (scenario overrides included) via "
+           "opts.effective_env", failures, verbose)
+
+    class _UnhermeticCli(Adapter):
+        name = "unhermetic"
+        binary = sys.executable
+
+        def build_argv(self, prompt, opts, *, cwd):
+            raise RuntimeError("cannot enumerate MCP servers")
+
+        def parse(self, stdout, stderr, exit_code, *, opts=None):
+            return ParseOutput()
+
+    ex_closed = _execute(_UnhermeticCli(), "p", RunOptions(), cwd="/tmp", timeout=5)
+    _check("mcp_exec.argv_failure_fails_closed",
+           "hermetic invocation" in (ex_closed.result.error or "")
+           and "cannot enumerate MCP servers" in ex_closed.result.error
+           and not ex_closed.result.argv,
+           f"an argv-construction failure becomes a failed run (nothing executed): "
+           f"{ex_closed.result.error!r}", failures, verbose)
+
+    # build_argv reads the state that decides hermeticity BEFORE launch; the child reads
+    # it again AFTER, and runs code in between (copilot execs git before globbing its
+    # agent dirs). Nothing can make that window empty — the discovery paths climb to `/`
+    # and the config home belongs to the child — so execute() re-checks once the child is
+    # gone and an adapter that finds the state moved fails the run. The default hook has
+    # no preflight state to re-check and stays a no-op.
+    class _LateLeakCli(Adapter):
+        name = "lateleak"
+        binary = sys.executable
+
+        def build_argv(self, prompt, opts, *, cwd):
+            return [sys.executable, "-c", "pass"]
+
+        def parse(self, stdout, stderr, exit_code, *, opts=None):
+            return ParseOutput()
+
+        def verify_post_run(self, argv, opts, *, cwd, stdout="", stderr=""):
+            raise RuntimeError("late.md appeared during the launch window")
+
+    ex_late = _execute(_LateLeakCli(), "p", RunOptions(), cwd="/tmp", timeout=60)
+    _check("mcp_exec.post_run_leak_fails_the_run",
+           ex_late.result.exit_code == 0
+           and "hermeticity was not confirmed after the run"
+               in (ex_late.result.error or "")
+           and "late.md" in (ex_late.result.error or ""),
+           f"a clean-exiting run whose hermeticity premise broke during launch is "
+           f"still FAILED (detection, not prevention): {ex_late.result.error!r}",
+           failures, verbose)
+    _check("mcp_exec.post_run_default_is_noop",
+           Adapter.verify_post_run(spy, ["x"], RunOptions(), cwd="/tmp") is None
+           and not (_execute(spy, "p", RunOptions(), cwd="/tmp", timeout=5)
+                    .result.error or "").startswith("MCP hermeticity"),
+           "an adapter with no preflight state to re-check is unaffected by the "
+           "post-run hook", failures, verbose)
+
+    # execute() is not the only place the harness spawns an agent CLI: probe_model runs
+    # one per candidate model, against the same discovery paths, with the same launch
+    # window — and it does NOT go through execute(). It has to run the verifier itself,
+    # and a probe it can't clear must come back unavailable rather than merely un-audited.
+    class _LateLeakProbe(_LateLeakCli):
+        name = "lateleakprobe"
+
+        def _probe_argv(self, model, *, cwd=None, env=None):
+            return [sys.executable, "-c", "pass"]
+
+    _pv_ran: list = []
+
+    class _CleanProbe(_LateLeakProbe):
+        name = "cleanprobe"
+
+        def verify_post_run(self, argv, opts, *, cwd, stdout="", stderr=""):
+            # also pins WHAT the probe hands the verifier: its own fresh workspace and
+            # the env its argv was built from, not the harness's ambient context
+            _pv_ran.append((cwd, isinstance(opts.effective_env, dict)))
+
+    with contextlib.redirect_stderr(io.StringIO()):
+        _pv_leak = _LateLeakProbe().probe_model("m", timeout=30)
+        _pv_ok = _CleanProbe().probe_model("m", timeout=30)
+    _check("mcp_probe.probe_runs_the_post_run_verifier",
+           _pv_leak.accepted is False and _pv_ok.accepted is True
+           and len(_pv_ran) == 1 and os.path.isabs(_pv_ran[0][0])
+           and _pv_ran[0][1] and not os.path.exists(_pv_ran[0][0]),
+           f"a model probe is verified after it runs like any other child and fails "
+           f"closed when it can't be cleared, against the probe's own workspace and "
+           f"env: leak_accepted={_pv_leak.accepted} clean_accepted={_pv_ok.accepted} "
+           f"saw={_pv_ran!r}", failures, verbose)
+
+    # A probe that TIMES OUT is the case that used to escape entirely: subprocess.run's
+    # kill reaches only the direct child, and the verifier was inside the try block the
+    # TimeoutExpired jumped out of. So the harness would leave a grandchild running — an
+    # MCP server, in the real case — and report the model unavailable without ever
+    # checking what the child had done. Both halves are pinned here: the group is reaped,
+    # and the verifier still runs on whatever output was captured before the kill.
+    import shutil as _psh
+    import tempfile as _pt
+    import time as _ptime
+
+    _pt_dir = _pt.mkdtemp(prefix="ase-probetimeout-")
+    _pt_tick = os.path.join(_pt_dir, "tick")
+    _pt_seen: list = []
+    try:
+        # the child outlives the timeout and leaves a grandchild ticking a file behind it
+        _pt_grandchild = (
+            "import time\n"
+            "while True:\n"
+            f"    open({_pt_tick!r}, 'a').write('.')\n"
+            "    time.sleep(0.05)\n"
+        )
+        _pt_child = (
+            "import subprocess, sys, time\n"
+            f"subprocess.Popen([sys.executable, '-c', {_pt_grandchild!r}])\n"
+            "sys.stdout.write('partial output before the kill\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(30)\n"
+        )
+
+        class _TimeoutProbe(_LateLeakCli):
+            name = "timeoutprobe"
+
+            def _probe_argv(self, model, *, cwd=None, env=None):
+                return [sys.executable, "-c", _pt_child]
+
+            def verify_post_run(self, argv, opts, *, cwd, stdout="", stderr=""):
+                _pt_seen.append(stdout)
+
+        _pt_res = _TimeoutProbe().probe_model("m", timeout=2)
+        # the grandchild must have really started, or the reaping arm proves nothing
+        _pt_started = os.path.exists(_pt_tick)
+        _pt_before = os.path.getsize(_pt_tick) if _pt_started else -1
+        _ptime.sleep(0.6)
+        _pt_after = os.path.getsize(_pt_tick) if _pt_started else -2
+    finally:
+        _psh.rmtree(_pt_dir, ignore_errors=True)
+    _check("mcp_probe.timed_out_probe_is_verified_and_reaped",
+           _pt_res.accepted is False and _pt_started and _pt_before == _pt_after
+           and len(_pt_seen) == 1 and "partial output" in _pt_seen[0],
+           f"a probe killed on timeout still goes through the post-run verifier — with "
+           f"the output captured before the kill, the only account the child ever gave — "
+           f"and its whole process group dies with it instead of orphaning an MCP server "
+           f"past the check meant to prove none started: accepted={_pt_res.accepted} "
+           f"grandchild_started={_pt_started} ticks {_pt_before}->{_pt_after} "
+           f"verifier_calls={len(_pt_seen)}", failures, verbose)
+
+    # On Windows process.env is case-insensitive, so a scenario `env: {copilot_home: ...}`
+    # that dodges isolation's case-sensitive COPILOT_HOME pop would still be read by the
+    # child as COPILOT_HOME — an isolation escape. execute() folds keys to a single
+    # uppercase form (win32-gated at the call site) before isolation runs; the fold itself
+    # is pure and checked on every host. Composing it with copilot's isolation env() shows
+    # the escape is closed: the folded COPILOT_HOME is popped (unmirrored → isolated home).
+    from .exec import _fold_env_keys_case_insensitive as _fold
+    folded = _fold({"COPILOT_HOME": "C:\\real", "copilot_home": "C:\\evil",
+                    "Path": "/p", "PATH": "/q"})
+    iso_env = get_adapter("copilot").env(
+        _fold({"copilot_home": "C:\\evil", "HOME": "/h"}), RunOptions(home="/iso"))
+    _check("mcp_exec.win_env_case_fold_closes_isolation_escape",
+           folded == {"COPILOT_HOME": "C:\\evil", "PATH": "/q"}   # one key each, last wins
+           and "copilot_home" not in iso_env and "COPILOT_HOME" not in iso_env
+           and iso_env.get("HOME") == "/iso",
+           f"case-colliding env keys fold to one uppercase key (last-wins) so isolation's "
+           f"COPILOT_HOME pop can't be dodged by a lowercase alias: {folded}, "
+           f"iso COPILOT_HOME={iso_env.get('COPILOT_HOME')!r}", failures, verbose)
 
 
 def _check_parallel_cell_idx(failures, verbose):
@@ -1499,6 +2369,823 @@ def _check_exec_timeout_group_kill(failures, verbose):
                 pass
         shutil.rmtree(tmp, ignore_errors=True)
 
+    _check_exec_early_exit_group_kill(failures, verbose)
+    _check_exec_normal_exit_group_sweep(failures, verbose)
+    _check_exec_process_tree_handles(failures, verbose)
+
+
+def _check_copilot_version_provenance(failures, verbose):
+    """Version drift is MESSAGED, never gated on — and the version is read from the run.
+
+    The adapter cannot gate on a version learned by executing the CLI: a preflight
+    `--version` resolves its app.js through writable caches the real argv bypasses, so the
+    two can execute different code. But the version that ACTUALLY ran is recoverable from
+    the child's own stream, which is the same evidence class as the MCP witness. These
+    arms pin that, the three severity tiers, and the bundle audit that clears a new build.
+    """
+    import io
+    import json as _json
+    import os
+    import shutil
+    import sys
+    import tempfile
+
+    from .adapters import copilot as _cop
+
+    print("copilot version provenance:")
+
+    def _skills(*entries):
+        """entries are (source, path); the real event carries both — verified against a
+        captured 1.0.72 run, which lists builtin and project skills side by side."""
+        return _json.dumps({"type": "session.skills_loaded", "ephemeral": True,
+                            "data": {"skills": [{"name": "s", "source": s, "path": p}
+                                                for s, p in entries]}})
+
+    app = "/Users/x/Library/Caches/copilot/pkg/darwin-arm64/1.0.72/builtin/s/SKILL.md"
+    # A model can write anything it likes into its own message; the version must not be
+    # readable from there, or a model could silence the drift warning by describing a
+    # verified version. Only builtin session.skills_loaded paths count.
+    forged = _json.dumps({"type": "assistant.message",
+                          "data": {"content": "running pkg/darwin-arm64/9.9.9/app.js"}})
+    ver_real = _cop._stream_cli_version(_skills(("builtin", app)))
+    ver_forged_only = _cop._stream_cli_version(forged)
+    ver_both = _cop._stream_cli_version(_skills(("builtin", app)) + "\n" + forged)
+    ver_none = _cop._stream_cli_version("")
+    # disagreeing app roots => unknown, not a coin flip
+    ver_ambig = _cop._stream_cli_version(_skills(
+        ("builtin", app), ("builtin", "/c/pkg/darwin-arm64/1.0.64/builtin/s/SKILL.md")))
+    # ...but a PROJECT skill path is workspace-controlled (verified live: they arrive as
+    # <workspace>/.agents/skills/<name>/SKILL.md). A repo laid out to look like an app
+    # root would otherwise force that same "disagreement" and resolve to None — silently
+    # disarming the denylist from inside the workspace under test.
+    ver_project = _cop._stream_cli_version(_skills(
+        ("builtin", app), ("project", "/ws/.agents/skills/pkg/darwin-arm64/9.9.9/S.md")))
+    # a prerelease build is REPORTED as itself (and so warns), not dropped as unreadable
+    ver_pre = _cop._stream_cli_version(_skills(
+        ("builtin", "/c/pkg/darwin-arm64/1.0.73-beta.1/builtin/s/SKILL.md")))
+    # A version-shaped `pkg/<x>/<v>/` component can appear on EITHER SIDE of the real app
+    # root, and the two want opposite tiebreaks — which is why the match is anchored on
+    # the `builtin/` the CLI's own layout guarantees, rather than tiebroken at all.
+    #   ABOVE it: a cache root is an ordinary directory ($COPILOT_CACHE_HOME is
+    #   caller-supplied), so one can be placed at a version-shaped path. Taking the FIRST
+    #   match then reports the outer decoy — a 6.6.6 build reporting itself as a VERIFIED
+    #   1.0.72, silently, which is the whole tier defeated.
+    ver_decoy_above = _cop._stream_cli_version(_skills(
+        ("builtin", "/x/pkg/darwin-arm64/1.0.72/c/pkg/darwin-arm64/6.6.6/builtin/s/S.md")))
+    #   BELOW it: a built-in skill's own directory can be named to the same shape. Taking
+    #   the LAST match reports that instead — the mirror-image failure, and the reason
+    #   "just take the deepest one" is not the fix it looks like.
+    ver_decoy_below = _cop._stream_cli_version(_skills(
+        ("builtin", "/c/pkg/darwin-arm64/1.0.72/builtin/pkg/darwin-arm64/9.9.9/S.md")))
+    # malformed telemetry is an unknown version, NOT an exception: this runs inside
+    # verify_post_run, where anything raised is reported as an MCP hermeticity failure.
+    malformed = "\n".join([
+        _json.dumps({"type": "session.skills_loaded", "data": {"skills": 5}}),
+        _json.dumps({"type": "session.skills_loaded", "data": {"skills": ["x"]}}),
+        _json.dumps({"type": "session.skills_loaded", "data": "not-an-object"}),
+        _json.dumps(["not", "an", "object"]),
+    ])
+    try:
+        ver_malformed, raised_malformed = _cop._stream_cli_version(malformed), None
+    except Exception as exc:            # noqa: BLE001 — not raising IS the assertion
+        ver_malformed, raised_malformed = None, exc
+    _check("copilot.version_read_from_the_run_not_a_probe",
+           ver_real == "1.0.72" and ver_forged_only is None and ver_both == "1.0.72"
+           and ver_none is None and ver_ambig is None and ver_project == "1.0.72"
+           and ver_pre == "1.0.73-beta.1"
+           and ver_decoy_above == "6.6.6" and ver_decoy_below == "1.0.72"
+           and ver_malformed is None and raised_malformed is None,
+           f"the executing version is recovered from the child's own BUILTIN app-root "
+           f"paths (same evidence class as the MCP witness, no second execution); model "
+           f"prose cannot forge it, a workspace-controlled project skill path cannot "
+           f"make it ambiguous, a prerelease reports as itself, a version-shaped "
+           f"directory on EITHER side of the app root cannot stand in for it, and "
+           f"malformed telemetry is an unknown version rather than a raised hermeticity "
+           f"failure: real={ver_real!r} forged_only={ver_forged_only!r} "
+           f"real+forged={ver_both!r} empty={ver_none!r} ambiguous={ver_ambig!r} "
+           f"with_project_path={ver_project!r} prerelease={ver_pre!r} "
+           f"decoy_above={ver_decoy_above!r} decoy_below={ver_decoy_below!r} "
+           f"malformed={ver_malformed!r} raised={raised_malformed!r}", failures, verbose)
+
+    # --- the three tiers ---------------------------------------------------------
+    saved_denied = dict(_cop._DENIED_VERSIONS)
+    saved_warned = set(_cop._WARNED_VERSIONS)
+    saved_err = sys.stderr
+    try:
+        _cop._DENIED_VERSIONS.clear()
+        _cop._DENIED_VERSIONS["6.6.6"] = "masks plugins incorrectly"
+        denied = ""
+        try:
+            _cop._check_cli_version_denied("6.6.6")
+        except RuntimeError as exc:
+            denied = str(exc)
+        # a verified version is neither denied nor warned about
+        _cop._WARNED_VERSIONS.clear()
+        sys.stderr = io.StringIO()
+        _cop._check_cli_version_denied(_cop._VERIFIED_VERSIONS[0])
+        _cop._warn_cli_version_drift(_cop._VERIFIED_VERSIONS[0], witnessed=True)
+        quiet = sys.stderr.getvalue()
+        # an unknown version warns ONCE per process, however many cells run
+        sys.stderr = io.StringIO()
+        _cop._warn_cli_version_drift("9.9.9", witnessed=True)
+        _cop._warn_cli_version_drift("9.9.9", witnessed=True)
+        warned = sys.stderr.getvalue()
+        # an undeterminable version warns too, rather than passing silently
+        sys.stderr = io.StringIO()
+        _cop._warn_cli_version_drift(None, witnessed=True)
+        warned_unknown = sys.stderr.getvalue()
+        # A run that never completed is EXCUSED from producing a witness, so it reaches
+        # this warning with no MCP evidence at all. Claiming "the runtime witness held"
+        # there would be the notice inventing the very check it is warning about.
+        sys.stderr = io.StringIO()
+        _cop._WARNED_VERSIONS.clear()
+        _cop._warn_cli_version_drift("9.9.9", witnessed=False)
+        unwitnessed = sys.stderr.getvalue()
+    finally:
+        sys.stderr = saved_err
+        _cop._DENIED_VERSIONS.clear()
+        _cop._DENIED_VERSIONS.update(saved_denied)
+        _cop._WARNED_VERSIONS.clear()
+        _cop._WARNED_VERSIONS.update(saved_warned)
+
+    _check("copilot.version_tiers",
+           "denylist" in denied and "AFTER the fact" in denied and quiet == ""
+           and warned.count("warning:") == 1 and "9.9.9" in warned
+           and "ADDED" in warned and "verify-copilot-channels" in warned
+           and "witness held" in warned
+           and warned_unknown.count("warning:") == 1
+           and "witness held" not in unwitnessed
+           and "no MCP witness at all" in unwitnessed,
+           f"a build known to be broken fails closed by name (the one tier the runtime "
+           f"contract cannot reach — such a defect leaves the witness intact); a verified "
+           f"build is silent; an unknown or undeterminable one warns ONCE per process and "
+           f"says plainly that a passing run does not cover a channel the build ADDED — "
+           f"claims the witness held only when one was actually produced, and calls the "
+           f"denial what it is — detection after the CLI has already run, since the "
+           f"version is only readable from the run's own output: "
+           f"denied={denied[:50]!r} quiet={quiet!r} warns={warned.count('warning:')} "
+           f"unknown_warns={warned_unknown.count('warning:')} "
+           f"unwitnessed_claims_witness={'witness held' in unwitnessed}",
+           failures, verbose)
+
+    # --- one stray stdout line must not masquerade as a hermeticity failure -------
+    # iter_jsonl yields any well-formed JSON VALUE; a bare `42` on its own line has no
+    # .get(). Raising on it inside verify_post_run is reported as "MCP hermeticity was
+    # not confirmed", so a single junk line would bury a perfectly good witness later in
+    # the same stream — and, being indistinguishable from a real leak, would be acted on
+    # as one. Skipping non-objects is not leniency: the witness itself is still required.
+    junk = "\n".join(["42", "[1, 2]", '"a string"', "null"])
+    witness_line = _json.dumps({"type": "session.mcp_servers_loaded", "data": {"servers": [
+        {"name": _cop._WITNESS_SENTINEL, "status": "disabled"}]}})
+    try:
+        junk_witness, junk_raised = _cop._mcp_witness(junk + "\n" + witness_line, 0), None
+    except Exception as exc:            # noqa: BLE001 — not raising IS the assertion
+        junk_witness, junk_raised = None, exc
+    try:
+        junk_parsed = _cop.CopilotAdapter().parse(junk + "\n" + witness_line, "", 0)
+        parse_raised = None
+    except Exception as exc:            # noqa: BLE001 — not raising IS the assertion
+        junk_parsed, parse_raised = None, exc
+    # and the contract is still enforced: junk ALONE is a run with no witness at all
+    junk_only, _live_only, _w_only = _cop._mcp_witness(junk, 0)
+    _check("copilot.malformed_telemetry_is_not_a_leak_report",
+           junk_raised is None and junk_witness == (None, [], True)
+           and parse_raised is None and junk_parsed is not None
+           and junk_only is not None,
+           f"a non-object JSON line is skipped by both the witness reader and the "
+           f"parser rather than raising — an AttributeError there is announced as an MCP "
+           f"hermeticity failure, which would let one junk line both hide a valid witness "
+           f"and impersonate a leak — while a stream of NOTHING BUT junk still fails the "
+           f"witness contract: witness={junk_witness!r} witness_raised={junk_raised!r} "
+           f"parse_raised={parse_raised!r} junk_only_violation={junk_only!r}",
+           failures, verbose)
+
+    # --- the build the run executes must not be redirectable by the environment ---
+    # Found while re-reading 1.0.72's loader to check the --no-auto-update claim:
+    # COPILOT_CLI_DIST_DIR is consulted BEFORE any argv, imports `<value>/index.js`
+    # directly, and is subject to no version floor and no cache-root constraint. An
+    # ambient value would run arbitrary code as the agent and make the provenance reading
+    # describe a build nobody chose.
+    _opts = _cop.RunOptions(model="m")
+    redirect_env = _cop.CopilotAdapter().env(
+        {"COPILOT_CLI_DIST_DIR": "/tmp/evil", "PATH": "/usr/bin"}, _opts)
+    _check("copilot.build_redirect_env_is_cleared",
+           "COPILOT_CLI_DIST_DIR" not in redirect_env and redirect_env.get("PATH"),
+           f"COPILOT_CLI_DIST_DIR is stripped from every copilot launch, isolated or not "
+           f"— it overrides --no-auto-update entirely and points the loader at an "
+           f"arbitrary index.js, which no MCP flag on the argv would then apply to: "
+           f"kept={sorted(redirect_env)}", failures, verbose)
+
+    # --- the bundle audit that clears a new build --------------------------------
+    tmp = tempfile.mkdtemp(prefix="ase-bundle-")
+    try:
+        markers = [m for m, _why in _cop._MCP_CHANNEL_MARKERS]
+        root = os.path.join(tmp, "pkg", "darwin-arm64")
+        # Every one of these is a directory the CLI's own loader treats as a candidate:
+        # it keeps whatever has a readable app.js, with NO name test, and orders by a
+        # PREFIX parse (read out of 1.0.72's index.js). So `1.0.73foo` and `1.0.73-`
+        # parse as 1.0.73 and can outrank the running build, and `nonsense` is selectable
+        # by exact name through --prefer-version. A tidier semver filter here skipped all
+        # three — saying nothing about a bundle that can execute, which in an audit reads
+        # exactly like having cleared it.
+        for ver, body in (("1.0.72", " ".join(markers)),
+                          ("2.0.0", " ".join(markers[:-1])),   # one channel dropped
+                          ("1.0.73-beta.1", " ".join(markers)),
+                          ("1.0.73foo", " ".join(markers)),
+                          ("1.0.73-", " ".join(markers)),
+                          ("nonsense", " ".join(markers))):
+            os.makedirs(os.path.join(root, ver))
+            with open(os.path.join(root, ver, "app.js"), "w") as f:
+                f.write(body)
+        found = _cop.find_cli_bundles({"COPILOT_CACHE_HOME": tmp, "COPILOT_HOME": tmp})
+        # A root the audit does not scan is a bundle it says nothing about, which is
+        # indistinguishable from one it cleared. XDG_CACHE_HOME is not a synonym for
+        # ~/.cache — where it points elsewhere, ~/.cache/copilot is the wrong directory.
+        roots_xdg = _cop._bundle_search_roots({"XDG_CACHE_HOME": "/xdg"})
+        roots_win = _cop._bundle_search_roots({"LOCALAPPDATA": "C:\\Users\\u\\AppData"})
+        covers_xdg = os.path.join("/xdg", "copilot", "pkg") in roots_xdg
+        covers_localappdata = any("AppData" in r for r in roots_win)
+        # The real per-platform cache roots are always scanned too (that is the point of
+        # the command), so this host's own bundles legitimately show up — restrict to the
+        # fixture to keep the assertion independent of what is installed here.
+        versions = [v for v, p in found if p.startswith(tmp)]
+        full = _cop.audit_channel_markers(os.path.join(root, "1.0.72", "app.js"))
+        gapped = _cop.audit_channel_markers(os.path.join(root, "2.0.0", "app.js"))
+        missing = sorted(m for m, ok in gapped.items() if not ok)
+        # a marker straddling the 1 MiB read boundary must still be found
+        straddle = os.path.join(tmp, "straddle.js")
+        pad = (1 << 20) - (len(markers[0]) // 2)
+        with open(straddle, "w") as f:
+            f.write("." * pad + " ".join(markers))
+        straddled = _cop.audit_channel_markers(straddle)
+        # Ordered by the loader's own comparator, not by semver: an unparseable name sorts
+        # below everything, `-` anywhere means prerelease, and the raw name breaks ties.
+        expect = ["nonsense", "1.0.72", "1.0.73-", "1.0.73-beta.1", "1.0.73foo", "2.0.0"]
+        _check("copilot.channel_bundle_audit",
+               versions == expect and all(full.values())
+               and missing == [markers[-1]] and all(straddled.values())
+               and covers_xdg and covers_localappdata,
+               f"the audit discovers every bundle the loader could run — using the "
+               f"loader's candidate rule (readable app.js, no name test) and its ordering "
+               f"(prefix parse, prerelease before its release, unparseable last), across "
+               f"the XDG and Windows cache roots, since a bundle or a root the audit "
+               f"skips reads the same as one it cleared — reports every channel marker "
+               f"present for an intact build, names the one a build DROPPED (the "
+               f"silent-degradation case it exists for), and finds a marker straddling "
+               f"the read-chunk boundary: versions={versions} "
+               f"all_present={all(full.values())} missing={missing} "
+               f"straddle_ok={all(straddled.values())} xdg={covers_xdg} "
+               f"localappdata={covers_localappdata}", failures, verbose)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _check_exec_early_exit_group_kill(failures, verbose):
+    """The timeout kill must still reach the group when the LEADER has already exited.
+
+    The check above keeps the parent alive for the whole timeout, so the group is always
+    reachable through the live leader — and it therefore passed while this shape was
+    broken. The shape that matters is the real one: the CLI starts an MCP server, exits,
+    and the server inherits and holds the captured stdout pipe. ``communicate()`` blocks
+    on that pipe (not on the process), reaps the leader via its own ``poll()``, and times
+    out — at which point deriving the group from ``os.getpgid(proc.pid)`` raises
+    ``ProcessLookupError`` and the kill silently degrades to a no-op on a dead pid.
+
+    Measured before the fix: a 1s timeout returned after 10.1s, ``timed_out=True``, and
+    the grandchild ran to completion and wrote its marker. The group id is now captured at
+    launch (``_ProcessTree``), so both halves hold — prompt return AND a dead grandchild.
+    """
+    import os
+    import shutil
+    import sys
+    import tempfile
+    import time
+
+    from .exec import run_captured
+
+    if not hasattr(os, "killpg"):
+        if verbose:
+            print("  [skipped — no process groups on this platform]")
+        return
+
+    tmp = tempfile.mkdtemp(prefix="ase-earlyexit-")
+    pidfile = os.path.join(tmp, "grandchild.pid")
+    # The grandchild INHERITS the pipe (no DEVNULL — that is what makes communicate()
+    # block on it) and outlives the parent, which records its pid and exits at once.
+    # Liveness is checked from that pid rather than from a marker file the grandchild
+    # writes after sleeping: such a marker is absent either way inside the window, so it
+    # asserted nothing, and only the elapsed-time half of this arm ever had teeth.
+    child = (
+        "import subprocess, sys\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        f"open({pidfile!r}, 'w').write(str(p.pid))\n"
+        "sys.exit(0)\n"
+    )
+    grandchild_pid = None
+    try:
+        start = time.monotonic()
+        _out, _err, code, timed_out = run_captured(
+            [sys.executable, "-c", child], cwd=tmp, env=dict(os.environ), timeout=1)
+        elapsed = time.monotonic() - start
+        try:
+            grandchild_pid = int(open(pidfile).read().strip())
+        except (OSError, ValueError):
+            grandchild_pid = None
+        alive = None
+        if grandchild_pid:
+            for _ in range(40):
+                try:
+                    os.kill(grandchild_pid, 0)
+                    alive = True
+                except ProcessLookupError:
+                    alive = False
+                    break
+                time.sleep(0.05)
+        _check("exec.timeout_kills_group_after_leader_exits",
+               timed_out and code == -9 and elapsed < 5
+               and grandchild_pid is not None and alive is False,
+               f"a parent that exits while a grandchild holds the captured pipe open is "
+               f"still reaped as a GROUP: the timeout returns promptly instead of "
+               f"blocking on the surviving pipe, and the grandchild does not outlive it "
+               f"(elapsed={elapsed:.2f}s timed_out={timed_out} code={code} "
+               f"grandchild={grandchild_pid} alive_after={alive})", failures, verbose)
+    finally:
+        if grandchild_pid:
+            try:
+                os.kill(grandchild_pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _check_exec_normal_exit_group_sweep(failures, verbose):
+    """A SUCCESSFUL run must not orphan descendants either.
+
+    Both checks above hang the leak off a timeout, so both passed while the ordinary case
+    leaked. Nothing about the shape needs a timeout: a CLI that starts an MCP server,
+    points its stdio somewhere other than the captured pipes, and exits 0 has nothing left
+    to block ``communicate()`` — it returns at once, reports success, and the server keeps
+    running. The pipes are what made the timeout version visible at all.
+
+    Measured before the fix: ``run_captured`` returned in 0.03s with exit code 0 while the
+    grandchild ran on to write its marker. ``_ProcessTree.close`` now sweeps the group on
+    every return, so the same run still returns in 0.03s and the marker never appears.
+    """
+    import os
+    import shutil
+    import sys
+    import tempfile
+    import time
+
+    from .exec import run_captured
+
+    if not hasattr(os, "killpg"):
+        if verbose:
+            print("  [skipped — no process groups on this platform]")
+        return
+
+    tmp = tempfile.mkdtemp(prefix="ase-sweep-")
+    pidfile = os.path.join(tmp, "grandchild.pid")
+    # The PARENT records the pid, before it exits — a grandchild that writes its own
+    # would lose the race against the very SIGKILL under test and leave nothing to check.
+    # Liveness is then read from the pid directly: an earlier version of this arm waited
+    # for a marker file the grandchild only writes after sleeping, which reads "dead"
+    # whether or not it was killed, and passed against the unfixed code.
+    child = (
+        "import subprocess, sys\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+        "                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        f"open({pidfile!r}, 'w').write(str(p.pid))\n"
+        "sys.exit(0)\n"
+    )
+    grandchild_pid = None
+    try:
+        start = time.monotonic()
+        _out, _err, code, timed_out = run_captured(
+            [sys.executable, "-c", child], cwd=tmp, env=dict(os.environ), timeout=30)
+        elapsed = time.monotonic() - start
+        try:
+            grandchild_pid = int(open(pidfile).read().strip())
+        except (OSError, ValueError):
+            grandchild_pid = None
+        alive = None
+        if grandchild_pid:
+            for _ in range(40):         # give SIGKILL a moment to be delivered/reaped
+                try:
+                    os.kill(grandchild_pid, 0)
+                    alive = True
+                except ProcessLookupError:
+                    alive = False
+                    break
+                time.sleep(0.05)
+        _check("exec.normal_exit_sweeps_the_group",
+               code == 0 and not timed_out and elapsed < 5
+               and grandchild_pid is not None and alive is False,
+               f"a clean exit is evidence the AGENT finished, not its descendants: the "
+               f"group is swept on every return, so a grandchild that detached its stdio "
+               f"and outlived a successful run is still reaped (elapsed={elapsed:.2f}s "
+               f"code={code} grandchild={grandchild_pid} alive_after={alive})",
+               failures, verbose)
+    finally:
+        if grandchild_pid:
+            try:
+                os.kill(grandchild_pid, 9)   # never leak a sleeper if the check failed
+            except (ProcessLookupError, PermissionError):
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _check_exec_process_tree_handles(failures, verbose):
+    """The Windows job-object path and the spawn/post-spawn error split.
+
+    Neither can be exercised by running a real process on a POSIX host, so both are
+    driven the way copilot's ODR registry read is: against a stub injected at the one
+    seam the production code calls through (``_win32_kernel32``). This pins the CALL
+    SEQUENCE and the failure handling; it is not a substitute for running on Windows,
+    which was not possible here (see ``_win32_assign_job``).
+    """
+    import sys
+
+    from . import exec as exec_mod
+    from .adapters.base import Adapter, ParseOutput
+    from .exec import ChildSpawned
+
+    calls: list = []
+
+    class _FakeFn:
+        def __init__(self, name, ret):
+            self.name, self.ret = name, ret
+            self.restype = self.argtypes = None
+
+        def __call__(self, *args):
+            calls.append((self.name, args))
+            return self.ret
+
+    class _IsProcessInJob(_FakeFn):
+        """IsProcessInJob reports through an out-parameter, so the stub has to write it —
+        the production code reads membership from there, not from the return value."""
+
+        def __init__(self, name, ret, member):
+            super().__init__(name, ret)
+            self.member = member
+
+        def __call__(self, *args):
+            args[2]._obj.value = self.member
+            return super().__call__(*args)
+
+    class _FakeK32:
+        def __init__(self, rets, member=1):
+            self._rets = rets
+            self._member = member
+            self._fns: dict = {}
+
+        def __getattr__(self, name):
+            if name not in self._fns:
+                ret = self._rets.get(name, 1)
+                self._fns[name] = (
+                    _IsProcessInJob(name, ret, self._member)
+                    if name == "IsProcessInJob" else _FakeFn(name, ret))
+            return self._fns[name]
+
+    class _FakeProc:
+        _handle = 7
+        pid = -12345            # never used: _HAS_KILLPG is forced off for these arms
+        killed = False
+
+        def kill(self):
+            self.killed = True
+
+    saved_k32 = exec_mod._win32_kernel32
+    try:
+        # --- the happy path: create, limit, assign, VERIFY membership ------------
+        exec_mod._win32_kernel32 = lambda: _FakeK32({"CreateJobObjectW": 4242})
+        job = exec_mod._win32_assign_job(_FakeProc())
+        names = [c[0] for c in calls]
+        set_info = next((c for c in calls if c[0] == "SetInformationJobObject"), None)
+        assigned = job == 4242 and names == [
+            "CreateJobObjectW", "SetInformationJobObject", "AssignProcessToJobObject",
+            "IsProcessInJob"]
+        # the info class must be the EXTENDED one, or the kill-on-close flag is ignored
+        info_class_ok = set_info is not None and set_info[1][1] == 9
+        limits = exec_mod._kill_on_close_limits()
+        flag_ok = limits.BasicLimitInformation.LimitFlags == 0x2000
+
+        # --- every step that can fail must fail CLOSED, and close its handle -----
+        # Including SetInformationJobObject: kill-on-close is what kills the tree when
+        # the harness dies before it can terminate the job, so a job that will not accept
+        # it does not contain the tree under the very failure it is there for.
+        # Including IsProcessInJob returning "not a member": that is how an assignment
+        # that "succeeded" against an already-exited process is caught — the shape that
+        # made the POSIX path fail open.
+        failure_modes = {
+            "create": ({"CreateJobObjectW": 0}, 1),
+            "limit": ({"CreateJobObjectW": 4242, "SetInformationJobObject": 0}, 1),
+            "assign": ({"CreateJobObjectW": 4242, "AssignProcessToJobObject": 0}, 1),
+            "verify_call": ({"CreateJobObjectW": 4242, "IsProcessInJob": 0}, 1),
+            "not_a_member": ({"CreateJobObjectW": 4242}, 0),
+        }
+        fail_closed, leaked, unswept = [], [], []
+        for label, (rets, member) in failure_modes.items():
+            calls.clear()
+            exec_mod._win32_kernel32 = lambda r=rets, m=member: _FakeK32(r, member=m)
+            if exec_mod._win32_assign_job(_FakeProc()) is not None:
+                fail_closed.append(label)
+            names = [c[0] for c in calls]
+            # a job that was created but abandoned must not leak its handle
+            if label != "create" and "CloseHandle" not in names:
+                leaked.append(label)
+            # ...and must be EMPTIED before it is released, because a failed setup does
+            # not mean an empty job: `assign` may have succeeded and only the membership
+            # re-read failed, and the `limit` case is worst — the step that failed IS
+            # kill-on-close, so closing the handle kills nothing. Terminate, then close.
+            if label != "create" and names[-2:] != ["TerminateJobObject", "CloseHandle"]:
+                unswept.append(label)
+
+        # --- kill() terminates the JOB, not just the direct child ----------------
+        calls.clear()
+        exec_mod._win32_kernel32 = lambda: _FakeK32({})
+        proc = _FakeProc()
+        saved_killpg, exec_mod._HAS_KILLPG = exec_mod._HAS_KILLPG, False
+        try:
+            tree = exec_mod._ProcessTree(proc)
+            tree._job = 4242            # as if _win32_assign_job had succeeded
+            tree.kill()
+            job_killed = ([c[0] for c in calls] == ["TerminateJobObject"]
+                          and not proc.killed)
+            # a job that refuses to terminate must not swallow the other kills: false is
+            # a failure, not a completed terminate.
+            calls.clear()
+            exec_mod._win32_kernel32 = lambda: _FakeK32({"TerminateJobObject": 0})
+            stubborn = _FakeProc()
+            tree = exec_mod._ProcessTree(stubborn)
+            tree._job = 4242
+            tree.kill()
+            terminate_checked = stubborn.killed
+        finally:
+            exec_mod._HAS_KILLPG = saved_killpg
+
+        # --- the sweep on a normal return TERMINATES; it does not rely on the close ----
+        # Kill-on-close only fires if CloseHandle succeeds, so a sweep resting on it does
+        # nothing in exactly the case it would have to survive — and close() would then
+        # return normally with the whole tree alive. Terminate first, check the close, and
+        # fail the run if either half did not happen.
+        swept, sweep_err = [], []
+        saved_killpg3, exec_mod._HAS_KILLPG = exec_mod._HAS_KILLPG, False
+        try:            # _FakeProc's pid is a placeholder; keep it away from a real killpg
+            for label, rets in (("ok", {}),
+                                ("terminate_fails", {"TerminateJobObject": 0}),
+                                ("close_fails", {"CloseHandle": 0})):
+                calls.clear()
+                exec_mod._win32_kernel32 = lambda r=rets: _FakeK32(r)
+                tree = exec_mod._ProcessTree(_FakeProc())
+                tree._job = 4242
+                raised = None
+                try:
+                    tree.close()
+                except RuntimeError as exc:
+                    raised = exc
+                swept.append((label, [c[0] for c in calls], raised is None))
+                if label == "ok":
+                    sweep_err.append(swept[-1][1] == ["TerminateJobObject", "CloseHandle"]
+                                     and raised is None)
+                else:
+                    # the close is attempted even when the terminate failed, so neither
+                    # failure can leave the handle behind on top of the live tree
+                    sweep_err.append(raised is not None
+                                     and swept[-1][1] == ["TerminateJobObject",
+                                                          "CloseHandle"])
+        finally:
+            exec_mod._HAS_KILLPG = saved_killpg3
+        sweep_ok = all(sweep_err)
+
+        _check("exec.win32_normal_return_sweeps_the_job",
+               sweep_ok,
+               f"close() terminates the job explicitly and then checks the handle "
+               f"release, rather than leaning on kill-on-close — a close that fails is "
+               f"a kill that never happened, and either failure fails the run instead of "
+               f"returning a result the surviving tree could have influenced: "
+               f"{[(lbl, seq, 'clean' if ok else 'raised') for lbl, seq, ok in swept]}",
+               failures, verbose)
+
+        _check("exec.win32_job_object_kills_the_tree",
+               assigned and info_class_ok and flag_ok and not fail_closed
+               and not leaked and not unswept and job_killed and terminate_checked,
+               f"the Windows path puts the child in a Job Object (so a grandchild whose "
+               f"parent already exited is still terminated — no process groups there, and "
+               f"taskkill /T walks links an exited parent no longer has), requires the "
+               f"kill-on-close limit, re-reads membership from the kernel, abandons the "
+               f"job on ANY failed step rather than running uncontained, EMPTIES it "
+               f"before releasing it (a failed setup does not mean an empty job, and the "
+               f"limit failure is precisely the loss of kill-on-close), and treats a "
+               f"false TerminateJobObject as a failure rather than a kill: "
+               f"assigned={assigned} info_class={info_class_ok} flag={flag_ok} "
+               f"failed_open={fail_closed or 'none'} leaked_handles={leaked or 'none'} "
+               f"abandoned_unswept={unswept or 'none'} "
+               f"job_killed={job_killed} terminate_checked={terminate_checked}",
+               failures, verbose)
+
+        # --- an uncontained tree fails the RUN, rather than running weakly -------
+        # Killing only the direct child is what let a leaked MCP server outlive its own
+        # run while the run reported success. If the tree cannot be contained the launch
+        # is a post-spawn failure: a child did start, so it is still parsed and audited.
+        shim_u = type(exec_mod)("subprocess_shim_uncontained")
+        shim_u.PIPE, shim_u.DEVNULL = exec_mod.subprocess.PIPE, exec_mod.subprocess.DEVNULL
+        shim_u.TimeoutExpired = exec_mod.subprocess.TimeoutExpired
+        uncontained_proc = _FakeProc()
+
+        class _NeverCommunicates:
+            def __init__(self, *a, **k):
+                self.pid, self.returncode = uncontained_proc.pid, None
+
+            def communicate(self, timeout=None):
+                raise AssertionError("an uncontained launch must not be waited on")
+
+            def kill(self):
+                uncontained_proc.killed = True
+
+        shim_u.Popen = _NeverCommunicates
+        saved_sub2, exec_mod.subprocess = exec_mod.subprocess, shim_u
+        saved_killpg2, exec_mod._HAS_KILLPG = exec_mod._HAS_KILLPG, False
+        try:                        # no killpg and no job => nothing contains the tree
+            exec_mod._win32_kernel32 = lambda: _FakeK32({"CreateJobObjectW": 0})
+            uncontained_err = None
+            try:
+                exec_mod.run_captured(["x"], cwd=".", env={}, timeout=1)
+            except BaseException as exc:     # noqa: BLE001 — the type IS the assertion
+                uncontained_err = exc
+        finally:
+            exec_mod.subprocess = saved_sub2
+            exec_mod._HAS_KILLPG = saved_killpg2
+        _check("exec.uncontained_launch_fails_closed",
+               isinstance(uncontained_err, ChildSpawned)
+               and "cannot be contained" in str(uncontained_err)
+               and uncontained_proc.killed,
+               f"a launch whose tree cannot be contained fails the run instead of "
+               f"proceeding with direct-child-only cleanup, and the child it did start "
+               f"is killed and audited (raised={type(uncontained_err).__name__} "
+               f"child_killed={uncontained_proc.killed})", failures, verbose)
+
+        # --- Windows is uncontainable, so nothing is LAUNCHED there ---------------
+        # The job can only be assigned once CreateProcess has returned, and Windows
+        # associates a member's FUTURE children only. A grandchild spawned inside that
+        # window is therefore never in the job and survives TerminateJobObject — and "the
+        # agent immediately starts an MCP server" needs no unlucky timing to land there.
+        #
+        # So the refusal has to come BEFORE the spawn. An earlier revision of this fix
+        # rejected win32 just after Popen and was rejected in review for exactly the right
+        # reason: by then the child exists, and the launch-window grandchild it is meant
+        # to prevent has already had its chance. Spawning and then killing is not a
+        # refusal. The assertion is therefore that Popen is NEVER CONSTRUCTED — hence a
+        # shim whose only behaviour is to fail the arm if anyone calls it.
+        popen_calls = []
+
+        class _MustNotSpawn:
+            def __init__(self, *a, **k):
+                popen_calls.append(a)
+                raise AssertionError("run_captured must not spawn on an unsupported "
+                                     "platform")
+
+        shim_w = type(exec_mod)("subprocess_shim_win32")
+        shim_w.PIPE, shim_w.DEVNULL = exec_mod.subprocess.PIPE, exec_mod.subprocess.DEVNULL
+        shim_w.TimeoutExpired = exec_mod.subprocess.TimeoutExpired
+        shim_w.Popen = _MustNotSpawn
+        fake_sys = type(exec_mod)("sys_shim")
+        fake_sys.platform = "win32"      # exec.py reads sys ONLY for .platform
+        saved_sys, exec_mod.sys = exec_mod.sys, fake_sys
+        saved_sub3, exec_mod.subprocess = exec_mod.subprocess, shim_w
+        try:
+            win_err = None
+            try:
+                exec_mod.run_captured(["x"], cwd=".", env={}, timeout=1)
+            except BaseException as exc:     # noqa: BLE001 — the type IS the assertion
+                win_err = exc
+            # the BACKSTOP, exercised directly: even handed a job that assigned cleanly
+            # AND a working process group, a tree on win32 must not report containment,
+            # so no future caller can inherit a guarantee that was never true here.
+            exec_mod._win32_kernel32 = lambda: _FakeK32({"CreateJobObjectW": 4242})
+            backstop = exec_mod._ProcessTree(_FakeProc())
+            backstop_contained = backstop.contained
+        finally:
+            exec_mod.sys = saved_sys
+            exec_mod.subprocess = saved_sub3
+        # An OSError subclass, so every existing caller's "could not start at all" path
+        # handles it fail-closed without having to learn a new type first.
+        _check("exec.win32_is_refused_before_launch",
+               isinstance(win_err, exec_mod.UnsupportedPlatform)
+               and isinstance(win_err, OSError)
+               and not popen_calls
+               and "Nothing was launched" in str(win_err)
+               and backstop_contained is False,
+               f"a Windows run is refused WITHOUT SPAWNING — the race is a grandchild "
+               f"started in the child's first instants, so a check that runs once the "
+               f"child exists has already let it happen — and the refusal is an OSError "
+               f"subclass so existing callers fail closed on it unchanged; a job that "
+               f"assigns cleanly still never reads as containment: "
+               f"raised={type(win_err).__name__} popen_calls={len(popen_calls)} "
+               f"contained_backstop={backstop_contained} "
+               f"reason={str(win_err)[:70]!r}", failures, verbose)
+
+        # --- ChildSpawned: a post-spawn failure is NOT a failure to spawn --------
+        # run_captured must distinguish them, because they demand opposite handling: a
+        # child that never started has nothing to audit, while one that broke mid-flight
+        # may already have brought an MCP server up.
+        shim = type(exec_mod)("subprocess_shim")
+        shim.PIPE, shim.DEVNULL = exec_mod.subprocess.PIPE, exec_mod.subprocess.DEVNULL
+        shim.TimeoutExpired = exec_mod.subprocess.TimeoutExpired
+
+        broken = _FakeProc()
+
+        class _BrokenPipePopen:
+            def __init__(self, *a, **k):
+                self.pid, self.returncode = broken.pid, None
+
+            def communicate(self, timeout=None):
+                raise OSError("the pipe went away mid-run")
+
+            def kill(self):
+                broken.killed = True
+
+        # The tree is stubbed rather than suppressed: this arm is about how run_captured
+        # CLASSIFIES the failure, and it only reaches that code at all on a contained
+        # launch (an uncontained one fails closed above). Stubbing also keeps the fake's
+        # placeholder pid away from a real killpg.
+        class _FakeTree:
+            contained, why_uncontained = True, ""
+            killed = closed_ = False
+
+            def __init__(self, proc):
+                self._proc = proc
+
+            def kill(self):
+                type(self).killed = True
+                self._proc.kill()
+
+            def close(self):
+                type(self).closed_ = True
+
+        shim.Popen = _BrokenPipePopen
+        saved_sub, exec_mod.subprocess = exec_mod.subprocess, shim
+        saved_tree, exec_mod._ProcessTree = exec_mod._ProcessTree, _FakeTree
+        try:
+            raised = None
+            try:
+                exec_mod.run_captured(["x"], cwd=".", env={}, timeout=1)
+            except BaseException as exc:      # noqa: BLE001 — the type IS the assertion
+                raised = exc
+        finally:
+            exec_mod.subprocess = saved_sub
+            exec_mod._ProcessTree = saved_tree
+        wrapped = (isinstance(raised, ChildSpawned)
+                   and isinstance(raised.__cause__, OSError) and broken.killed
+                   and _FakeTree.killed and _FakeTree.closed_)
+
+        # ...and the consumer acts on that split: the probe audits a child that RAN and
+        # skips the audit only when there was no child at all.
+        audited: list = []
+
+        class _AuditCli(Adapter):
+            name = "auditcli"
+            binary = sys.executable
+
+            def build_argv(self, prompt, opts, *, cwd):
+                return [self.binary, "-c", "pass"]
+
+            def _probe_argv(self, model, *, cwd=None, env=None):
+                return [self.binary, "-c", "pass"]
+
+            def parse(self, stdout, stderr, exit_code, *, opts=None):
+                return ParseOutput()
+
+            def verify_post_run(self, argv, opts, *, cwd, stdout="", stderr="",
+                                exit_code=None):
+                audited.append(stdout)
+
+        saved_rc = exec_mod.run_captured
+        try:
+            exec_mod.run_captured = lambda *a, **k: (_ for _ in ()).throw(
+                ChildSpawned(OSError("broke"), stdout="said something", stderr=""))
+            post_spawn = _AuditCli().probe_model("m", timeout=5)
+            audited_post_spawn = list(audited)
+            audited.clear()
+            exec_mod.run_captured = lambda *a, **k: (_ for _ in ()).throw(
+                OSError("could not spawn"))
+            never_spawned = _AuditCli().probe_model("m", timeout=5)
+        finally:
+            exec_mod.run_captured = saved_rc
+
+        _check("exec.post_spawn_failure_is_still_audited",
+               wrapped and post_spawn.accepted is False
+               and audited_post_spawn == ["said something"]
+               and never_spawned.accepted is False and audited == [],
+               f"a failure AFTER the child started is reported as ChildSpawned (carrying "
+               f"the output it managed to produce) and still goes through the post-run "
+               f"MCP audit, while a failure to spawn at all skips it — before, both "
+               f"arrived as OSError and a child that HAD run escaped the audit: "
+               f"wrapped={wrapped} audited_after_post_spawn={audited_post_spawn!r} "
+               f"audited_after_spawn_failure={audited!r}", failures, verbose)
+    finally:
+        exec_mod._win32_kernel32 = saved_k32
+
 
 def _check_inline_truncation(failures, verbose):
     """The report inlines every text file but must cap each one: a legitimate multi-MB CSV
@@ -1601,6 +3288,7 @@ def _check_reasoning_effort(failures, verbose):
     different models at different efforts."""
     import os
     import shutil
+    import sys
     import tempfile
 
     import agentskill_evals.runner as runner_mod
@@ -1611,42 +3299,71 @@ def _check_reasoning_effort(failures, verbose):
 
     print("reasoning effort:")
 
-    # --- per-adapter argv mapping ---
-    argv = get_adapter("claude").build_argv("p", RunOptions(reasoning_effort="high"), cwd="/tmp")
-    _check("effort.claude_flag",
-           "--effort" in argv and argv[argv.index("--effort") + 1] == "high",
-           f"claude maps to --effort: {argv}", failures, verbose)
-    argv = get_adapter("codex").build_argv("p", RunOptions(reasoning_effort="low"), cwd="/tmp")
-    _check("effort.codex_config",
-           'model_reasoning_effort="low"' in argv
-           and argv[argv.index('model_reasoning_effort="low"') - 1] == "-c"
-           and argv[-1] == "p",
-           f"codex maps to -c model_reasoning_effort, before the positional prompt: {argv}",
-           failures, verbose)
-    argv = get_adapter("copilot").build_argv("p", RunOptions(reasoning_effort="medium"), cwd="/tmp")
-    _check("effort.copilot_flag",
-           "--reasoning-effort" in argv
-           and argv[argv.index("--reasoning-effort") + 1] == "medium",
-           f"copilot maps to --reasoning-effort: {argv}", failures, verbose)
-    for name in ("claude", "codex", "copilot"):
-        _check(f"effort.{name}_supported_declared",
-               get_adapter(name).supports_reasoning_effort,
-               f"{name} declares supports_reasoning_effort", failures, verbose)
-    ag = get_adapter("antigravity")
-    _check("effort.antigravity_unsupported", not ag.supports_reasoning_effort,
-           "antigravity declares no reasoning-effort support (tiered model ids instead)",
-           failures, verbose)
-    ag_plain = ag.build_argv("p", RunOptions(), cwd="/tmp")
-    ag_effort = ag.build_argv("p", RunOptions(reasoning_effort="high"), cwd="/tmp")
-    _check("effort.antigravity_argv_unchanged", ag_plain == ag_effort,
-           f"antigravity argv unchanged when effort set: {ag_effort}", failures, verbose)
+    # A REAL 32-bit win32 harness fails every copilot _mcp_disable_args call closed
+    # by design (the WOW64 gate) — copilot's positive argv-mapping checks can't run
+    # there and are skipped (the gate itself is asserted in the copilot section).
+    # The copilot calls also pin COPILOT_HOME to a nonexistent dir so they never
+    # read — or fail closed on — this machine's real ~/.copilot (config, agents),
+    # and stub the ODR gate OFF so a 64-bit Windows host with a live ODR registry
+    # (where every copilot argv fails closed by design) can still run them.
+    import agentskill_evals.adapters.copilot as _cop_mod_eff
+    _cop_wow64 = sys.platform == "win32" and sys.maxsize <= 2**32
+    _cop_eff_priv, _cop_eff_cwd, _cop_env = _cop_private_fixture("ase-copeff-")
+    _odr_real_eff = _patch_module_attr(_cop_mod_eff, "_odr_registry_command",
+                                       lambda: None)
+    # ...and scope the (unbounded) custom-agent walk to this fixture's own tree, so an
+    # ambient agents dir in a shared ancestor can't fail these argv checks closed
+    _defs_real_eff = _cop_scope_agent_scan([_cop_eff_priv])
 
-    # --- unset keeps every argv unchanged (existing behavior preserved) ---
-    for name in ("claude", "codex", "copilot"):
-        plain = get_adapter(name).build_argv("p", RunOptions(), cwd="/tmp")
-        _check(f"effort.{name}_absent_when_unset",
-               not any("effort" in a for a in plain),
-               f"{name} argv carries no effort token when unset: {plain}", failures, verbose)
+    # --- per-adapter argv mapping ---
+    try:
+        argv = get_adapter("claude").build_argv("p", RunOptions(reasoning_effort="high"), cwd="/tmp")
+        _check("effort.claude_flag",
+               "--effort" in argv and argv[argv.index("--effort") + 1] == "high",
+               f"claude maps to --effort: {argv}", failures, verbose)
+        argv = get_adapter("codex").build_argv("p", RunOptions(reasoning_effort="low"), cwd="/tmp")
+        _check("effort.codex_config",
+               'model_reasoning_effort="low"' in argv
+               and argv[argv.index('model_reasoning_effort="low"') - 1] == "-c"
+               and argv[-1] == "p",
+               f"codex maps to -c model_reasoning_effort, before the positional prompt: {argv}",
+               failures, verbose)
+        if not _cop_wow64:
+            argv = get_adapter("copilot").build_argv(
+                "p", RunOptions(reasoning_effort="medium", effective_env=_cop_env),
+                cwd=_cop_eff_cwd)
+            _check("effort.copilot_flag",
+                   "--reasoning-effort" in argv
+                   and argv[argv.index("--reasoning-effort") + 1] == "medium",
+                   f"copilot maps to --reasoning-effort: {argv}", failures, verbose)
+        for name in ("claude", "codex", "copilot"):
+            _check(f"effort.{name}_supported_declared",
+                   get_adapter(name).supports_reasoning_effort,
+                   f"{name} declares supports_reasoning_effort", failures, verbose)
+        ag = get_adapter("antigravity")
+        _check("effort.antigravity_unsupported", not ag.supports_reasoning_effort,
+               "antigravity declares no reasoning-effort support (tiered model ids "
+               "instead)", failures, verbose)
+        ag_plain = ag.build_argv("p", RunOptions(), cwd="/tmp")
+        ag_effort = ag.build_argv("p", RunOptions(reasoning_effort="high"), cwd="/tmp")
+        _check("effort.antigravity_argv_unchanged", ag_plain == ag_effort,
+               f"antigravity argv unchanged when effort set: {ag_effort}", failures,
+               verbose)
+
+        # --- unset keeps every argv unchanged (existing behavior preserved) ---
+        for name in ("claude", "codex") if _cop_wow64 else ("claude", "codex", "copilot"):
+            opts = (RunOptions(effective_env=_cop_env) if name == "copilot"
+                    else RunOptions())
+            plain = get_adapter(name).build_argv(
+                "p", opts, cwd=_cop_eff_cwd if name == "copilot" else "/tmp")
+            _check(f"effort.{name}_absent_when_unset",
+                   not any("effort" in a for a in plain),
+                   f"{name} argv carries no effort token when unset: {plain}",
+                   failures, verbose)
+    finally:
+        _unpatch_module_attr(_cop_mod_eff, "_odr_registry_command", _odr_real_eff)
+        _cop_restore_agent_scan(_defs_real_eff)
+        shutil.rmtree(_cop_eff_priv, ignore_errors=True)
 
     # --- spec load: normalization + typed validation ---
     s = _spec_from_raw({"prompt": "p", "reasoning_effort": " HIGH "}, "/x.yaml")
@@ -1815,6 +3532,21 @@ def _check_api_compat(failures, verbose):
 
 
 def run_selftest(verbose: bool = False) -> int:
+    """Run the suite, then restore any adapter patch a raising check left installed.
+
+    The checks themselves live in _run_selftest_checks. This wrapper exists only so the
+    module-patch net (_MODULE_PATCHES) has ONE unconditional finally: the patches it
+    guards span most of the copilot section, and an exception escaping mid-section used
+    to leave e.g. a scoped _agent_definition_files bolted onto the adapter for the rest
+    of the process — harmless for the CLI, which exits, but this module is importable and
+    an embedding process would keep making adapter calls against the stub."""
+    try:
+        return _run_selftest_checks(verbose=verbose)
+    finally:
+        _restore_module_patches()
+
+
+def _run_selftest_checks(verbose: bool = False) -> int:
     failures: list[str] = []
 
     # cost_str formatting
@@ -1865,13 +3597,289 @@ def run_selftest(verbose: bool = False) -> int:
     _check("codex.command", cmds == ["npm install"], f"commands={cmds}", failures, verbose)
     _check("codex.file", "package.json" in paths, f"paths={paths}", failures, verbose)
     _check("codex.final", out.final_text == "Created demo-app.", repr(out.final_text), failures, verbose)
-    cargv = get_adapter("codex").build_argv("do the task", RunOptions(model="gpt-5.4-mini"), cwd="/tmp")
-    pre = cargv[:cargv.index("exec")]  # top-level flags precede the exec subcommand
-    _check("codex.argv",
-           "--ask-for-approval" in pre and "never" in pre
-           and "--sandbox" in pre and "workspace-write" in pre
-           and "--full-auto" not in cargv and cargv[-1] == "do the task",
-           f"non-interactive approval+sandbox before exec, prompt last: {cargv}", failures, verbose)
+    # MCP kill-switch (DESIGN_MCP_Support.md Phase 0): the isolated HOME symlinks ~/.codex
+    # wholesale, so any [mcp_servers.*] in the user's real config.toml loads in every run —
+    # and `-c mcp_servers={}` does NOT clear it (verified 0.140.0: -c deep-merges with the
+    # persisted table). Every configured server must be disabled BY NAME, on runs and on
+    # model probes alike. The enumerator is patched so these argv-shape checks never depend
+    # on (or read) the machine's real ~/.codex, and the post-verify — which would otherwise
+    # spawn a real codex — is stubbed to a no-op here (its own fail-closed behavior is
+    # exercised separately below with a mocked subprocess).
+    from .adapters.codex import CodexAdapter
+    orig_enum = CodexAdapter._configured_mcp_server_names
+    orig_verify = CodexAdapter._verify_all_mcp_disabled
+    CodexAdapter._verify_all_mcp_disabled = lambda self, *a, **k: None
+    try:
+        CodexAdapter._configured_mcp_server_names = \
+            lambda self, cwd=None, env=None: []
+        cargv = get_adapter("codex").build_argv("do the task", RunOptions(model="gpt-5.4-mini"), cwd="/tmp")
+        pre = cargv[:cargv.index("exec")]  # top-level flags precede the exec subcommand
+        _check("codex.argv",
+               "--ask-for-approval" in pre and "never" in pre
+               and "--sandbox" in pre and "workspace-write" in pre
+               and "--full-auto" not in cargv and cargv[-1] == "do the task",
+               f"non-interactive approval+sandbox before exec, prompt last: {cargv}", failures, verbose)
+        CodexAdapter._configured_mcp_server_names = \
+            lambda self, cwd=None, env=None: ["user_srv", "other-srv"]
+        kargv = get_adapter("codex").build_argv("do the task", RunOptions(), cwd="/tmp")
+        _check("codex.argv_mcp_killswitch",
+               "mcp_servers.user_srv.enabled=false" in kargv
+               and "mcp_servers.other-srv.enabled=false" in kargv
+               and "mcp_servers={}" not in kargv
+               and kargv[kargv.index("mcp_servers.user_srv.enabled=false") - 1] == "-c",
+               f"every configured server disabled by name (not the ineffective empty-table "
+               f"override): {kargv}", failures, verbose)
+        pargv = get_adapter("codex")._probe_argv("gpt-5.4-mini")
+        _check("codex.probe_mcp_killswitch",
+               "mcp_servers.user_srv.enabled=false" in pargv
+               and "mcp_servers.other-srv.enabled=false" in pargv,
+               f"per-name disables also passed on model probes: {pargv}", failures, verbose)
+        # a name outside codex's own `mcp add` charset can't be addressed by -c dotted
+        # paths; the quoted form is emitted anyway so codex refuses to load its config —
+        # the run fails closed instead of silently starting the server.
+        CodexAdapter._configured_mcp_server_names = \
+            lambda self, cwd=None, env=None: ["weird name.v2"]
+        import contextlib as _ctx
+        import io as _io
+        _stderr = _io.StringIO()
+        with _ctx.redirect_stderr(_stderr):
+            wargv = get_adapter("codex").build_argv("p", RunOptions(), cwd="/tmp")
+        _check("codex.exotic_mcp_name_fails_closed",
+               'mcp_servers."weird name.v2".enabled=false' in wargv
+               and "fail closed" in _stderr.getvalue(),
+               f"non-bare-key server name → quoted override (codex errors out, fail-closed) "
+               f"+ warning: {wargv}", failures, verbose)
+        # enumeration must see the CHILD's context, not the harness's: build_argv forwards
+        # its cwd and opts.effective_env (the exact subprocess env, set by exec.execute()
+        # before argv construction) — a trusted project's .codex/config.toml contributes
+        # servers by cwd, and a scenario's `env: {CODEX_HOME: ...}` moves the global
+        # config (both verified 0.140.0), so enumerating from the harness context would
+        # miss or over-disable (and over-disabling kills the run, "invalid transport").
+        seen_ctx: dict = {}
+
+        def _spy_enum(self, cwd=None, env=None):
+            seen_ctx["cwd"], seen_ctx["env"] = cwd, env
+            return []
+
+        CodexAdapter._configured_mcp_server_names = _spy_enum
+        child_env = {"CODEX_HOME": "/custom/codex-home", "HOME": "/child-home"}
+        get_adapter("codex").build_argv(
+            "p", RunOptions(effective_env=child_env), cwd="/the/child/ws")
+        _check("codex.enumeration_uses_child_context",
+               seen_ctx.get("cwd") == "/the/child/ws" and seen_ctx.get("env") == child_env,
+               f"build_argv hands the child's cwd + effective env to the MCP enumerator: "
+               f"{seen_ctx}", failures, verbose)
+        # `--disable plugins` must ride on every codex invocation: plugins can ship
+        # .mcp.json servers that never appear in config.toml (verified — enumeration can't
+        # see them, and a -c disable for a non-config name breaks the run with "invalid
+        # transport"). Enumerator is [] here so the probe builds cleanly.
+        CodexAdapter._configured_mcp_server_names = \
+            lambda self, cwd=None, env=None: []
+        _check("codex.argv_plugins_disabled",
+               _flag_pair(cargv, "--disable", "plugins")
+               and _flag_pair(get_adapter("codex")._probe_argv("m"), "--disable", "plugins"),
+               "--disable plugins on runs and probes closes the plugin MCP channel",
+               failures, verbose)
+        # extra_args ride AFTER the kill-switch overrides and their post-verify, where a
+        # config-channel token would outrank the verified MCP-off state (verified
+        # 0.140.0: the later of two duplicate `-c mcp_servers.<n>.enabled=` overrides
+        # wins) or switch which configuration loads (--profile/-p per-profile configs,
+        # --cd/-C project discovery, --enable plugins re-opening the plugin channel).
+        # build_argv fails closed on every spelling — separate value, attached short
+        # form, --flag=value — while neutral extra_args still pass through verbatim.
+        ok_argv = get_adapter("codex").build_argv(
+            "p", RunOptions(extra_args=["--skip-git-repo-check"]), cwd="/tmp")
+        _leaked = []
+        for _extras in (["-c", "mcp_servers.x.enabled=true"],
+                        ["-cmcp_servers.x.enabled=true"],
+                        ["--config", "mcp_servers.x.enabled=true"],
+                        ["--config=mcp_servers.x.enabled=true"],
+                        ["--enable", "plugins"],
+                        ["--profile", "work"], ["-p", "work"],
+                        ["--cd", "/elsewhere"], ["-C", "/elsewhere"]):
+            try:
+                get_adapter("codex").build_argv(
+                    "p", RunOptions(extra_args=_extras), cwd="/tmp")
+                _leaked.append(_extras)
+            except RuntimeError:
+                pass
+        _check("codex.extra_args_config_channels_fail_closed",
+               "--skip-git-repo-check" in ok_argv and not _leaked,
+               f"config-channel extra_args fail closed in every spelling; neutral ones "
+               f"pass through: leaked={_leaked}", failures, verbose)
+    finally:
+        CodexAdapter._configured_mcp_server_names = orig_enum
+        CodexAdapter._verify_all_mcp_disabled = orig_verify
+
+    # The primary — and ONLY — MCP enumerator is codex itself (`codex --disable plugins
+    # mcp list --json`); the fixture config.toml drives the live cross-checks below. There
+    # is no offline fallback: a hand-parsed subset of one config.toml misses the
+    # system/managed layers codex reads, so any failure of the CLI enumeration FAILS
+    # CLOSED. Profiles never contribute (0.140.0 rejects the legacy `profile=` key and
+    # ignores inactive [profiles.*] tables), so `eps`/`gamma` must not appear in codex's
+    # own listing either.
+    import os
+    import shutil as _sh
+    import subprocess as _sp
+    import tempfile as _tmp
+    import types as _types
+
+    import agentskill_evals.adapters.codex as codex_mod
+    _codex_home = _tmp.mkdtemp(prefix="ase-codexhome-")
+    _codex_ws = _tmp.mkdtemp(prefix="ase-codexws-")
+    try:
+        with open(os.path.join(_codex_home, "config.toml"), "w") as fh:
+            fh.write('model = "gpt-5.4"\n'
+                     'mcp_servers.delta = { command = "echo", env = { NESTED = "1" } }\n'
+                     '[mcp_servers.alpha]\ncommand = "echo"\n'
+                     '[mcp_servers."weird name.v2"]\ncommand = "echo"\n'
+                     '[profiles.work.mcp_servers.eps]\ncommand = "echo"\n'
+                     '[profiles.side]\nmcp_servers.gamma = { command = "echo" }\n')
+        expected = ["alpha", "delta", "weird name.v2"]
+        _cx_env = {**os.environ, "CODEX_HOME": _codex_home}
+
+        # a project .codex/config.toml above the cwd — used by the live trusted-project
+        # cross-check further down.
+        _proj = os.path.join(_codex_ws, "proj", "sub")
+        os.makedirs(os.path.join(_codex_ws, "proj", ".codex"))
+        os.makedirs(_proj)
+        with open(os.path.join(_codex_ws, "proj", ".codex", "config.toml"), "w") as fh:
+            fh.write('[mcp_servers.project_srv]\ncommand = "echo"\n')
+
+        # NO offline fallback: any primary-enumeration failure fails CLOSED. Parsing only
+        # the global config.toml would miss codex's system/managed layers, and a later
+        # successful main invocation could then launch an un-disabled server.
+        _cli_down = CodexAdapter()
+        _cli_down._mcp_names_via_cli = lambda cwd=None, env=None: None
+        try:
+            _cli_down._configured_mcp_server_names(cwd=_proj, env=_cx_env)
+            enum_closed = False
+        except RuntimeError as exc:
+            enum_closed = "failing closed" in str(exc)
+        _check("codex.mcp_enumeration_fails_closed", enum_closed,
+               "a failed `codex mcp list --json` raises (fail closed) instead of parsing "
+               "an incomplete offline view of config.toml that misses system/managed "
+               "layers", failures, verbose)
+
+        # `mcp list --json` output is validated strictly: schema drift must fail closed,
+        # never be read as an authoritative "no servers".
+        _v = codex_mod._validate_mcp_list_json
+        _check("codex.mcp_list_json_strict",
+               _v([{"name": "s1", "enabled": True}, {"name": "s0"}]) == ["s0", "s1"]
+               and _v([]) == []
+               and _v(None) is None                      # `null` stdout
+               and _v({"servers": [{"name": "s1"}]}) is None  # wrapped-object drift
+               and _v([{"name": 7}]) is None             # non-string name
+               and _v([{"no_name": "x"}]) is None,       # entry without a name
+               "only a list of {name: str} objects is authoritative; anything else fails "
+               "closed", failures, verbose)
+
+        # post-verify recognizes an ENABLED server: an entry counts as enabled unless it
+        # carries `"enabled": false`; drift → None so the caller fails closed.
+        _en = codex_mod._enabled_mcp_names
+        _check("codex.mcp_enabled_names",
+               _en([{"name": "a", "enabled": False}, {"name": "b"}]) == {"b"}
+               and _en([{"name": "a", "enabled": False}]) == set()
+               and _en([]) == set()
+               and _en(None) is None
+               and _en([{"no_name": 1}]) is None,
+               "enabled unless `enabled: false`; unrecognized shape → None (fail closed)",
+               failures, verbose)
+
+        # after the -c ...enabled=false overrides are applied, codex's OWN re-enumeration
+        # (same cwd/env, overrides in place) must show every server disabled — a
+        # higher-precedence managed/MDM layer can outrank -c, so a server still reported
+        # enabled (or an unreadable re-check) FAILS CLOSED. subprocess is stubbed via a
+        # namespace swap (no global monkeypatch of the real module).
+        _pv = CodexAdapter()
+
+        def _fake_all_disabled(argv, **kw):
+            return _types.SimpleNamespace(
+                returncode=0, stdout='[{"name": "user_srv", "enabled": false}]')
+
+        def _fake_still_enabled(argv, **kw):
+            return _types.SimpleNamespace(
+                returncode=0, stdout='[{"name": "user_srv", "enabled": true}]')
+
+        _real_cx_sp = codex_mod.subprocess
+        try:
+            codex_mod.subprocess = _types.SimpleNamespace(
+                run=_fake_all_disabled, DEVNULL=_sp.DEVNULL,
+                TimeoutExpired=_sp.TimeoutExpired)
+            pv_ok = True
+            try:
+                _pv._verify_all_mcp_disabled(
+                    ["-c", "mcp_servers.user_srv.enabled=false"], cwd="/tmp", env=_cx_env)
+            except RuntimeError:
+                pv_ok = False
+            codex_mod.subprocess.run = _fake_still_enabled
+            try:
+                _pv._verify_all_mcp_disabled(
+                    ["-c", "mcp_servers.user_srv.enabled=false"], cwd="/tmp", env=_cx_env)
+                pv_closed = False
+            except RuntimeError as exc:
+                pv_closed = "still enabled" in str(exc)
+        finally:
+            codex_mod.subprocess = _real_cx_sp
+        _check("codex.mcp_post_verify_fails_closed",
+               pv_ok and pv_closed,
+               "post-verify passes when the re-check confirms every server disabled, and "
+               "fails closed when a managed layer keeps one enabled", failures, verbose)
+
+        # live cross-checks when the codex CLI is installed: its own effective-config
+        # view (the primary enumerator at runtime) must match the fixture — and must
+        # SHIFT with the cwd: a trusted project's .codex/config.toml contributes servers
+        # (verified 0.140.0), which is exactly why enumeration runs in the child's
+        # context. env is passed explicitly — no os.environ mutation.
+        if get_adapter("codex").is_available():
+            via_cli = get_adapter("codex")._mcp_names_via_cli(cwd=_codex_ws, env=_cx_env)
+            _check("codex.mcp_enumeration_via_cli",
+                   via_cli == expected,
+                   f"`codex --disable plugins mcp list --json` agrees on the fixture: "
+                   f"{via_cli}", failures, verbose)
+            # This check needs a WORKING git, and `which` only proves a file exists —
+            # a broken install, an ownership/format refusal, or a shim answering for
+            # `git` all fail at run time. Treat that as "can't run this check" and skip
+            # it; a fixture that can't build its own precondition must never crash the
+            # suite (`check=True` here used to take every other check down with it).
+            # Global/system git config is neutralized so a developer's init template or
+            # hooks can't shape the fixture repo.
+            _troot = os.path.join(_codex_ws, "proj")
+            _git_env = {**_cx_env, "GIT_CONFIG_GLOBAL": os.devnull,
+                        "GIT_CONFIG_SYSTEM": os.devnull}
+            _git_ok = False
+            if _sh.which("git"):
+                try:
+                    # a clean exit is not proof: verify the repo the check needs
+                    # actually exists (a stand-in answering for `git` can exit 0
+                    # having created nothing)
+                    _git_ok = (_sp.run(["git", "init", "-q", _troot],
+                                       capture_output=True, env=_git_env,
+                                       timeout=60).returncode == 0
+                               and os.path.isdir(os.path.join(_troot, ".git")))
+                except (OSError, ValueError, _sp.SubprocessError):
+                    _git_ok = False
+            if _git_ok:
+                with open(os.path.join(_codex_home, "config.toml"), "a") as fh:
+                    fh.write(f'\n[projects."{os.path.realpath(_troot)}"]\n'
+                             f'trust_level = "trusted"\n')
+                in_proj = get_adapter("codex")._mcp_names_via_cli(cwd=_proj, env=_cx_env)
+                outside = get_adapter("codex")._mcp_names_via_cli(cwd=_codex_ws,
+                                                                  env=_cx_env)
+                _check("codex.mcp_enumeration_trusted_project_by_cwd",
+                       in_proj == sorted(expected + ["project_srv"])
+                       and outside == expected,
+                       f"a trusted project's .codex/config.toml contributes servers from "
+                       f"inside its tree (even a subdir) and not from outside: "
+                       f"in={in_proj}, out={outside}", failures, verbose)
+            elif verbose:
+                print("  [skipped — no working git] "
+                      "codex.mcp_enumeration_trusted_project_by_cwd")
+        elif verbose:
+            print("  [skipped — codex CLI not installed] codex.mcp_enumeration_via_cli")
+    finally:
+        _sh.rmtree(_codex_home, ignore_errors=True)
+        _sh.rmtree(_codex_ws, ignore_errors=True)
     sf = EvalSpec(name="t", prompt="p", source_path="/r/skill/evals/e.yaml",
                   files=["a.json", "fixtures/in.json", {"x/a.json": "data/a.json"},
                          "../esc.json",
@@ -1949,19 +3957,1565 @@ def run_selftest(verbose: bool = False) -> int:
            not any(e.kind == EventKind.SESSION_START and "skills_loaded" in str(e.raw)
                    for e in out.events),
            "ephemeral session events skipped", failures, verbose)
-    cargv = get_adapter("copilot").build_argv("do the task", RunOptions(model="auto"), cwd="/tmp")
-    _check("copilot.argv",
-           cargv[0] == "copilot" and "-p" in cargv and "--output-format" in cargv
-           and "json" in cargv and "--allow-all" in cargv and "--model" in cargv
-           and cargv[-1] != "do the task",
-           f"copilot argv: {cargv}", failures, verbose)
-    cargv_dt = get_adapter("copilot").build_argv("judge", RunOptions(disable_tools=True), cwd="/tmp")
-    _check("copilot.disable_tools",
-           "--available-tools" in cargv_dt and cargv_dt[cargv_dt.index("--available-tools") + 1] == "",
-           f"disable_tools → --available-tools '': {cargv_dt}", failures, verbose)
+    import sys
+
+    # A REAL 32-bit win32 harness fails every copilot _mcp_disable_args call closed
+    # by design (the WOW64 gate, asserted below via a shim AND — on such a host —
+    # natively here). The positive argv/enumeration checks in this section can't run
+    # there: they get architecture-aware skips instead of crashing the suite. Every
+    # argv-shape call runs in a PRIVATE fixture (_cop_private_fixture: private cwd,
+    # pinned HOME/USERPROFILE, private COPILOT_HOME) so none of them reads this
+    # machine's real ~/.copilot, and the custom-agent FILE scan is scoped to the
+    # registered fixture roots (_cop_scan_roots below) so an ambient agents dir in a
+    # shared ancestor — the walk now climbs to / — can't decide any of them.
+    _cop_wow64 = sys.platform == "win32" and sys.maxsize <= 2**32
+    _cop_priv, _cop_cwd, _cop_env = _cop_private_fixture("ase-copargv-")
+    _cop_scan_roots = [_cop_priv]
+    _defs_real_cop = _cop_scope_agent_scan(_cop_scan_roots)
+    # The ODR gate is stubbed OFF for every positive argv/enumeration check in this
+    # section: on a 64-bit Windows host whose live ODR registry is populated the
+    # adapter fails EVERY invocation closed by design (asserted separately in
+    # copilot.odr_gate_on_fails_closed), which would otherwise crash these checks.
+    # Restored at the ODR-specific checks below.
+    import agentskill_evals.adapters.copilot as copilot_mod
+    _odr_real_cop = _patch_module_attr(copilot_mod, "_odr_registry_command",
+                                       lambda: None)
+    if _cop_wow64:
+        try:
+            get_adapter("copilot").build_argv(
+                "do the task", RunOptions(model="auto", effective_env=_cop_env),
+                cwd=_cop_cwd)
+            _wow64_msg = "did not raise"
+        except RuntimeError as exc:
+            _wow64_msg = str(exc)
+        _check("copilot.argv_32bit_win32_fails_closed",
+               "32-bit" in _wow64_msg and "failing closed" in _wow64_msg,
+               f"a real 32-bit win32 harness fails copilot argv construction closed "
+               f"(WOW64 gate); positive argv checks skipped: {_wow64_msg}",
+               failures, verbose)
+    else:
+        cargv = get_adapter("copilot").build_argv(
+            "do the task",
+            RunOptions(model="auto", effective_env=_cop_env,
+                       extra_args=["--banner"]),  # neutral extra_args pass through
+            cwd=_cop_cwd)
+        _check("copilot.argv",
+               cargv[0] == "copilot" and "-p" in cargv and "--output-format" in cargv
+               and "json" in cargv and "--allow-all" in cargv and "--model" in cargv
+               and "--banner" in cargv and cargv[-1] != "do the task",
+               f"copilot argv: {cargv}", failures, verbose)
+        # Built-in / feature-gated in-process servers are disabled by NAME on every
+        # argv: --disable-builtin-mcps' help covers only github-mcp-server in
+        # 1.0.64, and config `enabledMcpServers` can switch on the staff-gated
+        # computer-use — which --disable-mcp-server must pre-empt by name.
+        _cop_builtins = {"github-mcp-server", "playwright", "bluebird",
+                         "computer-use"}
+        _cargv_dis = {cargv[i + 1] for i, a in enumerate(cargv)
+                      if a == "--disable-mcp-server"}
+        _pargv = get_adapter("copilot")._probe_argv("m", cwd=_cop_cwd, env=_cop_env)
+        _pargv_dis = {_pargv[i + 1] for i, a in enumerate(_pargv)
+                      if a == "--disable-mcp-server"}
+        _check("copilot.builtin_mcps_disabled_by_name",
+               _cop_builtins <= _cargv_dis and _cop_builtins <= _pargv_dis,
+               f"github-mcp-server/playwright/bluebird/computer-use are name-"
+               f"disabled on run AND probe argv (run={sorted(_cargv_dis)}, "
+               f"probe={sorted(_pargv_dis)})", failures, verbose)
+        cargv_dt = get_adapter("copilot").build_argv(
+            "judge", RunOptions(disable_tools=True, effective_env=_cop_env),
+            cwd=_cop_cwd)
+        _check("copilot.disable_tools",
+               "--available-tools" in cargv_dt
+               and cargv_dt[cargv_dt.index("--available-tools") + 1] == "",
+               f"disable_tools → --available-tools '': {cargv_dt}", failures, verbose)
     _check("copilot.no_output_schema",
            not get_adapter("copilot").supports_output_schema,
            "copilot has no native output schema support", failures, verbose)
+    # copilot has no "ignore user MCP config" flag (--disable-builtin-mcps only covers the
+    # bundled GitHub server) and loads servers from the user config, installed plugins, AND
+    # workspace configs — masks cover the first two under isolation; COPILOT_HOME must be
+    # mirrored or a set var bypasses them (design, Phase 0). The mcp-config mask must be
+    # the empty shape copilot ACCEPTS: bare "{}" fails validation ("mcpServers: Required",
+    # verified 1.0.64) and would kill every isolated run before execution.
+    _cop_masks = get_adapter("copilot").isolation_config_masks
+    _check("copilot.mcp_config_mask_declared",
+           _cop_masks.get(".copilot/mcp-config.json") == '{"mcpServers": {}}'
+           and _cop_masks.get(".copilot/installed-plugins", "x") is None
+           and _cop_masks.get(".copilot/agents", "x") is None
+           and callable(_cop_masks.get(".copilot/config.json"))
+           # settings.json takes the SAME sanitizer: 1.0.64 migrates user settings
+           # between the two files at startup, so a key stripped from one would ride
+           # back in through the other, which the overlay symlinks unless declared here
+           and _cop_masks.get(".copilot/settings.json")
+               is _cop_masks.get(".copilot/config.json")
+           and get_adapter("copilot").isolation_config_homes
+           == [("COPILOT_HOME", ".copilot", None)],
+           "copilot masks mcp-config.json (valid empty shape), installed-plugins, "
+           "agents/ (--disable-mcp-server cannot be AIMED at frontmatter mcp-servers: "
+           "the names are unenumerable), and "
+           "sanitizes config.json AND settings.json (copilot moves keys between them); "
+           "COPILOT_HOME mirrored", failures, verbose)
+
+    # the config.json sanitizer: plugin records there carry an absolute cache_path the
+    # loader follows even when installed-plugins/ is masked empty (verified 1.0.64) — they
+    # must go; auth/settings must stay; the file's JSONC comment lines must not break it;
+    # and customAgents.defaultLocalOnly must come out FORCED true — the documented setting
+    # (`copilot help config`) that is the only off-switch for remote custom-agent
+    # discovery, whose org/enterprise listings can carry mcp-servers outside the
+    # --disable-mcp-server set (1.0.64 bundle).
+    import json as _json
+    from .adapters.copilot import _sanitized_copilot_config
+    _san_dir = _tmp.mkdtemp(prefix="ase-copcfg-")
+    try:
+        cfg_path = os.path.join(_san_dir, "config.json")
+        # the fixture exercises copilot's FULL JSONC grammar (live-verified via
+        # `copilot mcp list`): full-line, inline, and block comments, trailing
+        # commas — with comment-lookalikes inside string values staying data
+        with open(cfg_path, "w") as fh:
+            fh.write('// User settings belong in settings.json.\n'
+                     '{\n'
+                     '  "copilotTokens": {"github.com": "tok-KEEP"}, // inline\n'
+                     '  /* block\n     comment */\n'
+                     '  "endpoint": "http://x/*not-a*/comment//either",\n'
+                     '  "installedPlugins": [{"name": "linear", "enabled": true,'
+                     ' "cache_path": "/real/plugins/linear"}],\n'
+                     '  "enabledPlugins": {"linear": true},\n'
+                     '  "enabledMcpServers": ["computer-use"],\n'
+                     '  "customAgents": {"defaultLocalOnly": false, "keep": 1,},\n'
+                     '}\n')
+        sanitized = _json.loads(_sanitized_copilot_config(cfg_path))
+        _check("copilot.config_sanitizer",
+               sanitized.get("copilotTokens") == {"github.com": "tok-KEEP"}
+               and sanitized.get("endpoint") == "http://x/*not-a*/comment//either"
+               and "installedPlugins" not in sanitized
+               and "enabledPlugins" not in sanitized
+               and "enabledMcpServers" not in sanitized
+               and sanitized.get("customAgents") == {"defaultLocalOnly": True,
+                                                     "keep": 1},
+               f"plugin registrations AND enabledMcpServers (feature-gated builtin "
+               f"switch, e.g. computer-use) dropped, auth kept, the full JSONC "
+               f"grammar handled (inline/block comments, trailing commas; string "
+               f"contents untouched), defaultLocalOnly forced true over an explicit "
+               f"false (sibling keys kept): {sorted(sanitized)}", failures, verbose)
+        _check("copilot.config_sanitizer_fail_closed",
+               _json.loads(_sanitized_copilot_config(os.path.join(_san_dir, "nope.json")))
+               == {"customAgents": {"defaultLocalOnly": True}},
+               "an unreadable config.json sanitizes to the neutral-but-hermetic shape "
+               "(no plugins can load, remote agents opted out)",
+               failures, verbose)
+    finally:
+        _sh.rmtree(_san_dir, ignore_errors=True)
+
+    # The whole enumeration block below builds positive copilot argv — skipped on a
+    # real 32-bit win32 harness, where _mcp_disable_args fails closed by design
+    # (see copilot.argv_32bit_win32_fails_closed above).
+    if not _cop_wow64:
+        # --disable-mcp-server enumeration: user config ($COPILOT_HOME else ~/.copilot)
+        # plus the workspace candidates. The workspace walk is a documented
+        # CONSERVATIVE SUPERSET of 1.0.64 — copilot reads only .mcp.json/.github/
+        # mcp.json (first existing per dir, cwd→git root; .vscode/mcp.json was
+        # REMOVED in 1.0.64), while the harness checks all three candidates in
+        # every ancestor: over-enumeration only adds harmless disables. This is
+        # what covers probes, judge runs, non-isolated runs, and scenario-seeded
+        # workspace configs.
+        import json as _json
+        # realpath: the custom-agent scan is scoped by PHYSICAL path
+        # (_cop_scope_agent_scan), so a /var → /private/var tmpdir must be resolved or
+        # these fixtures' own trees would be masked along with the ambient ones.
+        _cop_home = os.path.realpath(_tmp.mkdtemp(prefix="ase-cophome-"))
+        _cop_ws_root = os.path.realpath(_tmp.mkdtemp(prefix="ase-copws-"))
+        _cop_scan_roots += [_cop_home, _cop_ws_root]
+        _old_cop_home = os.environ.get("COPILOT_HOME")
+        _old_home_pins = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
+        try:
+            with open(os.path.join(_cop_home, "mcp-config.json"), "w") as fh:
+                _json.dump({"mcpServers": {"user-srv": {"command": "echo"}}}, fh)
+            # every config home here carries the remote-agents opt-out the sanitizer
+            # injects, so these MCP-enumeration checks never trip the custom-agent gate
+            _cop_optout = '{"customAgents": {"defaultLocalOnly": true}}'
+            with open(os.path.join(_cop_home, "config.json"), "w") as fh:
+                fh.write(_cop_optout)
+            ws = os.path.join(_cop_ws_root, "nested", "ws")
+            os.makedirs(os.path.join(ws, ".github"))
+            os.makedirs(os.path.join(ws, ".vscode"))
+            with open(os.path.join(ws, ".mcp.json"), "w") as fh:
+                _json.dump({"mcpServers": {"ws-srv": {}}}, fh)
+            with open(os.path.join(ws, ".github", "mcp.json"), "w") as fh:
+                _json.dump({"mcpServers": {"gh-srv": {}}}, fh)
+            with open(os.path.join(ws, ".vscode", "mcp.json"), "w") as fh:
+                # superset-only candidate: 1.0.64 no longer reads .vscode/mcp.json
+                # (or the "servers" spelling) — kept enumerated, harmless disable
+                _json.dump({"servers": {"vsc-srv": {}}}, fh)
+            with open(os.path.join(_cop_ws_root, ".mcp.json"), "w") as fh:
+                _json.dump({"mcpServers": {"ancestor-srv": {}}}, fh)
+            # Both walks climb from the cwd to the filesystem root. The MCP-config one
+            # is meant to (ancestor-srv is enumerated below); the custom-agent one has
+            # its FILE scan scoped to the registered fixture roots, so an ambient
+            # ~/.claude/agents or a planted $TMPDIR/.claude/agents can't fail this
+            # block closed (see _cop_scope_agent_scan).
+            os.environ["COPILOT_HOME"] = _cop_home
+            os.environ["HOME"] = os.environ["USERPROFILE"] = _cop_ws_root
+            dargv = get_adapter("copilot").build_argv("do it", RunOptions(), cwd=ws)
+            disabled = [dargv[i + 1] for i, a in enumerate(dargv) if a == "--disable-mcp-server"]
+            _check("copilot.mcp_disable_enumeration",
+                   {"user-srv", "ws-srv", "gh-srv", "vsc-srv", "ancestor-srv"} <= set(disabled),
+                   f"user + workspace + ancestor servers all disabled by name: {disabled}",
+                   failures, verbose)
+            # ...and the user config must resolve from the CHILD's env, not the harness's:
+            # a scenario's `env: {COPILOT_HOME: ...}` override reaches build_argv through
+            # opts.effective_env (exec.execute() sets it), with no os.environ involvement.
+            os.environ.pop("COPILOT_HOME", None)
+            eargv = get_adapter("copilot").build_argv(
+                "do it", RunOptions(effective_env=_cop_child_env(
+                    COPILOT_HOME=_cop_home)), cwd=None)
+            edis = [eargv[i + 1] for i, a in enumerate(eargv) if a == "--disable-mcp-server"]
+            _check("copilot.mcp_disable_uses_child_env",
+                   "user-srv" in edis,
+                   f"a COPILOT_HOME set only in the child's effective env still enumerates "
+                   f"its servers: {edis}", failures, verbose)
+            # ...and a RELATIVE COPILOT_HOME must resolve against the CHILD's cwd — copilot
+            # resolves it against its own process cwd (verified 1.0.64: `copilot mcp list`
+            # with COPILOT_HOME=relhome reads <its cwd>/relhome), so anchoring to the
+            # harness's cwd would enumerate a different config than the run actually loads
+            # (direct and `isolated: false` runs; isolation clears/repoints the var).
+            rel_cop_home = os.path.join(ws, "rel-cop-home")
+            os.makedirs(rel_cop_home)
+            with open(os.path.join(rel_cop_home, "mcp-config.json"), "w") as fh:
+                _json.dump({"mcpServers": {"rel-srv": {"command": "echo"}}}, fh)
+            with open(os.path.join(rel_cop_home, "config.json"), "w") as fh:
+                fh.write(_cop_optout)
+            rargv = get_adapter("copilot").build_argv(
+                "do it", RunOptions(effective_env=_cop_child_env(
+                    COPILOT_HOME="rel-cop-home", HOME=_cop_ws_root,
+                    USERPROFILE=_cop_ws_root)), cwd=ws)
+            rdis = [rargv[i + 1] for i, a in enumerate(rargv) if a == "--disable-mcp-server"]
+            _check("copilot.mcp_disable_relative_home_uses_child_cwd",
+                   "rel-srv" in rdis,
+                   f"a relative COPILOT_HOME enumerates from the child's cwd, not the "
+                   f"harness's: {rdis}", failures, verbose)
+            # ...and a SET-BUT-EMPTY home var must enumerate <child cwd>/.copilot — Node's
+            # homedir() returns "" for a set-but-empty HOME, so copilot's ".copilot" join
+            # goes relative and resolves against its process cwd (verified 1.0.64: `copilot
+            # mcp list` with HOME="" reads <its cwd>/.copilot). Treating empty as unset
+            # would enumerate the harness user's real ~/.copilot instead — the wrong config.
+            # POSIX-only: this empty-base-is-relative behaviour is Node/libuv's POSIX rule;
+            # on win32 libuv REJECTS an empty %USERPROFILE% (fail closed — see home_resolution).
+            # The agent scan is stubbed out entirely for the one call: this check is
+            # about home RESOLUTION and nothing else, and HOME="" would otherwise put
+            # <cwd>/.copilot/agents (which this fixture creates) in scope and fail the
+            # call closed before it ever enumerates mcp-config.json.
+            if os.name != "nt":
+                cwd_cop_home = os.path.join(ws, ".copilot")
+                os.makedirs(cwd_cop_home)
+                with open(os.path.join(cwd_cop_home, "mcp-config.json"), "w") as fh:
+                    _json.dump({"mcpServers": {"empty-home-srv": {"command": "echo"}}}, fh)
+                with open(os.path.join(cwd_cop_home, "config.json"), "w") as fh:
+                    fh.write(_cop_optout)
+                _real_agent_scan = copilot_mod._custom_agent_files
+                copilot_mod._custom_agent_files = lambda *a, **k: []
+                try:
+                    hargv = get_adapter("copilot").build_argv(
+                        "do it", RunOptions(effective_env=_cop_child_env(HOME="")),
+                        cwd=ws)
+                finally:
+                    copilot_mod._custom_agent_files = _real_agent_scan
+                hdis = [hargv[i + 1] for i, a in enumerate(hargv) if a == "--disable-mcp-server"]
+                _check("copilot.mcp_disable_empty_home_uses_child_cwd",
+                       "empty-home-srv" in hdis,
+                       f"a set-but-empty HOME enumerates <child cwd>/.copilot, as copilot "
+                       f"does: {hdis}", failures, verbose)
+        finally:
+            if _old_cop_home is None:
+                os.environ.pop("COPILOT_HOME", None)
+            else:
+                os.environ["COPILOT_HOME"] = _old_cop_home
+            for _k, _v in _old_home_pins.items():
+                if _v is None:
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _v
+            _sh.rmtree(_cop_home, ignore_errors=True)
+            _sh.rmtree(_cop_ws_root, ignore_errors=True)
+
+    # USER mcp-config.json is parsed with copilot's JSONC grammar — live-verified
+    # via `copilot mcp list`: line/inline/block comments and trailing commas all
+    # accept (three JSONC-declared fixture servers listed), JSON5 forms and garbage
+    # make copilot itself ERROR OUT ('Failed to read configuration ...'). A strict
+    # parser here would silently enumerate NOTHING for a JSONC-only config — the
+    # exact bypass Phase 0 forbids — so the user file gets the JSONC parser and an
+    # existing-but-unparseable one fails closed; WORKSPACE files stay strict (also
+    # live-verified: a trailing comma makes copilot silently ignore the file).
+    if not _cop_wow64:
+        _jc_home = os.path.realpath(_tmp.mkdtemp(prefix="ase-copjsonc-"))
+        _jc_root = os.path.realpath(_tmp.mkdtemp(prefix="ase-copjsoncws-"))
+        # registered so the custom-agent scan reads this fixture's own tree and
+        # nothing above it (see _cop_scope_agent_scan)
+        _cop_scan_roots += [_jc_home, _jc_root]
+        _jc_ws = os.path.join(_jc_root, "ws")
+        os.makedirs(_jc_ws)
+        try:
+            with open(os.path.join(_jc_home, "config.json"), "w") as fh:
+                fh.write('{"customAgents": {"defaultLocalOnly": true}}')
+
+            def _jc_disables():
+                a = get_adapter("copilot").build_argv(
+                    "p", RunOptions(effective_env=_cop_child_env(
+                        COPILOT_HOME=_jc_home, HOME=_jc_root,
+                        USERPROFILE=_jc_root)),
+                    cwd=_jc_ws)
+                return [a[i + 1] for i, t in enumerate(a)
+                        if t == "--disable-mcp-server"]
+
+            with open(os.path.join(_jc_home, "mcp-config.json"), "w") as fh:
+                fh.write('// line comment\n'
+                         '{\n'
+                         '  /* block\n     comment */\n'
+                         '  "mcpServers": {\n'
+                         '    "jsonc-line": { "command": "true" }, // inline\n'
+                         '    "jsonc-block": { "command": "true" } /* tail */,\n'
+                         '    "str-aware": { "command": "http://x/*y", '
+                         '"args": ["a,]", "b//c"] },\n'
+                         '  },\n'
+                         '}\n')
+            _jc_got = _jc_disables()
+            jsonc_ok = {"jsonc-line", "jsonc-block", "str-aware"} <= set(_jc_got)
+            with open(os.path.join(_jc_home, "mcp-config.json"), "w") as fh:
+                fh.write("{ this is not json ")
+            try:
+                _jc_disables()
+                garbage_closed = ""
+            except RuntimeError as exc:
+                garbage_closed = str(exc)
+            with open(os.path.join(_jc_home, "mcp-config.json"), "w") as fh:
+                fh.write('{ mcpServers: { "j5": { "command": "true" } } }')
+            try:
+                _jc_disables()
+                json5_closed = ""
+            except RuntimeError as exc:
+                json5_closed = str(exc)
+            os.remove(os.path.join(_jc_home, "mcp-config.json"))
+            with open(os.path.join(_jc_ws, ".mcp.json"), "w") as fh:
+                fh.write('{"mcpServers": {"ws-trailing": {"command": "true"},}}')
+            ws_strict_ok = "ws-trailing" not in _jc_disables()
+            _check("copilot.user_mcp_config_jsonc",
+                   jsonc_ok
+                   and "failing closed" in garbage_closed
+                   and "mcp-config.json" in garbage_closed
+                   and "failing closed" in json5_closed
+                   and ws_strict_ok,
+                   f"user mcp-config.json parses with copilot's live-verified JSONC "
+                   f"grammar (comments incl. inline/block, trailing commas; string "
+                   f"contents untouched: {_jc_got}); an existing-but-unparseable "
+                   f"user file (garbage or the JSON5 forms copilot rejects) fails "
+                   f"closed as copilot itself errors out; workspace files stay "
+                   f"strict (trailing comma → ignored, matching copilot)",
+                   failures, verbose)
+        finally:
+            _sh.rmtree(_jc_home, ignore_errors=True)
+            _sh.rmtree(_jc_root, ignore_errors=True)
+
+    # JSONC grammar edges that must fail the SAFE way (copilot_mod pure helpers):
+    #  - a comment is TOKEN-SEPARATING whitespace, not deletion: `tr/*x*/ue` must NOT
+    #    collapse to `true` (copilot reduces that malformed config to {}). Reading it as
+    #    `true` would let a comment FABRICATE customAgents.defaultLocalOnly and green-
+    #    light a repo run whose remote-agent listing is still live.
+    #  - an UNTERMINATED block comment raises (copilot's parser errors too).
+    #  - a leading UTF-8 BOM is consumed (copilot accepts a BOM-prefixed config; strict
+    #    json.loads rejects one — failing a valid mcp-config.json closed, or dropping
+    #    auth from a BOM-prefixed config.json).
+    _bom = chr(0xFEFF)
+
+    def _jsonc_raises(s):
+        try:
+            copilot_mod._jsonc_loads(s)
+            return False
+        except ValueError:
+            return True
+
+    jsonc_comment_ws = _jsonc_raises('{"customAgents":{"defaultLocalOnly":tr/*x*/ue}}')
+    jsonc_unterminated = (_jsonc_raises('{"a": 1 /* no close')
+                          and _jsonc_raises('{"a": 1 /* no close *'))
+    jsonc_bom_ok = (copilot_mod._jsonc_loads(_bom + '{"a": 1}') == {"a": 1}
+                    and copilot_mod._jsonc_loads(_bom + '// c\n{"a": 2}') == {"a": 2})
+    _optdir = _tmp.mkdtemp(prefix="ase-copopt-")
+    try:
+        # the security payoff: the comment-glued opt-out must NOT read as opted-out...
+        with open(os.path.join(_optdir, "config.json"), "w") as fh:
+            fh.write('{"customAgents":{"defaultLocalOnly":tr/*x*/ue}}')
+        opt_not_fabricated = copilot_mod._remote_agents_opted_out(_optdir) is False
+        # ...while a genuine BOM-prefixed opt-out still does
+        with open(os.path.join(_optdir, "config.json"), "w", encoding="utf-8") as fh:
+            fh.write(_bom + '{"customAgents": {"defaultLocalOnly": true}}')
+        opt_bom_ok = copilot_mod._remote_agents_opted_out(_optdir) is True
+        # a BOM-prefixed WORKSPACE file (strict JSON) still enumerates its servers —
+        # utf-8-sig consumes the BOM; leaving it would MISS the server (a leak)
+        with open(os.path.join(_optdir, ".mcp.json"), "w", encoding="utf-8") as fh:
+            fh.write(_bom + '{"mcpServers": {"ws-bom": {"command": "true"}}}')
+        ws_bom_ok = "ws-bom" in copilot_mod._mcp_server_names(
+            os.path.join(_optdir, ".mcp.json"))
+    finally:
+        _sh.rmtree(_optdir, ignore_errors=True)
+
+    # The opt-out lives in EITHER of copilot's two settings files, because 1.0.64 moves
+    # it between them: a value written into config.json is applied for that run and then
+    # migrated into settings.json (verified live against the installed CLI — the
+    # harness's own injected opt-out came back out of config.json and appeared intact in
+    # a settings.json copilot created). Reading only config.json makes the opt-out
+    # evaporate after the first run that touches the home, which strands non-isolated
+    # users in a loop: set the documented key, copilot relocates it, the next run fails
+    # closed telling them to set the key they already set. Which file WINS when the two
+    # disagree is decided in a native module, not readable JS — so a disagreement is not
+    # guessed at, it fails closed.
+    _twodir = _tmp.mkdtemp(prefix="ase-coptwo-")
+    try:
+        _tw_cfg = os.path.join(_twodir, "config.json")
+        _tw_set = os.path.join(_twodir, "settings.json")
+        _tw_on = '{"customAgents": {"defaultLocalOnly": true}}'
+        _tw_off = '{"customAgents": {"defaultLocalOnly": false}}'
+
+        def _tw(cfg, settings):
+            for p, body in ((_tw_cfg, cfg), (_tw_set, settings)):
+                if body is None:
+                    if os.path.exists(p):
+                        os.remove(p)
+                else:
+                    with open(p, "w") as fh:
+                        fh.write(body)
+            return copilot_mod._remote_agents_opted_out(_twodir)
+
+        # the migrated shape: config.json no longer carries it, settings.json does
+        tw_settings_only = _tw(None, _tw_on) is True
+        tw_config_only = _tw(_tw_on, None) is True
+        tw_both = _tw(_tw_on, _tw_on) is True
+        # neither set, and an explicit false, are not opted out
+        tw_neither = _tw(None, None) is False
+        tw_false = _tw(_tw_off, None) is False and _tw(None, _tw_off) is False
+        # disagreement fails closed in BOTH directions — no precedence is assumed
+        tw_conflict = _tw(_tw_on, _tw_off) is False and _tw(_tw_off, _tw_on) is False
+        # A PRESENT customAgents that does not itself say defaultLocalOnly:true is a
+        # contradiction, whatever shape it has. The migration moves the whole key across,
+        # so {"customAgents": {}} beside a settings.json opt-out overwrites the opt-out
+        # with {} — judging the subkey's presence instead of the key's read that as clean.
+        tw_empty = all(
+            _tw(body, _tw_on) is False and _tw(_tw_on, body) is False
+            for body in ('{"customAgents": {}}',
+                         '{"customAgents": null}',
+                         '{"customAgents": []}',
+                         '{"customAgents": "local"}',
+                         '{"customAgents": {"other": true}}',
+                         '{"customAgents": {"defaultLocalOnly": "true"}}',
+                         '{"customAgents": {"defaultLocalOnly": 1}}')
+        )
+        # an UNRELATED key is not a contradiction — the other file still speaks
+        tw_unrelated = _tw('{"theme": "dark"}', _tw_on) is True
+    finally:
+        _sh.rmtree(_twodir, ignore_errors=True)
+    _check("copilot.opt_out_read_from_both_settings_files",
+           tw_settings_only and tw_config_only and tw_both and tw_neither
+           and tw_false and tw_conflict and tw_empty and tw_unrelated,
+           "the remote-agent opt-out counts from config.json OR settings.json — copilot "
+           "migrates it between them at startup, so reading one file loses it after the "
+           "first run — while an explicit false, a missing key, and any DISAGREEMENT "
+           "between the two files (precedence being decided in a native module the "
+           "harness cannot read) all fail closed; a customAgents key that is PRESENT but "
+           "does not itself set defaultLocalOnly:true (empty object, wrong type, truthy "
+           "non-true) contradicts the other file, because the migration transports the "
+           "whole key", failures, verbose)
+    _check("copilot.jsonc_grammar_edges",
+           jsonc_comment_ws and jsonc_unterminated and jsonc_bom_ok
+           and opt_not_fabricated and opt_bom_ok and ws_bom_ok,
+           "JSONC comments are token-separating whitespace (tr/*x*/ue does NOT become "
+           "true, so a comment can't fabricate customAgents.defaultLocalOnly — the "
+           "opt-out reads False), an unterminated block comment raises, and a leading "
+           "UTF-8 BOM is consumed for user JSONC (a BOM-prefixed opt-out still reads "
+           "True) and strict workspace files (BOM-prefixed servers still enumerated)",
+           failures, verbose)
+
+    # Custom agents are an MCP channel --disable-mcp-server cannot be AIMED at: a
+    # selected agent's frontmatter mcp-servers WOULD honor the disable set, but their
+    # names are unenumerable (local frontmatter plus REMOTE org/enterprise listings the
+    # harness cannot read), and no flag disables custom agents (1.0.64 bundle). So
+    # _mcp_disable_args must FAIL CLOSED on any discoverable local agent file —
+    # <home>/agents plus .github/agents / .claude/agents from the run cwd up to the
+    # FILESYSTEM ROOT — and on any config that doesn't provably opt out of the REMOTE
+    # org/enterprise listing (customAgents.defaultLocalOnly, which the sanitizer
+    # injects).
+    #
+    # The walk carries NO boundary. copilot's own is `gitRoot if git discovery finds a
+    # repo else os.homedir()`: the git arm would take a git EXECUTION that copilot
+    # repeats at launch (the two-execution gap the ODR gate refuses), and the home arm
+    # is not a safe substitute because the choice is an either/or — a home nested in a
+    # repo gets walked past (copilot.agent_walk_not_bounded_by_home). Nothing in these
+    # fixtures needs a git binary, and nothing about them changes if one is missing.
+    if not _cop_wow64:
+        # realpath: the scan scope below matches on PHYSICAL paths, so an unresolved
+        # /var → /private/var tmpdir would mask the fixture's own files
+        _ag_dir = os.path.realpath(_tmp.mkdtemp(prefix="ase-copagents-"))
+        _cop_scan_roots.append(_ag_dir)
+        try:
+            _ag_home = os.path.join(_ag_dir, "home")
+            _ag_proj = os.path.join(_ag_dir, "proj")
+            _ag_ws = os.path.join(_ag_proj, "ws")
+            os.makedirs(_ag_home)
+            os.makedirs(_ag_ws)
+            # The walk climbs past this fixture into shared TMPDIR ancestors — nothing
+            # bounds it — so the scan is SCOPED to _ag_dir (registered above) and only
+            # files this fixture plants can decide these checks.
+            _ag_env = _cop_child_env(COPILOT_HOME=_ag_home, HOME=_ag_dir,
+                                     USERPROFILE=_ag_dir)
+            # the remote-agents opt-out is required for EVERY run now, so the fixture
+            # config home carries it and the LOCAL-agent checks below test only what
+            # they name (its own gate is asserted separately)
+            _ag_optout = os.path.join(_ag_home, "config.json")
+            with open(_ag_optout, "w") as fh:
+                fh.write('{"customAgents": {"defaultLocalOnly": true}}')
+
+            def _cop_agents_err(cwd, **extra_env):
+                try:
+                    get_adapter("copilot").build_argv(
+                        "p", RunOptions(effective_env={**_ag_env, **extra_env}),
+                        cwd=cwd)
+                    return ""
+                except RuntimeError as exc:
+                    return str(exc)
+
+            ag_clean = _cop_agents_err(_ag_ws) == ""      # empty tree builds fine
+            os.makedirs(os.path.join(_ag_home, "agents", "nested"))
+            open(os.path.join(_ag_home, "agents", "readme.txt"), "w").close()
+            ag_nonmd = _cop_agents_err(_ag_ws) == ""      # only *.md is an agent
+            # case-insensitive superset of copilot's *.md glob, at any depth
+            open(os.path.join(_ag_home, "agents", "nested", "Helper.MD"), "w").close()
+            _e = _cop_agents_err(_ag_ws)
+            ag_home_md = "custom-agent" in _e and "failing closed" in _e
+            _sh.rmtree(os.path.join(_ag_home, "agents"))
+            os.makedirs(os.path.join(_ag_proj, ".github", "agents"))
+            open(os.path.join(_ag_proj, ".github", "agents", "x.md"), "w").close()
+            ag_github = "custom-agent" in _cop_agents_err(_ag_ws)
+            _sh.rmtree(os.path.join(_ag_proj, ".github"))
+            os.makedirs(os.path.join(_ag_proj, ".claude", "agents"))
+            open(os.path.join(_ag_proj, ".claude", "agents", "x.agent.md"), "w").close()
+            ag_claude = "custom-agent" in _cop_agents_err(_ag_ws)
+            _sh.rmtree(os.path.join(_ag_proj, ".claude"))
+            _check("copilot.custom_agents_fail_closed",
+                   ag_clean and ag_nonmd and ag_home_md and ag_github and ag_claude,
+                   "any *.md under <home>/agents (recursive, case-insensitive) or a "
+                   ".github/agents / .claude/agents dir on the cwd walk fails closed "
+                   "(the harness cannot enumerate agent-declared mcp-server names); "
+                   "empty dirs and non-md files don't", failures, verbose)
+
+            # The agent walk must NOT be narrowed by any repository marker. copilot's
+            # own walk does stop at a git root, but the harness cannot learn where that
+            # is without executing git — and copilot executes git again at launch, so a
+            # stateful/slow/differently-resolved git can answer the two runs
+            # differently and leave copilot walking FARTHER than the harness looked.
+            # Every .git spelling below must therefore be inert: the agent file above it
+            # is still found.
+            os.makedirs(os.path.join(_ag_dir, ".claude", "agents"))
+            open(os.path.join(_ag_dir, ".claude", "agents", "above.md"), "w").close()
+            _ag_marker = os.path.join(_ag_proj, ".git")
+            os.makedirs(_ag_marker)                                  # bare .git dir
+            ag_marker_dir = "above.md" in _cop_agents_err(_ag_ws)
+            open(os.path.join(_ag_marker, "HEAD"), "w").close()      # + a HEAD
+            ag_marker_head = "above.md" in _cop_agents_err(_ag_ws)
+            _sh.rmtree(_ag_marker)
+            with open(_ag_marker, "w") as fh:                        # worktree .git FILE
+                fh.write("gitdir: /elsewhere\n")
+            ag_marker_file = "above.md" in _cop_agents_err(_ag_ws)
+            os.remove(_ag_marker)
+            # ...nor by anything that redirects git's own discovery
+            ag_git_env = all(
+                "above.md" in _cop_agents_err(_ag_ws, **{v: val})
+                for v, val in (("GIT_DIR", ""), ("GIT_DIR", "/some/gitdir"),
+                               ("GIT_WORK_TREE", _ag_proj),
+                               ("GIT_CEILING_DIRECTORIES", _ag_proj)))
+            _check("copilot.agent_walk_not_narrowed_by_git",
+                   ag_marker_dir and ag_marker_head and ag_marker_file and ag_git_env,
+                   "the local-agent scan is never narrowed by a repository signal — "
+                   "not a .git dir (empty or HEAD-bearing), not a worktree .git file, "
+                   "not GIT_DIR/GIT_WORK_TREE/GIT_CEILING_DIRECTORIES in the child env "
+                   "— because pinning the real boundary would mean executing git while "
+                   "copilot executes it again at launch (the ODR two-execution gap); "
+                   "an agent file above every one of those markers is still found",
+                   failures, verbose)
+            _sh.rmtree(os.path.join(_ag_dir, ".claude"))
+
+            # The REMOTE-listing gate is likewise never CLEARED by a preflight: the
+            # opt-out is required unconditionally, in a repo or not.
+            os.remove(_ag_optout)
+            _e = _cop_agents_err(_ag_ws)
+            ag_remote = "defaultLocalOnly" in _e and "failing closed" in _e
+            ag_remote_norepo = "defaultLocalOnly" in _cop_agents_err(_ag_home)
+            with open(_ag_optout, "w") as fh:
+                fh.write('{"customAgents": {"defaultLocalOnly": true}}')
+            ag_optout_runs = _cop_agents_err(_ag_ws) == ""
+            _check("copilot.remote_agents_fail_closed",
+                   ag_remote and ag_remote_norepo and ag_optout_runs,
+                   "a config that doesn't provably set customAgents.defaultLocalOnly "
+                   "fails closed on EVERY run — remote org/enterprise agents can carry "
+                   "mcp-servers the harness cannot name, and proving a cwd is outside "
+                   "a repository would take a git execution copilot independently "
+                   "repeats — while the opt-out (as the sanitizer injects it) runs "
+                   "clean", failures, verbose)
+        finally:
+            _sh.rmtree(_ag_dir, ignore_errors=True)
+
+    # The convention-dir walk runs over the PHYSICAL cwd: copilot resolves paths the
+    # same way, so a cwd symlinked into a tree must find the agent dirs living there.
+    if not _cop_wow64:
+        _gs_root = os.path.realpath(_tmp.mkdtemp(prefix="ase-copgs-"))
+        _cop_scan_roots.append(_gs_root)
+        try:
+            _gs_home = os.path.join(_gs_root, "home")
+            os.makedirs(_gs_home)
+            with open(os.path.join(_gs_home, "config.json"), "w") as fh:
+                fh.write('{"customAgents": {"defaultLocalOnly": true}}')
+            _gs_env = _cop_child_env(COPILOT_HOME=_gs_home, HOME=_gs_root,
+                                     USERPROFILE=_gs_root)
+
+            def _gs_err(cwd):
+                try:
+                    get_adapter("copilot").build_argv(
+                        "p", RunOptions(effective_env=_gs_env), cwd=cwd)
+                    return ""
+                except RuntimeError as exc:
+                    return str(exc)
+
+            _gs_proj = os.path.join(_gs_root, "proj")
+            _gs_sub = os.path.join(_gs_proj, "sub")
+            os.makedirs(_gs_sub)
+            os.makedirs(os.path.join(_gs_proj, ".github", "agents"))
+            open(os.path.join(_gs_proj, ".github", "agents", "mid.md"), "w").close()
+            physical_found = "custom-agent" in _gs_err(_gs_sub)
+            _check("copilot.agent_walk_physical_cwd", physical_found,
+                   "the convention-dir walk runs over the resolved cwd and finds the "
+                   "agent dirs of its ancestors", failures, verbose)
+            # a cwd SYMLINKED into that subtree must resolve to the physical path (an
+            # abspath walk would climb the LINK's parents and miss mid.md entirely).
+            # Windows may forbid creating the link at all — that arm is then SKIPPED
+            # outright rather than folded into a passing _check, which would report
+            # symlink behaviour as verified when nothing exercised it.
+            _gs_link = os.path.join(_gs_root, "link")
+            try:
+                os.symlink(_gs_sub, _gs_link, target_is_directory=True)
+            except (OSError, NotImplementedError, AttributeError):
+                _gs_link = None
+            if _gs_link is not None:
+                _check("copilot.agent_walk_symlinked_cwd",
+                       "custom-agent" in _gs_err(_gs_link),
+                       "a cwd symlinked into a tree resolves to the physical path and "
+                       "finds the same agent files copilot's own physical resolution "
+                       "does", failures, verbose)
+            elif verbose:
+                print("  [skipped — symlink creation unavailable] "
+                      "copilot.agent_walk_symlinked_cwd")
+        finally:
+            _sh.rmtree(_gs_root, ignore_errors=True)
+
+    # The walk is NOT bounded by the child's OS home. copilot's boundary is an
+    # either/or — `boundary = gitDiscovery(cwd).found ? gitRoot : os.homedir()` — not the
+    # nearer of the two, so a home NESTED IN a repository is walked straight past: with
+    # HOME=/repo/home and cwd /repo/home/ws, copilot reads /repo/.github/agents. A
+    # harness that stopped at the home would miss exactly that file, and
+    # defaultLocalOnly would not save the run (it suppresses REMOTE agents only, so the
+    # missed LOCAL agent still brings up its own mcp-servers). Deciding whether the home
+    # is the real boundary means deciding whether git discovery succeeds — the execution
+    # the harness refuses to make — so the home is simply INERT here, in every spelling.
+    #
+    # This fixture reproduces that geometry exactly: an agent dir at the repo root, the
+    # child's home BELOW it, the cwd below that.
+    if not _cop_wow64:
+        _hb_root = os.path.realpath(_tmp.mkdtemp(prefix="ase-cophb-"))
+        _cop_scan_roots.append(_hb_root)
+        try:
+            _hb_repo = os.path.join(_hb_root, "repo")
+            _hb_home = os.path.join(_hb_repo, "home")
+            _hb_cwd = os.path.join(_hb_home, "ws")
+            _hb_cop = os.path.join(_hb_home, ".copilot")
+            os.makedirs(_hb_cwd)
+            os.makedirs(_hb_cop)
+            # SYNTHETIC GEOMETRY, deliberately: a marker dir standing where copilot's
+            # boundary would be. The code under test never runs git — it walks to `/`
+            # precisely BECAUSE it refuses to trust a git it would have to execute — so a
+            # real repository would exercise nothing this doesn't, while costing an
+            # ambient subprocess (and its timeout) on every suite run. Nothing below reads
+            # `.git`; it marks the spot for the reader.
+            os.makedirs(os.path.join(_hb_repo, ".git"), exist_ok=True)
+            with open(os.path.join(_hb_cop, "config.json"), "w") as fh:
+                fh.write('{"customAgents": {"defaultLocalOnly": true}}')
+
+            def _hb_err(**home_env):
+                env = _cop_child_env(COPILOT_HOME=_hb_cop, HOME=_hb_home,
+                                     USERPROFILE=_hb_home)
+                env.update(home_env)
+                try:
+                    get_adapter("copilot").build_argv(
+                        "p", RunOptions(effective_env=env), cwd=_hb_cwd)
+                    return ""
+                except RuntimeError as exc:
+                    return str(exc)
+
+            # nothing planted yet: the run builds clean, so the failures below are the
+            # agent files and not some unrelated gate
+            hb_clean = _hb_err() == ""
+            # the P1 case — an agent dir ABOVE the child's home, at the repo root that
+            # is copilot's actual boundary. An exactly-spelled home must NOT hide it.
+            os.makedirs(os.path.join(_hb_repo, ".github", "agents"))
+            open(os.path.join(_hb_repo, ".github", "agents", "above_home.md"),
+                 "w").close()
+            hb_above_home_closed = "above_home.md" in _hb_err()
+            # ...and no spelling of the home changes that: exact, empty, relative,
+            # trailing separator, or absent altogether are all equally inert
+            hb_spelling_inert = all(
+                "above_home.md" in _hb_err(**{k: v for k in ("HOME", "USERPROFILE")})
+                for v in ("", "home", _hb_home + os.sep, _hb_root))
+            _hb_unset = {"COPILOT_HOME": _hb_cop}
+            try:
+                get_adapter("copilot").build_argv(
+                    "p", RunOptions(effective_env=_hb_unset), cwd=_hb_cwd)
+                hb_unset_closed = False
+            except RuntimeError as exc:
+                hb_unset_closed = "above_home.md" in str(exc)
+            # an agent dir AT the home is in scope too
+            os.makedirs(os.path.join(_hb_home, ".claude", "agents"))
+            open(os.path.join(_hb_home, ".claude", "agents", "at_home.md"), "w").close()
+            hb_at_home_closed = "at_home.md" in _hb_err()
+            _check("copilot.agent_walk_not_bounded_by_home",
+                   hb_clean and hb_above_home_closed and hb_spelling_inert
+                   and hb_unset_closed and hb_at_home_closed,
+                   "the child's OS home does not bound the local-agent scan: an agent "
+                   "dir ABOVE it — where copilot's real boundary, the git root, puts it "
+                   "in scope — fails the run closed, whatever the home is spelled as "
+                   "(exact, empty, relative, trailing separator, unset)", failures,
+                   verbose)
+        finally:
+            _sh.rmtree(_hb_root, ignore_errors=True)
+
+    # The launch window. _mcp_disable_args reads the agent dirs and MCP configs before
+    # launch; copilot reads them again for itself at startup, and execs `git rev-parse`
+    # (child PATH) for its convention-dir boundary BEFORE it globs the agent dirs.
+    # Whatever answers for git there can plant an agent file or a config entry that
+    # copilot then discovers and the disable set never named. Neither closing move
+    # exists: the discovery paths are every ancestor up to `/` plus a config home the
+    # child owns and can rewrite (isolation's empty agents/ mask included — same uid),
+    # and copilot's git can't be bound to a binary the harness trusts more, because the
+    # harness would resolve the same PATH to find one. So it is DETECTED instead:
+    # verify_post_run re-runs the enumeration after the child exits and fails the run if
+    # the answer moved. Re-executing the scan is sound in this direction only — it can
+    # add failures, never clear a gate (contrast the git preflight this branch refuses).
+    if not _cop_wow64:
+        _pr_root = os.path.realpath(_tmp.mkdtemp(prefix="ase-coppr-"))
+        _cop_scan_roots.append(_pr_root)
+        try:
+            _pr_cwd = os.path.join(_pr_root, "ws")
+            _pr_cop = os.path.join(_pr_root, ".copilot")
+            os.makedirs(_pr_cwd)
+            os.makedirs(_pr_cop)
+            _pr_cfg = os.path.join(_pr_cop, "mcp-config.json")
+            with open(os.path.join(_pr_cop, "config.json"), "w") as fh:
+                fh.write('{"customAgents": {"defaultLocalOnly": true}}')
+            with open(_pr_cfg, "w") as fh:
+                fh.write('{"mcpServers": {"early": {"command": "x"}}}')
+            _pr_env = _cop_child_env(COPILOT_HOME=_pr_cop, HOME=_pr_root,
+                                     USERPROFILE=_pr_root)
+            _pr_opts = RunOptions(effective_env=_pr_env)
+            _pr_cop_ad = get_adapter("copilot")
+            _pr_argv = _pr_cop_ad.build_argv("p", _pr_opts, cwd=_pr_cwd)
+
+            def _pr_err():
+                try:
+                    return ("" if _pr_cop_ad.verify_post_run(
+                        _pr_argv, _pr_opts, cwd=_pr_cwd) is None else "returned")
+                except RuntimeError as exc:
+                    return str(exc)
+
+            # nothing moved: the re-check is a clean no-op, so the failures below are
+            # the planted state and not a re-check that fails on everything
+            pr_clean = _pr_err() == ""
+            # a server configured AFTER argv was built is not in the launched disable
+            # set — copilot loads its config at startup, inside the window
+            with open(_pr_cfg, "w") as fh:
+                fh.write('{"mcpServers": {"early": {"command": "x"},'
+                         ' "late": {"command": "y"}}}')
+            pr_late_server = _pr_err()
+            # ...and an agent file planted in the window fails closed the same way,
+            # through the enumeration's own agent gate (config restored first, so the
+            # server arm above can't be what fires here)
+            with open(_pr_cfg, "w") as fh:
+                fh.write('{"mcpServers": {"early": {"command": "x"}}}')
+            os.makedirs(os.path.join(_pr_cwd, ".github", "agents"))
+            open(os.path.join(_pr_cwd, ".github", "agents", "late.md"), "w").close()
+            pr_late_agent = _pr_err()
+            _check("copilot.post_run_recheck_catches_launch_window",
+                   pr_clean
+                   and "late" in pr_late_server
+                   and "not provably MCP-hermetic" in pr_late_server
+                   and "early" not in pr_late_server.split("are configured now")[0]
+                   and "late.md" in pr_late_agent
+                   and "no longer" in pr_late_agent,
+                   f"state that moves between argv construction and the child's own "
+                   f"read is caught after the run — a late server names itself, a late "
+                   f"agent file fails the re-check closed: "
+                   f"server={pr_late_server[:60]!r} agent={pr_late_agent[:60]!r}",
+                   failures, verbose)
+
+            # ...but re-reading state cannot catch a change that is UNDONE before the
+            # child exits: plant, let copilot load the server, restore the original bytes,
+            # and the post-run read is byte-identical to the pre-run one. The only witness
+            # left is copilot itself, which streams the status of every configured server.
+            # So the fixture below restores the clean state — the re-check above is now a
+            # no-op again, proving these arms fire on the STREAM and nothing else.
+            _sh.rmtree(os.path.join(_pr_cwd, ".github"))
+
+            def _pr_out(*events, exit_code=None):
+                try:
+                    return ("" if _pr_cop_ad.verify_post_run(
+                        _pr_argv, _pr_opts, cwd=_pr_cwd, exit_code=exit_code,
+                        stdout="\n".join(_json.dumps(e) for e in events)) is None
+                        else "returned")
+                except RuntimeError as exc:
+                    return str(exc)
+
+            def _pr_loaded(*servers):
+                return {"type": "session.mcp_servers_loaded", "ephemeral": True,
+                        "data": {"servers": [{"name": n, "status": s}
+                                             for n, s in servers]}}
+
+            # the shape a real hermetic run emits, verbatim from 1.0.64 under the
+            # harness's flags: configured, listed, and disabled
+            pr_disabled_ok = _pr_out(_pr_loaded(("github-mcp-server", "disabled")),
+                                     {"type": "assistant.turn_end", "data": {}}) == ""
+            # the ABA case: nothing on disk moved, but copilot says it brought one up
+            pr_aba = _pr_out(_pr_loaded(("github-mcp-server", "disabled"),
+                                        ("planted", "connected")))
+            # a server that goes live LATER, after the loaded event said disabled
+            pr_changed = _pr_out(
+                _pr_loaded(("planted", "disabled")),
+                {"type": "session.mcp_server_status_changed", "ephemeral": True,
+                 "data": {"serverName": "planted", "status": "connected"}})
+            # `failed` still spawned the process, and a status a later version invents is
+            # not assumed inert — the allowlist is {disabled, not_configured}
+            pr_failed = _pr_out(_pr_loaded(("planted", "failed")))
+            pr_unknown = _pr_out(_pr_loaded(("planted", "quantum-superposed")))
+            # noise on stdout must not crash the reader or invent servers
+            pr_noise_ok = (_pr_out(_pr_loaded(("github-mcp-server", "disabled")),
+                                   {"type": "assistant.idle", "data": {}},
+                                   {"type": "result", "exitCode": 0}) == ""
+                           and _pr_err() == "")
+            _check("copilot.post_run_stream_evidence_catches_reverted_leak",
+                   pr_disabled_ok and pr_noise_ok
+                   and all("planted" in r and "event stream" in r
+                           for r in (pr_aba, pr_changed, pr_failed, pr_unknown))
+                   and "github-mcp-server" not in pr_aba,
+                   f"a leak reverted before the child exits reads back clean on disk and "
+                   f"is caught anyway, because copilot's own event stream already named "
+                   f"the server it brought up (and a disabled one is not a leak): "
+                   f"disabled_ok={pr_disabled_ok} aba={pr_aba[:60]!r} "
+                   f"changed={bool(pr_changed)} failed={bool(pr_failed)} "
+                   f"unknown={bool(pr_unknown)}", failures, verbose)
+
+            # The stream arms above are only as good as the event still existing. The CLI
+            # version cannot be read (npm metadata disagrees with the binary the updater
+            # rewrote in place) or pinned (a bare `copilot --version` resolves its app.js
+            # through a writable version cache the harness's own --no-auto-update argv
+            # bypasses), so the CONTRACT is required instead of a version: a run that
+            # emitted its own end-of-session `result` without ever naming an MCP host has
+            # lost the witness, and silently returning "no live servers" would read exactly
+            # like a clean run.
+            pr_gap = _pr_out({"type": "assistant.turn_end", "data": {}},
+                             {"type": "result", "exitCode": 0})
+            # renamed event == the drift this is here to catch
+            pr_renamed = _pr_out({"type": "session.mcp_servers_ready",
+                                  "data": {"servers": []}},
+                                 {"type": "result", "exitCode": 0})
+            # ...but a child that never finished is not blamed for a report it never had
+            # the chance to make: no `result`, NONZERO exit, no requirement (the state
+            # re-read, which covers exactly that case, has already run above)
+            pr_incomplete = _pr_out({"type": "assistant.turn_end", "data": {}}) == ""
+            pr_empty_stream = _pr_out() == ""
+            pr_killed = _pr_out(exit_code=-9) == ""
+            # A ZERO EXIT demands the witness even when NOTHING in the stream is
+            # recognizable. Inferring completion from copilot's own `result` event would
+            # make the gate self-defeating: a build that renamed both events emits
+            # neither, reads as "never finished", and passes — precisely the drift this
+            # replaced a version number to catch.
+            pr_zero_exit = _pr_out({"type": "session.done"}, exit_code=0)
+            pr_renamed_both = _pr_out({"type": "session.mcp_servers_ready",
+                                       "data": {"servers": []}},
+                                      {"type": "session.finished"}, exit_code=0)
+            # A well-formed but EMPTY list proves nothing: the built-in sentinel is
+            # configured and disabled on every hermetic invocation, so a witness that
+            # does not name it is not describing the host this adapter was verified
+            # against. (Presence is what is required — a sentinel reported LIVE is a
+            # leak, and is reported as one, not as a broken contract.)
+            pr_empty_list = _pr_out(_pr_loaded(), {"type": "result", "exitCode": 0})
+            pr_other_only = _pr_out(_pr_loaded(("something-else", "disabled")),
+                                    {"type": "result", "exitCode": 0})
+            # Payload SHAPE: a renamed field, a retyped one, a missing data object, and a
+            # malformed entry each read as "no servers" to a presence-only check.
+            pr_no_data = _pr_out({"type": "session.mcp_servers_loaded"}, exit_code=0)
+            pr_field_renamed = _pr_out(
+                {"type": "session.mcp_servers_loaded",
+                 "data": {"mcpServers": [{"name": "github-mcp-server",
+                                          "status": "disabled"}]}}, exit_code=0)
+            pr_servers_null = _pr_out({"type": "session.mcp_servers_loaded",
+                                       "data": {"servers": None}}, exit_code=0)
+            pr_bad_entry = _pr_out(
+                {"type": "session.mcp_servers_loaded",
+                 "data": {"servers": [{"name": "github-mcp-server",
+                                       "status": "disabled"}, {"name": 17}]}},
+                exit_code=0)
+            # ...and the same strictness on the transition event, which feeds `live`
+            pr_bad_changed = _pr_out(
+                _pr_loaded(("github-mcp-server", "disabled")),
+                {"type": "session.mcp_server_status_changed",
+                 "data": {"server": "planted", "status": "connected"}}, exit_code=0)
+            # the real hermetic shape still passes with a zero exit
+            pr_strict_ok = _pr_out(_pr_loaded(("github-mcp-server", "disabled")),
+                                   {"type": "result", "exitCode": 0}, exit_code=0) == ""
+            _check("copilot.post_run_requires_the_mcp_witness_contract",
+                   "session.mcp_servers_loaded" in pr_gap
+                   and all(bool(r) for r in (
+                       pr_renamed, pr_zero_exit, pr_renamed_both, pr_empty_list,
+                       pr_other_only, pr_no_data, pr_field_renamed, pr_servers_null,
+                       pr_bad_entry, pr_bad_changed))
+                   and "github-mcp-server" in pr_empty_list
+                   and "servers" in pr_field_renamed
+                   and "malformed" in pr_bad_entry and "malformed" in pr_bad_changed
+                   and pr_incomplete and pr_empty_stream and pr_killed and pr_strict_ok,
+                   f"a normally-finished run must produce a WELL-FORMED MCP witness "
+                   f"naming the built-in sentinel — a zero exit alone demands it (no "
+                   f"event rename can disguise that), and a renamed field, a retyped "
+                   f"one, a malformed entry or an empty list are contract violations "
+                   f"rather than 'no servers'; a killed or unfinished child is still not "
+                   f"penalized: gap={bool(pr_gap)} renamed={bool(pr_renamed)} "
+                   f"zero_exit={bool(pr_zero_exit)} both_renamed={bool(pr_renamed_both)} "
+                   f"empty_list={bool(pr_empty_list)} other_only={bool(pr_other_only)} "
+                   f"no_data={bool(pr_no_data)} field={bool(pr_field_renamed)} "
+                   f"null={bool(pr_servers_null)} bad_entry={bool(pr_bad_entry)} "
+                   f"bad_changed={bool(pr_bad_changed)} killed={pr_killed} "
+                   f"incomplete={pr_incomplete} ok={pr_strict_ok}", failures, verbose)
+        finally:
+            _sh.rmtree(_pr_root, ignore_errors=True)
+
+    # extra_args configuration channels fail closed (mirrors the codex vet): each
+    # spelling raises BEFORE enumeration (proven by stubbing the enumerator to a
+    # sentinel), neutral tokens reach enumeration untouched. Arch-independent — the
+    # vet precedes even the WOW64 gate.
+    _CopAd = type(get_adapter("copilot"))
+    _orig_cop_disable = _CopAd._mcp_disable_args
+
+    def _sentinel_disable(self, cwd, env=None):
+        raise AssertionError("enumeration ran before the extra_args vet")
+
+    _CopAd._mcp_disable_args = _sentinel_disable
+    try:
+        _cop_leaked = []
+        for _extras in (["--additional-mcp-config", '{"mcpServers":{"x":{}}}'],
+                        ["--additional-mcp-config=@/x/mcp.json"],
+                        ["--agent", "helper"], ["--agent=helper"],
+                        ["--plugin-dir", "/x/plug"], ["--plugin-dir=/x/plug"],
+                        ["--config-dir", "/x/cfg"], ["--config-dir=/x/cfg"],
+                        # hidden --prefer-version selects a DIFFERENT cached CLI version,
+                        # past which this adapter's assumptions no longer hold
+                        ["--prefer-version", "1.0.63"], ["--prefer-version=1.0.63"],
+                        # --output-format adds no server: it BLINDS the audit. extra_args
+                        # are appended last and copilot takes the last value for a
+                        # repeated option, so a trailing `text` turns off the JSON stream
+                        # verify_post_run reads its ABA-immune evidence from — after
+                        # which a reverted launch-window leak is invisible again
+                        ["--output-format", "text"], ["--output-format=text"],
+                        # even re-stating the value the harness itself passes: the point
+                        # is that this option must not be caller-controlled at all
+                        ["--output-format", "json"],
+                        # -C plus COMBINED short-option clusters carrying it: copilot
+                        # accepts -sC/tmp (== -s -C /tmp), which a leading-'-C' rule
+                        # would miss
+                        ["-C", "/elsewhere"], ["-C/elsewhere"],
+                        ["-sC/tmp"], ["-abC/tmp"]):
+            try:
+                get_adapter("copilot").build_argv(
+                    "p", RunOptions(extra_args=_extras), cwd="/tmp")
+                _cop_leaked.append(_extras)
+            except RuntimeError as exc:
+                if "configuration channel" not in str(exc):
+                    _cop_leaked.append(_extras)      # raised, but not by the vet
+            except AssertionError:
+                # the sentinel fired: the vet passed this token through to enumeration.
+                # Caught rather than allowed to propagate so a regression is reported as
+                # THIS check failing, instead of aborting the suite with a traceback that
+                # names no check (which is how a dropped token first showed up here).
+                _cop_leaked.append(_extras)
+        # a short cluster WITHOUT the cwd flag is neutral and must reach enumeration;
+        # -s/--silent is one of them — live-verified NOT to suppress the MCP events, so
+        # blocking it would be a false positive the witness does not need
+        _cop_neutral = None
+        for _neutral in (["--banner"], ["-vs"], ["-s"], ["--silent"]):
+            try:
+                get_adapter("copilot").build_argv(
+                    "p", RunOptions(extra_args=_neutral), cwd="/tmp")
+                _cop_neutral = "enumeration-skipped"     # sentinel must have fired
+            except AssertionError:
+                _cop_neutral = _cop_neutral or "vet-passed"
+            except RuntimeError:
+                _cop_neutral = "vetoed"
+    finally:
+        _CopAd._mcp_disable_args = _orig_cop_disable
+    _check("copilot.extra_args_config_channels_fail_closed",
+           not _cop_leaked and _cop_neutral == "vet-passed",
+           f"config-channel extra_args (--additional-mcp-config/--agent/--plugin-dir/"
+           f"--config-dir/--prefer-version, the audit-blinding --output-format, =value "
+           f"forms, and -C in attached AND combined short-cluster forms like -sC/tmp) "
+           f"raise before enumeration; neutral tokens incl. -s/--silent and C-free short "
+           f"clusters reach it: leaked={_cop_leaked}, neutral={_cop_neutral}",
+           failures, verbose)
+
+    # Windows ODR registry gate (design §2): copilot discovers MCP servers via a
+    # registry-advertised command's `mcp list` output. The harness does NOT
+    # pre-enumerate that listing — copilot executes the command a second,
+    # independent time, and a stateful/time-varying command can hand the two
+    # processes DIFFERENT listings, so a populated gate FAILS CLOSED for the whole
+    # invocation instead (copilot.odr_gate_on_fails_closed below). What stays
+    # testable off-Windows is the gate DETECTION (the registry read + ECMAScript
+    # trim/falsy test) and the fail-closed decisions, exercised via stubs.
+    # `copilot_mod` and `sys` are already in scope from earlier in run_selftest.
+    # The Windows fully-qualified predicate copilot home resolution leans on. Runs on every
+    # host because _win_fully_qualified uses ntpath explicitly — so the UNC-root, device-
+    # namespace, volume-GUID, and canonicality logic (the heart of the path findings) is
+    # verified off-win32 too. splitdrive returns a bare \\?\C: (and \\?\C:.copilot) as a
+    # complete "drive" with an empty tail on every supported Python, so these fixtures are
+    # version-stable (asserted on 3.10–3.14). Windows skips path normalization ONLY after
+    # an EXACT literal \\?\ prefix, so under \\?\ only an already-canonical literal prefix
+    # qualifies (a rooted drive, a volume-GUID root, or the extended-UNC share root — each
+    # with an optional single trailing separator); a noncanonical literal \\?\ (a '/' or a
+    # '.'/'..'/internal-or-repeated-empty segment) and ANY nonliteral //?/ spelling fail
+    # closed, because copilot's Node resolver canonicalizes/folds-to-literal (its open then
+    # skips normalization) while the harness's spelling is Win32-normalized, diverging. A
+    # \\.\ path is exempt — Windows normalizes it in both processes, so it reconverges —
+    # except a BARE \\.\ (or \\?\) root or an INCOMPLETE extended-UNC root, which
+    # 3.10/3.11 (bare) and 3.11 (trailing-sep UNC) join with a DOUBLED separator vs
+    # Node's single one (PROVEN divergence there; on 3.12+ the joins coincide and the
+    # rejection is CONSERVATIVE — one uniform version-stable rule): fail closed.
+    # Ordinary UNC roots must be COMPLETE (server AND share): Node joins a bare \\ into
+    # \mcp-config.json, resolved from the child drive's root — a real file copilot
+    # loads — while the harness's join names nothing. A TERMINAL-COLON body end is
+    # rejected everywhere, two cases under one test: a WHOLE-DRIVE colon root
+    # (\\?\foo:, \\srv\share:) is a PROVEN glue — splitdrive returns it whole as a
+    # drive ending in ":", so ntpath.join GLUES the child name on where Node inserts
+    # the separator, and no normalization reconverges a colon glue — while a colon-
+    # terminal DEVICE body past a rooted drive (\\?\C:\dir:) joins exactly like Node
+    # on every version and is rejected CONSERVATIVELY (stream syntax, never a
+    # directory). The ordinary-UNC arm only rejects the whole-drive form: a UNC tail
+    # merely ending in ":" (\\srv\share\dir:) joins like Node and passes.
+    _check("copilot.win_fully_qualified",
+           # ACCEPT: drive-with-root, complete UNC shares, and safe device paths
+           copilot_mod._win_fully_qualified("C:\\Users\\me")
+           and copilot_mod._win_fully_qualified("\\\\server\\share")       # bare UNC ROOT
+           and copilot_mod._win_fully_qualified("\\\\server\\share\\sub")
+           and copilot_mod._win_fully_qualified("//server/share")
+           and copilot_mod._win_fully_qualified("\\\\?\\C:\\Users\\me")    # rooted literal \\?\
+           and copilot_mod._win_fully_qualified("\\\\?\\C:\\")             # drive root + trailing sep
+           and copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv\\share")  # extended UNC root
+           and copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv\\share\\")
+           and copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv\\share\\sub")
+           and copilot_mod._win_fully_qualified("\\\\.\\UNC\\srv\\share")
+           and copilot_mod._win_fully_qualified("\\\\?\\unc\\srv\\share")  # case-insensitive
+           and copilot_mod._win_fully_qualified(                          # volume-GUID root
+               "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}")
+           and copilot_mod._win_fully_qualified(                          # + trailing sep
+               "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}\\")
+           and copilot_mod._win_fully_qualified(
+               "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}\\sub")
+           and copilot_mod._win_fully_qualified("\\\\.\\C:\\a\\..\\b")     # \\.\ normalizes -> converges
+           and copilot_mod._win_fully_qualified("\\\\.\\C:/real")         # \\.\ fwd slash -> converges
+           # colon segments with a ROOTED tail — and an ordinary-UNC tail merely
+           # ENDING in ":" — join like Node on every version
+           and copilot_mod._win_fully_qualified("\\\\srv\\share:\\sub")
+           and copilot_mod._win_fully_qualified("\\\\?\\foo:\\x")
+           and copilot_mod._win_fully_qualified("\\\\srv\\share\\dir:")
+           # REJECT: unrooted device drives (both namespaces), noncanonical literal \\?\,
+           # and any nonliteral //?/ spelling
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:")           # bare device drive
+           and not copilot_mod._win_fully_qualified("\\\\.\\C:")
+           and not copilot_mod._win_fully_qualified("//?/C:")
+           # bare namespace roots and incomplete extended-UNC roots: 3.10/3.11 join the
+           # bare forms — and 3.11 the trailing-sep UNC forms — with a DOUBLED separator
+           # (\\?\\mcp-config.json) where Node's single-separator join names a local
+           # DOS-device alias / share the harness never enumerates; no config can live
+           # at these roots on any version
+           and not copilot_mod._win_fully_qualified("\\\\?\\")
+           and not copilot_mod._win_fully_qualified("\\\\.\\")
+           and not copilot_mod._win_fully_qualified("//?/")
+           and not copilot_mod._win_fully_qualified("\\\\?\\UNC")
+           and not copilot_mod._win_fully_qualified("\\\\?\\UNC\\")
+           and not copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv")
+           and not copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv\\")
+           # incomplete ORDINARY UNC roots: no volume exists without server AND share —
+           # Node joins a bare \\ into \mcp-config.json, resolved from the CHILD's
+           # current-drive root (a real file copilot loads), while the harness's
+           # three-separator/incomplete-UNC join names nothing; \\srv\ joins with a
+           # doubled separator on 3.10/3.11
+           and not copilot_mod._win_fully_qualified("\\\\")
+           and not copilot_mod._win_fully_qualified("\\\\srv")
+           and not copilot_mod._win_fully_qualified("\\\\srv\\")
+           and not copilot_mod._win_fully_qualified("//")
+           and not copilot_mod._win_fully_qualified("//srv/")
+           # whole-drive terminal-colon roots: splitdrive returns the root as a drive
+           # ending in ":", so ntpath.join GLUES the child name on
+           # (\\?\foo:mcp-config.json) where Node inserts the separator — PROVEN
+           # divergence, in the device namespaces AND ordinary UNC
+           and not copilot_mod._win_fully_qualified("\\\\?\\foo:")
+           and not copilot_mod._win_fully_qualified("\\\\.\\foo:")
+           and not copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv\\share:")
+           and not copilot_mod._win_fully_qualified("\\\\srv\\share:")
+           # ...while a colon-terminal DEVICE body past a rooted drive joins exactly
+           # like Node on every version (verified 3.10–3.14) and is rejected
+           # CONSERVATIVELY — a terminal-colon component is NTFS stream syntax,
+           # never a directory
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\dir:")
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:.copilot")   # drive-relative device
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\a\\..\\b") # literal \\?\ + '..'
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:/real")      # literal \\?\ + '/'
+           and not copilot_mod._win_fully_qualified("\\\\?\\UNC\\srv/share")
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\a\\.")     # literal \\?\ + '.'
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\a\\\\b")   # literal \\?\ internal dup sep
+           and not copilot_mod._win_fully_qualified("\\\\?\\C:\\x\\\\")    # repeated trailing empty
+           and not copilot_mod._win_fully_qualified("//?/C:/real")        # nonliteral //?/
+           and not copilot_mod._win_fully_qualified("//?/C:/base./real")  # nonliteral //?/ + trailing period
+           and not copilot_mod._win_fully_qualified("//?/UNC/srv/share")  # nonliteral //?/
+           and not copilot_mod._win_fully_qualified("\\rooted")            # driveless-rooted
+           and not copilot_mod._win_fully_qualified("C:")                  # bare drive
+           and not copilot_mod._win_fully_qualified("C:x")                 # drive-relative
+           and not copilot_mod._win_fully_qualified("relpath"),
+           "win32 fully-qualified predicate: lettered-drive-with-root, COMPLETE UNC "
+           "shares (incl. the bare share root ntpath.isabs mis-reports on 3.10, fixed in "
+           "3.11), canonical literal \\\\?\\ device paths (rooted drive, volume-GUID root, "
+           "COMPLETE extended-UNC share — each with an optional single trailing "
+           "separator), and \\\\.\\ paths outside the shared rejections (Windows "
+           "normalizes them in both processes) qualify; unrooted device drives in either "
+           "namespace, bare namespace roots and incomplete extended-UNC roots (their "
+           "joins can DOUBLE the separator vs Node's), incomplete ordinary UNC roots "
+           "(\\\\, \\\\srv, \\\\srv\\ — Node resolves a bare \\\\ from the child drive's "
+           "root while the harness's join names nothing), terminal-colon body ends "
+           "(whole-drive roots GLUE in ntpath.join where Node inserts the separator — "
+           "proven; a colon-terminal device body past a rooted drive, \\\\?\\C:\\dir:, "
+           "joins like Node and is rejected conservatively as stream syntax), "
+           "noncanonical literal \\\\?\\ paths (a '/' "
+           "or a '.'/'..'/internal-or-repeated-empty segment), and every nonliteral //?/ "
+           "spelling (copilot folds it to a literal \\\\?\\ that skips normalization while "
+           "the harness's stays Win32-normalized) fail closed",
+           failures, verbose)
+
+    # copilot's user config home is $COPILOT_HOME, else Node os.homedir() — %USERPROFILE%
+    # on Windows, $HOME elsewhere. A stray HOME on win32 must NOT redirect it. A RELATIVE
+    # home resolves against copilot's own process cwd (verified 1.0.64), i.e. the CHILD's
+    # cwd — resolving against the harness's cwd would enumerate a different config than
+    # the run loads. POSIX: a SET-BUT-EMPTY $HOME is preserved, not treated as unset —
+    # Node's homedir() returns "" for it, so copilot reads <its cwd>/.copilot (verified
+    # 1.0.64); an empty COPILOT_HOME IS unset to copilot everywhere (verified 1.0.64, falls
+    # back to $HOME/.copilot). win32 (via _win_fully_qualified): a rooted-but-driveless home
+    # takes the child cwd's drive (where copilot resolves it), a complete UNC root is
+    # accepted as-is, and both a drive-relative home (bare "D:"/"C:x" — per-drive cwd
+    # unknowable) and an absent or present-but-<3-char %USERPROFILE% fail closed —
+    # libuv resolves only an ABSENT one via GetUserProfileDirectoryW (the real profile
+    # dir, unnameable from the env); a present short/empty one is a UV_ENOENT ERROR
+    # that Node's homedir() surfaces as a throw. Absolute fixtures are
+    # drive-qualified so they are fully absolute on win32 too.
+    _win = sys.platform == "win32"
+    _dq = "C:" if _win else ""
+
+    def _cop_home_raises(env, cwd):
+        try:
+            copilot_mod._copilot_home(env, cwd)
+        except RuntimeError:
+            return True
+        return False
+
+    _check("copilot.home_resolution",
+           copilot_mod._copilot_home({"COPILOT_HOME": _dq + "/custom"}) == _dq + "/custom"
+           and copilot_mod._copilot_home(
+               {"USERPROFILE": _dq + "/u/prof", "HOME": _dq + "/u/home"})
+               == os.path.join(_dq + ("/u/prof" if _win else "/u/home"), ".copilot")
+           and copilot_mod._copilot_home({"COPILOT_HOME": "rel-home"}, _dq + "/child/ws")
+               == os.path.normpath(os.path.join(_dq + "/child/ws", "rel-home"))
+           and copilot_mod._copilot_home({"USERPROFILE": "rel-base", "HOME": "rel-base"},
+                                         _dq + "/child/ws")
+               == os.path.normpath(os.path.join(_dq + "/child/ws", "rel-base", ".copilot"))
+           and copilot_mod._copilot_home(
+               {"COPILOT_HOME": "", "USERPROFILE": _dq + "/u/prof",
+                "HOME": _dq + "/u/home"})
+               == os.path.join(_dq + ("/u/prof" if _win else "/u/home"), ".copilot")
+           # POSIX empty-$HOME is preserved (→ <cwd>/.copilot); win32 handles empty
+           # %USERPROFILE% by failing closed, asserted in the win32 block below.
+           and (_win or copilot_mod._copilot_home({"HOME": ""}, "/child/ws")
+                        == os.path.normpath(os.path.join("/child/ws", ".copilot")))
+           and (not _win or (
+               copilot_mod._copilot_home({"COPILOT_HOME": "\\rooted"}, "D:\\child\\ws")
+                   == "D:\\rooted"
+               # complete UNC root accepted as-is (not anchored, not rejected)
+               and copilot_mod._copilot_home({"COPILOT_HOME": "\\\\srv\\share"},
+                                             "D:\\child\\ws") == "\\\\srv\\share"
+               # rooted device-namespace home accepted; a BARE device drive fails closed
+               # (its joins drop the separator — \\?\C:mcp-config.json is not a path
+               # copilot reads), from COPILOT_HOME and via a USERPROFILE join alike
+               and copilot_mod._copilot_home({"COPILOT_HOME": "\\\\?\\C:\\real"},
+                                             "D:\\child\\ws") == "\\\\?\\C:\\real"
+               # a single trailing separator is join-stable, and a \\.\ device path (which
+               # Windows normalizes in both processes) is accepted even when noncanonical
+               and copilot_mod._copilot_home({"COPILOT_HOME": "\\\\?\\C:\\"},
+                                             "D:\\child\\ws") == "\\\\?\\C:\\"
+               and copilot_mod._copilot_home({"COPILOT_HOME": "\\\\.\\C:\\a\\..\\b"},
+                                             "D:\\child\\ws") == "\\\\.\\C:\\a\\..\\b"
+               # a complete EXTENDED UNC share root is accepted as-is on every Python
+               # (3.11+ splitdrive returns it whole with an empty tail; joins match Node)
+               and copilot_mod._copilot_home({"COPILOT_HOME": "\\\\?\\UNC\\srv\\share"},
+                                             "D:\\child\\ws") == "\\\\?\\UNC\\srv\\share"
+               # a volume-GUID root is accepted as-is (its join inserts the separator,
+               # matching Node — verified 3.10–3.14)
+               and copilot_mod._copilot_home(
+                   {"COPILOT_HOME":
+                    "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}"},
+                   "D:\\child\\ws")
+                   == "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}"
+               and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:"}, "D:\\child\\ws")
+               and _cop_home_raises({"USERPROFILE": "\\\\?\\C:"}, "D:\\child\\ws")
+               # a bare namespace root and an incomplete extended-UNC root fail closed
+               # (3.10/3.11 join them with a doubled separator vs Node's single one)
+               and _cop_home_raises({"COPILOT_HOME": "\\\\?\\"}, "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "\\\\?\\UNC\\srv\\"},
+                                    "D:\\child\\ws")
+               # incomplete ORDINARY UNC and terminal-colon roots fail closed too
+               # (Node resolves a bare \\ from the child drive's root; a colon root
+               # glues in ntpath.join where Node inserts the separator)
+               and _cop_home_raises({"COPILOT_HOME": "\\\\"}, "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "\\\\srv\\"}, "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "\\\\?\\foo:"}, "D:\\child\\ws")
+               # a drive-relative device form, a NONCANONICAL literal \\?\ home, and any
+               # nonliteral //?/ spelling fail closed — copilot's Node resolver
+               # canonicalizes/folds-to-literal (its open then skips normalization) while
+               # the harness's spelling is Win32-normalized, so the two would diverge
+               and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:.copilot"},
+                                    "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:\\a\\..\\b"},
+                                    "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:/real"}, "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "//?/C:/real"}, "D:\\child\\ws")
+               # drive-relative homes fail closed — different drive AND same drive as cwd
+               and _cop_home_raises({"COPILOT_HOME": "C:drive-rel"}, "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "D:"}, "D:\\child\\ws")
+               and _cop_home_raises({"COPILOT_HOME": "D:sub"}, "D:\\child\\ws")
+               # absent %USERPROFILE% (libuv → GetUserProfileDirectoryW) and a present
+               # but <3-char one (libuv errors, Node homedir() throws) both fail closed
+               and _cop_home_raises({}, "D:\\child\\ws")
+               and _cop_home_raises({"USERPROFILE": ""}, "D:\\child\\ws")
+               and _cop_home_raises({"USERPROFILE": "C:"}, "D:\\child\\ws")
+               # the RAW %USERPROFILE% is vetted BEFORE the .copilot join: a value
+               # splitdrive returns whole as a drive ending in ":" would GLUE the
+               # join (\\?\foo:.copilot vs Node's \\?\foo:\.copilot) — fail closed
+               and _cop_home_raises({"USERPROFILE": "\\\\?\\foo:"}, "D:\\child\\ws")
+               and _cop_home_raises({"USERPROFILE": "\\\\.\\foo:"}, "D:\\child\\ws")
+               and _cop_home_raises({"USERPROFILE": "\\\\srv\\share:"},
+                                    "D:\\child\\ws")
+               # \\?\UNC\srv\share: splits whole (→ glue → raise) on 3.11+ only;
+               # 3.10 keeps a rooted tail and INSERTS the separator exactly like
+               # Node — the byte-identical join is accepted there
+               and (_cop_home_raises({"USERPROFILE": "\\\\?\\UNC\\srv\\share:"},
+                                     "D:\\child\\ws")
+                    if sys.version_info >= (3, 11) else
+                    copilot_mod._copilot_home(
+                        {"USERPROFILE": "\\\\?\\UNC\\srv\\share:"}, "D:\\child\\ws")
+                    == "\\\\?\\UNC\\srv\\share:\\.copilot")
+               and copilot_mod._copilot_home({"USERPROFILE": "C:\\Users\\me"},
+                                             "D:\\child\\ws")
+                   == os.path.join("C:\\Users\\me", ".copilot"))),
+           "COPILOT_HOME wins (empty = unset, as copilot treats it); otherwise "
+           "USERPROFILE on win32, HOME elsewhere; a POSIX empty HOME resolves to the "
+           "child cwd, relative homes resolve against the child's cwd as copilot does; "
+           "win32 driveless-rooted homes take the child cwd's drive, complete UNC roots "
+           "(incl. the extended \\\\?\\UNC form), canonical literal \\\\?\\ device paths "
+           "(rooted, volume-GUID, one trailing sep ok), and \\\\.\\ paths outside the "
+           "shared rejections are accepted, and drive-relative homes, bare/drive-"
+           "relative device drives, bare or incomplete namespace and ordinary-UNC "
+           "roots, terminal-colon roots, noncanonical literal-\\\\?\\ paths, nonliteral "
+           "//?/ spellings, plus absent/short USERPROFILE fail closed; a RAW "
+           "USERPROFILE that is one whole colon-terminal drive is vetted before the "
+           ".copilot join (it would GLUE where Node inserts the separator)",
+           failures, verbose)
+
+    # The win32 arm above only runs on Windows and there is no Windows CI — so the
+    # explicit-COPILOT_HOME device/UNC fixtures are ALSO exercised on every host by
+    # shimming the module-local `sys` (platform reads "win32", everything else
+    # delegates — same technique as the ODR extension check). Only these fixtures are
+    # portable: an ACCEPTED explicit home returns early through the pure-ntpath
+    # predicate and a REJECTED one raises on ntpath tests, neither touching os.path
+    # (posixpath on this host); the absent/short-USERPROFILE raises and the raw-
+    # USERPROFILE whole-drive-colon vet (pure ntpath on the raw value) also fire
+    # BEFORE any join. The USERPROFILE .copilot join itself and cwd anchoring DO go
+    # through os.path, so those assertions stay win32-only above.
+    _real_sys_home = copilot_mod.sys
+
+    class _Win32SysHome:
+        platform = "win32"
+
+        def __getattr__(self, _n):
+            return getattr(_real_sys_home, _n)
+
+    def _shim_accepts(home):
+        return copilot_mod._copilot_home({"COPILOT_HOME": home}, "D:\\child\\ws") == home
+
+    copilot_mod.sys = _Win32SysHome()
+    try:
+        home_shim_ok = (
+            _shim_accepts("\\\\srv\\share")
+            and _shim_accepts("\\\\?\\C:\\real")
+            and _shim_accepts("\\\\?\\C:\\")
+            and _shim_accepts("\\\\.\\C:\\a\\..\\b")
+            and _shim_accepts("\\\\?\\UNC\\srv\\share")
+            and _shim_accepts("\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}")
+            # drive-relative and unrooted/noncanonical/nonliteral device forms
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:.copilot"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:\\a\\..\\b"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\C:/real"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "//?/C:/real"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "C:drive-rel"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "D:"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "D:sub"}, "D:\\child\\ws")
+            # bare/incomplete device-namespace roots
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\.\\"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "//?/"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\UNC"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\UNC\\"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\UNC\\srv"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\UNC\\srv\\"}, "D:\\child\\ws")
+            # bare/incomplete ORDINARY UNC roots — Node joins a bare \\ into
+            # \mcp-config.json, resolved from the CHILD drive's root, while the
+            # harness's join names nothing (on 3.10 splitdrive returns an EMPTY
+            # drive for \\ and \\srv; the two-separator prefix test still rejects)
+            and _cop_home_raises({"COPILOT_HOME": "\\\\"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\srv"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\srv\\"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "//srv/"}, "D:\\child\\ws")
+            # terminal-colon roots — ntpath.join GLUES where Node inserts the sep
+            and _cop_home_raises({"COPILOT_HOME": "\\\\srv\\share:"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\foo:"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\.\\foo:"}, "D:\\child\\ws")
+            and _cop_home_raises({"COPILOT_HOME": "\\\\?\\UNC\\srv\\share:"},
+                                 "D:\\child\\ws")
+            # absent/short USERPROFILE raises fire before any os.path join
+            and _cop_home_raises({}, "D:\\child\\ws")
+            and _cop_home_raises({"USERPROFILE": ""}, "D:\\child\\ws")
+            and _cop_home_raises({"USERPROFILE": "C:"}, "D:\\child\\ws")
+            # ...and so does the raw-USERPROFILE whole-drive-colon vet: these would
+            # GLUE the .copilot join (\\?\foo:.copilot vs Node's \\?\foo:\.copilot)
+            and _cop_home_raises({"USERPROFILE": "\\\\?\\foo:"}, "D:\\child\\ws")
+            and _cop_home_raises({"USERPROFILE": "\\\\.\\foo:"}, "D:\\child\\ws")
+            and _cop_home_raises({"USERPROFILE": "\\\\srv\\share:"}, "D:\\child\\ws")
+            # 3.11+ splitdrive absorbs \\?\UNC\srv\share: whole → pre-join raise
+            # (portable); 3.10 keeps a rooted tail and INSERTS like Node — that
+            # accept runs through os.path.join, so it stays win32-only above
+            and (sys.version_info < (3, 11)
+                 or _cop_home_raises({"USERPROFILE": "\\\\?\\UNC\\srv\\share:"},
+                                     "D:\\child\\ws"))
+        )
+    finally:
+        copilot_mod.sys = _real_sys_home
+    _check("copilot.home_device_paths_cross_host", home_shim_ok,
+           "the win32 _copilot_home accept/reject decisions for explicit device, UNC, "
+           "and drive-relative COPILOT_HOME values (pure-ntpath paths that never touch "
+           "os.path) hold on every host via the sys shim — incl. bare/incomplete "
+           "namespace and ordinary-UNC roots, terminal-colon roots, absent/short "
+           "USERPROFILE, and raw whole-drive-colon USERPROFILE bases (vetted before "
+           "the .copilot join they would GLUE) failing closed", failures, verbose)
+
+    # The positive argv/enumeration checks above ran with the ODR gate stubbed OFF
+    # (see the stub near the top of this section) so a live-ODR 64-bit Windows host
+    # wouldn't fail them closed. The ODR-specific checks below drive the gate
+    # themselves — restore the real registry reader now. (The agent-scan scope stays
+    # installed: the ODR build arm below still runs a full _mcp_disable_args in the
+    # private fixture, and the agent walk precedes the gate inside it.)
+    _unpatch_module_attr(copilot_mod, "_odr_registry_command", _odr_real_cop)
+
+    _check("copilot.odr_gate_off_non_win32",
+           sys.platform == "win32" or copilot_mod._odr_registry_command() is None,
+           "off Windows the ODR gate reports no command (no registry to read)",
+           failures, verbose)
+
+    # The ODR registry read must pin the 64-BIT view AND request only query access:
+    # copilot 1.0.64's native helper calls RegGetValueW (opens with KEY_QUERY_VALUE)
+    # with the 64-bit-view flag, so the harness uses KEY_QUERY_VALUE | KEY_WOW64_64KEY —
+    # NOT the broader KEY_READ (a query-only ACL would deny KEY_READ and make the harness
+    # reject a host copilot reads fine). A 32-bit process's DEFAULT view is the redirected
+    # WOW6432Node one — there the key can be absent (the gate would read "off") while
+    # copilot's 64-bit view is populated. No Windows CI, so
+    # `winreg` is stubbed into sys.modules (the function imports it lazily) and the
+    # module-local `sys` shimmed to win32; the stub records the access mask OpenKey
+    # receives and drives the blank-value/absent/denied arms too.
+    _fake_winreg = type(sys)("winreg")   # a real module object, no importlib involved
+    _fake_winreg.HKEY_LOCAL_MACHINE = object()
+    _fake_winreg.KEY_READ = 0x20019          # the real winreg constants
+    _fake_winreg.KEY_QUERY_VALUE = 0x0001    # query-only — what copilot's RegGetValueW uses
+    _fake_winreg.KEY_WOW64_64KEY = 0x0100
+    _fake_winreg._value = "  C:\\odr\\host.exe mcp-src  "
+    _fake_winreg._raise = None
+    _reg_calls = []
+
+    class _FakeRegKey:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def _fake_openkey(root, sub, reserved=0, access=None):
+        _reg_calls.append((root, sub, reserved, access))
+        if _fake_winreg._raise is not None:
+            raise _fake_winreg._raise
+        return _FakeRegKey()
+
+    _fake_winreg.OpenKey = _fake_openkey
+    _fake_winreg.QueryValueEx = lambda _key, _name: (_fake_winreg._value, 1)
+    _real_sys_reg = copilot_mod.sys
+
+    class _Win32SysReg:
+        platform = "win32"
+
+        def __getattr__(self, _n):
+            return getattr(_real_sys_reg, _n)
+
+    _saved_winreg = sys.modules.get("winreg")
+    sys.modules["winreg"] = _fake_winreg
+    copilot_mod.sys = _Win32SysReg()
+    try:
+        reg_cmd = copilot_mod._odr_registry_command()          # value → stripped
+        _fake_winreg._value = "   "
+        reg_blank = copilot_mod._odr_registry_command()        # blank value → gate off
+        # the value is trimmed with ECMAScript trim(), matching the bundle's
+        # `value?.trim()` falsy test: a lone U+FEFF (JS-space, not Python-space)
+        # reads gate-OFF exactly as it does for copilot, and a BOM-wrapped command
+        # trims clean
+        _fake_winreg._value = "\ufeff"
+        reg_bom_blank = copilot_mod._odr_registry_command()    # JS-blank → gate off
+        _fake_winreg._value = "\ufeff C:\\odr\\host.exe mcp-src \ufeff"
+        reg_bom_cmd = copilot_mod._odr_registry_command()      # BOM-wrapped → trimmed
+        _fake_winreg._raise = FileNotFoundError("no key")
+        reg_absent = copilot_mod._odr_registry_command()       # absent key → gate off
+        _fake_winreg._raise = PermissionError("denied")
+        try:
+            copilot_mod._odr_registry_command()
+            reg_denied = "did not raise"
+        except RuntimeError as exc:
+            reg_denied = str(exc)
+    finally:
+        copilot_mod.sys = _real_sys_reg
+        if _saved_winreg is None:
+            sys.modules.pop("winreg", None)
+        else:
+            sys.modules["winreg"] = _saved_winreg
+    _check("copilot.odr_registry_64bit_view",
+           reg_cmd == "C:\\odr\\host.exe mcp-src"
+           and reg_blank is None and reg_bom_blank is None
+           and reg_bom_cmd == "C:\\odr\\host.exe mcp-src"
+           and reg_absent is None
+           and "failing closed" in reg_denied
+           and len(_reg_calls) == 6
+           and all(root is _fake_winreg.HKEY_LOCAL_MACHINE
+                   and sub == copilot_mod._ODR_REGISTRY_SUBKEY
+                   and reserved == 0
+                   and access == (_fake_winreg.KEY_QUERY_VALUE
+                                  | _fake_winreg.KEY_WOW64_64KEY)
+                   for root, sub, reserved, access in _reg_calls),
+           "the ODR registry key is opened with KEY_QUERY_VALUE | KEY_WOW64_64KEY — the "
+           "query-only access copilot's RegGetValueW uses (never the broader KEY_READ, "
+           "which a query-only ACL would deny, making the harness reject a host copilot "
+           "reads fine) plus the 64-bit view from any harness bitness (never the "
+           "WOW6432Node default a 32-bit process would read, where an absent key would "
+           "fake the gate 'off'); a missing key or blank/JS-blank (U+FEFF) value still "
+           "reads as gate-off, a BOM-wrapped command JS-trims clean, and an unreadable "
+           "key fails closed (stubbed winreg + sys shim)",
+           failures, verbose)
+
+    # A 32-bit harness process on win32 can't prove MCP hermeticity at all — the WOW64
+    # file-system redirector remaps System32 config-file reads to SysWOW64, so the
+    # files it reads are not what 64-bit copilot sees (the ODR command is copilot's to
+    # launch, not the harness's). The bitness check must fire FIRST: env={} would raise
+    # the absent-USERPROFILE error later if it were mis-ordered. Cross-host via a shim
+    # whose maxsize reads 32-bit.
+    _real_sys32 = copilot_mod.sys
+
+    class _Win32Sys32Bit:
+        platform = "win32"
+        maxsize = 2**31 - 1
+
+        def __getattr__(self, _n):
+            return getattr(_real_sys32, _n)
+
+    copilot_mod.sys = _Win32Sys32Bit()
+    try:
+        get_adapter("copilot")._mcp_disable_args("D:\\child\\ws", env={})
+        bits_raise = "did not raise"
+    except RuntimeError as exc:
+        bits_raise = str(exc)
+    finally:
+        copilot_mod.sys = _real_sys32
+    _check("copilot.win32_32bit_harness_fails_closed",
+           "32-bit" in bits_raise and "WOW64" in bits_raise
+           and "failing closed" in bits_raise,
+           "on win32 a 32-bit harness fails closed before enumerating anything — "
+           "WOW64 redirection gives it different filesystem (System32 → SysWOW64) "
+           "and default-registry views than copilot's 64-bit process (bitness shim, "
+           "cross-host; the raise precedes even the USERPROFILE checks)",
+           failures, verbose)
+
+    # With the gate POPULATED, every invocation fails CLOSED: copilot executes the
+    # registry command ITSELF to discover MCP servers, and a second, independent
+    # harness execution could be handed a DIFFERENT listing (a stateful/time-varying
+    # command) — so there is no sound pre-enumeration, only refusal. (Revisions
+    # before this one ran the command and disabled the resolved names; that
+    # two-execution gap is exactly what this replaces.) _assert_odr_gate_off raises
+    # directly, and the whole _mcp_disable_args build fails closed through it, so no
+    # cell/probe/judge argv is produced with un-disabled ODR servers live.
+    _odr_saved_cmd = _patch_module_attr(copilot_mod, "_odr_registry_command",
+                                        lambda: "C:\\odr\\host.exe mcp-src")
+    try:
+        try:
+            get_adapter("copilot")._assert_odr_gate_off()
+            odr_assert_closed = ""
+        except RuntimeError as exc:
+            odr_assert_closed = str(exc)
+        # _mcp_disable_args must propagate the same fail-closed (build_argv/_probe_argv
+        # both route through it). The private fixture — registered agent-scan scope
+        # plus a config home carrying the opt-out — clears the earlier custom-agent
+        # raises (which precede the gate), so the ODR gate is provably what fires. A
+        # real 32-bit win32 harness fails closed on bitness first, so the build arm is
+        # skipped there.
+        odr_build_closed = ""
+        if not _cop_wow64:
+            try:
+                get_adapter("copilot")._mcp_disable_args(_cop_cwd, env=_cop_env)
+            except RuntimeError as exc:
+                odr_build_closed = str(exc)
+        _check("copilot.odr_gate_on_fails_closed",
+               "gate is ON" in odr_assert_closed
+               and "failing closed" in odr_assert_closed
+               and (_cop_wow64 or ("gate is ON" in odr_build_closed
+                                   and "failing closed" in odr_build_closed)),
+               "a populated ODR registry gate fails the whole invocation closed "
+               "(copilot runs the command itself, so a harness re-execution can't "
+               "prove it sees the same listing) rather than pre-enumerating names "
+               "to disable — both _assert_odr_gate_off and the _mcp_disable_args "
+               "build raise", failures, verbose)
+
+        # gate OFF (no registry command) is a clean no-op: the assertion returns and
+        # enumeration proceeds on the non-ODR channels only.
+        copilot_mod._odr_registry_command = lambda: None
+        _check("copilot.odr_gate_off_no_disables",
+               get_adapter("copilot")._assert_odr_gate_off() is None,
+               "with no registry command the ODR gate is a no-op — nothing fails "
+               "and enumeration proceeds on the non-ODR channels", failures, verbose)
+    finally:
+        _unpatch_module_attr(copilot_mod, "_odr_registry_command", _odr_saved_cmd)
+        _cop_restore_agent_scan(_defs_real_cop)     # last copilot argv check
+        _sh.rmtree(_cop_priv, ignore_errors=True)   # private argv fixture
 
     # A _FILE_TOOLS write must be counted ONCE by file_paths_touched(), not twice — Copilot
     # emits both a TOOL_CALL and a FILE_CHANGE for the same write, and file_paths_touched() reads
@@ -2008,6 +5562,49 @@ def run_selftest(verbose: bool = False) -> int:
 
     out = get_adapter("antigravity").parse(ANTIGRAVITY_RAW, "", 0)
     _check("antigravity.raw.final", out.final_text == ANTIGRAVITY_RAW, repr(out.final_text), failures, verbose)
+    # agy has no MCP flags at all — masking its file-based discovery configs is its only
+    # MCP kill-switch (design, Phase 0): the global mcp_config.json, plugins.json (which
+    # can register EXTERNAL plugin dirs by absolute path), every registry plugin's own
+    # mcp_config.json, and the workspace files it discovers via --add-dir. The workspace
+    # channel spans FOUR customization roots (.agents/.agent/_agents/_agent — each
+    # verified 1.1.1 with a sentinel server launched at session start) × four files:
+    # the root's mcp_config.json, per-plugin plugins/*/mcp_config.json AND the
+    # dot-inclusive plugins/.*/mcp_config.json companion (Python's glob excludes
+    # dot-leading names from `*`, but agy discovers dot-prefixed plugin dirs too), and
+    # plugins.json (registers external plugin dirs; verified 1.1.1 that a workspace
+    # plugins.json entry's external mcp_config.json launches).
+    _agy_ws_expected = {
+        f"{root}/{rel}": content
+        for root in (".agents", ".agent", "_agents", "_agent")
+        for rel, content in (("mcp_config.json", '{"mcpServers": {}}'),
+                             ("plugins/*/mcp_config.json", '{"mcpServers": {}}'),
+                             ("plugins/.*/mcp_config.json", '{"mcpServers": {}}'),
+                             ("plugins.json", "{}"))
+    }
+    _check("antigravity.mcp_config_mask_declared",
+           get_adapter("antigravity").isolation_config_masks
+           == {".gemini/config/mcp_config.json": '{"mcpServers": {}}',
+               ".gemini/config/plugins.json": "{}"}
+           and get_adapter("antigravity").plugin_registry_config_masks
+           == {"mcp_config.json": '{"mcpServers": {}}'}
+           and get_adapter("antigravity").workspace_config_masks == _agy_ws_expected,
+           "antigravity masks global + plugins.json + per-plugin + all four workspace "
+           "roots' MCP configs", failures, verbose)
+    # probes must anchor --add-dir to the fresh private probe workspace (cwd), falling
+    # back to a throwaway dir — NEVER the shared system temp root, where anyone's planted
+    # .agents/mcp_config.json would load (agy scans the anchor's roots at session start;
+    # /tmp is world-writable on Linux).
+    import tempfile as _tf
+    _agy_pargv = get_adapter("antigravity")._probe_argv("m", cwd="/priv/probe-ws")
+    _agy_fallback = get_adapter("antigravity")._probe_argv("m")
+    _fb_anchor = _agy_fallback[_agy_fallback.index("--add-dir") + 1]
+    _check("antigravity.probe_private_workspace",
+           _agy_pargv[_agy_pargv.index("--add-dir") + 1] == os.path.abspath("/priv/probe-ws")
+           and _fb_anchor != _tf.gettempdir()
+           and os.path.basename(_fb_anchor).startswith("ase-probe-agy-"),
+           f"probe --add-dir anchors to the private probe cwd (fallback: fresh dir, "
+           f"never the shared temp root): {_fb_anchor}", failures, verbose)
+    _sh.rmtree(_fb_anchor, ignore_errors=True)
 
     # judge JSON extraction (markdown fences, bare JSON, mixed text)
     print("judge verdict extraction:")
@@ -2348,6 +5945,8 @@ def run_selftest(verbose: bool = False) -> int:
     # undeclared repo skills read via the real on-disk checkout (workspace-escape leak)
     _check_leaked_skill_reads(failures, verbose)
     _check_workspace_relocation(failures, verbose)
+    # MCP hermeticity on the non-cell paths: masked-home overlay, probes, judge, fail-closed
+    _check_mcp_hermetic_paths(failures, verbose)
     _check_parallel_cell_idx(failures, verbose)
     _check_cell_crash_safety(failures, verbose)
 
@@ -2363,6 +5962,9 @@ def run_selftest(verbose: bool = False) -> int:
 
     # timeout kills the agent's whole process group, not just the direct child
     _check_exec_timeout_group_kill(failures, verbose)
+
+    # CLI version drift: read from the run, tiered, and auditable
+    _check_copilot_version_provenance(failures, verbose)
 
     # report inlining is capped per file; the judge's skip behavior is unchanged
     _check_inline_truncation(failures, verbose)

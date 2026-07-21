@@ -1,0 +1,41 @@
+# list_mcp_server_visible_copilot.yaml — ambient hermeticity smoke check: with MCP off,
+# the agent must see NO MCP servers. One runner per file (a `target:` pins a single runner).
+# Run:  agentskill-evals run --config scenarios/list_mcp_server_visible_copilot.yaml
+# Dry:  agentskill-evals run --config scenarios/list_mcp_server_visible_copilot.yaml --dry-run
+
+# WHAT THIS IS — AND IS NOT
+# This is an AMBIENT SMOKE CHECK, not a regression test. It plants no MCP server of its
+# own, so on a host that never had one configured it passes whether or not the
+# hermeticity machinery is working: removing the kill switch would not fail it. What it
+# DOES catch is the case that actually bites in practice — a developer or CI host with
+# real MCP servers configured, where a gap in the isolation masks or the
+# --disable-mcp-server enumeration would surface them to the agent. The enforced,
+# host-independent coverage lives in `agentskill-evals selftest` (the copilot adapter's
+# fail-closed and enumeration checks); run this alongside it, not instead of it.
+
+name: list_mcp_server_visible_copilot
+description: >
+  Ambient hermeticity smoke check for the copilot runner: ask the agent to list visible
+  MCP servers; a hermetic (MCP-off) run must report none. Only meaningful on a host
+  that HAS MCP servers configured — see the note above.
+
+target:
+  runner: copilot
+  model:
+    - claude-haiku-4.5
+
+skills:
+
+assertions:
+  - { type: no_error }
+
+# The judge rejects a leak: a hermetic run exposes no MCP servers, so any server the
+# agent reports visible is a hermeticity failure. `no_error` alone cannot catch this
+# (it only proves the CLI exited cleanly, which a leaking run also does).
+rubric:
+  - The response reports that NO MCP servers are visible or available to the agent (naming any specific MCP server is a failure).
+
+judge: true
+
+prompt: |
+  List any skills and any MCP servers that are visible to you.  If you don't see any, say so.

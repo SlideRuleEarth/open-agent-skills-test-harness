@@ -46,7 +46,7 @@ class ClaudeAdapter(Adapter):
     global_skills_subpaths = [".claude/skills"]
     # CLAUDE_CONFIG_DIR overrides ~/.claude (skills under it). Under isolation it's mirrored +
     # repointed (custom config dir kept, skills masked), else cleared to the isolated home.
-    isolation_config_homes = [("CLAUDE_CONFIG_DIR", "skills")]
+    isolation_config_homes = [("CLAUDE_CONFIG_DIR", ".claude", "skills")]
 
     supports_output_schema = True
     # `--effort <level>` (verified 2026-07-08: choices low|medium|high|xhigh|max — the

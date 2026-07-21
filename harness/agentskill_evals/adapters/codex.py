@@ -20,14 +20,45 @@ item.completed is only counted once as a TOOL_CALL.
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
-from typing import Any, Optional
+import sys
+from typing import Any, Mapping, Optional
 
 from ..schema import EventKind, NormalizedEvent
 from .base import Adapter, ParseOutput, ProbeResult, RunOptions, extract_command, extract_path, iter_jsonl, try_load_json, warn_unknown_usage
 
 
 _KNOWN_USAGE_KEYS = {"input_tokens", "output_tokens", "reasoning_tokens", "total_tokens"}
+
+# What `codex mcp add` accepts as a server name (verified 0.140.0: "use letters, numbers,
+# '-', '_'") — exactly the TOML bare-key charset, so any addable name works in an unquoted
+# `-c mcp_servers.<name>...` dotted path.
+_BARE_KEY_RE = re.compile(r"[A-Za-z0-9_-]+\Z")
+
+# extra_args tokens that reach past the verified MCP-off state (see build_argv): `-c`/
+# `--config` overrides appended after the kill-switch outrank it (verified 0.140.0: the
+# later of two duplicate `-c mcp_servers.<n>.enabled=` overrides wins), `--profile`/`-p`
+# and `--cd`/`-C` change WHICH configuration codex resolves (per-profile config files;
+# trusted-project discovery follows the effective cwd), and `--enable` re-opens feature
+# channels (`plugins` is its own MCP channel, invisible to `mcp list` enumeration). The
+# long forms are matched exact or `--flag=value`; the short forms exact or with an
+# attached value (`-cKEY=VAL` parses, verified 0.140.0).
+_CONFIG_CHANNEL_LONG = ("--config", "--profile", "--cd", "--enable")
+_CONFIG_CHANNEL_SHORT = ("-c", "-p", "-C")
+
+
+def _config_channel_token(extra_args: list[str]) -> Optional[str]:
+    """The first extra_args token that opens a codex configuration channel, or None.
+    A token that merely LOOKS like one (e.g. a value following some unrelated flag) is
+    reported too — that false positive fails closed, the safe direction."""
+    for tok in extra_args:
+        if any(tok == f or tok.startswith(f + "=") for f in _CONFIG_CHANNEL_LONG):
+            return tok
+        if any(tok.startswith(f) for f in _CONFIG_CHANNEL_SHORT):
+            return tok
+    return None
 
 
 class CodexAdapter(Adapter):
@@ -38,7 +69,7 @@ class CodexAdapter(Adapter):
     global_skills_subpaths = [".codex/skills", ".agents/skills"]
     # CODEX_HOME overrides ~/.codex (skills under $CODEX_HOME/skills). Under isolation it's
     # mirrored + repointed (custom home kept, skills masked), else cleared to the isolated home.
-    isolation_config_homes = [("CODEX_HOME", "skills")]
+    isolation_config_homes = [("CODEX_HOME", ".codex", "skills")]
     # No dedicated flag; the config.toml key `model_reasoning_effort` (settable per-run via
     # `-c`) reaches the API as `reasoning.effort` (verified 2026-07-08: the API echoes
     # supported values none|minimal|low|medium|high|xhigh on a bad one).
@@ -58,11 +89,14 @@ class CodexAdapter(Adapter):
                 json.JSONDecodeError, KeyError):
             return None
 
-    def _probe_argv(self, model: str):
+    def _probe_argv(self, model: str, *, cwd: Optional[str] = None,
+                    env: Optional[dict] = None):
         return [self.binary, "--ask-for-approval", "never", "--sandbox", "read-only",
                 "exec", "--ephemeral", "--disable", "memories",
+                "--disable", "plugins",
                 "-c", "memories.use_memories=false",
                 "-c", "memories.generate_memories=false",
+                *self._mcp_disable_args(cwd=cwd, env=env),
                 "--json", "-m", model, "say ok"]
 
     def _parse_probe_cost(self, output: str) -> ProbeResult:
@@ -83,7 +117,153 @@ class CodexAdapter(Adapter):
         # Mirrors the OpenAI example which referenced skills as "$skill-name".
         return f"${skill}"
 
+    # --- MCP hermeticity ------------------------------------------------------
+
+    def _mcp_disable_args(self, cwd: Optional[str] = None,
+                          env: Optional[Mapping[str, str]] = None) -> list[str]:
+        """`-c mcp_servers.<name>.enabled=false` for every server codex would actually
+        load. Verified on 0.140.0: `-c mcp_servers={}` deep-merges with config.toml
+        instead of replacing it (the server stays enabled), while the per-server `enabled`
+        override does disable it — so hermeticity requires enumerating names. Enumeration
+        must match codex's *effective* view exactly: disabling a name codex doesn't load
+        creates an incomplete top-level entry and the run dies with "invalid transport"
+        (verified) — and that effective view depends on the run's cwd and env, not the
+        harness's: a *trusted* project's `.codex/config.toml` (found via the git root
+        above cwd) contributes servers, and $CODEX_HOME moves the global config (verified
+        0.140.0) — so callers pass the child's exact cwd/env (exec.execute() and
+        probe_model() both do). Riding on argv (not the isolation overlay) makes this
+        cover every invocation the same way: cells (isolated or not), model probes, and
+        judge runs. A `-c enabled=false` (and `--disable plugins`) can still be OUTRANKED
+        by a higher-precedence managed/MDM configuration layer, so once the overrides are
+        built they are POST-VERIFIED against codex's own effective view — with the
+        overrides applied, in the same cwd/env — and the run fails closed if any server is
+        still enabled (see _verify_all_mcp_disabled)."""
+        args: list[str] = []
+        names = self._configured_mcp_server_names(cwd=cwd, env=env)
+        for name in names:
+            if _BARE_KEY_RE.match(name):
+                args += ["-c", f"mcp_servers.{name}.enabled=false"]
+            else:
+                # Only reachable via a hand-edited config.toml — `codex mcp add` rejects
+                # anything outside [A-Za-z0-9_-]. The -c parser can't address quoted key
+                # segments, and passing this form makes codex refuse to load its config at
+                # all: the run errors out (fail closed) instead of silently executing with
+                # the server live.
+                print(f"warning: [codex] MCP server name {name!r} can't be disabled via "
+                      f"-c (non-bare TOML key); the run will fail closed rather than load "
+                      f"it — rename the server in config.toml.", file=sys.stderr)
+                args += ["-c", f'mcp_servers."{name}".enabled=false']
+        if names:
+            # A managed/MDM config layer can outrank the -c overrides above (and
+            # `--disable plugins`); the only trustworthy check is codex's own post-override
+            # view, so confirm every server is actually disabled — fail closed otherwise.
+            self._verify_all_mcp_disabled(args, cwd=cwd, env=env)
+        return args
+
+    def _verify_all_mcp_disabled(self, disable_args: list[str], cwd: Optional[str] = None,
+                                 env: Optional[Mapping[str, str]] = None) -> None:
+        """Re-run codex's own effective-config enumeration WITH the generated
+        `-c ...enabled=false` overrides and `--disable plugins` applied, in the child's
+        exact cwd and env, and confirm no server is still enabled. A higher-precedence
+        managed/MDM configuration can override a `-c` value (and the plugins feature
+        flag), so the pre-override enumeration alone doesn't prove hermeticity — only
+        codex's post-override view does. Any server still reported enabled, or any failure
+        to obtain that view (binary missing, non-zero exit, timeout, unrecognized shape),
+        raises RuntimeError so the invocation fails closed rather than launching an
+        un-disabled server."""
+        try:
+            r = subprocess.run(
+                [self.binary, *disable_args, "--disable", "plugins",
+                 "mcp", "list", "--json"],
+                capture_output=True, text=True, encoding="utf-8", timeout=15,
+                stdin=subprocess.DEVNULL, cwd=cwd,
+                env=dict(env) if env is not None else None,
+            )
+            if r.returncode != 0:
+                raise ValueError(f"`codex mcp list` exited with code {r.returncode}")
+            data = json.loads(r.stdout)
+        except (subprocess.TimeoutExpired, FileNotFoundError, NotADirectoryError,
+                OSError, ValueError) as exc:
+            raise RuntimeError(
+                "codex could not be re-checked after applying the MCP kill-switch "
+                f"overrides ({exc}) — failing closed rather than running without "
+                "confirming every server is disabled."
+            )
+        still_enabled = _enabled_mcp_names(data)
+        if still_enabled is None:
+            raise RuntimeError(
+                "codex's post-override `mcp list --json` returned an unrecognized shape — "
+                "cannot confirm its MCP servers are disabled, failing closed."
+            )
+        if still_enabled:
+            raise RuntimeError(
+                "these MCP servers are still enabled after the kill-switch overrides "
+                f"({', '.join(sorted(still_enabled))}) — a higher-precedence managed/MDM "
+                "configuration is overriding `-c ...enabled=false`; failing closed rather "
+                "than running with them live."
+            )
+
+    def _configured_mcp_server_names(self, cwd: Optional[str] = None,
+                                     env: Optional[Mapping[str, str]] = None) -> list[str]:
+        """Server names codex will load from *configuration* (its plugin channel is closed
+        separately by `--disable plugins`, and plugin-provided servers must NOT be disabled
+        by name — they have no config.toml entry, so a `-c` disable would create an
+        incomplete one and break the run). The sole source is codex itself:
+        `codex --disable plugins mcp list --json`, run with the child's exact cwd and env,
+        which is the only view that matches codex's effective resolution (trusted-project
+        configs, $CODEX_HOME, and the system/managed layers all included). There is no
+        offline fallback and no caching: a hand-parsed subset of one config.toml misses
+        the system/managed layers codex itself reads (so a later successful run could
+        still launch an un-disabled server), and the effective view depends on the full
+        execution context (resolved binary/PATH, git-root state, managed config) — more
+        than any cache key could capture — so a stale entry could disable the wrong set.
+        Any failure to positively enumerate therefore FAILS CLOSED (RuntimeError)."""
+        names = self._mcp_names_via_cli(cwd=cwd, env=env)
+        if names is None:
+            raise RuntimeError(
+                "codex could not enumerate its MCP servers "
+                "(`codex --disable plugins mcp list --json` did not return a usable "
+                "list) — failing closed rather than running without a verified server "
+                "set (an offline config parse would miss the system/managed layers codex "
+                "itself reads)."
+            )
+        return names
+
+    def _mcp_names_via_cli(self, cwd: Optional[str] = None,
+                           env: Optional[Mapping[str, str]] = None) -> Optional[list[str]]:
+        """Ask codex itself which MCP servers its effective config defines — from the
+        child's exact cwd and env, so trusted-project configs and $CODEX_HOME resolve the
+        same way they will in the run. None (fall back) when the binary is missing,
+        errors out, or answers in a shape we don't positively recognize."""
+        try:
+            r = subprocess.run(
+                [self.binary, "--disable", "plugins", "mcp", "list", "--json"],
+                capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+                cwd=cwd, env=dict(env) if env is not None else None,
+            )
+            if r.returncode != 0:
+                return None
+            data = json.loads(r.stdout)
+        except (subprocess.TimeoutExpired, FileNotFoundError, NotADirectoryError,
+                OSError, ValueError):
+            return None
+        return _validate_mcp_list_json(data)
+
     def build_argv(self, prompt: str, opts: RunOptions, *, cwd: str) -> list[str]:
+        # extra_args ride at the END of argv (below), after the MCP kill-switch overrides
+        # are built and POST-VERIFIED — a config-channel token there would outrank or
+        # sidestep the verified MCP-off state (see _CONFIG_CHANNEL_LONG/_SHORT). Standard
+        # runner cells never populate extra_args; a programmatic caller passing one of
+        # these fails closed here (exec.execute() records a failed run), checked first so
+        # a doomed invocation never spends the enumeration/post-verify subprocesses.
+        bad = _config_channel_token(opts.extra_args)
+        if bad is not None:
+            raise RuntimeError(
+                f"extra_args token {bad!r} opens a codex configuration channel "
+                "(-c/--config, --profile/-p, --cd/-C, --enable) after the MCP "
+                "kill-switch overrides were verified — failing closed rather than "
+                "running with an unverifiable MCP state."
+            )
         argv = [self.binary]
         if opts.auto_approve:
             # Non-interactive parity with the deprecated `--full-auto`: never prompt for
@@ -91,8 +271,21 @@ class CodexAdapter(Adapter):
             # `-s/--sandbox` are top-level options, so they precede the `exec` subcommand.
             argv += ["--ask-for-approval", "never", "--sandbox", "workspace-write"]
         argv += ["exec", "--ephemeral", "--disable", "memories",
+                 # Plugins are their own MCP channel (a plugin can ship .mcp.json servers
+                 # that never appear in config.toml); the feature switch removes the whole
+                 # channel — plugin-provided skills go with it, documented trade-off.
+                 "--disable", "plugins",
                  "-c", "memories.use_memories=false",
                  "-c", "memories.generate_memories=false",
+                 # MCP kill-switch (DESIGN_MCP_Support.md, Phase 0): the isolated HOME
+                 # symlinks ~/.codex wholesale, so any [mcp_servers.*] in the user's real
+                 # config.toml loads in every run — and `-c mcp_servers={}` does NOT clear
+                 # it (verified 0.140.0: -c deep-merges with the persisted table). Each
+                 # configured server is disabled by name instead, enumerated from the
+                 # child's own cwd/env (opts.effective_env, set by exec.execute()) so
+                 # trusted-project configs and env-overridden CODEX_HOMEs resolve
+                 # exactly as they will in the run.
+                 *self._mcp_disable_args(cwd=cwd, env=opts.effective_env),
                  "--json"]
         if opts.model:
             argv += ["-m", opts.model]
@@ -229,6 +422,39 @@ class CodexAdapter(Adapter):
             structured = try_load_json(final_text)
 
         return ParseOutput(events=events, final_text=final_text, structured_output=structured)
+
+
+def _validate_mcp_list_json(data: Any) -> Optional[list[str]]:
+    """Strictly validate `codex mcp list --json` output (verified 0.140.0: a JSON array
+    of objects, each with a string ``name``). Any other shape — ``null``, an object like
+    ``{"servers": [...]}``, an entry without a usable name — returns None so the caller
+    FAILS CLOSED instead of trusting schema drift as an authoritative "no servers"."""
+    if not isinstance(data, list):
+        return None
+    names: set[str] = set()
+    for s in data:
+        if not isinstance(s, dict) or not isinstance(s.get("name"), str) or not s["name"]:
+            return None
+        names.add(s["name"])
+    return sorted(names)
+
+
+def _enabled_mcp_names(data: Any) -> Optional[set[str]]:
+    """Names of servers codex still reports as ENABLED in `mcp list --json` output — an
+    entry counts as enabled unless it carries ``"enabled": false`` (a disabled server is
+    either omitted from the listing or present with that flag; either way it drops out).
+    Returns None for an unrecognized shape (``null``, a wrapped object, an entry without a
+    usable name) so the caller can fail closed — an empty set means every server is
+    confirmed disabled."""
+    if not isinstance(data, list):
+        return None
+    enabled: set[str] = set()
+    for s in data:
+        if not isinstance(s, dict) or not isinstance(s.get("name"), str) or not s["name"]:
+            return None
+        if s.get("enabled") is not False:
+            enabled.add(s["name"])
+    return enabled
 
 
 def _codex_changed_paths(item: dict) -> list[str]:
