@@ -6,12 +6,15 @@ subprocess/timeout/error handling in one place so adapters stay pure.
 
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import os
 import signal
 import subprocess
 import sys
+from ctypes import wintypes
 from dataclasses import dataclass
+from typing import Optional
 
 from .adapters.base import Adapter, RunOptions
 from .schema import RunResult
@@ -22,6 +25,26 @@ class ExecResult:
     result: RunResult
     stdout: str
     stderr: str
+
+
+class ChildSpawned(Exception):
+    """Raised in place of any error that happens AFTER the child process started.
+
+    Spawning failures and post-spawn failures demand opposite handling, and both used to
+    arrive as a bare ``OSError``. If ``Popen`` itself fails there is no child, nothing
+    ran, and nothing needs auditing. If ``communicate()`` fails there IS a child — it may
+    have brought an MCP server up before the pipe broke — so the run still has to go
+    through ``verify_post_run``. Collapsing the two let a post-spawn ``OSError`` skip the
+    audit on a child that had genuinely run.
+
+    Carries whatever output was recovered, so the caller can audit the child's own
+    account of itself rather than only its absence.
+    """
+
+    def __init__(self, exc: BaseException, stdout: str = "", stderr: str = ""):
+        super().__init__(str(exc))
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 def execute(
@@ -73,15 +96,25 @@ def execute(
         rr.error = f"{adapter.binary!r} not found on PATH"
         return ExecResult(rr, "", "")
 
+    # A failure to SPAWN returns here: no child ran, so there is nothing to audit. A
+    # failure AFTER the child started (ChildSpawned) must not take that exit — the child
+    # may have brought an MCP server up before the pipe broke, so it falls through to
+    # parse and, crucially, to verify_post_run like any other run that happened.
+    child_error = ""
     try:
         stdout, stderr, code, timed_out = run_captured(
             argv, cwd=cwd, env=env, timeout=timeout)
+    except ChildSpawned as exc:
+        stdout, stderr, code, timed_out = exc.stdout, exc.stderr, -1, False
+        child_error = f"exec failed after the child started: {exc}"
     except FileNotFoundError:
         rr.error = f"{adapter.binary!r} not found on PATH"
         return ExecResult(rr, "", "")
     except Exception as exc:  # pragma: no cover - defensive
         rr.error = f"exec failed: {exc}"
         return ExecResult(rr, "", "")
+    if child_error:
+        rr.error = child_error
     if timed_out:
         stderr += f"\n[timeout after {timeout}s]"
         rr.timed_out = True
@@ -116,7 +149,8 @@ def execute(
     # prevention: a server started inside the window already ran. It is appended, never
     # substituted, so a timeout or a nonzero exit keeps its own diagnosis alongside.
     try:
-        adapter.verify_post_run(argv, opts, cwd=cwd, stdout=stdout, stderr=stderr)
+        adapter._verify_post_run_compat(argv, opts, cwd=cwd, stdout=stdout,
+                                        stderr=stderr, exit_code=code)
     except Exception as exc:
         rr.error = ((rr.error + "; " if rr.error else "")
                     + f"MCP hermeticity was not confirmed after the run: {exc}")
@@ -173,50 +207,224 @@ def run_captured(argv: list[str], *, cwd: str, env: dict[str, str],
         text=True,
         stdin=subprocess.DEVNULL,  # non-interactive: agents that probe stdin (e.g. codex
                                    # exec) get immediate EOF instead of blocking forever
-        start_new_session=hasattr(os, "killpg"),
+        start_new_session=_HAS_KILLPG,
     )
+    tree = _ProcessTree(proc)   # captured AT LAUNCH — see the class docstring
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        return (stdout or ""), (stderr or ""), proc.returncode, False
-    except subprocess.TimeoutExpired:
-        _kill_process_group(proc)
         try:
-            # The group is dead, so the pipes close and this returns quickly with all
-            # output accumulated so far (communicate() retried after a timeout loses none).
-            stdout, stderr = proc.communicate(timeout=10)
-        except (subprocess.TimeoutExpired, ValueError, OSError):  # pragma: no cover
-            proc.kill()
-            stdout, stderr = "", ""
-        return (stdout or ""), (stderr or ""), -9, True
-    except BaseException:  # pragma: no cover - defensive
-        # Never leave the group running because the wait was interrupted (KeyboardInterrupt
-        # included) — the orphan outlives the harness otherwise.
-        _kill_process_group(proc)
-        raise
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return (stdout or ""), (stderr or ""), proc.returncode, False
+        except subprocess.TimeoutExpired:
+            tree.kill()
+            try:
+                # The tree is dead, so the pipes close and this returns quickly with all
+                # output accumulated so far (communicate() retried after a timeout loses
+                # none).
+                stdout, stderr = proc.communicate(timeout=10)
+            except (subprocess.TimeoutExpired, ValueError, OSError):  # pragma: no cover
+                proc.kill()
+                stdout, stderr = "", ""
+            return (stdout or ""), (stderr or ""), -9, True
+        except BaseException as exc:
+            # Never leave the tree running because the wait was interrupted
+            # (KeyboardInterrupt included) — the orphan outlives the harness otherwise.
+            tree.kill()
+            # A post-spawn failure is reported as ChildSpawned so the caller can tell it
+            # from "never launched" and still audit the child that DID run; control-flow
+            # BaseExceptions (KeyboardInterrupt, SystemExit) propagate untouched.
+            if isinstance(exc, Exception):
+                raise ChildSpawned(exc) from exc
+            raise
+    finally:
+        tree.close()
 
 
-def _kill_process_group(proc: subprocess.Popen) -> None:
-    """SIGKILL the agent's whole process group (POSIX); fall back to killing just the
-    direct child where process groups aren't available (Windows) or the group is gone.
+_HAS_KILLPG = hasattr(os, "killpg")
 
-    Never the HARNESS's own group. That is only possible if the child was spawned without
-    ``start_new_session``, which run_captured always passes — but the failure mode is
-    severe enough to guard rather than assume: the group SIGKILL would then reach this
-    process and everything above it, taking down the whole run (and, under the self-test,
-    the shell that launched it — observed while mutation-testing exactly that change).
-    Killing just the child is the correct degradation; it is what Windows already does."""
-    if hasattr(os, "killpg"):
+# Windows Job Object constants (winnt.h). Only these two are needed: the extended-limit
+# info class to request kill-on-close, and the flag itself.
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+
+
+def _win32_kernel32():  # pragma: no cover — win32 only; stubbed in the selftest
+    """The kernel32 handle ``_win32_assign_job`` calls through. A seam, not a wrapper:
+    it is the single point the selftest replaces to exercise the job-object call
+    sequence on a non-Windows host, exactly as ``winreg`` is stubbed for the ODR read."""
+    import ctypes
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _win32_assign_job(proc: subprocess.Popen) -> Optional[int]:
+    """Put *proc* into a fresh Windows Job Object; return the job handle, or None.
+
+    A Job Object is the only Windows mechanism that reliably kills a process TREE, and
+    the tree is what has to die: an agent CLI's MCP server is a grandchild. The
+    alternatives both fail on the case that motivates this — a parent that has already
+    exited. ``proc.kill()`` reaches exactly one process, and ``taskkill /T`` walks live
+    parent/child links, which are precisely what an exited parent no longer provides.
+    Every process created by a job member joins the job automatically, so
+    ``TerminateJobObject`` reaches the grandchildren no matter who is still alive.
+
+    ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` is requested too, so the tree also dies if the
+    harness is killed before it can terminate the job explicitly. That request is
+    best-effort: if it fails the job is still perfectly usable for the explicit
+    terminate, so it must not fail the launch.
+
+    Assignment happens immediately after ``Popen`` rather than under
+    ``CREATE_SUSPENDED``, because Python's Popen closes the child's thread handle and
+    leaves no supported way to resume it. The residual race is the instant between
+    process creation and assignment, before the child has run any of its own code.
+
+    Returns None when the job cannot be created or assigned (an old Windows without
+    nested-job support, a denied handle, a child that already exited); the caller then
+    degrades to killing the direct child — the behaviour that was there before.
+
+    NOT verified against a live Windows host: none was available. The ctypes call
+    sequence is exercised cross-host in the selftest against a stubbed kernel32, the
+    same way copilot's ODR registry read is exercised against a stubbed ``winreg``.
+    """
+    handle = getattr(proc, "_handle", None)
+    if handle is None:
+        return None
+    try:  # pragma: no cover — win32 only
+        k32 = _win32_kernel32()
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return None
         try:
-            pgid = os.getpgid(proc.pid)
-            if pgid != os.getpgid(0):
-                os.killpg(pgid, signal.SIGKILL)
+            k32.SetInformationJobObject(
+                wintypes.HANDLE(job), _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(_kill_on_close_limits()),
+                ctypes.sizeof(_JOBOBJECT_EXTENDED_LIMIT_INFORMATION))
+        except Exception:
+            pass    # best-effort only; the job still terminates on demand
+        if not k32.AssignProcessToJobObject(wintypes.HANDLE(job),
+                                            wintypes.HANDLE(int(handle))):
+            k32.CloseHandle(wintypes.HANDLE(job))
+            return None
+        return int(job)
+    except Exception:
+        return None
+
+
+# The winnt.h layouts SetInformationJobObject expects. Written with EXPLICIT widths
+# rather than `wintypes` aliases: `wintypes.DWORD` is `c_ulong`, which is 4 bytes on
+# Windows (LLP64) but 8 on an LP64 host, so an alias-built struct would silently take a
+# different shape off Windows — 72 bytes instead of 64 — and the cross-host selftest
+# would then be validating a layout Windows never sees. `c_uint32` is 4 everywhere and
+# identical to Windows' DWORD; `c_size_t` matches ULONG_PTR on the host that matters.
+# Defining them at module scope is safe on every platform (these are plain ctypes types),
+# which is what keeps the job-object call sequence testable off Windows at all.
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [(_name, ctypes.c_uint64) for _name in (
+        "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+        "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", ctypes.c_uint32),              # DWORD
+                ("MinimumWorkingSetSize", ctypes.c_size_t),   # ULONG_PTR
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", ctypes.c_uint32),
+                ("Affinity", ctypes.c_size_t),                # ULONG_PTR
+                ("PriorityClass", ctypes.c_uint32),
+                ("SchedulingClass", ctypes.c_uint32)]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+
+def _kill_on_close_limits() -> _JOBOBJECT_EXTENDED_LIMIT_INFORMATION:
+    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    return info
+
+
+class _ProcessTree:
+    """Kill handle for every process a launch creates, not just the direct child.
+
+    The identity of the tree is captured AT LAUNCH, and that is the whole point. By the
+    time the kill is needed the direct child may be gone: an agent CLI can start an MCP
+    server, exit, and leave the server holding the captured stdout pipe open —
+    ``communicate()`` then blocks on that pipe until the timeout, having already reaped
+    the leader via its own ``poll()``. Deriving the target at kill time from the leader
+    (``os.getpgid(proc.pid)``) raises ``ProcessLookupError`` in exactly that case and
+    silently degrades to killing a process that is already dead, while the server keeps
+    running. Reproduced before this change: a 1s timeout returned after 10.1s with the
+    grandchild not merely alive but running to completion.
+
+    POSIX: ``start_new_session`` makes the child a session and process-group leader, so
+    the group id IS its pid — known without a syscall and with no window in which it can
+    be wrong. A pid that is in use as a process-group id is not recycled while the group
+    still has members, so a stored pgid either names that same group or names nothing
+    (``ESRCH``); it cannot drift onto an unrelated process.
+
+    Windows: a Job Object, since there are no process groups to kill (see
+    ``_win32_assign_job``). Where neither mechanism is available the fallback is killing
+    the direct child — the pre-existing behaviour, and a real gap rather than a fix.
+    """
+
+    def __init__(self, proc: subprocess.Popen):
+        self._proc = proc
+        # start_new_session was passed iff _HAS_KILLPG, so the pgid is the child's pid
+        # exactly then. Never re-derived later; see the class docstring.
+        self._pgid: Optional[int] = proc.pid if _HAS_KILLPG else None
+        self._job: Optional[int] = (_win32_assign_job(proc)
+                                    if sys.platform == "win32" else None)
+
+    def kill(self) -> None:
+        """SIGKILL the whole process group (POSIX) or terminate the whole job (Windows),
+        falling back to the direct child when neither is available.
+
+        Never the HARNESS's own group. With ``start_new_session`` that cannot happen —
+        the stored pgid is the child's own pid — but the failure mode is severe enough to
+        guard rather than assume: a group SIGKILL that reached this process would take
+        down the whole run (and, under the self-test, the shell that launched it —
+        observed while mutation-testing exactly that change)."""
+        if self._job is not None:  # pragma: no cover — win32 only
+            try:
+                from ctypes import wintypes
+                _win32_kernel32().TerminateJobObject(wintypes.HANDLE(self._job), 1)
                 return
-        except (ProcessLookupError, PermissionError, OSError):
+            except Exception:
+                pass
+        if self._pgid is not None:
+            try:
+                if self._pgid != os.getpgid(0):
+                    os.killpg(self._pgid, signal.SIGKILL)
+                    return
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        try:
+            self._proc.kill()
+        except OSError:  # pragma: no cover — already gone
             pass
-    try:
-        proc.kill()
-    except OSError:  # pragma: no cover — already gone
-        pass
+
+    def close(self) -> None:
+        """Release the job handle. Closing it also kills anything still in the job when
+        the kill-on-close limit was accepted — a backstop for a tree that outlived a
+        normal (non-timeout) return, which is a leak either way."""
+        job, self._job = self._job, None
+        if job is not None:  # pragma: no cover — win32 only
+            try:
+                from ctypes import wintypes
+                _win32_kernel32().CloseHandle(wintypes.HANDLE(job))
+            except Exception:
+                pass
 
 
 def _tail(text: str | None, limit: int = 400) -> str:

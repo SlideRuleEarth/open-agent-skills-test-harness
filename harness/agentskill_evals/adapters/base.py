@@ -192,12 +192,21 @@ class Adapter(ABC):
             # spawn the same grandchildren, and subprocess.run's timeout kill reaches only
             # the direct child — a probe that timed out used to leave an MCP server alive
             # behind it, outliving the very check meant to establish it never started one.
+            from ..exec import ChildSpawned, run_captured
+            child_error = False
             try:
-                from ..exec import run_captured
                 out, err, code, timed_out = run_captured(
                     argv, cwd=probe_ws, env=env, timeout=timeout)
+            except ChildSpawned as exc:
+                # The child STARTED and something then went wrong (a pipe/decode error out
+                # of communicate). It may have launched an MCP server before it broke, so
+                # it still gets audited below — that is the whole point of the distinction.
+                # Previously this arrived as a bare OSError, was read as "never spawned",
+                # and skipped the audit on a child that had actually run.
+                out, err, code, timed_out = exc.stdout, exc.stderr, -1, False
+                child_error = True
             except (FileNotFoundError, OSError):
-                # Could not start at all: no child, so nothing to audit.
+                # Could not start AT ALL: no child, so there is genuinely nothing to audit.
                 return ProbeResult(accepted=False)
             # Verify EVERY child that started, timeout included, and in its own exception
             # scope. A probe is otherwise the one un-audited child the harness spawns: it
@@ -208,8 +217,8 @@ class Adapter(ABC):
             # Keeping this separate from the spawn scope above also stops a verifier
             # OSError from being silently reclassified as an ordinary model rejection.
             try:
-                self.verify_post_run(argv, probe_opts, cwd=probe_ws,
-                                     stdout=out, stderr=err)
+                self._verify_post_run_compat(argv, probe_opts, cwd=probe_ws,
+                                             stdout=out, stderr=err, exit_code=code)
             except Exception as exc:
                 # Not provably MCP-hermetic. The model may well be fine, but reporting it
                 # available would bless a child whose hermeticity broke — the same
@@ -218,7 +227,7 @@ class Adapter(ABC):
                       f"MCP hermeticity could not be confirmed afterwards ({exc}); "
                       f"reporting the model unavailable (fail-closed).", file=sys.stderr)
                 return ProbeResult(accepted=False)
-            if timed_out:
+            if timed_out or child_error:
                 return ProbeResult(accepted=False)
             combined = err + out
             lower = combined.lower()
@@ -306,8 +315,21 @@ class Adapter(ABC):
         """
         raise NotImplementedError
 
+    def _verify_post_run_compat(self, argv: list[str], opts: RunOptions, *, cwd: str,
+                                stdout: str, stderr: str,
+                                exit_code: Optional[int]) -> None:
+        """Call ``verify_post_run`` with the child's exit status, tolerating out-of-tree
+        adapters that still override the pre-Phase-0 signature without ``exit_code``
+        (same accommodation ``_probe_argv_compat`` makes)."""
+        import inspect
+        kwargs: dict[str, Any] = {"cwd": cwd, "stdout": stdout, "stderr": stderr}
+        if "exit_code" in inspect.signature(self.verify_post_run).parameters:
+            kwargs["exit_code"] = exit_code
+        return self.verify_post_run(argv, opts, **kwargs)
+
     def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str,
-                        stdout: str = "", stderr: str = "") -> None:
+                        stdout: str = "", stderr: str = "",
+                        exit_code: Optional[int] = None) -> None:
         """Re-assert, after the child has exited, the premise ``argv`` was built on.
 
         ``build_argv`` reads filesystem state — config files, agent definitions — to
@@ -327,6 +349,12 @@ class Adapter(ABC):
           about files, so reverting the files afterwards does not retract it. This is the
           only evidence that survives a transient change; it is not sufficient alone,
           because a child killed on timeout may never have reported anything.
+
+        ``exit_code`` is the child's status (``None`` when it could not be determined), so
+        an adapter can require the stream evidence it depends on from any run that
+        finished NORMALLY, without having to infer "finished" from a version-specific
+        event that a future build could rename. It is passed through
+        ``_verify_post_run_compat``.
 
         This is DETECTION, not prevention: it cannot un-start a server the child already
         launched. What it buys is that a leak inside that window becomes a loud failure

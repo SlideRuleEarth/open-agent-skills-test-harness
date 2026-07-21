@@ -28,7 +28,16 @@ Ephemeral events (`session.*`, `assistant.message_start/delta`,
 `assistant.reasoning_delta`) are streaming fragments — we skip them and parse
 only the non-ephemeral `assistant.message`, `tool.*`, and `result` events.
 
-Verified against copilot 1.0.64 on 2026-07-17 (installed CLI + its app.js bundle).
+VERSION PROVENANCE. The findings recorded throughout this module are dated to the build
+they were established on — most say "1.0.64", the build the original analysis read
+(installed CLI + its app.js bundle, 2026-07-17). The authoritative, queryable record is
+``_VERIFIED_VERSIONS``, currently ``1.0.64`` and ``1.0.72``; a run on anything else warns
+(see ``_check_cli_version``) and a build known to be broken fails closed by name.
+
+Do not read a "1.0.64" comment as "this is the shipping version" — the CLI updates itself
+by rewriting its executable IN PLACE, and this module was running against 1.0.72 four days
+after being verified against 1.0.64, with nothing in the code aware of the gap. That is
+the failure this provenance block exists to prevent.
 """
 
 from __future__ import annotations
@@ -36,6 +45,7 @@ from __future__ import annotations
 import json
 import ntpath
 import os
+import re
 import sys
 from typing import Any, Mapping, Optional
 
@@ -214,54 +224,286 @@ def _disabled_server_names(argv: list[str]) -> set[str]:
 _INERT_MCP_STATUSES = {"disabled", "not_configured"}
 
 
-def _live_mcp_servers(stdout: str) -> list[str]:
-    """The MCP servers copilot's own event stream says it brought up, as ``name (status)``.
+# --- Version provenance ---------------------------------------------------------------
+#
+# The CLI builds this adapter's MCP analysis has actually been checked against, as DATA
+# rather than the prose scattered through this module. The prose comments below record
+# individual findings and stay dated to the build they were made on; this constant is the
+# single queryable source of truth, the one the drift warning cites, and the one to update
+# when a new build is cleared.
+#
+# It exists because provenance kept in prose rots silently: this module was written and
+# verified against 1.0.64 on 2026-07-17 and, four days later, was running against 1.0.72 —
+# copilot's updater having rewritten the executable in place, which is the very mechanism
+# _mcp_witness documents as making the version unpinnable. Nobody was warned, because
+# nothing in the code knew what version it had been verified against.
+#
+# 1.0.64: original analysis (installed CLI + its app.js bundle).
+# 1.0.72: re-verified 2026-07-21 — the witness contract confirmed live (a real run emits
+#         session.mcp_servers_loaded naming github-mcp-server as `disabled`), and every
+#         channel marker in _MCP_CHANNEL_MARKERS confirmed still present in the bundle.
+_VERIFIED_VERSIONS = ("1.0.64", "1.0.72")
+_VERIFIED_ON = "2026-07-21"
 
-    ``--output-format json`` streams two ephemeral events that describe the MCP host:
+# Builds found to actively BREAK a hermeticity assumption, mapped to what broke. Empty is
+# the normal state. This is the tier the runtime contract cannot cover: a build that
+# breaks, say, plugin masking leaves the MCP witness perfectly intact, so no runtime check
+# fires — the failure has to be recorded here once a human finds it, and then it fails
+# closed by name instead of waiting for a violation that never comes.
+_DENIED_VERSIONS: dict[str, str] = {}
+
+# The MCP/config discovery channels this adapter neutralizes, each with a string that must
+# be present in the CLI bundle for the corresponding defence to still mean anything. This
+# is the inventory `verify-copilot-channels` audits a new build against; a marker that has
+# GONE means the assumption behind that defence no longer holds and the finding needs
+# re-establishing. See cmd_verify_copilot_channels for the (important) limits of that
+# audit — above all that it cannot detect a channel a new build ADDED.
+_MCP_CHANNEL_MARKERS: tuple[tuple[str, str], ...] = (
+    ("github-mcp-server", "the built-in server, and the witness sentinel"),
+    ("playwright", "feature-gated built-in server disabled by name"),
+    ("bluebird", "feature-gated built-in server disabled by name"),
+    ("computer-use", "staff-gated built-in server disabled by name"),
+    ("defaultLocalOnly", "the ONLY off-switch for remote custom-agent discovery"),
+    (".github/mcp.json", "workspace MCP config candidate"),
+    ("mcp-servers", "custom-agent frontmatter key that declares MCP servers"),
+    ("enabledMcpServers", "config key that switches on feature-gated built-ins"),
+    ("installedPlugins", "config key whose cache_path loads plugins past the mask"),
+    ("session.mcp_servers_loaded", "the MCP witness event the post-run audit reads"),
+    ("not_configured", "inert-status value the witness classifies against"),
+)
+
+# An app root is `<cache>/pkg/<platform>/<version>/`, so the version of the code that
+# ACTUALLY executed is recoverable from any path the child reports out of it.
+_APP_ROOT_VERSION_RE = re.compile(r"[/\\]pkg[/\\][^/\\]+[/\\](\d+\.\d+\.\d+)[/\\]")
+
+
+def _stream_cli_version(stdout: str) -> Optional[str]:
+    """The CLI version that actually EXECUTED, read out of the child's own stream.
+
+    Same epistemics as the MCP witness, and for the same reason: the evidence comes from
+    the run being judged, so it needs no second execution and cannot disagree with what
+    ran. A preflight ``copilot --version`` can — it resolves its app.js by scanning
+    writable cache roots that this adapter's ``--no-auto-update`` argv deliberately
+    bypasses, so the probe and the run can execute different code (see _mcp_witness).
+
+    Read ONLY from ``session.skills_loaded`` skill paths, never by scanning stdout at
+    large. Those paths are structural data the CLI emits about its own app root; assistant
+    message content sits in the same stream and is model-controlled, so a broad regex over
+    stdout would let a model's prose ("I am running pkg/darwin-arm64/9.9.9/") forge the
+    version that silences the drift warning.
+
+    None when no app-root path appears, or when paths disagree — either way the version is
+    unknown, which warns rather than fails (absence of evidence about the version is not
+    evidence of a leak; the contract check is what actually gates).
+    """
+    seen: set[str] = set()
+    for obj in iter_jsonl(stdout):
+        if obj.get("type") != "session.skills_loaded":
+            continue
+        data = obj.get("data")
+        if not isinstance(data, dict):
+            continue
+        for skill in data.get("skills") or ():
+            path = skill.get("path") if isinstance(skill, dict) else None
+            if isinstance(path, str):
+                m = _APP_ROOT_VERSION_RE.search(path)
+                if m:
+                    seen.add(m.group(1))
+    return seen.pop() if len(seen) == 1 else None
+
+
+# Versions already warned about, so the drift notice fires once per process rather than
+# once per cell — a warning repeated on every run of a matrix is one nobody reads.
+_WARNED_VERSIONS: set[str] = set()
+
+
+def _check_cli_version_denied(version: Optional[str]) -> None:
+    """Refuse a build KNOWN to break a hermeticity assumption.
+
+    This is the only version check that can fail a run, and it runs BEFORE the contract
+    evidence because it covers precisely what that evidence cannot: a defect that leaves
+    the MCP witness perfectly intact (broken plugin masking, say) fires no runtime check
+    at all. Once a human finds such a build it is recorded in ``_DENIED_VERSIONS`` and
+    refused by name, rather than waiting for a violation that never comes.
+    """
+    if version is not None and version in _DENIED_VERSIONS:
+        raise RuntimeError(
+            f"copilot {version} is on this adapter's denylist: "
+            f"{_DENIED_VERSIONS[version]}. That defect leaves the MCP witness intact, so "
+            "no runtime check catches it — the run is refused by version instead. Pin a "
+            "different CLI build for harness runs."
+        )
+
+
+def _warn_cli_version_drift(version: Optional[str], *, agent: str = "copilot") -> None:
+    """Warn once per version that a run executed a build the analysis has not been checked
+    against. A WARNING, not a failure — and deliberately so.
+
+    By the time this runs the contract has already held, so the channels this adapter
+    knows about were disabled and none loaded. What a newer build can still do — and what
+    nothing at runtime can see — is introduce a discovery channel that was never
+    enumerated because no code was ever written to enumerate it. You cannot detect the
+    absence of a check you never wrote. The message says that explicitly, because the
+    danger is a green run being read as covering it.
+
+    Once per version per process, not per cell: a warning repeated across every cell of a
+    model matrix is one that gets filtered out, which defeats the purpose.
+    """
+    if version is not None and version in _VERIFIED_VERSIONS:
+        return
+    key = version or ""
+    if key in _WARNED_VERSIONS:
+        return
+    _WARNED_VERSIONS.add(key)
+    ran = f"CLI {version}" if version else "a CLI whose version could not be determined"
+    print(
+        f"warning: [{agent}] this run executed {ran}; the MCP hermeticity analysis was "
+        f"verified against {'/'.join(_VERIFIED_VERSIONS)} ({_VERIFIED_ON}).\n"
+        "  The runtime witness held, so the channels this adapter KNOWS ABOUT were "
+        "disabled and none loaded. That does NOT cover a discovery channel ADDED after "
+        f"{_VERIFIED_VERSIONS[-1]}: a new one would never have been enumerated, and no "
+        "runtime check can see a check that was never written.\n"
+        "  To clear it: `agentskill-evals verify-copilot-channels` (audits the CLI "
+        "bundle against the known channel inventory), then add the version to "
+        "_VERIFIED_VERSIONS in adapters/copilot.py.",
+        file=sys.stderr)
+
+
+def _bundle_search_roots(env_map: Optional[Mapping[str, str]] = None) -> list[str]:
+    """The ``pkg`` roots a copilot app bundle can live under — the same writable cache
+    roots the loader scans (``$COPILOT_CACHE_HOME``, ``$COPILOT_HOME``, ``~/.cache/copilot``,
+    ``~/.copilot``) plus the per-platform default the installed CLI actually uses
+    (``~/Library/Caches/copilot`` on darwin, ``~/.cache/copilot`` elsewhere)."""
+    env_map = env_map if env_map is not None else os.environ
+    home = os.path.expanduser("~")
+    bases = [env_map.get("COPILOT_CACHE_HOME"), env_map.get("COPILOT_HOME"),
+             os.path.join(home, ".cache", "copilot"), os.path.join(home, ".copilot")]
+    if sys.platform == "darwin":
+        bases.append(os.path.join(home, "Library", "Caches", "copilot"))
+    roots: list[str] = []
+    for b in bases:
+        if b:
+            p = os.path.join(b, "pkg")
+            if p not in roots:
+                roots.append(p)
+    return roots
+
+
+def find_cli_bundles(env_map: Optional[Mapping[str, str]] = None
+                     ) -> list[tuple[str, str]]:
+    """Every discoverable ``(version, app.js path)``, newest-sorting last.
+
+    These are the bundles the loader can pick from, which is not necessarily the code a
+    given run executes: this adapter's ``--no-auto-update`` argv pins the run to the
+    binary's own app root. The audit is therefore about a BUILD, not about a past run —
+    for what actually executed, read the version out of the run's own stream
+    (``_stream_cli_version``)."""
+    found: list[tuple[str, str]] = []
+    for root in _bundle_search_roots(env_map):
+        for platform_dir in sorted(_safe_listdir(root)):
+            pdir = os.path.join(root, platform_dir)
+            for ver in sorted(_safe_listdir(pdir)):
+                if not re.fullmatch(r"\d+\.\d+\.\d+", ver):
+                    continue
+                app = os.path.join(pdir, ver, "app.js")
+                if os.path.isfile(app):
+                    found.append((ver, app))
+    found.sort(key=lambda vp: tuple(int(x) for x in vp[0].split(".")))
+    return found
+
+
+def _safe_listdir(path: str) -> list[str]:
+    try:
+        return os.listdir(path)
+    except OSError:
+        return []
+
+
+def audit_channel_markers(app_js: str) -> dict[str, bool]:
+    """Which ``_MCP_CHANNEL_MARKERS`` are still present in one CLI bundle.
+
+    Substring search over the raw bundle, streamed in chunks with an overlap so a marker
+    straddling a chunk boundary is not missed. Deliberately crude: the bundle is minified
+    JS, so anything cleverer would be brittle, and the question being asked is only
+    "does this string still occur anywhere" — a marker that has VANISHED is the signal."""
+    needles = [m.encode() for m, _why in _MCP_CHANNEL_MARKERS]
+    hits = [False] * len(needles)
+    longest = max(len(n) for n in needles)
+    with open(app_js, "rb") as f:
+        tail = b""
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            buf = tail + chunk
+            for i, needle in enumerate(needles):
+                if not hits[i] and needle in buf:
+                    hits[i] = True
+            if all(hits):
+                break
+            tail = buf[-longest:]
+    return {m: hits[i] for i, (m, _why) in enumerate(_MCP_CHANNEL_MARKERS)}
+
+
+# The built-in server a hermetic invocation always CONFIGURES and always disables:
+# --disable-builtin-mcps covers it and _BUILTIN_MCP_SERVERS names it on every argv.
+# 1.0.64 therefore lists it in session.mcp_servers_loaded on every run under the
+# harness's flags — verified live, as the sole entry, `{"name": "github-mcp-server",
+# "status": "disabled"}`. That makes it the witness's SENTINEL: a well-formed event that
+# does not name it is not describing the MCP host this adapter was built against, so an
+# empty or truncated server list can no longer pass for "nothing was loaded".
+_WITNESS_SENTINEL = "github-mcp-server"
+
+
+def _mcp_witness(stdout: str,
+                 exit_code: Optional[int]) -> tuple[Optional[str], list[str]]:
+    """Read copilot's MCP witness out of its own event stream.
+
+    Returns ``(contract_violation, live_servers)`` — the violation being ``None`` when the
+    stream still speaks the contract this audit depends on, and ``live_servers`` the
+    servers copilot said it brought up, as ``name (status)``.
+
+    ``--output-format json`` streams two ephemeral events describing the MCP host:
     ``session.mcp_servers_loaded`` (emitted right after initializeMcpHost(), one entry per
-    CONFIGURED server with its status — a disabled one is listed as ``disabled``, not
+    CONFIGURED server with its status — a disabled one is LISTED as ``disabled``, not
     omitted) and ``session.mcp_server_status_changed`` (a later transition, e.g. a server
     that connects mid-run). Both are read here; ``parse`` skips them only because they are
     ephemeral streaming fragments, not because they are absent.
 
     This is the one piece of evidence a launch-window leak cannot take back. Every other
-    check the adapter makes reads the filesystem, so a change that is reverted before the
-    child exits reads back clean — but copilot has already said, in its own output, which
-    servers it started. Verified against 1.0.64: with the harness's flags the sole entry
-    reports ``{"name": "github-mcp-server", "status": "disabled"}`` and never transitions,
-    while dropping --disable-builtin-mcps yields ``connected`` plus a status_changed event.
+    check the adapter makes reads the filesystem, so a change reverted before the child
+    exits reads back clean — but copilot has already said, in its own captured output,
+    which servers it started. Verified against 1.0.64: with the harness's flags the sole
+    entry reports ``github-mcp-server``/``disabled`` and never transitions, while dropping
+    --disable-builtin-mcps yields ``connected`` plus a status_changed event.
 
-    Absence proves nothing (a child killed on timeout may report nothing at all), which is
-    why this supplements the state re-check rather than replacing it.
-    """
-    live: dict[str, str] = {}
+    THE CONTRACT IS CHECKED, NOT THE VERSION, and the check has to be strict in three
+    separate ways, because every weakening of it degrades silently into "no servers
+    found" — which is indistinguishable from a clean run:
 
-    def note(name: object, status: object) -> None:
-        if isinstance(name, str) and name and str(status) not in _INERT_MCP_STATUSES:
-            live[name] = str(status)
+    * WHEN the witness is required. Inferring "the session finished" from copilot's own
+      ``result`` event makes the gate self-defeating: a build that renamed BOTH events
+      would emit neither, be judged incomplete, and pass. So a normal zero exit is what
+      demands the witness — a fact about the process, not about the stream, and one no
+      rename can erase. (``result`` still counts, so a nonzero exit that nonetheless
+      reported a completed session is held to the contract too.) A child killed on
+      timeout exits -9 and is not blamed for a report it never had the chance to make;
+      the state re-check covers exactly that case.
+    * WHAT SHAPE the payload has. ``data`` must be an object and ``data.servers`` a list
+      of entries each carrying a non-empty string ``name`` and ``status``. A renamed
+      field (``mcpServers``), a null, a string, or one malformed entry means the event is
+      no longer the event this reader understands — that is a contract violation, not an
+      empty server list.
+    * WHAT IT NAMES. A well-formed but EMPTY list would still satisfy a
+      presence-only check while proving nothing, so the built-in sentinel
+      (``_WITNESS_SENTINEL``) must appear. Only its presence is required here, not its
+      status: a sentinel reported live is a genuine leak and is reported as such by the
+      caller, with the message that actually fits.
 
-    for obj in iter_jsonl(stdout):
-        etype = obj.get("type")
-        data = obj.get("data") or {}
-        if etype == "session.mcp_servers_loaded":
-            servers = data.get("servers")
-            if isinstance(servers, list):
-                for srv in servers:
-                    if isinstance(srv, dict):
-                        note(srv.get("name"), srv.get("status"))
-        elif etype == "session.mcp_server_status_changed":
-            note(data.get("serverName"), data.get("status"))
-    return [f"{n} ({live[n]})" for n in sorted(live)]
-
-
-def _mcp_witness_gap(stdout: str) -> bool:
-    """True when copilot ran to COMPLETION under the JSON contract and yet never reported
-    its MCP host — i.e. the evidence _live_mcp_servers reads was silently not there.
-
-    This is the version gate, and it is deliberately not a version NUMBER. The obvious
-    check — read ``copilot --version`` before launching and refuse builds this adapter was
-    not verified against — cannot be built soundly here, for two independently fatal
-    reasons, both established against the installed CLI rather than reasoned about:
+    Why not a version NUMBER instead — the obvious alternative, refusing builds this
+    adapter was not verified against? Because it cannot be built soundly here, for two
+    independently fatal reasons, both established against the installed CLI rather than
+    reasoned about:
 
     * The version reported is not the version that runs. The npm package advertises
       1.0.63 in its metadata while the executable it resolves to (a ~150 MB
@@ -284,26 +526,82 @@ def _mcp_witness_gap(stdout: str) -> bool:
 
     So the version is unreadable and unpinnable from outside, and the branch's standing
     rule applies anyway: a fact learned by executing a program copilot independently
-    executes again may not CLEAR a security decision.
-
-    What is checkable is the thing a version gate was wanted for. The audit's ABA-immune
-    witness depends on one stream contract — ``session.mcp_servers_loaded`` naming every
-    configured server — and a build that renames or drops that event would make
-    _live_mcp_servers return an empty list, which reads exactly like a clean run. Requiring
-    the event to be PRESENT converts that silent degradation into a loud failure, without
-    executing anything twice: the evidence comes from the run being judged. The
-    requirement is conditioned on copilot's own ``result`` event, its end-of-session
-    marker, so a child killed on timeout or one that died before its MCP host initialized
-    is not blamed for a report it never had the chance to make.
+    executes again may not CLEAR a security decision. The contract check needs no second
+    execution — its evidence comes from the very run being judged.
     """
-    completed = reported = False
+    live: dict[str, str] = {}
+    violations: list[str] = []
+    completed = exit_code == 0
+    loaded_ok = sentinel_seen = False
+
+    def note(name: str, status: str) -> None:
+        if status not in _INERT_MCP_STATUSES:
+            live[name] = status
+
+    def entry(name: object, status: object, where: str) -> bool:
+        if (not isinstance(name, str) or not name
+                or not isinstance(status, str) or not status):
+            violations.append(
+                f"{where} carries a malformed entry (name={name!r}, status={status!r}): "
+                "each entry must name a server and its status as non-empty strings")
+            return False
+        note(name, status)
+        return True
+
     for obj in iter_jsonl(stdout):
         etype = obj.get("type")
+        data = obj.get("data")
         if etype == "result":
             completed = True
         elif etype == "session.mcp_servers_loaded":
-            reported = True
-    return completed and not reported
+            if not isinstance(data, dict):
+                violations.append(
+                    "session.mcp_servers_loaded carries no 'data' object "
+                    f"(got {type(data).__name__})")
+                continue
+            servers = data.get("servers")
+            if not isinstance(servers, list):
+                violations.append(
+                    "session.mcp_servers_loaded has no 'data.servers' LIST (got "
+                    f"{type(servers).__name__}; keys present: {sorted(data)}) — a "
+                    "renamed or retyped field reads as 'no servers', which is exactly "
+                    "what a clean run looks like")
+                continue
+            well_formed = True
+            for srv in servers:
+                if isinstance(srv, dict):
+                    ok = entry(srv.get("name"), srv.get("status"),
+                               "session.mcp_servers_loaded.data.servers")
+                    if ok and srv.get("name") == _WITNESS_SENTINEL:
+                        sentinel_seen = True
+                else:
+                    ok = entry(None, None, "session.mcp_servers_loaded.data.servers")
+                well_formed = well_formed and ok
+            loaded_ok = loaded_ok or well_formed
+        elif etype == "session.mcp_server_status_changed":
+            if not isinstance(data, dict):
+                violations.append(
+                    "session.mcp_server_status_changed carries no 'data' object "
+                    f"(got {type(data).__name__})")
+                continue
+            entry(data.get("serverName"), data.get("status"),
+                  "session.mcp_server_status_changed.data")
+
+    if violations:
+        return violations[0], _fmt_live(live)
+    if completed and not loaded_ok:
+        return ("no well-formed session.mcp_servers_loaded event reached the harness",
+                _fmt_live(live))
+    if completed and not sentinel_seen:
+        return (f"session.mcp_servers_loaded never named the built-in "
+                f"{_WITNESS_SENTINEL!r}, which a hermetic invocation always configures "
+                "and disables — so the event is not describing the MCP host this "
+                "adapter was verified against", _fmt_live(live))
+    return None, _fmt_live(live)
+
+
+def _fmt_live(live: Mapping[str, str]) -> list[str]:
+    return [f"{n} ({live[n]})" for n in sorted(live)]
 
 
 def _jsonc_strip(text: str) -> str:
@@ -1059,7 +1357,7 @@ class CopilotAdapter(Adapter):
     # directory sorts highest — a planted 9.9.9/app.js runs, as arbitrary code inside the
     # child, ahead of every MCP flag on this argv. With the flag the run is pinned to the
     # binary's own app root and the plant is ignored (both halves verified live). See
-    # _mcp_witness_gap for why the resulting build still cannot be identified by version.
+    # _mcp_witness for why the resulting build still cannot be identified by version.
     _HERMETIC = [
         "--no-custom-instructions",
         "--disable-builtin-mcps",
@@ -1281,7 +1579,8 @@ class CopilotAdapter(Adapter):
         return argv
 
     def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str,
-                        stdout: str = "", stderr: str = "") -> None:
+                        stdout: str = "", stderr: str = "",
+                        exit_code: Optional[int] = None) -> None:
         """Audit the finished run two ways: what copilot SAID it loaded, and whether the
         state the disable set was computed from still says the same thing.
 
@@ -1303,7 +1602,7 @@ class CopilotAdapter(Adapter):
 
         So the window is audited rather than closed, from two directions:
 
-        1. THE CHILD'S OWN REPORT (_live_mcp_servers). Copilot streams
+        1. THE CHILD'S OWN REPORT (_mcp_witness). Copilot streams
            session.mcp_servers_loaded / session.mcp_server_status_changed naming every
            configured server and its status. Any server not reported inert was brought
            up, and no later edit to the filesystem retracts that. This is what catches
@@ -1323,9 +1622,12 @@ class CopilotAdapter(Adapter):
 
         Direction (1) is only as good as the stream contract it reads, and the CLI version
         that contract belongs to can neither be read nor pinned from outside the run (see
-        _mcp_witness_gap). So the contract is checked instead of the version: a run that
-        reported its own completion without ever reporting an MCP host has silently lost
-        the witness, and is refused before either direction is consulted.
+        _mcp_witness). So the CONTRACT is checked instead of the version, and checked
+        strictly: any run that finished normally — a zero exit, which no event rename can
+        disguise — must produce a well-formed ``session.mcp_servers_loaded`` naming the
+        built-in sentinel. A witness that is absent, reshaped, or renamed degrades into
+        "no servers found", which is indistinguishable from a clean run, so it is refused
+        before either direction is consulted.
 
         Re-executing the enumeration is sound in the direction it is used — unlike the
         git preflight this branch refuses (which would CLEAR a gate on the first of two
@@ -1341,19 +1643,24 @@ class CopilotAdapter(Adapter):
         observe, and this scan errs toward the loud answer like every other one on this
         path. Relocate such fixtures outside the discovery tree.
         """
-        if _mcp_witness_gap(stdout):
+        # A build KNOWN to break an assumption is refused first: that is the one tier the
+        # runtime contract cannot reach, since such a defect leaves the witness intact.
+        # Everything after this point is contract evidence, which is version-independent.
+        version = _stream_cli_version(stdout)
+        _check_cli_version_denied(version)
+        broken, live = _mcp_witness(stdout, exit_code)
+        if broken is not None:
             raise RuntimeError(
-                "copilot ran to completion (it emitted its own 'result' event) without "
-                "ever reporting an MCP host: no session.mcp_servers_loaded event reached "
-                "the harness. That event is where the ABA-immune half of this audit gets "
-                "its evidence, and a hermetic run on a build this adapter understands "
-                "always emits it (naming at least the built-in server as 'disabled'). Its "
-                "absence means the stream contract no longer holds — most likely a CLI "
-                "build that renamed or dropped it, which the version cannot be checked "
-                "for (see _mcp_witness_gap) — so the run's hermeticity is unwitnessed "
-                "rather than confirmed; failing closed."
+                f"copilot's MCP witness does not hold: {broken}. The run finished "
+                "normally (zero exit, or its own 'result' event), and that stream is "
+                "where the ABA-immune half of this audit gets its evidence — a hermetic "
+                "run on a build this adapter understands always reports its MCP host and "
+                "names the built-in server there. A witness that is missing, reshaped, or "
+                "renamed yields 'no servers found', which reads exactly like a clean run, "
+                "so it is refused instead: the version this contract belongs to can "
+                "neither be read nor pinned from outside (see _mcp_witness). The run's "
+                "hermeticity is unwitnessed rather than confirmed; failing closed."
             )
-        live = _live_mcp_servers(stdout)
         if live:
             raise RuntimeError(
                 f"copilot's own event stream reports MCP server(s) {', '.join(live)} as "
@@ -1379,6 +1686,12 @@ class CopilotAdapter(Adapter):
                 "execs git for its agent-dir boundary, so a server added in that "
                 "window loads un-disabled. This run is not provably MCP-hermetic."
             )
+        # Last, and only on a run that cleared every gate above: say so if the build is
+        # one the analysis has never been checked against. Warning here rather than
+        # earlier keeps a genuine hermeticity failure from being buried under a version
+        # notice, and keeps the notice honest — it describes what a PASSING run does and
+        # does not cover.
+        _warn_cli_version_drift(version, agent=self.name)
 
     def parse(self, stdout: str, stderr: str, exit_code: int,
                *, opts: Optional[RunOptions] = None) -> ParseOutput:

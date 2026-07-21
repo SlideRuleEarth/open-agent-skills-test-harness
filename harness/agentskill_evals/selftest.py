@@ -2369,6 +2369,378 @@ def _check_exec_timeout_group_kill(failures, verbose):
                 pass
         shutil.rmtree(tmp, ignore_errors=True)
 
+    _check_exec_early_exit_group_kill(failures, verbose)
+    _check_exec_process_tree_handles(failures, verbose)
+
+
+def _check_copilot_version_provenance(failures, verbose):
+    """Version drift is MESSAGED, never gated on — and the version is read from the run.
+
+    The adapter cannot gate on a version learned by executing the CLI: a preflight
+    `--version` resolves its app.js through writable caches the real argv bypasses, so the
+    two can execute different code. But the version that ACTUALLY ran is recoverable from
+    the child's own stream, which is the same evidence class as the MCP witness. These
+    arms pin that, the three severity tiers, and the bundle audit that clears a new build.
+    """
+    import io
+    import json as _json
+    import os
+    import shutil
+    import sys
+    import tempfile
+
+    from .adapters import copilot as _cop
+
+    print("copilot version provenance:")
+
+    def _skills(*paths):
+        return _json.dumps({"type": "session.skills_loaded", "ephemeral": True,
+                            "data": {"skills": [{"name": "s", "path": p}
+                                                for p in paths]}})
+
+    app = "/Users/x/Library/Caches/copilot/pkg/darwin-arm64/1.0.72/builtin/s/SKILL.md"
+    # A model can write anything it likes into its own message; the version must not be
+    # readable from there, or a model could silence the drift warning by describing a
+    # verified version. Only session.skills_loaded paths count.
+    forged = _json.dumps({"type": "assistant.message",
+                          "data": {"content": "running pkg/darwin-arm64/9.9.9/app.js"}})
+    ver_real = _cop._stream_cli_version(_skills(app))
+    ver_forged_only = _cop._stream_cli_version(forged)
+    ver_both = _cop._stream_cli_version(_skills(app) + "\n" + forged)
+    ver_none = _cop._stream_cli_version("")
+    # disagreeing app roots => unknown, not a coin flip
+    ver_ambig = _cop._stream_cli_version(_skills(
+        app, "/c/pkg/darwin-arm64/1.0.64/builtin/s/SKILL.md"))
+    _check("copilot.version_read_from_the_run_not_a_probe",
+           ver_real == "1.0.72" and ver_forged_only is None and ver_both == "1.0.72"
+           and ver_none is None and ver_ambig is None,
+           f"the executing version is recovered from the child's own app-root paths "
+           f"(same evidence class as the MCP witness, no second execution), and model "
+           f"prose cannot forge it: real={ver_real!r} forged_only={ver_forged_only!r} "
+           f"real+forged={ver_both!r} empty={ver_none!r} ambiguous={ver_ambig!r}",
+           failures, verbose)
+
+    # --- the three tiers ---------------------------------------------------------
+    saved_denied = dict(_cop._DENIED_VERSIONS)
+    saved_warned = set(_cop._WARNED_VERSIONS)
+    saved_err = sys.stderr
+    try:
+        _cop._DENIED_VERSIONS.clear()
+        _cop._DENIED_VERSIONS["6.6.6"] = "masks plugins incorrectly"
+        denied = ""
+        try:
+            _cop._check_cli_version_denied("6.6.6")
+        except RuntimeError as exc:
+            denied = str(exc)
+        # a verified version is neither denied nor warned about
+        _cop._WARNED_VERSIONS.clear()
+        sys.stderr = io.StringIO()
+        _cop._check_cli_version_denied(_cop._VERIFIED_VERSIONS[0])
+        _cop._warn_cli_version_drift(_cop._VERIFIED_VERSIONS[0])
+        quiet = sys.stderr.getvalue()
+        # an unknown version warns ONCE per process, however many cells run
+        sys.stderr = io.StringIO()
+        _cop._warn_cli_version_drift("9.9.9")
+        _cop._warn_cli_version_drift("9.9.9")
+        warned = sys.stderr.getvalue()
+        # an undeterminable version warns too, rather than passing silently
+        sys.stderr = io.StringIO()
+        _cop._warn_cli_version_drift(None)
+        warned_unknown = sys.stderr.getvalue()
+    finally:
+        sys.stderr = saved_err
+        _cop._DENIED_VERSIONS.clear()
+        _cop._DENIED_VERSIONS.update(saved_denied)
+        _cop._WARNED_VERSIONS.clear()
+        _cop._WARNED_VERSIONS.update(saved_warned)
+
+    _check("copilot.version_tiers",
+           "denylist" in denied and quiet == ""
+           and warned.count("warning:") == 1 and "9.9.9" in warned
+           and "ADDED" in warned and "verify-copilot-channels" in warned
+           and warned_unknown.count("warning:") == 1,
+           f"a build known to be broken fails closed by name (the one tier the runtime "
+           f"contract cannot reach — such a defect leaves the witness intact); a verified "
+           f"build is silent; an unknown or undeterminable one warns ONCE per process and "
+           f"says plainly that a passing run does not cover a channel the build ADDED: "
+           f"denied={denied[:50]!r} quiet={quiet!r} warns={warned.count('warning:')} "
+           f"unknown_warns={warned_unknown.count('warning:')}", failures, verbose)
+
+    # --- the bundle audit that clears a new build --------------------------------
+    tmp = tempfile.mkdtemp(prefix="ase-bundle-")
+    try:
+        markers = [m for m, _why in _cop._MCP_CHANNEL_MARKERS]
+        root = os.path.join(tmp, "pkg", "darwin-arm64")
+        for ver, body in (("1.0.72", " ".join(markers)),
+                          ("2.0.0", " ".join(markers[:-1])),   # one channel dropped
+                          ("nonsense", " ".join(markers))):
+            os.makedirs(os.path.join(root, ver))
+            with open(os.path.join(root, ver, "app.js"), "w") as f:
+                f.write(body)
+        found = _cop.find_cli_bundles({"COPILOT_CACHE_HOME": tmp, "COPILOT_HOME": tmp})
+        # The real per-platform cache roots are always scanned too (that is the point of
+        # the command), so this host's own bundles legitimately show up — restrict to the
+        # fixture to keep the assertion independent of what is installed here.
+        versions = [v for v, p in found if p.startswith(tmp)]
+        full = _cop.audit_channel_markers(os.path.join(root, "1.0.72", "app.js"))
+        gapped = _cop.audit_channel_markers(os.path.join(root, "2.0.0", "app.js"))
+        missing = sorted(m for m, ok in gapped.items() if not ok)
+        # a marker straddling the 1 MiB read boundary must still be found
+        straddle = os.path.join(tmp, "straddle.js")
+        pad = (1 << 20) - (len(markers[0]) // 2)
+        with open(straddle, "w") as f:
+            f.write("." * pad + " ".join(markers))
+        straddled = _cop.audit_channel_markers(straddle)
+        _check("copilot.channel_bundle_audit",
+               versions == ["1.0.72", "2.0.0"] and all(full.values())
+               and missing == [markers[-1]] and all(straddled.values()),
+               f"the audit discovers version-shaped bundles only (a 'nonsense' dir is "
+               f"skipped), reports every channel marker present for an intact build, "
+               f"names the one a build DROPPED — the silent-degradation case it exists "
+               f"for — and finds a marker straddling the read-chunk boundary: "
+               f"versions={versions} all_present={all(full.values())} "
+               f"missing={missing} straddle_ok={all(straddled.values())}",
+               failures, verbose)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _check_exec_early_exit_group_kill(failures, verbose):
+    """The timeout kill must still reach the group when the LEADER has already exited.
+
+    The check above keeps the parent alive for the whole timeout, so the group is always
+    reachable through the live leader — and it therefore passed while this shape was
+    broken. The shape that matters is the real one: the CLI starts an MCP server, exits,
+    and the server inherits and holds the captured stdout pipe. ``communicate()`` blocks
+    on that pipe (not on the process), reaps the leader via its own ``poll()``, and times
+    out — at which point deriving the group from ``os.getpgid(proc.pid)`` raises
+    ``ProcessLookupError`` and the kill silently degrades to a no-op on a dead pid.
+
+    Measured before the fix: a 1s timeout returned after 10.1s, ``timed_out=True``, and
+    the grandchild ran to completion and wrote its marker. The group id is now captured at
+    launch (``_ProcessTree``), so both halves hold — prompt return AND a dead grandchild.
+    """
+    import os
+    import shutil
+    import sys
+    import tempfile
+    import time
+
+    from .exec import run_captured
+
+    if not hasattr(os, "killpg"):
+        if verbose:
+            print("  [skipped — no process groups on this platform]")
+        return
+
+    tmp = tempfile.mkdtemp(prefix="ase-earlyexit-")
+    marker = os.path.join(tmp, "survived")
+    # The grandchild inherits the pipe and outlives the parent, which exits at once.
+    grandchild = (
+        "import time\n"
+        "time.sleep(10)\n"
+        f"open({marker!r}, 'w').write('survived')\n"
+    )
+    child = (
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}])\n"
+        "sys.exit(0)\n"
+    )
+    try:
+        start = time.monotonic()
+        _out, _err, code, timed_out = run_captured(
+            [sys.executable, "-c", child], cwd=tmp, env=dict(os.environ), timeout=1)
+        elapsed = time.monotonic() - start
+        time.sleep(0.3)     # a surviving grandchild would still be sleeping, not writing
+        survived = os.path.exists(marker)
+        _check("exec.timeout_kills_group_after_leader_exits",
+               timed_out and code == -9 and elapsed < 5 and not survived,
+               f"a parent that exits while a grandchild holds the captured pipe open is "
+               f"still reaped as a GROUP: the timeout returns promptly instead of "
+               f"blocking on the surviving pipe, and the grandchild does not outlive it "
+               f"(elapsed={elapsed:.2f}s timed_out={timed_out} code={code} "
+               f"grandchild_survived={survived})", failures, verbose)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _check_exec_process_tree_handles(failures, verbose):
+    """The Windows job-object path and the spawn/post-spawn error split.
+
+    Neither can be exercised by running a real process on a POSIX host, so both are
+    driven the way copilot's ODR registry read is: against a stub injected at the one
+    seam the production code calls through (``_win32_kernel32``). This pins the CALL
+    SEQUENCE and the failure handling; it is not a substitute for running on Windows,
+    which was not possible here (see ``_win32_assign_job``).
+    """
+    import sys
+
+    from . import exec as exec_mod
+    from .adapters.base import Adapter, ParseOutput
+    from .exec import ChildSpawned
+
+    calls: list = []
+
+    class _FakeFn:
+        def __init__(self, name, ret):
+            self.name, self.ret = name, ret
+            self.restype = self.argtypes = None
+
+        def __call__(self, *args):
+            calls.append((self.name, args))
+            return self.ret
+
+    class _FakeK32:
+        def __init__(self, rets):
+            self._rets = rets
+            self._fns: dict = {}
+
+        def __getattr__(self, name):
+            if name not in self._fns:
+                self._fns[name] = _FakeFn(name, self._rets.get(name, 1))
+            return self._fns[name]
+
+    class _FakeProc:
+        _handle = 7
+        pid = -12345            # never used: _HAS_KILLPG is forced off for these arms
+        killed = False
+
+        def kill(self):
+            self.killed = True
+
+    saved_k32 = exec_mod._win32_kernel32
+    try:
+        # --- the happy path: create, request kill-on-close, assign ---------------
+        exec_mod._win32_kernel32 = lambda: _FakeK32({"CreateJobObjectW": 4242})
+        job = exec_mod._win32_assign_job(_FakeProc())
+        names = [c[0] for c in calls]
+        set_info = next((c for c in calls if c[0] == "SetInformationJobObject"), None)
+        assigned = job == 4242 and names == [
+            "CreateJobObjectW", "SetInformationJobObject", "AssignProcessToJobObject"]
+        # the info class must be the EXTENDED one, or the kill-on-close flag is ignored
+        info_class_ok = set_info is not None and set_info[1][1] == 9
+        limits = exec_mod._kill_on_close_limits()
+        flag_ok = limits.BasicLimitInformation.LimitFlags == 0x2000
+
+        # --- a job that cannot be created, and one that cannot be assigned -------
+        calls.clear()
+        exec_mod._win32_kernel32 = lambda: _FakeK32({"CreateJobObjectW": 0})
+        no_job = exec_mod._win32_assign_job(_FakeProc())
+        calls.clear()
+        exec_mod._win32_kernel32 = lambda: _FakeK32(
+            {"CreateJobObjectW": 4242, "AssignProcessToJobObject": 0})
+        unassigned = exec_mod._win32_assign_job(_FakeProc())
+        # a job that could not be assigned must not leak its handle
+        closed = any(c[0] == "CloseHandle" for c in calls)
+
+        # --- kill() terminates the JOB, not just the direct child ----------------
+        calls.clear()
+        exec_mod._win32_kernel32 = lambda: _FakeK32({})
+        proc = _FakeProc()
+        saved_killpg, exec_mod._HAS_KILLPG = exec_mod._HAS_KILLPG, False
+        try:
+            tree = exec_mod._ProcessTree(proc)
+            tree._job = 4242            # as if _win32_assign_job had succeeded
+            tree.kill()
+        finally:
+            exec_mod._HAS_KILLPG = saved_killpg
+        job_killed = ([c[0] for c in calls] == ["TerminateJobObject"]
+                      and not proc.killed)
+
+        _check("exec.win32_job_object_kills_the_tree",
+               assigned and info_class_ok and flag_ok and no_job is None
+               and unassigned is None and closed and job_killed,
+               f"the Windows path puts the child in a Job Object (so a grandchild whose "
+               f"parent already exited is still terminated — no process groups there, and "
+               f"taskkill /T walks links an exited parent no longer has), requests "
+               f"kill-on-close, degrades to None when the job can't be created or "
+               f"assigned, and terminates the JOB rather than the one process: "
+               f"assigned={assigned} info_class={info_class_ok} flag={flag_ok} "
+               f"no_job={no_job is None} unassigned={unassigned is None} "
+               f"handle_closed={closed} job_killed={job_killed}", failures, verbose)
+
+        # --- ChildSpawned: a post-spawn failure is NOT a failure to spawn --------
+        # run_captured must distinguish them, because they demand opposite handling: a
+        # child that never started has nothing to audit, while one that broke mid-flight
+        # may already have brought an MCP server up.
+        shim = type(exec_mod)("subprocess_shim")
+        shim.PIPE, shim.DEVNULL = exec_mod.subprocess.PIPE, exec_mod.subprocess.DEVNULL
+        shim.TimeoutExpired = exec_mod.subprocess.TimeoutExpired
+
+        broken = _FakeProc()
+
+        class _BrokenPipePopen:
+            def __init__(self, *a, **k):
+                self.pid, self.returncode = broken.pid, None
+
+            def communicate(self, timeout=None):
+                raise OSError("the pipe went away mid-run")
+
+            def kill(self):
+                broken.killed = True
+
+        shim.Popen = _BrokenPipePopen
+        saved_sub, exec_mod.subprocess = exec_mod.subprocess, shim
+        saved_killpg, exec_mod._HAS_KILLPG = exec_mod._HAS_KILLPG, False
+        try:
+            raised = None
+            try:
+                exec_mod.run_captured(["x"], cwd=".", env={}, timeout=1)
+            except BaseException as exc:      # noqa: BLE001 — the type IS the assertion
+                raised = exc
+        finally:
+            exec_mod.subprocess = saved_sub
+            exec_mod._HAS_KILLPG = saved_killpg
+        wrapped = (isinstance(raised, ChildSpawned)
+                   and isinstance(raised.__cause__, OSError) and broken.killed)
+
+        # ...and the consumer acts on that split: the probe audits a child that RAN and
+        # skips the audit only when there was no child at all.
+        audited: list = []
+
+        class _AuditCli(Adapter):
+            name = "auditcli"
+            binary = sys.executable
+
+            def build_argv(self, prompt, opts, *, cwd):
+                return [self.binary, "-c", "pass"]
+
+            def _probe_argv(self, model, *, cwd=None, env=None):
+                return [self.binary, "-c", "pass"]
+
+            def parse(self, stdout, stderr, exit_code, *, opts=None):
+                return ParseOutput()
+
+            def verify_post_run(self, argv, opts, *, cwd, stdout="", stderr="",
+                                exit_code=None):
+                audited.append(stdout)
+
+        saved_rc = exec_mod.run_captured
+        try:
+            exec_mod.run_captured = lambda *a, **k: (_ for _ in ()).throw(
+                ChildSpawned(OSError("broke"), stdout="said something", stderr=""))
+            post_spawn = _AuditCli().probe_model("m", timeout=5)
+            audited_post_spawn = list(audited)
+            audited.clear()
+            exec_mod.run_captured = lambda *a, **k: (_ for _ in ()).throw(
+                OSError("could not spawn"))
+            never_spawned = _AuditCli().probe_model("m", timeout=5)
+        finally:
+            exec_mod.run_captured = saved_rc
+
+        _check("exec.post_spawn_failure_is_still_audited",
+               wrapped and post_spawn.accepted is False
+               and audited_post_spawn == ["said something"]
+               and never_spawned.accepted is False and audited == [],
+               f"a failure AFTER the child started is reported as ChildSpawned (carrying "
+               f"the output it managed to produce) and still goes through the post-run "
+               f"MCP audit, while a failure to spawn at all skips it — before, both "
+               f"arrived as OSError and a child that HAD run escaped the audit: "
+               f"wrapped={wrapped} audited_after_post_spawn={audited_post_spawn!r} "
+               f"audited_after_spawn_failure={audited!r}", failures, verbose)
+    finally:
+        exec_mod._win32_kernel32 = saved_k32
+
 
 def _check_inline_truncation(failures, verbose):
     """The report inlines every text file but must cap each one: a legitimate multi-MB CSV
@@ -3948,10 +4320,10 @@ def _run_selftest_checks(verbose: bool = False) -> int:
             # no-op again, proving these arms fire on the STREAM and nothing else.
             _sh.rmtree(os.path.join(_pr_cwd, ".github"))
 
-            def _pr_out(*events):
+            def _pr_out(*events, exit_code=None):
                 try:
                     return ("" if _pr_cop_ad.verify_post_run(
-                        _pr_argv, _pr_opts, cwd=_pr_cwd,
+                        _pr_argv, _pr_opts, cwd=_pr_cwd, exit_code=exit_code,
                         stdout="\n".join(_json.dumps(e) for e in events)) is None
                         else "returned")
                 except RuntimeError as exc:
@@ -4010,24 +4382,72 @@ def _run_selftest_checks(verbose: bool = False) -> int:
                                   "data": {"servers": []}},
                                  {"type": "result", "exitCode": 0})
             # ...but a child that never finished is not blamed for a report it never had
-            # the chance to make: no `result`, no requirement (the state re-read, which
-            # covers exactly that case, has already run above)
+            # the chance to make: no `result`, NONZERO exit, no requirement (the state
+            # re-read, which covers exactly that case, has already run above)
             pr_incomplete = _pr_out({"type": "assistant.turn_end", "data": {}}) == ""
             pr_empty_stream = _pr_out() == ""
-            # an empty server LIST still satisfies the contract — the event is the witness,
-            # not its contents
-            pr_empty_list = _pr_out(_pr_loaded(), {"type": "result", "exitCode": 0}) == ""
-            _check("copilot.post_run_requires_the_mcp_witness_event",
-                   "result" in pr_gap and "session.mcp_servers_loaded" in pr_gap
-                   and bool(pr_renamed) and pr_incomplete and pr_empty_stream
-                   and pr_empty_list,
-                   f"a completed run that never reported an MCP host fails closed rather "
-                   f"than passing on absent evidence (this is the version gate, the "
-                   f"version itself being neither readable nor pinnable), while an "
-                   f"unfinished run and an empty server list are not penalized: "
-                   f"gap={pr_gap[:70]!r} renamed={bool(pr_renamed)} "
-                   f"incomplete={pr_incomplete} empty_stream={pr_empty_stream} "
-                   f"empty_list={pr_empty_list}", failures, verbose)
+            pr_killed = _pr_out(exit_code=-9) == ""
+            # A ZERO EXIT demands the witness even when NOTHING in the stream is
+            # recognizable. Inferring completion from copilot's own `result` event would
+            # make the gate self-defeating: a build that renamed both events emits
+            # neither, reads as "never finished", and passes — precisely the drift this
+            # replaced a version number to catch.
+            pr_zero_exit = _pr_out({"type": "session.done"}, exit_code=0)
+            pr_renamed_both = _pr_out({"type": "session.mcp_servers_ready",
+                                       "data": {"servers": []}},
+                                      {"type": "session.finished"}, exit_code=0)
+            # A well-formed but EMPTY list proves nothing: the built-in sentinel is
+            # configured and disabled on every hermetic invocation, so a witness that
+            # does not name it is not describing the host this adapter was verified
+            # against. (Presence is what is required — a sentinel reported LIVE is a
+            # leak, and is reported as one, not as a broken contract.)
+            pr_empty_list = _pr_out(_pr_loaded(), {"type": "result", "exitCode": 0})
+            pr_other_only = _pr_out(_pr_loaded(("something-else", "disabled")),
+                                    {"type": "result", "exitCode": 0})
+            # Payload SHAPE: a renamed field, a retyped one, a missing data object, and a
+            # malformed entry each read as "no servers" to a presence-only check.
+            pr_no_data = _pr_out({"type": "session.mcp_servers_loaded"}, exit_code=0)
+            pr_field_renamed = _pr_out(
+                {"type": "session.mcp_servers_loaded",
+                 "data": {"mcpServers": [{"name": "github-mcp-server",
+                                          "status": "disabled"}]}}, exit_code=0)
+            pr_servers_null = _pr_out({"type": "session.mcp_servers_loaded",
+                                       "data": {"servers": None}}, exit_code=0)
+            pr_bad_entry = _pr_out(
+                {"type": "session.mcp_servers_loaded",
+                 "data": {"servers": [{"name": "github-mcp-server",
+                                       "status": "disabled"}, {"name": 17}]}},
+                exit_code=0)
+            # ...and the same strictness on the transition event, which feeds `live`
+            pr_bad_changed = _pr_out(
+                _pr_loaded(("github-mcp-server", "disabled")),
+                {"type": "session.mcp_server_status_changed",
+                 "data": {"server": "planted", "status": "connected"}}, exit_code=0)
+            # the real hermetic shape still passes with a zero exit
+            pr_strict_ok = _pr_out(_pr_loaded(("github-mcp-server", "disabled")),
+                                   {"type": "result", "exitCode": 0}, exit_code=0) == ""
+            _check("copilot.post_run_requires_the_mcp_witness_contract",
+                   "session.mcp_servers_loaded" in pr_gap
+                   and all(bool(r) for r in (
+                       pr_renamed, pr_zero_exit, pr_renamed_both, pr_empty_list,
+                       pr_other_only, pr_no_data, pr_field_renamed, pr_servers_null,
+                       pr_bad_entry, pr_bad_changed))
+                   and "github-mcp-server" in pr_empty_list
+                   and "servers" in pr_field_renamed
+                   and "malformed" in pr_bad_entry and "malformed" in pr_bad_changed
+                   and pr_incomplete and pr_empty_stream and pr_killed and pr_strict_ok,
+                   f"a normally-finished run must produce a WELL-FORMED MCP witness "
+                   f"naming the built-in sentinel — a zero exit alone demands it (no "
+                   f"event rename can disguise that), and a renamed field, a retyped "
+                   f"one, a malformed entry or an empty list are contract violations "
+                   f"rather than 'no servers'; a killed or unfinished child is still not "
+                   f"penalized: gap={bool(pr_gap)} renamed={bool(pr_renamed)} "
+                   f"zero_exit={bool(pr_zero_exit)} both_renamed={bool(pr_renamed_both)} "
+                   f"empty_list={bool(pr_empty_list)} other_only={bool(pr_other_only)} "
+                   f"no_data={bool(pr_no_data)} field={bool(pr_field_renamed)} "
+                   f"null={bool(pr_servers_null)} bad_entry={bool(pr_bad_entry)} "
+                   f"bad_changed={bool(pr_bad_changed)} killed={pr_killed} "
+                   f"incomplete={pr_incomplete} ok={pr_strict_ok}", failures, verbose)
         finally:
             _sh.rmtree(_pr_root, ignore_errors=True)
 
@@ -5097,6 +5517,9 @@ def _run_selftest_checks(verbose: bool = False) -> int:
 
     # timeout kills the agent's whole process group, not just the direct child
     _check_exec_timeout_group_kill(failures, verbose)
+
+    # CLI version drift: read from the run, tiered, and auditable
+    _check_copilot_version_provenance(failures, verbose)
 
     # report inlining is capped per file; the judge's skip behavior is unchanged
     _check_inline_truncation(failures, verbose)
