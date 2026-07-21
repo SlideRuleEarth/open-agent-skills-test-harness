@@ -39,6 +39,13 @@ From `adapters/copilot.py`:
    the harness thinks it ran.
 4. **Three tiers**: contract violation → fail; denylisted version → fail; unrecognized
    version → warn once per process, run proceeds.
+
+   **Say which of those are prevention and which are detection.** None of them are
+   prevention. The version is only legible in the run's own output, so the denylist fires
+   after the CLI has finished — a denylisted build has already done whatever it does, and
+   what the tier actually buys is that the result never counts. Review read the original
+   wording ("the run is refused by version") as a claim that the build could not run at
+   all. Wherever a tier acts later than a reader would assume, the message has to say so.
 5. **`verify-copilot-channels`** — audits an installed bundle against the inventory of
    discovery channels the adapter neutralizes, so clearing a new build is a minute rather
    than an afternoon.
@@ -102,6 +109,31 @@ Versions below are what was installed on the dev host on 2026-07-21.
   `$XDG_CACHE_HOME`, `%LOCALAPPDATA%`, and prerelease directory names the loader accepts,
   and reported nothing about them — indistinguishable in the output from having checked
   them. Err toward scanning roots that may not exist.
+
+- **Take the loader's rules from the loader, not from the spec it resembles.** The audit
+  filtered candidate directories to well-formed semver, which is *stricter* than copilot:
+  its loader keeps every directory with a readable `app.js` — no name test at all — and
+  orders them by a leading `\d+.\d+.\d+` **prefix**. So `1.0.73foo` and `1.0.73-` outrank
+  the running build and were being skipped. Two scans do this, on different filenames
+  (`sea-loader.js` finds `index.js`, which then re-scans for `app.js`), and reading them
+  is a ten-minute job that no amount of reasoning about semver substitutes for. Every
+  runner here ships its bundle as readable JS; read it.
+
+- **Anchor a version extracted from a path on something structural.** `pkg/<plat>/<ver>/`
+  can occur on either side of the real app root — above it because a cache root is an
+  ordinary caller-supplied directory, below it because a skill directory can be named
+  anything — so neither "first match" nor "deepest match" is right. The fix is to anchor
+  on a segment the CLI's own layout guarantees (`.../<ver>/builtin/`). Worth writing down
+  because the *test* for this is easy to get wrong too: a decoy above the root is caught
+  by taking the last match, so it proves nothing about the anchor. It takes a decoy on
+  each side to pin the real rule.
+
+- **Nothing in an adapter's argv is load-bearing if an env var overrides it.** Re-reading
+  copilot's loader to check the `--no-auto-update` claim turned up `COPILOT_CLI_DIST_DIR`,
+  which is consulted before any argv, imports `<value>/index.js` with no version floor and
+  no cache-root constraint, and would run arbitrary code as the agent while provenance
+  cheerfully described whatever it found. Any port should grep its loader for
+  `process.env` and account for every hit that steers code resolution.
 
 - **Be honest about the ceiling.** None of this detects a channel a new build *added* — no
   marker exists for code nobody has written yet. It converts silent drift into dated,

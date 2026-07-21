@@ -21,6 +21,24 @@ MCP was intentionally disabled from the start, but before Phase 0 only the Claud
 - **antigravity** — **leaked** (latently). `<iso_home>/.gemini/config/mcp_config.json` was a symlink to the real file; benign at the time only because that file happened to be empty.
 
 Fixing this was Phase 0, worth doing regardless of the rest of this design.
+
+**Update: Phase 0 does not support Windows, and refuses to run there.** The design below
+works out copilot's Windows ODR gate, WOW64 views and `%USERPROFILE%` resolution in
+detail, and all of that stands — but it is downstream of a guarantee the harness cannot
+currently make on that platform at all. Every hermeticity claim here rests on being able
+to kill the whole process tree the agent creates, and on Windows the only mechanism for
+that (a Job Object) can be assigned only *after* `CreateProcess` returns, while the OS
+associates a member's **future** children only. A grandchild spawned in that window —
+an MCP server started as the first thing the agent does — is permanently outside the job.
+Job-at-creation via `PROC_THREAD_ATTRIBUTE_JOB_LIST` is unreachable through stdlib
+`Popen` (CPython honours `lpAttributeList` for `handle_list` and nothing else), so
+closing it needs a bespoke `CreateProcess` or a launcher shim, plus a Windows host to
+verify on — neither of which exists yet. Rather than ship a guarantee that is silently
+unsound on one platform, `exec.run_captured` fails every win32 run closed. The Job Object
+code stays in place, correct and tested against a stubbed kernel32, because it is still
+the right sweep for the child that did start and because the follow-up that adds
+job-at-creation should change one predicate rather than start from nothing.
+
 **Update: Phase 0 is implemented** (revised across several review rounds — see §8 for the mechanics). Findings from implementation that corrected this design, all verified against the installed CLIs: codex's `-c mcp_servers={}` does **not** clear the persisted table (deep-merge), disabling a name codex doesn't load *breaks* the run, its plugins are a separate MCP channel, and its effective server set depends on the run's **cwd and env** (trusted-project `.codex/config.toml`, `$CODEX_HOME`) — so enumeration must run in the child's exact context; copilot/agy each have additional channels beyond the single user config file (plugins — including copilot's `config.json` `cache_path` records and agy's `plugins.json` — workspace configs across agy's *four* customization roots, `COPILOT_HOME`, and copilot's Windows ODR registry, which is a **fail-closed gate** — copilot executes the registry-advertised command itself, so a populated gate can't be soundly pre-enumerated and instead fails the run closed), and copilot rejects `{}` as an MCP config (§2).
 
 ## 2. Per-CLI MCP capability survey

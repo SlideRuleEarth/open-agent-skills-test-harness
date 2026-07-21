@@ -2423,6 +2423,20 @@ def _check_copilot_version_provenance(failures, verbose):
     # a prerelease build is REPORTED as itself (and so warns), not dropped as unreadable
     ver_pre = _cop._stream_cli_version(_skills(
         ("builtin", "/c/pkg/darwin-arm64/1.0.73-beta.1/builtin/s/SKILL.md")))
+    # A version-shaped `pkg/<x>/<v>/` component can appear on EITHER SIDE of the real app
+    # root, and the two want opposite tiebreaks — which is why the match is anchored on
+    # the `builtin/` the CLI's own layout guarantees, rather than tiebroken at all.
+    #   ABOVE it: a cache root is an ordinary directory ($COPILOT_CACHE_HOME is
+    #   caller-supplied), so one can be placed at a version-shaped path. Taking the FIRST
+    #   match then reports the outer decoy — a 6.6.6 build reporting itself as a VERIFIED
+    #   1.0.72, silently, which is the whole tier defeated.
+    ver_decoy_above = _cop._stream_cli_version(_skills(
+        ("builtin", "/x/pkg/darwin-arm64/1.0.72/c/pkg/darwin-arm64/6.6.6/builtin/s/S.md")))
+    #   BELOW it: a built-in skill's own directory can be named to the same shape. Taking
+    #   the LAST match reports that instead — the mirror-image failure, and the reason
+    #   "just take the deepest one" is not the fix it looks like.
+    ver_decoy_below = _cop._stream_cli_version(_skills(
+        ("builtin", "/c/pkg/darwin-arm64/1.0.72/builtin/pkg/darwin-arm64/9.9.9/S.md")))
     # malformed telemetry is an unknown version, NOT an exception: this runs inside
     # verify_post_run, where anything raised is reported as an MCP hermeticity failure.
     malformed = "\n".join([
@@ -2439,16 +2453,19 @@ def _check_copilot_version_provenance(failures, verbose):
            ver_real == "1.0.72" and ver_forged_only is None and ver_both == "1.0.72"
            and ver_none is None and ver_ambig is None and ver_project == "1.0.72"
            and ver_pre == "1.0.73-beta.1"
+           and ver_decoy_above == "6.6.6" and ver_decoy_below == "1.0.72"
            and ver_malformed is None and raised_malformed is None,
            f"the executing version is recovered from the child's own BUILTIN app-root "
            f"paths (same evidence class as the MCP witness, no second execution); model "
            f"prose cannot forge it, a workspace-controlled project skill path cannot "
-           f"make it ambiguous, a prerelease reports as itself, and malformed telemetry "
-           f"is an unknown version rather than a raised hermeticity failure: "
-           f"real={ver_real!r} forged_only={ver_forged_only!r} real+forged={ver_both!r} "
-           f"empty={ver_none!r} ambiguous={ver_ambig!r} with_project_path={ver_project!r} "
-           f"prerelease={ver_pre!r} malformed={ver_malformed!r} "
-           f"raised={raised_malformed!r}", failures, verbose)
+           f"make it ambiguous, a prerelease reports as itself, a version-shaped "
+           f"directory on EITHER side of the app root cannot stand in for it, and "
+           f"malformed telemetry is an unknown version rather than a raised hermeticity "
+           f"failure: real={ver_real!r} forged_only={ver_forged_only!r} "
+           f"real+forged={ver_both!r} empty={ver_none!r} ambiguous={ver_ambig!r} "
+           f"with_project_path={ver_project!r} prerelease={ver_pre!r} "
+           f"decoy_above={ver_decoy_above!r} decoy_below={ver_decoy_below!r} "
+           f"malformed={ver_malformed!r} raised={raised_malformed!r}", failures, verbose)
 
     # --- the three tiers ---------------------------------------------------------
     saved_denied = dict(_cop._DENIED_VERSIONS)
@@ -2492,7 +2509,7 @@ def _check_copilot_version_provenance(failures, verbose):
         _cop._WARNED_VERSIONS.update(saved_warned)
 
     _check("copilot.version_tiers",
-           "denylist" in denied and quiet == ""
+           "denylist" in denied and "AFTER the fact" in denied and quiet == ""
            and warned.count("warning:") == 1 and "9.9.9" in warned
            and "ADDED" in warned and "verify-copilot-channels" in warned
            and "witness held" in warned
@@ -2503,22 +2520,79 @@ def _check_copilot_version_provenance(failures, verbose):
            f"contract cannot reach — such a defect leaves the witness intact); a verified "
            f"build is silent; an unknown or undeterminable one warns ONCE per process and "
            f"says plainly that a passing run does not cover a channel the build ADDED — "
-           f"and claims the witness held only when one was actually produced: "
+           f"claims the witness held only when one was actually produced, and calls the "
+           f"denial what it is — detection after the CLI has already run, since the "
+           f"version is only readable from the run's own output: "
            f"denied={denied[:50]!r} quiet={quiet!r} warns={warned.count('warning:')} "
            f"unknown_warns={warned_unknown.count('warning:')} "
            f"unwitnessed_claims_witness={'witness held' in unwitnessed}",
            failures, verbose)
+
+    # --- one stray stdout line must not masquerade as a hermeticity failure -------
+    # iter_jsonl yields any well-formed JSON VALUE; a bare `42` on its own line has no
+    # .get(). Raising on it inside verify_post_run is reported as "MCP hermeticity was
+    # not confirmed", so a single junk line would bury a perfectly good witness later in
+    # the same stream — and, being indistinguishable from a real leak, would be acted on
+    # as one. Skipping non-objects is not leniency: the witness itself is still required.
+    junk = "\n".join(["42", "[1, 2]", '"a string"', "null"])
+    witness_line = _json.dumps({"type": "session.mcp_servers_loaded", "data": {"servers": [
+        {"name": _cop._WITNESS_SENTINEL, "status": "disabled"}]}})
+    try:
+        junk_witness, junk_raised = _cop._mcp_witness(junk + "\n" + witness_line, 0), None
+    except Exception as exc:            # noqa: BLE001 — not raising IS the assertion
+        junk_witness, junk_raised = None, exc
+    try:
+        junk_parsed = _cop.CopilotAdapter().parse(junk + "\n" + witness_line, "", 0)
+        parse_raised = None
+    except Exception as exc:            # noqa: BLE001 — not raising IS the assertion
+        junk_parsed, parse_raised = None, exc
+    # and the contract is still enforced: junk ALONE is a run with no witness at all
+    junk_only, _live_only, _w_only = _cop._mcp_witness(junk, 0)
+    _check("copilot.malformed_telemetry_is_not_a_leak_report",
+           junk_raised is None and junk_witness == (None, [], True)
+           and parse_raised is None and junk_parsed is not None
+           and junk_only is not None,
+           f"a non-object JSON line is skipped by both the witness reader and the "
+           f"parser rather than raising — an AttributeError there is announced as an MCP "
+           f"hermeticity failure, which would let one junk line both hide a valid witness "
+           f"and impersonate a leak — while a stream of NOTHING BUT junk still fails the "
+           f"witness contract: witness={junk_witness!r} witness_raised={junk_raised!r} "
+           f"parse_raised={parse_raised!r} junk_only_violation={junk_only!r}",
+           failures, verbose)
+
+    # --- the build the run executes must not be redirectable by the environment ---
+    # Found while re-reading 1.0.72's loader to check the --no-auto-update claim:
+    # COPILOT_CLI_DIST_DIR is consulted BEFORE any argv, imports `<value>/index.js`
+    # directly, and is subject to no version floor and no cache-root constraint. An
+    # ambient value would run arbitrary code as the agent and make the provenance reading
+    # describe a build nobody chose.
+    _opts = _cop.RunOptions(model="m")
+    redirect_env = _cop.CopilotAdapter().env(
+        {"COPILOT_CLI_DIST_DIR": "/tmp/evil", "PATH": "/usr/bin"}, _opts)
+    _check("copilot.build_redirect_env_is_cleared",
+           "COPILOT_CLI_DIST_DIR" not in redirect_env and redirect_env.get("PATH"),
+           f"COPILOT_CLI_DIST_DIR is stripped from every copilot launch, isolated or not "
+           f"— it overrides --no-auto-update entirely and points the loader at an "
+           f"arbitrary index.js, which no MCP flag on the argv would then apply to: "
+           f"kept={sorted(redirect_env)}", failures, verbose)
 
     # --- the bundle audit that clears a new build --------------------------------
     tmp = tempfile.mkdtemp(prefix="ase-bundle-")
     try:
         markers = [m for m, _why in _cop._MCP_CHANNEL_MARKERS]
         root = os.path.join(tmp, "pkg", "darwin-arm64")
+        # Every one of these is a directory the CLI's own loader treats as a candidate:
+        # it keeps whatever has a readable app.js, with NO name test, and orders by a
+        # PREFIX parse (read out of 1.0.72's index.js). So `1.0.73foo` and `1.0.73-`
+        # parse as 1.0.73 and can outrank the running build, and `nonsense` is selectable
+        # by exact name through --prefer-version. A tidier semver filter here skipped all
+        # three — saying nothing about a bundle that can execute, which in an audit reads
+        # exactly like having cleared it.
         for ver, body in (("1.0.72", " ".join(markers)),
                           ("2.0.0", " ".join(markers[:-1])),   # one channel dropped
-                          # a prerelease the loader would happily run: skipping it means
-                          # reporting nothing about it, which reads as having cleared it
                           ("1.0.73-beta.1", " ".join(markers)),
+                          ("1.0.73foo", " ".join(markers)),
+                          ("1.0.73-", " ".join(markers)),
                           ("nonsense", " ".join(markers))):
             os.makedirs(os.path.join(root, ver))
             with open(os.path.join(root, ver, "app.js"), "w") as f:
@@ -2544,17 +2618,21 @@ def _check_copilot_version_provenance(failures, verbose):
         with open(straddle, "w") as f:
             f.write("." * pad + " ".join(markers))
         straddled = _cop.audit_channel_markers(straddle)
+        # Ordered by the loader's own comparator, not by semver: an unparseable name sorts
+        # below everything, `-` anywhere means prerelease, and the raw name breaks ties.
+        expect = ["nonsense", "1.0.72", "1.0.73-", "1.0.73-beta.1", "1.0.73foo", "2.0.0"]
         _check("copilot.channel_bundle_audit",
-               versions == ["1.0.72", "1.0.73-beta.1", "2.0.0"] and all(full.values())
+               versions == expect and all(full.values())
                and missing == [markers[-1]] and all(straddled.values())
                and covers_xdg and covers_localappdata,
-               f"the audit discovers every bundle the loader could run — prereleases "
-               f"included, ordered semver-wise (a prerelease before its release), and "
-               f"across the XDG and Windows cache roots, since an unscanned root reads "
-               f"the same as a cleared one — skips a non-version dir, reports every "
-               f"channel marker present for an intact build, names the one a build "
-               f"DROPPED (the silent-degradation case it exists for), and finds a marker "
-               f"straddling the read-chunk boundary: versions={versions} "
+               f"the audit discovers every bundle the loader could run — using the "
+               f"loader's candidate rule (readable app.js, no name test) and its ordering "
+               f"(prefix parse, prerelease before its release, unparseable last), across "
+               f"the XDG and Windows cache roots, since a bundle or a root the audit "
+               f"skips reads the same as one it cleared — reports every channel marker "
+               f"present for an intact build, names the one a build DROPPED (the "
+               f"silent-degradation case it exists for), and finds a marker straddling "
+               f"the read-chunk boundary: versions={versions} "
                f"all_present={all(full.values())} missing={missing} "
                f"straddle_ok={all(straddled.values())} xdg={covers_xdg} "
                f"localappdata={covers_localappdata}", failures, verbose)
@@ -2839,6 +2917,49 @@ def _check_exec_process_tree_handles(failures, verbose):
         finally:
             exec_mod._HAS_KILLPG = saved_killpg
 
+        # --- the sweep on a normal return TERMINATES; it does not rely on the close ----
+        # Kill-on-close only fires if CloseHandle succeeds, so a sweep resting on it does
+        # nothing in exactly the case it would have to survive — and close() would then
+        # return normally with the whole tree alive. Terminate first, check the close, and
+        # fail the run if either half did not happen.
+        swept, sweep_err = [], []
+        saved_killpg3, exec_mod._HAS_KILLPG = exec_mod._HAS_KILLPG, False
+        try:            # _FakeProc's pid is a placeholder; keep it away from a real killpg
+            for label, rets in (("ok", {}),
+                                ("terminate_fails", {"TerminateJobObject": 0}),
+                                ("close_fails", {"CloseHandle": 0})):
+                calls.clear()
+                exec_mod._win32_kernel32 = lambda r=rets: _FakeK32(r)
+                tree = exec_mod._ProcessTree(_FakeProc())
+                tree._job = 4242
+                raised = None
+                try:
+                    tree.close()
+                except RuntimeError as exc:
+                    raised = exc
+                swept.append((label, [c[0] for c in calls], raised is None))
+                if label == "ok":
+                    sweep_err.append(swept[-1][1] == ["TerminateJobObject", "CloseHandle"]
+                                     and raised is None)
+                else:
+                    # the close is attempted even when the terminate failed, so neither
+                    # failure can leave the handle behind on top of the live tree
+                    sweep_err.append(raised is not None
+                                     and swept[-1][1] == ["TerminateJobObject",
+                                                          "CloseHandle"])
+        finally:
+            exec_mod._HAS_KILLPG = saved_killpg3
+        sweep_ok = all(sweep_err)
+
+        _check("exec.win32_normal_return_sweeps_the_job",
+               sweep_ok,
+               f"close() terminates the job explicitly and then checks the handle "
+               f"release, rather than leaning on kill-on-close — a close that fails is "
+               f"a kill that never happened, and either failure fails the run instead of "
+               f"returning a result the surviving tree could have influenced: "
+               f"{[(lbl, seq, 'clean' if ok else 'raised') for lbl, seq, ok in swept]}",
+               failures, verbose)
+
         _check("exec.win32_job_object_kills_the_tree",
                assigned and info_class_ok and flag_ok and not fail_closed
                and not leaked and job_killed and terminate_checked,
@@ -2887,12 +3008,64 @@ def _check_exec_process_tree_handles(failures, verbose):
             exec_mod._HAS_KILLPG = saved_killpg2
         _check("exec.uncontained_launch_fails_closed",
                isinstance(uncontained_err, ChildSpawned)
-               and "could not be contained" in str(uncontained_err)
+               and "cannot be contained" in str(uncontained_err)
                and uncontained_proc.killed,
                f"a launch whose tree cannot be contained fails the run instead of "
                f"proceeding with direct-child-only cleanup, and the child it did start "
                f"is killed and audited (raised={type(uncontained_err).__name__} "
                f"child_killed={uncontained_proc.killed})", failures, verbose)
+
+        # --- Windows is uncontainable, so Windows runs fail — every one of them ---
+        # The job can only be assigned once CreateProcess has returned, and Windows
+        # associates a member's FUTURE children only. A grandchild spawned inside that
+        # window is therefore never in the job and survives TerminateJobObject — and "the
+        # agent immediately starts an MCP server" needs no unlucky timing to land there.
+        # A successful job assignment must NOT be allowed to read as containment; nor may
+        # a working process group, which is why this runs with _HAS_KILLPG left ON. Until
+        # job-at-creation lands (PROC_THREAD_ATTRIBUTE_JOB_LIST, unreachable through
+        # stdlib Popen) the harness cannot make its guarantee here, so it declines to
+        # claim it rather than shipping one platform's silent exception to it.
+        win_proc = _FakeProc()
+
+        class _WinPopen(_NeverCommunicates):
+            def __init__(self, *a, **k):
+                self.pid, self.returncode, self._handle = 4321, None, 7
+
+            def kill(self):
+                win_proc.killed = True
+
+        shim_w = type(exec_mod)("subprocess_shim_win32")
+        shim_w.PIPE, shim_w.DEVNULL = exec_mod.subprocess.PIPE, exec_mod.subprocess.DEVNULL
+        shim_w.TimeoutExpired = exec_mod.subprocess.TimeoutExpired
+        shim_w.Popen = _WinPopen
+        fake_sys = type(exec_mod)("sys_shim")
+        fake_sys.platform = "win32"      # exec.py reads sys ONLY for .platform
+        saved_sys, exec_mod.sys = exec_mod.sys, fake_sys
+        saved_sub3, exec_mod.subprocess = exec_mod.subprocess, shim_w
+        try:
+            calls.clear()
+            # the job ASSIGNS cleanly here: containment must not follow from that
+            exec_mod._win32_kernel32 = lambda: _FakeK32({"CreateJobObjectW": 4242})
+            win_err = None
+            try:
+                exec_mod.run_captured(["x"], cwd=".", env={}, timeout=1)
+            except BaseException as exc:     # noqa: BLE001 — the type IS the assertion
+                win_err = exc
+            win_calls = [c[0] for c in calls]
+        finally:
+            exec_mod.sys = saved_sys
+            exec_mod.subprocess = saved_sub3
+        _check("exec.win32_runs_fail_closed",
+               isinstance(win_err, ChildSpawned)
+               and "cannot be contained" in str(win_err)
+               and "CreateProcess returns" in str(win_err)
+               and "TerminateJobObject" in win_calls,
+               f"a Windows run is refused even though the Job Object assigned cleanly and "
+               f"a process group was available, because assignment-after-CreateProcess "
+               f"cannot reach a grandchild spawned in the launch window — and the child "
+               f"that did start is swept through the job on the way out: "
+               f"raised={type(win_err).__name__} kernel32={win_calls} "
+               f"reason={str(win_err)[-90:]!r}", failures, verbose)
 
         # --- ChildSpawned: a post-spawn failure is NOT a failure to spawn --------
         # run_captured must distinguish them, because they demand opposite handling: a

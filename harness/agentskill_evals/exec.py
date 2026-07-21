@@ -201,9 +201,12 @@ def run_captured(argv: list[str], *, cwd: str, env: dict[str, str],
     The group is swept on EVERY return, not only on timeout — see ``_ProcessTree.close``.
     A clean exit says the agent finished, never that its descendants did.
 
-    Raises ``ChildSpawned`` if the tree could not be contained at launch (Windows only, in
-    practice): a child the harness cannot guarantee it can kill is a failed run, not a
-    quietly weaker one.
+    Raises ``ChildSpawned`` if the tree could not be contained at launch — which on
+    Windows is EVERY run, because assignment-after-CreateProcess cannot contain a
+    grandchild spawned in the launch window (see ``_ProcessTree.contained``). A child the
+    harness cannot guarantee it can kill is a failed run, not a quietly weaker one, and
+    "the harness has no Windows support yet" is a far better thing to ship than a
+    hermeticity guarantee that is unsound on one platform and says nothing about it.
     """
     proc = subprocess.Popen(
         argv,
@@ -227,8 +230,9 @@ def run_captured(argv: list[str], *, cwd: str, env: dict[str, str],
         if not tree.contained:
             tree.kill()
             raise ChildSpawned(RuntimeError(
-                f"the process tree could not be contained ({tree.why_uncontained}), so "
-                f"a surviving grandchild could not be killed"))
+                f"this run's process tree cannot be contained, so a grandchild the agent "
+                f"leaves behind — an MCP server, most of all — could outlive the run "
+                f"while it reported success: {tree.why_uncontained}"))
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
             return (stdout or ""), (stderr or ""), proc.returncode, False
@@ -296,15 +300,23 @@ def _win32_assign_job(proc: subprocess.Popen) -> Optional[int]:
     assignment that "succeeded" against a process which had already exited — the exact
     shape that made the POSIX path fail open (see ``_ProcessTree``).
 
-    THE LAUNCH RACE IS REAL AND IS NOT CLOSED HERE. Assignment happens immediately after
-    ``Popen`` returns, so a child that spawns a grandchild in that window leaves that
-    grandchild outside the job. Microsoft's own answer is to create the process already
-    in the job via ``PROC_THREAD_ATTRIBUTE_JOB_LIST``, which stdlib ``Popen`` cannot
-    express: ``STARTUPINFO.lpAttributeList`` is honoured for ``handle_list`` and nothing
-    else, and ``CREATE_SUSPENDED`` is no help because Popen closes the child's thread
-    handle and leaves no supported way to resume it. Closing this needs either a bespoke
-    ``CreateProcess`` or a job-resident launcher shim; both are Windows-only code that
-    cannot be verified here, so the window is documented rather than papered over.
+    THE LAUNCH RACE IS REAL AND IS NOT CLOSED HERE, WHICH IS WHY WINDOWS RUNS FAIL.
+    Assignment happens immediately after ``Popen`` returns, so a child that spawns a
+    grandchild in that window leaves that grandchild outside the job — permanently, since
+    Windows only associates a member's FUTURE children. Microsoft's own answer is to
+    create the process already in the job via ``PROC_THREAD_ATTRIBUTE_JOB_LIST``, which
+    stdlib ``Popen`` cannot express: ``STARTUPINFO.lpAttributeList`` is honoured for
+    ``handle_list`` and nothing else, and ``CREATE_SUSPENDED`` is no help because Popen
+    closes the child's thread handle and leaves no supported way to resume it. Closing
+    this needs either a bespoke ``CreateProcess`` or a job-resident launcher shim; both
+    are Windows-only code that cannot be verified without a Windows host.
+
+    So this job does NOT make a run containable — ``_ProcessTree.contained`` is False on
+    win32 and ``run_captured`` refuses the run. What the job is still worth is the kill:
+    it is the only mechanism that reaches a grandchild whose parent has already exited, so
+    it is what sweeps the child that did start before the run is failed. Keeping the call
+    sequence correct and tested also means the follow-up that adds job-at-creation changes
+    one predicate rather than starting from nothing.
 
     NOT verified against a live Windows host: none was available. The ctypes call
     sequence is exercised cross-host in the selftest against a stubbed kernel32, the
@@ -348,14 +360,47 @@ def _win32_assign_job(proc: subprocess.Popen) -> Optional[int]:
         return None
 
 
+def _win32_close_handle(k32, job: int) -> bool:  # pragma: no cover — win32 only
+    """``CloseHandle``, reporting whether the kernel actually accepted it.
+
+    A false return means the handle is still open, which matters here for one specific
+    reason: a job handle that will not close is a job whose kill-on-close backstop can
+    never fire. The callers that can act on that do (see ``_ProcessTree.close``); the
+    abandon paths cannot, and only leak a handle in a process that is already failing."""
+    try:
+        k32.CloseHandle.restype = wintypes.BOOL
+        return bool(k32.CloseHandle(wintypes.HANDLE(job)))
+    except Exception:
+        return False
+
+
 def _win32_close(k32, job: int) -> None:  # pragma: no cover — win32 only
     """Close a job handle and report the failure as None, so every abandon path in
     ``_win32_assign_job`` is one statement and none of them can leak the handle."""
-    try:
-        k32.CloseHandle(wintypes.HANDLE(job))
-    except Exception:
-        pass
+    _win32_close_handle(k32, job)
     return None
+
+
+def _win32_sweep_job(job: int) -> bool:  # pragma: no cover — win32 only
+    """Terminate everything in *job*, then release the handle. True only if BOTH worked.
+
+    Order matters: terminate first, close second. Closing a kill-on-close job is *also* a
+    kill, but only if the close succeeds, so a sweep built on it silently does nothing on
+    the one failure it would need to survive. Terminating first makes the close pure
+    hygiene — and it is still checked, because a handle that would not close is evidence
+    the kernel disagrees about the state of this job, which is not a thing to shrug at
+    while claiming the tree is dead."""
+    try:
+        k32 = _win32_kernel32()
+    except Exception:
+        return False
+    try:
+        k32.TerminateJobObject.restype = wintypes.BOOL
+        terminated = bool(k32.TerminateJobObject(wintypes.HANDLE(job), 1))
+    except Exception:
+        terminated = False
+    closed = _win32_close_handle(k32, job)   # attempted even after a failed terminate
+    return terminated and closed
 
 
 # The winnt.h layouts SetInformationJobObject expects. Written with EXPLICIT widths
@@ -436,13 +481,34 @@ class _ProcessTree:
 
     @property
     def contained(self) -> bool:
-        """Whether a kill here would reach the whole tree rather than one process."""
-        return self._pgid is not None or self._job is not None
+        """Whether a kill here reaches EVERY process this launch created — including one
+        the child spawned before the harness got a chance to act.
+
+        WINDOWS IS NEVER CONTAINED, and that is not a stub: it is what the mechanism
+        actually provides. The job is assigned after ``CreateProcess`` has already
+        returned, so a grandchild spawned inside that window is not a job member and
+        ``TerminateJobObject`` does not reach it. Windows associates *future* children of a
+        member, never past ones. So the job contains the tree in every case except the one
+        that needs no window at all to happen: an MCP server started as the first thing the
+        child does. Reporting that as containment would be the same fail-open this class
+        exists to remove, one platform over.
+
+        Closing it needs job-at-creation (``PROC_THREAD_ATTRIBUTE_JOB_LIST``, unreachable
+        through stdlib ``Popen`` — see ``_win32_assign_job``) or a job-resident launcher
+        shim, plus a Windows host to verify on. Until then the honest answer is that the
+        harness cannot make its process-tree guarantee on Windows, so it refuses to claim
+        it: ``run_captured`` fails the run. The job is still created and still terminated,
+        because it is the best sweep available for the child that did start."""
+        if sys.platform == "win32":  # pragma: no cover — win32 only
+            return False
+        return self._pgid is not None
 
     @property
     def why_uncontained(self) -> str:
         if sys.platform == "win32":  # pragma: no cover — win32 only
-            return "no Windows Job Object could be created, limited and assigned"
+            return ("Windows containment is not sound: the Job Object can only be assigned "
+                    "after CreateProcess returns, so a grandchild spawned in that window "
+                    "is never a job member and survives TerminateJobObject")
         return "this platform has neither process groups nor Job Objects"
 
     def kill(self) -> None:
@@ -502,17 +568,28 @@ class _ProcessTree:
         a pid in use as a process-group id is not recycled while the group has members,
         so this either reaches that group or reaches nothing.
 
-        On Windows the job handle is the sweep — closing it kills whatever is still
-        inside, since ``_win32_assign_job`` fails the launch unless kill-on-close was
-        accepted."""
+        On Windows the sweep is an EXPLICIT ``TerminateJobObject``, not the kill-on-close
+        limit. Kill-on-close is a backstop for the harness dying unexpectedly; leaning on
+        it here would make the sweep depend on a ``CloseHandle`` that is not guaranteed to
+        succeed, and a failed close would then leave the whole tree running while this
+        method returned normally. Terminating first means a failed close leaks a handle
+        rather than a process tree — and the close is checked anyway, because the pair
+        "terminated, then closed" is the only outcome that actually swept.
+
+        Raises if the Windows sweep failed, which propagates out of ``run_captured``'s
+        ``finally`` and fails the run. Replacing a return value that way is deliberate: a
+        run whose descendants may still be alive has nothing worth reporting. On POSIX
+        there is nothing to raise about — a group that is already gone is the normal case
+        and is indistinguishable from one that never existed (both are ``ESRCH``)."""
         if self._pgid is not None:
             self._kill_group()
         job, self._job = self._job, None
-        if job is not None:  # pragma: no cover — win32 only
-            try:
-                _win32_kernel32().CloseHandle(wintypes.HANDLE(job))
-            except Exception:
-                pass
+        if job is not None and not _win32_sweep_job(job):  # pragma: no cover — win32 only
+            raise RuntimeError(
+                "the Windows Job Object holding this run's process tree could not be "
+                "terminated and released, so descendants of the agent may still be "
+                "running; failing the run rather than reporting a result that a leaked "
+                "MCP server could have influenced")
 
 
 def _tail(text: str | None, limit: int = 400) -> str:

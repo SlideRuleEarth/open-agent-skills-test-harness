@@ -278,12 +278,30 @@ _MCP_CHANNEL_MARKERS: tuple[tuple[str, str], ...] = (
 # reads as "no version found" and warns about the wrong thing (or, in the audit below,
 # silently skips a bundle that the loader would happily run).
 _VERSION_DIR = r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z][0-9A-Za-z.+-]*)?"
-_VERSION_DIR_RE = re.compile(_VERSION_DIR)
 
-# An app root is `<cache>/pkg/<platform>/<version>/`, so the version of the code that
-# ACTUALLY executed is recoverable from any path the child reports out of it.
+# An app root is `<cache>/pkg/<platform>/<version>/`, and the built-in skills live
+# directly under it in `builtin/` — verified against a captured 1.0.72 run:
+# `~/Library/Caches/copilot/pkg/darwin-arm64/1.0.72/builtin/<name>/SKILL.md`.
+#
+# The `builtin/` is part of the pattern, not decoration. Without it this matches any
+# version-shaped `pkg/*/` component ANYWHERE in the path, and the first such component
+# is not necessarily the app root: a cache root that itself sits under a path of that
+# shape (`$COPILOT_CACHE_HOME` is an ordinary directory anyone can place) puts a decoy
+# ahead of the real one, and the reported version is then the outer directory's name
+# rather than the code that ran — a build could report itself as a VERIFIED version that
+# way. Anchoring on the segment the CLI's own layout guarantees pins the match to the
+# real root; ``finditer``'s last hit is taken as well, so the deepest such root wins even
+# if the anchor itself were ever nested.
 _APP_ROOT_VERSION_RE = re.compile(
-    r"[/\\]pkg[/\\][^/\\]+[/\\](" + _VERSION_DIR + r")[/\\]")
+    r"[/\\]pkg[/\\][^/\\]+[/\\](" + _VERSION_DIR + r")[/\\]builtin[/\\]")
+
+
+def _app_root_version(path: str) -> Optional[str]:
+    """The app-root version *path* was emitted out of, or None if it names no app root."""
+    last = None
+    for m in _APP_ROOT_VERSION_RE.finditer(path):
+        last = m.group(1)
+    return last
 
 
 def _stream_cli_version(stdout: str) -> Optional[str]:
@@ -329,9 +347,9 @@ def _stream_cli_version(stdout: str) -> Optional[str]:
                 continue
             path = skill.get("path")
             if isinstance(path, str):
-                m = _APP_ROOT_VERSION_RE.search(path)
-                if m:
-                    seen.add(m.group(1))
+                found = _app_root_version(path)
+                if found:
+                    seen.add(found)
     return seen.pop() if len(seen) == 1 else None
 
 
@@ -341,20 +359,42 @@ _WARNED_VERSIONS: set[str] = set()
 
 
 def _check_cli_version_denied(version: Optional[str]) -> None:
-    """Refuse a build KNOWN to break a hermeticity assumption.
+    """Fail a run that turns out to have executed a build KNOWN to break a hermeticity
+    assumption.
 
-    This is the only version check that can fail a run, and it runs BEFORE the contract
-    evidence because it covers precisely what that evidence cannot: a defect that leaves
-    the MCP witness perfectly intact (broken plugin masking, say) fires no runtime check
-    at all. Once a human finds such a build it is recorded in ``_DENIED_VERSIONS`` and
-    refused by name, rather than waiting for a violation that never comes.
+    POST-RUN DETECTION, NOT PREVENTION, and the distinction is not pedantic: by the time
+    this fires the CLI has already run to completion. If the denylisted defect is that a
+    build silently loads an MCP server, that server has already been reachable for the
+    whole run and whatever it did is already done. What this buys is that the run is
+    reported as FAILED rather than passing — the result never enters the record as
+    evidence — not that the build was kept away from anything.
+
+    It cannot be moved earlier, and that is a property of copilot rather than a shortcut
+    taken here. The executing version is knowable only from the run's own stream: the npm
+    metadata names a version the executable no longer is (verified: package.json said
+    1.0.63 while the SEA had been rewritten in place), no file the harness can read states
+    what the binary will resolve, and the branch's standing rule bars clearing a security
+    decision with a fact learned by executing the same program a second time — a preflight
+    probe resolves its app root by a different path than the real argv, so it can honestly
+    report a version the run does not use. A pre-launch gate here would therefore be
+    guessing with more ceremony.
+
+    It still runs BEFORE the contract evidence, because it covers precisely what that
+    evidence cannot: a defect that leaves the MCP witness perfectly intact (broken plugin
+    masking, say) fires no runtime check at all. Once a human finds such a build it is
+    recorded in ``_DENIED_VERSIONS`` and refused by name, rather than waiting for a
+    violation that never comes. Keeping the tiers honest about *when* they act is what
+    stops "the denylist covers it" from being read as "that build cannot run here".
     """
     if version is not None and version in _DENIED_VERSIONS:
         raise RuntimeError(
-            f"copilot {version} is on this adapter's denylist: "
+            f"this run executed copilot {version}, which is on this adapter's denylist: "
             f"{_DENIED_VERSIONS[version]}. That defect leaves the MCP witness intact, so "
-            "no runtime check catches it — the run is refused by version instead. Pin a "
-            "different CLI build for harness runs."
+            "no runtime check catches it — the run is failed by version instead. Note "
+            "this is detection AFTER the fact: the version is only readable from the "
+            "run's own output, so the CLI has already executed and any side effect of "
+            "that defect has already happened; what is prevented is the RESULT counting. "
+            "Pin a different CLI build before running again."
         )
 
 
@@ -406,11 +446,15 @@ def _warn_cli_version_drift(version: Optional[str], *, agent: str = "copilot",
 
 
 def _bundle_search_roots(env_map: Optional[Mapping[str, str]] = None) -> list[str]:
-    """The ``pkg`` roots a copilot app bundle can live under — the same writable cache
-    roots the loader scans (``$COPILOT_CACHE_HOME``, ``$COPILOT_HOME``,
-    ``$XDG_CACHE_HOME/copilot``, ``~/.cache/copilot``, ``~/.copilot``) plus the
-    per-platform default the installed CLI actually uses (``~/Library/Caches/copilot`` on
-    darwin, ``%LOCALAPPDATA%\\copilot`` on Windows, ``~/.cache/copilot`` elsewhere).
+    """The ``pkg`` roots a copilot app bundle can live under.
+
+    Transcribed from the root list in 1.0.72's own loader rather than inferred:
+    ``$COPILOT_CACHE_HOME/pkg``, a per-platform default, ``${XDG_CACHE_HOME:-~/.cache}/
+    copilot/pkg``, ``$COPILOT_HOME/pkg`` and ``~/.copilot/pkg`` — where the per-platform
+    default is ``~/Library/Caches/copilot`` on darwin, ``${LOCALAPPDATA:-~/.cache}/
+    copilot`` on Windows and the XDG one elsewhere. Every branch of that is covered here,
+    and the two XDG-conditional ones are covered unconditionally, which makes this list a
+    superset — the safe direction.
 
     A root missing from this list is a bundle the audit reports nothing about, which is
     indistinguishable from a bundle it cleared — so the list errs toward scanning roots
@@ -445,17 +489,32 @@ def find_cli_bundles(env_map: Optional[Mapping[str, str]] = None
     given run executes: this adapter's ``--no-auto-update`` argv pins the run to the
     binary's own app root. The audit is therefore about a BUILD, not about a past run —
     for what actually executed, read the version out of the run's own stream
-    (``_stream_cli_version``)."""
+    (``_stream_cli_version``).
+
+    CANDIDACY IS THE LOADER'S, NOT A TIDIER ONE. Read out of the 1.0.72 bundle's own
+    ``index.js``: it lists each ``<root>/{universal,<platform>}`` directory, keeps every
+    entry whose ``app.js`` is merely R_OK-readable — no name test of any kind — sorts them
+    by a PREFIX parse (``/^(\\d+)\\.(\\d+)\\.(\\d+)/``) and imports the first. So
+    ``1.0.73foo`` and ``1.0.73-`` parse as 1.0.73 and can outrank the running build, and
+    ``nonsense`` is a candidate the ``--prefer-version`` path (banned from scenario argv,
+    but present in the CLI) selects by exact name. Requiring a well-formed semver
+    directory here would have skipped all three — reporting nothing about a bundle that
+    can execute, which in an audit's output is indistinguishable from having cleared it.
+    The name filter is therefore gone entirely and ``_version_sort_key`` reproduces the
+    loader's ordering rather than a stricter semver one.
+
+    ``app.js`` is the candidacy file because it is the one that has to exist for code to
+    run: the outer SEA loader looks for ``index.js``, but that shim then resolves
+    ``<its own dir>/app.js``, so an ``index.js`` without a sibling ``app.js`` fails to
+    import rather than executing. It is also the file the markers live in.
+
+    Directories other than ``universal``/``<platform>`` are scanned even though the loader
+    ignores them — a superset is the safe direction for an audit."""
     found: list[tuple[str, str]] = []
     for root in _bundle_search_roots(env_map):
         for platform_dir in sorted(_safe_listdir(root)):
             pdir = os.path.join(root, platform_dir)
             for ver in sorted(_safe_listdir(pdir)):
-                # Prereleases included: the loader will run `1.0.73-beta.1` whatever this
-                # audit thinks of the name, and skipping it means reporting nothing about
-                # a bundle that can execute — which reads the same as clearing it.
-                if not _VERSION_DIR_RE.fullmatch(ver):
-                    continue
                 app = os.path.join(pdir, ver, "app.js")
                 if os.path.isfile(app):
                     found.append((ver, app))
@@ -463,16 +522,21 @@ def find_cli_bundles(env_map: Optional[Mapping[str, str]] = None
     return found
 
 
-def _version_sort_key(version: str) -> tuple[tuple[int, ...], int, str]:
-    """Newest-last ordering, with a prerelease sorting BEFORE its own release as semver
-    says (``1.0.73-beta.1`` < ``1.0.73``). Splitting on ``.`` and calling int() cannot do
-    this — it raises on the suffix — and the ordering matters because callers report the
-    newest bundle as the interesting one."""
-    m = re.match(r"(\d+)\.(\d+)\.(\d+)(.*)", version)
-    if not m:   # pragma: no cover — callers filter on _VERSION_DIR_RE first
-        return ((0, 0, 0), 0, version)
-    suffix = m.group(4)
-    return (tuple(int(g) for g in m.groups()[:3]), 0 if suffix else 1, suffix)
+def _version_sort_key(version: str) -> tuple[int, tuple[int, ...], int, str]:
+    """Newest-last ordering, reproducing the comparator in the CLI's own loader.
+
+    Ported from 1.0.72's ``index.js``/``sea-loader.js`` rather than from the semver spec,
+    because the question this answers is "which of these would the loader pick", and it
+    picks by its own rules: a leading ``\\d+.\\d+.\\d+`` PREFIX (so ``1.0.73foo`` is
+    1.0.73), a name that does not parse at all sorting below every one that does, a name
+    containing ``-`` treated as a prerelease and sorting before its release
+    (``1.0.73-beta.1`` < ``1.0.73``, and equally ``1.0.73-`` < ``1.0.73``), and the raw
+    name as the final tiebreak. Ordering matters because callers report the newest bundle
+    as the interesting one."""
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", version)
+    if not m:
+        return (0, (0, 0, 0), 0, version)
+    return (1, tuple(int(g) for g in m.groups()), 0 if "-" in version else 1, version)
 
 
 def _safe_listdir(path: str) -> list[str]:
@@ -619,6 +683,16 @@ def _mcp_witness(stdout: str,
         return True
 
     for obj in iter_jsonl(stdout):
+        # iter_jsonl yields any well-formed JSON VALUE, not just objects: a bare `42` or
+        # a list on its own line parses fine and has no .get(). Skipping those is not
+        # leniency about the contract — the events below are still required to be
+        # well-formed, and a run that produced none of them still fails. It is about
+        # WHICH failure gets reported: an AttributeError here escapes verify_post_run and
+        # is announced as an MCP hermeticity failure, so one stray line would mask a
+        # perfectly good witness later in the same stream (reproduced: `42` ahead of a
+        # valid session.mcp_servers_loaded).
+        if not isinstance(obj, dict):
+            continue
         etype = obj.get("type")
         data = obj.get("data")
         if etype == "result":
@@ -1424,17 +1498,38 @@ class CopilotAdapter(Adapter):
     # --no-auto-update carries more weight than its name suggests and must not be
     # dropped: without it copilot's loader picks the app.js it executes by scanning
     # WRITABLE cache roots ($COPILOT_CACHE_HOME/pkg, $COPILOT_HOME/pkg,
-    # ~/.cache/copilot/pkg, ~/.copilot/pkg) and importing whichever version-shaped
-    # directory sorts highest — a planted 9.9.9/app.js runs, as arbitrary code inside the
-    # child, ahead of every MCP flag on this argv. With the flag the run is pinned to the
-    # binary's own app root and the plant is ignored (both halves verified live). See
-    # _mcp_witness for why the resulting build still cannot be identified by version.
+    # ~/.cache/copilot/pkg, ~/.copilot/pkg) and importing whichever directory name sorts
+    # highest under its own prefix-parse — a planted 9.9.9/app.js runs, as arbitrary code
+    # inside the child, ahead of every MCP flag on this argv. With the flag the run is
+    # pinned to the binary's own app root and the plant is ignored (both halves verified
+    # live; the selection rule itself is read out of the bundle in find_cli_bundles). See
+    # _mcp_witness for why the resulting build still cannot be identified by version, and
+    # _BUILD_REDIRECT_VARS below for the env var that bypasses this flag entirely.
     _HERMETIC = [
         "--no-custom-instructions",
         "--disable-builtin-mcps",
         "--no-remote",
         "--no-auto-update",
     ]
+
+    # ...and the flag is not sufficient on its own. Reading 1.0.72's loader to check the
+    # claim above turned up an env var that is consulted BEFORE any of this argv is
+    # examined: COPILOT_CLI_DIST_DIR imports `<its value>/index.js` directly, with no
+    # version floor, no cache-root constraint and no interaction with --no-auto-update at
+    # all. An ambient value in the developer's shell — or a scenario `env:` override —
+    # would run arbitrary code as the agent, and _stream_cli_version would then be
+    # reporting the provenance of a build nobody chose. Cleared for every copilot launch,
+    # not just isolated ones, since the var is read from the child's environment however
+    # it got there. (COPILOT_CLI_VERSION and COPILOT_AUTO_UPDATE were checked at the same
+    # time and are inert under this argv: both only feed the rescan that --no-auto-update
+    # already switches off, and COPILOT_AUTO_UPDATE can only disable, never enable.)
+    _BUILD_REDIRECT_VARS = ("COPILOT_CLI_DIST_DIR",)
+
+    def env(self, base_env: dict[str, str], opts: RunOptions) -> dict[str, str]:
+        env = dict(super().env(base_env, opts))
+        for var in self._BUILD_REDIRECT_VARS:
+            env.pop(var, None)
+        return env
 
     def _probe_argv(self, model: str, *, cwd: Optional[str] = None,
                     env: Optional[dict] = None):
@@ -1778,6 +1873,8 @@ class CopilotAdapter(Adapter):
         seen_tools: set[str] = set()
 
         for obj in iter_jsonl(stdout):
+            if not isinstance(obj, dict):   # a bare JSON scalar/list is not an event
+                continue
             if obj.get("ephemeral"):
                 continue
 
