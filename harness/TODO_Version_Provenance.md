@@ -28,6 +28,15 @@ From `adapters/copilot.py`:
    preflight `--version` can resolve different code than the real invocation. Read it from
    structural fields the CLI emits about itself — and *not* from anywhere model-controlled
    text can reach, or a model can forge the string that silences the warning.
+
+   Model-controlled prose is only the obvious half. Review found the subtler one: the
+   *same* structural event also carried `source: "project"` skill paths, which are
+   **workspace-controlled**. A repo laid out as `.agents/skills/pkg/x/9.9.9/SKILL.md`
+   injected a second version, and because disagreement resolves to "unknown", that alone
+   silently disarmed the denylist — from inside the workspace under test. Whatever field
+   a runner exposes, filter it to the entries the CLI vouches for itself, and check what
+   *else* rides in on the same event. The workspace does not get a vote on which build
+   the harness thinks it ran.
 4. **Three tiers**: contract violation → fail; denylisted version → fail; unrecognized
    version → warn once per process, run proceeds.
 5. **`verify-copilot-channels`** — audits an installed bundle against the inventory of
@@ -78,6 +87,22 @@ Versions below are what was installed on the dev host on 2026-07-21.
 - **Do not gate on a version learned by executing the CLI.** Standing rule on this branch:
   a fact learned by running a program the agent independently runs again may not *clear* a
   security decision. Version telemetry may warn; only the runtime contract may pass a run.
+- **Never let the notice overstate its own evidence.** The drift warning used to say "the
+  runtime witness held" unconditionally. But a run that did not complete normally is
+  *excused* from producing a witness, so the sentence was reached with no MCP evidence at
+  all — inventing the very check it was warning about. `_warn_cli_version_drift` now takes
+  `witnessed`. Any port of this needs the same split: a security notice a reader would
+  quote to justify shipping has to be true on every path that prints it.
+
+- **Telemetry parsing must not raise.** These helpers run inside `verify_post_run`, where
+  anything raised is reported as an MCP hermeticity failure. A mistyped `data.skills` is
+  not one — malformed telemetry is an *unknown version*, which warns.
+
+- **An unscanned location reads exactly like a cleared one.** The bundle audit missed
+  `$XDG_CACHE_HOME`, `%LOCALAPPDATA%`, and prerelease directory names the loader accepts,
+  and reported nothing about them — indistinguishable in the output from having checked
+  them. Err toward scanning roots that may not exist.
+
 - **Be honest about the ceiling.** None of this detects a channel a new build *added* — no
   marker exists for code nobody has written yet. It converts silent drift into dated,
   actionable drift and makes "should a human re-read this bundle?" a decision someone

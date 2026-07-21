@@ -272,9 +272,18 @@ _MCP_CHANNEL_MARKERS: tuple[tuple[str, str], ...] = (
     ("not_configured", "inert-status value the witness classifies against"),
 )
 
+# A version directory: `1.0.72`, or a prerelease like `1.0.73-beta.1`. The suffix is
+# matched rather than rejected so a prerelease build is REPORTED as the thing it is —
+# `1.0.73-beta.1` is not in _VERIFIED_VERSIONS and warns, whereas failing to match at all
+# reads as "no version found" and warns about the wrong thing (or, in the audit below,
+# silently skips a bundle that the loader would happily run).
+_VERSION_DIR = r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z][0-9A-Za-z.+-]*)?"
+_VERSION_DIR_RE = re.compile(_VERSION_DIR)
+
 # An app root is `<cache>/pkg/<platform>/<version>/`, so the version of the code that
 # ACTUALLY executed is recoverable from any path the child reports out of it.
-_APP_ROOT_VERSION_RE = re.compile(r"[/\\]pkg[/\\][^/\\]+[/\\](\d+\.\d+\.\d+)[/\\]")
+_APP_ROOT_VERSION_RE = re.compile(
+    r"[/\\]pkg[/\\][^/\\]+[/\\](" + _VERSION_DIR + r")[/\\]")
 
 
 def _stream_cli_version(stdout: str) -> Optional[str]:
@@ -286,25 +295,39 @@ def _stream_cli_version(stdout: str) -> Optional[str]:
     writable cache roots that this adapter's ``--no-auto-update`` argv deliberately
     bypasses, so the probe and the run can execute different code (see _mcp_witness).
 
-    Read ONLY from ``session.skills_loaded`` skill paths, never by scanning stdout at
-    large. Those paths are structural data the CLI emits about its own app root; assistant
-    message content sits in the same stream and is model-controlled, so a broad regex over
-    stdout would let a model's prose ("I am running pkg/darwin-arm64/9.9.9/") forge the
-    version that silences the drift warning.
+    Read ONLY from ``source == "builtin"`` skill paths in ``session.skills_loaded``, never
+    by scanning stdout at large and never from the other skill sources. Built-in skill
+    paths are structural data the CLI emits about its own app root. The rest of the same
+    stream is not: assistant message content is model-controlled, so a broad regex would
+    let a model's prose ("I am running pkg/darwin-arm64/9.9.9/") forge the version that
+    silences the drift warning — and the SAME event also lists ``source: "project"``
+    skills whose paths are workspace-controlled (verified live: they arrive as
+    ``<workspace>/.agents/skills/<name>/SKILL.md``). A repo laid out as
+    ``.../pkg/x/9.9.9/SKILL.md`` would inject a second, bogus version, and because
+    disagreement resolves to None, that alone would silently disarm the denylist. The
+    workspace does not get a vote on which build the harness thinks it ran.
 
-    None when no app-root path appears, or when paths disagree — either way the version is
-    unknown, which warns rather than fails (absence of evidence about the version is not
-    evidence of a leak; the contract check is what actually gates).
+    None when no app-root path appears, when paths disagree, or when the telemetry is
+    malformed — all of them mean the version is unknown, which warns rather than fails
+    (absence of evidence about the version is not evidence of a leak; the contract check
+    is what actually gates). Malformed telemetry must reach that same warning rather than
+    raise: this is called from ``verify_post_run``, where an exception is reported as an
+    MCP hermeticity failure, and a mistyped ``data.skills`` is not one.
     """
     seen: set[str] = set()
     for obj in iter_jsonl(stdout):
-        if obj.get("type") != "session.skills_loaded":
+        if not isinstance(obj, dict) or obj.get("type") != "session.skills_loaded":
             continue
         data = obj.get("data")
         if not isinstance(data, dict):
             continue
-        for skill in data.get("skills") or ():
-            path = skill.get("path") if isinstance(skill, dict) else None
+        skills = data.get("skills")
+        if not isinstance(skills, list):
+            continue
+        for skill in skills:
+            if not isinstance(skill, dict) or skill.get("source") != "builtin":
+                continue
+            path = skill.get("path")
             if isinstance(path, str):
                 m = _APP_ROOT_VERSION_RE.search(path)
                 if m:
@@ -335,16 +358,22 @@ def _check_cli_version_denied(version: Optional[str]) -> None:
         )
 
 
-def _warn_cli_version_drift(version: Optional[str], *, agent: str = "copilot") -> None:
+def _warn_cli_version_drift(version: Optional[str], *, agent: str = "copilot",
+                            witnessed: bool = False) -> None:
     """Warn once per version that a run executed a build the analysis has not been checked
     against. A WARNING, not a failure — and deliberately so.
 
-    By the time this runs the contract has already held, so the channels this adapter
-    knows about were disabled and none loaded. What a newer build can still do — and what
-    nothing at runtime can see — is introduce a discovery channel that was never
-    enumerated because no code was ever written to enumerate it. You cannot detect the
-    absence of a check you never wrote. The message says that explicitly, because the
-    danger is a green run being read as covering it.
+    What a newer build can do, and what nothing at runtime can see, is introduce a
+    discovery channel that was never enumerated because no code was ever written to
+    enumerate it. You cannot detect the absence of a check you never wrote. The message
+    says that explicitly, because the danger is a green run being read as covering it.
+
+    *witnessed* decides which half of that it is entitled to claim. A run that did not
+    complete is excused from producing a witness, so this is reached with no MCP evidence
+    at all — and "the runtime witness held, so the channels this adapter knows about were
+    disabled and none loaded" would then be describing a check that never ran. A security
+    notice that overstates its own evidence is worse than none: it is the sentence a
+    reader would use to justify shipping.
 
     Once per version per process, not per cell: a warning repeated across every cell of a
     model matrix is one that gets filtered out, which defeats the purpose.
@@ -356,13 +385,20 @@ def _warn_cli_version_drift(version: Optional[str], *, agent: str = "copilot") -
         return
     _WARNED_VERSIONS.add(key)
     ran = f"CLI {version}" if version else "a CLI whose version could not be determined"
-    print(
-        f"warning: [{agent}] this run executed {ran}; the MCP hermeticity analysis was "
-        f"verified against {'/'.join(_VERIFIED_VERSIONS)} ({_VERIFIED_ON}).\n"
+    established = (
         "  The runtime witness held, so the channels this adapter KNOWS ABOUT were "
         "disabled and none loaded. That does NOT cover a discovery channel ADDED after "
         f"{_VERIFIED_VERSIONS[-1]}: a new one would never have been enumerated, and no "
         "runtime check can see a check that was never written.\n"
+        if witnessed else
+        "  This run produced no MCP witness at all — it did not complete normally, which "
+        "is allowed but proves nothing about its MCP host. So the channels this adapter "
+        "knows about were NOT confirmed inert here, and a channel ADDED after "
+        f"{_VERIFIED_VERSIONS[-1]} would be invisible on top of that.\n")
+    print(
+        f"warning: [{agent}] this run executed {ran}; the MCP hermeticity analysis was "
+        f"verified against {'/'.join(_VERIFIED_VERSIONS)} ({_VERIFIED_ON}).\n"
+        + established +
         "  To clear it: `agentskill-evals verify-copilot-channels` (audits the CLI "
         "bundle against the known channel inventory), then add the version to "
         "_VERIFIED_VERSIONS in adapters/copilot.py.",
@@ -371,15 +407,27 @@ def _warn_cli_version_drift(version: Optional[str], *, agent: str = "copilot") -
 
 def _bundle_search_roots(env_map: Optional[Mapping[str, str]] = None) -> list[str]:
     """The ``pkg`` roots a copilot app bundle can live under — the same writable cache
-    roots the loader scans (``$COPILOT_CACHE_HOME``, ``$COPILOT_HOME``, ``~/.cache/copilot``,
-    ``~/.copilot``) plus the per-platform default the installed CLI actually uses
-    (``~/Library/Caches/copilot`` on darwin, ``~/.cache/copilot`` elsewhere)."""
+    roots the loader scans (``$COPILOT_CACHE_HOME``, ``$COPILOT_HOME``,
+    ``$XDG_CACHE_HOME/copilot``, ``~/.cache/copilot``, ``~/.copilot``) plus the
+    per-platform default the installed CLI actually uses (``~/Library/Caches/copilot`` on
+    darwin, ``%LOCALAPPDATA%\\copilot`` on Windows, ``~/.cache/copilot`` elsewhere).
+
+    A root missing from this list is a bundle the audit reports nothing about, which is
+    indistinguishable from a bundle it cleared — so the list errs toward scanning roots
+    that may not exist (``_safe_listdir`` swallows those) rather than toward missing one
+    that does. ``$XDG_CACHE_HOME`` in particular is not a synonym for ``~/.cache``: where
+    it is set to something else, ``~/.cache/copilot`` is the wrong directory entirely."""
     env_map = env_map if env_map is not None else os.environ
     home = os.path.expanduser("~")
+    xdg = env_map.get("XDG_CACHE_HOME")
     bases = [env_map.get("COPILOT_CACHE_HOME"), env_map.get("COPILOT_HOME"),
+             os.path.join(xdg, "copilot") if xdg else None,
              os.path.join(home, ".cache", "copilot"), os.path.join(home, ".copilot")]
     if sys.platform == "darwin":
         bases.append(os.path.join(home, "Library", "Caches", "copilot"))
+    local_appdata = env_map.get("LOCALAPPDATA")
+    if local_appdata:
+        bases.append(os.path.join(local_appdata, "copilot"))
     roots: list[str] = []
     for b in bases:
         if b:
@@ -403,13 +451,28 @@ def find_cli_bundles(env_map: Optional[Mapping[str, str]] = None
         for platform_dir in sorted(_safe_listdir(root)):
             pdir = os.path.join(root, platform_dir)
             for ver in sorted(_safe_listdir(pdir)):
-                if not re.fullmatch(r"\d+\.\d+\.\d+", ver):
+                # Prereleases included: the loader will run `1.0.73-beta.1` whatever this
+                # audit thinks of the name, and skipping it means reporting nothing about
+                # a bundle that can execute — which reads the same as clearing it.
+                if not _VERSION_DIR_RE.fullmatch(ver):
                     continue
                 app = os.path.join(pdir, ver, "app.js")
                 if os.path.isfile(app):
                     found.append((ver, app))
-    found.sort(key=lambda vp: tuple(int(x) for x in vp[0].split(".")))
+    found.sort(key=lambda vp: _version_sort_key(vp[0]))
     return found
+
+
+def _version_sort_key(version: str) -> tuple[tuple[int, ...], int, str]:
+    """Newest-last ordering, with a prerelease sorting BEFORE its own release as semver
+    says (``1.0.73-beta.1`` < ``1.0.73``). Splitting on ``.`` and calling int() cannot do
+    this — it raises on the suffix — and the ordering matters because callers report the
+    newest bundle as the interesting one."""
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)(.*)", version)
+    if not m:   # pragma: no cover — callers filter on _VERSION_DIR_RE first
+        return ((0, 0, 0), 0, version)
+    suffix = m.group(4)
+    return (tuple(int(g) for g in m.groups()[:3]), 0 if suffix else 1, suffix)
 
 
 def _safe_listdir(path: str) -> list[str]:
@@ -456,12 +519,19 @@ _WITNESS_SENTINEL = "github-mcp-server"
 
 
 def _mcp_witness(stdout: str,
-                 exit_code: Optional[int]) -> tuple[Optional[str], list[str]]:
+                 exit_code: Optional[int]) -> tuple[Optional[str], list[str], bool]:
     """Read copilot's MCP witness out of its own event stream.
 
-    Returns ``(contract_violation, live_servers)`` — the violation being ``None`` when the
-    stream still speaks the contract this audit depends on, and ``live_servers`` the
-    servers copilot said it brought up, as ``name (status)``.
+    Returns ``(contract_violation, live_servers, witnessed)`` — the violation being
+    ``None`` when the stream still speaks the contract this audit depends on,
+    ``live_servers`` the servers copilot said it brought up as ``name (status)``, and
+    ``witnessed`` whether a conforming witness was actually SEEN.
+
+    ``witnessed`` is not the negation of the violation. A run that did not complete is
+    excused from producing a witness (a child killed on timeout emits none), so it can
+    return no violation and no witness at all — nothing was proven either way, and
+    anything downstream that describes what this run established has to say so rather
+    than infer a clean bill from a silent ``None``.
 
     ``--output-format json`` streams two ephemeral events describing the MCP host:
     ``session.mcp_servers_loaded`` (emitted right after initializeMcpHost(), one entry per
@@ -587,17 +657,18 @@ def _mcp_witness(stdout: str,
             entry(data.get("serverName"), data.get("status"),
                   "session.mcp_server_status_changed.data")
 
+    witnessed = loaded_ok and sentinel_seen
     if violations:
-        return violations[0], _fmt_live(live)
+        return violations[0], _fmt_live(live), witnessed
     if completed and not loaded_ok:
         return ("no well-formed session.mcp_servers_loaded event reached the harness",
-                _fmt_live(live))
+                _fmt_live(live), witnessed)
     if completed and not sentinel_seen:
         return (f"session.mcp_servers_loaded never named the built-in "
                 f"{_WITNESS_SENTINEL!r}, which a hermetic invocation always configures "
                 "and disables — so the event is not describing the MCP host this "
-                "adapter was verified against", _fmt_live(live))
-    return None, _fmt_live(live)
+                "adapter was verified against", _fmt_live(live), witnessed)
+    return None, _fmt_live(live), witnessed
 
 
 def _fmt_live(live: Mapping[str, str]) -> list[str]:
@@ -1648,7 +1719,7 @@ class CopilotAdapter(Adapter):
         # Everything after this point is contract evidence, which is version-independent.
         version = _stream_cli_version(stdout)
         _check_cli_version_denied(version)
-        broken, live = _mcp_witness(stdout, exit_code)
+        broken, live, witnessed = _mcp_witness(stdout, exit_code)
         if broken is not None:
             raise RuntimeError(
                 f"copilot's MCP witness does not hold: {broken}. The run finished "
@@ -1689,9 +1760,11 @@ class CopilotAdapter(Adapter):
         # Last, and only on a run that cleared every gate above: say so if the build is
         # one the analysis has never been checked against. Warning here rather than
         # earlier keeps a genuine hermeticity failure from being buried under a version
-        # notice, and keeps the notice honest — it describes what a PASSING run does and
-        # does not cover.
-        _warn_cli_version_drift(version, agent=self.name)
+        # notice, and keeps the notice honest — it describes what THIS run does and does
+        # not cover, which is why `witnessed` goes with it: clearing every gate is not
+        # the same as having produced evidence, since a run that never completed is
+        # excused from the witness entirely.
+        _warn_cli_version_drift(version, agent=self.name, witnessed=witnessed)
 
     def parse(self, stdout: str, stderr: str, exit_code: int,
                *, opts: Optional[RunOptions] = None) -> ParseOutput:
