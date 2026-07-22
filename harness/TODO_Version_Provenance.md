@@ -284,6 +284,22 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   Three of those six were caught only because the previous round's habit was already in
   place: they arrived as loud failures on a `lost` list rather than as silent passes.
 
+- **Hardening a sanitizer is not the same as bounding what it has to sanitize.** Four rounds
+  of review went into the workspace scrub — inodes, symlinks, xattrs, special files, fixed
+  points — and the fourth round's largest finding was not in it at all. The agent's cwd was
+  relocated to a detached tempdir *only under `--no-isolated`'s opposite*, so a non-isolated
+  cell ran with its working directory **inside** the artifact tree and `../agent-created.txt`
+  published a secret in a directory the scrub does not examine, because only `workspace` is
+  archived. Every property proved about the scrub was true and none of them applied. Two
+  things generalize. A **cwd is a write capability**, not just a read one — the relocation
+  had been justified entirely by `list_dir` walking up into the repo's skills, so the
+  writable half of the same hole was never considered. And **one flag was answering two
+  questions**: `isolated` meant "mask HOME so the model sees only declared skills" and, by
+  reuse, "keep the agent out of the results directory". A user turning off the first had no
+  reason to think they were turning off the second, and the flag's own documentation only
+  ever described the first. Ask what a sanitizer's *domain* is before making it stronger:
+  narrowing what can enter the domain beats certifying more of what already has.
+
 - **A mutation test is also a test of the deletion path nobody exercised.** Disabling the
   scrub's permission repair was supposed to make one arm go red; instead it crashed the
   whole section, because the quarantine could not remove a `chmod 000` *directory* — `rmtree`

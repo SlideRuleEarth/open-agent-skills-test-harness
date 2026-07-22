@@ -69,6 +69,10 @@ test declares.
 agent also sees whatever skills you've installed globally — the test's skills *plus* every
 other repo skill on your machine. (Handy for reproducing "works on my box" differences.)
 
+`--no-isolated` changes what the agent can *see*, not where it *runs*. Every cell still
+executes in a throwaway temp directory that gets moved into `artifacts/` afterwards, so the
+agent never has a filesystem path into the results tree.
+
 **Why isolation is the default**
 
 Agents discover skills from several places — the current project *and* your personal (global)

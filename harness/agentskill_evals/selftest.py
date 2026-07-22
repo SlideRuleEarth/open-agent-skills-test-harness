@@ -966,6 +966,10 @@ def _check_workspace_relocation(failures, verbose):
                 seen["mask_content"] = open(mask).read()
         with open(os.path.join(cwd, "run.py"), "w") as f:
             f.write("print('hi')\n")
+        # A cwd is a place the agent can WRITE, so `..` is part of the attack surface, not
+        # just `list_dir`'s. Written every time: the arms below assert where it landed.
+        with open(os.path.join(cwd, "..", "above-cwd.txt"), "w") as f:
+            f.write("tok sk-secret-abcdef\n")
         rr = RunResult(
             agent=agent_name, eval_name=eval_name, prompt=prompt, workdir=cwd,
             events=[NormalizedEvent(EventKind.FILE_CHANGE, path="run.py")],
@@ -1025,6 +1029,39 @@ def _check_workspace_relocation(failures, verbose):
                rp == os.path.join(cell_workspace, "run.py") and os.path.isfile(rp),
                f"file_exists resolved_path points at the final workspace, not the deleted "
                f"tempdir: {rp}", failures, verbose)
+        _check("relocate.parent_of_exec_cwd_is_not_published",
+               not os.path.exists(os.path.join(cell.artifacts_dir, "above-cwd.txt"))
+               and not os.path.isdir(os.path.dirname(cwd_used or repo_root)),
+               f"what the agent wrote ABOVE its cwd is discarded, not archived: exec_ws is "
+               f"nested one level inside the harness's own tempdir, so `..` reaches a "
+               f"directory that is deleted whole rather than the artifact tree: "
+               f"cell_dir={sorted(os.listdir(cell.artifacts_dir))}", failures, verbose)
+
+        # Everything above ran isolated. The exec-dir relocation must NOT be gated on that
+        # flag: `--no-isolated` means "see my real HOME and installed skills", and review
+        # used it to write `../agent-created.txt` straight into cell_dir, where the workspace
+        # scrub never looks because only `workspace` is archived.
+        seen.clear()
+        run_dir2 = os.path.join(repo_root, "artifacts", "run2")
+        os.makedirs(run_dir2)
+        r.run_id, r.run_dir, r.isolated = "run2", run_dir2, False
+        r._secrets = r._run_secrets = ("sk-secret-abcdef",)
+        try:
+            cell2 = r._run_cell(ModelTarget(), spec)
+        finally:
+            r._secrets = r._run_secrets = ()
+        cwd2 = seen.get("cwd")
+        inside2 = os.path.abspath(cwd2 or "").startswith(
+            os.path.abspath(cell2.artifacts_dir) + os.sep)
+        above2 = os.path.join(cell2.artifacts_dir, "above-cwd.txt")
+        _check("relocate.exec_cwd_detached_even_when_not_isolated",
+               cwd2 is not None and not inside2 and not os.path.exists(above2)
+               and os.path.isfile(os.path.join(cell2.artifacts_dir, "workspace", "run.py")),
+               f"a --no-isolated cell still runs in a detached tempdir, so `../x` from the "
+               f"agent's cwd cannot reach the artifact directory — HOME isolation and "
+               f"execution-directory isolation answer different questions, and gating the "
+               f"second on the first left the results tree writable: cwd={cwd2} "
+               f"cell_dir={sorted(os.listdir(cell2.artifacts_dir))}", failures, verbose)
     finally:
         runner_mod.execute = orig_execute
         shutil.rmtree(repo_root, ignore_errors=True)
@@ -7518,6 +7555,58 @@ def _check_mcp_declared_servers(failures, verbose):
            f"secret out of a name can complete a different one with a neighbour that has "
            f"already been visited, and repairing one spelling per pass leaves every other "
            f"one standing: {ws13_paths}", failures, verbose)
+
+    # `os.link(src, dst, follow_symlinks=False)` works on macOS, so "a symlink is not an
+    # object an unprivileged agent can share" was wrong: an external link hardlinked into the
+    # workspace had its metadata rewritten through the shared inode by an in-place setxattr.
+    ws14 = os.path.join(root, "ws14")
+    os.makedirs(ws14, exist_ok=True)
+    link_outside = os.path.join(root, "link-outside")
+    _try(lambda: os.symlink("/tmp/sk-secret-abcdef/creds", link_outside))
+    _try(lambda: _xattrs.setxattr(link_outside, b"user.tok", b"sk-secret-abcdef"))
+    ws14_copy = os.path.join(ws14, "copy")
+    shared14 = _try(lambda: (os.link(link_outside, ws14_copy, follow_symlinks=False),
+                             os.lstat(link_outside).st_ino == os.lstat(ws14_copy).st_ino)[1],
+                    "(cannot hardlink a symlink here)")
+    lost14 = runner_mod._scrub_tree(ws14, ("sk-secret-abcdef",))
+    out14 = (_try(lambda: os.readlink(link_outside), ""),
+             _try(lambda: _xattrs.getxattr(link_outside, b"user.tok"), b""))
+    in14 = (_try(lambda: os.readlink(ws14_copy), ""),
+            _try(lambda: [_xattrs.getxattr(ws14_copy, n) for n in _xattrs.listxattr(ws14_copy)],
+                 []))
+    _check("mcp.multiply_linked_symlink_is_replaced_not_edited",
+           shared14 is True and lost14 == []
+           and out14 == ("/tmp/sk-secret-abcdef/creds", b"sk-secret-abcdef")
+           and os.path.islink(ws14_copy) and "sk-secret-abcdef" not in in14[0]
+           and not any(b"sk-secret-abcdef" in v for v in in14[1])
+           and os.lstat(link_outside).st_ino != os.lstat(ws14_copy).st_ino,
+           f"a symlink is scrubbed by BUILDING A REPLACEMENT and renaming it over the old "
+           f"name, never by editing in place — a symlink CAN be hardlinked, so an in-place "
+           f"`setxattr` writes through to every other name for that inode, exactly as an "
+           f"in-place content rewrite did for regular files: shared_before={shared14} "
+           f"outside={out14} archived={in14} lost={lost14}", failures, verbose)
+
+    # Absence and refusal are different answers. A bare `except OSError: return []` gave them
+    # the same one, certifying a workspace it could not even stat.
+    ws15 = os.path.join(root, "ws15")
+    ws15_ws = os.path.join(ws15, "workspace")
+    os.makedirs(ws15_ws, exist_ok=True)
+    open(os.path.join(ws15_ws, "leak.txt"), "w").write("tok sk-secret-abcdef\n")
+    os.chmod(ws15, 0o000)
+    try:
+        lost15 = _try(lambda: runner_mod._scrub_tree(ws15_ws, ("sk-secret-abcdef",)), "(raised)")
+    finally:
+        _try(lambda: os.chmod(ws15, 0o700))
+    body15 = _try(lambda: open(os.path.join(ws15_ws, "leak.txt")).read(), "(unreadable)")
+    missing15 = runner_mod._scrub_tree(os.path.join(root, "ws15-never-existed"),
+                                       ("sk-secret-abcdef",))
+    _check("mcp.unreadable_root_is_repaired_or_reported_never_certified",
+           lost15 == [] and "sk-secret-abcdef" not in body15 and missing15 == [],
+           f"a root that cannot be stat-ed is repaired through its parent — `cell_dir` is "
+           f"this harness's own directory — and only a genuine ENOENT returns clean, because "
+           f"'nothing was archived' and 'I was refused' are opposite answers that an "
+           f"`except OSError` collapses into a clean bill of health: lost={lost15} "
+           f"body={body15.strip()!r} absent_root={missing15}", failures, verbose)
 
     # --- the run summary, written after every cell cleared its secrets ---------
     # `_secrets` is deliberately cell-scoped, so by the time the summary is written it is

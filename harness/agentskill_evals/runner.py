@@ -274,18 +274,28 @@ class Runner:
         workspace = os.path.join(cell_dir, "workspace")
         _prepare_workspace(workspace)
 
-        # The directory the agent actually runs in. Under isolation this is a tempdir with NO
-        # path relationship to this repo's checkout — not `<repo>/artifacts/.../workspace`,
-        # which put every eval's cwd two `list_dir`/`cd ..` hops from the repo's own undeclared
-        # skill directories. HOME-overlay isolation (below) only masks global skill-discovery
-        # paths; it did nothing to stop a general-purpose file-browsing agent (antigravity's
+        # The directory the agent actually runs in: a tempdir with NO path relationship to
+        # this repo's checkout — not `<repo>/artifacts/.../workspace`, which put every eval's
+        # cwd two `list_dir`/`cd ..` hops from the repo's own undeclared skill directories.
+        # HOME-overlay isolation (below) only masks global skill-discovery paths; it did
+        # nothing to stop a general-purpose file-browsing agent (antigravity's
         # list_dir/view_file/shell on arbitrary absolute paths, not just its own cwd) from
         # walking up and reading them directly, which is exactly what happened in run
         # 20260707-072933_scen_SimpleATL06PromptGrandMesa. Moved into `workspace` (inside
         # cell_dir) once the run + assertions are done, so artifacts/report are unaffected.
-        exec_ws = workspace
-        if self.isolated:
-            exec_ws = tempfile.mkdtemp(prefix="ase-ws-")
+        #
+        # Unconditional, NOT gated on `self.isolated`, which was the third review round's
+        # find: a cwd is a place the agent can write, and `..` from a cwd inside the artifact
+        # tree IS the artifact tree. A `--no-isolated` cell wrote `../agent-created.txt` and
+        # published the raw secret in cell_dir, where the workspace scrub never looks because
+        # only `workspace` is archived. `--no-isolated` means "see my real HOME and installed
+        # skills"; it never meant "run inside the results directory".
+        #
+        # The extra nesting level is the point: `..` from exec_ws is `exec_root`, which is
+        # the harness's own tempdir, is never archived, and is deleted whole.
+        exec_root = tempfile.mkdtemp(prefix="ase-ws-")
+        exec_ws = os.path.join(exec_root, "workspace")
+        os.makedirs(exec_ws)
 
         # A cell that raises (a buggy assertion, the judge choking on a malformed response, an
         # OSError mid-move, ...) must not: (a) leak the exec_ws tempdir forever, or (b) abort
@@ -296,11 +306,11 @@ class Runner:
         except Exception as exc:
             return self._failed_cell(target, spec, cell_idx, cell_dir, exec_ws, exc)
         finally:
-            # A no-op on the success path AND the usual crash path: `shutil.move` (here or in
-            # _failed_cell) already relocated exec_ws to `workspace`, so there's nothing left
-            # at the old path to remove. This only fires when even that preservation failed.
-            if exec_ws != workspace and os.path.isdir(exec_ws):
-                shutil.rmtree(exec_ws, ignore_errors=True)
+            # exec_ws itself is usually already gone — `shutil.move` (here or in _failed_cell)
+            # relocated it to `workspace`. exec_root is what remains, and it is removed
+            # whether or not it is empty: anything the agent wrote ABOVE its cwd landed here,
+            # was never part of the archived workspace, and is discarded rather than published.
+            shutil.rmtree(exec_root, ignore_errors=True)
             # Cleared per cell, not per run: these are this scenario's resolved credentials
             # and nothing after this point may still be redacting against a stale set — a
             # secret carried into the NEXT cell would scrub text there for no reason, and
@@ -382,8 +392,8 @@ class Runner:
         #    vendor skills), not this repo's globally-installed skills.
         iso_home = None
         iso_env: dict[str, str] = {}
-        # Distinct from `self.isolated` (the run-level config flag, which also gates the exec_ws
-        # relocation above): this tracks whether THIS cell's HOME-overlay skill masking actually
+        # Distinct from `self.isolated` (the run-level config flag; the exec_ws relocation above
+        # is not gated on it): this tracks whether THIS cell's HOME-overlay skill masking actually
         # succeeded, which can independently fail (e.g. no symlink privileges) and fall back.
         home_isolated = False
         # Config masks neutralize per-user config the overlay's wholesale symlinks would
@@ -535,15 +545,15 @@ class Runner:
             (clean and all(c.passed for c in checks)) if checks else clean)
 
         # Move the tempdir exec workspace into cell_dir/workspace for artifacts/report — `rmdir`
-        # is safe since `_prepare_workspace` left it empty and nothing else wrote into it while
-        # isolated; `move` renames when possible (same filesystem) instead of a copy+delete pass.
-        # Assertion details recorded paths under the (about to vanish) exec_ws tempdir — remap
-        # them onto the final workspace location so assertions.json points at real files.
-        if self.isolated:
-            os.rmdir(workspace)
-            shutil.move(exec_ws, workspace)
-            for c in checks:
-                c.details = _remap_paths(c.details, exec_ws, workspace)
+        # is safe since `_prepare_workspace` left it empty and nothing else wrote into it (the
+        # agent has never had a path into cell_dir); `move` renames when possible (same
+        # filesystem) instead of a copy+delete pass. Assertion details recorded paths under the
+        # (about to vanish) exec_ws tempdir — remap them onto the final workspace location so
+        # assertions.json points at real files.
+        os.rmdir(workspace)
+        shutil.move(exec_ws, workspace)
+        for c in checks:
+            c.details = _remap_paths(c.details, exec_ws, workspace)
         # The workspace is the one artifact this runner does not WRITE, so it never met
         # `_rw`/`_rwj` and review found it kept credentials the rest of the tree had
         # scrubbed: an MCP result can echo a token back and the agent can save it to a file.
@@ -1348,12 +1358,58 @@ def _scrub_file(path: str, secrets) -> None:
         raise
 
 
-def _scrub_xattrs(path: str, secrets) -> None:
-    """Scrub attributes in place, for the entries that cannot be replaced by a copy.
+def _scrub_link(path: str, secrets) -> None:
+    """Rewrite one symlink — target AND attributes — onto a fresh inode.
 
-    Directories and symlinks have no rename-over trick available, and neither is a hardlink
-    an unprivileged agent can create, so writing through them stays inside the tree. Names
-    are scrubbed as well as values: an attribute name is attacker-chosen text too.
+    A symlink is not the unshareable object the previous round assumed it was:
+    `os.link(src, dst, follow_symlinks=False)` works on macOS, and review used it to
+    hardlink an EXTERNAL symlink into the workspace and watch an in-place `setxattr` rewrite
+    the outside name's metadata. So a link that needs changing is replaced rather than
+    edited — same reasoning as ``_scrub_file`` and the same result: our name gets a new
+    inode, every other name keeps its own. The replacement carries no attributes it was not
+    given, which is the strongest form of scrubbed metadata can be.
+
+    The link is still never FOLLOWED — its target may sit outside the artifact tree, and
+    rewriting through one would let a link the agent created redirect this scrub into an
+    arbitrary file. But the target STRING lives in the tree and `readlink` reads it straight
+    back, so a blandly named link pointing at `/tmp/<token>` publishes the credential as
+    plainly as a file containing it.
+    """
+    target = os.readlink(path)
+    attrs = [(n, xattrs.getxattr(path, n)) for n in xattrs.listxattr(path)]
+    clean = redact(target, secrets)
+    clean_attrs = [(redact_bytes(n, secrets), redact_bytes(v, secrets)) for n, v in attrs]
+    if clean == target and clean_attrs == attrs:
+        return  # untouched: the common no-leak run leaves the link exactly as it found it
+    parent = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    n = 0
+    tmp = os.path.join(parent, f".scrub-{base}")
+    while os.path.lexists(tmp):
+        n += 1
+        tmp = os.path.join(parent, f".scrub-{n}-{base}")
+    try:
+        os.symlink(clean, tmp)
+        for name, value in clean_attrs:
+            xattrs.setxattr(tmp, name, value)
+        os.replace(tmp, path)  # renames the LINK; never follows it
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _scrub_xattrs(path: str, secrets) -> None:
+    """Scrub a directory's attributes in place, there being no rename-over trick for one.
+
+    Directories are the one entry kind left that is written through rather than replaced.
+    An unprivileged agent cannot hardlink a directory on either platform this harness runs
+    on, so the shared-inode problem that forced files and symlinks onto fresh inodes does
+    not arise here — and `st_nlink` could not detect it if it did, since every directory has
+    at least two links (`.` and its parent's entry). Names are scrubbed as well as values:
+    an attribute name is attacker-chosen text too.
     """
     for name in xattrs.listxattr(path):
         value = xattrs.getxattr(path, name)
@@ -1471,11 +1527,8 @@ def _scrub_tree(root: str, secrets) -> list[str]:
 
     * **Contents**, onto a fresh inode (see ``_scrub_file``).
     * **Extended attributes**, which no read of a file's bytes will ever show.
-    * **Symlink targets**, in place. The link is never followed — its target may sit
-      outside the artifact tree, and rewriting through one would let a link the agent
-      created redirect this scrub into an arbitrary file — but the target STRING lives in
-      the tree and `readlink` reads it straight back, so a blandly named link pointing at
-      `/tmp/<token>` publishes the credential as plainly as a file containing it.
+    * **Symlink targets**, also onto a fresh inode (see ``_scrub_link``). The link is never
+      followed, but its target STRING is archived and `readlink` reads it straight back.
     * **Names**, one component at a time, and then
     * **assembled paths**, to a fixed point; see ``_spells_secret``.
 
@@ -1486,8 +1539,23 @@ def _scrub_tree(root: str, secrets) -> list[str]:
         return []
     try:
         st = os.lstat(root)
+    except FileNotFoundError:
+        return []  # nothing was archived, so there is nothing to certify
     except OSError:
-        return []
+        # Absence and REFUSAL are different answers, and a bare `except OSError: return []`
+        # gave them the same one: review chmod-ed the cell directory to 000 and got a clean
+        # bill of health over a workspace still holding the secret. The parent is `cell_dir`
+        # — created by this harness, in the artifact tree, ours to repair — so try that once.
+        _relax_dir(os.path.dirname(root) or ".")
+        try:
+            st = os.lstat(root)
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            raise ScrubFailed(
+                f"secret scrub could not even inspect {root} ({exc.strerror}) — the archived "
+                f"workspace cannot be certified free of declared secrets, and cannot be "
+                f"removed either; delete it before sharing this run") from exc
     if not stat.S_ISDIR(st.st_mode):
         # `os.path.isdir` FOLLOWS symlinks, and review used that to aim the entire scrub at
         # an external directory: every file under it came back rewritten to «redacted». A
@@ -1537,12 +1605,7 @@ def _scrub_tree(root: str, secrets) -> list[str]:
             try:
                 mode = os.lstat(path).st_mode
                 if stat.S_ISLNK(mode):
-                    _scrub_xattrs(path, secrets)
-                    target = os.readlink(path)
-                    clean = redact(target, secrets)
-                    if clean != target:
-                        os.unlink(path)
-                        os.symlink(clean, path)
+                    _scrub_link(path, secrets)
                 elif stat.S_ISDIR(mode):
                     _scrub_xattrs(path, secrets)
                 elif stat.S_ISREG(mode):
