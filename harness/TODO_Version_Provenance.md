@@ -266,6 +266,33 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   converts three of these from silent leaks into loud failures even in the cases nobody
   thought to model. An audit that cannot report incompleteness will report success instead.
 
+  The **third** round then found six more, and the enumeration habit is why: I had listed
+  the kinds of *entry* and stopped there. What was still unlisted was the kinds of *channel*
+  by which one object reaches another. The root was checked with `os.path.isdir`, which
+  follows symlinks — so the container the whole sweep ran inside was itself a way out of the
+  tree. The bytes went through write-and-rename to spare a shared inode, and then the
+  permission repair `chmod`-ed that same inode, because "don't write through a hardlink" had
+  been learned as a fact about *file contents* rather than about the inode. A FIFO proved
+  that "not a directory" and "a readable regular file" are different claims. Extended
+  attributes proved that not all of a file's bytes are in the file. `chflags uchg` proved
+  that a deletion is a request, not an outcome. And the fixed-point failure proved the
+  sharpest one: **a repair is an edit, and an edit can create the defect it is repairing** —
+  renaming a parent to remove one secret spelled out a second across the new name and a
+  child the walk had already passed. Iterating to a fixed point is what "the tree is clean"
+  means when the cleaning step is itself a mutation of the thing being checked.
+
+  Three of those six were caught only because the previous round's habit was already in
+  place: they arrived as loud failures on a `lost` list rather than as silent passes.
+
+- **A mutation test is also a test of the deletion path nobody exercised.** Disabling the
+  scrub's permission repair was supposed to make one arm go red; instead it crashed the
+  whole section, because the quarantine could not remove a `chmod 000` *directory* — `rmtree`
+  needs to list what it descends, and `os.walk` yields nothing for a directory it cannot
+  open, so the code relaxing permissions on what the walk reported never reached the
+  directory doing the refusing. The mutation was reintroducing a defect in *reading*; it
+  exposed an unrelated defect in *deleting*, on a path the passing suite had never taken.
+  Fault injection reaches the error handlers, which is where the untested code lives.
+
 - **Refactoring to a pattern covers the code that already had the pattern's shape.** The
   selftest's `_check_*` sections were wrapped so one crashing section could not abort the
   suite — all 31 of them. The first *ten* sections were not `_check_*` functions at all;

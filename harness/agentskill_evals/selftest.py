@@ -6930,10 +6930,13 @@ def _check_mcp_declared_servers(failures, verbose):
     import json as _json
     import os
     import shutil as _shutil
+    import stat as _stat
     import sys as _sys
     import tempfile as _tempfile
+    import threading as _threading
 
     from . import runner as runner_mod
+    from . import xattrs as _xattrs
     from .adapters import get_adapter
     from .adapters.base import RunOptions
     from .mcp import (parse_mcp_servers, redact, resolve_mcp_servers,
@@ -7311,7 +7314,7 @@ def _check_mcp_declared_servers(failures, verbose):
     open(os.path.join(hidden, "buried.txt"), "w").write("buried sk-secret-abcdef\n")
     os.chmod(hidden, 0o000)
     lost4 = runner_mod._scrub_tree(ws4, ("sk-secret-abcdef",))
-    os.chmod(hidden, 0o700)
+    _try(lambda: os.chmod(hidden, 0o700))  # a regression QUARANTINES it; don't crash the section
     buried = _try(lambda: open(os.path.join(hidden, "buried.txt")).read(), "(unreadable)")
     _check("mcp.unreadable_subtree_is_opened_rather_than_silently_skipped",
            "sk-secret-abcdef" not in buried and lost4 == [],
@@ -7359,6 +7362,162 @@ def _check_mcp_declared_servers(failures, verbose):
            f"the caller, which fails the cell with it named — the rest of the workspace is "
            f"untouched, so failing closed costs one artifact rather than the run's whole "
            f"evidence: lost={lost6}", failures, verbose)
+
+    # `os.path.isdir` FOLLOWS symlinks, so an agent that replaces its whole workspace with a
+    # link aims the entire scrub at whatever it points at — review had every file under an
+    # external directory rewritten to «redacted».
+    ws7 = os.path.join(root, "ws7")
+    ws7_target = os.path.join(root, "ws7-external")
+    os.makedirs(ws7_target, exist_ok=True)
+    open(os.path.join(ws7_target, "creds.txt"), "w").write("sk-secret-abcdef stays\n")
+    os.symlink(ws7_target, ws7)
+    lost7 = runner_mod._scrub_tree(ws7, ("sk-secret-abcdef",))
+    _check("mcp.workspace_root_must_itself_be_a_real_directory",
+           open(os.path.join(ws7_target, "creds.txt")).read() == "sk-secret-abcdef stays\n"
+           and lost7 and not os.path.islink(ws7) and os.path.isdir(ws7),
+           f"a workspace root that is not a real directory is dropped whole rather than "
+           f"walked — following it would let the agent point the scrub at any directory on "
+           f"the machine and rewrite it — and an empty directory is left behind so the "
+           f"report writer downstream still finds the shape it expects: lost={lost7}",
+           failures, verbose)
+
+    # Reading a 000-mode file needs a chmod, and a chmod changes the INODE — which is the
+    # same object every hardlink to it sees. Review watched an external file go 000 -> 600.
+    ws8 = os.path.join(root, "ws8")
+    os.makedirs(ws8, exist_ok=True)
+    locked_outside = os.path.join(root, "locked-outside.txt")
+    open(locked_outside, "w").write("sk-secret-abcdef stays\n")
+    os.link(locked_outside, os.path.join(ws8, "locked.txt"))
+    os.chmod(locked_outside, 0o000)
+    lost8 = runner_mod._scrub_tree(ws8, ("sk-secret-abcdef",))
+    mode8 = _stat.S_IMODE(os.stat(locked_outside).st_mode)
+    os.chmod(locked_outside, 0o600)
+    _check("mcp.permission_repair_never_widens_a_shared_inode",
+           mode8 == 0o000 and lost8 == ["locked.txt"]
+           and not os.path.exists(os.path.join(ws8, "locked.txt")),
+           f"an unreadable file with more than one name is quarantined rather than chmod-ed "
+           f"open: widening the mode would be a change visible through every OTHER name for "
+           f"that inode, i.e. outside the artifact tree, so the harness drops its own name "
+           f"and leaves the rest alone: external mode={mode8:04o} lost={lost8}",
+           failures, verbose)
+
+    # "Not a directory" is not the same claim as "a readable regular file". A FIFO makes
+    # `open(...).read()` wait for a writer that will never come, and review hung the scrub.
+    ws9 = os.path.join(root, "ws9")
+    os.makedirs(ws9, exist_ok=True)
+    os.mkfifo(os.path.join(ws9, "pipe"))
+    open(os.path.join(ws9, "ordinary.txt"), "w").write("tok sk-secret-abcdef\n")
+    box9: dict = {}
+    t9 = _threading.Thread(
+        target=lambda: box9.update(r=_try(lambda: runner_mod._scrub_tree(
+            ws9, ("sk-secret-abcdef",)), "(raised)")), daemon=True)
+    t9.start()
+    t9.join(20.0)
+    ord9 = _try(lambda: open(os.path.join(ws9, "ordinary.txt")).read(), "(unreadable)")
+    _check("mcp.special_files_are_removed_rather_than_read",
+           not t9.is_alive() and box9.get("r") == ["pipe"]
+           and not os.path.lexists(os.path.join(ws9, "pipe"))
+           and "sk-secret-abcdef" not in ord9,
+           f"entries are classified with `lstat`, so a FIFO/socket/device is removed and "
+           f"named instead of being opened — none of them holds archivable bytes and an "
+           f"`open` on one never returns, which would hang the whole run rather than fail "
+           f"it: returned={box9.get('r')} still_running={t9.is_alive()}", failures, verbose)
+
+    # On macOS a file's bytes are not all in the file: `xattr -w` parks a credential beside
+    # the data where no `read()` will show it, and `cp -p`/`ditto`/zip carry it along.
+    ws10 = os.path.join(root, "ws10")
+    ws10_sub = os.path.join(ws10, "sub")
+    os.makedirs(ws10_sub, exist_ok=True)
+    ws10_file = os.path.join(ws10, "plain.txt")
+    open(ws10_file, "w").write("nothing to see\n")
+    ws10_link = os.path.join(ws10, "plain.link")
+    os.symlink("plain.txt", ws10_link)
+    _try(lambda: _xattrs.setxattr(ws10_file, b"user.tok", b"sk-secret-abcdef"))
+    _try(lambda: _xattrs.setxattr(ws10_file, b"user.sk-secret-abcdef", b"in the NAME"))
+    _try(lambda: _xattrs.setxattr(ws10_sub, b"user.tok", b"sk-secret-abcdef"))
+    _try(lambda: _xattrs.setxattr(ws10_link, b"user.tok", b"sk-secret-abcdef"))
+    lost10 = runner_mod._scrub_tree(ws10, ("sk-secret-abcdef",))
+    left10 = []
+    for p in (ws10_file, ws10_sub, ws10_link):
+        for n in _try(lambda: _xattrs.listxattr(p), []):
+            left10.append((os.path.basename(p), n, _try(lambda: _xattrs.getxattr(p, n), b"")))
+    _check("mcp.extended_attributes_are_scrubbed_like_contents",
+           _xattrs.SUPPORTED and lost10 == []
+           and not any(b"sk-secret-abcdef" in n or b"sk-secret-abcdef" in v
+                       for _, n, v in left10)
+           and any(b"redacted" in n or b"redacted" in v for _, n, v in left10),
+           f"attribute VALUES and attribute NAMES are both scrubbed, on files, directories "
+           f"and symlinks alike — metadata is archived with the tree and is invisible to "
+           f"every check that reads a file's contents, so `lost == []` would otherwise be "
+           f"certifying bytes it never looked at: {left10}", failures, verbose)
+
+    # `chflags uchg` makes a file undeletable, and the old quarantine swallowed the failure:
+    # it reported the path as lost while leaving the raw secret sitting there.
+    ws11 = os.path.join(root, "ws11")
+    os.makedirs(ws11, exist_ok=True)
+    stuck11 = os.path.join(ws11, "immutable.txt")
+    open(stuck11, "w").write("tok sk-secret-abcdef\n")
+    _orig_scrub_file = runner_mod._scrub_file
+    runner_mod._scrub_file = lambda p, s: (
+        (_ for _ in ()).throw(OSError(30, "Read-only file system"))
+        if p.endswith("immutable.txt") else _orig_scrub_file(p, s))
+    _try(lambda: os.chflags(stuck11, _stat.UF_IMMUTABLE))
+    try:
+        lost11 = _try(lambda: runner_mod._scrub_tree(ws11, ("sk-secret-abcdef",)), "(raised)")
+    finally:
+        runner_mod._scrub_file = _orig_scrub_file
+        _try(lambda: os.chflags(stuck11, 0))  # never leave the selftest root undeletable
+    _check("mcp.quarantine_proves_the_deletion_rather_than_assuming_it",
+           lost11 == ["immutable.txt"] and not os.path.lexists(stuck11),
+           f"an immutable artifact is unlocked and actually removed — the result is the "
+           f"answer to `lexists`, not the absence of an exception, because a swallowed "
+           f"`unlink` failure reports a deletion that did not happen and publishes the "
+           f"secret under a clean-looking `lost` entry: lost={lost11} "
+           f"still_there={os.path.lexists(stuck11)}", failures, verbose)
+
+    # And when even that fails, the difference between "removed" and "still on disk" is the
+    # whole point — reporting the second as the first is the failure mode being fixed.
+    ws12 = os.path.join(root, "ws12")
+    os.makedirs(ws12, exist_ok=True)
+    open(os.path.join(ws12, "welded.txt"), "w").write("tok sk-secret-abcdef\n")
+    _orig_remove = runner_mod._remove
+    runner_mod._scrub_file = lambda p, s: (_ for _ in ()).throw(OSError(30, "Read-only"))
+    runner_mod._remove = lambda p: False
+    try:
+        note12 = runner_mod._scrub_and_note(ws12, ("sk-secret-abcdef",))
+        raised12 = _try(lambda: runner_mod._scrub_tree(ws12, ("sk-secret-abcdef",)), "(raised)")
+    finally:
+        runner_mod._scrub_file, runner_mod._remove = _orig_scrub_file, _orig_remove
+    _check("mcp.unremovable_leak_is_reported_as_a_leak_not_as_a_removal",
+           raised12 == "(raised)" and "welded.txt" in note12
+           and "still contains a declared secret" in note12,
+           f"an artifact that can be neither scrubbed nor deleted raises rather than "
+           f"joining the `lost` list, and the sentence the cell carries says the secret is "
+           f"STILL THERE instead of claiming a removal — a `lost` entry promises the "
+           f"artifact is gone: note={note12!r}", failures, verbose)
+
+    # One round of assembled-path reasoning is not enough: with two secrets declared,
+    # renaming a parent to remove the first CREATED the second across the new parent and an
+    # untouched child the bottom-up walk had already gone past.
+    # The second pair is independent of the first and forces a SECOND round: one pass over
+    # the tree repairs one spelling, so a check that runs once leaves the other standing.
+    ws13 = os.path.join(root, "ws13")
+    os.makedirs(os.path.join(ws13, "secretAAAAtailpart"), exist_ok=True)
+    os.makedirs(os.path.join(ws13, "otherpart"), exist_ok=True)
+    open(os.path.join(ws13, "secretAAAAtailpart", "childsecret"), "w").write("harmless\n")
+    open(os.path.join(ws13, "otherpart", "othersecret"), "w").write("harmless\n")
+    ws13_secrets = ("secretAAAA", "tailpart/childsecret", "otherpart/othersecret")
+    lost13 = runner_mod._scrub_tree(ws13, ws13_secrets)
+    ws13_paths = sorted(os.path.relpath(os.path.join(d, n), ws13).replace(os.sep, "/")
+                        for d, ds, fs in os.walk(ws13) for n in ds + fs)
+    _check("mcp.assembled_path_check_runs_to_a_fixed_point",
+           lost13 == []
+           and not any(runner_mod._spells_secret(p, ws13_secrets) for p in ws13_paths),
+           f"the tree is re-examined until no assembled path spells ANY declared secret, "
+           f"rather than each component being judged once on the way past — scrubbing one "
+           f"secret out of a name can complete a different one with a neighbour that has "
+           f"already been visited, and repairing one spelling per pass leaves every other "
+           f"one standing: {ws13_paths}", failures, verbose)
 
     # --- the run summary, written after every cell cleared its secrets ---------
     # `_secrets` is deliberately cell-scoped, so by the time the summary is written it is
