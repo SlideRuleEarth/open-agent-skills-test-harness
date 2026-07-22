@@ -6825,6 +6825,9 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _check_parallel_requires_isolation(failures, verbose)
     _check_codex_post_run_mcp_recheck(failures, verbose)
 
+    # declared MCP servers: schema, secrets, injection, refusals
+    _check_mcp_declared_servers(failures, verbose)
+
     # report inlining is capped per file; the judge's skip behavior is unchanged
     _check_inline_truncation(failures, verbose)
 
@@ -6846,3 +6849,281 @@ def _run_selftest_checks(verbose: bool = False) -> int:
         return 1
     print("SELFTEST PASSED")
     return 0
+
+
+def _check_mcp_declared_servers(failures, verbose):
+    """Declared `mcp_servers:` — schema, secrets, injection, and the refusals.
+
+    The through-line is that every way this feature can be WRONG is louder than the way it
+    is right. A misspelled key, a filter the runner cannot enforce, an adapter that cannot
+    inject at all, an unset credential — each fails before tokens are spent, because the
+    alternative in every case is a scenario that runs without the tool surface it declared
+    and fails somewhere unrecognizable.
+    """
+    import json as _json
+    import os
+    import tempfile as _tempfile
+
+    from . import runner as runner_mod
+    from .adapters import get_adapter
+    from .adapters.base import RunOptions
+    from .mcp import (parse_mcp_servers, redact, resolve_mcp_servers,
+                      validate_mcp_servers)
+
+    print("mcp declared servers:")
+
+    def _try(fn, default=None):
+        """Run fn, turning any exception into `default`.
+
+        Arms below assert on VALUES, and a mutation that makes production code raise
+        instead of returning the wrong value would otherwise abort this whole check with a
+        traceback — failing the selftest, but naming no invariant. Collapsing the raise
+        into a falsy value keeps the report pointed at the broken guarantee.
+        """
+        try:
+            return fn()
+        except Exception:
+            return default
+
+    # --- structure: everything checkable without the environment ---------------
+    rejected = {}
+    for label, raw in [
+        ("both_transports", {"e": {"command": "x", "url": "http://y"}}),
+        ("neither_transport", {"e": {}}),
+        ("claude_native_filter", {"e": {"command": "x", "allowedTools": ["a"]}}),
+        ("codex_native_filter", {"e": {"command": "x", "enabled_tools": ["a"]}}),
+        ("unknown_key", {"e": {"command": "x", "tolls": ["a"]}}),
+        ("name_with_space", {"bad name": {"command": "x"}}),
+        ("name_with_dunder", {"a__b": {"command": "x"}}),
+        ("bad_transport", {"e": {"url": "http://y", "transport": "grpc"}}),
+        ("stdio_key_on_remote", {"e": {"url": "http://y", "args": ["a"]}}),
+        ("remote_key_on_stdio", {"e": {"command": "x", "headers": {"a": "b"}}}),
+        ("not_a_mapping", {"e": ["command", "x"]}),
+    ]:
+        try:
+            parse_mcp_servers(raw, where="t")
+            rejected[label] = ""
+        except ValueError as exc:
+            rejected[label] = str(exc)
+    _check("mcp.schema_rejects_every_malformed_server",
+           all(rejected.values()),
+           f"each malformed server shape is a load error, not a silent default — "
+           f"{sorted(k for k, v in rejected.items() if not v) or 'all rejected'}",
+           failures, verbose)
+
+    # Rejection alone is not the guarantee here — an unknown-key error would also reject
+    # these. What the native-filter list buys is that the author is told the RIGHT thing:
+    # claude ACCEPTS `allowedTools` in an --mcp-config server object and silently ignores
+    # it, so the error has to name `tools:` as the working replacement rather than leaving
+    # someone to conclude the key was merely misspelled.
+    _check("mcp.native_filter_spellings_are_refused_by_name",
+           all("tools:" in rejected[k] and "silently IGNORES" in rejected[k]
+               for k in ("claude_native_filter", "codex_native_filter")),
+           f"a CLI-native filter spelling is refused with an error naming the portable "
+           f"`tools:` field and saying the CLI would have ignored it — "
+           f"{rejected['claude_native_filter'][:90]!r}", failures, verbose)
+
+    # A name carrying `__` would make `mcp__a__b__c` un-splittable back into server and
+    # tool — which is exactly the split the §6-C2 post-run allowlist check performs.
+    _check("mcp.server_name_cannot_contain_the_tool_name_separator",
+           rejected["name_with_dunder"],
+           "'a__b' is refused as a server name because claude spells MCP tools "
+           "mcp__<server>__<tool>; with a dunder in the name the two halves could not be "
+           "told apart afterwards", failures, verbose)
+
+    # --- interpolation, the secrets registry, and the redaction floor ----------
+    remote = parse_mcp_servers(
+        {"r": {"url": "https://h/${SEG}", "headers": {"Authorization": "Bearer ${TOK}"}}},
+        where="t")
+    env_ok = {"TOK": "sk-secret-abcdef", "SEG": "v1"}
+    res, secrets = resolve_mcp_servers(remote, env=env_ok)
+    missing_errs = _try(lambda: validate_mcp_servers(remote, env={"SEG": "v1"})[0], [])
+    _short_warns = _try(
+        lambda: validate_mcp_servers(remote, env={"TOK": "ab", "SEG": "v1"})[1], [])
+    _, short_secrets = resolve_mcp_servers(remote, env={"TOK": "ab", "SEG": "v1"})
+
+    _check("mcp.interpolates_from_process_env_and_registers_the_secret",
+           res["r"].headers["Authorization"] == "Bearer sk-secret-abcdef"
+           and res["r"].url == "https://h/v1"
+           and secrets == {"sk-secret-abcdef"},
+           f"${{VAR}} resolves in headers and the url, and the substituted VALUE (not the "
+           f"whole field) is registered for redaction — {secrets}. Registering the field "
+           f"would scrub 'Bearer ' out of unrelated text; registering the value scrubs the "
+           f"credential", failures, verbose)
+
+    _check("mcp.unset_variable_is_a_validation_error_naming_it",
+           len(missing_errs) == 1 and "TOK" in missing_errs[0],
+           f"an unset ${{VAR}} is reported by name before the run, not raised at load — "
+           f"raising would abort discovery of every OTHER eval in the directory over one "
+           f"unset variable: {missing_errs}", failures, verbose)
+
+    _check("mcp.too_short_to_redact_is_warned_and_left_alone",
+           short_secrets == set() and any("TOK" in w for w in _short_warns),
+           f"a 2-character secret is NOT added to the redaction set ({short_secrets}) and "
+           f"the author is told why — redacting it would rewrite every unrelated "
+           f"occurrence of those characters across the artifacts", failures, verbose)
+
+    # `${VAR}` is honoured in credentials, never in `command`/`args`: substituting there
+    # would turn an environment variable into a way to choose what program executes.
+    stdio_var = parse_mcp_servers({"e": {"command": "${EVIL}", "args": ["${EVIL}"]}},
+                                  where="t")
+    res_v, sec_v = resolve_mcp_servers(stdio_var, env={"EVIL": "/bin/sh"})
+    _check("mcp.interpolation_cannot_choose_what_program_runs",
+           res_v["e"].command == "${EVIL}" and res_v["e"].args == ["${EVIL}"]
+           and sec_v == set(),
+           f"${{VAR}} stays literal in command/args ({res_v['e'].command!r}) — it is a "
+           f"credential mechanism, and honouring it there would let an env var select the "
+           f"executable, a categorically larger power than supplying a token",
+           failures, verbose)
+
+    # --- per-adapter: who can inject, who can enforce `tools:` -----------------
+    plain = parse_mcp_servers({"e": {"command": "python3"}}, where="t")
+    gated = parse_mcp_servers({"e": {"command": "python3", "tools": ["echo"]}}, where="t")
+    inject = {a: len(get_adapter(a).validate_mcp_support(plain)[0]) for a in
+              ("claude", "codex", "copilot", "antigravity")}
+    tools_claude = get_adapter("claude").validate_mcp_support(gated)[0]
+
+    _check("mcp.adapters_without_injection_refuse_rather_than_drop_the_servers",
+           inject["claude"] == 0 and all(inject[a] == 1 for a in
+                                         ("codex", "copilot", "antigravity")),
+           f"only claude accepts declared servers today, and the other three REFUSE the "
+           f"run instead of silently running without them — {inject}. Dropping them would "
+           f"grade a scenario that never had the tools it asked for, and every MCP "
+           f"assertion would fail for a reason that looks nothing like the cause",
+           failures, verbose)
+
+    _check("mcp.claude_refuses_tools_it_cannot_enforce",
+           len(tools_claude) == 1 and "C3" in tools_claude[0]
+           and "tools:" in tools_claude[0],
+           f"`tools:` on claude is a validation ERROR, not an accepted no-op: the only "
+           f"mechanism is deny-the-complement, which needs a tool list obtainable only "
+           f"from a second server instance that can answer differently than the one claude "
+           f"launches (§6-C2). The error points at C3 — {tools_claude}", failures, verbose)
+
+    # --- claude's config materialization --------------------------------------
+    scratch = _tempfile.mkdtemp(prefix="ase-mcptest-")
+    cl = get_adapter("claude")
+    resolved, _ = resolve_mcp_servers(
+        parse_mcp_servers({"echo": {"command": "python3", "args": ["s.py"],
+                                    "env": {"K": "V"}}}, where="t"), env={})
+    argv = _try(lambda: cl.build_argv(
+        "hi", RunOptions(mcp_servers=resolved, mcp_scratch_dir=scratch), cwd=scratch), [])
+    cfg_path = os.path.join(scratch, "mcp.json")
+    cfg = _try(lambda: _json.loads(open(cfg_path).read()))
+    mode = _try(lambda: os.stat(cfg_path).st_mode & 0o777)
+
+    _check("mcp.claude_writes_a_file_not_inline_json",
+           _flag_pair(argv, "--mcp-config", cfg_path)
+           and cfg == {"mcpServers": {"echo": {"command": "python3", "args": ["s.py"],
+                                               "env": {"K": "V"}}}},
+           f"the config goes to a FILE named on argv, never inline: argv is archived "
+           f"verbatim into result.json, so inline JSON would publish every resolved "
+           f"credential into the artifacts — {cfg}", failures, verbose)
+
+    _check("mcp.claude_config_is_not_world_readable",
+           mode == 0o600,
+           f"the scratch config is created 0600 in one step (O_CREAT with the mode, not "
+           f"write-then-chmod, which would leave a window where the credentials are "
+           f"readable) — got {oct(mode)}", failures, verbose)
+
+    # Any exception counts as "refused", but the MESSAGE has to explain itself: a bare
+    # TypeError from joining None would also stop the run, and would tell the operator
+    # nothing about why writing credentials into the workspace is refused.
+    no_scratch = None
+    try:
+        cl.build_argv("hi", RunOptions(mcp_servers=resolved), cwd=scratch)
+    except Exception as exc:
+        no_scratch = str(exc)
+    _check("mcp.claude_refuses_to_write_secrets_without_a_scratch_dir",
+           no_scratch is not None and "workspace" in no_scratch,
+           f"with no scratch dir the adapter RAISES rather than falling back to the "
+           f"workspace — the workspace is archived into artifacts and inlined into "
+           f"report.md, so that fallback would publish the credentials: {no_scratch!r}",
+           failures, verbose)
+
+    # `--strict-mcp-config` must survive injection, or the declared servers stop being the
+    # ONLY servers and the opt-in silently becomes an opt-in-plus-whatever-the-host-has.
+    _check("mcp.declared_servers_stay_hermetic",
+           "--strict-mcp-config" in argv,
+           "--mcp-config is paired with --strict-mcp-config, so declaring servers grants "
+           "exactly those and not the user's ambient ones", failures, verbose)
+
+    # --- the witness now permits declared servers, and only those --------------
+    init_echo = _json.dumps({"type": "system", "subtype": "init",
+                             "mcp_servers": [{"name": "echo", "status": "connected"}],
+                             "claude_code_version": "2.1.113"})
+    declared_ok = None
+    try:
+        cl.verify_post_run([], RunOptions(mcp_servers=resolved), cwd=scratch,
+                           stdout=init_echo, stderr="", exit_code=0)
+    except RuntimeError as exc:
+        declared_ok = str(exc)
+    undeclared = None
+    try:
+        cl.verify_post_run([], RunOptions(mcp_servers=resolved), cwd=scratch,
+                           stdout=_json.dumps(
+                               {"type": "system", "subtype": "init",
+                                "mcp_servers": [{"name": "echo"}, {"name": "sneaky"}],
+                                "claude_code_version": "2.1.113"}),
+                           stderr="", exit_code=0)
+    except RuntimeError as exc:
+        undeclared = str(exc)
+    none_opts = None
+    try:
+        cl.verify_post_run([], None, cwd=scratch, stdout=init_echo, stderr="",
+                           exit_code=0)
+    except RuntimeError as exc:
+        none_opts = str(exc)
+
+    _check("mcp.witness_permits_declared_servers_and_only_those",
+           declared_ok is None and undeclared is not None
+           and "sneaky" in undeclared and "echo" not in undeclared.split("server(s)")[1][:20],
+           f"a DECLARED server no longer fails the run (was: any named server was a "
+           f"kill-switch violation, so every intentional server failed closed), while an "
+           f"UNDECLARED one still does and is named — declared={declared_ok!r} "
+           f"undeclared={undeclared!r}", failures, verbose)
+
+    _check("mcp.witness_without_options_treats_everything_as_undeclared",
+           none_opts is not None,
+           f"called with no RunOptions (selftest, out-of-tree callers) the witness reads "
+           f"'nothing was declared' and fails on any reported server — defaulting the "
+           f"other way would let a missing argument silently permit any server at all: "
+           f"{none_opts!r}", failures, verbose)
+
+    # --- redaction reaches the artifacts, including nested and argv ------------
+    root = _tempfile.mkdtemp(prefix="ase-mcpred-")
+    r = runner_mod.Runner("claude", models=["m"], artifacts_root=os.path.join(root, "a"),
+                          run_id="c", skills_root=root)
+    r._secrets = ("sk-secret-abcdef",)
+    cell_dir = os.path.join(root, "cell")
+    os.makedirs(cell_dir, exist_ok=True)
+    r._rw(os.path.join(cell_dir, "t.txt"), "tool said sk-secret-abcdef back")
+    r._rwj(os.path.join(cell_dir, "t.json"),
+           {"argv": ["x", "--header", "Bearer sk-secret-abcdef"],
+            "events": [{"raw": {"deep": {"nested": "sk-secret-abcdef"}}}]})
+    txt = open(os.path.join(cell_dir, "t.txt")).read()
+    js = open(os.path.join(cell_dir, "t.json")).read()
+    js_obj = _json.loads(js)
+
+    _check("mcp.secrets_are_scrubbed_from_every_artifact_shape",
+           "sk-secret-abcdef" not in txt and "sk-secret-abcdef" not in js
+           and js_obj["argv"][2] == "Bearer «redacted»"
+           and js_obj["events"][0]["raw"]["deep"]["nested"] == "«redacted»",
+           f"redaction happens at the WRITERS, on the serialized form, so it reaches "
+           f"argv, arbitrarily nested event payloads, and plain text alike without "
+           f"knowing any of their shapes — and covers the case no CLI flag can, a tool "
+           f"RESULT echoing a token back into the transcript. Structure survives: "
+           f"{js_obj['argv']}", failures, verbose)
+
+    # A value that contains another must not be left half-rewritten by the shorter one.
+    overlap = redact("token=abcdef123456 short=abcdef",
+                     {"abcdef", "abcdef123456"})
+    _check("mcp.longest_secret_is_redacted_first",
+           overlap == "token=«redacted» short=«redacted»",
+           f"overlapping secrets are replaced longest-first, so the longer value is not "
+           f"left as '«redacted»123456' by the shorter one's pass — {overlap!r}",
+           failures, verbose)
+
+    import shutil as _shutil
+    _shutil.rmtree(scratch, ignore_errors=True)
+    _shutil.rmtree(root, ignore_errors=True)

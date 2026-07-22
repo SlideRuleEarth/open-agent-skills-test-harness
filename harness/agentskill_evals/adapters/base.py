@@ -51,6 +51,14 @@ class RunOptions:
     # harness's. None outside execute() (direct build_argv calls); adapters fall back
     # to os.environ then.
     effective_env: Optional[dict] = None
+    # Declared MCP servers for this run, already interpolated (name -> mcp.MCPServer).
+    # Empty/None means MCP stays hermetically off — the Phase 0 default.
+    mcp_servers: Optional[dict] = None
+    # Per-cell scratch dir for CLI config files carrying resolved secrets. Deliberately
+    # OUTSIDE the workspace: the workspace is archived into artifacts and inlined into
+    # report.md, which would publish the credentials this dir exists to keep out of them.
+    # Created and removed by the runner; adapters only write into it.
+    mcp_scratch_dir: Optional[str] = None
 
 
 @dataclass
@@ -373,6 +381,56 @@ class Adapter(ABC):
         argv that makes servers impossible.
         """
         return None
+
+    # Whether this adapter can INJECT declared `mcp_servers:` (Phase 1+). False is not a
+    # soft "ignores the field" — the runner refuses the run, because silently dropping
+    # declared servers would grade a scenario that never had the tools it asked for.
+    supports_mcp_injection = False
+
+    # How `tools:` on a declared server is enforced here:
+    #   "native"     — a hard CLI filter (codex enabled_tools, copilot per-server tools)
+    #   "complement" — deny-the-rest, bounded by what enumeration saw (claude, §6-C2)
+    #   "none"       — no mechanism exists in this CLI (antigravity)
+    #   "unbuilt"    — a mechanism exists but this harness has not implemented it yet
+    # Anything other than "native"/"complement" means `tools:` cannot be honoured, and the
+    # validator refuses it rather than accepting a filter that would quietly not apply.
+    mcp_tool_filter = "none"
+
+    def validate_mcp_support(self, mcp_servers: dict) -> tuple[list[str], list[str]]:
+        """Can THIS runner honour these declared servers? Returns (errors, warnings).
+
+        Split out from ``validate_spec`` because the answer is per-adapter and spec.py must
+        not import adapters. Called before any tokens are spent.
+
+        The default refuses `mcp_servers:` outright. That is the fail-closed direction and
+        the only honest one: an adapter that cannot inject servers would otherwise run the
+        scenario with none of them, and every assertion about MCP tool use would fail for a
+        reason that looks nothing like the cause.
+        """
+        if not mcp_servers:
+            return [], []
+        errors: list[str] = []
+        warnings: list[str] = []
+        if not self.supports_mcp_injection:
+            errors.append(
+                f"`mcp_servers:` is declared but the {self.name} adapter cannot inject MCP "
+                "servers yet, and running without them would grade a scenario that never "
+                "had the tools it asked for. Run this eval on an adapter that supports "
+                "them, or remove `mcp_servers:`.")
+            return errors, warnings
+        gated = sorted(n for n, s in mcp_servers.items() if getattr(s, "tools", None) is not None)
+        if gated and self.mcp_tool_filter not in ("native", "complement"):
+            detail = {
+                "none": (f"{self.name} has no tool-filtering mechanism at all"),
+                "unbuilt": (f"tool filtering on {self.name} is not implemented in this "
+                            "harness yet"),
+            }.get(self.mcp_tool_filter, f"{self.name} cannot enforce it")
+            errors.append(
+                f"MCP server(s) {', '.join(gated)} set `tools:`, but {detail}. An allowlist "
+                "that is accepted and not enforced is worse than no allowlist, because "
+                "nothing in the results would show it never applied — refusing instead. "
+                "Remove `tools:` to run with the server's full tool surface.")
+        return errors, warnings
 
     def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str,
                         stdout: str = "", stderr: str = "",

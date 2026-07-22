@@ -34,6 +34,7 @@ from .assertions import AssertionContext, AssertionResult, run_assertion
 from .exec import execute
 from .isolation import build_isolated_home, config_home_entries, reroot_config_masks
 from .judge import Judge
+from .mcp import redact
 from .progress import Progress
 from .schema import EventKind, RunResult
 from .spec import EvalSpec, ModelTarget, repo_root_for, skill_names
@@ -107,6 +108,12 @@ class CellResult:
 
 
 class Runner:
+    # Class-level default so the redacting artifact writers work on a Runner built without
+    # __init__ — selftest constructs partial runners to exercise the writers in isolation,
+    # and an artifact writer that raises AttributeError on "no secrets to redact" would be
+    # failing at the safest possible moment.
+    _secrets: tuple[str, ...] = ()
+
     def __init__(
         self,
         agent: str,
@@ -152,6 +159,11 @@ class Runner:
         # for masking stale global symlinks (retired names) that still point into this checkout
         self._repo_root = repo_root_for(skills_root)
         self.run_dir = os.path.join(artifacts_root, run_id)
+        # Values interpolated into THIS cell's MCP config, scrubbed from every artifact this
+        # runner writes. Cell-scoped (set in _run_cell_body, cleared in _run_cell's finally)
+        # rather than run-scoped, and never stored on CellResult/RunResult — those are
+        # serialized, which would archive the very strings this exists to keep out.
+        self._secrets: tuple[str, ...] = ()
 
     @property
     def models(self) -> list[Optional[str]]:
@@ -274,6 +286,11 @@ class Runner:
             # at the old path to remove. This only fires when even that preservation failed.
             if exec_ws != workspace and os.path.isdir(exec_ws):
                 shutil.rmtree(exec_ws, ignore_errors=True)
+            # Cleared per cell, not per run: these are this scenario's resolved credentials
+            # and nothing after this point may still be redacting against a stale set — a
+            # secret carried into the NEXT cell would scrub text there for no reason, and
+            # one carried past the last cell would outlive the artifacts it protects.
+            self._secrets = ()
 
     def _failed_cell(self, target: ModelTarget, spec: EvalSpec, cell_idx: int,
                      cell_dir: str, exec_ws: str, exc: Exception) -> CellResult:
@@ -303,7 +320,7 @@ class Runner:
             pass  # best-effort — the finally in _run_cell still cleans up the tempdir
         try:
             self._write_cell_json(cell_dir, cell)
-            _write(os.path.join(cell_dir, "report.md"), render_report(cell))
+            self._rw(os.path.join(cell_dir, "report.md"), render_report(cell))
         except Exception:
             pass  # best-effort only — don't let artifact-writing mask the real error above
         if self.progress and cell_idx:
@@ -417,6 +434,16 @@ class Runner:
             # neither RunOptions nor the recorded effective_effort claims a thinking budget
             # the CLI silently ignored — that would corrupt cross-effort comparisons.
             effort = None
+        # Declared MCP servers, resolved per cell. The scratch dir holds CLI config files
+        # carrying the interpolated credentials, so it lives OUTSIDE the workspace (which is
+        # archived into artifacts and inlined into report.md) and is removed in the same
+        # finally as the isolated home, on every exit path including a timeout.
+        mcp_scratch = None
+        mcp_resolved: dict = {}
+        if spec.mcp_servers:
+            mcp_resolved, secrets = spec.resolved_mcp_servers()
+            self._secrets = tuple(secrets)
+            mcp_scratch = tempfile.mkdtemp(prefix="ase-mcp-")
         opts = RunOptions(
             model=model,
             auto_approve=self.auto_approve,
@@ -424,6 +451,8 @@ class Runner:
             output_schema=spec.output_schema,
             home=iso_home,
             isolation_env=iso_env,
+            mcp_servers=mcp_resolved or None,
+            mcp_scratch_dir=mcp_scratch,
         )
         try:
             ex = execute(
@@ -434,6 +463,8 @@ class Runner:
         finally:
             if iso_home:
                 shutil.rmtree(iso_home, ignore_errors=True)
+            if mcp_scratch:
+                shutil.rmtree(mcp_scratch, ignore_errors=True)
         rr = ex.result
 
         if model and rr.error and _looks_like_model_error(rr.error, ex.stderr, model):
@@ -504,7 +535,7 @@ class Runner:
         if ctx.judge_exec is not None:
             cell.judge_run_result = ctx.judge_exec.result
         self._write_cell_json(cell_dir, cell)
-        _write(os.path.join(cell_dir, "report.md"), render_report(cell))
+        self._rw(os.path.join(cell_dir, "report.md"), render_report(cell))
 
         # 8) judge artifacts — same detail level as the agent, prefixed judge_*
         if ctx.judge_exec is not None:
@@ -560,17 +591,38 @@ class Runner:
 
     # --- artifact writers ---------------------------------------------------
 
+    def _rw(self, path: str, text: str) -> None:
+        """Write text with this cell's MCP secrets scrubbed.
+
+        Every artifact write in this class goes through here or `_rwj`. Redacting at the
+        writers rather than at each producer is deliberate: the transcript can carry a
+        credential that no flag could have kept out — a tool RESULT echoing a token back,
+        or the model quoting one — so the scrub has to sit at the last point before disk,
+        where it covers producers nobody thought about.
+        """
+        _write(path, redact(text, self._secrets) if self._secrets else text)
+
+    def _rwj(self, path: str, obj) -> None:
+        if not self._secrets:
+            _write_json(path, obj)
+            return
+        # Redact the SERIALIZED form, so a secret is caught wherever it sits in the
+        # structure — argv entries, nested event payloads, assertion messages — without
+        # this needing to know the shape of any of them. json.dumps/loads round-trips
+        # because the replacement is a plain string.
+        _write_json(path, json.loads(redact(json.dumps(obj), self._secrets)))
+
     def _write_artifacts(self, cell_dir: str, stdout: str, stderr: str, rr: RunResult) -> None:
         os.makedirs(cell_dir, exist_ok=True)
-        _write(os.path.join(cell_dir, "stdout.jsonl"), stdout)
-        _write(os.path.join(cell_dir, "stderr.txt"), stderr)
+        self._rw(os.path.join(cell_dir, "stdout.jsonl"), stdout)
+        self._rw(os.path.join(cell_dir, "stderr.txt"), stderr)
         rr.stdout_path = os.path.join(cell_dir, "stdout.jsonl")
         rr.stderr_path = os.path.join(cell_dir, "stderr.txt")
-        _write_json(os.path.join(cell_dir, "events.json"), [e.to_dict() for e in rr.events])
-        _write_json(os.path.join(cell_dir, "result.json"), rr.to_dict())
+        self._rwj(os.path.join(cell_dir, "events.json"), [e.to_dict() for e in rr.events])
+        self._rwj(os.path.join(cell_dir, "result.json"), rr.to_dict())
 
     def _write_cell_json(self, cell_dir: str, cell: CellResult) -> None:
-        _write_json(
+        self._rwj(
             os.path.join(cell_dir, "assertions.json"),
             {
                 "agent": cell.agent,
@@ -595,11 +647,11 @@ class Runner:
         """Write judge_* artifacts — same format as the agent's, so a human can
         audit the judge's reasoning at the same level of detail."""
         jrr = judge_ex.result
-        _write(os.path.join(cell_dir, "judge_stdout.jsonl"), judge_ex.stdout)
-        _write(os.path.join(cell_dir, "judge_stderr.txt"), judge_ex.stderr)
-        _write_json(os.path.join(cell_dir, "judge_events.json"),
-                     [e.to_dict() for e in jrr.events])
-        _write_json(os.path.join(cell_dir, "judge_result.json"), jrr.to_dict())
+        self._rw(os.path.join(cell_dir, "judge_stdout.jsonl"), judge_ex.stdout)
+        self._rw(os.path.join(cell_dir, "judge_stderr.txt"), judge_ex.stderr)
+        self._rwj(os.path.join(cell_dir, "judge_events.json"),
+                  [e.to_dict() for e in jrr.events])
+        self._rwj(os.path.join(cell_dir, "judge_result.json"), jrr.to_dict())
 
         # The LAST llm_judge assertion, to match ctx.judge_exec — _llm_judge overwrites
         # judge_exec on each run, so with several llm_judge assertions the saved exec trace
@@ -617,7 +669,7 @@ class Runner:
             assertions=[judge_assertion] if judge_assertion else [],
             artifacts_dir=cell_dir,
         )
-        _write(os.path.join(cell_dir, "judge_report.md"), render_report(judge_cell))
+        self._rw(os.path.join(cell_dir, "judge_report.md"), render_report(judge_cell))
 
     def _consistency(self, results: list[CellResult]) -> dict:
         """Did every cell in this matrix run under the same conditions?

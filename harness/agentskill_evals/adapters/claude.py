@@ -19,6 +19,8 @@ Anthropic SDK message objects:
 from __future__ import annotations
 
 import json
+import os
+import sys
 from typing import Any, Optional
 
 from ..schema import EventKind, NormalizedEvent
@@ -127,6 +129,11 @@ def _stream_cli_version(stdout: str) -> Optional[str]:
 def _mcp_witness(stdout: str, exit_code: int) -> tuple[Optional[str], list[str], bool]:
     """Check the run's own account of its MCP host. Returns (violation, live, witnessed).
 
+    ``live`` is every server the run reports, DECLARED OR NOT — deciding which of those
+    were supposed to be there belongs to the caller, which is the only layer that knows
+    what the scenario asked for. Filtering here would make the witness an accomplice to
+    the policy it exists to check.
+
     The init event lists ``mcp_servers``; under ``--strict-mcp-config`` with no
     ``--mcp-config`` passed, a hermetic run reports that list empty. Reading it from the
     run being judged is what makes this immune to the ABA problem that any
@@ -194,6 +201,19 @@ class ClaudeAdapter(Adapter):
     # harness only passes the typed cross-runner subset low|medium|high).
     supports_reasoning_effort = True
 
+    # Declared servers ride in on `--mcp-config` (stdio shape verified live, 2.1.113).
+    supports_mcp_injection = True
+    # Per-server `tools:` is REFUSED here rather than half-enforced. The only claude
+    # mechanism that gates MCP tools is `--disallowedTools` on the complement of the
+    # allowlist (`--allowedTools` does nothing under --dangerously-skip-permissions —
+    # measured, DESIGN_MCP_Support.md §6-C2), and computing a complement requires the
+    # server's full tool list, which is knowable only by starting the server and asking it
+    # — a SECOND server instance that can answer differently from the one claude launches.
+    # That gap is the design's C3 (a harness-owned filtering proxy), deliberately not built
+    # yet, so the honest state is "no enforcement mechanism implemented" and the validator
+    # refuses `tools:` instead of accepting an allowlist that would not apply.
+    mcp_tool_filter = "unbuilt"
+
     # TODO: Claude Code has no `list-models` command yet (feature request pending).
     # When one ships, add has_model_list = True and a discover_models() override
     # like Codex and AntiGravity have — then probing falls back to free discovery.
@@ -254,6 +274,62 @@ class ClaudeAdapter(Adapter):
             return None
         return []
 
+    def _write_mcp_config(self, opts: RunOptions) -> str:
+        """Materialize `<scratch>/mcp.json` and return its path.
+
+        A FILE, not `--mcp-config '<inline json>'`: argv is archived verbatim into
+        result.json, so an inline config would publish every resolved credential into the
+        artifacts. The file lives in the runner's per-cell scratch dir — outside the
+        workspace, which is archived and inlined into report.md — and is created 0600 so it
+        is not readable by other users for the seconds it exists.
+
+        Written on every build_argv call rather than cached, because build_argv is the only
+        hook that runs after the runner has created the scratch dir and before the child
+        starts, and a stale file from a previous cell would silently outrank the current
+        scenario's servers.
+        """
+        if not opts.mcp_scratch_dir:
+            raise RuntimeError(
+                "claude: mcp_servers were declared but no scratch dir was provided — "
+                "refusing to write MCP config with resolved secrets into the workspace, "
+                "which is archived into artifacts and inlined into report.md.")
+        servers: dict[str, Any] = {}
+        for name, s in opts.mcp_servers.items():
+            if s.is_stdio:
+                entry: dict[str, Any] = {"command": s.command}
+                if s.args:
+                    entry["args"] = list(s.args)
+                if s.env:
+                    entry["env"] = dict(s.env)
+            else:
+                # `type` is claude's transport discriminator; `http` and `sse` are the two
+                # documented values (§2 — this half is still INFERRED, unlike the stdio
+                # shape which is verified live against fixtures/echo_mcp_server.py).
+                entry = {"type": s.transport, "url": s.url}
+                if s.headers:
+                    entry["headers"] = dict(s.headers)
+            servers[name] = entry
+
+        path = os.path.join(opts.mcp_scratch_dir, "mcp.json")
+        # Create with 0600 from the start — writing then chmod'ing would leave a window
+        # where the credentials are world-readable.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"mcpServers": servers}, fh)
+        return path
+
+    def validate_mcp_support(self, mcp_servers: dict) -> tuple[list[str], list[str]]:
+        errors, warnings = super().validate_mcp_support(mcp_servers)
+        # Point at the reason and the escape hatch rather than the internal state name —
+        # "unbuilt" tells the scenario author nothing actionable.
+        errors = [e + (" (claude's only MCP tool filter is deny-the-complement, which "
+                       "needs a tool list this harness cannot obtain without a second, "
+                       "independently answerable server instance — see C3 in "
+                       "DESIGN_MCP_Support.md)"
+                       if "tools:" in e and "not implemented" in e else "")
+                  for e in errors]
+        return errors, warnings
+
     def build_argv(self, prompt: str, opts: RunOptions, *, cwd: str) -> list[str]:
         argv = [
             self.binary,
@@ -276,6 +352,10 @@ class ClaudeAdapter(Adapter):
             argv += ["--allowedTools", ",".join(opts.allowed_tools)]
         if opts.disable_tools:
             argv += ["--tools", ""]  # reasoning-only (judge mode)
+        if opts.mcp_servers:
+            # --strict-mcp-config is already in _HERMETIC, so these become the ONLY servers
+            # the run can reach — the opt-in is hermetic for free (§5.1).
+            argv += ["--mcp-config", self._write_mcp_config(opts)]
         argv += opts.extra_args
         return argv
 
@@ -310,15 +390,35 @@ class ClaudeAdapter(Adapter):
                 "refused instead: the run's hermeticity is unwitnessed rather than "
                 "confirmed; failing closed."
             )
-        if live:
+        # `opts` is None on direct calls (selftest, out-of-tree callers). Absent options
+        # mean nothing was declared, which is the STRICT reading: every reported server is
+        # then undeclared and fails the run. Defaulting the other way would let a missing
+        # argument silently permit any server at all.
+        declared = set(getattr(opts, "mcp_servers", None) or {})
+        undeclared = sorted(s for s in live if s not in declared)
+        if undeclared:
+            expected = (f"only the declared server(s) {', '.join(sorted(declared))}"
+                        if declared else
+                        "that list empty, since --strict-mcp-config was passed with no "
+                        "--mcp-config")
             raise RuntimeError(
-                f"claude reports MCP server(s) {', '.join(sorted(live))} loaded during "
-                "this run, but --strict-mcp-config with no --mcp-config should leave that "
-                "list empty. Either the flag no longer governs every server source, or "
-                "something in this invocation supplied one. The state on disk may read "
-                "clean now — a config planted inside the launch window and reverted "
-                "before exit would — but the run itself was not MCP-hermetic."
+                f"claude reports MCP server(s) {', '.join(undeclared)} loaded during this "
+                f"run, but this invocation should have had {expected}. Either "
+                "--strict-mcp-config no longer governs every server source, or something "
+                "in this invocation supplied one. The state on disk may read clean now — a "
+                "config planted inside the launch window and reverted before exit would — "
+                "but the run itself was not MCP-hermetic."
             )
+        # A DECLARED server that is missing from the witness is not a hermeticity failure
+        # (nothing leaked) and is not silently fine either: the scenario asked for a tool
+        # surface it did not get, so assertions about it will fail confusingly. Surfaced as
+        # a warning rather than a raise, because verify_post_run's raises all mean "this
+        # run was not hermetic" and widening that would blur what a failure here means.
+        missing = sorted(declared - set(live))
+        if missing and witnessed:
+            print(f"warning: [claude] declared MCP server(s) {', '.join(missing)} were not "
+                  "reported by the run — the scenario ran without them; check the server "
+                  "command and its startup output.", file=sys.stderr)
         _PROVENANCE.warn_drift(version, witnessed=witnessed)
 
     def parse(self, stdout: str, stderr: str, exit_code: int,

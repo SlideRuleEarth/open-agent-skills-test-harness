@@ -140,6 +140,10 @@ class EvalSpec:
     assertions: list[dict] = field(default_factory=list)
     rubric: list[str] = field(default_factory=list)
     output_schema: Optional[dict] = None
+    # Declared MCP servers, PRE-interpolation — `${VAR}` is still literal here. Absent/empty
+    # means MCP stays hermetically off, which is what every adapter's kill-switch enforces
+    # (DESIGN_MCP_Support.md §4). Resolution happens per run via resolved_mcp_servers().
+    mcp_servers: dict = field(default_factory=dict)
     # provenance (set by the loader)
     source_path: Optional[str] = None
     skill_name: Optional[str] = None
@@ -180,6 +184,16 @@ class EvalSpec:
                 dest = norm
             out.append((src, dest))
         return out
+
+    def resolved_mcp_servers(self, env: Optional[dict] = None):
+        """(servers with `${VAR}` substituted, values to redact from artifacts).
+
+        Resolved per run rather than at load so an unset variable is a validation error
+        naming the variable, not an exception that aborts discovery of every other eval in
+        the directory.
+        """
+        from .mcp import resolve_mcp_servers
+        return resolve_mcp_servers(self.mcp_servers, env=env, base_dir=self.base_dir())
 
     def resolved_fixture(self) -> Optional[str]:
         if not self.fixture:
@@ -386,6 +400,16 @@ def validate_spec(spec: "EvalSpec", *,
     if fixture and not os.path.isdir(fixture):
         errors.append(f"fixture {fixture!r} does not exist — fix `fixture:` or the path")
 
+    # --- declared MCP servers ---
+    # Adapter-independent only (unresolvable `${VAR}`, dead filters). Whether the SELECTED
+    # runner can actually honour these servers is an adapter question, checked by
+    # `Adapter.validate_mcp_support` at the call site — spec.py must not import adapters.
+    if spec.mcp_servers:
+        from .mcp import validate_mcp_servers
+        mcp_errors, mcp_warnings = validate_mcp_servers(spec.mcp_servers)
+        errors.extend(mcp_errors)
+        warnings.extend(mcp_warnings)
+
     # --- empty rubric items ---
     for i, r in enumerate(spec.rubric):
         text = str(r) if not isinstance(r, str) else r
@@ -476,6 +500,9 @@ def _spec_from_raw(raw: dict, path: str) -> EvalSpec:
     # `error: ...` before any tokens are spent, not a per-adapter CLI rejection mid-run.
     effort = _normalize_effort(raw.get("reasoning_effort"), path)
 
+    from .mcp import parse_mcp_servers
+    mcp_servers = parse_mcp_servers(raw.get("mcp_servers"), where=path)
+
     name = raw.get("name") or os.path.splitext(os.path.basename(path))[0]
     skill_name = _infer_skill_name(path) or (skills[0] if skills else None)
 
@@ -495,6 +522,7 @@ def _spec_from_raw(raw: dict, path: str) -> EvalSpec:
         assertions=raw.get("assertions", []) or [],
         rubric=list(rubric),
         output_schema=raw.get("output_schema"),
+        mcp_servers=mcp_servers,
         source_path=os.path.abspath(path),
         skill_name=skill_name,
     )

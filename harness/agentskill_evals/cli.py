@@ -477,6 +477,13 @@ def cmd_run(args) -> int:
     has_errors = False
     for s in specs:
         vr = validate_spec(s, available_skills=valid_skills, judge_enabled=do_judge)
+        # Adapter-aware MCP checks live here, not in validate_spec: whether `mcp_servers:`
+        # can be injected at all, and whether `tools:` would actually be enforced, are
+        # properties of the selected runner, and spec.py must not import adapters.
+        if s.mcp_servers:
+            mcp_errors, mcp_warnings = get_adapter(agent).validate_mcp_support(s.mcp_servers)
+            vr.errors.extend(mcp_errors)
+            vr.warnings.extend(mcp_warnings)
         label = f"{s.name}" + (f" ({s.source_path})" if s.source_path else "")
         for e in vr.errors:
             print(f"error: {label}: {e}", file=sys.stderr)
