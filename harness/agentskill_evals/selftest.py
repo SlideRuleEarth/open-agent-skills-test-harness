@@ -110,6 +110,34 @@ def _check(name, cond, msg, failures, verbose):
         failures.append(name)
 
 
+def _section(fn, failures, verbose):
+    """Run one check section, containing a crash to that section.
+
+    A section that RAISES used to take the whole selftest with it: no summary line, and
+    every section after it silently never ran, so one crash hid an unknown number of real
+    results and each fix-and-rerun cycle surfaced only the next one. Individual arms
+    already have this property — a false condition is recorded and the run continues — and
+    this extends it one level up.
+
+    A crash is recorded as a FAILURE, never a skip. That direction is the whole point: the
+    alternative turns today's loud abort into a quiet green, which is strictly worse than
+    the problem being fixed. The traceback is printed rather than swallowed, because the
+    reason this is safe to contain is that the diagnostic survives containment.
+
+    Catches `Exception`, not `BaseException`, so KeyboardInterrupt and SystemExit still
+    stop the run — a selftest that cannot be interrupted is its own defect.
+    """
+    name = fn.__name__.removeprefix("_check_")
+    try:
+        fn(failures, verbose)
+    except Exception:                       # noqa: BLE001 — containment is the point
+        import traceback
+        failures.append(f"{name}.CRASHED")
+        print(f"  [FAIL] {name}.CRASHED: the section raised instead of reporting, so its "
+              f"remaining arms never ran and prove nothing. Sections after it still did.")
+        print("".join("    " + ln for ln in traceback.format_exc().splitlines(True)))
+
+
 def _flag_pair(argv, flag, value) -> bool:
     """True if argv contains ``flag`` immediately followed by ``value``."""
     return any(a == flag and i + 1 < len(argv) and argv[i + 1] == value
@@ -6781,67 +6809,67 @@ def _run_selftest_checks(verbose: bool = False) -> int:
                failures, verbose)
 
     # HOME isolation overlay + side-effect-free provisioning
-    _check_isolation(failures, verbose)
-    _check_provision(failures, verbose)
-    _check_workspace_reset(failures, verbose)
-    _check_snake_case_keys(failures, verbose)
-    _check_antigravity_transcript(failures, verbose)
+    _section(_check_isolation, failures, verbose)
+    _section(_check_provision, failures, verbose)
+    _section(_check_workspace_reset, failures, verbose)
+    _section(_check_snake_case_keys, failures, verbose)
+    _section(_check_antigravity_transcript, failures, verbose)
 
     # per-cell readable report
-    _check_report(failures, verbose)
+    _section(_check_report, failures, verbose)
 
     # artifact / trace path resolution (no false passes on seeded fixtures; workspace-relative;
     # symlink escapes via write-trace)
-    _check_path_resolution(failures, verbose)
-    _check_workspace_view_skill_dir_match(failures, verbose)
+    _section(_check_path_resolution, failures, verbose)
+    _section(_check_workspace_view_skill_dir_match, failures, verbose)
 
     # undeclared repo skills read via the real on-disk checkout (workspace-escape leak)
-    _check_leaked_skill_reads(failures, verbose)
-    _check_workspace_relocation(failures, verbose)
+    _section(_check_leaked_skill_reads, failures, verbose)
+    _section(_check_workspace_relocation, failures, verbose)
     # MCP hermeticity on the non-cell paths: masked-home overlay, probes, judge, fail-closed
-    _check_mcp_hermetic_paths(failures, verbose)
-    _check_parallel_cell_idx(failures, verbose)
-    _check_cell_crash_safety(failures, verbose)
+    _section(_check_mcp_hermetic_paths, failures, verbose)
+    _section(_check_parallel_cell_idx, failures, verbose)
+    _section(_check_cell_crash_safety, failures, verbose)
 
     # cli.py's pure helpers (YAML-error detection, --model/--all-models, models.yaml validation)
-    _check_cli_helpers(failures, verbose)
-    _check_progress_thread_safety(failures, verbose)
+    _section(_check_cli_helpers, failures, verbose)
+    _section(_check_progress_thread_safety, failures, verbose)
 
     # real pass/fail behavior for every deterministic assertion type
-    _check_assertion_pass_fail(failures, verbose)
+    _section(_check_assertion_pass_fail, failures, verbose)
 
     # verdict coercion edge cases (string "false", extra items)
-    _check_verdict_coercion(failures, verbose)
+    _section(_check_verdict_coercion, failures, verbose)
 
     # timeout kills the agent's whole process group, not just the direct child
-    _check_exec_timeout_group_kill(failures, verbose)
+    _section(_check_exec_timeout_group_kill, failures, verbose)
 
     # CLI version drift: read from the run, tiered, and auditable
-    _check_copilot_version_provenance(failures, verbose)
-    _check_version_provenance_shared(failures, verbose)
-    _check_claude_version_provenance(failures, verbose)
-    _check_unreadable_version_adapters(failures, verbose)
-    _check_matrix_consistency(failures, verbose)
-    _check_parallel_requires_isolation(failures, verbose)
-    _check_codex_post_run_mcp_recheck(failures, verbose)
+    _section(_check_copilot_version_provenance, failures, verbose)
+    _section(_check_version_provenance_shared, failures, verbose)
+    _section(_check_claude_version_provenance, failures, verbose)
+    _section(_check_unreadable_version_adapters, failures, verbose)
+    _section(_check_matrix_consistency, failures, verbose)
+    _section(_check_parallel_requires_isolation, failures, verbose)
+    _section(_check_codex_post_run_mcp_recheck, failures, verbose)
 
     # declared MCP servers: schema, secrets, injection, refusals
-    _check_mcp_declared_servers(failures, verbose)
+    _section(_check_mcp_declared_servers, failures, verbose)
 
     # report inlining is capped per file; the judge's skip behavior is unchanged
-    _check_inline_truncation(failures, verbose)
+    _section(_check_inline_truncation, failures, verbose)
 
     # model-rejection annotation only fires on actual rejections
-    _check_model_error_heuristic(failures, verbose)
+    _section(_check_model_error_heuristic, failures, verbose)
 
     # scenario run-knob overrides are type-checked at load
-    _check_scenario_override_validation(failures, verbose)
+    _section(_check_scenario_override_validation, failures, verbose)
 
     # typed reasoning-effort knob: spec validation, Runner threading, per-adapter mapping
-    _check_reasoning_effort(failures, verbose)
+    _section(_check_reasoning_effort, failures, verbose)
 
     # deprecated pre-#67 module API (models= / .models / plain-id render columns)
-    _check_api_compat(failures, verbose)
+    _section(_check_api_compat, failures, verbose)
 
     print()
     if failures:
