@@ -2786,6 +2786,68 @@ def _check_unreadable_version_adapters(failures, verbose):
            f"blessed", failures, verbose)
 
 
+def _check_parallel_requires_isolation(failures, verbose):
+    """Parallel cells + isolation off = cells sharing one mutable config home.
+
+    Isolation is what makes parallelism safe here: each isolated cell gets its own
+    `ase-home-*`, so nothing one cell writes is visible to another. With `--no-isolated`
+    every cell reads and writes the real $HOME, while agents run with auto-approve and can
+    write there — so concurrent cells contaminate each other's CLI configuration.
+
+    This was an UNENFORCED invariant: the harness is serial (DEFAULT_JOBS = 1) and isolated
+    (`--no-isolated` is opt-out) by default, so the property held by accident, and one flag
+    combination silently removed it. `jobs` and `isolated` are both scenario-override keys,
+    so a YAML file could reach it too, without anyone passing a flag at all.
+    """
+    import os
+    import shutil
+    import tempfile as _tempfile
+
+    from . import runner as runner_mod
+
+    print("parallel cells require isolation:")
+
+    root = _tempfile.mkdtemp(prefix="ase-par-")
+
+    def _mk(jobs, isolated):
+        return runner_mod.Runner("claude", models=["m1"],
+                                 artifacts_root=os.path.join(root, "artifacts"),
+                                 run_id="par", skills_root=root,
+                                 jobs=jobs, isolated=isolated)
+
+    def _run(jobs, isolated):
+        """Empty spec list: run() reaches the guard before it would execute any cell, so
+        this exercises the refusal without launching a CLI."""
+        try:
+            _mk(jobs, isolated).run([])
+        except RuntimeError as exc:
+            return str(exc)
+        return ""
+
+    try:
+        refused = _run(4, False)
+        # The three safe combinations must all still work — a guard that also blocks these
+        # would be worse than the hole, since serial non-isolated is a DOCUMENTED opt-out
+        # and parallel isolated is the whole point of --jobs.
+        serial_unisolated = _run(1, False)
+        parallel_isolated = _run(4, True)
+        serial_isolated = _run(1, True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    _check("runner.parallel_cells_require_isolation",
+           "refusing to run 4 cells in parallel" in refused
+           and "--jobs 1" in refused and "--no-isolated" in refused
+           and serial_unisolated == "" and parallel_isolated == ""
+           and serial_isolated == "",
+           f"parallel + non-isolated is refused, naming both escapes, because the cells "
+           f"would share one real $HOME and overwrite each other's CLI config "
+           f"nondeterministically — a wrong ANSWER blamed on the model, not a crash. The "
+           f"three safe combinations still run: serial non-isolated (the documented "
+           f"opt-out), parallel isolated (private home per cell), and serial isolated",
+           failures, verbose)
+
+
 def _check_codex_post_run_mcp_recheck(failures, verbose):
     """codex closes the launch window it used to leave open.
 
@@ -6558,6 +6620,7 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _check_version_provenance_shared(failures, verbose)
     _check_claude_version_provenance(failures, verbose)
     _check_unreadable_version_adapters(failures, verbose)
+    _check_parallel_requires_isolation(failures, verbose)
     _check_codex_post_run_mcp_recheck(failures, verbose)
 
     # report inlining is capped per file; the judge's skip behavior is unchanged

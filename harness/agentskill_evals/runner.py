@@ -162,6 +162,36 @@ class Runner:
 
     def run(self, specs: list[EvalSpec]) -> list[CellResult]:
         os.makedirs(self.run_dir, exist_ok=True)
+        if self.jobs > 1 and not self.isolated:
+            # Isolation is what keeps parallel cells from sharing mutable CLI state: each
+            # isolated cell gets its own `ase-home-*`, so one cell's config is invisible to
+            # another. Turn isolation off and every cell reads and writes the SAME real
+            # $HOME — ~/.codex, ~/.copilot, ~/.gemini — while agents run with auto-approve
+            # and can write there. (Workspaces stay per-cell either way; the shared thing
+            # is the config home.)
+            #
+            # Run those concurrently and cells contaminate each other: cell A's agent, or
+            # the CLI's own startup bookkeeping, writes config that cell B enumerates
+            # mid-launch. The result is a nondeterministic cross-cell interaction that
+            # looks like a model behaving oddly, so it gets blamed on the model — the
+            # failure mode is a wrong ANSWER, not a crash, which is why this refuses
+            # instead of warning.
+            #
+            # Refused rather than warned even though non-isolated on its own is a
+            # documented opt-out: that opt-out says "I accept seeing my real config", which
+            # is a static, understood exposure. Adding concurrency to it is a different
+            # claim — that cells cannot disturb each other — and nothing here can honour
+            # it. Both escapes are one flag.
+            raise RuntimeError(
+                f"refusing to run {self.jobs} cells in parallel with isolation off: "
+                "without the per-cell isolated home, every cell shares the real $HOME, so "
+                "concurrent cells can read and write each other's CLI configuration "
+                "mid-run (agents run with auto-approve). That corrupts results "
+                "nondeterministically and looks like a model problem rather than a "
+                "harness one. Either drop --no-isolated (each cell gets a private home, "
+                "parallelism is safe) or run with --jobs 1 (non-isolated, but one cell at "
+                "a time)."
+            )
         if not self.isolated and (getattr(self.adapter, "isolation_config_masks", None)
                                   or getattr(self.adapter, "plugin_registry_config_masks", None)):
             # This runner's MCP-off guarantee lives in the isolation overlay's config masks

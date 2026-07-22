@@ -264,6 +264,22 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
 
 ## Still open
 
+- **Phase 1 must refuse `isolated: false` together with `mcp_servers:`.** The companion to
+  the parallel/isolation guard now in `Runner.run()`, and it could not be written yet
+  because the `mcp_servers:` schema does not exist. The reasoning is the same: isolation is
+  what gives a cell a private config home, so a scenario that declares MCP servers *and*
+  turns isolation off is asking the harness to materialize server config into the user's
+  real `$HOME` — where it outlives the run and is visible to everything else on the
+  machine. Write it with the schema, not after.
+
+- **The safety property to watch for is the one that holds by DEFAULT rather than by
+  CHECK.** The harness was safe against cross-cell config contamination only because
+  `DEFAULT_JOBS = 1` and isolation is opt-*out*; `--jobs 4 --no-isolated` removed it
+  silently, and `jobs`/`isolated` are both scenario-override keys, so a YAML file could
+  reach it without anyone typing a flag. Nothing warned. An invariant maintained by a
+  default is one nobody notices losing — the guard costs ~15 lines and converts it into
+  something enforced. Worth a sweep for others of the same shape.
+
 - **codex's residual ABA hole — an idle server that starts and is reverted is
   undetectable.** A server added to a config codex reads after argv was built, started by
   codex, then removed before `verify_post_run` re-enumerates, passes both checks whenever
