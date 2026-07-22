@@ -4412,24 +4412,7 @@ def _check_api_compat(failures, verbose):
         shutil.rmtree(repo_root, ignore_errors=True)
 
 
-def run_selftest(verbose: bool = False) -> int:
-    """Run the suite, then restore any adapter patch a raising check left installed.
-
-    The checks themselves live in _run_selftest_checks. This wrapper exists only so the
-    module-patch net (_MODULE_PATCHES) has ONE unconditional finally: the patches it
-    guards span most of the copilot section, and an exception escaping mid-section used
-    to leave e.g. a scoped _agent_definition_files bolted onto the adapter for the rest
-    of the process — harmless for the CLI, which exits, but this module is importable and
-    an embedding process would keep making adapter calls against the stub."""
-    try:
-        return _run_selftest_checks(verbose=verbose)
-    finally:
-        _restore_module_patches()
-
-
-def _run_selftest_checks(verbose: bool = False) -> int:
-    failures: list[str] = []
-
+def _check_cost_formatting(failures, verbose):
     # cost_str formatting
     print("cost formatting:")
     from .schema import RunResult as _RR
@@ -4445,6 +4428,8 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _check("cost.none", _RR(agent="x", eval_name="", prompt="", workdir="").cost_str == "",
            "empty cost_str", failures, verbose)
 
+
+def _check_claude_adapter(failures, verbose):
     # Claude
     print("claude adapter:")
     out = get_adapter("claude").parse(CLAUDE, "", 0)
@@ -4470,6 +4455,8 @@ def _run_selftest_checks(verbose: bool = False) -> int:
            f"resolved_model captured from the system/init event: {out.resolved_model!r}",
            failures, verbose)
 
+
+def _check_codex_adapter(failures, verbose):
     # Codex
     print("codex adapter:")
     out = get_adapter("codex").parse(CODEX, "", 0)
@@ -4813,7 +4800,14 @@ def _run_selftest_checks(verbose: bool = False) -> int:
            f"via the generic fallback instead of being silently dropped: {extra_paths}",
            failures, verbose)
 
+
+def _check_copilot_adapter(failures, verbose):
     # Copilot
+    import os
+    import shutil as _sh
+    import tempfile as _tmp
+
+    from .schema import RunResult as _RR
     print("copilot adapter:")
     out = get_adapter("copilot").parse(COPILOT, "", 0)
     cmds = [e.command for e in out.events if e.command]
@@ -6415,7 +6409,11 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _check("copilot.error_event", len(ft_errors) == 1 and ft_errors[0].is_error,
            f"an `error` event is surfaced: {ft_errors}", failures, verbose)
 
+
+def _check_antigravity_adapter(failures, verbose):
     # AntiGravity (3 shapes)
+    import os
+    import shutil as _sh
     print("antigravity adapter:")
     out = get_adapter("antigravity").parse(ANTIGRAVITY_STREAM, "", 0)
     cmds = [e.command for e in out.events if e.command]
@@ -6487,6 +6485,8 @@ def _run_selftest_checks(verbose: bool = False) -> int:
            f"never the shared temp root): {_fb_anchor}", failures, verbose)
     _sh.rmtree(_fb_anchor, ignore_errors=True)
 
+
+def _check_judge_verdict_extraction(failures, verbose):
     # judge JSON extraction (markdown fences, bare JSON, mixed text)
     print("judge verdict extraction:")
     from .judge import _extract_json
@@ -6505,6 +6505,8 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _check("judge.no_json", _extract_json("just plain text with no json") is None,
            "returns None for plain text", failures, verbose)
 
+
+def _check_schema_validator(failures, verbose):
     # schema validator fallback
     print("schema validator:")
     from .assertions import validate_schema
@@ -6516,6 +6518,8 @@ def _run_selftest_checks(verbose: bool = False) -> int:
                                {"type": "object", "required": ["name", "port"]})
     _check("schema.invalid", not bad, f"missing-required caught: {err}", failures, verbose)
 
+
+def _check_progress_indicator(failures, verbose):
     # progress indicator
     print("progress indicator:")
     import io
@@ -6532,6 +6536,8 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _check("progress.done", "✓" in output and "✗" in output,
            "done marks appear for pass and fail", failures, verbose)
 
+
+def _check_spec_validation(failures, verbose):
     # pre-flight spec validation
     print("spec validation:")
     from .spec import validate_spec
@@ -6732,6 +6738,8 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _check("validate.clean", vr9.ok and not vr9.warnings,
            f"clean spec: errors={vr9.errors} warnings={vr9.warnings}", failures, verbose)
 
+
+def _check_scenario_multi_model(failures, verbose):
     # scenario multi-model target (needs PyYAML)
     print("scenario multi-model:")
     try:
@@ -6807,6 +6815,36 @@ def _run_selftest_checks(verbose: bool = False) -> int:
         _check("scenario.models_compat_property", _scen.models == [None],
                f"Scenario.models keeps working for old callers: {_scen.models}",
                failures, verbose)
+
+
+def run_selftest(verbose: bool = False) -> int:
+    """Run the suite, then restore any adapter patch a raising check left installed.
+
+    The checks themselves live in _run_selftest_checks. This wrapper exists only so the
+    module-patch net (_MODULE_PATCHES) has ONE unconditional finally: the patches it
+    guards span most of the copilot section, and an exception escaping mid-section used
+    to leave e.g. a scoped _agent_definition_files bolted onto the adapter for the rest
+    of the process — harmless for the CLI, which exits, but this module is importable and
+    an embedding process would keep making adapter calls against the stub."""
+    try:
+        return _run_selftest_checks(verbose=verbose)
+    finally:
+        _restore_module_patches()
+
+
+def _run_selftest_checks(verbose: bool = False) -> int:
+    failures: list[str] = []
+
+    _section(_check_cost_formatting, failures, verbose)
+    _section(_check_claude_adapter, failures, verbose)
+    _section(_check_codex_adapter, failures, verbose)
+    _section(_check_copilot_adapter, failures, verbose)
+    _section(_check_antigravity_adapter, failures, verbose)
+    _section(_check_judge_verdict_extraction, failures, verbose)
+    _section(_check_schema_validator, failures, verbose)
+    _section(_check_progress_indicator, failures, verbose)
+    _section(_check_spec_validation, failures, verbose)
+    _section(_check_scenario_multi_model, failures, verbose)
 
     # HOME isolation overlay + side-effect-free provisioning
     _section(_check_isolation, failures, verbose)
@@ -7221,10 +7259,106 @@ def _check_mcp_declared_servers(failures, verbose):
            failures, verbose)
 
     _check("mcp.workspace_scrub_does_not_follow_symlinks",
-           open(outside).read() == "sk-secret-abcdef untouched\n",
-           "symlinks are skipped rather than followed: the target can sit outside the "
-           "artifact tree, and rewriting through one would let a link the agent created "
-           "redirect the scrub into an arbitrary file", failures, verbose)
+           open(outside).read() == "sk-secret-abcdef untouched\n"
+           and os.path.islink(os.path.join(ws, "link.txt")),
+           f"symlinks are not traversed: the target can sit outside the artifact tree, and "
+           f"reading through one would let a link the agent created pull arbitrary external "
+           f"content INTO the archive — the link is still a link afterwards, not a copy of "
+           f"what it pointed at: still_a_link={os.path.islink(os.path.join(ws, 'link.txt'))}",
+           failures, verbose)
+
+    # A HARDLINK has no target to refuse to follow — it IS the file, sharing one inode with
+    # every other name pointing at it. Review demonstrated an in-place rewrite reaching
+    # straight out of the artifact tree and overwriting an external file with «redacted».
+    ws2 = os.path.join(root, "ws2")
+    os.makedirs(ws2, exist_ok=True)
+    hard_outside = os.path.join(root, "hard-outside.txt")
+    open(hard_outside, "w").write("sk-secret-abcdef must survive\n")
+    before_ino = os.stat(hard_outside).st_ino
+    os.link(hard_outside, os.path.join(ws2, "hard.txt"))
+    runner_mod._scrub_tree(ws2, ("sk-secret-abcdef",))
+    hard_inside = open(os.path.join(ws2, "hard.txt")).read()
+    _check("mcp.workspace_scrub_breaks_hardlinks_instead_of_writing_through_them",
+           open(hard_outside).read() == "sk-secret-abcdef must survive\n"
+           and os.stat(hard_outside).st_ino == before_ino
+           and "sk-secret-abcdef" not in hard_inside,
+           f"the archived copy is scrubbed while the file the agent hardlinked to keeps its "
+           f"contents AND its inode — the replacement is written beside the original and "
+           f"renamed over it, so the artifact tree gets a new inode rather than the scrub "
+           f"mutating shared storage outside it: inside={hard_inside.strip()!r}",
+           failures, verbose)
+
+    # A symlink's TARGET STRING lives in the tree even though its contents do not, and
+    # `readlink` reads it straight back — an innocuously named link is as good a hiding
+    # place for a credential as a file containing one. Not following it is not scrubbing it.
+    ws3 = os.path.join(root, "ws3")
+    os.makedirs(ws3, exist_ok=True)
+    os.symlink("/tmp/sk-secret-abcdef/creds", os.path.join(ws3, "innocent"))
+    runner_mod._scrub_tree(ws3, ("sk-secret-abcdef",))
+    link_target = os.readlink(os.path.join(ws3, "innocent"))
+    _check("mcp.symlink_target_is_scrubbed_even_though_it_is_not_followed",
+           "sk-secret-abcdef" not in link_target and "«redacted»" in link_target,
+           f"the stored target of a symlink is redacted in place: skipping TRAVERSAL is "
+           f"correct (it can point outside the tree) but says nothing about the link's own "
+           f"metadata, which is archived and readable: {link_target!r}", failures, verbose)
+
+    # `os.walk` reports an unreadable directory to `onerror` and then yields NOTHING for it,
+    # which is indistinguishable from an empty one — a chmod 000 subtree was skipped in
+    # silence while the scrub reported success.
+    ws4 = os.path.join(root, "ws4")
+    hidden = os.path.join(ws4, "hidden")
+    os.makedirs(hidden, exist_ok=True)
+    open(os.path.join(hidden, "buried.txt"), "w").write("buried sk-secret-abcdef\n")
+    os.chmod(hidden, 0o000)
+    lost4 = runner_mod._scrub_tree(ws4, ("sk-secret-abcdef",))
+    os.chmod(hidden, 0o700)
+    buried = _try(lambda: open(os.path.join(hidden, "buried.txt")).read(), "(unreadable)")
+    _check("mcp.unreadable_subtree_is_opened_rather_than_silently_skipped",
+           "sk-secret-abcdef" not in buried and lost4 == [],
+           f"permissions are repaired before the walk so an inaccessible subtree is scrubbed "
+           f"rather than passed over — the harness owns this tree, so they are its to "
+           f"restore, and an empty return means every byte really was examined: "
+           f"buried={buried.strip()!r} lost={lost4}", failures, verbose)
+
+    # A secret containing a separator spells itself out across a directory and its child
+    # while every individual component looks clean, so a per-component scrub certifies a
+    # tree whose own `find` output is the credential.
+    ws5 = os.path.join(root, "ws5")
+    os.makedirs(os.path.join(ws5, "tenantpart"), exist_ok=True)
+    open(os.path.join(ws5, "tenantpart", "secretpart"), "w").write("harmless\n")
+    runner_mod._scrub_tree(ws5, ("tenantpart/secretpart",))
+    ws5_paths = sorted(os.path.relpath(os.path.join(d, f), ws5)
+                       for d, _, fs in os.walk(ws5) for f in fs)
+    _check("mcp.secret_spanning_path_components_is_scrubbed",
+           not any("tenantpart/secretpart" in p for p in ws5_paths),
+           f"a slash-bearing secret is caught by checking the ASSEMBLED path, not one "
+           f"component at a time — the component that COMPLETES it is renamed, leaving the "
+           f"prefix (which is not itself a secret) alone: {ws5_paths}", failures, verbose)
+
+    # Fail closed on what cannot be certified. An artifact the scrub could not read or
+    # rewrite is deleted rather than published unchecked, and the caller is told which —
+    # a silent deletion would be worse than either outcome it is choosing between.
+    ws6 = os.path.join(root, "ws6")
+    os.makedirs(ws6, exist_ok=True)
+    open(os.path.join(ws6, "leaky.txt"), "w").write("tok sk-secret-abcdef\n")
+    open(os.path.join(ws6, "fine.txt"), "w").write("nothing to see\n")
+    _orig_scrub_file = runner_mod._scrub_file
+    runner_mod._scrub_file = lambda p, s: (
+        (_ for _ in ()).throw(OSError(30, "Read-only file system"))
+        if p.endswith("leaky.txt") else _orig_scrub_file(p, s))
+    try:
+        lost6 = runner_mod._scrub_tree(ws6, ("sk-secret-abcdef",))
+    finally:
+        runner_mod._scrub_file = _orig_scrub_file
+    _check("mcp.uncertifiable_artifact_is_removed_and_named",
+           lost6 == ["leaky.txt"]
+           and not os.path.exists(os.path.join(ws6, "leaky.txt"))
+           and os.path.exists(os.path.join(ws6, "fine.txt"))
+           and "leaky.txt" in runner_mod._scrub_note(lost6),
+           f"a file the scrub cannot rewrite is removed from the archive and RETURNED to "
+           f"the caller, which fails the cell with it named — the rest of the workspace is "
+           f"untouched, so failing closed costs one artifact rather than the run's whole "
+           f"evidence: lost={lost6}", failures, verbose)
 
     # --- the run summary, written after every cell cleared its secrets ---------
     # `_secrets` is deliberately cell-scoped, so by the time the summary is written it is
@@ -7332,6 +7466,129 @@ def _check_mcp_declared_servers(failures, verbose):
            f"through, so the refusal cannot be routed around by calling Runner.run() or "
            f"the adapter directly: unsupported={prog_unsupported[:60]!r} "
            f"gated={prog_gated[:60]!r}", failures, verbose)
+
+    # --- a warning nobody can read afterwards is not a warning -----------------
+    # The server-health warning above went to the HARNESS process's stderr, which nothing
+    # archives — `execute()` captures the CHILD's. So the message claiming that assertions
+    # "will fail for a reason the results will not show" was itself that reason. It now
+    # rides the result into cell.json, report.md and summary.json. Driven end to end through
+    # `execute()` rather than by calling the collector directly, because the defect was
+    # never in the printing — it was in nothing being wired to listen.
+    from .notices import collecting as _collecting
+    from .notices import warn as _warn
+
+    from .adapters.base import Adapter as _Adapter
+    from .adapters.base import ParseOutput as _ParseOutput
+
+    class _WarningAdapter(_Adapter):
+        name = "warnadapter"
+        binary = _sys.executable
+        skills_subdir = ".x/skills"
+
+        def build_argv(self, prompt, opts, *, cwd):
+            return [_sys.executable, "-c", ""]
+
+        def parse(self, stdout, stderr, exit_code, *, opts=None):
+            return _ParseOutput(events=[], final_text="")
+
+        def verify_post_run(self, argv, opts, *, cwd, stdout, stderr, exit_code=None):
+            _warn("warning: [warnadapter] server 'echo' was reported but not connected")
+            raise RuntimeError("and then the verification failed")
+
+    wd = _tempfile.mkdtemp(prefix="ase-warn-")
+    try:
+        wex = exec_mod.execute(_WarningAdapter(), "hi", RunOptions(), cwd=wd, timeout=10)
+        wrr = wex.result
+        wcell = runner_mod.CellResult(agent="claude", model="m", eval_name="e",
+                                      skill=None, passed=False, run_result=wrr,
+                                      artifacts_dir=os.path.join(wd, "c0"))
+        wreport = _try(lambda: runner_mod.render_report(wcell), "")
+        wrun = runner_mod.Runner("claude", models=["m"], artifacts_root=wd,
+                                 run_id="w", skills_root=root)
+        _wbuf = _io.StringIO()
+        _wsaved, _sys.stderr = _sys.stderr, _wbuf
+        try:
+            wrun._write_summary([wcell], [])
+        finally:
+            _sys.stderr = _wsaved
+        wsum = _json.loads(open(os.path.join(wd, "w", "summary.json")).read())
+        wsum_warn = wsum["cells"][0].get("warnings")
+    finally:
+        _shutil.rmtree(wd, ignore_errors=True)
+    _check("mcp.post_run_warnings_survive_the_process_that_printed_them",
+           any("not connected" in w for w in wrr.warnings)
+           and "not connected" in wreport
+           and wsum_warn is not None and any("not connected" in w for w in wsum_warn)
+           and wrr.error and "and then the verification failed" in wrr.error,
+           f"a warning raised during post-run verification is recorded on the RESULT and "
+           f"reaches report.md and summary.json, not just the operator's terminal — and a "
+           f"warning emitted BEFORE the verification went on to raise is kept too, since "
+           f"the last finding failing does not unsay the earlier ones: "
+           f"warnings={wrr.warnings} error={(wrr.error or '')[:50]!r}", failures, verbose)
+
+    # The mechanism working proves nothing about its CALLERS still using it, so claude's own
+    # health warning is re-run inside a window and the drift warning — whose terminal output
+    # is rate-limited once per (agent, version) — is emitted twice.
+    _cbuf = _io.StringIO()
+    _csaved, _sys.stderr = _sys.stderr, _cbuf
+    try:
+        with _collecting() as claude_durable:
+            _try(lambda: cl.verify_post_run(
+                [], RunOptions(mcp_servers=resolved), cwd=scratch,
+                stdout=_json.dumps({"type": "system", "subtype": "init",
+                                    "mcp_servers": [{"name": "echo", "status": "failed"}],
+                                    "claude_code_version": "9.9.9-unverified"}),
+                stderr="", exit_code=0))
+        with _collecting() as drift_second:
+            _try(lambda: cl.verify_post_run(
+                [], RunOptions(mcp_servers=resolved), cwd=scratch,
+                stdout=_json.dumps({"type": "system", "subtype": "init",
+                                    "mcp_servers": [{"name": "echo", "status": "connected"}],
+                                    "claude_code_version": "9.9.9-unverified"}),
+                stderr="", exit_code=0))
+    finally:
+        _sys.stderr = _csaved
+    drift_echoes = _cbuf.getvalue().count("9.9.9-unverified")
+    _check("mcp.rate_limited_warnings_still_record_on_every_cell",
+           any("not as connected" in w for w in claude_durable)
+           and any("9.9.9-unverified" in w for w in claude_durable)
+           and any("9.9.9-unverified" in w for w in drift_second)
+           and drift_echoes == 1,
+           f"claude's health and version-drift warnings both reach the collector, and the "
+           f"drift warning's once-per-version suppression governs the TERMINAL only — a "
+           f"matrix where cell 1 carries the finding and cells 2..n look clean would "
+           f"misreport what happened to them: echoes={drift_echoes} "
+           f"second_cell={[w[:40] for w in drift_second]}", failures, verbose)
+
+    # Parallel cells share one process stderr, so the collector is thread-local: a
+    # redirect_stderr at the call site would have attributed one cell's warnings to another.
+    import threading as _threading
+    _cross: dict = {}
+
+    def _collect_one(tag, bar):
+        with _collecting() as got:
+            # Both windows must be OPEN before either warns, or the threads just take
+            # turns and a process-wide sink would pass by luck of the scheduler.
+            _try(lambda: bar.wait(5.0))
+            _warn(f"warning: from-{tag}")
+            _try(lambda: bar.wait(5.0))
+            _cross[tag] = list(got)
+
+    _bar = _threading.Barrier(2)
+    _t1 = _threading.Thread(target=_collect_one, args=("a", _bar))
+    _t2 = _threading.Thread(target=_collect_one, args=("b", _bar))
+    _wbuf2 = _io.StringIO()
+    _wsaved2, _sys.stderr = _sys.stderr, _wbuf2
+    try:
+        _t1.start(); _t2.start(); _t1.join(10.0); _t2.join(10.0)
+    finally:
+        _sys.stderr = _wsaved2
+    _check("mcp.warning_collection_is_per_cell_not_per_process",
+           _cross.get("a") == ["warning: from-a"] and _cross.get("b") == ["warning: from-b"],
+           f"two collection windows open at once in different threads each capture only "
+           f"their own warnings — cells run in parallel and stderr is process-global, so a "
+           f"process-wide capture would file one cell's findings on another's result: "
+           f"{_cross}", failures, verbose)
 
     _shutil.rmtree(scratch, ignore_errors=True)
     _shutil.rmtree(root, ignore_errors=True)

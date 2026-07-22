@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
 from ..isolation import build_mcp_masked_home, config_home_entries
+from ..notices import warn
 from ..schema import NormalizedEvent
 
 
@@ -671,37 +672,37 @@ class VersionProvenance:
         message says that explicitly, because the danger is a green run being read as
         covering it.
         """
-        import sys
-
         if version is not None and version in self.verified:
             return
         key = (self.agent, version or "")
-        if key in _WARNED_VERSIONS:
-            return
+        # The once-per-version suppression governs the TERMINAL only. Every cell that ran a
+        # drifted build records the warning on its own result, because a matrix where cell 1
+        # carries the finding and cells 2..n look clean misreports what happened to them.
+        echo = key not in _WARNED_VERSIONS
         _WARNED_VERSIONS.add(key)
 
         if self.unreadable is not None:
             # Not drift — a standing limitation. Phrased as one, because "could not be
             # determined" invites the reader to go look for the version, and here there
             # is nothing to find.
-            print(
+            warn(
                 f"warning: [{self.agent}] this harness cannot tell which {self.agent} "
                 f"build executed: {self.unreadable}. The {self.analysis} was verified "
                 f"against {'/'.join(self.verified)} ({self.verified_on}); whether THIS "
                 "run used one of those is unknown and cannot be established after the "
                 "fact.\n"
                 f"  {self.clear_hint}",
-                file=sys.stderr)
+                echo=echo)
             return
 
         ran = f"CLI {version}" if version else "a CLI whose version could not be determined"
         established = self.witness_held if witnessed else self.witness_absent
-        print(
+        warn(
             f"warning: [{self.agent}] this run executed {ran}; the {self.analysis} was "
             f"verified against {'/'.join(self.verified)} ({self.verified_on}).\n"
             + (established + "\n" if established else "")
             + f"  {self.clear_hint}",
-            file=sys.stderr)
+            echo=echo)
 
 
 # ---------------------------------------------------------------------------

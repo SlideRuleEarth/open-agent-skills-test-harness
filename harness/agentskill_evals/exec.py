@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .adapters.base import Adapter, RunOptions
+from .notices import collecting
 from .schema import RunResult
 
 
@@ -198,12 +199,19 @@ def execute(
     # the child's own report of the servers it brought up still shows it. Detection, not
     # prevention: a server started inside the window already ran. It is appended, never
     # substituted, so a timeout or a nonzero exit keeps its own diagnosis alongside.
-    try:
-        adapter._verify_post_run_compat(argv, opts, cwd=cwd, stdout=stdout,
-                                        stderr=stderr, exit_code=code)
-    except Exception as exc:
-        rr.error = ((rr.error + "; " if rr.error else "")
-                    + f"MCP hermeticity was not confirmed after the run: {exc}")
+    # Anything the verification WARNS about is collected onto the result as well as printed:
+    # its whole purpose is to explain a result, and stderr of the harness process is not
+    # archived anywhere. Thread-local, so parallel cells cannot collect each other's.
+    with collecting() as warned:
+        try:
+            adapter._verify_post_run_compat(argv, opts, cwd=cwd, stdout=stdout,
+                                            stderr=stderr, exit_code=code)
+        except Exception as exc:
+            rr.error = ((rr.error + "; " if rr.error else "")
+                        + f"MCP hermeticity was not confirmed after the run: {exc}")
+    # Whatever was warned BEFORE a raise is kept too: the verification reports several
+    # independent findings and the last one failing does not unsay the earlier ones.
+    rr.warnings.extend(warned)
 
     return ExecResult(rr, stdout, stderr)
 

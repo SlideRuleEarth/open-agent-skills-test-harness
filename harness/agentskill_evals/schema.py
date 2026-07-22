@@ -79,6 +79,11 @@ class RunResult:
     stderr_path: Optional[str] = None
     timed_out: bool = False
     error: Optional[str] = None  # harness-level error (binary missing, crash, timeout)
+    # Non-fatal findings from the adapter's post-run verification — a declared MCP server
+    # that never connected, a probe that proved nothing. These do NOT fail the run; they
+    # explain results that would otherwise be inexplicable, which only works if they are
+    # still readable after the terminal that printed them is gone. See notices.py.
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def cost_str(self) -> str:

@@ -20,9 +20,9 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from typing import Any, Optional
 
+from ..notices import warn
 from ..schema import EventKind, NormalizedEvent
 from .base import (Adapter, ParseOutput, ProbeResult, RunOptions, VersionProvenance,
                    extract_command, extract_path, iter_jsonl, warn_unknown_usage)
@@ -430,25 +430,30 @@ class ClaudeAdapter(Adapter):
         # run was not hermetic" and widening that would blur what a failure here means.
         missing = sorted(declared - set(live))
         if missing and witnessed:
-            print(f"warning: [claude] declared MCP server(s) {', '.join(missing)} were not "
-                  "reported by the run — the scenario ran without them; check the server "
-                  "command and its startup output.", file=sys.stderr)
+            warn(f"warning: [claude] declared MCP server(s) {', '.join(missing)} were not "
+                 "reported by the run — the scenario ran without them; check the server "
+                 "command and its startup output.")
         # Being NAMED in the witness is not the same as being usable. A server reported
         # `{"name": "echo", "status": "failed"}` used to clear this check silently — it was
         # present, so it was not "missing", and its status was discarded. That is the same
         # confusing outcome as a missing server (assertions about tools that never existed)
-        # and it gets the same durable warning. Unknown states warn too rather than being
-        # assumed good: a status this adapter does not recognise is not evidence of health.
+        # and it gets the same warning. Unknown states warn too rather than being assumed
+        # good: a status this adapter does not recognise is not evidence of health.
+        #
+        # Through `warn`, not `print`. The message's own claim — that assertions will fail
+        # "for a reason the results will not show" — was true of the message as well when it
+        # went only to the harness process's stderr, which nothing archives. It now lands on
+        # RunResult.warnings, so the cell that fails confusingly carries its own explanation.
         unhealthy = sorted(
             (name, statuses.get(name)) for name in declared & set(live)
             if statuses.get(name) != "connected"
         )
         if unhealthy and witnessed:
             detail = ", ".join(f"{n} ({s or 'no status reported'})" for n, s in unhealthy)
-            print(f"warning: [claude] declared MCP server(s) {detail} were reported by the "
-                  "run but not as connected — their tools were most likely unavailable, so "
-                  "assertions about them will fail for a reason the results will not show.",
-                  file=sys.stderr)
+            warn(f"warning: [claude] declared MCP server(s) {detail} were reported by the "
+                 "run but not as connected — their tools were most likely unavailable, so "
+                 "assertions about them will fail for a reason the results would otherwise "
+                 "not show.")
         _PROVENANCE.warn_drift(version, witnessed=witnessed)
 
     def parse(self, stdout: str, stderr: str, exit_code: int,

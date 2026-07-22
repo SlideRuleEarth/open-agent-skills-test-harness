@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,7 +35,7 @@ from .assertions import AssertionContext, AssertionResult, run_assertion
 from .exec import execute
 from .isolation import build_isolated_home, config_home_entries, reroot_config_masks
 from .judge import Judge
-from .mcp import redact, redact_bytes, redact_obj
+from .mcp import REDACTED, redact, redact_bytes, redact_obj
 from .progress import Progress
 from .schema import EventKind, RunResult
 from .spec import EvalSpec, ModelTarget, repo_root_for, skill_names
@@ -335,7 +336,9 @@ class Runner:
         # agent's output into the artifact tree, so a credential it wrote to a file is
         # archived here too. `_secrets` is still populated — _run_cell clears it in a finally
         # that runs after this. Ordered before report.md below, which INLINES workspace files.
-        _scrub_tree(workspace, self._secrets)
+        lost = _scrub_tree(workspace, self._secrets)
+        if lost:
+            rr.error = (rr.error + "; " if rr.error else "") + _scrub_note(lost)
         try:
             self._write_cell_json(cell_dir, cell)
             self._rw(os.path.join(cell_dir, "report.md"), render_report(cell))
@@ -552,7 +555,14 @@ class Runner:
         #
         # Runs after grading, never before: assertions above ran against `exec_ws`, so what
         # was graded is exactly what the agent produced, unmodified.
-        _scrub_tree(workspace, self._secrets)
+        lost = _scrub_tree(workspace, self._secrets)
+        if lost:
+            # The scrub could not certify part of the tree, so it deleted that part. Say so
+            # loudly and fail the cell: a cell that had to destroy evidence to stay safe has
+            # not produced a trustworthy result, and a silent deletion would be worse than
+            # either outcome it is choosing between.
+            rr.error = (rr.error + "; " if rr.error else "") + _scrub_note(lost)
+            passed = False
 
         cell = CellResult(
             agent=self.agent, model=model, eval_name=spec.name, skill=spec.skill_name,
@@ -865,6 +875,7 @@ class Runner:
                     "ungraded": c.ungraded,
                     "passed": c.passed, "n_pass": c.n_pass, "n_total": c.n_total,
                     "error": c.run_result.error, "timed_out": c.run_result.timed_out,
+                    "warnings": c.run_result.warnings,
                     "cost_usd": c.run_result.cost_usd,
                     "premium_requests": c.run_result.premium_requests,
                     "judge_cost_usd": c.judge_run_result.cost_usd if c.judge_run_result else None,
@@ -1089,6 +1100,11 @@ def render_report(cell: CellResult) -> str:
     out.append(f"- **run:** {', '.join(meta)}")
     if rr.error:
         out.append(f"- **error:** {rr.error}")
+    for w in rr.warnings:
+        # Above the transcript, not buried under it: these exist to explain a verdict the
+        # reader is looking at right now (a server that never connected, a build the
+        # analysis was not verified against).
+        out.append(f"- **warning:** {w.strip()}")
     if cell.isolation_leaks:
         out += ["", "> ⚠ **Isolation leak:** this run read undeclared skill(s) from the real "
                     "repo checkout, bypassing HOME-based isolation:"]
@@ -1203,49 +1219,185 @@ def _remap_paths(obj, old: str, new: str):
     return obj
 
 
-def _scrub_tree(root: str, secrets) -> None:
-    """Rewrite any archived workspace file that carries a declared secret.
+def _scrub_note(lost: list[str]) -> str:
+    """The one sentence a deleted artifact gets, on the result that had to delete it."""
+    shown = ", ".join(lost[:5]) + (f" (+{len(lost) - 5} more)" if len(lost) > 5 else "")
+    return (f"secret scrub could not certify {shown} — removed from the archived workspace "
+            f"rather than published unchecked")
 
-    Bottom-up so a directory is renamed only after its contents are done, and rewrites are
-    conditional: a file whose bytes do not contain a secret is left with its original
-    mtime and permissions, which keeps this invisible on the overwhelmingly common run
-    where nothing leaked.
 
-    Names are scrubbed as well as contents. An agent told to "save the token" may well use
-    it as the filename, and a redacted file whose own path spells out the credential would
-    be a scrub that only looks complete. Symlinks are skipped rather than followed: the
-    target may sit outside the artifact tree, and rewriting through one would let a link
-    the agent created redirect this into an arbitrary file.
+def _spells_secret(rel: str, secrets) -> bool:
+    """True when a path, ASSEMBLED from its components, reads back as a secret.
+
+    A secret containing a separator — `tenant/key`, an `https://user:pw@host` URL — is
+    spelled out by a directory and its child while every individual component looks
+    clean, so a per-component check certifies a tree whose `find` output is the
+    credential.
+    """
+    return redact(rel, secrets) != rel
+
+
+def _reljoin(parent_rel: str, name: str) -> str:
+    return name if parent_rel in (".", "") else f"{parent_rel}/{name}"
+
+
+def _make_traversable(root: str) -> None:
+    """Restore owner access on directories under *root* so nothing hides from the scrub.
+
+    ``os.walk`` hands an unreadable directory to ``onerror`` and then yields nothing for
+    it, which is indistinguishable from an empty one — review showed a `chmod 000` subtree
+    being skipped in silence while the scrub reported success. The harness owns this tree
+    (it created the workspace; the agent wrote into it as the same user), so these
+    permissions are ours to restore. Whatever cannot be restored is still caught by the
+    walk's ``onerror`` and removed rather than published unchecked.
+    """
+    pending = [root]
+    while pending:
+        d = pending.pop()
+        try:
+            st = os.lstat(d)
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            continue  # never chase a link out of the tree to widen permissions
+        mode = stat.S_IMODE(st.st_mode)
+        want = mode | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+        if want != mode:
+            try:
+                os.chmod(d, want)
+            except OSError:
+                continue
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(entry.path)
+        except OSError:
+            continue
+
+
+def _scrub_file(path: str, secrets) -> None:
+    """Rewrite one file's bytes, breaking any hardlink rather than writing through it.
+
+    Writing in place mutates the INODE, and a hardlink shares its inode with every other
+    name pointing at it — review demonstrated the scrub reaching outside the artifact tree
+    and overwriting an external file the agent had linked to. The replacement is written
+    beside the original and renamed over it, so the artifact tree gets a fresh inode and
+    the agent's link target is left exactly as it was.
+
+    Unreadable files are chmod-repaired once and retried, for the same reason directories
+    are: a file this harness cannot open is a file it cannot certify.
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except PermissionError:
+        mode = stat.S_IMODE(os.lstat(path).st_mode)
+        os.chmod(path, mode | stat.S_IRUSR | stat.S_IWUSR)
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    scrubbed = redact_bytes(raw, secrets)
+    if scrubbed == raw:
+        return  # untouched: original mtime and mode survive the common no-leak run
+    keep = stat.S_IMODE(os.stat(path).st_mode)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".scrub-")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(scrubbed)
+        os.chmod(tmp, keep)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _scrub_tree(root: str, secrets) -> list[str]:
+    """Rewrite any archived workspace entry that carries a declared secret.
+
+    Returns the paths, relative to *root*, that could NOT be certified clean. Each one has
+    already been REMOVED from the tree: an artifact the harness cannot prove is scrubbed
+    must not be published, and the caller fails the cell so that deletion is never silent.
+    An empty list is a positive statement — every byte, every symlink target and every
+    assembled path under `root` was examined.
+
+    Bottom-up, so a directory is renamed only after its contents are done. Three things
+    get scrubbed, because review found a leak in each:
+
+    * **Contents**, via write-and-rename (see ``_scrub_file``).
+    * **Symlink targets**, in place. The link is never followed — its target may sit
+      outside the artifact tree, and rewriting through one would let a link the agent
+      created redirect this scrub into an arbitrary file — but the target STRING lives in
+      the tree and `readlink` reads it straight back, so a blandly named link pointing at
+      `/tmp/<token>` publishes the credential as plainly as a file containing it.
+    * **Names, as assembled paths** rather than one component at a time; see
+      ``_spells_secret``.
     """
     if not secrets or not os.path.isdir(root):
-        return
-    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
-        for name in filenames:
-            path = os.path.join(dirpath, name)
-            if os.path.islink(path):
-                continue
-            try:
-                raw = open(path, "rb").read()
-                scrubbed = redact_bytes(raw, secrets)
-                if scrubbed != raw:
-                    with open(path, "wb") as fh:
-                        fh.write(scrubbed)
-            except OSError as exc:
-                print(f"warning: could not scrub {path}: {exc}", file=sys.stderr)
+        return []
+    _make_traversable(root)
+    lost: set[str] = set()
+    blocked: list[str] = []
+
+    def _rel(path: str) -> str:
+        return os.path.relpath(path, root).replace(os.sep, "/")
+
+    def _give_up(path: str) -> None:
+        """Delete what could not be certified, and remember it for the caller."""
+        lost.add(_rel(path))
+        try:
+            if os.path.islink(path) or not os.path.isdir(path):
+                os.unlink(path)
+            else:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+    walk = os.walk(root, topdown=False,
+                   onerror=lambda exc: blocked.append(getattr(exc, "filename", "") or root))
+    for dirpath, dirnames, filenames in walk:
         for name in dirnames + filenames:
-            clean = redact(name, secrets)
-            if clean == name:
+            path = os.path.join(dirpath, name)
+            try:
+                if os.path.islink(path):
+                    target = os.readlink(path)
+                    clean = redact(target, secrets)
+                    if clean != target:
+                        os.unlink(path)
+                        os.symlink(clean, path)
+                elif not os.path.isdir(path):
+                    _scrub_file(path, secrets)
+            except OSError:
+                _give_up(path)
+        parent_rel = _rel(dirpath)
+        for name in dirnames + filenames:
+            new = redact(name, secrets)
+            # A component that is individually clean can still complete a secret begun by
+            # its parent. Renaming it is only correct where the parent is NOT itself already
+            # spelling one — otherwise the fix belongs further up, and the bottom-up walk
+            # reaches that parent in a later iteration.
+            if (_spells_secret(_reljoin(parent_rel, new), secrets)
+                    and not _spells_secret(parent_rel, secrets)):
+                new = REDACTED
+            if new == name:
                 continue
             src = os.path.join(dirpath, name)
-            dst = os.path.join(dirpath, clean)
+            dst = os.path.join(dirpath, new)
             n = 1
             while os.path.lexists(dst):
-                dst = os.path.join(dirpath, f"{clean}.{n}")
+                dst = os.path.join(dirpath, f"{new}.{n}")
                 n += 1
             try:
                 os.rename(src, dst)
-            except OSError as exc:
-                print(f"warning: could not rename {src}: {exc}", file=sys.stderr)
+            except OSError:
+                _give_up(src)
+
+    for path in blocked:
+        if os.path.lexists(path):
+            _give_up(path)
+    return sorted(lost)
 
 
 def _write(path: str, text: str) -> None:

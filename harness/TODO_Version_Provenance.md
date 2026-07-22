@@ -243,6 +243,50 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   disk, not the representation the author typed — and if a transform sits between the two,
   either compare before it or expand the needle to cover what it produces.
 
+- **A traversal is only as good as its inventory of what a filesystem entry can be.** The
+  second review round found four more leaks in the *same* workspace scrub, and every one
+  came from an object the walk did not model rather than from a path it failed to reach.
+  It refused to follow symlinks — and a **hardlink** has no target to refuse, so an in-place
+  rewrite mutated a shared inode and edited a file outside the artifact tree. It skipped
+  symlinks entirely — and a link's **target string** is archived even when its contents are
+  not, `readlink` reading a credential straight back out of a blandly named link. It walked
+  the tree — and `os.walk` hands an unreadable directory to `onerror` and then yields
+  nothing, so a `chmod 000` subtree is **shaped exactly like an empty one** and was skipped
+  in silence. It scrubbed names — one component at a time, so a secret containing a
+  separator was spelled out across a directory and its child with every component
+  individually clean.
+
+  Two habits fall out. First, enumerate the *kinds* of thing in the domain before writing
+  the loop — regular file, hardlink, symlink (name, target, contents: three separate
+  objects), unreadable directory, and the assembled path, which is a thing in its own right
+  and not the concatenation of things already checked. Second, and the one that would have
+  caught all four: **make the sweep say whether it finished.** The old scrub returned
+  `None`, so "examined everything" and "silently examined nothing" were the same value. It
+  now returns what it could not certify, deletes exactly that, and fails the cell — which
+  converts three of these from silent leaks into loud failures even in the cases nobody
+  thought to model. An audit that cannot report incompleteness will report success instead.
+
+- **Refactoring to a pattern covers the code that already had the pattern's shape.** The
+  selftest's `_check_*` sections were wrapped so one crashing section could not abort the
+  suite — all 31 of them. The first *ten* sections were not `_check_*` functions at all;
+  they were inline blocks at the head of `_run_selftest_checks`, and they stayed unguarded,
+  which is exactly the region a crash aborts everything from. Measured: a crash injected
+  into the first section left **0 of 422 arms** reported. After extracting the ten blocks
+  into sections, the same crash costs its own 4 arms and 418 still run. Grepping for the
+  call site being changed finds the places already written in the form being fixed — the
+  ones written some other way are invisible to that search and are, disproportionately,
+  the older code where the pattern was never applied in the first place.
+
+- **A warning that only exists in a terminal is a warning you have decided not to keep.**
+  The claude health warning said assertions would "fail for a reason the results will not
+  show" — and, going to the harness process's stderr while `execute()` archives only the
+  *child's*, it was itself that reason. Worth checking, for any diagnostic: who reads this,
+  and are they present at the moment it is emitted? The person debugging a red cell three
+  days later is the actual audience, and they have only the artifacts. The parallel-cell
+  detail generalises too: process-global capture (`redirect_stderr`) would have attributed
+  one cell's warnings to whichever cell happened to be collecting — when work is concurrent,
+  a diagnostic channel needs the same scoping discipline as the data.
+
 - **codex's stream witness is presence-only, and that changes which check carries the
   argument.** Established live with a sentinel stdio MCP server rather than reasoned from
   the event list. Three findings, each of which moved the design:
