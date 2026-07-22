@@ -281,10 +281,11 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   individually valid; what is prevented is silently reading a CLI auto-update as a model
   difference.
 
-  The subtle requirement: **unknown is not agreement.** A matrix where no cell states its
-  version (every codex and agy run) must not report `cli_version_verified: true`, or a
-  green line stands in for a check that could not run. Nor is it *drift* — nothing
-  actually differed — so the two states are recorded separately.
+  The subtle requirement: **unknown is not agreement, on any axis.** A matrix where no cell
+  states its version (every codex and agy run) must not report `cli_version_verified: true`,
+  or a green line stands in for a check that could not run. Nor is it *drift* — nothing
+  actually differed — so the two states are recorded separately. The same holds for the MCP
+  axis, which is why `verified` requires all of them (see the tri-state entry below).
 
 - **An isolated home is a symlink OVERLAY, not a copy — so isolation does not make
   concurrency safe.** `isolation._overlay` wholesale-symlinks every entry it is not
@@ -311,6 +312,23 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   Now a tri-state `comparability: verified | unverified | drift` carries it in the primary
   field. Any check that can be inconclusive needs three states, not two, or the green one
   becomes the default answer to a question that was never asked.
+
+  **The tri-state then has to cover every axis, or the green light just moves.** The first
+  cut computed `comparability` from the CLI version alone, so a claude matrix with a known
+  uniform version and an entirely unread MCP axis reported `verified` sitting one field away
+  from `mcp_server_set_unknown_cells: 2` — the same misleading green, rebuilt inside the
+  mechanism written to remove it (found in review). `verified` now requires every compared
+  axis to be positively known *and* uniform. Fixing a defect on the axis that motivated the
+  work does not fix it on the axes that did not; the rule has to be stated over all of them.
+
+  That rule immediately raised the cost of an adapter shrugging. Under it, claude would have
+  been permanently `unverified` — except claude does not actually lack the evidence: it
+  passes `--strict-mcp-config` and never passes `--mcp-config`, which *proves* the set was
+  empty. So `mcp_servers_seen` returns `[]` (a positive claim) rather than `None` (no claim),
+  falling back to `None` the moment argv stops proving it. **`[]` and `None` are different
+  answers and the difference is the whole point** — an adapter that reports unknown where it
+  could prove empty throws away a real guarantee, and one that reports empty where it cannot
+  know manufactures agreement out of silence.
 
 - **Don't encode a set as a delimited string when the delimiter is a legal character.**
   Comparing MCP server sets by `",".join(...)` made `{"a,b"}` and `{"a","b"}` identical,

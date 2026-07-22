@@ -2868,6 +2868,28 @@ def _check_matrix_consistency(failures, verbose):
         ambiguous, _ = _consistency([
             _cell("1.0.72", ["--disable-mcp-server", "a,b"]),
             _cell("1.0.72", ["--disable-mcp-server", "a", "--disable-mcp-server", "b"])])
+        # UNKNOWN IS NOT AGREEMENT ON *EVERY* AXIS, not just the version that motivated
+        # the tri-state. Found in review: gating `verified` on the CLI version alone let a
+        # matrix whose MCP axis was never read report the green primary state anyway, one
+        # field away from `mcp_server_set_unknown_cells: 2`. claude reaches that state by
+        # taking a --mcp-config it cannot resolve to names.
+        opaque_mcp, opaque_msg = _consistency(
+            [_cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"]),
+             _cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"])], "claude")
+        # ...and the other side of that rule: an adapter that can PROVE it ran no servers
+        # says [] and stays verified. Without this, the stricter rule above would park
+        # every claude matrix at "unverified" forever, which is just the green light's
+        # useless twin.
+        proven_empty, proven_msg = _consistency(
+            [_cell("2.1.113", ["--strict-mcp-config"]),
+             _cell("2.1.113", ["--strict-mcp-config"])], "claude")
+        claude_ad = runner_mod.get_adapter("claude")
+        claude_seen = (
+            claude_ad.mcp_servers_seen(["--strict-mcp-config"]),
+            claude_ad.mcp_servers_seen(["--strict-mcp-config", "--mcp-config", "x.json"]),
+            claude_ad.mcp_servers_seen(["--strict-mcp-config", "--mcp-config=x.json"]),
+            claude_ad.mcp_servers_seen(["-p", "hi"]),
+        )
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -2904,6 +2926,35 @@ def _check_matrix_consistency(failures, verbose):
            f"one; one readable cell beside an unreadable one is likewise unverified "
            f"({partial['cli_versions']})",
            failures, verbose)
+
+    _check("runner.verified_requires_every_axis_known",
+           opaque_mcp["comparability"] == "unverified"
+           and opaque_mcp["cli_version_verified"] is True
+           and opaque_mcp["mcp_server_set_verified"] is False
+           and opaque_mcp["mcp_server_set_unknown_cells"] == 2
+           and opaque_mcp["drift"] == [] and opaque_msg == "",
+           f"a matrix whose CLI version is known and uniform but whose MCP configuration "
+           f"was never read reports comparability={opaque_mcp['comparability']!r}, not "
+           f"'verified'. Gating the primary state on the version axis alone rebuilt the "
+           f"misleading green one field over: cli_version_verified="
+           f"{opaque_mcp['cli_version_verified']} beside mcp_server_set_unknown_cells="
+           f"{opaque_mcp['mcp_server_set_unknown_cells']}. Every axis must be positively "
+           f"known before the matrix claims its cells were compared", failures, verbose)
+
+    _check("runner.claude_proves_empty_mcp_set_rather_than_reporting_unknown",
+           claude_seen == ([], None, None, None)
+           and proven_empty["comparability"] == "verified"
+           and proven_empty["mcp_server_sets"] == [[]]
+           and proven_empty["mcp_server_set_unknown_cells"] == 0
+           and proven_empty["mcp_server_set_verified"] is True
+           and proven_msg == "",
+           f"claude reports [] — not unknown — when argv PROVES no server could load "
+           f"(--strict-mcp-config with no --mcp-config), so its matrices still reach "
+           f"'verified' ({proven_empty['comparability']!r}) under the every-axis rule. It "
+           f"falls back to unknown the moment argv stops proving it: a --mcp-config in "
+           f"either spelling, or a missing --strict-mcp-config — {claude_seen}. Proving "
+           f"the empty set and admitting ignorance are different claims and this is where "
+           f"they part", failures, verbose)
 
 
 def _check_parallel_requires_isolation(failures, verbose):

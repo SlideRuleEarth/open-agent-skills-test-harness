@@ -360,10 +360,17 @@ class Adapter(ABC):
         one matrix that disabled different server sets ran against different configurations
         and are not comparable, however green both are.
 
-        ``None`` means "this runner does not express servers on argv" (claude's
-        ``--strict-mcp-config`` names none; antigravity works through file masks), which is
-        distinct from ``[]`` — "argv could express them and there were none". The check has
-        to tell those apart or every claude matrix reads as inconsistent.
+        ``None`` means "this runner does not express its servers where argv can be read"
+        (antigravity works through file masks), and is sharply distinct from ``[]`` —
+        "argv positively establishes that there were none", which is what claude's
+        ``--strict-mcp-config`` with no ``--mcp-config`` does.
+
+        That distinction is load-bearing rather than cosmetic: the consistency check counts
+        ``None`` as an axis it could not compare and downgrades the whole matrix to
+        `unverified`, so returning None where the adapter could actually prove ``[]``
+        throws away a real guarantee, while returning ``[]`` where it cannot manufactures
+        agreement out of silence. Default to None; return ``[]`` only against something on
+        argv that makes servers impossible.
         """
         return None
 

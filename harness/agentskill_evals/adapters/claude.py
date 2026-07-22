@@ -228,6 +228,32 @@ class ClaudeAdapter(Adapter):
     def format_skill(self, skill: str) -> str:
         return f"/{skill}"
 
+    def mcp_servers_seen(self, argv: list[str]) -> Optional[list[str]]:
+        """``[]`` — this run could not have had MCP servers — or None if argv stops saying so.
+
+        Unlike codex and copilot, which neutralize servers by NAME and so report the disable
+        set, claude's whole MCP argument is one flag: ``--strict-mcp-config`` restricts the
+        run to servers from ``--mcp-config``, and this adapter never passes one. That is a
+        POSITIVE claim about the configuration, not an absence of information, so it is
+        reported as the empty set rather than as unknown — and the distinction decides
+        whether a matrix reads `verified` or `unverified`, since an axis nobody can read
+        must not be counted as agreement.
+
+        Both halves are checked on the argv actually used, not assumed from build_argv:
+        ``extra_args`` rides at the end verbatim, so a programmatic caller can append
+        ``--mcp-config``. Then servers may exist and their names live in a JSON file this
+        cannot resolve — unknown, so None. Same if ``--strict-mcp-config`` is gone.
+
+        This is a comparability report, never a safety decision: hermeticity is decided by
+        the run's own init event in `verify_post_run`, which sees servers from any source,
+        including ones argv never mentions.
+        """
+        if "--strict-mcp-config" not in argv:
+            return None
+        if any(a == "--mcp-config" or a.startswith("--mcp-config=") for a in argv):
+            return None
+        return []
+
     def build_argv(self, prompt: str, opts: RunOptions, *, cwd: str) -> list[str]:
         argv = [
             self.binary,

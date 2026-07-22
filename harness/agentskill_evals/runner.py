@@ -642,10 +642,15 @@ class Runner:
         perfectly readable once the reader knows they are not comparable. What is prevented
         is the silent part.
 
-        Unknown is not agreement. A ``cli_version`` of None means the runner does not state
-        it (codex, antigravity), and a matrix of all-unknown is not "consistent" — it is
-        unverifiable, which is reported as its own state so a green consistency line never
-        implies a check that could not run.
+        Unknown is not agreement, on EVERY axis. A ``cli_version`` of None means the runner
+        does not state it (codex, antigravity); an ``mcp_servers_seen`` of None means the
+        runner does not express its servers where this can read them (antigravity's file
+        masks). A matrix of all-unknown is not "consistent" — it is unverifiable, which is
+        reported as its own state so a green consistency line never implies a check that
+        could not run. ``verified`` therefore requires every axis to be positively known
+        AND uniform: an adapter that can prove it ran no MCP servers says so with ``[]``,
+        and one that cannot say anything gets ``unverified``, not a green line resting on
+        one axis while another was never read.
         """
         def _spread(values):
             """Distinct values, with None folded into an `unknown` count rather than
@@ -683,23 +688,34 @@ class Runner:
         if len(isolation) > 1:
             drift.append("isolation varied across cells: some ran isolated, some did not")
 
+        # Per-axis verification. "Exactly one known value AND no unknown cells" is the
+        # only shape that means the axis was actually compared; `len(...) <= 1` would
+        # accept an axis where every cell was unreadable, which is the mistake below.
         cli_verified = len(versions) == 1 and versions_unknown == 0
+        mcp_verified = len(servers) == 1 and servers_unknown == 0
+        isolation_verified = len(isolation) == 1  # always readable; empty matrix aside
         # TRI-STATE, not a boolean. A boolean `consistent` reads true whenever nothing
         # DIFFERED — including when nothing could be compared at all, which is every codex
         # and antigravity matrix. Automation would then take a green field as proof of a
         # check that never ran, which is precisely the failure this whole line of work
         # keeps finding. The nuance cannot live only in a secondary field that careful
         # readers consult; the primary one has to carry it.
+        #
+        # And it has to carry it for EVERY axis, not just the one that motivated the state.
+        # A first cut gated `verified` on cli_verified alone, so a claude matrix with a
+        # known uniform version and an entirely unread MCP axis reported "verified" beside
+        # `mcp_server_set_unknown_cells: 2` — reconstructing, one field over, exactly the
+        # misleading green this tri-state exists to remove (found in review).
         if drift:
             comparability = "drift"
-        elif cli_verified:
+        elif cli_verified and mcp_verified and isolation_verified:
             comparability = "verified"
         else:
             comparability = "unverified"
 
         return {
-            # "verified"  — every cell positively reported the same conditions
-            # "unverified" — nothing differed, but the CLI version could not be read, so
+            # "verified"  — every axis was positively read on every cell, and agreed
+            # "unverified" — nothing differed, but at least one axis could not be read, so
             #                sameness was never established (codex, antigravity)
             # "drift"     — cells demonstrably ran under different conditions
             "comparability": comparability,
@@ -711,6 +727,7 @@ class Runner:
             # name can contain any separator (see _spread's caller).
             "mcp_server_sets": [list(s) for s in servers],
             "mcp_server_set_unknown_cells": servers_unknown,
+            "mcp_server_set_verified": mcp_verified,
             "isolation_uniform": len(isolation) <= 1,
         }
 
