@@ -118,6 +118,22 @@ class Adapter(ABC):
     # (isolation.build_mcp_masked_home). Adapters with a working flag-level kill-switch
     # (claude --strict-mcp-config, codex per-server disables) don't need one.
     isolation_config_masks: dict[str, Optional[str]] = {}
+    # Whether two cells of this runner may execute CONCURRENTLY without sharing mutable
+    # configuration. Default False, and every adapter here is currently False.
+    #
+    # It is not enough for the runs to be isolated. An isolated home is a symlink OVERLAY,
+    # not a copy: `isolation._overlay` wholesale-symlinks every entry it is not explicitly
+    # told to mask, so two isolated homes' `.codex/config.toml` are two paths to ONE real
+    # file. Verified by writing through one overlay and reading it back through another —
+    # and the write lands in the user's real home as well. Only `isolation_config_masks`
+    # entries are materialized, and no adapter masks its whole config home.
+    #
+    # So concurrency here is a correctness problem, not a hermeticity one: cell A's agent
+    # (or the CLI's own startup bookkeeping) writes config that cell B reads mid-launch,
+    # and the result is a wrong ANSWER attributed to the model. Set True only when every
+    # mutable file the CLI reads is materialized per cell — at which point the runner stops
+    # refusing `--jobs > 1` for it.
+    parallel_safe_config: bool = False
     # File names materialized (with the given content) inside every plugin of every
     # global_plugin_registry_subpaths dir — plugins can carry their own MCP configs
     # (e.g. agy's plugins/<name>/mcp_config.json), a server-discovery channel of their own.

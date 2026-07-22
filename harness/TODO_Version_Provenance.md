@@ -286,6 +286,38 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   green line stands in for a check that could not run. Nor is it *drift* — nothing
   actually differed — so the two states are recorded separately.
 
+- **An isolated home is a symlink OVERLAY, not a copy — so isolation does not make
+  concurrency safe.** `isolation._overlay` wholesale-symlinks every entry it is not
+  explicitly told to mask, so two isolated cells' `.codex/config.toml` are two paths to one
+  real file; a write through one cell's overlay is visible through the other's *and* lands
+  in the user's real home. Only `isolation_config_masks` entries are materialized, and no
+  adapter masks its whole config home (claude 0 files, codex 0, agy 2, copilot 5).
+
+  This invalidated the first version of the parallelism guard, which gated on `isolated`
+  and so permitted exactly the race it was written to stop. Parallelism is now gated on
+  `Adapter.parallel_safe_config`, which no adapter can currently claim, so `--jobs > 1` is
+  refused outright until per-cell materialization exists.
+
+  The generalizable error: **I reasoned about isolation from its purpose (a private home)
+  rather than its mechanism (a symlink tree).** The name says "isolated"; the
+  implementation says "shares everything not on a list". Where a safety argument depends on
+  a component being independent, check how it is *built*, not what it is *called* — and
+  the selftest now proves the sharing directly rather than assuming it in either direction.
+
+- **A boolean "is this OK" field silently absorbs "could not tell".** `consistent: true`
+  was returned whenever nothing *differed*, which includes every matrix where nothing could
+  be compared — all codex and agy runs. The nuance lived in a secondary
+  `cli_version_verified`, which careful readers would consult and automation would not.
+  Now a tri-state `comparability: verified | unverified | drift` carries it in the primary
+  field. Any check that can be inconclusive needs three states, not two, or the green one
+  becomes the default answer to a question that was never asked.
+
+- **Don't encode a set as a delimited string when the delimiter is a legal character.**
+  Comparing MCP server sets by `",".join(...)` made `{"a,b"}` and `{"a","b"}` identical,
+  reporting two different configurations as consistent — and copilot server names are
+  arbitrary JSON object keys, so the delimiter is legal. Sets are compared as tuples and
+  emitted as JSON arrays.
+
 - **The safety property to watch for is the one that holds by DEFAULT rather than by
   CHECK.** The harness was safe against cross-cell config contamination only because
   `DEFAULT_JOBS = 1` and isolation is opt-*out*; `--jobs 4 --no-isolated` removed it

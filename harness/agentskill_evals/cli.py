@@ -523,20 +523,22 @@ def cmd_run(args) -> int:
 
     max_cells = args.max_cells if args.max_cells is not None else int(ov.get("max_cells", DEFAULT_MAX_CELLS))
     jobs = args.jobs if args.jobs is not None else int(ov.get("jobs", DEFAULT_JOBS))
-    # Runner.run() refuses this combination too — that is the real guard, and it covers
-    # programmatic callers. Repeating it here is purely for the operator: catching it
-    # before the plan is printed turns a traceback after "Plan: N cells" into the same
-    # clean `error:` line every other misconfiguration gets. Both readings of the flags
-    # are resolved by this point, including the scenario-file overrides, so a YAML that
-    # sets `jobs:` and `isolated:` lands here as well.
-    if jobs > 1 and not isolated:
-        print(f"error: --jobs {jobs} cannot be combined with isolation off. Without the "
-              "per-cell isolated home every cell shares the real $HOME, so concurrent "
-              "cells can read and write each other's CLI configuration mid-run (agents "
-              "run with auto-approve) — results get corrupted nondeterministically and it "
-              "looks like a model problem.\n"
-              "  Either drop --no-isolated (each cell gets a private home, so parallelism "
-              "is safe), or use --jobs 1 to keep a non-isolated run serial.",
+    # Runner.run() refuses this too — that is the real guard, and it covers programmatic
+    # callers. Repeating it here is purely for the operator: catching it before the plan is
+    # printed turns a traceback after "Plan: N cells" into the same clean `error:` line
+    # every other misconfiguration gets. `jobs` is resolved by this point including the
+    # scenario-file override, so a YAML that sets `jobs:` lands here as well.
+    #
+    # Gated on the adapter, NOT on isolation: an isolated home is a symlink overlay, so
+    # unmasked config files are shared between cells regardless (see Runner.run).
+    if jobs > 1 and not getattr(get_adapter(agent), "parallel_safe_config", False):
+        print(f"error: --jobs {jobs} is not supported for {agent}: its CLI configuration "
+              "is not materialized per cell, so concurrent cells share it and corrupt "
+              "each other's results nondeterministically.\n"
+              "  Isolation does not fix this — an isolated home is a symlink overlay, so "
+              "any config file it does not explicitly mask is a symlink to the one real "
+              "file, and a write through one cell is visible to all of them.\n"
+              "  Use --jobs 1 (the default).",
               file=sys.stderr)
         return 2
     n_eligible = sum(1 for s in specs if s.agents is None or agent in s.agents)

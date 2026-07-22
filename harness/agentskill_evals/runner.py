@@ -162,35 +162,38 @@ class Runner:
 
     def run(self, specs: list[EvalSpec]) -> list[CellResult]:
         os.makedirs(self.run_dir, exist_ok=True)
-        if self.jobs > 1 and not self.isolated:
-            # Isolation is what keeps parallel cells from sharing mutable CLI state: each
-            # isolated cell gets its own `ase-home-*`, so one cell's config is invisible to
-            # another. Turn isolation off and every cell reads and writes the SAME real
-            # $HOME — ~/.codex, ~/.copilot, ~/.gemini — while agents run with auto-approve
-            # and can write there. (Workspaces stay per-cell either way; the shared thing
-            # is the config home.)
+        if self.jobs > 1 and not getattr(self.adapter, "parallel_safe_config", False):
+            # An earlier revision of this guard refused only NON-isolated parallel runs, on
+            # the premise that an isolated cell's private home made concurrency safe. That
+            # premise was wrong, and review caught it: an isolated home is a symlink
+            # OVERLAY, not a copy. `isolation._overlay` wholesale-symlinks every entry it
+            # is not explicitly told to mask, so two isolated cells' `.codex/config.toml`
+            # are two paths to one real file — verified by writing through one overlay and
+            # reading the change back through another, with the write also landing in the
+            # user's real home. Only `isolation_config_masks` entries are materialized, and
+            # no adapter masks its whole config home.
             #
-            # Run those concurrently and cells contaminate each other: cell A's agent, or
-            # the CLI's own startup bookkeeping, writes config that cell B enumerates
-            # mid-launch. The result is a nondeterministic cross-cell interaction that
-            # looks like a model behaving oddly, so it gets blamed on the model — the
-            # failure mode is a wrong ANSWER, not a crash, which is why this refuses
-            # instead of warning.
+            # So isolation is the wrong thing to gate on. What matters is whether the
+            # adapter's mutable configuration is materialized PER CELL, which is what
+            # `parallel_safe_config` declares. Today no adapter can claim it, so this
+            # refuses `--jobs > 1` outright rather than pretending one flag combination is
+            # the dangerous one.
             #
-            # Refused rather than warned even though non-isolated on its own is a
-            # documented opt-out: that opt-out says "I accept seeing my real config", which
-            # is a static, understood exposure. Adding concurrency to it is a different
-            # claim — that cells cannot disturb each other — and nothing here can honour
-            # it. Both escapes are one flag.
+            # Refused rather than warned because the failure mode is a wrong ANSWER, not a
+            # crash: cell A's agent (or the CLI's own startup bookkeeping) writes config
+            # that cell B reads mid-launch, and the resulting nondeterminism gets attributed
+            # to the model. `--jobs 1` is the whole workaround, and it is the default.
             raise RuntimeError(
-                f"refusing to run {self.jobs} cells in parallel with isolation off: "
-                "without the per-cell isolated home, every cell shares the real $HOME, so "
-                "concurrent cells can read and write each other's CLI configuration "
-                "mid-run (agents run with auto-approve). That corrupts results "
-                "nondeterministically and looks like a model problem rather than a "
-                "harness one. Either drop --no-isolated (each cell gets a private home, "
-                "parallelism is safe) or run with --jobs 1 (non-isolated, but one cell at "
-                "a time)."
+                f"refusing to run {self.jobs} cells in parallel: the {self.agent} adapter "
+                "does not materialize its CLI configuration per cell, so concurrent cells "
+                "share it. Isolation does NOT fix this — an isolated home is a symlink "
+                "overlay, so every config file it does not explicitly mask is a symlink to "
+                "the one real file, and a write through one cell's overlay is visible to "
+                "every other cell (and to your real home). Concurrent cells would corrupt "
+                "each other's results nondeterministically, in a way that looks like a "
+                "model problem. Use --jobs 1 (the default). Parallelism can be re-enabled "
+                "for a runner once its mutable config is materialized per cell — set "
+                "parallel_safe_config on the adapter then."
             )
         if not self.isolated and (getattr(self.adapter, "isolation_config_masks", None)
                                   or getattr(self.adapter, "plugin_registry_config_masks", None)):
@@ -646,7 +649,11 @@ class Runner:
         """
         def _spread(values):
             """Distinct values, with None folded into an `unknown` count rather than
-            treated as a value — otherwise one unreadable cell reads as a version change."""
+            treated as a value — otherwise one unreadable cell reads as a version change.
+
+            Sorting is over the values as given (strings or tuples), so callers keep
+            whatever structure they passed in; nothing is stringified here.
+            """
             known = sorted({v for v in values if v is not None})
             return known, sum(1 for v in values if v is None)
 
@@ -657,7 +664,12 @@ class Runner:
                 seen = self.adapter.mcp_servers_seen(c.run_result.argv)
             except Exception:  # pragma: no cover — a reporting path must never fail a run
                 seen = None
-            servers_raw.append(None if seen is None else ",".join(seen))
+            # Kept as a TUPLE, never joined into a string. Server names are arbitrary JSON
+            # object keys for copilot, so a name may itself contain the separator: joining
+            # on "," makes {"a,b"} and {"a","b"} the same value and reports two genuinely
+            # different configurations as consistent. Tuples compare structurally and are
+            # emitted below as JSON arrays.
+            servers_raw.append(None if seen is None else tuple(seen))
         servers, servers_unknown = _spread(servers_raw)
         isolation = sorted({bool(c.isolated) for c in results})
 
@@ -666,19 +678,38 @@ class Runner:
             drift.append(f"CLI version varied across cells: {', '.join(versions)}")
         if len(servers) > 1:
             drift.append("MCP server set varied across cells: "
-                         + "; ".join(f"[{s or 'none'}]" for s in servers))
+                         + "; ".join("[" + (", ".join(s) if s else "none") + "]"
+                                     for s in servers))
         if len(isolation) > 1:
             drift.append("isolation varied across cells: some ran isolated, some did not")
 
+        cli_verified = len(versions) == 1 and versions_unknown == 0
+        # TRI-STATE, not a boolean. A boolean `consistent` reads true whenever nothing
+        # DIFFERED — including when nothing could be compared at all, which is every codex
+        # and antigravity matrix. Automation would then take a green field as proof of a
+        # check that never ran, which is precisely the failure this whole line of work
+        # keeps finding. The nuance cannot live only in a secondary field that careful
+        # readers consult; the primary one has to carry it.
+        if drift:
+            comparability = "drift"
+        elif cli_verified:
+            comparability = "verified"
+        else:
+            comparability = "unverified"
+
         return {
-            "consistent": not drift,
+            # "verified"  — every cell positively reported the same conditions
+            # "unverified" — nothing differed, but the CLI version could not be read, so
+            #                sameness was never established (codex, antigravity)
+            # "drift"     — cells demonstrably ran under different conditions
+            "comparability": comparability,
             "drift": drift,
             "cli_versions": versions,
             "cli_version_unknown_cells": versions_unknown,
-            # True only when every cell positively stated the same build. All-unknown is
-            # NOT verified — see the docstring.
-            "cli_version_verified": len(versions) == 1 and versions_unknown == 0,
-            "mcp_server_sets": servers,
+            "cli_version_verified": cli_verified,
+            # JSON arrays, one per distinct set — never a joined string, since a server
+            # name can contain any separator (see _spread's caller).
+            "mcp_server_sets": [list(s) for s in servers],
             "mcp_server_set_unknown_cells": servers_unknown,
             "isolation_uniform": len(isolation) <= 1,
         }

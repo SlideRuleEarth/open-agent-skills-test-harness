@@ -898,6 +898,11 @@ class _FakeAdapter:
     # True so effort-threading checks see the resolved value in RunOptions; _run_cell_body
     # nulls the effort for adapters without this control (see effort.unsupported_not_claimed).
     supports_reasoning_effort = True
+    # This stand-in invokes no CLI and reads no configuration, so it has nothing for
+    # concurrent cells to share — which is exactly what the flag asserts. Set so the
+    # parallel-dispatch tests (cell_idx assignment) can still exercise --jobs>1; the real
+    # adapters all leave it False because their config homes ARE shared (see base.Adapter).
+    parallel_safe_config = True
 
 
 def _check_workspace_relocation(failures, verbose):
@@ -2856,57 +2861,74 @@ def _check_matrix_consistency(failures, verbose):
         # One readable cell + one unreadable one is not a version CHANGE either; there is
         # simply nothing to compare against. It must not be reported as drift.
         partial, partial_msg = _consistency([_cell("1.0.72", disabled), _cell(None, disabled)])
+        # Server names are arbitrary JSON object keys for copilot, so a name can contain
+        # any separator. Joining the set into a string made {"a,b"} and {"a","b"} the same
+        # value — two genuinely different configurations reported as consistent. The sets
+        # are kept structurally for exactly this.
+        ambiguous, _ = _consistency([
+            _cell("1.0.72", ["--disable-mcp-server", "a,b"]),
+            _cell("1.0.72", ["--disable-mcp-server", "a", "--disable-mcp-server", "b"])])
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
     _check("runner.matrix_consistency_flags_mid_matrix_drift",
-           drifted["consistent"] is False
+           drifted["comparability"] == "drift"
            and any("1.0.64" in d and "1.0.72" in d for d in drifted["drift"])
            and "not strictly comparable" in drift_msg
-           and uniform["consistent"] is True and uniform_msg == ""
-           and iso_drift["consistent"] is False
+           and uniform["comparability"] == "verified" and uniform_msg == ""
+           and iso_drift["comparability"] == "drift"
            and any("isolation varied" in d for d in iso_drift["drift"])
-           and srv_drift["consistent"] is False
-           and any("MCP server set varied" in d for d in srv_drift["drift"]),
+           and srv_drift["comparability"] == "drift"
+           and any("MCP server set varied" in d for d in srv_drift["drift"])
+           and ambiguous["comparability"] == "drift"
+           and ambiguous["mcp_server_sets"] == [["a", "b"], ["a,b"]],
            f"a matrix straddling a CLI auto-update is reported as not comparable even "
            f"though every cell passed ({drifted['cli_versions']}), and so is one where "
            f"isolation or the MCP server set varied; a uniform matrix says nothing at all "
-           f"({uniform_msg!r})", failures, verbose)
+           f"({uniform_msg!r}). Server sets are compared STRUCTURALLY, so a name "
+           f"containing the separator ({{'a,b'}} vs {{'a','b'}}) is not collapsed into "
+           f"agreement — {ambiguous['mcp_server_sets']}", failures, verbose)
 
     _check("runner.unknown_version_is_not_reported_as_agreement",
-           unknown["cli_version_verified"] is False
+           unknown["comparability"] == "unverified"
+           and unknown["cli_version_verified"] is False
            and unknown["cli_version_unknown_cells"] == 2
-           and unknown["consistent"] is True and unknown_msg == ""
-           and partial["consistent"] is True
-           and partial["cli_version_verified"] is False,
-           f"a matrix where no cell states its version (every codex/agy run) is NOT "
-           f"reported as version-verified ({unknown['cli_version_verified']}) — absence "
-           f"of evidence is not agreement — but neither is it reported as drift, since "
-           f"nothing actually differed; and one readable cell beside an unreadable one is "
-           f"likewise unverified rather than drifting ({partial['cli_versions']})",
+           and unknown["drift"] == [] and unknown_msg == ""
+           and partial["comparability"] == "unverified"
+           and partial["drift"] == [],
+           f"a matrix where no cell states its version (every codex/agy run) reports "
+           f"comparability={unknown['comparability']!r} — NOT a green 'verified', since "
+           f"absence of evidence is not agreement, and not 'drift' either, since nothing "
+           f"actually differed. The tri-state carries that in the PRIMARY field, so "
+           f"automation reading it cannot mistake an uncheckable matrix for a checked "
+           f"one; one readable cell beside an unreadable one is likewise unverified "
+           f"({partial['cli_versions']})",
            failures, verbose)
 
 
 def _check_parallel_requires_isolation(failures, verbose):
-    """Parallel cells + isolation off = cells sharing one mutable config home.
+    """Concurrent cells share mutable CLI configuration — isolated or not.
 
-    Isolation is what makes parallelism safe here: each isolated cell gets its own
-    `ase-home-*`, so nothing one cell writes is visible to another. With `--no-isolated`
-    every cell reads and writes the real $HOME, while agents run with auto-approve and can
-    write there — so concurrent cells contaminate each other's CLI configuration.
+    An isolated home is a symlink OVERLAY, not a copy: `isolation._overlay` wholesale-
+    symlinks every entry it is not told to mask, so two isolated cells' `.codex/config.toml`
+    are two paths to one real file. The first version of this guard gated on isolation,
+    believing a private home made concurrency safe; review disproved it, and the arm below
+    now proves the sharing directly rather than assuming either way.
 
-    This was an UNENFORCED invariant: the harness is serial (DEFAULT_JOBS = 1) and isolated
-    (`--no-isolated` is opt-out) by default, so the property held by accident, and one flag
-    combination silently removed it. `jobs` and `isolated` are both scenario-override keys,
-    so a YAML file could reach it too, without anyone passing a flag at all.
+    So the property that matters is per-cell MATERIALIZED config (`parallel_safe_config`),
+    which no real adapter can currently claim — `--jobs>1` is therefore refused outright.
+    It was an unenforced invariant before that: DEFAULT_JOBS is 1, so the harness was safe
+    by accident, and `jobs` is a scenario-override key, so YAML could raise it without
+    anyone passing a flag.
     """
     import os
     import shutil
     import tempfile as _tempfile
 
     from . import runner as runner_mod
+    from .isolation import build_isolated_home
 
-    print("parallel cells require isolation:")
+    print("parallel cells require materialized config:")
 
     root = _tempfile.mkdtemp(prefix="ase-par-")
 
@@ -2925,27 +2947,54 @@ def _check_parallel_requires_isolation(failures, verbose):
             return str(exc)
         return ""
 
+    # The load-bearing case, and the one an earlier revision of this arm got WRONG: an
+    # isolated home is a symlink overlay, so parallel ISOLATED cells share every config
+    # file the overlay does not explicitly mask. Proven directly below rather than asserted,
+    # because the whole guard rests on it.
+    shared_home = _tempfile.mkdtemp(prefix="ase-shared-")
+    os.makedirs(os.path.join(shared_home, ".codex"))
+    with open(os.path.join(shared_home, ".codex", "config.toml"), "w") as fh:
+        fh.write("original\n")
+    cells = []
+    for i in range(2):
+        h = _tempfile.mkdtemp(prefix=f"ase-cell{i}-")
+        build_isolated_home(h, [".codex/skills"], set(), [], shared_home)
+        cells.append(os.path.join(h, ".codex", "config.toml"))
+    with open(cells[0], "w") as fh:                       # cell A writes...
+        fh.write("[mcp_servers.sneaky]\n")
+    leaked_to_sibling = "sneaky" in open(cells[1]).read()  # ...cell B sees it
+    leaked_to_real = "sneaky" in open(
+        os.path.join(shared_home, ".codex", "config.toml")).read()
+
     try:
-        refused = _run(4, False)
-        # The three safe combinations must all still work — a guard that also blocks these
-        # would be worse than the hole, since serial non-isolated is a DOCUMENTED opt-out
-        # and parallel isolated is the whole point of --jobs.
-        serial_unisolated = _run(1, False)
-        parallel_isolated = _run(4, True)
+        refused_isolated = _run(4, True)
+        refused_unisolated = _run(4, False)
+        # Serial must keep working in BOTH modes: --jobs 1 is the default and the whole
+        # workaround, and non-isolated serial is a documented opt-out. A guard that broke
+        # either would be worse than the hole it closes.
         serial_isolated = _run(1, True)
+        serial_unisolated = _run(1, False)
     finally:
         shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(shared_home, ignore_errors=True)
 
-    _check("runner.parallel_cells_require_isolation",
-           "refusing to run 4 cells in parallel" in refused
-           and "--jobs 1" in refused and "--no-isolated" in refused
-           and serial_unisolated == "" and parallel_isolated == ""
-           and serial_isolated == "",
-           f"parallel + non-isolated is refused, naming both escapes, because the cells "
-           f"would share one real $HOME and overwrite each other's CLI config "
-           f"nondeterministically — a wrong ANSWER blamed on the model, not a crash. The "
-           f"three safe combinations still run: serial non-isolated (the documented "
-           f"opt-out), parallel isolated (private home per cell), and serial isolated",
+    _check("runner.isolated_homes_share_config_between_cells",
+           leaked_to_sibling and leaked_to_real,
+           f"an isolated home is a symlink OVERLAY, not a copy: a write through one cell's "
+           f"overlay is visible through another's ({leaked_to_sibling}) and lands in the "
+           f"real home ({leaked_to_real}). This is the fact the parallelism guard rests "
+           f"on — asserted directly, because an earlier revision assumed the opposite and "
+           f"gated on isolation instead of on the adapter", failures, verbose)
+
+    _check("runner.parallel_refused_until_config_is_materialized",
+           "refusing to run 4 cells in parallel" in refused_isolated
+           and "--jobs 1" in refused_isolated
+           and "parallel_safe_config" in refused_isolated
+           and refused_unisolated != ""
+           and serial_isolated == "" and serial_unisolated == "",
+           f"--jobs>1 is refused for a runner whose config is not materialized per cell — "
+           f"ISOLATED included, since isolation does not stop the sharing — and the message "
+           f"names what would lift it. Both serial modes still run",
            failures, verbose)
 
 
