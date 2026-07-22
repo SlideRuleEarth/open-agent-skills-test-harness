@@ -2786,6 +2786,107 @@ def _check_unreadable_version_adapters(failures, verbose):
            f"blessed", failures, verbose)
 
 
+def _check_matrix_consistency(failures, verbose):
+    """A matrix claims its cells are comparable. This checks that they actually were.
+
+    "Model A beat model B" silently requires the cells to differ ONLY in the model. Three
+    things can drift underneath that without failing any cell: the CLI rewriting itself
+    mid-matrix (the failure that started this work — copilot went 1.0.64 → 1.0.72 in four
+    days), the MCP server set changing, and a cell falling back to non-isolated.
+
+    Reported, never enforced: the cells have already run and been paid for, and each is
+    still individually valid. What is prevented is reading the DIFFERENCE between them as
+    caused by the variable under test.
+    """
+    import io
+    import os
+    import shutil
+    import sys
+    import tempfile as _tempfile
+
+    from . import runner as runner_mod
+    from .schema import RunResult
+
+    print("matrix consistency:")
+
+    root = _tempfile.mkdtemp(prefix="ase-cons-")
+
+    def _cell(version=None, argv=(), isolated=True, name="e"):
+        rr = RunResult(agent="copilot", eval_name=name, prompt="", workdir="",
+                       argv=list(argv))
+        rr.cli_version = version
+        return runner_mod.CellResult(
+            agent="copilot", model="m", eval_name=name, skill=None, passed=True,
+            run_result=rr, isolated=isolated)
+
+    def _consistency(cells, agent="copilot"):
+        r = runner_mod.Runner(agent, models=["m"],
+                              artifacts_root=os.path.join(root, "a"),
+                              run_id="c", skills_root=root)
+        err = io.StringIO()
+        saved, sys.stderr = sys.stderr, err
+        try:
+            out = r._consistency(cells)
+            r._warn_inconsistent(out)
+        finally:
+            sys.stderr = saved
+        return out, err.getvalue()
+
+    try:
+        # copilot's own spelling — the fixture must use the adapter's real flag or
+        # mcp_servers_seen reads nothing and the arm passes for the wrong reason.
+        disabled = ["--disable-mcp-server", "known"]
+        # The motivating case: an auto-update mid-matrix. Every cell passes.
+        drifted, drift_msg = _consistency([
+            _cell("1.0.64", disabled), _cell("1.0.72", disabled)])
+        # Uniform on all three axes.
+        uniform, uniform_msg = _consistency([
+            _cell("1.0.72", disabled), _cell("1.0.72", disabled)])
+        # A cell that fell back to non-isolated saw skills its siblings did not.
+        iso_drift, _ = _consistency([
+            _cell("1.0.72", disabled), _cell("1.0.72", disabled, isolated=False)])
+        # Different configurations: one cell had a server the other did not.
+        srv_drift, _ = _consistency([
+            _cell("1.0.72", disabled),
+            _cell("1.0.72", ["--disable-mcp-server", "other"])])
+        # UNKNOWN IS NOT AGREEMENT. Every codex/agy matrix looks like this, and it must
+        # not report a verified-uniform version — that would be a green line standing in
+        # for a check that could not run.
+        unknown, unknown_msg = _consistency([_cell(None, []), _cell(None, [])], "codex")
+        # One readable cell + one unreadable one is not a version CHANGE either; there is
+        # simply nothing to compare against. It must not be reported as drift.
+        partial, partial_msg = _consistency([_cell("1.0.72", disabled), _cell(None, disabled)])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    _check("runner.matrix_consistency_flags_mid_matrix_drift",
+           drifted["consistent"] is False
+           and any("1.0.64" in d and "1.0.72" in d for d in drifted["drift"])
+           and "not strictly comparable" in drift_msg
+           and uniform["consistent"] is True and uniform_msg == ""
+           and iso_drift["consistent"] is False
+           and any("isolation varied" in d for d in iso_drift["drift"])
+           and srv_drift["consistent"] is False
+           and any("MCP server set varied" in d for d in srv_drift["drift"]),
+           f"a matrix straddling a CLI auto-update is reported as not comparable even "
+           f"though every cell passed ({drifted['cli_versions']}), and so is one where "
+           f"isolation or the MCP server set varied; a uniform matrix says nothing at all "
+           f"({uniform_msg!r})", failures, verbose)
+
+    _check("runner.unknown_version_is_not_reported_as_agreement",
+           unknown["cli_version_verified"] is False
+           and unknown["cli_version_unknown_cells"] == 2
+           and unknown["consistent"] is True and unknown_msg == ""
+           and partial["consistent"] is True
+           and partial["cli_version_verified"] is False,
+           f"a matrix where no cell states its version (every codex/agy run) is NOT "
+           f"reported as version-verified ({unknown['cli_version_verified']}) — absence "
+           f"of evidence is not agreement — but neither is it reported as drift, since "
+           f"nothing actually differed; and one readable cell beside an unreadable one is "
+           f"likewise unverified rather than drifting ({partial['cli_versions']})",
+           failures, verbose)
+
+
 def _check_parallel_requires_isolation(failures, verbose):
     """Parallel cells + isolation off = cells sharing one mutable config home.
 
@@ -6620,6 +6721,7 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _check_version_provenance_shared(failures, verbose)
     _check_claude_version_provenance(failures, verbose)
     _check_unreadable_version_adapters(failures, verbose)
+    _check_matrix_consistency(failures, verbose)
     _check_parallel_requires_isolation(failures, verbose)
     _check_codex_post_run_mcp_recheck(failures, verbose)
 

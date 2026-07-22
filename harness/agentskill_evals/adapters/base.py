@@ -82,6 +82,11 @@ class ParseOutput:
     premium_requests: Optional[float] = None
     duration_ms: Optional[int] = None
     resolved_model: Optional[str] = None
+    # The CLI build that actually executed, when this runner's own telemetry states it.
+    # None where it does not (codex, antigravity — see each adapter's VersionProvenance),
+    # and None is NOT interchangeable with a version: it means "unknown", which the
+    # cross-cell consistency check must not treat as agreement.
+    cli_version: Optional[str] = None
 
 
 class Adapter(ABC):
@@ -326,6 +331,25 @@ class Adapter(ABC):
         if "exit_code" in inspect.signature(self.verify_post_run).parameters:
             kwargs["exit_code"] = exit_code
         return self.verify_post_run(argv, opts, **kwargs)
+
+    def mcp_servers_seen(self, argv: list[str]) -> Optional[list[str]]:
+        """The MCP servers this invocation knew about, read back off its own argv.
+
+        For the runners that neutralize servers by NAME (codex, copilot) this is the
+        disable set, which is a faithful record of what the CLI's configuration held at
+        launch — the same list the pre-launch enumeration produced, archived in the one
+        place that survives into the artifact.
+
+        Used by the cross-cell consistency check, not by any safety decision: two cells of
+        one matrix that disabled different server sets ran against different configurations
+        and are not comparable, however green both are.
+
+        ``None`` means "this runner does not express servers on argv" (claude's
+        ``--strict-mcp-config`` names none; antigravity works through file masks), which is
+        distinct from ``[]`` — "argv could express them and there were none". The check has
+        to tell those apart or every claude matrix reads as inconsistent.
+        """
+        return None
 
     def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str,
                         stdout: str = "", stderr: str = "",

@@ -236,6 +236,11 @@ class CodexAdapter(Adapter):
                     return ProbeResult(accepted=True, cost_usd=None)
         return ProbeResult(accepted=True)
 
+    def mcp_servers_seen(self, argv: list[str]) -> Optional[list[str]]:
+        """The servers this run disabled by name — codex's record of what its configuration
+        held at launch. Same reader the post-run re-check uses."""
+        return sorted(_disabled_server_names(argv))
+
     def format_skill(self, skill: str) -> str:
         # Mirrors the OpenAI example which referenced skills as "$skill-name".
         return f"${skill}"

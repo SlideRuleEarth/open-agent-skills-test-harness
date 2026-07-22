@@ -616,9 +616,95 @@ class Runner:
         )
         _write(os.path.join(cell_dir, "judge_report.md"), render_report(judge_cell))
 
+    def _consistency(self, results: list[CellResult]) -> dict:
+        """Did every cell in this matrix run under the same conditions?
+
+        A matrix's whole purpose is comparison — "model A scored better than model B" is
+        the claim the artifact makes. That claim silently requires the cells to differ
+        ONLY in the thing being compared. Three things can drift underneath it without
+        failing a single cell:
+
+        * **CLI version.** The failure that started this line of work: copilot rewrote its
+          own executable from 1.0.64 to 1.0.72 in four days. A long matrix, or two runs a
+          day apart, can straddle an auto-update, and every cell still passes. The
+          difference then gets attributed to the model.
+        * **MCP server set.** Cells that disabled different servers ran against different
+          configurations.
+        * **Isolation.** A cell that fell back to non-isolated saw skills its siblings did
+          not (``CellResult.isolated`` already records the ACHIEVED state, which is why
+          this reads that rather than the requested flag).
+
+        Reported, never enforced, and deliberately so: by the time this runs the cells have
+        executed and been paid for, so failing them would destroy results that are still
+        perfectly readable once the reader knows they are not comparable. What is prevented
+        is the silent part.
+
+        Unknown is not agreement. A ``cli_version`` of None means the runner does not state
+        it (codex, antigravity), and a matrix of all-unknown is not "consistent" — it is
+        unverifiable, which is reported as its own state so a green consistency line never
+        implies a check that could not run.
+        """
+        def _spread(values):
+            """Distinct values, with None folded into an `unknown` count rather than
+            treated as a value — otherwise one unreadable cell reads as a version change."""
+            known = sorted({v for v in values if v is not None})
+            return known, sum(1 for v in values if v is None)
+
+        versions, versions_unknown = _spread([c.run_result.cli_version for c in results])
+        servers_raw = []
+        for c in results:
+            try:
+                seen = self.adapter.mcp_servers_seen(c.run_result.argv)
+            except Exception:  # pragma: no cover — a reporting path must never fail a run
+                seen = None
+            servers_raw.append(None if seen is None else ",".join(seen))
+        servers, servers_unknown = _spread(servers_raw)
+        isolation = sorted({bool(c.isolated) for c in results})
+
+        drift = []
+        if len(versions) > 1:
+            drift.append(f"CLI version varied across cells: {', '.join(versions)}")
+        if len(servers) > 1:
+            drift.append("MCP server set varied across cells: "
+                         + "; ".join(f"[{s or 'none'}]" for s in servers))
+        if len(isolation) > 1:
+            drift.append("isolation varied across cells: some ran isolated, some did not")
+
+        return {
+            "consistent": not drift,
+            "drift": drift,
+            "cli_versions": versions,
+            "cli_version_unknown_cells": versions_unknown,
+            # True only when every cell positively stated the same build. All-unknown is
+            # NOT verified — see the docstring.
+            "cli_version_verified": len(versions) == 1 and versions_unknown == 0,
+            "mcp_server_sets": servers,
+            "mcp_server_set_unknown_cells": servers_unknown,
+            "isolation_uniform": len(isolation) <= 1,
+        }
+
+    def _warn_inconsistent(self, consistency: dict) -> None:
+        """Say it on stderr as well as in the artifact. A drift recorded only in
+        summary.json is one nobody sees until they are already arguing about the numbers."""
+        if consistency["drift"]:
+            print(f"warning: [{self.agent}] this matrix did NOT run under uniform "
+                  "conditions, so its cells are not strictly comparable:", file=sys.stderr)
+            for d in consistency["drift"]:
+                print(f"  - {d}", file=sys.stderr)
+            print("  The per-cell results are still valid individually; what is not "
+                  "supported is reading the DIFFERENCE between them as caused by the thing "
+                  "the matrix varies (model, effort, skill). See summary.json "
+                  "`consistency`.", file=sys.stderr)
+
     def _write_summary(self, results: list[CellResult], specs: list[EvalSpec]) -> None:
+        consistency = self._consistency(results)
+        self._warn_inconsistent(consistency)
         summary = {
             "run_id": self.run_id,
+            # Whether this matrix's cells are comparable to each other at all — see
+            # _consistency. Recorded before the results themselves because it qualifies
+            # every number below it.
+            "consistency": consistency,
             "command": self.command,
             "agent": self.agent,
             "models": [t.model for t in self.targets if t.model is not None] or ["default"],
@@ -641,6 +727,8 @@ class Runner:
                     "effective_effort": c.effective_effort,
                     "eval": c.eval_name, "skill": c.skill,
                     "isolated": c.isolated, "isolation_leaks": c.isolation_leaks,
+                    # None where the runner's telemetry does not state it (codex, agy).
+                    "cli_version": c.run_result.cli_version,
                     "ungraded": c.ungraded,
                     "passed": c.passed, "n_pass": c.n_pass, "n_total": c.n_total,
                     "error": c.run_result.error, "timed_out": c.run_result.timed_out,

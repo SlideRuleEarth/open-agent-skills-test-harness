@@ -272,6 +272,20 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   real `$HOME` — where it outlives the run and is visible to everything else on the
   machine. Write it with the schema, not after.
 
+- **Provenance is only half the job; the other half is COMPARABILITY.** The whole point of
+  a matrix is the difference between its cells, and that difference is only attributable to
+  the variable under test if everything else held still. `Runner._consistency` now records,
+  per matrix, whether the CLI version, the MCP server set, and the isolation mode were
+  uniform across cells, warns on stderr when they were not, and writes a `consistency`
+  block into `summary.json`. Reported, never enforced — the cells have already run and are
+  individually valid; what is prevented is silently reading a CLI auto-update as a model
+  difference.
+
+  The subtle requirement: **unknown is not agreement.** A matrix where no cell states its
+  version (every codex and agy run) must not report `cli_version_verified: true`, or a
+  green line stands in for a check that could not run. Nor is it *drift* — nothing
+  actually differed — so the two states are recorded separately.
+
 - **The safety property to watch for is the one that holds by DEFAULT rather than by
   CHECK.** The harness was safe against cross-cell config contamination only because
   `DEFAULT_JOBS = 1` and isolation is opt-*out*; `--jobs 4 --no-isolated` removed it

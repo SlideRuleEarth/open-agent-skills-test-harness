@@ -1684,6 +1684,11 @@ class CopilotAdapter(Adapter):
                                    premium_requests=float(pr) if pr is not None else None)
         return ProbeResult(accepted=True)
 
+    def mcp_servers_seen(self, argv: list[str]) -> Optional[list[str]]:
+        """The servers this run disabled by name — copilot's record of what its
+        configuration held at launch. Same reader the post-run re-check uses."""
+        return sorted(_disabled_server_names(argv))
+
     def format_skill(self, skill: str) -> str:
         return f"/{skill}"
 
@@ -1991,4 +1996,7 @@ class CopilotAdapter(Adapter):
             premium_requests=premium_requests,
             duration_ms=duration_ms,
             resolved_model=resolved_model,
+            # Same reader the hermeticity check uses, so the recorded build is the one the
+            # verification was reasoning about rather than a second determination of it.
+            cli_version=_stream_cli_version(stdout),
         )

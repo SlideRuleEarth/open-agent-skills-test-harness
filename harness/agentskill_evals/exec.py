@@ -167,6 +167,7 @@ def execute(
         rr.premium_requests = parsed.premium_requests
         rr.duration_ms = parsed.duration_ms
         rr.resolved_model = parsed.resolved_model
+        rr.cli_version = parsed.cli_version
     except Exception as exc:  # parsing must never crash a run
         rr.error = (rr.error + "; " if rr.error else "") + f"parse failed: {exc}"
 

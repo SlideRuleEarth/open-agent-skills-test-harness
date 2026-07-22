@@ -418,4 +418,8 @@ class ClaudeAdapter(Adapter):
             cost_usd=cost,
             duration_ms=dur,
             resolved_model=resolved_model,
+            # Same reader the hermeticity check uses, so the recorded build is the one the
+            # verification was reasoning about rather than a second, possibly different,
+            # determination of it.
+            cli_version=_stream_cli_version(stdout),
         )

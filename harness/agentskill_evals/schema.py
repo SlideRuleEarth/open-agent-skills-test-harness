@@ -71,6 +71,10 @@ class RunResult:
     premium_requests: Optional[float] = None
     duration_ms: Optional[int] = None
     resolved_model: Optional[str] = None  # actual model used (when adapter can detect it)
+    # CLI build that executed (when the runner's telemetry states it; None = unknown).
+    # Recorded per cell so a matrix can be checked for having run under ONE build — a
+    # self-updating CLI can change mid-matrix, which silently makes cells incomparable.
+    cli_version: Optional[str] = None
     stdout_path: Optional[str] = None
     stderr_path: Optional[str] = None
     timed_out: bool = False
