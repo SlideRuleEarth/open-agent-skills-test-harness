@@ -2617,14 +2617,14 @@ def _check_claude_version_provenance(failures, verbose):
            f"identical one does not ({ver_repeat!r})", failures, verbose)
 
     _check("claude.mcp_witness_fails_closed",
-           ok == (None, [], True)
+           ok == (None, [], True, {})
            and live[0] is None and live[1] == ["leaky"]
            # The message must NAME the reshape, not merely be non-empty: a fallback path
            # ("no init event at all") also yields a violation here, so `is not None` alone
            # passes for the wrong reason and would survive the field-check being removed.
            and reshaped[0] is not None and "mcp_servers" in reshaped[0]
            and reshaped[2] is False
-           and crashed == (None, [], False)
+           and crashed == (None, [], False, {})
            and completed_silently[0] is not None,
            f"a hermetic run witnesses an empty server list {ok}; a loaded server is "
            f"surfaced {live}; a RESHAPED field fails closed rather than reading as clean "
@@ -6860,8 +6860,11 @@ def _check_mcp_declared_servers(failures, verbose):
     alternative in every case is a scenario that runs without the tool surface it declared
     and fails somewhere unrecognizable.
     """
+    import io as _io
     import json as _json
     import os
+    import shutil as _shutil
+    import sys as _sys
     import tempfile as _tempfile
 
     from . import runner as runner_mod
@@ -7109,11 +7112,50 @@ def _check_mcp_declared_servers(failures, verbose):
            "sk-secret-abcdef" not in txt and "sk-secret-abcdef" not in js
            and js_obj["argv"][2] == "Bearer «redacted»"
            and js_obj["events"][0]["raw"]["deep"]["nested"] == "«redacted»",
-           f"redaction happens at the WRITERS, on the serialized form, so it reaches "
-           f"argv, arbitrarily nested event payloads, and plain text alike without "
-           f"knowing any of their shapes — and covers the case no CLI flag can, a tool "
-           f"RESULT echoing a token back into the transcript. Structure survives: "
-           f"{js_obj['argv']}", failures, verbose)
+           f"redaction happens at the WRITERS, so it reaches argv, arbitrarily nested "
+           f"event payloads, and plain text alike without knowing any of their shapes — "
+           f"and covers the case no CLI flag can, a tool RESULT echoing a token back into "
+           f"the transcript. Structure survives: {js_obj['argv']}", failures, verbose)
+
+    # --- the same scrub, on secrets the JSON encoder RE-SPELLS -----------------
+    # Review reproduced this leak in both `_rwj` and the JSONL text path: the scrub used to
+    # search the SERIALIZED form for the RAW value, so any secret containing a quote, a
+    # backslash, a control character, or a non-ASCII byte was stored in an escaped spelling
+    # the search could not match, and sailed through in plain view. These are not exotic
+    # characters for a credential — a base64 secret can contain `/` and `+`, and a passphrase
+    # can contain anything at all.
+    tricky = ['tok"quote-abcdef', "tok\\slash-abcdef", "tökén-abcdef", "tok\nnewline-abcdef"]
+    r._secrets = tuple(tricky)
+    # The text path gets the secrets already JSON-ESCAPED, which is how they arrive in a
+    # CLI's own stdout.jsonl stream — the artifact this harness copies rather than authors.
+    r._rw(os.path.join(cell_dir, "esc.jsonl"),
+          "\n".join(_json.dumps({"result": t}) for t in tricky))
+    r._rwj(os.path.join(cell_dir, "esc.json"), {"argv": list(tricky), "n": {"deep": tricky}})
+    esc_txt = open(os.path.join(cell_dir, "esc.jsonl")).read()
+    esc_js = open(os.path.join(cell_dir, "esc.json")).read()
+    esc_obj = _json.loads(esc_js)
+    # Checked against BOTH spellings: the raw value and the encoder's version of it. Testing
+    # only the raw one would pass against the very bug this arm exists for.
+    escaped_forms = [_json.dumps(t)[1:-1] for t in tricky]
+    _check("mcp.redaction_survives_json_escaping",
+           all(t not in esc_txt and t not in esc_js for t in tricky)
+           and all(e not in esc_txt and e not in esc_js for e in escaped_forms)
+           and esc_obj["argv"] == ["«redacted»"] * len(tricky),
+           f"a secret containing a quote, backslash, control character or non-ASCII byte "
+           f"is scrubbed in every spelling it can reach disk in — the structured writer "
+           f"compares BEFORE serialization, and the text writer also matches the escaped "
+           f"form a CLI's own JSONL stream carries. argv={esc_obj['argv']}",
+           failures, verbose)
+
+    # Keys, not just values: a credential can be a dict key (an env map keyed by token, a
+    # header name) as easily as a leaf, and a walk that only visits values would miss it.
+    r._secrets = ("sk-secret-abcdef",)
+    r._rwj(os.path.join(cell_dir, "key.json"), {"sk-secret-abcdef": "v", "x": object()})
+    key_obj = _json.loads(open(os.path.join(cell_dir, "key.json")).read())
+    _check("mcp.redaction_covers_dict_keys_and_stringified_leaves",
+           "«redacted»" in key_obj and "sk-secret-abcdef" not in key_obj,
+           f"dict KEYS are scrubbed alongside values, and a leaf the encoder would render "
+           f"via default=str is rendered scrubbed — {sorted(key_obj)}", failures, verbose)
 
     # A value that contains another must not be left half-rewritten by the shorter one.
     overlap = redact("token=abcdef123456 short=abcdef",
@@ -7124,6 +7166,144 @@ def _check_mcp_declared_servers(failures, verbose):
            f"left as '«redacted»123456' by the shorter one's pass — {overlap!r}",
            failures, verbose)
 
-    import shutil as _shutil
+    # --- the archived workspace, the one artifact the runner does not WRITE ----
+    # It is moved into the artifact tree wholesale, so it never met `_rw`/`_rwj` and review
+    # found it kept credentials every other artifact had scrubbed: an MCP result can echo a
+    # token back and the agent can save it to a file.
+    ws = os.path.join(root, "ws")
+    os.makedirs(os.path.join(ws, "sub"), exist_ok=True)
+    open(os.path.join(ws, "notes.txt"), "w").write("the token is sk-secret-abcdef\n")
+    open(os.path.join(ws, "sub", "creds-sk-secret-abcdef.txt"), "w").write("x")
+    # Binary: a decode-then-scrub implementation skips or corrupts this one silently.
+    open(os.path.join(ws, "blob.bin"), "wb").write(b"\x00\xff" + b"sk-secret-abcdef" + b"\x00")
+    outside = os.path.join(root, "outside.txt")
+    open(outside, "w").write("sk-secret-abcdef untouched\n")
+    os.symlink(outside, os.path.join(ws, "link.txt"))
+    runner_mod._scrub_tree(ws, ("sk-secret-abcdef",))
+    ws_txt = open(os.path.join(ws, "notes.txt")).read()
+    ws_bin = open(os.path.join(ws, "blob.bin"), "rb").read()
+    ws_names = sorted(os.listdir(os.path.join(ws, "sub")))
+    _check("mcp.archived_workspace_is_scrubbed",
+           "sk-secret-abcdef" not in ws_txt and b"sk-secret-abcdef" not in ws_bin
+           and ws_bin.startswith(b"\x00\xff") and ws_names == ["creds-«redacted».txt"],
+           f"a credential the agent wrote into its workspace is scrubbed from file "
+           f"CONTENTS (text and binary alike, on bytes, so an undecodable file is not "
+           f"skipped) and from file NAMES — a redacted file whose own path spells out the "
+           f"token would be a scrub that only looks complete: {ws_names}",
+           failures, verbose)
+
+    _check("mcp.workspace_scrub_does_not_follow_symlinks",
+           open(outside).read() == "sk-secret-abcdef untouched\n",
+           "symlinks are skipped rather than followed: the target can sit outside the "
+           "artifact tree, and rewriting through one would let a link the agent created "
+           "redirect the scrub into an arbitrary file", failures, verbose)
+
+    # --- the run summary, written after every cell cleared its secrets ---------
+    # `_secrets` is deliberately cell-scoped, so by the time the summary is written it is
+    # empty — review reproduced a credential republished through both summary.json and
+    # summary.md via `RunResult.error`, which carries a tail of the child's output.
+    srun = os.path.join(root, "summ")
+    r2 = runner_mod.Runner("claude", models=["m"], artifacts_root=srun, run_id="s",
+                           skills_root=root)
+    r2._secrets = ("sk-secret-abcdef",)
+    r2._run_secrets = ("sk-secret-abcdef",)
+    r2._secrets = ()          # exactly what _run_cell's finally leaves behind
+    err_rr = runner_mod.RunResult(agent="claude", eval_name="e", prompt="", workdir="")
+    err_rr.error = "child failed: Authorization: Bearer sk-secret-abcdef"
+    scell = runner_mod.CellResult(agent="claude", model="m", eval_name="e", skill=None,
+                                  passed=False, run_result=err_rr,
+                                  artifacts_dir=os.path.join(srun, "s", "c0"))
+    _serr = _io.StringIO()
+    _saved, _sys.stderr = _sys.stderr, _serr
+    try:
+        r2._write_summary([scell], [])
+    finally:
+        _sys.stderr = _saved
+    sum_js = open(os.path.join(srun, "s", "summary.json")).read()
+    sum_md = open(os.path.join(srun, "s", "summary.md")).read()
+    # Parsed, not grepped: `_write_json` writes with ensure_ascii, so the marker itself
+    # lands as `«redacted»` and a raw substring test for it would read as a miss.
+    sum_err = _json.loads(sum_js)["cells"][0]["error"]
+    _check("mcp.run_summary_is_scrubbed_after_cells_clear_their_secrets",
+           "sk-secret-abcdef" not in sum_js and "sk-secret-abcdef" not in sum_md
+           and sum_err.endswith("«redacted»"),
+           f"summary.json and summary.md are scrubbed against the RUN-scoped union of "
+           f"every cell's secrets, because they are written long after the last cell "
+           f"cleared its own registry and they AGGREGATE cells — one cell's set would "
+           f"leave the others exposed. json_clean={'sk-secret-abcdef' not in sum_js} "
+           f"md_clean={'sk-secret-abcdef' not in sum_md}", failures, verbose)
+
+    # --- named is not the same as usable --------------------------------------
+    # `status` used to be discarded, so a server reported as failed counted as successfully
+    # present: not undeclared, so no violation, and not missing, so not even a warning.
+    def _witness_warnings(servers):
+        buf = _io.StringIO()
+        saved, _sys.stderr = _sys.stderr, buf
+        try:
+            cl.verify_post_run(
+                [], RunOptions(mcp_servers=resolved), cwd=scratch,
+                stdout=_json.dumps({"type": "system", "subtype": "init",
+                                    "mcp_servers": servers,
+                                    "claude_code_version": "2.1.113"}),
+                stderr="", exit_code=0)
+        except RuntimeError as exc:
+            return f"RAISED {exc}"
+        finally:
+            _sys.stderr = saved
+        return buf.getvalue()
+
+    w_failed = _witness_warnings([{"name": "echo", "status": "failed"}])
+    w_nostatus = _witness_warnings([{"name": "echo"}])
+    w_connected = _witness_warnings([{"name": "echo", "status": "connected"}])
+    # An UNDECLARED server still fails the run no matter how sick it claims to be — the
+    # hermeticity violation is that it was there at all, and a status field is attacker-
+    # controlled input from the server's own host.
+    w_undeclared_failed = _witness_warnings(
+        [{"name": "echo", "status": "connected"}, {"name": "sneaky", "status": "failed"}])
+    _check("mcp.declared_server_must_be_reported_connected",
+           "echo" in w_failed and "failed" in w_failed
+           and "echo" in w_nostatus and w_connected == ""
+           and w_undeclared_failed.startswith("RAISED") and "sneaky" in w_undeclared_failed,
+           f"a DECLARED server reported in any state but `connected` gets a durable "
+           f"warning instead of passing as present — an unknown state warns too, since a "
+           f"status this adapter does not recognise is not evidence of health — while a "
+           f"healthy one is silent and an UNDECLARED one still fails the run whatever its "
+           f"status says: failed={w_failed.strip()[:70]!r} clean={w_connected!r}",
+           failures, verbose)
+
+    # --- the refusals hold off the CLI path ------------------------------------
+    # They used to live only in the CLI's pre-flight, so `Runner.run()` and any direct
+    # caller could run an adapter that cannot inject servers with `mcp_servers:` quietly
+    # dropped, or claude with `tools:` quietly unenforced — the exact degradations the
+    # validation claims to refuse.
+    from . import exec as exec_mod
+    gated = parse_mcp_servers({"e": {"command": "true", "tools": ["echo"]}}, where="t")
+    plain = parse_mcp_servers({"e": {"command": "true"}}, where="t")
+
+    def _prog_run(agent, servers):
+        d = _tempfile.mkdtemp(prefix="ase-mcpprog-")
+        try:
+            ex = exec_mod.execute(
+                get_adapter(agent), "hi",
+                RunOptions(mcp_servers=servers, mcp_scratch_dir=d),
+                cwd=d, timeout=5)
+            return ex.result.error or ""
+        except Exception as exc:                # noqa: BLE001 — a raise is also a refusal
+            return f"RAISED {exc}"
+        finally:
+            _shutil.rmtree(d, ignore_errors=True)
+
+    prog_unsupported = _try(lambda: _prog_run("antigravity", plain), "")
+    prog_gated = _try(lambda: _prog_run("claude", gated), "")
+    _check("mcp.refusals_hold_on_the_programmatic_path",
+           "cannot inject MCP servers" in prog_unsupported
+           and "tools:" in prog_gated and "not implemented" in prog_gated,
+           f"an adapter that cannot inject declared servers, and claude with a `tools:` "
+           f"allowlist it cannot enforce, are BOTH refused without the CLI's pre-flight in "
+           f"the picture — re-asserted at the one choke point every invocation passes "
+           f"through, so the refusal cannot be routed around by calling Runner.run() or "
+           f"the adapter directly: unsupported={prog_unsupported[:60]!r} "
+           f"gated={prog_gated[:60]!r}", failures, verbose)
+
     _shutil.rmtree(scratch, ignore_errors=True)
     _shutil.rmtree(root, ignore_errors=True)

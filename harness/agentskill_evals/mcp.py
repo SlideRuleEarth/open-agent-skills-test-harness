@@ -18,6 +18,7 @@ a tool RESULT echoing a token back into the transcript.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -318,12 +319,87 @@ def _abs_arg(arg: str, base_dir: Optional[str]) -> str:
 # Redaction
 # ---------------------------------------------------------------------------
 
+def _surface_forms(value: str) -> list[str]:
+    """Every spelling one secret can wear in an artifact.
+
+    Found in review: searching artifacts for the RAW value misses the escaped one, and
+    almost every artifact this harness writes is JSON. A token containing `"`, `\\`, a
+    control character, or any non-ASCII byte is re-spelled by the encoder before it lands
+    — `a"b` is stored `a\\"b`, `ö` is stored `\\u00f6` — so the raw needle is simply not
+    present in the haystack and the scrub passes over a credential sitting in plain view.
+
+    Both encoder settings are generated because both reach disk: this harness writes with
+    the `ensure_ascii=True` default, while a CLI's own JSONL stream may use either.
+    """
+    forms = {value}
+    for ensure_ascii in (True, False):
+        encoded = json.dumps(value, ensure_ascii=ensure_ascii)[1:-1]
+        if encoded:
+            forms.add(encoded)
+    return list(forms)
+
+
 def redact(text: str, secrets) -> str:
-    """Replace every occurrence of every secret. Longest first, so a value that contains
-    another is not left half-rewritten by the shorter one's replacement."""
+    """Replace every occurrence of every secret, in each form it can appear in.
+
+    Longest first — across the expanded form set, not just the raw values — so a value
+    that contains another is not left half-rewritten by the shorter one's replacement.
+    """
     if not text or not secrets:
         return text
-    for value in sorted(secrets, key=len, reverse=True):
+    forms: set[str] = set()
+    for value in secrets:
         if value:
-            text = text.replace(value, REDACTED)
+            forms.update(_surface_forms(value))
+    for form in sorted(forms, key=len, reverse=True):
+        text = text.replace(form, REDACTED)
     return text
+
+
+def redact_obj(obj, secrets):
+    """Scrub a structure before it is serialized, rather than after.
+
+    ``_rwj`` used to redact the serialized JSON, which made the escaping bug above a leak
+    in every structured artifact at once. Walking the object first means the comparison
+    happens against the value the author actually supplied, with no encoder in between.
+    Keys are scrubbed as well as values: a credential can be a dict key (an env map keyed
+    by token, a header name) as easily as a leaf.
+
+    Leaves that are neither str/list/dict/tuple still matter, because ``_write_json``
+    serializes them with ``default=str`` — so an object whose ``str()`` exposes a secret
+    is replaced by that redacted string rather than passed through to the encoder.
+    """
+    if not secrets:
+        return obj
+    if isinstance(obj, str):
+        return redact(obj, secrets)
+    if isinstance(obj, dict):
+        return {redact_obj(k, secrets): redact_obj(v, secrets) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [redact_obj(x, secrets) for x in obj]
+    if isinstance(obj, (int, float, bool, type(None))):
+        return obj
+    rendered = str(obj)
+    scrubbed = redact(rendered, secrets)
+    return scrubbed if scrubbed != rendered else obj
+
+
+def redact_bytes(raw: bytes, secrets) -> bytes:
+    """Byte-level scrub, for files this harness did not author.
+
+    The agent's workspace is archived into the artifact tree verbatim, so a credential an
+    MCP result echoed back can arrive on disk inside a file the agent wrote. Those files
+    have no guaranteed encoding and may be binary, so the substitution is done on bytes:
+    decoding first would throw away the very files most likely to be skipped silently.
+    """
+    if not raw or not secrets:
+        return raw
+    forms: set[bytes] = set()
+    for value in secrets:
+        if value:
+            for form in _surface_forms(value):
+                forms.add(form.encode("utf-8", "surrogatepass"))
+    replacement = REDACTED.encode("utf-8")
+    for form in sorted(forms, key=len, reverse=True):
+        raw = raw.replace(form, replacement)
+    return raw

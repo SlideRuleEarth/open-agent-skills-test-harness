@@ -123,6 +123,18 @@ def execute(
     # when it can't guarantee a hermetic invocation (e.g. MCP servers it can't enumerate).
     opts = dataclasses.replace(opts, effective_env=env)
     try:
+        # The MCP refusals used to live only in the CLI's pre-flight, which meant the
+        # supported programmatic path (Runner.run, or any direct caller) could run an
+        # adapter that cannot inject servers with `mcp_servers:` quietly dropped, or Claude
+        # with `tools:` quietly unenforced — the exact degradations that validation claims
+        # to refuse (found in review). Re-asserted HERE because this is the one choke point
+        # every invocation passes through, and because raising inside the argv-construction
+        # block reuses the fail-closed path below: an invocation that cannot be built to the
+        # scenario's spec becomes a failed run, not a silently weaker one.
+        if getattr(opts, "mcp_servers", None):
+            mcp_errors, _ = adapter.validate_mcp_support(opts.mcp_servers)
+            if mcp_errors:
+                raise RuntimeError("; ".join(mcp_errors))
         argv = adapter.build_argv(prompt, opts, cwd=cwd)
     except Exception as exc:
         rr.error = f"could not construct a hermetic invocation: {exc}"

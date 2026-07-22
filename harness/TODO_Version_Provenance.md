@@ -218,6 +218,31 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   failing an arm — a red signal, but the wrong one, and it hid the fact that the arm never
   proved the fail-closed behaviour it claimed to.
 
+- **A guarantee is only as wide as the surface it is attached to, and "where did I put
+  it?" is a different question from "is it correct?"** Review of the Phase 1 MCP work
+  returned five defects and four were the same mistake wearing different clothes: a control
+  that was *right* but *narrower than the thing it claimed to protect*. Secret redaction
+  was placed at the artifact writers — correct, and it missed the `workspace/` tree because
+  that one is **moved** in rather than written. It was scoped per cell — correct, and the
+  run summaries are written after the last cell clears its registry. The four MCP refusals
+  were placed in the CLI's pre-flight — correct, and `Runner.run()` does not go through it,
+  so every refusal was routable around by the supported programmatic path. And the witness
+  checked which servers were **named** — correct, and a server reported `status: "failed"`
+  is named, so it passed as present.
+
+  The generalisable move is to ask, for each control, *what set does this actually cover,
+  and what is in the protected set but not in that one?* Writers ⊂ artifacts. Cells ⊂ runs.
+  CLI ⊂ callers. Named ⊂ usable. Each gap was invisible from inside the control, because
+  the control does its job perfectly on everything it can see — which is also why none of
+  these produced a failing test until an arm was written that stood *outside* the control
+  and looked in.
+
+  The fifth defect was different and worth its own note: redaction searched the serialized
+  JSON for the raw secret, so any value the encoder re-spells (`"`, `\`, control chars,
+  non-ASCII) was invisible to it. A scrub has to match the representation that reaches
+  disk, not the representation the author typed — and if a transform sits between the two,
+  either compare before it or expand the needle to cover what it produces.
+
 - **codex's stream witness is presence-only, and that changes which check carries the
   argument.** Established live with a sentinel stdio MCP server rather than reasoned from
   the event list. Three findings, each of which moved the design:

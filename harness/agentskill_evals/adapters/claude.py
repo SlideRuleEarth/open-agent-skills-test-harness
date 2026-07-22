@@ -126,8 +126,11 @@ def _stream_cli_version(stdout: str) -> Optional[str]:
     return seen.pop() if len(seen) == 1 else None
 
 
-def _mcp_witness(stdout: str, exit_code: int) -> tuple[Optional[str], list[str], bool]:
-    """Check the run's own account of its MCP host. Returns (violation, live, witnessed).
+def _mcp_witness(stdout: str,
+                 exit_code: int) -> tuple[Optional[str], list[str], bool, dict]:
+    """Check the run's own account of its MCP host.
+
+    Returns (violation, live, witnessed, statuses).
 
     ``live`` is every server the run reports, DECLARED OR NOT — deciding which of those
     were supposed to be there belongs to the caller, which is the only layer that knows
@@ -156,6 +159,7 @@ def _mcp_witness(stdout: str, exit_code: int) -> tuple[Optional[str], list[str],
     """
     violation: Optional[str] = None
     live: list[str] = []
+    statuses: dict[str, Optional[str]] = {}
     witnessed = False
     for obj in iter_jsonl(stdout):
         if not isinstance(obj, dict):
@@ -176,16 +180,26 @@ def _mcp_witness(stdout: str, exit_code: int) -> tuple[Optional[str], list[str],
             name = str(s.get("name") if isinstance(s, dict) else s)
             if name not in live:
                 live.append(name)
+            # `status` was being discarded, so a server reported `{"name": "echo",
+            # "status": "failed"}` counted as successfully present and passed verification
+            # without even the missing-server warning (found in review). Recorded per name,
+            # strictest reading wins: once a server is seen in a non-connected state that
+            # sticks, because a stream that reports the same server both ways has not
+            # established that the scenario got the tool surface it asked for.
+            status = s.get("status") if isinstance(s, dict) else None
+            status = str(status) if status is not None else None
+            if name not in statuses or statuses[name] == "connected":
+                statuses[name] = status
     if violation is not None:
         # Report the violation, but hand back whatever servers WERE named: a stream that
         # both reshaped one event and loaded a server in another should not lose the
         # second fact to the first.
-        return (violation, live, False)
+        return (violation, live, False, statuses)
     if witnessed:
-        return (None, live, True)
+        return (None, live, True, statuses)
     if exit_code == 0:
-        return ("the run completed but emitted no system/init event", [], False)
-    return (None, [], False)
+        return ("the run completed but emitted no system/init event", [], False, {})
+    return (None, [], False, {})
 
 
 class ClaudeAdapter(Adapter):
@@ -378,7 +392,7 @@ class ClaudeAdapter(Adapter):
         still has to put a denial ahead of a contract failure.
         """
         version = _stream_cli_version(stdout)
-        broken, live, witnessed = _mcp_witness(stdout, exit_code)
+        broken, live, witnessed, statuses = _mcp_witness(stdout, exit_code)
         _PROVENANCE.check_denied(version, completed=witnessed)
         if broken is not None:
             raise RuntimeError(
@@ -419,6 +433,22 @@ class ClaudeAdapter(Adapter):
             print(f"warning: [claude] declared MCP server(s) {', '.join(missing)} were not "
                   "reported by the run — the scenario ran without them; check the server "
                   "command and its startup output.", file=sys.stderr)
+        # Being NAMED in the witness is not the same as being usable. A server reported
+        # `{"name": "echo", "status": "failed"}` used to clear this check silently — it was
+        # present, so it was not "missing", and its status was discarded. That is the same
+        # confusing outcome as a missing server (assertions about tools that never existed)
+        # and it gets the same durable warning. Unknown states warn too rather than being
+        # assumed good: a status this adapter does not recognise is not evidence of health.
+        unhealthy = sorted(
+            (name, statuses.get(name)) for name in declared & set(live)
+            if statuses.get(name) != "connected"
+        )
+        if unhealthy and witnessed:
+            detail = ", ".join(f"{n} ({s or 'no status reported'})" for n, s in unhealthy)
+            print(f"warning: [claude] declared MCP server(s) {detail} were reported by the "
+                  "run but not as connected — their tools were most likely unavailable, so "
+                  "assertions about them will fail for a reason the results will not show.",
+                  file=sys.stderr)
         _PROVENANCE.warn_drift(version, witnessed=witnessed)
 
     def parse(self, stdout: str, stderr: str, exit_code: int,

@@ -34,7 +34,7 @@ from .assertions import AssertionContext, AssertionResult, run_assertion
 from .exec import execute
 from .isolation import build_isolated_home, config_home_entries, reroot_config_masks
 from .judge import Judge
-from .mcp import redact
+from .mcp import redact, redact_bytes, redact_obj
 from .progress import Progress
 from .schema import EventKind, RunResult
 from .spec import EvalSpec, ModelTarget, repo_root_for, skill_names
@@ -113,6 +113,9 @@ class Runner:
     # and an artifact writer that raises AttributeError on "no secrets to redact" would be
     # failing at the safest possible moment.
     _secrets: tuple[str, ...] = ()
+    # Union of every cell's secrets, for the artifacts written AFTER the per-cell registry
+    # is cleared. See `_run_secrets` in __init__.
+    _run_secrets: tuple[str, ...] = ()
 
     def __init__(
         self,
@@ -164,6 +167,16 @@ class Runner:
         # rather than run-scoped, and never stored on CellResult/RunResult — those are
         # serialized, which would archive the very strings this exists to keep out.
         self._secrets: tuple[str, ...] = ()
+        # The run-scoped union of the above. Needed because the run summary is written long
+        # after the last cell cleared `_secrets`, and it AGGREGATES cells — `RunResult.error`
+        # carries a tail of the child's stdout/stderr, so summary.json and summary.md can
+        # republish a credential that every per-cell artifact correctly scrubbed. Review
+        # reproduced the leak through both files.
+        #
+        # Union, not per-cell: a summary row mixes cells, so scrubbing it against one cell's
+        # set would leave the others exposed. The cost is over-redaction — cell A's token
+        # blanked out of cell B's row — which is the harmless direction.
+        self._run_secrets: tuple[str, ...] = ()
 
     @property
     def models(self) -> list[Optional[str]]:
@@ -318,6 +331,11 @@ class Runner:
                     shutil.move(exec_ws, workspace)
         except OSError:
             pass  # best-effort — the finally in _run_cell still cleans up the tempdir
+        # Same scrub as the success path, and needed for the same reason: this preserves the
+        # agent's output into the artifact tree, so a credential it wrote to a file is
+        # archived here too. `_secrets` is still populated — _run_cell clears it in a finally
+        # that runs after this. Ordered before report.md below, which INLINES workspace files.
+        _scrub_tree(workspace, self._secrets)
         try:
             self._write_cell_json(cell_dir, cell)
             self._rw(os.path.join(cell_dir, "report.md"), render_report(cell))
@@ -443,6 +461,7 @@ class Runner:
         if spec.mcp_servers:
             mcp_resolved, secrets = spec.resolved_mcp_servers()
             self._secrets = tuple(secrets)
+            self._run_secrets = tuple(dict.fromkeys(self._run_secrets + self._secrets))
             mcp_scratch = tempfile.mkdtemp(prefix="ase-mcp-")
         opts = RunOptions(
             model=model,
@@ -521,6 +540,19 @@ class Runner:
             shutil.move(exec_ws, workspace)
             for c in checks:
                 c.details = _remap_paths(c.details, exec_ws, workspace)
+        # The workspace is the one artifact this runner does not WRITE, so it never met
+        # `_rw`/`_rwj` and review found it kept credentials the rest of the tree had
+        # scrubbed: an MCP result can echo a token back and the agent can save it to a file.
+        #
+        # Outside the isolation branch on purpose. `workspace` is the final artifact
+        # location either way — under isolation the tempdir was just moved onto it, and
+        # without isolation the agent wrote into it directly — so scoping this to isolated
+        # runs would leave the non-isolated ones, where the agent's output lands in the
+        # artifact tree with no move at all, unscrubbed.
+        #
+        # Runs after grading, never before: assertions above ran against `exec_ws`, so what
+        # was graded is exactly what the agent produced, unmodified.
+        _scrub_tree(workspace, self._secrets)
 
         cell = CellResult(
             agent=self.agent, model=model, eval_name=spec.name, skill=spec.skill_name,
@@ -603,14 +635,15 @@ class Runner:
         _write(path, redact(text, self._secrets) if self._secrets else text)
 
     def _rwj(self, path: str, obj) -> None:
-        if not self._secrets:
-            _write_json(path, obj)
-            return
-        # Redact the SERIALIZED form, so a secret is caught wherever it sits in the
-        # structure — argv entries, nested event payloads, assertion messages — without
-        # this needing to know the shape of any of them. json.dumps/loads round-trips
-        # because the replacement is a plain string.
-        _write_json(path, json.loads(redact(json.dumps(obj), self._secrets)))
+        # Walks the structure and scrubs each string, so a secret is caught wherever it
+        # sits — argv entries, nested event payloads, assertion messages — without this
+        # needing to know the shape of any of them.
+        #
+        # This used to redact the SERIALIZED form instead, which review showed was a leak:
+        # the encoder re-spells a value containing a quote, a backslash, a control
+        # character, or any non-ASCII byte, so the raw secret was no longer present to
+        # match. Comparing before serialization removes the encoder from the path.
+        _write_json(path, redact_obj(obj, self._secrets) if self._secrets else obj)
 
     def _write_artifacts(self, cell_dir: str, stdout: str, stderr: str, rr: RunResult) -> None:
         os.makedirs(cell_dir, exist_ok=True)
@@ -841,10 +874,16 @@ class Runner:
                 for c in results
             ],
         }
-        _write_json(os.path.join(self.run_dir, "summary.json"), summary)
+        # Scrubbed against the RUN-scoped union, not `_secrets`: by the time this runs every
+        # cell has cleared its own registry, so the per-cell writers would be redacting
+        # against an empty set here. Both files aggregate `RunResult.error`, which carries a
+        # tail of child output.
+        _write_json(os.path.join(self.run_dir, "summary.json"),
+                    redact_obj(summary, self._run_secrets))
         _write(os.path.join(self.run_dir, "summary.md"),
-               render_markdown(results, self.agent, self.targets,
-                               run_dir=self.run_dir, command=self.command))
+               redact(render_markdown(results, self.agent, self.targets,
+                                      run_dir=self.run_dir, command=self.command),
+                      self._run_secrets))
 
 
 # ---------------------------------------------------------------------------
@@ -1162,6 +1201,51 @@ def _remap_paths(obj, old: str, new: str):
     if isinstance(obj, dict):
         return {k: _remap_paths(v, old, new) for k, v in obj.items()}
     return obj
+
+
+def _scrub_tree(root: str, secrets) -> None:
+    """Rewrite any archived workspace file that carries a declared secret.
+
+    Bottom-up so a directory is renamed only after its contents are done, and rewrites are
+    conditional: a file whose bytes do not contain a secret is left with its original
+    mtime and permissions, which keeps this invisible on the overwhelmingly common run
+    where nothing leaked.
+
+    Names are scrubbed as well as contents. An agent told to "save the token" may well use
+    it as the filename, and a redacted file whose own path spells out the credential would
+    be a scrub that only looks complete. Symlinks are skipped rather than followed: the
+    target may sit outside the artifact tree, and rewriting through one would let a link
+    the agent created redirect this into an arbitrary file.
+    """
+    if not secrets or not os.path.isdir(root):
+        return
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path):
+                continue
+            try:
+                raw = open(path, "rb").read()
+                scrubbed = redact_bytes(raw, secrets)
+                if scrubbed != raw:
+                    with open(path, "wb") as fh:
+                        fh.write(scrubbed)
+            except OSError as exc:
+                print(f"warning: could not scrub {path}: {exc}", file=sys.stderr)
+        for name in dirnames + filenames:
+            clean = redact(name, secrets)
+            if clean == name:
+                continue
+            src = os.path.join(dirpath, name)
+            dst = os.path.join(dirpath, clean)
+            n = 1
+            while os.path.lexists(dst):
+                dst = os.path.join(dirpath, f"{clean}.{n}")
+                n += 1
+            try:
+                os.rename(src, dst)
+            except OSError as exc:
+                print(f"warning: could not rename {src}: {exc}", file=sys.stderr)
 
 
 def _write(path: str, text: str) -> None:
