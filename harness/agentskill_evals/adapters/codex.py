@@ -421,8 +421,12 @@ class CodexAdapter(Adapter):
 
     def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str,
                         stdout: str = "", stderr: str = "", exit_code: int = 0) -> None:
-        """Close the launch window on codex's MCP kill switch, then record that this run's
+        """Narrow the launch window on codex's MCP kill switch, then record that this run's
         build is unidentifiable.
+
+        NARROW, not close. **There is a residual case this cannot detect, by construction**
+        — see "The hole that stays open" below. Read that before quoting this method as
+        evidence a codex run was MCP-hermetic.
 
         The gap this exists for: everything codex verified before now ran from
         ``build_argv`` — ``_verify_all_mcp_disabled`` is a post-*enumeration*, pre-*launch*
@@ -432,24 +436,40 @@ class CodexAdapter(Adapter):
         ``-c ...enabled=false`` set does not name, so it loads live. copilot has closed
         this window since Phase 0; codex never did.
 
-        Two checks, because each covers the other's blind spot — the same shape as
-        copilot's, but the halves are NOT equally strong here and the difference matters:
+        Two checks:
 
-        1. **Stream evidence** (ABA-immune, presence-only). A file edit reverted before
-           exit re-reads as clean, so re-enumeration alone can be defeated by a change that
-           does not outlive the run. Testimony the CLI already emitted cannot be retracted
-           that way. codex's is much weaker than copilot's: copilot emits
-           ``session.mcp_servers_loaded`` naming every server it brought up, so absence of
-           a leak is positively witnessed, whereas codex emits nothing at all when a server
-           starts — verified live against a sentinel stdio server, which codex launched and
-           handed ``initialize``/``tools/list`` without a single stream event. The only MCP
-           trace is an ``mcp_tool_call`` item, which appears **only if the model actually
-           called a tool**. So presence proves a leak; absence proves nothing whatsoever.
-           That asymmetry is why check 2 is not optional here.
+        1. **Stream evidence** (survives a revert, presence-only). A file edit undone
+           before exit re-reads as clean, so re-enumeration alone can be defeated by a
+           change that does not outlive the run. Testimony the CLI already emitted cannot
+           be retracted that way. codex's testimony is far weaker than copilot's: copilot
+           emits ``session.mcp_servers_loaded`` naming every server it brought up, so a
+           clean run is positively witnessed, whereas codex emits **nothing at all when a
+           server starts** — verified live against a sentinel stdio server, which codex
+           launched and handed ``initialize``/``tools/list`` without a single stream event.
+           The only MCP trace is an ``mcp_tool_call`` item, which appears **only if the
+           model actually called a tool**. Presence proves a leak; absence proves nothing.
 
         2. **Re-enumeration.** The whole disable set is rebuilt from codex's own effective
            view, in the child's exact cwd/env, and any server configured now that argv did
-           not disable fails the run. Blind to a reverted change, hence check 1.
+           not disable fails the run. Blind to a change reverted before it runs.
+
+        **The hole that stays open.** These two do NOT cover each other's blind spots —
+        that is true of copilot, and porting the claim here was wrong. A server added after
+        argv was built, started by codex, and removed again before this method
+        re-enumerates is invisible to *both* checks whenever the model never calls one of
+        its tools: check 1 sees nothing because no tool call happened and startup emits no
+        event, and check 2 sees the restored config. Since it is exactly the *idle* server
+        that goes unseen, and since a server does not need to be called to act — the
+        sentinel received ``initialize``/``tools/list`` and could have done anything at
+        startup, running as the agent for the whole session — this residue is not a corner
+        case that only matters to a pedant.
+
+        What it would take to actually close it: give the child a *materialized* private
+        config rather than one it shares with the host, so there is no file an outside
+        writer can add a server to mid-run. That is a real change to codex's isolation
+        story (``$CODEX_HOME`` currently mirrors the user's, which is what keeps auth
+        working) and is deliberately not attempted here. Until then this is detection with
+        a known blind spot, and ``DESIGN_MCP_Support.md`` §1 states the narrowed guarantee.
 
         Detection, not prevention, and the same live test shows why that is not a
         formality: ``--ask-for-approval never`` cancelled the sentinel's tool *call* but

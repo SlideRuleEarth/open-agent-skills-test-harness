@@ -2834,20 +2834,39 @@ def _check_codex_post_run_mcp_recheck(failures, verbose):
     # Enumeration itself stopped working after the run: hermeticity is no longer
     # ESTABLISHABLE, which is not the same as established, so it fails closed.
     unenumerable = _run(_adapter(None), launched)
-    # A server that vanished before the check is not a violation — it is the ABA case the
-    # stream half exists for, and re-enumeration honestly cannot see it. Pinned so nobody
-    # "fixes" it into a false positive.
-    vanished = _run(_adapter([]), launched)
-
-    _check("codex.post_run_reenumeration_closes_the_launch_window",
+    _check("codex.post_run_reenumeration_narrows_the_launch_window",
            clean == "" and "sneaky" in appeared and "not provably MCP-hermetic" in appeared
-           and "no longer is" in unenumerable and vanished == "",
+           and "no longer is" in unenumerable,
            f"a run whose configured server set is unchanged passes; one where a server "
-           f"appeared after argv was built fails, naming it; an enumeration that stops "
-           f"working post-run fails closed rather than assuming the earlier check still "
-           f"holds; and a server REMOVED during the run is not reported, because "
-           f"re-enumeration genuinely cannot see it — that blind spot is the stream "
-           f"half's job", failures, verbose)
+           f"appeared after argv was built fails, naming it; and an enumeration that stops "
+           f"working post-run fails closed rather than assuming the pre-launch check still "
+           f"holds", failures, verbose)
+
+    # --- the residual gap, asserted as a KNOWN HOLE rather than as correct behaviour ---
+    # A server added after argv was built, started by codex, then removed again before this
+    # check re-enumerates passes both halves whenever the model never called one of its
+    # tools: the stream is silent (codex emits nothing when a server STARTS — established
+    # live) and re-enumeration sees the restored config.
+    #
+    # An earlier revision asserted this same outcome with a comment saying the stream half
+    # covered it. That is true of copilot, whose witness names every server it brought up;
+    # it is false for codex, and the claim contradicted this file's own finding. Review
+    # caught it. The arm is kept — the behaviour is real and worth pinning so a future
+    # change to it is deliberate — but it is NAMED as a gap, so nobody reads a green
+    # selftest as evidence the window is shut.
+    #
+    # If this ever goes red because codex grew a server-start event, that is not a
+    # regression: it means the hole can be closed. Rewrite the check to use it.
+    idle_server_reverted = _run(_adapter([]), launched, stdout="")
+    _check("codex.KNOWN_GAP_idle_server_reverted_before_recheck_is_undetectable",
+           idle_server_reverted == "",
+           f"DOCUMENTED HOLE, not a passing property: a server that started during the run "
+           f"and was removed before the post-run enumeration goes unreported when the model "
+           f"never called it. Both halves are blind — no tool call means no stream evidence, "
+           f"and codex emits nothing when a server starts, so absence of evidence is not "
+           f"evidence of absence here. Closing it needs a materialized private config for "
+           f"the child (see verify_post_run, DESIGN_MCP_Support.md §1); until then a green "
+           f"codex run means 'no leak was detected', NOT 'no server ran'", failures, verbose)
 
     # --- the stream half: presence proves a leak, absence proves nothing --------------
     # Shapes taken verbatim from a live codex 0.140.0 run against a sentinel stdio server.

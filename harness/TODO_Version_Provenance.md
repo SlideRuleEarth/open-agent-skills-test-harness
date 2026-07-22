@@ -238,7 +238,57 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   down because it generalizes: when a guard's failure message quotes the same identifier
   the unguarded crash does, only the type distinguishes them.
 
+- **Two weak checks do not make a strong one, and "each covers the other's blind spot" is
+  a claim that has to be re-proved per CLI.** copilot pairs re-enumeration with a stream
+  witness that names every server it brought up, so the pair genuinely is complementary.
+  Porting that sentence to codex was wrong: codex emits nothing when a server *starts*, so
+  its stream cannot cover re-enumeration's blind spot, and the two checks share a hole
+  rather than closing each other's. The failure mode is subtle because both checks are
+  individually correct and individually useful — what was false was the *composition*
+  claim, stated by analogy instead of being re-established. Review caught it after I had
+  documented the very finding (no server-start event) that disproves it, one commit
+  earlier, in the same file.
+
+  Two habits fall out of it: a compensating control is only compensating for the specific
+  thing it observes, so name that thing rather than the role; and when porting a security
+  argument between adapters, port the *evidence*, not the prose — the sentence survives
+  the copy, the property may not.
+
+- **A selftest arm can quietly ratify a gap.** The arm that pinned this hole asserted the
+  vulnerable outcome (`vanished == ""`) with a comment explaining why it was fine — so a
+  green run *looked like* the case was handled. Mutation testing cannot catch this class:
+  the assertion is load-bearing and every mutation flips it correctly. It is only visible
+  by reading what the arm claims against what the system actually does. Where an arm pins
+  behaviour that is a known limitation, its NAME should say so (`KNOWN_GAP_…`), because
+  the name is what a reader sees in the output.
+
 ## Still open
+
+- **codex's residual ABA hole — an idle server that starts and is reverted is
+  undetectable.** A server added to a config codex reads after argv was built, started by
+  codex, then removed before `verify_post_run` re-enumerates, passes both checks whenever
+  the model never calls one of its tools. Neither half can see it: no tool call means no
+  stream evidence, and codex emits no event when a server *starts*. Because it is the idle
+  server that escapes, and a server can act at startup without ever being called, this is
+  a genuine hole rather than a technicality — for codex, a clean verification means "no
+  leak was detected", not "no server ran".
+
+  Detection cannot fix this; it needs **prevention**. The direction is a *materialized*
+  private config for the child instead of one shared with the host, so there is no file an
+  outside writer can add a server to mid-run. What makes it real work rather than a
+  one-liner:
+
+  * `$CODEX_HOME` currently mirrors the user's, which is what keeps auth (`auth.json`)
+    working — materializing it means deciding what to copy and what to synthesize.
+  * A *trusted project's* `.codex/config.toml` is found from the git root above cwd, i.e.
+    inside the workspace, so a private `CODEX_HOME` does not cover it. The scenario's own
+    task can write one mid-run (copilot documents the same false-positive shape).
+  * Whatever is materialized has to keep the pre-launch enumeration honest, or the
+    fail-closed path fires on every run.
+
+  Worth doing before Phase 1 puts *intentional* servers on codex, because that work has to
+  materialize a config anyway — the two changes want to be designed together rather than
+  the second one inheriting the first's shared-file assumption.
 
 - **agy has a candidate in-band version source that is not yet usable.**
   `~/.gemini/antigravity-cli/cli.log` opens with a `Language server version: <v>` banner
@@ -247,10 +297,11 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   isolated HOME actually containing it rather than the real one (unverified); and it is a
   free-form log the agent's own activity also writes into, so a naive scan reads a channel
   model-controlled text can reach — the forgery hazard copilot had to design around.
-- ~~**codex has no post-run config re-check.**~~ **Done.** `CodexAdapter.verify_post_run`
-  now re-enumerates codex's effective view after the run and fails any run where a server
-  is configured that the launched `-c ...enabled=false` set did not name, plus reads the
-  run's own stream for `mcp_tool_call` items. See "codex's stream witness is
-  presence-only" below for why those two halves are not equal partners here.
+- ~~**codex has no post-run config re-check.**~~ **Partly done — the persistent case is
+  covered, one case remains open.** `CodexAdapter.verify_post_run` now re-enumerates
+  codex's effective view after the run and fails any run where a server is configured that
+  the launched `-c ...enabled=false` set did not name, plus reads the run's own stream for
+  `mcp_tool_call` items. It does **not** close the window; see "codex's residual ABA hole"
+  below, which is now tracked as its own open item.
 - The two `DESIGN_MCP_Support.md` §9 probes (claude `--allowedTools` gating, codex TOML
   array/inline-table values via `-c`) remain deferred, then Phase 1.
