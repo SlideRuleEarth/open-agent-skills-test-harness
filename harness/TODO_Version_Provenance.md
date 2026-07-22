@@ -56,6 +56,17 @@ From `adapters/copilot.py`:
    what the tier actually buys is that the result never counts. Review read the original
    wording ("the run is refused by version") as a claim that the build could not run at
    all. Wherever a tier acts later than a reader would assume, the message has to say so.
+
+   **Citing this precedent is not the same as satisfying it.** The MCP design later wrote
+   that a claude tool-allowlist gap was "closed the same way every other Phase 0 gap was:
+   enumerate for prevention, then verify from telemetry" — invoking these exact decisions
+   while dropping the word that made them honest. They were *classified* as detection, not
+   closed. Review caught it: full visibility into the run's init event closes an **evidence**
+   gap, and the enforcement window between two independent server instances stays open
+   underneath it. A precedent carried forward keeps its qualifiers, or it is being used as
+   a rhetorical shortcut past the very analysis it records. When reusing a pattern, restate
+   what it does *not* cover in the new setting, in the new text — a reader of §6 should not
+   have to go read §8 to find out that "closed" meant "detected".
 5. **`verify-copilot-channels`** — audits an installed bundle against the inventory of
    discovery channels the adapter neutralizes, so clearing a new build is a minute rather
    than an afternoon.
