@@ -979,18 +979,43 @@ def _check_workspace_relocation(failures, verbose):
     def _fake_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides, agent_name, eval_name):
         seen["cwd"] = cwd
         seen["scratch"] = opts.mcp_scratch_dir
+        seen["home"] = opts.home
         # the isolated HOME is deleted right after execute() returns, so the mask must be
         # inspected here, while the agent would actually see it.
         if opts.home:
             mask = os.path.join(opts.home, ".fakecli", "mcp.json")
             if os.path.isfile(mask) and not os.path.islink(mask):
                 seen["mask_content"] = open(mask).read()
+            # $HOME is WRITABLE by the child, so the harness knows this directory's initial
+            # contents and not its final ones. Every real agent does this — caches, session
+            # state — and any of it can be a copy of what the agent was handed.
+            with open(os.path.join(opts.home, "agent-cache.txt"), "w") as f:
+                f.write("tok sk-secret-abcdef\n")
         with open(os.path.join(cwd, "run.py"), "w") as f:
             f.write("print('hi')\n")
         # A cwd is a place the agent can WRITE, so `..` is part of the attack surface, not
         # just `list_dir`'s. Written every time: the arms below assert where it landed.
         with open(os.path.join(cwd, "..", "above-cwd.txt"), "w") as f:
             f.write("tok sk-secret-abcdef\n")
+        if seen.get("make_special"):
+            # A special file the scrub cannot read and therefore cannot certify: it gets
+            # QUARANTINED, which is a deletion the cell has to report.
+            #
+            # A socket rather than a FIFO, deliberately. Both are special files and both
+            # take the same `_give_up` branch, but `open()` on a FIFO BLOCKS while `open()`
+            # on a socket fails ENXIO at once — and this arm drives `_run_cell` on the main
+            # thread. Mutation testing found that the hard way: the mutation that makes the
+            # scrub treat every non-directory as a readable regular file wedged the whole
+            # suite here. The one arm that must use a FIFO joins a 20s thread for this
+            # reason; every other arm should simply not arm the trap.
+            def _sock():
+                import socket as _socket
+                s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                try:
+                    s.bind(os.path.join(cwd, "sock"))
+                finally:
+                    s.close()
+            _try(_sock)
         if seen.get("lock_exec_root") and os.path.basename(cwd) == "workspace":
             # The agent locks the directory it was handed. `rmtree(ignore_errors=True)` then
             # answers "did this raise" rather than "is it gone", and both secret-bearing
@@ -1429,6 +1454,122 @@ def _check_workspace_relocation(failures, verbose):
                f"report.md) instead of failing the cell, and its sentence must not claim it "
                f"holds credentials. warnings={warns11[:130]!r} "
                f"err={(cell11.run_result.error or '')[:60]!r}", failures, verbose)
+
+        # ...but only while it holds what the HARNESS put in it. `$HOME` is writable by the
+        # child, so a cell that resolved credentials has handed the agent somewhere to copy
+        # them; the severity has to follow the contents, not the creation.
+        # A spec that actually resolves a `${VAR}`, so `_secrets` is non-empty and the scrub
+        # has something to do — `spec5` declares a server but interpolates nothing.
+        os.environ["ASE_SELFTEST_TOKEN"] = "sk-secret-abcdef"
+        spec_secret = EvalSpec(
+            name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"),
+            mcp_servers=parse_mcp_servers(
+                {"echo": {"command": "/bin/echo", "env": {"TOKEN": "${ASE_SELFTEST_TOKEN}"}}},
+                where="selftest"))
+
+        seen.clear()
+        run_dir13 = os.path.join(repo_root, "artifacts", "run13")
+        os.makedirs(run_dir13)
+        r.run_id, r.run_dir = "run13", run_dir13
+        stuck13: list = []
+        leaked13 = False
+
+        def _no_home_removal13(p):
+            if "ase-home-" in p:
+                stuck13.append(p)
+                return False
+            return _orig_remove(p)
+
+        runner_mod._remove = _no_home_removal13
+        try:
+            cell13 = r._run_cell(ModelTarget(), spec_secret)
+        finally:
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            # Read the premise BEFORE tearing it down: an earlier draft deleted the leaked
+            # HOME here and then asked whether the token was in it.
+            home13 = seen.get("home") or ""
+            leaked13 = bool(home13) and os.path.isfile(
+                os.path.join(home13, "agent-cache.txt"))
+            for p in stuck13:
+                if os.path.basename(p).startswith("ase-home-"):
+                    _try(lambda p=p: shutil.rmtree(p, ignore_errors=True))
+        err13 = cell13.run_result.error or ""
+        _check("relocate.child_writable_home_is_credential_bearing_after_the_run",
+               leaked13 and cell13.passed is False
+               and "could have written this cell's resolved credentials" in err13
+               and "no resolved credentials are in it" not in err13,
+               f"the agent copied its token into $HOME and the removal failed: a directory "
+               f"the child can write is credential-bearing from the moment the cell HAS "
+               f"credentials, so it fails the cell and its sentence claims reach rather than "
+               f"denying contents the harness stopped controlling at launch. "
+               f"leaked={leaked13} passed={cell13.passed} err={err13[:130]!r}",
+               failures, verbose)
+
+        # Acknowledgement moved to the last statement before the return because everything
+        # between the writes and there can still raise — and `_failed_cell` REWRITES
+        # result.json, so an early ack erases the finding rather than merely omitting it.
+        class _DoneExplodes:
+            def __init__(self):
+                self.calls = 0
+
+            def update(self, **kw):
+                pass
+
+            def done(self, **kw):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("selftest: progress.done exploded")
+
+        seen.clear()
+        run_dir14 = os.path.join(repo_root, "artifacts", "run14")
+        os.makedirs(run_dir14)
+        r.run_id, r.run_dir = "run14", run_dir14
+        r.progress = _DoneExplodes()
+        runner_mod._remove = lambda p: False if "ase-mcp-" in p else _orig_remove(p)
+        try:
+            cell14 = r._run_cell(ModelTarget(), spec5, cell_idx=1)
+        finally:
+            r.progress = _saved_progress
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            s14 = seen.get("scratch") or ""
+            if os.path.basename(s14).startswith("ase-mcp-"):
+                _try(lambda: shutil.rmtree(s14, ignore_errors=True))
+        res14 = _try(lambda: open(os.path.join(cell14.artifacts_dir, "result.json")).read(), "")
+        _check("relocate.cleanup_note_survives_a_raise_after_the_artifacts",
+               bool(seen.get("scratch")) and "progress.done exploded" in res14
+               and "MCP scratch directory" in res14,
+               f"the artifact writes had all returned and the note was still not safe: the "
+               f"judge artifacts and `progress.done` come after them, and a raise there "
+               f"reaches the path that REBUILDS result.json. Acknowledge where nothing is "
+               f"left to go wrong: in_result_json={'MCP scratch directory' in res14} "
+               f"res={res14[:120]!r}", failures, verbose)
+
+        # The scrub's verdict is the one finding that CANNOT be recomputed: it reports what
+        # it already deleted, so a rescan after a raise sees a clean tree and says nothing.
+        seen.clear()
+        run_dir15 = os.path.join(repo_root, "artifacts", "run15")
+        os.makedirs(run_dir15)
+        r.run_id, r.run_dir = "run15", run_dir15
+        seen["make_special"] = True
+        r.progress = _DoneExplodes()
+        try:
+            cell15 = r._run_cell(ModelTarget(), spec_secret, cell_idx=1)
+        finally:
+            r.progress = _saved_progress
+            r._secrets = r._run_secrets = ()
+            os.environ.pop("ASE_SELFTEST_TOKEN", None)
+        res15 = _try(lambda: open(os.path.join(cell15.artifacts_dir, "result.json")).read(), "")
+        ws15 = os.path.join(cell15.artifacts_dir, "workspace")
+        _check("relocate.scrub_verdict_survives_a_raise_that_rebuilds_the_result",
+               "progress.done exploded" in res15 and "could not certify" in res15
+               and "sock" in res15 and not os.path.lexists(os.path.join(ws15, "sock")),
+               f"the scrub removed an artifact it could not certify and then a later raise "
+               f"rebuilt the result: rescanning finds the tree clean, so the deletion goes "
+               f"unreported unless the original verdict rode the same protocol as the purge "
+               f"failures. An evidence deletion that nothing records is worse than either "
+               f"outcome it chose between. res={res15[:150]!r}", failures, verbose)
     finally:
         runner_mod.execute = orig_execute
         shutil.rmtree(repo_root, ignore_errors=True)

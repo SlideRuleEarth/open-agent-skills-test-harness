@@ -365,9 +365,12 @@ class Runner:
         # difference. `take()` collects the failures from both this sweep and any the body
         # recorded before it raised, which is the whole reason they are not body locals.
         cleanup.purge_all()
-        scrub_note = _scrub_and_note(workspace, self._secrets)
+        # Re-scrubbed because the body may have raised before it got here; `note` dedupes
+        # and, crucially, does not replace — if the body already scrubbed, this rescan finds
+        # a clean tree and says nothing, and the finding it made is still in `cleanup`.
+        cleanup.note(_scrub_and_note(workspace, self._secrets))
         pending = cleanup.pending()
-        _record_notes(rr, ([(True, scrub_note)] if scrub_note else []) + pending)
+        _record_notes(rr, pending)
         try:
             # Refreshed only if step 6 got as far as writing one: this path must not invent
             # an artifact the successful path would have, but must not leave a stale one
@@ -519,6 +522,14 @@ class Runner:
                 # Registered the moment it exists rather than once it holds something: the
                 # window between the two is where the credentials get written into it.
                 cleanup.own("the MCP scratch directory", mcp_scratch)
+                # This cell now HAS credentials, which changes what the isolated HOME is.
+                # It was registered as a leaked-tempdir risk because the harness built it
+                # out of masks and symlinks — but it is `$HOME` for a child that can write,
+                # and review's agent copied its resolved token straight into it, then
+                # watched a failed removal report that no credentials were present. What a
+                # writable directory contains is decided after the harness stops looking, so
+                # from here it is treated exactly like the scratch dir.
+                cleanup.own("the isolated HOME", iso_home, tail=_EXPOSED_TAIL)
             opts = RunOptions(
                 model=model,
                 auto_approve=self.auto_approve,
@@ -631,10 +642,15 @@ class Runner:
         # `pending`, not a drain: this collects the scratch-dir failure recorded back at
         # `execute`'s finally along with this one, and forgetting them here would put them in
         # a local again — one frame later than the bug this replaced, and just as lossy if a
-        # write below raises. They are acknowledged after the writes, not before.
-        scrub_note = _scrub_and_note(workspace, self._secrets)
+        # write below raises. They are acknowledged at the return, not here.
+        #
+        # The scrub's verdict goes through `cleanup` too. It reads like a value that can be
+        # recomputed, and it cannot: the scrub DELETES what it could not certify, so a raise
+        # after this line reached `_failed_cell`, which rescanned a tree that was clean by
+        # then and turned an evidence deletion into a silent one.
+        cleanup.note(_scrub_and_note(workspace, self._secrets))
         pending = cleanup.pending()
-        if _record_notes(rr, ([(True, scrub_note)] if scrub_note else []) + pending):
+        if _record_notes(rr, pending):
             passed = False
         if rr.error != error_before or pending:
             # `result.json` was serialized back at step 6, before the workspace could be
@@ -658,10 +674,6 @@ class Runner:
             cell.judge_run_result = ctx.judge_exec.result
         self._write_cell_json(cell_dir, cell)
         self._rw(os.path.join(cell_dir, "report.md"), render_report(cell))
-        # The cleanup findings are on disk now — `result.json` above, `cell.json` and
-        # `report.md` just now — so they can be forgotten. Anything still held after this
-        # point is something no artifact carries, which is exactly what `flush` warns about.
-        cleanup.acknowledge(pending)
 
         # 8) judge artifacts — same detail level as the agent, prefixed judge_*
         if ctx.judge_exec is not None:
@@ -670,6 +682,13 @@ class Runner:
         if p and cell_idx:
             p.done(cell=cell_idx, passed=passed if not ungraded else None,
                    cost=cell.cost_str)
+        # Last statement before the return, not merely after the writes that carry the
+        # notes. Everything above can still raise — the judge artifacts, `progress.done` —
+        # and a raise reaches `_failed_cell`, which rebuilds the result from scratch and
+        # REWRITES `result.json` from it: anything acknowledged early is not just missing
+        # from the new record, it is erased from the old one. The only moment that is safe
+        # is the one where nothing is left to go wrong.
+        cleanup.acknowledge(pending)
         return cell
 
     def _skill_dirs(self, spec: EvalSpec) -> list[str]:
@@ -1565,6 +1584,11 @@ _CREDENTIAL_TAIL = ("it holds this cell's resolved credentials; delete it before
                     "this machine's state")
 _TEMPDIR_TAIL = ("no resolved credentials are in it — config masks and symlinks into the "
                  "real home — but nothing will clean it up now")
+# The harness built it, but the agent could write to it, so its final contents are the
+# agent's business and not the harness's. Said as "could have" rather than "holds": the
+# claim being made is about reach, which is what an operator has to act on.
+_EXPOSED_TAIL = ("the agent had it as $HOME and could have written this cell's resolved "
+                 "credentials into it; delete it before sharing this machine's state")
 
 
 def _purge(label: str, path: Optional[str], tail: str = _CREDENTIAL_TAIL) -> str:
@@ -1605,22 +1629,45 @@ class _CellCleanup:
 
     def __init__(self, agent: str) -> None:
         self._agent = agent
-        self._owned: list[tuple[str, str, bool]] = []
+        self._owned: list[tuple[str, str, bool, str]] = []
         self._notes: list[tuple[bool, str]] = []
 
-    def own(self, label: str, path: Optional[str], *, fatal: bool = True) -> None:
+    def own(self, label: str, path: Optional[str], *, fatal: bool = True,
+            tail: Optional[str] = None) -> None:
         """Register a directory as this cell's to remove; `None` is a no-op.
 
         `fatal` says what a failure to remove it MEANS. The credential directories fail the
         cell: a resolved `${VAR}` outliving the run that resolved it is not a result anyone
-        should trust. The isolated HOME holds config masks and symlinks into the real home,
-        so a stubborn one is a leaked temp directory rather than a leaked secret and lands on
-        `warnings` instead. The distinction is the reason it is a flag and not two classes:
-        both need the same registration, the same verified removal, and the same guarantee
-        that the answer outlives the frame that asked for it.
+        should trust. A directory holding only harness-built masks and symlinks is a leaked
+        temp directory rather than a leaked secret, and lands on `warnings` instead. The
+        distinction is a flag and not two classes because both need the same registration,
+        the same verified removal, and the same guarantee that the answer outlives the frame
+        that asked for it.
+
+        Re-registering a path REPLACES its severity, which is the point rather than a
+        convenience: what a directory contains is not fixed at creation. The isolated HOME
+        is `$HOME` for a child that can write, so the harness knows its initial contents and
+        not its final ones — review copied a resolved token into it and watched a failed
+        removal reported as holding no credentials. Anything the agent can write to is
+        credential-bearing from the moment this cell has credentials.
         """
-        if path:
-            self._owned.append((label, path, fatal))
+        if not path:
+            return
+        self._owned = [e for e in self._owned if e[1] != path]
+        self._owned.append(
+            (label, path, fatal, tail or (_CREDENTIAL_TAIL if fatal else _TEMPDIR_TAIL)))
+
+    def note(self, text: str, *, fatal: bool = True) -> None:
+        """Record a finding that is not about a directory this object removes.
+
+        The workspace scrub's verdict travels the same way for the same reason: it was a
+        body local, so a raise after an uncertifiable file had already been DELETED reached
+        `_failed_cell`, which rescanned a now-clean tree, found nothing to say, and turned an
+        evidence deletion into a silent one. A finding that cannot be recomputed must not be
+        held anywhere that a raise can discard.
+        """
+        if text and (fatal, text) not in self._notes:
+            self._notes.append((fatal, text))
 
     def purge(self, path: Optional[str]) -> None:
         """Remove one registered directory, keeping any failure; `None` is a no-op.
@@ -1631,14 +1678,12 @@ class _CellCleanup:
         """
         for entry in [e for e in self._owned if path and e[1] == path]:
             self._owned.remove(entry)
-            label, owned, fatal = entry
-            note = _purge(label, owned, _CREDENTIAL_TAIL if fatal else _TEMPDIR_TAIL)
-            if note:
-                self._notes.append((fatal, note))
+            label, owned, fatal, tail = entry
+            self.note(_purge(label, owned, tail), fatal=fatal)
 
     def purge_all(self) -> None:
         """Remove every directory still registered, most recently created first."""
-        for _, path, _ in list(reversed(self._owned)):
+        for _, path, _, _ in list(reversed(self._owned)):
             self.purge(path)
 
     def pending(self) -> list[tuple[bool, str]]:

@@ -362,6 +362,32 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   lands on `error` or on `warnings`, and in refusing to borrow the credential wording for a
   directory that holds none.
 
+- **A classification is a claim about a moment, and the moment passes.** I labelled the
+  isolated HOME non-fatal because it holds config masks and symlinks — which was true when
+  the harness finished building it and false about ten lines later, because it is `$HOME`
+  for a child with write access. Review copied the resolved token into it, failed the
+  removal, and got a passing cell whose warning said no credentials were present: the
+  sentence was not merely imprecise, it was actively reassuring about the thing that had
+  just gone wrong. Anything the agent can write to is credential-bearing from the moment the
+  cell has credentials, and the fix that generalizes is to make severity re-registerable
+  rather than to hard-code a better initial guess.
+
+  The wording change matters as much as the flag. A message that describes contents the
+  harness stopped controlling at launch is a guess presented as an observation; one that
+  describes *reach* — "the agent had it as `$HOME` and could have written this cell's
+  resolved credentials into it" — is true regardless, and is what an operator has to act on
+  anyway.
+
+  Same round, the delivery protocol needed the same treatment twice more. Acknowledging
+  after the artifact writes was still too early, because the judge artifacts and
+  `progress.done()` come after them and the crash path *rewrites* `result.json` — so an
+  early ack erases a finding rather than omitting it. And the scrub's verdict had stayed a
+  body local because it reads like a value a caller can re-derive; it cannot, since the
+  scrub deletes what it could not certify, so a rescan after a raise sees a clean tree and
+  reports nothing about a deletion that already happened. Three rounds in, the reliable
+  question is not "is this computed correctly" but "who still holds this if the next line
+  raises, and can they recompute it if they lost it".
+
 - **A mutation test is also a test of the deletion path nobody exercised.** Disabling the
   scrub's permission repair was supposed to make one arm go red; instead it crashed the
   whole section, because the quarantine could not remove a `chmod 000` *directory* — `rmtree`
