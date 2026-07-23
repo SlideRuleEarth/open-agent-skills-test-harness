@@ -248,6 +248,31 @@ def validate_mcp_servers(servers: dict[str, MCPServer], *,
     return errors, warnings
 
 
+def interpolated_refs(servers: Optional[dict[str, MCPServer]]) -> list[str]:
+    """Which declared fields carry a `${VAR}`, i.e. will hold a credential once resolved.
+
+    A property of the DECLARATION, so it needs no environment and cannot be confused with
+    `resolve_mcp_servers`'s redaction set. That set deliberately omits values shorter than
+    MIN_REDACTABLE_LEN — redacting a three-character string would rewrite unrelated text
+    everywhere — and a short credential is still a credential. So `bool(secrets)` answers
+    "what can be scrubbed", never "does this cell handle secrets": review found the harness
+    failing a cell for credentials it could not have had, because the only question being
+    asked was whether `mcp_servers` was present at all. Anything reasoning about exposure
+    asks here; only the redaction pass may ask there.
+
+    Covers exactly the fields `resolve_mcp_servers` substitutes into — `env`, `url`,
+    `headers` — and deliberately not `command`/`args`, which are never interpolated so that
+    a variable cannot choose what program runs.
+    """
+    found: list[str] = []
+    for name, s in (servers or {}).items():
+        fields = [(f"{name}.url", s.url or "")]
+        fields += [(f"{name}.env.{k}", v) for k, v in s.env.items()]
+        fields += [(f"{name}.headers.{k}", v) for k, v in s.headers.items()]
+        found += [label for label, text in fields if _VAR_RE.search(text or "")]
+    return sorted(found)
+
+
 def resolve_mcp_servers(servers: dict[str, MCPServer], *,
                         env: Optional[dict] = None,
                         base_dir: Optional[str] = None

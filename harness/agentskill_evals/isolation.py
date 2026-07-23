@@ -170,6 +170,38 @@ def build_isolated_home(
     return dest_home
 
 
+def home_write_escapes(home: Optional[str]) -> list[str]:
+    """Overlay paths a write would travel to land in the REAL home.
+
+    The overlay masks what the model can READ. It was never a boundary on what the model can
+    WRITE: step 1 of `_overlay` passes every unmasked real-HOME entry through as a symlink,
+    so `$HOME/.cache/x` IS `~/.cache/x`. Review wrote a token through one of those and
+    watched the overlay's removal succeed while the token stayed in the real home — outside
+    every directory this harness deletes and outside the workspace it scrubs.
+
+    Returns HOME-relative symlink paths resolving to a directory outside *home*, sorted.
+    Directories specifically, because a directory symlink is what lets a NEW file be created
+    outside the overlay; a symlink to a file can be clobbered but not used to plant one.
+
+    Walks the overlay, never through it (``followlinks=False``): the cost is the materialized
+    part of the tree, not the real home hanging off its symlinks.
+    """
+    if not home or not os.path.isdir(home):
+        return []
+    root = os.path.abspath(home)
+    inside = root + os.sep
+    found: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in list(dirnames) + list(filenames):
+            path = os.path.join(dirpath, name)
+            if not os.path.islink(path):
+                continue
+            target = os.path.realpath(path)
+            if os.path.isdir(target) and target != root and not target.startswith(inside):
+                found.append(os.path.relpath(path, root))
+    return sorted(found)
+
+
 def _validate_mask_subpath(sub: str) -> None:
     """Masks are opened for writing (O_TRUNC) at the joined path — an absolute,
     drive-anchored, or ``..``-traversing subpath would clobber a file outside the overlay.

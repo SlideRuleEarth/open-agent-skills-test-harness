@@ -388,6 +388,37 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   question is not "is this computed correctly" but "who still holds this if the next line
   raises, and can they recompute it if they lost it".
 
+- **A mask is not a container, and I kept treating one as the other.** The round after that,
+  the whole HOME severity apparatus turned out to be reasoning about a boundary that does
+  not exist. The isolated HOME is a *symlink overlay*: it was built to control what the
+  model can READ — which skills it discovers, which MCP configs it loads — and every
+  unmasked entry is passed straight through as a symlink, so `$HOME/.cache/x` is
+  `~/.cache/x`. Review wrote a token through one and watched the overlay's deletion succeed
+  while the token stayed in the real home. Two rounds of work on removing that directory
+  *verifiably* were, for this leak, work on the wrong object: deleting a symlink says
+  nothing about its target.
+
+  What makes it a lesson rather than a bug is the direction of the mistake. The overlay's
+  purpose is stated everywhere in the code as read-side masking, and I had silently promoted
+  it to write-side containment because I needed a container and it was the thing that was
+  there. The check that now exists asks the question directly — `home_write_escapes()`
+  enumerates the symlinks a write can travel out through — and the answer is load-bearing:
+  a cell that interpolates a `${VAR}` is refused rather than reported as contained. Refusing
+  is the honest outcome when there is nothing to scrub, because the harness does not know
+  which of the real home's directories were written to and will not go looking through a
+  user's home to find out. Making the check structural rather than a blanket ban is what
+  lets materializing the HOME lift the restriction later without anyone having to remember
+  to delete a guard.
+
+  Smaller, same round, same shape: the severity upgrade was gated on `mcp_servers` being
+  *declared* rather than on a `${VAR}` being *interpolated*, so a cell that handled no
+  credential at all was failed for possibly leaking one. And the obvious fix — `bool(secrets)`
+  — would have been wrong too, because the redaction set deliberately excludes values under
+  six characters (rewriting a three-character string corrupts unrelated text) and a short
+  credential is still a credential. "What can be scrubbed" and "does this cell handle
+  secrets" are different questions; they had been sharing one answer because one answer
+  happened to be available.
+
 - **A mutation test is also a test of the deletion path nobody exercised.** Disabling the
   scrub's permission repair was supposed to make one arm go red; instead it crashed the
   whole section, because the quarantine could not remove a `chmod 000` *directory* — `rmtree`

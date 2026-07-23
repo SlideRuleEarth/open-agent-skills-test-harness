@@ -953,6 +953,10 @@ def _check_workspace_relocation(failures, verbose):
 
     print("workspace relocation (exec dir escapes the repo tree):")
     repo_root = tempfile.mkdtemp(prefix="ase-repo2-")
+    # Defined out here because the finally below restores them; an arm that raises early
+    # must not turn its own cleanup into a NameError.
+    real_home_env = os.environ.get("HOME")
+    contained_home = tempfile.mkdtemp(prefix="ase-fakehome-")
     seen: dict = {}
     orig_execute = runner_mod.execute
 
@@ -1467,6 +1471,12 @@ def _check_workspace_relocation(failures, verbose):
                 {"echo": {"command": "/bin/echo", "env": {"TOKEN": "${ASE_SELFTEST_TOKEN}"}}},
                 where="selftest"))
 
+        # An interpolating cell is REFUSED unless its $HOME has no write path into the real
+        # home, so these arms need a contained one to reach the behaviour they are about.
+        # Pointing HOME at an empty directory is also the honest fixture: the arms below
+        # were symlinking the developer's actual home into a temp overlay on every run.
+        os.environ["HOME"] = contained_home
+
         seen.clear()
         run_dir13 = os.path.join(repo_root, "artifacts", "run13")
         os.makedirs(run_dir13)
@@ -1570,8 +1580,104 @@ def _check_workspace_relocation(failures, verbose):
                f"unreported unless the original verdict rode the same protocol as the purge "
                f"failures. An evidence deletion that nothing records is worse than either "
                f"outcome it chose between. res={res15[:150]!r}", failures, verbose)
+
+        # The overlay masks READS. Its unmasked entries are symlinks into the real home, so
+        # a token written through one lands where nothing this run deletes or scrubs can
+        # reach — and deleting a symlink certifies nothing about its target.
+        seen.clear()
+        run_dir16 = os.path.join(repo_root, "artifacts", "run16")
+        os.makedirs(run_dir16)
+        r.run_id, r.run_dir = "run16", run_dir16
+        os.makedirs(os.path.join(contained_home, "cache"), exist_ok=True)  # one passthrough
+        os.environ["ASE_SELFTEST_TOKEN"] = "sk-secret-abcdef"
+        try:
+            cell16 = r._run_cell(ModelTarget(), spec_secret)
+        finally:
+            r._secrets = r._run_secrets = ()
+            _try(lambda: os.rmdir(os.path.join(contained_home, "cache")))
+        err16 = cell16.run_result.error or ""
+        _check("mcp.credential_run_is_refused_when_home_writes_escape_the_overlay",
+               cell16.passed is False and "interpolates a credential" in err16
+               and "cache" in err16 and "Refusing" in err16
+               and seen.get("cwd") is None,
+               f"a cell that resolves a `${{VAR}}` under a symlink overlay is refused before "
+               f"the agent starts, naming the entries that lead out: the harness will not "
+               f"go hunting through the user's home afterwards, so 'run it and scrub' is "
+               f"not on the table and 'run it and delete the overlay' certifies nothing. "
+               f"ran={seen.get('cwd') is not None} passed={cell16.passed} "
+               f"err={err16[:150]!r}", failures, verbose)
+
+        # A credential too short to redact is still a credential. This is the arm that would
+        # have caught gating on `bool(secrets)` — the redaction set is empty here.
+        seen.clear()
+        run_dir18 = os.path.join(repo_root, "artifacts", "run18")
+        os.makedirs(run_dir18)
+        r.run_id, r.run_dir = "run18", run_dir18
+        os.environ["ASE_SELFTEST_SHORT"] = "ab"
+        spec_short = EvalSpec(
+            name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"),
+            mcp_servers=parse_mcp_servers(
+                {"echo": {"command": "/bin/echo", "env": {"TOKEN": "${ASE_SELFTEST_SHORT}"}}},
+                where="selftest"))
+        os.makedirs(os.path.join(contained_home, "cache"), exist_ok=True)
+        try:
+            cell18 = r._run_cell(ModelTarget(), spec_short)
+        finally:
+            os.environ.pop("ASE_SELFTEST_SHORT", None)
+            r._secrets = r._run_secrets = ()
+            _try(lambda: os.rmdir(os.path.join(contained_home, "cache")))
+        err18 = cell18.run_result.error or ""
+        _check("mcp.short_credential_run_is_refused_like_any_other",
+               cell18.passed is False and "interpolates a credential" in err18
+               and seen.get("cwd") is None,
+               f"the resolved value is two characters, so the redaction set is EMPTY — and "
+               f"the token is no less a token. Gating exposure on what can be scrubbed "
+               f"would have let this one run and leak: ran={seen.get('cwd') is not None} "
+               f"err={err18[:110]!r}", failures, verbose)
+
+        # And a declaration that interpolates NOTHING must not be treated as credentialed.
+        seen.clear()
+        run_dir17 = os.path.join(repo_root, "artifacts", "run17")
+        os.makedirs(run_dir17)
+        r.run_id, r.run_dir = "run17", run_dir17
+        stuck17: list = []
+
+        def _no_home_removal17(p):
+            if "ase-home-" in p:
+                stuck17.append(p)
+                return False
+            return _orig_remove(p)
+
+        runner_mod._remove = _no_home_removal17
+        try:
+            cell17 = r._run_cell(ModelTarget(), spec5)  # `mcp_servers`, but no ${VAR}
+        finally:
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            for p in stuck17:
+                if os.path.basename(p).startswith("ase-home-"):
+                    _try(lambda p=p: shutil.rmtree(p, ignore_errors=True))
+        err17 = cell17.run_result.error or ""
+        warns17 = " ".join(cell17.run_result.warnings or [])
+        _check("mcp.home_severity_follows_interpolation_not_declaration",
+               bool(seen.get("cwd")) and "the isolated HOME" not in err17
+               and "the isolated HOME could not be removed" in warns17
+               and "resolved credentials into it" not in warns17,
+               f"declaring a server is not handling a secret: `{{'echo': {{'command': "
+               f"'/bin/echo'}}}}` interpolates nothing, so a stubborn HOME is a leaked "
+               f"tempdir and must not fail the cell claiming the agent could have written "
+               f"credentials it was never given. Gated on `${{VAR}}` in the declaration, "
+               f"not on `bool(secrets)` — short values are excluded from redaction on "
+               f"purpose and are still credentials. err={err17[:90]!r} "
+               f"warnings={warns17[:110]!r}", failures, verbose)
     finally:
         runner_mod.execute = orig_execute
+        if real_home_env is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = real_home_env
+        os.environ.pop("ASE_SELFTEST_TOKEN", None)
+        shutil.rmtree(contained_home, ignore_errors=True)
         shutil.rmtree(repo_root, ignore_errors=True)
 
 
@@ -1646,6 +1752,44 @@ def _check_mcp_hermetic_paths(failures, verbose):
                none_home is None and none_env == {},
                "an adapter without masks gets no overlay (runs against the real HOME)",
                failures, verbose)
+
+        # What the overlay lets a write REACH, which is a different question from what it
+        # lets the model read — and the one the harness had never asked.
+        from .isolation import build_isolated_home, home_write_escapes
+        esc_home = tempfile.mkdtemp(prefix="ase-esc-")
+        beyond = tempfile.mkdtemp(prefix="ase-beyond-")
+        # A symlink BEHIND the escape, reachable only by following it. The walk must not:
+        # the overlay is small and the real home is not, and a path found that way is not a
+        # path the overlay actually offers. Not a loop back into `real` — `followlinks=True`
+        # would spin on a cycle forever, which is a worse way to learn the same thing.
+        os.symlink(beyond, os.path.join(real, ".fakecli", "plugins", "elsewhere"))
+        try:
+            build_isolated_home(esc_home, [".fakecli/skills"], set(), [], real_home=real)
+            escapes = home_write_escapes(esc_home)
+            skills = os.path.join(esc_home, ".fakecli", "skills")
+            authlink = os.path.join(esc_home, ".fakecli", "auth.json")
+            _check("mcp_masked_home.write_escapes_are_directory_symlinks_out_of_the_overlay",
+                   escapes == [os.path.join(".fakecli", "plugins")]
+                   and os.path.islink(authlink)
+                   and os.path.isdir(skills) and not os.path.islink(skills),
+                   f"a passed-through directory is a path OUT: writing "
+                   f"$HOME/.fakecli/plugins/x creates real/.fakecli/plugins/x, which no "
+                   f"cleanup here deletes and no scrub reads. Exactly the directory "
+                   f"symlinks: the masked skills dir is materialized so it is not one, "
+                   f"`auth.json` is a symlink to a FILE (clobberable, but you cannot plant "
+                   f"a new file through it), and the escape is reported once rather than "
+                   f"once per entry of the real directory behind it — the walk must not "
+                   f"descend through what it is reporting. escapes={escapes}",
+                   failures, verbose)
+            _check("mcp_masked_home.contained_overlay_reports_no_escapes",
+                   home_write_escapes(tempfile.mkdtemp(prefix="ase-empty-")) == []
+                   and home_write_escapes(None) == [],
+                   "an overlay with nothing symlinked out reports nothing, so the refusal "
+                   "this feeds lifts itself once the HOME is materialized instead of "
+                   "needing the check removed", failures, verbose)
+        finally:
+            shutil.rmtree(esc_home, ignore_errors=True)
+            shutil.rmtree(beyond, ignore_errors=True)
     finally:
         if old_var is None:
             os.environ.pop("FAKECLI_HOME", None)
@@ -7579,6 +7723,24 @@ def _check_mcp_declared_servers(failures, verbose):
            f"a 2-character secret is NOT added to the redaction set ({short_secrets}) and "
            f"the author is told why — redacting it would rewrite every unrelated "
            f"occurrence of those characters across the artifacts", failures, verbose)
+
+    # ...which makes the redaction set the wrong thing to ask "does this cell handle a
+    # secret". The exclusion above is about what can safely be REWRITTEN, not about what is
+    # confidential, and the two questions had been sharing one answer.
+    from .mcp import interpolated_refs
+    short_spec = parse_mcp_servers(
+        {"r": {"url": "https://h", "headers": {"Authorization": "${TOK}"}}}, where="t")
+    _, short_set = resolve_mcp_servers(short_spec, env={"TOK": "ab"})
+    plain_spec = parse_mcp_servers({"e": {"command": "/bin/echo"}}, where="t")
+    _check("mcp.short_interpolated_value_still_counts_as_a_credential",
+           interpolated_refs(short_spec) == ["r.headers.Authorization"]
+           and short_set == set() and interpolated_refs(plain_spec) == []
+           and interpolated_refs(None) == [],
+           f"a 2-character token is excluded from redaction and is still a credential, so "
+           f"exposure decisions read the DECLARATION for `${{VAR}}` rather than counting "
+           f"the redaction set: refs={interpolated_refs(short_spec)} "
+           f"redactable={short_set}. A server declared with no `${{VAR}}` at all handles "
+           f"nothing confidential and must not be treated as if it did", failures, verbose)
 
     # `${VAR}` is honoured in credentials, never in `command`/`args`: substituting there
     # would turn an environment variable into a way to choose what program executes.

@@ -33,9 +33,10 @@ from .adapters import get_adapter
 from .adapters.base import RunOptions
 from .assertions import AssertionContext, AssertionResult, run_assertion
 from .exec import execute
-from .isolation import build_isolated_home, config_home_entries, reroot_config_masks
+from .isolation import (build_isolated_home, config_home_entries, home_write_escapes,
+                        reroot_config_masks)
 from .judge import Judge
-from .mcp import REDACTED, redact, redact_bytes, redact_obj
+from .mcp import REDACTED, interpolated_refs, redact, redact_bytes, redact_obj
 from .notices import warn
 from .progress import Progress
 from .schema import EventKind, RunResult
@@ -521,15 +522,23 @@ class Runner:
                 mcp_scratch = tempfile.mkdtemp(prefix="ase-mcp-")
                 # Registered the moment it exists rather than once it holds something: the
                 # window between the two is where the credentials get written into it.
-                cleanup.own("the MCP scratch directory", mcp_scratch)
-                # This cell now HAS credentials, which changes what the isolated HOME is.
-                # It was registered as a leaked-tempdir risk because the harness built it
-                # out of masks and symlinks — but it is `$HOME` for a child that can write,
-                # and review's agent copied its resolved token straight into it, then
-                # watched a failed removal report that no credentials were present. What a
-                # writable directory contains is decided after the harness stops looking, so
-                # from here it is treated exactly like the scratch dir.
-                cleanup.own("the isolated HOME", iso_home, tail=_EXPOSED_TAIL)
+                # `${VAR}` in the DECLARATION, not `bool(secrets)`: the redaction set omits
+                # values under MIN_REDACTABLE_LEN, and a short credential is still a
+                # credential. Review failed a cell for credentials it could not have had
+                # because the only question asked was whether `mcp_servers` was present.
+                interpolated = interpolated_refs(spec.mcp_servers)
+                cleanup.own("the MCP scratch directory", mcp_scratch,
+                            tail=_CREDENTIAL_TAIL if interpolated else _CONFIG_TAIL)
+                if interpolated:
+                    _refuse_uncontained_home(iso_home, spec.name, interpolated)
+                    # This cell HAS credentials, which changes what the isolated HOME is.
+                    # It was registered as a leaked-tempdir risk because the harness built
+                    # it out of masks and symlinks — but it is `$HOME` for a child that can
+                    # write, and review's agent copied its resolved token straight into it,
+                    # then watched a failed removal report that no credentials were
+                    # present. What a writable directory contains is decided after the
+                    # harness stops looking, so from here it is the scratch dir's equal.
+                    cleanup.own("the isolated HOME", iso_home, tail=_EXPOSED_TAIL)
             opts = RunOptions(
                 model=model,
                 auto_approve=self.auto_approve,
@@ -1589,6 +1598,46 @@ _TEMPDIR_TAIL = ("no resolved credentials are in it — config masks and symlink
 # claim being made is about reach, which is what an operator has to act on.
 _EXPOSED_TAIL = ("the agent had it as $HOME and could have written this cell's resolved "
                  "credentials into it; delete it before sharing this machine's state")
+_CONFIG_TAIL = ("this cell interpolated no ${VAR}, so no credential is in it — but it holds "
+                "MCP configuration the harness wrote outside the workspace")
+
+
+def _refuse_uncontained_home(home: Optional[str], eval_name: str, refs: list[str]) -> None:
+    """Fail a credential-bearing cell whose $HOME has write paths into the real home.
+
+    The isolated HOME is a symlink overlay: it masks what the model can READ, and passes
+    every unmasked real-home entry through as a symlink. So a model that has just been given
+    a token — an MCP tool result can hand it straight back — can write it to
+    `$HOME/<anything>/token` and have it land in the real home, outside every directory this
+    runner deletes and outside the workspace it scrubs. Review demonstrated exactly that, and
+    the overlay's removal still reported success: deleting a symlink certifies nothing about
+    its target.
+
+    Refused rather than warned, and refused rather than run-and-scrubbed, because there is
+    nothing to scrub — the harness does not know which of the real home's directories were
+    written to and will not go looking through the user's home. `isolated: false` is not the
+    escape hatch either: that gives the agent the real home with no overlay at all.
+
+    The check is structural, not a blanket ban, so it lifts itself once the writable HOME
+    state is materialized (DESIGN_MCP_Support.md §5.3) instead of needing this code deleted.
+    """
+    if not home:
+        raise RuntimeError(
+            f"{eval_name!r} interpolates a credential into `mcp_servers` "
+            f"({', '.join(refs)}) but this cell has no isolated HOME, so the agent runs "
+            f"against the real one: anything it writes there outlives the run and the "
+            f"harness cannot certify otherwise. Refusing rather than reporting a contained "
+            f"run — remove the `${{VAR}}` or run with isolation available.")
+    escapes = home_write_escapes(home)
+    if not escapes:
+        return
+    raise RuntimeError(
+        f"{eval_name!r} interpolates a credential into `mcp_servers` ({', '.join(refs)}) "
+        f"and its isolated HOME is a symlink overlay: {len(escapes)} of its entries "
+        f"({_shown(escapes[:3])}) resolve to directories in the real home, so a token the "
+        f"agent writes through one lands outside every directory this run deletes and "
+        f"outside the workspace it scrubs. Removing the overlay cannot certify those "
+        f"targets. Refusing the run rather than reporting it as contained.")
 
 
 def _purge(label: str, path: Optional[str], tail: str = _CREDENTIAL_TAIL) -> str:
