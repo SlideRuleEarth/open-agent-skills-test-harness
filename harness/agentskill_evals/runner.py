@@ -297,6 +297,11 @@ class Runner:
         exec_root = tempfile.mkdtemp(prefix="ase-ws-")
         exec_ws = os.path.join(exec_root, "workspace")
         os.makedirs(exec_ws)
+        # Registered with the frame that owns the try/except/finally, not held in the body
+        # that creates them: a raise below unwinds the body's locals, and a credential
+        # directory nothing can still name is a credential directory nothing will remove.
+        cleanup = _CellCleanup()
+        cleanup.own("the agent's execution directory", exec_root)
 
         # A cell that raises (a buggy assertion, the judge choking on a malformed response, an
         # OSError mid-move, ...) must not: (a) leak the exec_ws tempdir forever, or (b) abort
@@ -304,18 +309,18 @@ class Runner:
         # so this is the only backstop.
         try:
             return self._run_cell_body(target, spec, cell_idx, cell_dir, workspace, exec_ws,
-                                       exec_root)
+                                       exec_root, cleanup)
         except Exception as exc:
-            return self._failed_cell(target, spec, cell_idx, cell_dir, exec_ws, exc, exec_root)
+            return self._failed_cell(target, spec, cell_idx, cell_dir, exec_ws, exc, cleanup)
         finally:
-            # Backstop. Both paths above purge exec_root themselves, before they write
-            # artifacts, so a failure lands on the result somebody will actually read. This
-            # fires only when neither got that far — _failed_cell raising, say — and it is
-            # the last moment anything knows the directory existed, so it says so out loud
-            # rather than discarding what it knows.
-            leftover = _purge("the agent's execution directory", exec_root)
-            if leftover:
-                warn(f"warning: [{self.agent}] {leftover}")
+            # Backstop. Both paths above purge what they own and RECORD the failures, before
+            # they write artifacts, so a failure lands on the result somebody will actually
+            # read. This fires only when neither got that far — _failed_cell raising, say —
+            # and it is the last moment anything knows these directories existed, so it says
+            # what it knows out loud rather than discarding it.
+            cleanup.purge_all()
+            for note in cleanup.take():
+                warn(f"warning: [{self.agent}] {note}")
             # Cleared per cell, not per run: these are this scenario's resolved credentials
             # and nothing after this point may still be redacting against a stale set — a
             # secret carried into the NEXT cell would scrub text there for no reason, and
@@ -324,7 +329,7 @@ class Runner:
 
     def _failed_cell(self, target: ModelTarget, spec: EvalSpec, cell_idx: int,
                      cell_dir: str, exec_ws: str, exc: Exception,
-                     exec_root: str) -> CellResult:
+                     cleanup: "_CellCleanup") -> CellResult:
         """Best-effort CellResult for a cell that raised instead of completing normally — keeps
         one broken eval from aborting the whole run() batch, and still records something on disk
         (report.md/assertions.json) rather than leaving the cell's artifacts dir silently empty."""
@@ -354,10 +359,14 @@ class Runner:
         # archived here too. `_secrets` is still populated — _run_cell clears it in a finally
         # that runs after this. Ordered before report.md below, which INLINES workspace files.
         # Same purge as the success path, and needed more here: this cell crashed, so it may
-        # well have crashed BEFORE the body reached its own cleanup, leaving the credentials
-        # directory exactly where the agent left it.
-        for note in (_scrub_and_note(workspace, self._secrets),
-                     _purge("the agent's execution directory", exec_root)):
+        # well have crashed BEFORE the body reached its own cleanup, leaving a credentials
+        # directory exactly where the agent left it. `purge_all` rather than a named path
+        # because THIS frame cannot know how far the body got — the MCP scratch dir may be
+        # unremoved, already removed, or removed-and-failed, and only `cleanup` can tell the
+        # difference. `take()` collects the failures from both this sweep and any the body
+        # recorded before it raised, which is the whole reason they are not body locals.
+        cleanup.purge_all()
+        for note in [_scrub_and_note(workspace, self._secrets)] + cleanup.take():
             if note:
                 rr.error = (rr.error + "; " if rr.error else "") + note
         try:
@@ -377,7 +386,7 @@ class Runner:
 
     def _run_cell_body(self, target: ModelTarget, spec: EvalSpec, cell_idx: int,
                        cell_dir: str, workspace: str, exec_ws: str,
-                       exec_root: str) -> CellResult:
+                       exec_root: str, cleanup: "_CellCleanup") -> CellResult:
         adapter = self.adapter
         p = self.progress
         model = target.model
@@ -489,22 +498,29 @@ class Runner:
         # finally as the isolated home, on every exit path including a timeout.
         mcp_scratch = None
         mcp_resolved: dict = {}
-        if spec.mcp_servers:
-            mcp_resolved, secrets = spec.resolved_mcp_servers()
-            self._secrets = tuple(secrets)
-            self._run_secrets = tuple(dict.fromkeys(self._run_secrets + self._secrets))
-            mcp_scratch = tempfile.mkdtemp(prefix="ase-mcp-")
-        opts = RunOptions(
-            model=model,
-            auto_approve=self.auto_approve,
-            reasoning_effort=effort,
-            output_schema=spec.output_schema,
-            home=iso_home,
-            isolation_env=iso_env,
-            mcp_servers=mcp_resolved or None,
-            mcp_scratch_dir=mcp_scratch,
-        )
+        # The try starts HERE, not at `execute`: everything between resolving the credentials
+        # and launching the agent can raise (a `${VAR}` that no longer resolves, an adapter
+        # whose RunOptions no longer match), and each of those raises used to escape the only
+        # code that removes the scratch dir and the isolated home.
         try:
+            if spec.mcp_servers:
+                mcp_resolved, secrets = spec.resolved_mcp_servers()
+                self._secrets = tuple(secrets)
+                self._run_secrets = tuple(dict.fromkeys(self._run_secrets + self._secrets))
+                mcp_scratch = tempfile.mkdtemp(prefix="ase-mcp-")
+                # Registered the moment it exists rather than once it holds something: the
+                # window between the two is where the credentials get written into it.
+                cleanup.own("the MCP scratch directory", mcp_scratch)
+            opts = RunOptions(
+                model=model,
+                auto_approve=self.auto_approve,
+                reasoning_effort=effort,
+                output_schema=spec.output_schema,
+                home=iso_home,
+                isolation_env=iso_env,
+                mcp_servers=mcp_resolved or None,
+                mcp_scratch_dir=mcp_scratch,
+            )
             ex = execute(
                 adapter, prompt, opts,
                 cwd=exec_ws, timeout=spec.timeout_sec,
@@ -513,8 +529,10 @@ class Runner:
         finally:
             # Verified removal, not best-effort: `mcp.json` in here holds the interpolated
             # credentials, and this is the last code that will ever look at the directory.
-            # Collected rather than raised — it belongs on this cell's result, below.
-            purge_notes = [n for n in [_purge("the MCP scratch directory", mcp_scratch)] if n]
+            # The failure goes to `cleanup` rather than a local: an exception from `execute`
+            # leaves this function, and a note in a local leaves with it — which is exactly
+            # how a failed scratch removal came to be reported as nothing at all.
+            cleanup.purge(mcp_scratch)
             # The isolated HOME carries config masks and symlinks into the real home, not
             # resolved secrets, so a stubborn one warns instead of failing the cell. It gets
             # the same verified removal all the same: "best effort" was never the intent
@@ -593,9 +611,12 @@ class Runner:
         # exec_root can only go once exec_ws has been moved out of it. Whatever is left is
         # what the agent wrote ABOVE its cwd: never archived, never scrubbed, and — since a
         # cell only has secrets when it declared MCP servers — potentially a copy of one.
-        purge_notes.append(_purge("the agent's execution directory", exec_root))
+        cleanup.purge(exec_root)
         error_before = rr.error
-        for note in [_scrub_and_note(workspace, self._secrets)] + purge_notes:
+        # `take()` drains the scratch-dir failure recorded back at `execute`'s finally along
+        # with this one. Both are this cell's, and this is the last place that can put them
+        # somewhere a reader will find them.
+        for note in [_scrub_and_note(workspace, self._secrets)] + cleanup.take():
             if not note:
                 continue
             # The scrub could not certify part of the tree, so it deleted that part — or,
@@ -1548,6 +1569,59 @@ def _purge(label: str, path: Optional[str]) -> str:
         return ""
     return (f"{label} could not be removed and is still on disk: {path} — it holds this "
             f"cell's resolved credentials; delete it before sharing this machine's state")
+
+
+class _CellCleanup:
+    """One cell's credential directories, and what removing them found.
+
+    Owned by `_run_cell` — the frame with the try/except/finally — and not by the body that
+    creates them, because an exception in the body transfers control OUT of the body: a
+    directory only a body local knew about becomes unreachable, and a note only a body local
+    held is gone. Review made `execute()` raise while the scratch removal failed, and watched
+    the raw `mcp.json` survive a cell whose recorded error was just the crash. Creating these
+    directories is the body's job; outliving it is not.
+
+    Each site still removes its own at the moment that is right for it — the scratch dir the
+    instant the agent exits, `exec_root` only once the workspace has been moved out of it —
+    and whoever runs last sweeps whatever is left.
+    """
+
+    def __init__(self) -> None:
+        self._owned: list[tuple[str, str]] = []
+        self._notes: list[str] = []
+
+    def own(self, label: str, path: Optional[str]) -> None:
+        """Register a credential directory as this cell's to remove; `None` is a no-op."""
+        if path:
+            self._owned.append((label, path))
+
+    def purge(self, path: Optional[str]) -> None:
+        """Remove one registered directory, keeping any failure; `None` is a no-op.
+
+        Deliberately NOT a "purge everything" default: the callers pass a variable that is
+        `None` whenever the cell declared no MCP servers, and a `None`-means-all sentinel
+        would have swept `exec_root` while the agent's workspace was still inside it.
+        """
+        for entry in [e for e in self._owned if path and e[1] == path]:
+            self._owned.remove(entry)
+            note = _purge(*entry)
+            if note:
+                self._notes.append(note)
+
+    def purge_all(self) -> None:
+        """Remove every directory still registered, most recently created first."""
+        for _, path in list(reversed(self._owned)):
+            self.purge(path)
+
+    def take(self) -> list[str]:
+        """Hand the failures so far to a caller that will record them, and forget them.
+
+        Draining is what makes the backstop meaningful: what is left when `_run_cell`'s
+        finally runs is exactly what no result was written for, so it can warn without
+        repeating a sentence that already reached the artifacts.
+        """
+        notes, self._notes = self._notes, []
+        return notes
 
 
 def _all_offending_paths(root: str, secrets) -> list[str]:

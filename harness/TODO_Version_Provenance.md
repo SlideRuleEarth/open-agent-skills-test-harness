@@ -317,6 +317,31 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   but not the machine-readable one is a finding that half the readers never see, which is
   the same defect `notices.py` fixed for warnings, in the one artifact written twice.
 
+- **A finding is only as durable as the frame that holds it.** The round after that one, the
+  verified removal was correct and the note it produced was still lost: it went into a
+  `purge_notes` local of `_run_cell_body`, and an exception out of `execute()` does not
+  return to `_run_cell_body` — it unwinds it. The crashed cell recorded the crash and said
+  nothing about the `mcp.json` sitting on disk, and the same loss followed *any* raise
+  between the agent exiting and the notes being applied. I had fixed *how* the answer was
+  computed twice over and never asked where it lived.
+
+  What makes this its own lesson rather than a missed `except` is that no number of `except`
+  clauses would have been the fix. Every raise site is a place the note can be dropped, so
+  guarding them one at a time is a list that grows with the code. The property wanted is
+  structural: the thing that must outlive the failure has to be **owned by a frame the
+  failure cannot unwind**. `_run_cell` already had that shape for `exec_root` — which is
+  exactly why `exec_root` was fine and the scratch dir was not — so the fix was to give the
+  scratch dir the same owner rather than to give the body better error handling.
+
+  Two corollaries fell out of writing it. A `None`-means-everything sentinel on the sweep
+  would have purged `exec_root` while the agent's workspace was still inside it, on every
+  cell that declared no MCP servers — the callers pass a variable that is `None` in the
+  normal case, so the convenient default was the dangerous one. And the guard has to begin
+  where the resource does: the `try` started at `execute`, while the directory was created
+  two raise-capable statements earlier, which left a window where it existed and nothing
+  owned it. A resource is unguarded for exactly as long as the gap between creating it and
+  registering it.
+
 - **A mutation test is also a test of the deletion path nobody exercised.** Disabling the
   scrub's permission repair was supposed to make one arm go red; instead it crashed the
   whole section, because the quarantine could not remove a `chmod 000` *directory* — `rmtree`

@@ -1175,6 +1175,109 @@ def _check_workspace_relocation(failures, verbose):
                f"directory — the config file in there is the resolved secret in the clear, so "
                f"'probably deleted' is not an answer: scratch={seen.get('scratch')} "
                f"passed={cell5.passed} err={err5[:110]!r}", failures, verbose)
+
+        # ...but only if the note SURVIVES. `execute()` raising is not an exotic path — a
+        # crashed CLI, a timeout handler that throws, an adapter bug — and it transfers
+        # control out of the frame holding the note. Review forced both at once and got a
+        # cell that recorded `RuntimeError` and nothing about the `mcp.json` left on disk.
+        seen.clear()
+        run_dir6 = os.path.join(repo_root, "artifacts", "run6")
+        os.makedirs(run_dir6)
+        r.run_id, r.run_dir = "run6", run_dir6
+
+        def _crashing_execute(*a, **kw):
+            _fake_execute(*a, **kw)  # record the scratch dir, then die like a real CLI
+            raise RuntimeError("child crashed")
+
+        runner_mod.execute = _crashing_execute
+        runner_mod._remove = lambda p: False if "ase-mcp-" in p else _orig_remove(p)
+        try:
+            cell6 = r._run_cell(ModelTarget(), spec5)
+        finally:
+            runner_mod.execute = _fake_execute
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            s6 = seen.get("scratch") or ""
+            if os.path.basename(s6).startswith("ase-mcp-"):  # never reach past what we made
+                _try(lambda: shutil.rmtree(s6, ignore_errors=True))
+        err6 = cell6.run_result.error or ""
+        rep6 = _try(lambda: open(os.path.join(cell6.artifacts_dir, "report.md")).read(), "")
+        _check("relocate.scratch_failure_survives_a_crashing_execute",
+               bool(seen.get("scratch")) and "child crashed" in err6
+               and (seen.get("scratch") or "?") in err6
+               and err6.count("MCP scratch directory") == 1
+               and "MCP scratch directory" in rep6,
+               f"a crash in execute() must not swallow the credential-directory failure "
+               f"recorded on the way out: the note lived in a body local and the exception "
+               f"left the body, so the crashed cell reported only the crash. Once, not "
+               f"twice — a directory that could not be removed is deregistered, so the "
+               f"outer sweep neither retries what already escalated nor repeats itself. "
+               f"scratch={seen.get('scratch')} err={err6[:130]!r}", failures, verbose)
+
+        # The other half of the same loss: `execute` returns, the note is recorded, and
+        # something AFTER it raises before the body reaches the code that applies notes —
+        # "an OSError mid-move" is the case `_run_cell`'s own docstring already names.
+        seen.clear()
+        run_dir7 = os.path.join(repo_root, "artifacts", "run7")
+        os.makedirs(run_dir7)
+        r.run_id, r.run_dir = "run7", run_dir7
+        _orig_move = shutil.move
+
+        def _failing_move(src, dst, *a, **kw):
+            # Scoped to the exec tempdir: patching a stdlib function must not be able to
+            # reach anything else in this process, this section's own teardown included.
+            if "ase-ws-" in str(src):
+                raise OSError("selftest: move failed")
+            return _orig_move(src, dst, *a, **kw)
+
+        shutil.move = _failing_move
+        runner_mod._remove = lambda p: False if "ase-mcp-" in p else _orig_remove(p)
+        try:
+            cell7 = r._run_cell(ModelTarget(), spec5)
+        finally:
+            shutil.move = _orig_move
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            s7 = seen.get("scratch") or ""
+            if os.path.basename(s7).startswith("ase-mcp-"):
+                _try(lambda: shutil.rmtree(s7, ignore_errors=True))
+        err7 = cell7.run_result.error or ""
+        res7 = _try(lambda: open(os.path.join(cell7.artifacts_dir, "result.json")).read(), "")
+        _check("relocate.scratch_failure_survives_a_raise_after_the_run",
+               bool(seen.get("scratch")) and (seen.get("scratch") or "?") in err7
+               and "MCP scratch directory" in err7 and "MCP scratch directory" in res7,
+               f"a raise anywhere between the agent exiting and the notes being applied "
+               f"dropped the same failure on the floor — the fix is not an extra except "
+               f"clause per raise site but holding the note in the frame that SURVIVES the "
+               f"raise: scratch={seen.get('scratch')} err={err7[:130]!r}", failures, verbose)
+
+        # And a raise BEFORE the agent ever launches — a `${VAR}` that stopped resolving, an
+        # adapter whose RunOptions changed shape — used to escape the only code that removes
+        # the scratch dir, because the guard started at `execute` and the directory does not.
+        seen.clear()
+        run_dir8 = os.path.join(repo_root, "artifacts", "run8")
+        os.makedirs(run_dir8)
+        r.run_id, r.run_dir = "run8", run_dir8
+        removed: list = []
+        _orig_opts = runner_mod.RunOptions
+
+        def _exploding_options(*a, **kw):
+            raise TypeError("selftest: RunOptions changed shape")
+
+        runner_mod.RunOptions = _exploding_options
+        runner_mod._remove = lambda p: (removed.append(p), _orig_remove(p))[1]
+        try:
+            r._run_cell(ModelTarget(), spec5)  # the cell's verdict is not the point here
+        finally:
+            runner_mod.RunOptions = _orig_opts
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+        _check("relocate.scratch_dir_removed_even_if_the_run_never_starts",
+               any(os.path.basename(p).startswith("ase-mcp-") for p in removed),
+               f"the scratch dir holds the resolved credentials from the instant it is "
+               f"created, so the guard has to start where the directory does rather than at "
+               f"`execute` with two raise-capable statements in between: "
+               f"removed={[os.path.basename(p) for p in removed]}", failures, verbose)
     finally:
         runner_mod.execute = orig_execute
         shutil.rmtree(repo_root, ignore_errors=True)
