@@ -127,6 +127,22 @@ class Adapter(ABC):
     # (isolation.build_mcp_masked_home). Adapters with a working flag-level kill-switch
     # (claude --strict-mcp-config, codex per-server disables) don't need one.
     isolation_config_masks: dict[str, Optional[str]] = {}
+    # HOME-relative paths this CLI genuinely needs from the real home, for a CONTAINED home
+    # (isolation.py's contained mode) — the home a credential-bearing run requires. They are
+    # COPIED, never symlinked: the escape rule this harness enforces is "any symlink
+    # resolving outside the overlay", so a contained home can hold no outward symlink at
+    # all, auth included.
+    #
+    # None is not "nothing needed" — it is "this adapter has not been mapped", and it fails
+    # closed: containment is unavailable, so runner._refuse_uncontained_home keeps refusing
+    # this adapter's credential-bearing cells. An empty list is the positive claim that the
+    # CLI needs nothing, which is a real and verifiable answer.
+    #
+    # Determining it is empirical per adapter and needs live runs — the failure mode is the
+    # CLI erroring on something undeclared, which fails closed but only shows up by running
+    # it. Verified for claude 2.1.113 on 2026-07-23: [] runs, because it authenticates from
+    # CLAUDE_CODE_OAUTH_TOKEN in the environment rather than from anything under HOME.
+    contained_home_subpaths: Optional[list[str]] = None
     # Whether two cells of this runner may execute CONCURRENTLY without sharing mutable
     # configuration. Default False, and every adapter here is currently False.
     #

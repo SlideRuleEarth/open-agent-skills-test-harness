@@ -420,6 +420,12 @@ class Runner:
         # 3) render prompt (fill {skill}/{skills} for this adapter)
         prompt = self._render_prompt(spec)
 
+        # Which declared MCP fields carry a `${VAR}`. Resolved HERE rather than at the point
+        # of use below, because it decides what KIND of HOME this cell needs and the HOME is
+        # built first. `${VAR}` in the declaration, not `bool(secrets)`: the redaction set
+        # omits values under MIN_REDACTABLE_LEN and a short credential is still a credential.
+        interpolated = interpolated_refs(spec.mcp_servers) if spec.mcp_servers else []
+
         # 4) isolate HOME so the model sees only the provisioned skills (+ the surface's
         #    vendor skills), not this repo's globally-installed skills.
         iso_home = None
@@ -434,7 +440,16 @@ class Runner:
         # (DESIGN_MCP_Support.md, Phase 0).
         cfg_masks = dict(getattr(adapter, "isolation_config_masks", {}) or {})
         plugin_cfg_masks = dict(getattr(adapter, "plugin_registry_config_masks", {}) or {})
-        if self.isolated and (adapter.global_skills_subpaths or cfg_masks or plugin_cfg_masks):
+        # A cell holding a credential needs a HOME with no way out of it, not the symlink
+        # overlay — see isolation.py's contained mode and `_refuse_uncontained_home`. The
+        # adapter declares the surface; None means it has not been mapped, so containment is
+        # unavailable and the refusal below still fires. Contained mode is NOT applied to
+        # credential-free cells: it is stricter (a CLI needing something undeclared errors),
+        # and every existing scenario is entitled to the overlay it was verified against.
+        contained_subs = getattr(adapter, "contained_home_subpaths", None)
+        contain_home = bool(interpolated) and contained_subs is not None
+        if self.isolated and (adapter.global_skills_subpaths or cfg_masks or plugin_cfg_masks
+                              or contain_home):
             iso_home = tempfile.mkdtemp(prefix="ase-home-")
             # Registered at creation, like the scratch dir and for the same reason: what
             # follows — the overlay build, `_phase`, the effort resolution — can raise, and
@@ -451,9 +466,17 @@ class Runner:
                     repo_root=self._repo_root,
                     config_file_masks=cfg_masks,
                     plugin_config_masks=plugin_cfg_masks,
+                    contained_subpaths=contained_subs if contain_home else None,
                 )
                 cfg_root = None
-                for var, replaces, skills_sub in config_home_entries(adapter):
+                # A custom config home is MIRRORED with the wholesale symlink pass, so every
+                # mirror is a fresh set of escapes — mirroring one into a contained home
+                # would undo the containment entirely. Contained cells mirror nothing and
+                # leave the var unset in `isolation_env`, which makes adapter.env() clear it
+                # so the CLI falls back to the contained HOME. Fails closed: the run loses
+                # the custom config, it does not gain a way out.
+                for var, replaces, skills_sub in ([] if contain_home
+                                                  else config_home_entries(adapter)):
                     custom = os.environ.get(var)
                     if custom and os.path.isdir(custom):
                         if cfg_root is None:
@@ -522,11 +545,12 @@ class Runner:
                 mcp_scratch = tempfile.mkdtemp(prefix="ase-mcp-")
                 # Registered the moment it exists rather than once it holds something: the
                 # window between the two is where the credentials get written into it.
-                # `${VAR}` in the DECLARATION, not `bool(secrets)`: the redaction set omits
-                # values under MIN_REDACTABLE_LEN, and a short credential is still a
+                # `interpolated` was resolved before the HOME was built (it decides whether
+                # the HOME must be contained); the property it encodes is unchanged — it is
+                # `${VAR}` in the DECLARATION, not `bool(secrets)`, because the redaction set
+                # omits values under MIN_REDACTABLE_LEN and a short credential is still a
                 # credential. Review failed a cell for credentials it could not have had
                 # because the only question asked was whether `mcp_servers` was present.
-                interpolated = interpolated_refs(spec.mcp_servers)
                 cleanup.own("the MCP scratch directory", mcp_scratch,
                             tail=_CREDENTIAL_TAIL if interpolated else _CONFIG_TAIL)
                 if interpolated:

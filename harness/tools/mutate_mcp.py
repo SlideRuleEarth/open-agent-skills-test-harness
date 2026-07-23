@@ -391,17 +391,25 @@ MUTATIONS = [
      "mcp_masked_home.write_escapes_are_any_symlink_out_of_the_overlay"),
     # Back to asking whether `mcp_servers` was declared rather than whether a ${VAR} was
     # interpolated, so a credential-free cell is failed for credentials it never had.
+    # Re-anchored: `interpolated` moved out of the credential block and up to before the
+    # HOME is built, because it now decides what KIND of home the cell needs. Same defect,
+    # same arm, new site — this is the STALE ANCHOR case the header warns is routine.
     ("M67-severity-follows-declaration-not-interpolation", RUNNER,
-     "                interpolated = interpolated_refs(spec.mcp_servers)",
-     "                interpolated = list(spec.mcp_servers or {})",
+     "\n        interpolated = interpolated_refs(spec.mcp_servers) if spec.mcp_servers else []",
+     "\n        interpolated = list(spec.mcp_servers or {})",
      "mcp.home_severity_follows_interpolation_not_declaration"),
     # `bool(secrets)` instead: passes for long values, silently drops short ones, which are
     # excluded from redaction ON PURPOSE and are still credentials.
     # `bool(secrets)` as the exposure gate: correct for long values, silently open for short
     # ones, which are excluded from redaction ON PURPOSE and are still credentials.
+    # Re-anchored with M67. `sorted(secrets)` no longer expresses the defect at this site —
+    # `secrets` is not bound until the credential block below — so the same gate is spelled
+    # by resolving early and reading the redaction set off the result. Identical meaning: a
+    # value too short to redact is treated as no credential at all.
     ("M68-exposure-gated-on-the-redaction-set", RUNNER,
-     "                interpolated = interpolated_refs(spec.mcp_servers)",
-     "                interpolated = sorted(secrets)",
+     "\n        interpolated = interpolated_refs(spec.mcp_servers) if spec.mcp_servers else []",
+     "\n        interpolated = (sorted(spec.resolved_mcp_servers()[1])"
+     " if spec.mcp_servers else [])",
      "mcp.short_credential_run_is_refused_like_any_other"),
     # Only the target canonicalized. On macOS `/var` is a symlink to `/private/var`, so a
     # link pointing inside its own overlay compares as outside — over-refusal, which is the
@@ -412,6 +420,79 @@ MUTATIONS = [
      "    root = os.path.realpath(home)",
      "    root = os.path.abspath(home)",
      "mcp_masked_home.write_escapes_are_any_symlink_out_of_the_overlay"),
+    # --- contained HOME (#81): the refusal lifts by being SATISFIED, not exempted --------
+    # Containment never engages, so a credential cell keeps hitting the refusal it is now
+    # entitled to pass. The whole feature, reduced to one constant.
+    ("M72-contained-mode-never-engaged", RUNNER,
+     "\n        contain_home = bool(interpolated) and contained_subs is not None",
+     "\n        contain_home = False",
+     "mcp.credential_run_is_permitted_once_the_home_is_contained"),
+    # `is not None` -> truthiness. Reads an EMPTY declaration as an absent one, which is
+    # precisely claude's answer (it needs nothing from the real home), so the one adapter
+    # this work exists to unblock silently stays refused while every other arm passes.
+    ("M73-empty-declaration-read-as-unmapped", RUNNER,
+     "\n        contain_home = bool(interpolated) and contained_subs is not None",
+     "\n        contain_home = bool(interpolated) and bool(contained_subs)",
+     "mcp.empty_contained_declaration_contains_rather_than_refuses"),
+    # The custom config home is mirrored anyway. The mirror is built by the wholesale
+    # symlink pass and lands INSIDE the contained home, so every escape comes back one level
+    # down while the home still looks materialized from the top.
+    ("M74-custom-config-home-mirrored-into-a-contained-home", RUNNER,
+     "                for var, replaces, skills_sub in ([] if contain_home\n"
+     "                                                  else config_home_entries(adapter)):",
+     "                for var, replaces, skills_sub in config_home_entries(adapter):",
+     "mcp.contained_home_does_not_mirror_a_custom_config_home"),
+    # The wholesale symlink pass still runs under containment — the single line that makes
+    # the home a mask again. Everything else about contained mode still works.
+    ("M75-wholesale-symlink-pass-survives-containment", ISO,
+     "\n    if os.path.isdir(real_dir) and not contained:",
+     "\n    if os.path.isdir(real_dir):",
+     "contained_home.no_name_leads_out_of_a_hostile_real_home"),
+    # Vendor skills symlinked anyway. This is the site that hides behind "contained mode ==
+    # skip the wholesale pass": the skills dir is rebuilt entry by entry and mints one
+    # outward symlink per vendor skill, all of them escapes.
+    ("M76-vendor-skills-still-symlinked", ISO,
+     "            if contained:\n"
+     "                _materialize(src, dst)\n"
+     "            else:\n"
+     "                os.symlink(src, dst)\n"
+     "            placed.add(name)",
+     "            os.symlink(src, dst)\n"
+     "            placed.add(name)",
+     "contained_home.vendor_skills_are_copied_not_symlinked"),
+    # The same defect at the plugin registry, the second pass-through site — anchored on the
+    # `src, dst =` line above it because the four lines that follow are byte-identical to
+    # the skills-dir version at the same indentation (the substring-anchor trap).
+    ("M77-plugin-contents-still-symlinked", ISO,
+     "            src, dst = os.path.join(real_plugin, name), os.path.join(dst_plugin, name)\n"
+     "            if contained:\n"
+     "                _materialize(src, dst)\n"
+     "            else:\n"
+     "                os.symlink(src, dst)",
+     "            src, dst = os.path.join(real_plugin, name), os.path.join(dst_plugin, name)\n"
+     "            os.symlink(src, dst)",
+     "contained_home.plugin_packages_are_copied_not_symlinked"),
+    # (No M78: the `S_ISREG` guard in `_materialize` is intentionally NOT mutation-tested.
+    #  `shutil.copyfile` raises SpecialFileError on a FIFO and a socket open fails ENXIO —
+    #  both already caught downstream — so removing the guard is unobservable from userspace;
+    #  its only unique job is device nodes, which a test cannot create without root. An arm
+    #  there would be decorative, so there is none, and thus no mutation. See _materialize's
+    #  docstring and the note in selftest's contained-home section.)
+    # Directories not recursed, so a declared subpath naming a directory silently yields
+    # nothing — the CLI then fails on something absent, which is fail-closed but is not the
+    # contract the field advertises.
+    ("M79-declared-directories-not-recursed", ISO,
+     "\n    if stat.S_ISDIR(st.st_mode):",
+     "\n    if False and stat.S_ISDIR(st.st_mode):",
+     "contained_home.declared_directory_is_copied_by_content"),
+    # Back to last-write-wins insertion. A contained subpath colliding with a config mask
+    # replaces the neutral "{}" with a faithful copy of the user's REAL MCP config: the home
+    # stays perfectly contained, so every containment arm still passes, and hermeticity is
+    # gone. Found by this suite's own fixture declaring a path twice by accident.
+    ("M80-copy-leaf-displaces-a-mask", ISO,
+     "        _insert_copy_leaf(tree, sub)",
+     "        _insert_leaf(tree, [sub], _COPY_LEAF)",
+     "contained_home.copy_declaration_may_not_displace_a_mask"),
     ("M50-purge-always-claims-success", RUNNER,
      '    if _remove(path):\n        return ""\n    return f"{label} could not be removed',
      '    if True:\n        return ""\n    return f"{label} could not be removed',
@@ -419,9 +500,22 @@ MUTATIONS = [
 ]
 
 
+# A selftest never legitimately runs this long — the whole suite is ~10-30s, with a couple
+# of arms deliberately joining a 20s thread. A mutation that blows past this is looping or
+# blocked (M65's followlinks flip once walked a whole real home at 100% CPU because a test
+# helper fed it a real-home overlay), and without a bound it wedges the ENTIRE suite with no
+# output. Bounded, such a mutation is reported as TIMEOUT and the suite carries on — a
+# hanging mutation is a finding, not a reason to lose the other 78.
+_SELFTEST_TIMEOUT = 300
+
+
 def run(cwd):
-    p = subprocess.run([str(cwd / ".venv/bin/python"), "-m", "agentskill_evals", "selftest"],
-                       cwd=cwd, capture_output=True, text=True)
+    try:
+        p = subprocess.run(
+            [str(cwd / ".venv/bin/python"), "-m", "agentskill_evals", "selftest"],
+            cwd=cwd, capture_output=True, text=True, timeout=_SELFTEST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return 124, "__TIMEOUT__"
     return p.returncode, p.stdout + p.stderr
 
 
@@ -431,6 +525,10 @@ def main():
     shutil.copytree(HARNESS, work, symlinks=True,
                     ignore=shutil.ignore_patterns("__pycache__", "artifacts", "build"))
     rc, out = run(work)
+    if out == "__TIMEOUT__":
+        print(f"BASELINE TIMED OUT after {_SELFTEST_TIMEOUT}s — the unmutated selftest hung, "
+              f"so nothing below would prove anything.")
+        return 1
     if rc != 0:
         print("BASELINE FAILED — mutations prove nothing:")
         print(out[-3000:])
@@ -454,7 +552,14 @@ def main():
         rc, out = run(work)
         path.write_text(original)
         failed = re.findall(r"\[FAIL\]\s+([^:]+):", out)
-        if rc != 0 and arm in failed:
+        if out == "__TIMEOUT__":
+            # Not a clean catch: the arm never got to report because the selftest hung. A
+            # mutation whose defect is an infinite loop must be caught by an arm that BOUNDS
+            # the work (a thread + join), not by the suite's own timeout — so this counts as
+            # uncaught and fails the run, forcing a real fix rather than masking the hang.
+            print(f"{mid}: *** TIMEOUT *** selftest exceeded {_SELFTEST_TIMEOUT}s — the "
+                  f"defect hangs rather than reddening {arm}")
+        elif rc != 0 and arm in failed:
             print(f"{mid}: CAUGHT by {arm}")
             caught += 1
         elif rc != 0:
