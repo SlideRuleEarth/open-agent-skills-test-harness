@@ -956,8 +956,29 @@ def _check_workspace_relocation(failures, verbose):
     seen: dict = {}
     orig_execute = runner_mod.execute
 
+    def _try(fn, default=None):
+        """Run fn, turning any exception into `default` — arms below assert on VALUES, and a
+        mutation that makes production code raise would otherwise abort the section."""
+        try:
+            return fn()
+        except Exception:
+            return default
+
+    def _own_tempdir(path):
+        """The exec tempdir, but only if it still looks like one.
+
+        These arms chmod and rmtree what `_run_cell` handed the agent. A defect that makes
+        exec_ws the tempdir ROOT turns `dirname(cwd)` into the SYSTEM temp directory, and
+        this cleanup would then lock or delete it — mutation testing found that by wiping
+        its own working tree. A test's cleanup must never be able to reach further than the
+        thing it created."""
+        parent = os.path.dirname(path or "")
+        return parent if os.path.basename(path or "") == "workspace" and (
+            os.path.basename(parent).startswith("ase-ws-")) else None
+
     def _fake_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides, agent_name, eval_name):
         seen["cwd"] = cwd
+        seen["scratch"] = opts.mcp_scratch_dir
         # the isolated HOME is deleted right after execute() returns, so the mask must be
         # inspected here, while the agent would actually see it.
         if opts.home:
@@ -970,6 +991,11 @@ def _check_workspace_relocation(failures, verbose):
         # just `list_dir`'s. Written every time: the arms below assert where it landed.
         with open(os.path.join(cwd, "..", "above-cwd.txt"), "w") as f:
             f.write("tok sk-secret-abcdef\n")
+        if seen.get("lock_exec_root") and os.path.basename(cwd) == "workspace":
+            # The agent locks the directory it was handed. `rmtree(ignore_errors=True)` then
+            # answers "did this raise" rather than "is it gone", and both secret-bearing
+            # files survived a cell that said nothing about them.
+            os.chmod(os.path.dirname(cwd), 0o000)
         rr = RunResult(
             agent=agent_name, eval_name=eval_name, prompt=prompt, workdir=cwd,
             events=[NormalizedEvent(EventKind.FILE_CHANGE, path="run.py")],
@@ -1062,6 +1088,93 @@ def _check_workspace_relocation(failures, verbose):
                f"execution-directory isolation answer different questions, and gating the "
                f"second on the first left the results tree writable: cwd={cwd2} "
                f"cell_dir={sorted(os.listdir(cell2.artifacts_dir))}", failures, verbose)
+
+        # The exec tempdir holds whatever the agent wrote, including anything it echoed back
+        # from an MCP result. `shutil.rmtree(..., ignore_errors=True)` reports on the CALL,
+        # not on the directory: a chmod 000 left both secret-bearing files on disk in silence.
+        seen.clear()
+        seen["lock_exec_root"] = True
+        run_dir3 = os.path.join(repo_root, "artifacts", "run3")
+        os.makedirs(run_dir3)
+        r.run_id, r.run_dir, r.isolated = "run3", run_dir3, True
+        r._secrets = r._run_secrets = ("sk-secret-abcdef",)
+        try:
+            r._run_cell(ModelTarget(), spec)  # the cell's verdict is not the point here
+        finally:
+            r._secrets = r._run_secrets = ()
+        root3 = _own_tempdir(seen.get("cwd")) or os.path.join(repo_root, "no-exec-root")
+        _try(lambda: os.chmod(root3, 0o700))  # a regression leaves it undeletable otherwise
+        _check("relocate.locked_exec_dir_is_actually_removed",
+               not os.path.exists(root3),
+               f"a temp dir the agent locked is still removed, through the same outward-in "
+               f"escalation the workspace quarantine uses — `ignore_errors=True` answers "
+               f"'did this raise', which is not the question being asked of a directory "
+               f"holding resolved credentials: {root3} "
+               f"survivors={_try(lambda: sorted(os.listdir(root3)), [])}", failures, verbose)
+
+        # And when removal genuinely cannot succeed, saying nothing is the failure. The note
+        # has to reach the artifacts — result.json included, which step 6 wrote long before
+        # any of this was knowable — and has to cost the cell its pass.
+        seen.clear()
+        run_dir4 = os.path.join(repo_root, "artifacts", "run4")
+        os.makedirs(run_dir4)
+        r.run_id, r.run_dir = "run4", run_dir4
+        r._secrets = r._run_secrets = ("sk-secret-abcdef",)
+        _orig_remove = runner_mod._remove
+        runner_mod._remove = lambda p: False if "ase-ws-" in p else _orig_remove(p)
+        try:
+            cell4 = r._run_cell(ModelTarget(), spec)
+        finally:
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            leftover4 = _own_tempdir(seen.get("cwd"))
+            if leftover4:
+                _try(lambda: os.chmod(leftover4, 0o700))
+                _try(lambda: shutil.rmtree(leftover4, ignore_errors=True))
+        err4 = cell4.run_result.error or ""
+        rj4 = os.path.join(cell4.artifacts_dir, "result.json")
+        res4 = _try(lambda: open(rj4).read(), "")
+        rep4 = _try(lambda: open(os.path.join(cell4.artifacts_dir, "report.md")).read(), "")
+        _check("relocate.undeletable_exec_dir_is_durable_and_load_bearing",
+               cell4.passed is False and "could not be removed and is still on disk" in err4
+               and "could not be removed" in res4 and "could not be removed" in rep4
+               and "sk-secret-abcdef" not in res4 and "sk-secret-abcdef" not in rep4,
+               f"a credential directory that outlives its cell fails that cell and says so "
+               f"in result.json as well as report.md — result.json is serialized at step 6, "
+               f"before the workspace is even moved, so a note appended afterwards reaches "
+               f"only half the readers unless it is re-written: passed={cell4.passed} "
+               f"in_result_json={'could not be removed' in res4} err={err4[:90]!r}",
+               failures, verbose)
+
+        # The MCP scratch dir is the one place a resolved `${VAR}` is written in the clear —
+        # its `mcp.json` IS the credential — and it was removed by the same best-effort call.
+        from .mcp import parse_mcp_servers
+        seen.clear()
+        run_dir5 = os.path.join(repo_root, "artifacts", "run5")
+        os.makedirs(run_dir5)
+        r.run_id, r.run_dir = "run5", run_dir5
+        spec5 = EvalSpec(name="demo", prompt="hi",
+                         source_path=os.path.join(repo_root, "demo.yaml"),
+                         mcp_servers=parse_mcp_servers(
+                             {"echo": {"command": "/bin/echo"}}, where="selftest"))
+        runner_mod._remove = lambda p: False if "ase-mcp-" in p else _orig_remove(p)
+        try:
+            cell5 = r._run_cell(ModelTarget(), spec5)
+        finally:
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            s5 = seen.get("scratch") or ""
+            if os.path.basename(s5).startswith("ase-mcp-"):  # never reach past what we made
+                _try(lambda: shutil.rmtree(s5, ignore_errors=True))
+        err5 = cell5.run_result.error or ""
+        _check("relocate.mcp_scratch_dir_removal_is_load_bearing",
+               bool(seen.get("scratch")) and cell5.passed is False
+               and "MCP scratch directory" in err5 and (seen.get("scratch") or "?") in err5,
+               f"the scratch dir that held the interpolated credentials is purged through "
+               f"the verified path too, and a failure to remove it fails the cell naming the "
+               f"directory — the config file in there is the resolved secret in the clear, so "
+               f"'probably deleted' is not an answer: scratch={seen.get('scratch')} "
+               f"passed={cell5.passed} err={err5[:110]!r}", failures, verbose)
     finally:
         runner_mod.execute = orig_execute
         shutil.rmtree(repo_root, ignore_errors=True)
@@ -7607,6 +7720,35 @@ def _check_mcp_declared_servers(failures, verbose):
            f"'nothing was archived' and 'I was refused' are opposite answers that an "
            f"`except OSError` collapses into a clean bill of health: lost={lost15} "
            f"body={body15.strip()!r} absent_root={missing15}", failures, verbose)
+
+    # The scratch dir holds the CLI config file carrying the INTERPOLATED credentials — the
+    # one place on disk where a resolved `${VAR}` is written in the clear — and it was
+    # removed with the same `ignore_errors=True` that let a locked exec dir survive a cell.
+    ws16 = os.path.join(root, "ws16")
+    os.makedirs(ws16, exist_ok=True)
+    open(os.path.join(ws16, "mcp.json"), "w").write('{"token": "sk-secret-abcdef"}')
+    os.chmod(ws16, 0o000)
+    gone16 = runner_mod._purge("the MCP scratch directory", ws16)
+    _try(lambda: os.chmod(ws16, 0o700))
+    ws17 = os.path.join(root, "ws17")
+    os.makedirs(ws17, exist_ok=True)
+    _orig_remove = runner_mod._remove
+    runner_mod._remove = lambda p: False
+    try:
+        stuck17 = runner_mod._purge("the MCP scratch directory", ws17)
+    finally:
+        runner_mod._remove = _orig_remove
+    absent17 = runner_mod._purge("the MCP scratch directory",
+                                 os.path.join(root, "ws17-never-existed"))
+    _check("mcp.credential_scratch_dir_removal_is_verified_not_best_effort",
+           gone16 == "" and not os.path.exists(ws16)
+           and ws17 in stuck17 and "resolved credentials" in stuck17 and absent17 == "",
+           f"a locked credentials directory is removed through the same outward-in "
+           f"escalation the workspace quarantine uses, and one that genuinely cannot go "
+           f"returns a sentence NAMING it rather than an empty answer — `rmtree(..., "
+           f"ignore_errors=True)` reports on the call, not on the directory: "
+           f"locked_removed={not os.path.exists(ws16)} stuck={stuck17[:80]!r} "
+           f"absent={absent17!r}", failures, verbose)
 
     # --- the run summary, written after every cell cleared its secrets ---------
     # `_secrets` is deliberately cell-scoped, so by the time the summary is written it is

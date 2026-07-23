@@ -36,6 +36,7 @@ from .exec import execute
 from .isolation import build_isolated_home, config_home_entries, reroot_config_masks
 from .judge import Judge
 from .mcp import REDACTED, redact, redact_bytes, redact_obj
+from .notices import warn
 from .progress import Progress
 from .schema import EventKind, RunResult
 from . import xattrs
@@ -302,15 +303,19 @@ class Runner:
         # every other cell in the batch — `run()` has no try/except of its own around this call,
         # so this is the only backstop.
         try:
-            return self._run_cell_body(target, spec, cell_idx, cell_dir, workspace, exec_ws)
+            return self._run_cell_body(target, spec, cell_idx, cell_dir, workspace, exec_ws,
+                                       exec_root)
         except Exception as exc:
-            return self._failed_cell(target, spec, cell_idx, cell_dir, exec_ws, exc)
+            return self._failed_cell(target, spec, cell_idx, cell_dir, exec_ws, exc, exec_root)
         finally:
-            # exec_ws itself is usually already gone — `shutil.move` (here or in _failed_cell)
-            # relocated it to `workspace`. exec_root is what remains, and it is removed
-            # whether or not it is empty: anything the agent wrote ABOVE its cwd landed here,
-            # was never part of the archived workspace, and is discarded rather than published.
-            shutil.rmtree(exec_root, ignore_errors=True)
+            # Backstop. Both paths above purge exec_root themselves, before they write
+            # artifacts, so a failure lands on the result somebody will actually read. This
+            # fires only when neither got that far — _failed_cell raising, say — and it is
+            # the last moment anything knows the directory existed, so it says so out loud
+            # rather than discarding what it knows.
+            leftover = _purge("the agent's execution directory", exec_root)
+            if leftover:
+                warn(f"warning: [{self.agent}] {leftover}")
             # Cleared per cell, not per run: these are this scenario's resolved credentials
             # and nothing after this point may still be redacting against a stale set — a
             # secret carried into the NEXT cell would scrub text there for no reason, and
@@ -318,7 +323,8 @@ class Runner:
             self._secrets = ()
 
     def _failed_cell(self, target: ModelTarget, spec: EvalSpec, cell_idx: int,
-                     cell_dir: str, exec_ws: str, exc: Exception) -> CellResult:
+                     cell_dir: str, exec_ws: str, exc: Exception,
+                     exec_root: str) -> CellResult:
         """Best-effort CellResult for a cell that raised instead of completing normally — keeps
         one broken eval from aborting the whole run() batch, and still records something on disk
         (report.md/assertions.json) rather than leaving the cell's artifacts dir silently empty."""
@@ -347,10 +353,20 @@ class Runner:
         # agent's output into the artifact tree, so a credential it wrote to a file is
         # archived here too. `_secrets` is still populated — _run_cell clears it in a finally
         # that runs after this. Ordered before report.md below, which INLINES workspace files.
-        note = _scrub_and_note(workspace, self._secrets)
-        if note:
-            rr.error = (rr.error + "; " if rr.error else "") + note
+        # Same purge as the success path, and needed more here: this cell crashed, so it may
+        # well have crashed BEFORE the body reached its own cleanup, leaving the credentials
+        # directory exactly where the agent left it.
+        for note in (_scrub_and_note(workspace, self._secrets),
+                     _purge("the agent's execution directory", exec_root)):
+            if note:
+                rr.error = (rr.error + "; " if rr.error else "") + note
         try:
+            # Refreshed only if step 6 got as far as writing one: this path must not invent
+            # an artifact the successful path would have, but must not leave a stale one
+            # either. Inside the same best-effort block as the writes below — artifact
+            # bookkeeping must never mask the crash that brought us here.
+            if os.path.isfile(os.path.join(cell_dir, "result.json")):
+                self._rwj(os.path.join(cell_dir, "result.json"), rr.to_dict())
             self._write_cell_json(cell_dir, cell)
             self._rw(os.path.join(cell_dir, "report.md"), render_report(cell))
         except Exception:
@@ -360,7 +376,8 @@ class Runner:
         return cell
 
     def _run_cell_body(self, target: ModelTarget, spec: EvalSpec, cell_idx: int,
-                       cell_dir: str, workspace: str, exec_ws: str) -> CellResult:
+                       cell_dir: str, workspace: str, exec_ws: str,
+                       exec_root: str) -> CellResult:
         adapter = self.adapter
         p = self.progress
         model = target.model
@@ -437,7 +454,7 @@ class Runner:
                     # kill-switch) — running against the real HOME would load the user's
                     # real MCP servers, so fail this cell instead of falling open. An
                     # explicit `isolated: false` run is the documented opt-out.
-                    shutil.rmtree(iso_home, ignore_errors=True)
+                    _remove(iso_home)
                     raise RuntimeError(
                         f"HOME-overlay isolation failed ({exc}) and {self.agent} depends "
                         f"on it to keep MCP hermetically off — failing closed rather than "
@@ -446,7 +463,7 @@ class Runner:
                     ) from exc
                 print(f"warning: [{self.agent}] skill isolation unavailable ({exc}); "
                       "running non-isolated.", file=sys.stderr)
-                shutil.rmtree(iso_home, ignore_errors=True)
+                _remove(iso_home)
                 iso_home = None
                 iso_env = {}
             except Exception:
@@ -454,7 +471,7 @@ class Runner:
                 # tempdir either — clean up, then re-raise so _run_cell's crash-safety wrapper
                 # records a failed cell instead of aborting the whole batch (it has no way to
                 # reach this function-local iso_home itself).
-                shutil.rmtree(iso_home, ignore_errors=True)
+                _remove(iso_home)
                 raise
 
         # 5) run
@@ -494,10 +511,17 @@ class Runner:
                 env_overrides=spec.env, agent_name=self.agent, eval_name=spec.name,
             )
         finally:
-            if iso_home:
-                shutil.rmtree(iso_home, ignore_errors=True)
-            if mcp_scratch:
-                shutil.rmtree(mcp_scratch, ignore_errors=True)
+            # Verified removal, not best-effort: `mcp.json` in here holds the interpolated
+            # credentials, and this is the last code that will ever look at the directory.
+            # Collected rather than raised — it belongs on this cell's result, below.
+            purge_notes = [n for n in [_purge("the MCP scratch directory", mcp_scratch)] if n]
+            # The isolated HOME carries config masks and symlinks into the real home, not
+            # resolved secrets, so a stubborn one warns instead of failing the cell. It gets
+            # the same verified removal all the same: "best effort" was never the intent
+            # here, it was just what `ignore_errors=True` happened to mean.
+            if iso_home and not _remove(iso_home):
+                warn(f"warning: [{self.agent}] the isolated HOME could not be removed: "
+                     f"{iso_home}")
         rr = ex.result
 
         if model and rr.error and _looks_like_model_error(rr.error, ex.stderr, model):
@@ -566,14 +590,30 @@ class Runner:
         #
         # Runs after grading, never before: assertions above ran against `exec_ws`, so what
         # was graded is exactly what the agent produced, unmodified.
-        note = _scrub_and_note(workspace, self._secrets)
-        if note:
+        # exec_root can only go once exec_ws has been moved out of it. Whatever is left is
+        # what the agent wrote ABOVE its cwd: never archived, never scrubbed, and — since a
+        # cell only has secrets when it declared MCP servers — potentially a copy of one.
+        purge_notes.append(_purge("the agent's execution directory", exec_root))
+        error_before = rr.error
+        for note in [_scrub_and_note(workspace, self._secrets)] + purge_notes:
+            if not note:
+                continue
             # The scrub could not certify part of the tree, so it deleted that part — or,
-            # worse, could not delete it either. Say so loudly and fail the cell: a cell that
-            # had to destroy evidence to stay safe has not produced a trustworthy result, and
-            # a silent deletion would be worse than either outcome it is choosing between.
+            # worse, could not delete it either; or a directory holding this cell's
+            # credentials outlived the cell. Say so loudly and fail: a cell that had to
+            # destroy evidence to stay safe has not produced a trustworthy result, and a
+            # silent deletion would be worse than either outcome it is choosing between.
+            # Ordered before the artifact writes below, so the sentence is on disk and not
+            # only in memory, and while `_secrets` still redacts what gets written.
             rr.error = (rr.error + "; " if rr.error else "") + note
             passed = False
+        if rr.error != error_before:
+            # `result.json` was serialized back at step 6, before the workspace could be
+            # moved and long before any of this was knowable. Re-write it: `error` is the
+            # field tooling greps, and a finding that reaches only report.md is a finding
+            # half the readers never see — the same durability gap `notices.py` closed for
+            # warnings, in the one artifact that is written twice.
+            self._rwj(os.path.join(cell_dir, "result.json"), rr.to_dict())
 
         cell = CellResult(
             agent=self.agent, model=model, eval_name=spec.name, skill=spec.skill_name,
@@ -1486,6 +1526,28 @@ def _remove(path: str) -> bool:
                     pass
     _attempt()
     return not os.path.lexists(path)
+
+
+def _purge(label: str, path: Optional[str]) -> str:
+    """Remove a directory that held credentials; return a sentence if it is still there.
+
+    `shutil.rmtree(..., ignore_errors=True)` answers "did this raise", which is not the
+    question — review chmod-ed an exec tempdir to 000 and watched both of its raw-secret
+    files survive a cell that reported nothing about them. ``_remove`` is the same
+    outward-in escalation the workspace quarantine uses, and its result is `lexists`: an
+    answer about the directory rather than about the call.
+
+    The failure is returned rather than raised so the caller can put it on the cell's own
+    result, which is where somebody will actually read it — and can do so while
+    ``_secrets`` is still populated, before the redaction registry that protects the
+    artifacts is torn down.
+    """
+    if not path or not os.path.lexists(path):
+        return ""
+    if _remove(path):
+        return ""
+    return (f"{label} could not be removed and is still on disk: {path} — it holds this "
+            f"cell's resolved credentials; delete it before sharing this machine's state")
 
 
 def _all_offending_paths(root: str, secrets) -> list[str]:

@@ -300,6 +300,23 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   ever described the first. Ask what a sanitizer's *domain* is before making it stronger:
   narrowing what can enter the domain beats certifying more of what already has.
 
+- **`ignore_errors=True` is a claim about the call, not about the world.** Two rounds went
+  into teaching the workspace quarantine that a deletion is a request rather than an
+  outcome — escalating outward-in, then answering `lexists` instead of "did this raise" —
+  and the two directories that hold the *actual credentials* were still being removed with
+  `shutil.rmtree(..., ignore_errors=True)`. An agent that `chmod 000`-ed its own execution
+  directory kept both secret-bearing files, and the cell reported nothing. This is the
+  refactoring lesson a second time, in a form worth naming separately: the fix had been
+  written as a *function* (`_remove`) rather than as a *policy*, so it covered the call
+  sites that were in front of me and none of the ones that were not. When a helper exists
+  because a weaker idiom was wrong, grep for the weaker idiom, not for the helper.
+
+  The other half was durability. `result.json` is serialized at step 6, before the workspace
+  is even moved, so every note appended afterwards — the scrub's, and now the purge's —
+  reached `report.md` and nothing else. A finding that lands in the human-readable artifact
+  but not the machine-readable one is a finding that half the readers never see, which is
+  the same defect `notices.py` fixed for warnings, in the one artifact written twice.
+
 - **A mutation test is also a test of the deletion path nobody exercised.** Disabling the
   scrub's permission repair was supposed to make one arm go red; instead it crashed the
   whole section, because the quarantine could not remove a `chmod 000` *directory* — `rmtree`
