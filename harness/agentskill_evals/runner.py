@@ -1634,10 +1634,11 @@ def _refuse_uncontained_home(home: Optional[str], eval_name: str, refs: list[str
     raise RuntimeError(
         f"{eval_name!r} interpolates a credential into `mcp_servers` ({', '.join(refs)}) "
         f"and its isolated HOME is a symlink overlay: {len(escapes)} of its entries "
-        f"({_shown(escapes[:3])}) resolve to directories in the real home, so a token the "
-        f"agent writes through one lands outside every directory this run deletes and "
-        f"outside the workspace it scrubs. Removing the overlay cannot certify those "
-        f"targets. Refusing the run rather than reporting it as contained.")
+        f"({_shown(escapes[:3])}) resolve outside it, so a token the agent writes through "
+        f"one lands outside every directory this run deletes and outside the workspace it "
+        f"scrubs — planted in a passed-through directory, or written over a passed-through "
+        f"file. Removing the overlay cannot certify those targets. Refusing the run rather "
+        f"than reporting it as contained.")
 
 
 def _purge(label: str, path: Optional[str], tail: str = _CREDENTIAL_TAIL) -> str:

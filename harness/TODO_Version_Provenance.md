@@ -410,6 +410,16 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   lets materializing the HOME lift the restriction later without anyone having to remember
   to delete a guard.
 
+  The check itself then needed the lesson applied to it a second time. I first reported only
+  symlinks pointing at *directories*, with a confident comment explaining that a file
+  symlink can be clobbered but not used to plant a new file. That sentence is true and
+  irrelevant: clobbering an existing file with the token is the same leak by a different
+  verb, and a dangling symlink has no target to classify at all while a write through it
+  creates one. Having just learned not to ask "is this thing a container", I went on to ask
+  "what kind of thing is at the other end" — when the question a boundary check has to ask
+  is only ever "does this name lead out of the tree I can account for". The type of the
+  destination never entered into it.
+
   Smaller, same round, same shape: the severity upgrade was gated on `mcp_servers` being
   *declared* rather than on a `${VAR}` being *interpolated*, so a cell that handled no
   credential at all was failed for possibly leaking one. And the obvious fix — `bool(secrets)`

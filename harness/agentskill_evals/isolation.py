@@ -179,9 +179,14 @@ def home_write_escapes(home: Optional[str]) -> list[str]:
     watched the overlay's removal succeed while the token stayed in the real home — outside
     every directory this harness deletes and outside the workspace it scrubs.
 
-    Returns HOME-relative symlink paths resolving to a directory outside *home*, sorted.
-    Directories specifically, because a directory symlink is what lets a NEW file be created
-    outside the overlay; a symlink to a file can be clobbered but not used to plant one.
+    Returns HOME-relative paths of EVERY symlink resolving outside *home*, sorted —
+    whatever it points at. The first version reported only directory symlinks, reasoning
+    that a file symlink can be clobbered but not used to plant a new file. Clobbering is the
+    leak: review symlinked a `state.json`, the gate reported nothing, and writing through it
+    replaced the real file's contents with the token. A dangling symlink is worse still — it
+    has no target to inspect and a write CREATES one outside. "What kind of thing is at the
+    other end" is not the question; "does this name lead out of the tree we can account for"
+    is, and it has the same answer for all three.
 
     Walks the overlay, never through it (``followlinks=False``): the cost is the materialized
     part of the tree, not the real home hanging off its symlinks.
@@ -196,8 +201,10 @@ def home_write_escapes(home: Optional[str]) -> list[str]:
             path = os.path.join(dirpath, name)
             if not os.path.islink(path):
                 continue
+            # realpath, not lstat: a dangling link still resolves to the path a write would
+            # create, and that path is exactly what needs to be inside the overlay.
             target = os.path.realpath(path)
-            if os.path.isdir(target) and target != root and not target.startswith(inside):
+            if target != root and not target.startswith(inside):
                 found.append(os.path.relpath(path, root))
     return sorted(found)
 

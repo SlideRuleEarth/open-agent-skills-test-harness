@@ -1763,24 +1763,25 @@ def _check_mcp_hermetic_paths(failures, verbose):
         # path the overlay actually offers. Not a loop back into `real` — `followlinks=True`
         # would spin on a cycle forever, which is a worse way to learn the same thing.
         os.symlink(beyond, os.path.join(real, ".fakecli", "plugins", "elsewhere"))
+        # A link with nothing at the other end: no target to inspect, and a write through it
+        # CREATES one outside the overlay.
+        os.symlink(os.path.join(beyond, "nope"), os.path.join(real, ".fakecli", "dangling"))
         try:
             build_isolated_home(esc_home, [".fakecli/skills"], set(), [], real_home=real)
             escapes = home_write_escapes(esc_home)
             skills = os.path.join(esc_home, ".fakecli", "skills")
-            authlink = os.path.join(esc_home, ".fakecli", "auth.json")
-            _check("mcp_masked_home.write_escapes_are_directory_symlinks_out_of_the_overlay",
-                   escapes == [os.path.join(".fakecli", "plugins")]
-                   and os.path.islink(authlink)
-                   and os.path.isdir(skills) and not os.path.islink(skills),
-                   f"a passed-through directory is a path OUT: writing "
-                   f"$HOME/.fakecli/plugins/x creates real/.fakecli/plugins/x, which no "
-                   f"cleanup here deletes and no scrub reads. Exactly the directory "
-                   f"symlinks: the masked skills dir is materialized so it is not one, "
-                   f"`auth.json` is a symlink to a FILE (clobberable, but you cannot plant "
-                   f"a new file through it), and the escape is reported once rather than "
-                   f"once per entry of the real directory behind it — the walk must not "
-                   f"descend through what it is reporting. escapes={escapes}",
-                   failures, verbose)
+            rel = [os.path.join(".fakecli", n)
+                   for n in ("auth.json", "dangling", "mcp.json", "plugins")]
+            _check("mcp_masked_home.write_escapes_are_any_symlink_out_of_the_overlay",
+                   escapes == rel and os.path.isdir(skills) and not os.path.islink(skills),
+                   f"every name that leads out, whatever is at the far end. A directory "
+                   f"symlink lets a token be PLANTED outside; a file symlink lets one be "
+                   f"written OVER an existing file, which is the same leak and was missed "
+                   f"by filtering on target type; a dangling one has no target to classify "
+                   f"and a write creates it. The masked skills dir is materialized, so it "
+                   f"is not a way out — and each escape is reported once rather than once "
+                   f"per entry behind it, since the walk must not descend through what it "
+                   f"is reporting. escapes={escapes}", failures, verbose)
             _check("mcp_masked_home.contained_overlay_reports_no_escapes",
                    home_write_escapes(tempfile.mkdtemp(prefix="ase-empty-")) == []
                    and home_write_escapes(None) == [],
