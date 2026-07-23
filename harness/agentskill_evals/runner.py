@@ -300,7 +300,7 @@ class Runner:
         # Registered with the frame that owns the try/except/finally, not held in the body
         # that creates them: a raise below unwinds the body's locals, and a credential
         # directory nothing can still name is a credential directory nothing will remove.
-        cleanup = _CellCleanup()
+        cleanup = _CellCleanup(self.agent)
         cleanup.own("the agent's execution directory", exec_root)
 
         # A cell that raises (a buggy assertion, the judge choking on a malformed response, an
@@ -319,8 +319,7 @@ class Runner:
             # and it is the last moment anything knows these directories existed, so it says
             # what it knows out loud rather than discarding it.
             cleanup.purge_all()
-            for note in cleanup.take():
-                warn(f"warning: [{self.agent}] {note}")
+            cleanup.flush()
             # Cleared per cell, not per run: these are this scenario's resolved credentials
             # and nothing after this point may still be redacting against a stale set — a
             # secret carried into the NEXT cell would scrub text there for no reason, and
@@ -366,9 +365,9 @@ class Runner:
         # difference. `take()` collects the failures from both this sweep and any the body
         # recorded before it raised, which is the whole reason they are not body locals.
         cleanup.purge_all()
-        for note in [_scrub_and_note(workspace, self._secrets)] + cleanup.take():
-            if note:
-                rr.error = (rr.error + "; " if rr.error else "") + note
+        scrub_note = _scrub_and_note(workspace, self._secrets)
+        pending = cleanup.pending()
+        _record_notes(rr, ([(True, scrub_note)] if scrub_note else []) + pending)
         try:
             # Refreshed only if step 6 got as far as writing one: this path must not invent
             # an artifact the successful path would have, but must not leave a stale one
@@ -378,6 +377,9 @@ class Runner:
                 self._rwj(os.path.join(cell_dir, "result.json"), rr.to_dict())
             self._write_cell_json(cell_dir, cell)
             self._rw(os.path.join(cell_dir, "report.md"), render_report(cell))
+            # Only now, with the writes returned: this whole block is best-effort, and
+            # acknowledging before it would forget a note precisely when it failed to land.
+            cleanup.acknowledge(pending)
         except Exception:
             pass  # best-effort only — don't let artifact-writing mask the real error above
         if self.progress and cell_idx:
@@ -430,6 +432,12 @@ class Runner:
         plugin_cfg_masks = dict(getattr(adapter, "plugin_registry_config_masks", {}) or {})
         if self.isolated and (adapter.global_skills_subpaths or cfg_masks or plugin_cfg_masks):
             iso_home = tempfile.mkdtemp(prefix="ase-home-")
+            # Registered at creation, like the scratch dir and for the same reason: what
+            # follows — the overlay build, `_phase`, the effort resolution — can raise, and
+            # until this line the only thing that knew the directory existed was a local in
+            # the frame the raise unwinds. Non-fatal: it holds config masks and symlinks
+            # into the real home, so a stubborn one is a leaked tempdir, not a leaked secret.
+            cleanup.own("the isolated HOME", iso_home, fatal=False)
             seed_dirs = declared_dirs if self.provision else []
             try:
                 build_isolated_home(
@@ -463,7 +471,7 @@ class Runner:
                     # kill-switch) — running against the real HOME would load the user's
                     # real MCP servers, so fail this cell instead of falling open. An
                     # explicit `isolated: false` run is the documented opt-out.
-                    _remove(iso_home)
+                    cleanup.purge(iso_home)
                     raise RuntimeError(
                         f"HOME-overlay isolation failed ({exc}) and {self.agent} depends "
                         f"on it to keep MCP hermetically off — failing closed rather than "
@@ -472,7 +480,7 @@ class Runner:
                     ) from exc
                 print(f"warning: [{self.agent}] skill isolation unavailable ({exc}); "
                       "running non-isolated.", file=sys.stderr)
-                _remove(iso_home)
+                cleanup.purge(iso_home)
                 iso_home = None
                 iso_env = {}
             except Exception:
@@ -480,7 +488,7 @@ class Runner:
                 # tempdir either — clean up, then re-raise so _run_cell's crash-safety wrapper
                 # records a failed cell instead of aborting the whole batch (it has no way to
                 # reach this function-local iso_home itself).
-                _remove(iso_home)
+                cleanup.purge(iso_home)
                 raise
 
         # 5) run
@@ -534,12 +542,11 @@ class Runner:
             # how a failed scratch removal came to be reported as nothing at all.
             cleanup.purge(mcp_scratch)
             # The isolated HOME carries config masks and symlinks into the real home, not
-            # resolved secrets, so a stubborn one warns instead of failing the cell. It gets
-            # the same verified removal all the same: "best effort" was never the intent
+            # resolved secrets, so a stubborn one warns instead of failing the cell — the
+            # `fatal=False` it was registered with. It gets the same verified removal and
+            # the same durable record all the same: "best effort" was never the intent
             # here, it was just what `ignore_errors=True` happened to mean.
-            if iso_home and not _remove(iso_home):
-                warn(f"warning: [{self.agent}] the isolated HOME could not be removed: "
-                     f"{iso_home}")
+            cleanup.purge(iso_home)
         rr = ex.result
 
         if model and rr.error and _looks_like_model_error(rr.error, ex.stderr, model):
@@ -613,22 +620,23 @@ class Runner:
         # cell only has secrets when it declared MCP servers — potentially a copy of one.
         cleanup.purge(exec_root)
         error_before = rr.error
-        # `take()` drains the scratch-dir failure recorded back at `execute`'s finally along
-        # with this one. Both are this cell's, and this is the last place that can put them
-        # somewhere a reader will find them.
-        for note in [_scrub_and_note(workspace, self._secrets)] + cleanup.take():
-            if not note:
-                continue
-            # The scrub could not certify part of the tree, so it deleted that part — or,
-            # worse, could not delete it either; or a directory holding this cell's
-            # credentials outlived the cell. Say so loudly and fail: a cell that had to
-            # destroy evidence to stay safe has not produced a trustworthy result, and a
-            # silent deletion would be worse than either outcome it is choosing between.
-            # Ordered before the artifact writes below, so the sentence is on disk and not
-            # only in memory, and while `_secrets` still redacts what gets written.
-            rr.error = (rr.error + "; " if rr.error else "") + note
+        # The scrub could not certify part of the tree, so it deleted that part — or, worse,
+        # could not delete it either; or a directory holding this cell's credentials outlived
+        # the cell. Say so loudly and fail: a cell that had to destroy evidence to stay safe
+        # has not produced a trustworthy result, and a silent deletion would be worse than
+        # either outcome it is choosing between. Ordered before the artifact writes below, so
+        # the sentence is on disk and not only in memory, and while `_secrets` still redacts
+        # what gets written.
+        #
+        # `pending`, not a drain: this collects the scratch-dir failure recorded back at
+        # `execute`'s finally along with this one, and forgetting them here would put them in
+        # a local again — one frame later than the bug this replaced, and just as lossy if a
+        # write below raises. They are acknowledged after the writes, not before.
+        scrub_note = _scrub_and_note(workspace, self._secrets)
+        pending = cleanup.pending()
+        if _record_notes(rr, ([(True, scrub_note)] if scrub_note else []) + pending):
             passed = False
-        if rr.error != error_before:
+        if rr.error != error_before or pending:
             # `result.json` was serialized back at step 6, before the workspace could be
             # moved and long before any of this was knowable. Re-write it: `error` is the
             # field tooling greps, and a finding that reaches only report.md is a finding
@@ -650,6 +658,10 @@ class Runner:
             cell.judge_run_result = ctx.judge_exec.result
         self._write_cell_json(cell_dir, cell)
         self._rw(os.path.join(cell_dir, "report.md"), render_report(cell))
+        # The cleanup findings are on disk now — `result.json` above, `cell.json` and
+        # `report.md` just now — so they can be forgotten. Anything still held after this
+        # point is something no artifact carries, which is exactly what `flush` warns about.
+        cleanup.acknowledge(pending)
 
         # 8) judge artifacts — same detail level as the agent, prefixed judge_*
         if ctx.judge_exec is not None:
@@ -1549,7 +1561,13 @@ def _remove(path: str) -> bool:
     return not os.path.lexists(path)
 
 
-def _purge(label: str, path: Optional[str]) -> str:
+_CREDENTIAL_TAIL = ("it holds this cell's resolved credentials; delete it before sharing "
+                    "this machine's state")
+_TEMPDIR_TAIL = ("no resolved credentials are in it — config masks and symlinks into the "
+                 "real home — but nothing will clean it up now")
+
+
+def _purge(label: str, path: Optional[str], tail: str = _CREDENTIAL_TAIL) -> str:
     """Remove a directory that held credentials; return a sentence if it is still there.
 
     `shutil.rmtree(..., ignore_errors=True)` answers "did this raise", which is not the
@@ -1567,8 +1585,7 @@ def _purge(label: str, path: Optional[str]) -> str:
         return ""
     if _remove(path):
         return ""
-    return (f"{label} could not be removed and is still on disk: {path} — it holds this "
-            f"cell's resolved credentials; delete it before sharing this machine's state")
+    return f"{label} could not be removed and is still on disk: {path} — {tail}"
 
 
 class _CellCleanup:
@@ -1586,14 +1603,24 @@ class _CellCleanup:
     and whoever runs last sweeps whatever is left.
     """
 
-    def __init__(self) -> None:
-        self._owned: list[tuple[str, str]] = []
-        self._notes: list[str] = []
+    def __init__(self, agent: str) -> None:
+        self._agent = agent
+        self._owned: list[tuple[str, str, bool]] = []
+        self._notes: list[tuple[bool, str]] = []
 
-    def own(self, label: str, path: Optional[str]) -> None:
-        """Register a credential directory as this cell's to remove; `None` is a no-op."""
+    def own(self, label: str, path: Optional[str], *, fatal: bool = True) -> None:
+        """Register a directory as this cell's to remove; `None` is a no-op.
+
+        `fatal` says what a failure to remove it MEANS. The credential directories fail the
+        cell: a resolved `${VAR}` outliving the run that resolved it is not a result anyone
+        should trust. The isolated HOME holds config masks and symlinks into the real home,
+        so a stubborn one is a leaked temp directory rather than a leaked secret and lands on
+        `warnings` instead. The distinction is the reason it is a flag and not two classes:
+        both need the same registration, the same verified removal, and the same guarantee
+        that the answer outlives the frame that asked for it.
+        """
         if path:
-            self._owned.append((label, path))
+            self._owned.append((label, path, fatal))
 
     def purge(self, path: Optional[str]) -> None:
         """Remove one registered directory, keeping any failure; `None` is a no-op.
@@ -1604,24 +1631,66 @@ class _CellCleanup:
         """
         for entry in [e for e in self._owned if path and e[1] == path]:
             self._owned.remove(entry)
-            note = _purge(*entry)
+            label, owned, fatal = entry
+            note = _purge(label, owned, _CREDENTIAL_TAIL if fatal else _TEMPDIR_TAIL)
             if note:
-                self._notes.append(note)
+                self._notes.append((fatal, note))
 
     def purge_all(self) -> None:
         """Remove every directory still registered, most recently created first."""
-        for _, path in list(reversed(self._owned)):
+        for _, path, _ in list(reversed(self._owned)):
             self.purge(path)
 
-    def take(self) -> list[str]:
-        """Hand the failures so far to a caller that will record them, and forget them.
+    def pending(self) -> list[tuple[bool, str]]:
+        """The failures recorded so far, WITHOUT forgetting them.
 
-        Draining is what makes the backstop meaningful: what is left when `_run_cell`'s
-        finally runs is exactly what no result was written for, so it can warn without
-        repeating a sentence that already reached the artifacts.
+        Reading used to drain, which put the note in a local again — one frame later than
+        before, and just as lossy: review made the `result.json` rewrite raise between the
+        read and the write, and the scratch-dir failure vanished from a cell that then
+        reported only the write error. A note is owed to a reader until it reaches one, so
+        handing it out and forgetting it are separate steps (see `acknowledge`).
+        """
+        return list(self._notes)
+
+    def acknowledge(self, notes: list[tuple[bool, str]]) -> None:
+        """Forget failures that are now ON DISK — never merely handed to something.
+
+        Call this after the artifact writes that carry them have returned, not before. What
+        is still here when `flush` runs is exactly what no artifact ever recorded.
+        """
+        for note in notes:
+            if note in self._notes:
+                self._notes.remove(note)
+
+    def flush(self) -> None:
+        """Last stop: echo whatever never reached an artifact, and forget it.
+
+        `_run_cell`'s finally is the final moment anything knows these directories existed.
+        Reaching here means both the success and failure paths were unable to write the
+        finding down, so stderr is all that is left — better than the silence that a
+        drain-on-read gave when the write behind it failed.
         """
         notes, self._notes = self._notes, []
-        return notes
+        for _, note in notes:
+            warn(f"warning: [{self._agent}] {note}")
+
+
+def _record_notes(rr: RunResult, notes: list[tuple[bool, str]]) -> bool:
+    """Put cleanup failures on a result; return True if any of them must fail the cell.
+
+    Fatal ones join `error`, the field tooling greps. The rest join `warnings`, which
+    `notices.py` already routes to cell.json, report.md and summary.json — so a leaked
+    temp directory is still named somewhere durable without pretending the cell's output
+    is untrustworthy.
+    """
+    fatal_seen = False
+    for fatal, note in notes:
+        if fatal:
+            rr.error = (rr.error + "; " if rr.error else "") + note
+            fatal_seen = True
+        elif note not in rr.warnings:
+            rr.warnings.append(note)
+    return fatal_seen
 
 
 def _all_offending_paths(root: str, secrets) -> list[str]:

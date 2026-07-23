@@ -342,6 +342,26 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   owned it. A resource is unguarded for exactly as long as the gap between creating it and
   registering it.
 
+  And then the same lesson landed a third time, on the *read* side. My first version of the
+  handoff drained the notes when the caller took them — which put them straight back into a
+  local, one frame later than the bug I had just fixed. Review made the write that was
+  supposed to carry the note raise, and it was gone again. A destructive read is a transfer
+  of custody to something that has not yet succeeded. `pending()` now hands out a copy and
+  `acknowledge()` is called after the writes return, which is the same shape as an ack in
+  any delivery protocol and for the same reason: the sender forgets when the receiver
+  confirms, not when the sender transmits. The corollary caught a further variant — one
+  write later is still too early, because the crash path *rewrites* `result.json` from a
+  rebuilt result, so a note already forgotten is overwritten rather than merely absent.
+
+  The other half of that round: the isolated HOME had never been a registered resource at
+  all, built at step 4 with its cleanup beginning at step 5. Giving it the same ownership
+  meant admitting a severity axis, since a stubborn HOME is a leaked temp directory and not
+  a leaked secret. Making that a flag on the registration rather than a second mechanism is
+  what keeps the two honest: identical registration, identical verified removal, identical
+  guarantee that the answer outlives the frame — differing only in whether the sentence
+  lands on `error` or on `warnings`, and in refusing to borrow the credential wording for a
+  directory that holds none.
+
 - **A mutation test is also a test of the deletion path nobody exercised.** Disabling the
   scrub's permission repair was supposed to make one arm go red; instead it crashed the
   whole section, because the quarantine could not remove a `chmod 000` *directory* — `rmtree`

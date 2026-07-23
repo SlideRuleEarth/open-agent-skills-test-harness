@@ -1278,6 +1278,157 @@ def _check_workspace_relocation(failures, verbose):
                f"created, so the guard has to start where the directory does rather than at "
                f"`execute` with two raise-capable statements in between: "
                f"removed={[os.path.basename(p) for p in removed]}", failures, verbose)
+
+        # Holding the note in the surviving frame is only half of it: reading it must not
+        # DESTROY it either. A drain-on-read puts the note back in a local — one frame later
+        # than the original bug and just as lossy the moment the write behind it raises.
+        seen.clear()
+        run_dir9 = os.path.join(repo_root, "artifacts", "run9")
+        os.makedirs(run_dir9)
+        r.run_id, r.run_dir = "run9", run_dir9
+        _orig_rwj = runner_mod.Runner._rwj
+        writes: list = []
+
+        def _flaky_rwj(self, path, data):
+            if os.path.basename(path) == "result.json":
+                writes.append(path)
+                if len(writes) == 2:  # the rewrite that is supposed to carry the note
+                    raise OSError("selftest: result.json write failed")
+            return _orig_rwj(self, path, data)
+
+        runner_mod.Runner._rwj = _flaky_rwj
+        runner_mod._remove = lambda p: False if "ase-mcp-" in p else _orig_remove(p)
+        try:
+            cell9 = r._run_cell(ModelTarget(), spec5)
+        finally:
+            runner_mod.Runner._rwj = _orig_rwj
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            s9 = seen.get("scratch") or ""
+            if os.path.basename(s9).startswith("ase-mcp-"):
+                _try(lambda: shutil.rmtree(s9, ignore_errors=True))
+        err9 = cell9.run_result.error or ""
+        res9 = _try(lambda: open(os.path.join(cell9.artifacts_dir, "result.json")).read(), "")
+        _check("relocate.cleanup_note_is_acknowledged_only_once_it_is_on_disk",
+               bool(seen.get("scratch")) and "result.json write failed" in err9
+               and "MCP scratch directory" in err9 and (seen.get("scratch") or "?") in err9
+               and "MCP scratch directory" in res9,
+               f"the write that was supposed to carry the note raised, and the crash path "
+               f"has to still find it: a note is owed to a reader until it REACHES one, so "
+               f"handing it out and forgetting it are separate steps and the second happens "
+               f"after the artifact writes return. err={err9[:150]!r} "
+               f"in_result_json={'MCP scratch directory' in res9}", failures, verbose)
+
+        # And the same again one write later. Acknowledging after `result.json` but before
+        # `report.md` looks safe — the note IS on disk — right up until the crash path
+        # rewrites `result.json` from a fresh result that no longer carries it.
+        seen.clear()
+        run_dir12 = os.path.join(repo_root, "artifacts", "run12")
+        os.makedirs(run_dir12)
+        r.run_id, r.run_dir = "run12", run_dir12
+        _orig_wcj = runner_mod.Runner._write_cell_json
+        cj_writes: list = []
+
+        def _flaky_write_cell_json(self, cell_dir, cell):
+            cj_writes.append(cell_dir)
+            if len(cj_writes) == 1:  # the body's write, after result.json already landed
+                raise OSError("selftest: cell.json write failed")
+            return _orig_wcj(self, cell_dir, cell)
+
+        runner_mod.Runner._write_cell_json = _flaky_write_cell_json
+        runner_mod._remove = lambda p: False if "ase-mcp-" in p else _orig_remove(p)
+        try:
+            cell12 = r._run_cell(ModelTarget(), spec5)
+        finally:
+            runner_mod.Runner._write_cell_json = _orig_wcj
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            s12 = seen.get("scratch") or ""
+            if os.path.basename(s12).startswith("ase-mcp-"):
+                _try(lambda: shutil.rmtree(s12, ignore_errors=True))
+        res12 = _try(lambda: open(os.path.join(cell12.artifacts_dir, "result.json")).read(), "")
+        _check("relocate.cleanup_note_survives_the_crash_rewriting_result_json",
+               bool(seen.get("scratch")) and "cell.json write failed" in res12
+               and "MCP scratch directory" in res12,
+               f"the note reached result.json and a LATER write raised — and the crash path "
+               f"then rewrites result.json from a result it rebuilt, so anything already "
+               f"forgotten is overwritten rather than merely absent. Acknowledgement belongs "
+               f"after every write that carries the note, not after the first one: "
+               f"in_result_json={'MCP scratch directory' in res12} res={res12[:120]!r}",
+               failures, verbose)
+
+        # The isolated HOME is built well before the guard that removed it, and everything in
+        # between — the overlay build, a progress update, the effort resolution — can raise.
+        class _AngryProgress:
+            def update(self, **kw):
+                if str(kw.get("phase", "")).startswith("running agent"):
+                    raise RuntimeError("selftest: progress exploded")
+
+            def done(self, **kw):
+                pass
+
+        seen.clear()
+        run_dir10 = os.path.join(repo_root, "artifacts", "run10")
+        os.makedirs(run_dir10)
+        r.run_id, r.run_dir = "run10", run_dir10
+        homes_seen: list = []
+        _saved_progress = r.progress
+        r.progress = _AngryProgress()
+        runner_mod._remove = lambda p: (homes_seen.append(p), _orig_remove(p))[1]
+        try:
+            cell10 = r._run_cell(ModelTarget(), spec)
+        finally:
+            r.progress = _saved_progress
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+        homes = [p for p in homes_seen if os.path.basename(p).startswith("ase-home-")]
+        _check("relocate.isolated_home_is_owned_from_the_moment_it_exists",
+               bool(homes) and all(not os.path.lexists(p) for p in homes)
+               and "progress exploded" in (cell10.run_result.error or ""),
+               f"a raise between building the isolated HOME and reaching the code that "
+               f"removes it left `ase-home-*` behind, unnamed: registration belongs at "
+               f"creation, since until then the only thing that knows the directory exists "
+               f"is a local in the frame the raise unwinds. "
+               f"homes={[os.path.basename(p) for p in homes]}", failures, verbose)
+
+        # ...and a HOME that will not go is NAMED — on `warnings`, not `error`. It carries
+        # config masks and symlinks into the real home, so it is a leaked temp directory
+        # rather than a leaked secret, and failing the cell over it would be a lie.
+        seen.clear()
+        run_dir11 = os.path.join(repo_root, "artifacts", "run11")
+        os.makedirs(run_dir11)
+        r.run_id, r.run_dir = "run11", run_dir11
+        stuck_homes: list = []
+        r.progress = _AngryProgress()
+
+        def _no_home_removal(p):
+            if "ase-home-" in p:
+                stuck_homes.append(p)
+                return False
+            return _orig_remove(p)
+
+        runner_mod._remove = _no_home_removal
+        try:
+            cell11 = r._run_cell(ModelTarget(), spec)
+        finally:
+            r.progress = _saved_progress
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            for p in stuck_homes:  # never reach past what the runner made
+                if os.path.basename(p).startswith("ase-home-"):
+                    _try(lambda p=p: shutil.rmtree(p, ignore_errors=True))
+        warns11 = " ".join(cell11.run_result.warnings or [])
+        rep11 = _try(lambda: open(os.path.join(cell11.artifacts_dir, "report.md")).read(), "")
+        _check("relocate.stubborn_isolated_home_warns_rather_than_failing_the_cell",
+               "the isolated HOME could not be removed" in warns11
+               and "holds this cell's resolved credentials" not in warns11
+               and "the isolated HOME" not in (cell11.run_result.error or "")
+               and "the isolated HOME could not be removed" in rep11,
+               f"same registration and same verified removal as the credential dirs, but a "
+               f"different verdict: this one lands on `warnings` (durable via cell.json and "
+               f"report.md) instead of failing the cell, and its sentence must not claim it "
+               f"holds credentials. warnings={warns11[:130]!r} "
+               f"err={(cell11.run_result.error or '')[:60]!r}", failures, verbose)
     finally:
         runner_mod.execute = orig_execute
         shutil.rmtree(repo_root, ignore_errors=True)
