@@ -1,0 +1,49 @@
+# mcp_echo_smoke.yaml — the positive half of the MCP story: a DECLARED server must be
+# reachable, and the agent must actually call it.
+# Run:  agentskill-evals run --config scenarios/mcp_echo_smoke.yaml
+# Dry:  agentskill-evals run --config scenarios/mcp_echo_smoke.yaml --dry-run
+
+# HOW THIS DIFFERS FROM list_mcp_server_visible_claude.yaml
+# That one is an ambient check that no server leaks IN. This one proves the opposite
+# direction: a server the scenario declares is loaded, advertised, and callable. Both are
+# needed — a kill-switch that also blocks intentional servers would pass the hermeticity
+# check and be useless, which is exactly the state the claude adapter was in before
+# `_mcp_witness` learned to permit declared servers.
+#
+# Unlike the ambient check, this one is HOST-INDEPENDENT: it ships its own server
+# (fixtures/echo_mcp_server.py, zero dependencies, stdio) rather than depending on whatever
+# the host happens to have configured, so a failure here is always a real failure.
+
+name: mcp_echo_smoke
+description: >
+  Declared-MCP smoke test for the claude runner: a scenario-supplied stdio server is
+  loaded via --mcp-config under --strict-mcp-config, and the agent calls its `echo` tool.
+
+target:
+  runner: claude
+  model:
+    - claude-haiku-4-5
+
+skills:
+
+mcp_servers:
+  echo:
+    command: python3
+    # Resolved against this file's directory and absolutized, because the agent runs in a
+    # tempdir workspace with no path relationship to this repo (see spec.resolved_files).
+    args: [../harness/fixtures/echo_mcp_server.py]
+
+assertions:
+  - { type: no_error }
+  # Claude passes tool_use names through untouched, so an MCP tool arrives under its
+  # native `mcp__<server>__<tool>` spelling. The portable `used_mcp_tool` assertion in
+  # DESIGN §7 lands when a second adapter does — naming conventions differ per CLI, and
+  # there is nothing to normalize across yet.
+  - { type: used_tool, name: mcp__echo__echo }
+  - { type: final_contains, contains: "porcupine" }
+
+# A distinctive token so `final_contains` cannot pass on a paraphrase: the model has no way
+# to produce it except by calling the tool and reading the result back.
+prompt: |
+  Use the `echo` MCP tool to echo the exact text `porcupine-42` and then tell me
+  precisely what the tool returned.

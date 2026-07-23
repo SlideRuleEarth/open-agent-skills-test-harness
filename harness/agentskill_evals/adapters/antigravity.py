@@ -1,8 +1,15 @@
 """AntiGravity (Google) adapter.
 
-Verified against agy 1.0.16:
+Invocation:
     agy -p "<prompt>" --output-format json [--add-dir DIR] \\
         [--dangerously-skip-permissions] [--model MODEL]
+
+Version provenance is _VERIFIED_VERSIONS below, not this header — the findings in this
+file were established at different times against different builds, and a single "verified
+against X" line at the top could only ever be wrong about most of them. (It was: it said
+1.0.16 while the comments below cited 1.1.1, which is the prose-rot failure this
+adapter's provenance constant exists to stop.) Each finding names the build it was
+checked on, inline, where it can be re-checked.
 
   * Binary is `agy`, not `antigravity`. `-p` / `--print` / `--prompt` run a
     single prompt non-interactively.
@@ -51,12 +58,68 @@ from .base import (
     Adapter,
     ParseOutput,
     RunOptions,
+    VersionProvenance,
     extract_command,
     extract_path,
     iter_jsonl,
     snake_case_keys,
     try_load_json,
     warn_unknown_usage,
+)
+
+# --- CLI version provenance (see base.VersionProvenance) ---------------------------
+#
+# 1.1.1: the build the MCP/customization-channel inventory below was established against
+#        — the four customization roots and the plugin mcp_config.json channel, each
+#        confirmed with a live sentinel stdio server. That inventory is what this
+#        adapter's hermeticity argument rests on, so it is what the constant tracks.
+#
+# NOT 1.1.2, which is what was installed on the dev host on 2026-07-21. The invocation
+# contract was re-checked there and holds (`agy --help` still documents -p/--print,
+# --add-dir, --dangerously-skip-permissions, --model), but the channel inventory was NOT
+# re-established, and that is the part a new build can quietly invalidate. Listing 1.1.2
+# here because it "seems fine" would be the constant blessing an unknown state — the
+# exact prose-rot failure it replaced. So a 1.1.2 run warns, correctly: the drift is real
+# and un-re-verified, and the warning is how it stays visible until someone re-runs the
+# sentinel tests.
+_VERIFIED_VERSIONS = ("1.1.1",)
+_VERIFIED_ON = "2026-07-21"
+
+# Why the executing version cannot be read from the run, checked on 2026-07-21:
+#
+#   * The `--output-format json` result object carries no version — its keys are exactly
+#     _KNOWN_RESULT_KEYS below.
+#   * Neither does the transcript this adapter already reads off disk
+#     (transcript_full.jsonl steps carry step_index/source/type/status/created_at/content).
+#
+# There IS a candidate: `~/.gemini/antigravity-cli/cli.log` opens with a "Language server
+# version: <v>" banner the run itself writes. It is not used, for two reasons that would
+# each have to be settled first. It sits at a fixed shared path, so attributing a line to
+# THIS run depends on the isolated HOME actually containing it rather than the real one —
+# unverified. And it is a free-form log the agent's own activity also writes into, so a
+# naive scan would be reading a channel that model-controlled text can reach, which is the
+# forgery hazard the copilot adapter had to design around. Until both are settled, "we do
+# not know" is the honest answer.
+#
+# An `agy --version` probe is not the answer either: the standing rule is that a fact
+# learned by executing the program again may not CLEAR a security decision, and a probe
+# resolves its own code path — it can truthfully report a build the run never used.
+_VERSION_UNREADABLE = (
+    "neither agy's `--output-format json` result nor the transcript it writes to disk "
+    "states the executing version"
+)
+
+_PROVENANCE = VersionProvenance(
+    agent="antigravity",
+    verified=_VERIFIED_VERSIONS,
+    verified_on=_VERIFIED_ON,
+    unreadable=_VERSION_UNREADABLE,
+    analysis="MCP/customization-channel hermeticity analysis",
+    clear_hint=(
+        "There is nothing to clear per-run. Check `agy --version` against the list above "
+        "out of band; if it differs, re-establish the customization-root and plugin "
+        "mcp_config channel findings in adapters/antigravity.py with live sentinel "
+        "servers, then update _VERIFIED_VERSIONS."),
 )
 
 _PAREN_RE = re.compile(r"\s*\(([^)]+)\)\s*$")
@@ -200,6 +263,19 @@ class AntigravityAdapter(Adapter):
             argv += ["--model", opts.model]
         argv += opts.extra_args
         return argv
+
+    def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str,
+                        stdout: str = "", stderr: str = "", exit_code: int = 0) -> None:
+        """Record that this run's agy build is unidentifiable, and against which build the
+        channel inventory was actually established.
+
+        No denylist check, and none is possible: every version-keyed tier needs a version.
+        VersionProvenance refuses to hold a denylist next to ``unreadable`` for that
+        reason. The hermeticity argument itself rests on the isolation overlay masking the
+        customization roots, which is evidence about this run's filesystem rather than
+        about which build read it.
+        """
+        _PROVENANCE.warn_drift(None)
 
     def parse(self, stdout: str, stderr: str, exit_code: int,
                *, opts: Optional[RunOptions] = None) -> ParseOutput:

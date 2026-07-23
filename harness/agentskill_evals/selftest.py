@@ -110,6 +110,34 @@ def _check(name, cond, msg, failures, verbose):
         failures.append(name)
 
 
+def _section(fn, failures, verbose):
+    """Run one check section, containing a crash to that section.
+
+    A section that RAISES used to take the whole selftest with it: no summary line, and
+    every section after it silently never ran, so one crash hid an unknown number of real
+    results and each fix-and-rerun cycle surfaced only the next one. Individual arms
+    already have this property — a false condition is recorded and the run continues — and
+    this extends it one level up.
+
+    A crash is recorded as a FAILURE, never a skip. That direction is the whole point: the
+    alternative turns today's loud abort into a quiet green, which is strictly worse than
+    the problem being fixed. The traceback is printed rather than swallowed, because the
+    reason this is safe to contain is that the diagnostic survives containment.
+
+    Catches `Exception`, not `BaseException`, so KeyboardInterrupt and SystemExit still
+    stop the run — a selftest that cannot be interrupted is its own defect.
+    """
+    name = fn.__name__.removeprefix("_check_")
+    try:
+        fn(failures, verbose)
+    except Exception:                       # noqa: BLE001 — containment is the point
+        import traceback
+        failures.append(f"{name}.CRASHED")
+        print(f"  [FAIL] {name}.CRASHED: the section raised instead of reporting, so its "
+              f"remaining arms never ran and prove nothing. Sections after it still did.")
+        print("".join("    " + ln for ln in traceback.format_exc().splitlines(True)))
+
+
 def _flag_pair(argv, flag, value) -> bool:
     """True if argv contains ``flag`` immediately followed by ``value``."""
     return any(a == flag and i + 1 < len(argv) and argv[i + 1] == value
@@ -898,6 +926,11 @@ class _FakeAdapter:
     # True so effort-threading checks see the resolved value in RunOptions; _run_cell_body
     # nulls the effort for adapters without this control (see effort.unsupported_not_claimed).
     supports_reasoning_effort = True
+    # This stand-in invokes no CLI and reads no configuration, so it has nothing for
+    # concurrent cells to share — which is exactly what the flag asserts. Set so the
+    # parallel-dispatch tests (cell_idx assignment) can still exercise --jobs>1; the real
+    # adapters all leave it False because their config homes ARE shared (see base.Adapter).
+    parallel_safe_config = True
 
 
 def _check_workspace_relocation(failures, verbose):
@@ -920,19 +953,78 @@ def _check_workspace_relocation(failures, verbose):
 
     print("workspace relocation (exec dir escapes the repo tree):")
     repo_root = tempfile.mkdtemp(prefix="ase-repo2-")
+    # Defined out here because the finally below restores them; an arm that raises early
+    # must not turn its own cleanup into a NameError.
+    real_home_env = os.environ.get("HOME")
+    contained_home = tempfile.mkdtemp(prefix="ase-fakehome-")
     seen: dict = {}
     orig_execute = runner_mod.execute
 
+    def _try(fn, default=None):
+        """Run fn, turning any exception into `default` — arms below assert on VALUES, and a
+        mutation that makes production code raise would otherwise abort the section."""
+        try:
+            return fn()
+        except Exception:
+            return default
+
+    def _own_tempdir(path):
+        """The exec tempdir, but only if it still looks like one.
+
+        These arms chmod and rmtree what `_run_cell` handed the agent. A defect that makes
+        exec_ws the tempdir ROOT turns `dirname(cwd)` into the SYSTEM temp directory, and
+        this cleanup would then lock or delete it — mutation testing found that by wiping
+        its own working tree. A test's cleanup must never be able to reach further than the
+        thing it created."""
+        parent = os.path.dirname(path or "")
+        return parent if os.path.basename(path or "") == "workspace" and (
+            os.path.basename(parent).startswith("ase-ws-")) else None
+
     def _fake_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides, agent_name, eval_name):
         seen["cwd"] = cwd
+        seen["scratch"] = opts.mcp_scratch_dir
+        seen["home"] = opts.home
         # the isolated HOME is deleted right after execute() returns, so the mask must be
         # inspected here, while the agent would actually see it.
         if opts.home:
             mask = os.path.join(opts.home, ".fakecli", "mcp.json")
             if os.path.isfile(mask) and not os.path.islink(mask):
                 seen["mask_content"] = open(mask).read()
+            # $HOME is WRITABLE by the child, so the harness knows this directory's initial
+            # contents and not its final ones. Every real agent does this — caches, session
+            # state — and any of it can be a copy of what the agent was handed.
+            with open(os.path.join(opts.home, "agent-cache.txt"), "w") as f:
+                f.write("tok sk-secret-abcdef\n")
         with open(os.path.join(cwd, "run.py"), "w") as f:
             f.write("print('hi')\n")
+        # A cwd is a place the agent can WRITE, so `..` is part of the attack surface, not
+        # just `list_dir`'s. Written every time: the arms below assert where it landed.
+        with open(os.path.join(cwd, "..", "above-cwd.txt"), "w") as f:
+            f.write("tok sk-secret-abcdef\n")
+        if seen.get("make_special"):
+            # A special file the scrub cannot read and therefore cannot certify: it gets
+            # QUARANTINED, which is a deletion the cell has to report.
+            #
+            # A socket rather than a FIFO, deliberately. Both are special files and both
+            # take the same `_give_up` branch, but `open()` on a FIFO BLOCKS while `open()`
+            # on a socket fails ENXIO at once — and this arm drives `_run_cell` on the main
+            # thread. Mutation testing found that the hard way: the mutation that makes the
+            # scrub treat every non-directory as a readable regular file wedged the whole
+            # suite here. The one arm that must use a FIFO joins a 20s thread for this
+            # reason; every other arm should simply not arm the trap.
+            def _sock():
+                import socket as _socket
+                s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                try:
+                    s.bind(os.path.join(cwd, "sock"))
+                finally:
+                    s.close()
+            _try(_sock)
+        if seen.get("lock_exec_root") and os.path.basename(cwd) == "workspace":
+            # The agent locks the directory it was handed. `rmtree(ignore_errors=True)` then
+            # answers "did this raise" rather than "is it gone", and both secret-bearing
+            # files survived a cell that said nothing about them.
+            os.chmod(os.path.dirname(cwd), 0o000)
         rr = RunResult(
             agent=agent_name, eval_name=eval_name, prompt=prompt, workdir=cwd,
             events=[NormalizedEvent(EventKind.FILE_CHANGE, path="run.py")],
@@ -992,8 +1084,600 @@ def _check_workspace_relocation(failures, verbose):
                rp == os.path.join(cell_workspace, "run.py") and os.path.isfile(rp),
                f"file_exists resolved_path points at the final workspace, not the deleted "
                f"tempdir: {rp}", failures, verbose)
+        _check("relocate.parent_of_exec_cwd_is_not_published",
+               not os.path.exists(os.path.join(cell.artifacts_dir, "above-cwd.txt"))
+               and not os.path.isdir(os.path.dirname(cwd_used or repo_root)),
+               f"what the agent wrote ABOVE its cwd is discarded, not archived: exec_ws is "
+               f"nested one level inside the harness's own tempdir, so `..` reaches a "
+               f"directory that is deleted whole rather than the artifact tree: "
+               f"cell_dir={sorted(os.listdir(cell.artifacts_dir))}", failures, verbose)
+
+        # Everything above ran isolated. The exec-dir relocation must NOT be gated on that
+        # flag: `--no-isolated` means "see my real HOME and installed skills", and review
+        # used it to write `../agent-created.txt` straight into cell_dir, where the workspace
+        # scrub never looks because only `workspace` is archived.
+        seen.clear()
+        run_dir2 = os.path.join(repo_root, "artifacts", "run2")
+        os.makedirs(run_dir2)
+        r.run_id, r.run_dir, r.isolated = "run2", run_dir2, False
+        r._secrets = r._run_secrets = ("sk-secret-abcdef",)
+        try:
+            cell2 = r._run_cell(ModelTarget(), spec)
+        finally:
+            r._secrets = r._run_secrets = ()
+        cwd2 = seen.get("cwd")
+        inside2 = os.path.abspath(cwd2 or "").startswith(
+            os.path.abspath(cell2.artifacts_dir) + os.sep)
+        above2 = os.path.join(cell2.artifacts_dir, "above-cwd.txt")
+        _check("relocate.exec_cwd_detached_even_when_not_isolated",
+               cwd2 is not None and not inside2 and not os.path.exists(above2)
+               and os.path.isfile(os.path.join(cell2.artifacts_dir, "workspace", "run.py")),
+               f"a --no-isolated cell still runs in a detached tempdir, so `../x` from the "
+               f"agent's cwd cannot reach the artifact directory — HOME isolation and "
+               f"execution-directory isolation answer different questions, and gating the "
+               f"second on the first left the results tree writable: cwd={cwd2} "
+               f"cell_dir={sorted(os.listdir(cell2.artifacts_dir))}", failures, verbose)
+
+        # The exec tempdir holds whatever the agent wrote, including anything it echoed back
+        # from an MCP result. `shutil.rmtree(..., ignore_errors=True)` reports on the CALL,
+        # not on the directory: a chmod 000 left both secret-bearing files on disk in silence.
+        seen.clear()
+        seen["lock_exec_root"] = True
+        run_dir3 = os.path.join(repo_root, "artifacts", "run3")
+        os.makedirs(run_dir3)
+        r.run_id, r.run_dir, r.isolated = "run3", run_dir3, True
+        r._secrets = r._run_secrets = ("sk-secret-abcdef",)
+        try:
+            r._run_cell(ModelTarget(), spec)  # the cell's verdict is not the point here
+        finally:
+            r._secrets = r._run_secrets = ()
+        root3 = _own_tempdir(seen.get("cwd")) or os.path.join(repo_root, "no-exec-root")
+        _try(lambda: os.chmod(root3, 0o700))  # a regression leaves it undeletable otherwise
+        _check("relocate.locked_exec_dir_is_actually_removed",
+               not os.path.exists(root3),
+               f"a temp dir the agent locked is still removed, through the same outward-in "
+               f"escalation the workspace quarantine uses — `ignore_errors=True` answers "
+               f"'did this raise', which is not the question being asked of a directory "
+               f"holding resolved credentials: {root3} "
+               f"survivors={_try(lambda: sorted(os.listdir(root3)), [])}", failures, verbose)
+
+        # And when removal genuinely cannot succeed, saying nothing is the failure. The note
+        # has to reach the artifacts — result.json included, which step 6 wrote long before
+        # any of this was knowable — and has to cost the cell its pass.
+        seen.clear()
+        run_dir4 = os.path.join(repo_root, "artifacts", "run4")
+        os.makedirs(run_dir4)
+        r.run_id, r.run_dir = "run4", run_dir4
+        r._secrets = r._run_secrets = ("sk-secret-abcdef",)
+        _orig_remove = runner_mod._remove
+        runner_mod._remove = lambda p: False if "ase-ws-" in p else _orig_remove(p)
+        try:
+            cell4 = r._run_cell(ModelTarget(), spec)
+        finally:
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            leftover4 = _own_tempdir(seen.get("cwd"))
+            if leftover4:
+                _try(lambda: os.chmod(leftover4, 0o700))
+                _try(lambda: shutil.rmtree(leftover4, ignore_errors=True))
+        err4 = cell4.run_result.error or ""
+        rj4 = os.path.join(cell4.artifacts_dir, "result.json")
+        res4 = _try(lambda: open(rj4).read(), "")
+        rep4 = _try(lambda: open(os.path.join(cell4.artifacts_dir, "report.md")).read(), "")
+        _check("relocate.undeletable_exec_dir_is_durable_and_load_bearing",
+               cell4.passed is False and "could not be removed and is still on disk" in err4
+               and "could not be removed" in res4 and "could not be removed" in rep4
+               and "sk-secret-abcdef" not in res4 and "sk-secret-abcdef" not in rep4,
+               f"a credential directory that outlives its cell fails that cell and says so "
+               f"in result.json as well as report.md — result.json is serialized at step 6, "
+               f"before the workspace is even moved, so a note appended afterwards reaches "
+               f"only half the readers unless it is re-written: passed={cell4.passed} "
+               f"in_result_json={'could not be removed' in res4} err={err4[:90]!r}",
+               failures, verbose)
+
+        # The MCP scratch dir is the one place a resolved `${VAR}` is written in the clear —
+        # its `mcp.json` IS the credential — and it was removed by the same best-effort call.
+        from .mcp import parse_mcp_servers
+        seen.clear()
+        run_dir5 = os.path.join(repo_root, "artifacts", "run5")
+        os.makedirs(run_dir5)
+        r.run_id, r.run_dir = "run5", run_dir5
+        spec5 = EvalSpec(name="demo", prompt="hi",
+                         source_path=os.path.join(repo_root, "demo.yaml"),
+                         mcp_servers=parse_mcp_servers(
+                             {"echo": {"command": "/bin/echo"}}, where="selftest"))
+        runner_mod._remove = lambda p: False if "ase-mcp-" in p else _orig_remove(p)
+        try:
+            cell5 = r._run_cell(ModelTarget(), spec5)
+        finally:
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            s5 = seen.get("scratch") or ""
+            if os.path.basename(s5).startswith("ase-mcp-"):  # never reach past what we made
+                _try(lambda: shutil.rmtree(s5, ignore_errors=True))
+        err5 = cell5.run_result.error or ""
+        _check("relocate.mcp_scratch_dir_removal_is_load_bearing",
+               bool(seen.get("scratch")) and cell5.passed is False
+               and "MCP scratch directory" in err5 and (seen.get("scratch") or "?") in err5,
+               f"the scratch dir that held the interpolated credentials is purged through "
+               f"the verified path too, and a failure to remove it fails the cell naming the "
+               f"directory — the config file in there is the resolved secret in the clear, so "
+               f"'probably deleted' is not an answer: scratch={seen.get('scratch')} "
+               f"passed={cell5.passed} err={err5[:110]!r}", failures, verbose)
+
+        # ...but only if the note SURVIVES. `execute()` raising is not an exotic path — a
+        # crashed CLI, a timeout handler that throws, an adapter bug — and it transfers
+        # control out of the frame holding the note. Review forced both at once and got a
+        # cell that recorded `RuntimeError` and nothing about the `mcp.json` left on disk.
+        seen.clear()
+        run_dir6 = os.path.join(repo_root, "artifacts", "run6")
+        os.makedirs(run_dir6)
+        r.run_id, r.run_dir = "run6", run_dir6
+
+        def _crashing_execute(*a, **kw):
+            _fake_execute(*a, **kw)  # record the scratch dir, then die like a real CLI
+            raise RuntimeError("child crashed")
+
+        runner_mod.execute = _crashing_execute
+        runner_mod._remove = lambda p: False if "ase-mcp-" in p else _orig_remove(p)
+        try:
+            cell6 = r._run_cell(ModelTarget(), spec5)
+        finally:
+            runner_mod.execute = _fake_execute
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            s6 = seen.get("scratch") or ""
+            if os.path.basename(s6).startswith("ase-mcp-"):  # never reach past what we made
+                _try(lambda: shutil.rmtree(s6, ignore_errors=True))
+        err6 = cell6.run_result.error or ""
+        rep6 = _try(lambda: open(os.path.join(cell6.artifacts_dir, "report.md")).read(), "")
+        _check("relocate.scratch_failure_survives_a_crashing_execute",
+               bool(seen.get("scratch")) and "child crashed" in err6
+               and (seen.get("scratch") or "?") in err6
+               and err6.count("MCP scratch directory") == 1
+               and "MCP scratch directory" in rep6,
+               f"a crash in execute() must not swallow the credential-directory failure "
+               f"recorded on the way out: the note lived in a body local and the exception "
+               f"left the body, so the crashed cell reported only the crash. Once, not "
+               f"twice — a directory that could not be removed is deregistered, so the "
+               f"outer sweep neither retries what already escalated nor repeats itself. "
+               f"scratch={seen.get('scratch')} err={err6[:130]!r}", failures, verbose)
+
+        # The other half of the same loss: `execute` returns, the note is recorded, and
+        # something AFTER it raises before the body reaches the code that applies notes —
+        # "an OSError mid-move" is the case `_run_cell`'s own docstring already names.
+        seen.clear()
+        run_dir7 = os.path.join(repo_root, "artifacts", "run7")
+        os.makedirs(run_dir7)
+        r.run_id, r.run_dir = "run7", run_dir7
+        _orig_move = shutil.move
+
+        def _failing_move(src, dst, *a, **kw):
+            # Scoped to the exec tempdir: patching a stdlib function must not be able to
+            # reach anything else in this process, this section's own teardown included.
+            if "ase-ws-" in str(src):
+                raise OSError("selftest: move failed")
+            return _orig_move(src, dst, *a, **kw)
+
+        shutil.move = _failing_move
+        runner_mod._remove = lambda p: False if "ase-mcp-" in p else _orig_remove(p)
+        try:
+            cell7 = r._run_cell(ModelTarget(), spec5)
+        finally:
+            shutil.move = _orig_move
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            s7 = seen.get("scratch") or ""
+            if os.path.basename(s7).startswith("ase-mcp-"):
+                _try(lambda: shutil.rmtree(s7, ignore_errors=True))
+        err7 = cell7.run_result.error or ""
+        res7 = _try(lambda: open(os.path.join(cell7.artifacts_dir, "result.json")).read(), "")
+        _check("relocate.scratch_failure_survives_a_raise_after_the_run",
+               bool(seen.get("scratch")) and (seen.get("scratch") or "?") in err7
+               and "MCP scratch directory" in err7 and "MCP scratch directory" in res7,
+               f"a raise anywhere between the agent exiting and the notes being applied "
+               f"dropped the same failure on the floor — the fix is not an extra except "
+               f"clause per raise site but holding the note in the frame that SURVIVES the "
+               f"raise: scratch={seen.get('scratch')} err={err7[:130]!r}", failures, verbose)
+
+        # And a raise BEFORE the agent ever launches — a `${VAR}` that stopped resolving, an
+        # adapter whose RunOptions changed shape — used to escape the only code that removes
+        # the scratch dir, because the guard started at `execute` and the directory does not.
+        seen.clear()
+        run_dir8 = os.path.join(repo_root, "artifacts", "run8")
+        os.makedirs(run_dir8)
+        r.run_id, r.run_dir = "run8", run_dir8
+        removed: list = []
+        _orig_opts = runner_mod.RunOptions
+
+        def _exploding_options(*a, **kw):
+            raise TypeError("selftest: RunOptions changed shape")
+
+        runner_mod.RunOptions = _exploding_options
+        runner_mod._remove = lambda p: (removed.append(p), _orig_remove(p))[1]
+        try:
+            r._run_cell(ModelTarget(), spec5)  # the cell's verdict is not the point here
+        finally:
+            runner_mod.RunOptions = _orig_opts
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+        _check("relocate.scratch_dir_removed_even_if_the_run_never_starts",
+               any(os.path.basename(p).startswith("ase-mcp-") for p in removed),
+               f"the scratch dir holds the resolved credentials from the instant it is "
+               f"created, so the guard has to start where the directory does rather than at "
+               f"`execute` with two raise-capable statements in between: "
+               f"removed={[os.path.basename(p) for p in removed]}", failures, verbose)
+
+        # Holding the note in the surviving frame is only half of it: reading it must not
+        # DESTROY it either. A drain-on-read puts the note back in a local — one frame later
+        # than the original bug and just as lossy the moment the write behind it raises.
+        seen.clear()
+        run_dir9 = os.path.join(repo_root, "artifacts", "run9")
+        os.makedirs(run_dir9)
+        r.run_id, r.run_dir = "run9", run_dir9
+        _orig_rwj = runner_mod.Runner._rwj
+        writes: list = []
+
+        def _flaky_rwj(self, path, data):
+            if os.path.basename(path) == "result.json":
+                writes.append(path)
+                if len(writes) == 2:  # the rewrite that is supposed to carry the note
+                    raise OSError("selftest: result.json write failed")
+            return _orig_rwj(self, path, data)
+
+        runner_mod.Runner._rwj = _flaky_rwj
+        runner_mod._remove = lambda p: False if "ase-mcp-" in p else _orig_remove(p)
+        try:
+            cell9 = r._run_cell(ModelTarget(), spec5)
+        finally:
+            runner_mod.Runner._rwj = _orig_rwj
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            s9 = seen.get("scratch") or ""
+            if os.path.basename(s9).startswith("ase-mcp-"):
+                _try(lambda: shutil.rmtree(s9, ignore_errors=True))
+        err9 = cell9.run_result.error or ""
+        res9 = _try(lambda: open(os.path.join(cell9.artifacts_dir, "result.json")).read(), "")
+        _check("relocate.cleanup_note_is_acknowledged_only_once_it_is_on_disk",
+               bool(seen.get("scratch")) and "result.json write failed" in err9
+               and "MCP scratch directory" in err9 and (seen.get("scratch") or "?") in err9
+               and "MCP scratch directory" in res9,
+               f"the write that was supposed to carry the note raised, and the crash path "
+               f"has to still find it: a note is owed to a reader until it REACHES one, so "
+               f"handing it out and forgetting it are separate steps and the second happens "
+               f"after the artifact writes return. err={err9[:150]!r} "
+               f"in_result_json={'MCP scratch directory' in res9}", failures, verbose)
+
+        # And the same again one write later. Acknowledging after `result.json` but before
+        # `report.md` looks safe — the note IS on disk — right up until the crash path
+        # rewrites `result.json` from a fresh result that no longer carries it.
+        seen.clear()
+        run_dir12 = os.path.join(repo_root, "artifacts", "run12")
+        os.makedirs(run_dir12)
+        r.run_id, r.run_dir = "run12", run_dir12
+        _orig_wcj = runner_mod.Runner._write_cell_json
+        cj_writes: list = []
+
+        def _flaky_write_cell_json(self, cell_dir, cell):
+            cj_writes.append(cell_dir)
+            if len(cj_writes) == 1:  # the body's write, after result.json already landed
+                raise OSError("selftest: cell.json write failed")
+            return _orig_wcj(self, cell_dir, cell)
+
+        runner_mod.Runner._write_cell_json = _flaky_write_cell_json
+        runner_mod._remove = lambda p: False if "ase-mcp-" in p else _orig_remove(p)
+        try:
+            cell12 = r._run_cell(ModelTarget(), spec5)
+        finally:
+            runner_mod.Runner._write_cell_json = _orig_wcj
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            s12 = seen.get("scratch") or ""
+            if os.path.basename(s12).startswith("ase-mcp-"):
+                _try(lambda: shutil.rmtree(s12, ignore_errors=True))
+        res12 = _try(lambda: open(os.path.join(cell12.artifacts_dir, "result.json")).read(), "")
+        _check("relocate.cleanup_note_survives_the_crash_rewriting_result_json",
+               bool(seen.get("scratch")) and "cell.json write failed" in res12
+               and "MCP scratch directory" in res12,
+               f"the note reached result.json and a LATER write raised — and the crash path "
+               f"then rewrites result.json from a result it rebuilt, so anything already "
+               f"forgotten is overwritten rather than merely absent. Acknowledgement belongs "
+               f"after every write that carries the note, not after the first one: "
+               f"in_result_json={'MCP scratch directory' in res12} res={res12[:120]!r}",
+               failures, verbose)
+
+        # The isolated HOME is built well before the guard that removed it, and everything in
+        # between — the overlay build, a progress update, the effort resolution — can raise.
+        class _AngryProgress:
+            def update(self, **kw):
+                if str(kw.get("phase", "")).startswith("running agent"):
+                    raise RuntimeError("selftest: progress exploded")
+
+            def done(self, **kw):
+                pass
+
+        seen.clear()
+        run_dir10 = os.path.join(repo_root, "artifacts", "run10")
+        os.makedirs(run_dir10)
+        r.run_id, r.run_dir = "run10", run_dir10
+        homes_seen: list = []
+        _saved_progress = r.progress
+        r.progress = _AngryProgress()
+        runner_mod._remove = lambda p: (homes_seen.append(p), _orig_remove(p))[1]
+        try:
+            cell10 = r._run_cell(ModelTarget(), spec)
+        finally:
+            r.progress = _saved_progress
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+        homes = [p for p in homes_seen if os.path.basename(p).startswith("ase-home-")]
+        _check("relocate.isolated_home_is_owned_from_the_moment_it_exists",
+               bool(homes) and all(not os.path.lexists(p) for p in homes)
+               and "progress exploded" in (cell10.run_result.error or ""),
+               f"a raise between building the isolated HOME and reaching the code that "
+               f"removes it left `ase-home-*` behind, unnamed: registration belongs at "
+               f"creation, since until then the only thing that knows the directory exists "
+               f"is a local in the frame the raise unwinds. "
+               f"homes={[os.path.basename(p) for p in homes]}", failures, verbose)
+
+        # ...and a HOME that will not go is NAMED — on `warnings`, not `error`. It carries
+        # config masks and symlinks into the real home, so it is a leaked temp directory
+        # rather than a leaked secret, and failing the cell over it would be a lie.
+        seen.clear()
+        run_dir11 = os.path.join(repo_root, "artifacts", "run11")
+        os.makedirs(run_dir11)
+        r.run_id, r.run_dir = "run11", run_dir11
+        stuck_homes: list = []
+        r.progress = _AngryProgress()
+
+        def _no_home_removal(p):
+            if "ase-home-" in p:
+                stuck_homes.append(p)
+                return False
+            return _orig_remove(p)
+
+        runner_mod._remove = _no_home_removal
+        try:
+            cell11 = r._run_cell(ModelTarget(), spec)
+        finally:
+            r.progress = _saved_progress
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            for p in stuck_homes:  # never reach past what the runner made
+                if os.path.basename(p).startswith("ase-home-"):
+                    _try(lambda p=p: shutil.rmtree(p, ignore_errors=True))
+        warns11 = " ".join(cell11.run_result.warnings or [])
+        rep11 = _try(lambda: open(os.path.join(cell11.artifacts_dir, "report.md")).read(), "")
+        _check("relocate.stubborn_isolated_home_warns_rather_than_failing_the_cell",
+               "the isolated HOME could not be removed" in warns11
+               and "holds this cell's resolved credentials" not in warns11
+               and "the isolated HOME" not in (cell11.run_result.error or "")
+               and "the isolated HOME could not be removed" in rep11,
+               f"same registration and same verified removal as the credential dirs, but a "
+               f"different verdict: this one lands on `warnings` (durable via cell.json and "
+               f"report.md) instead of failing the cell, and its sentence must not claim it "
+               f"holds credentials. warnings={warns11[:130]!r} "
+               f"err={(cell11.run_result.error or '')[:60]!r}", failures, verbose)
+
+        # ...but only while it holds what the HARNESS put in it. `$HOME` is writable by the
+        # child, so a cell that resolved credentials has handed the agent somewhere to copy
+        # them; the severity has to follow the contents, not the creation.
+        # A spec that actually resolves a `${VAR}`, so `_secrets` is non-empty and the scrub
+        # has something to do — `spec5` declares a server but interpolates nothing.
+        os.environ["ASE_SELFTEST_TOKEN"] = "sk-secret-abcdef"
+        spec_secret = EvalSpec(
+            name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"),
+            mcp_servers=parse_mcp_servers(
+                {"echo": {"command": "/bin/echo", "env": {"TOKEN": "${ASE_SELFTEST_TOKEN}"}}},
+                where="selftest"))
+
+        # An interpolating cell is REFUSED unless its $HOME has no write path into the real
+        # home, so these arms need a contained one to reach the behaviour they are about.
+        # Pointing HOME at an empty directory is also the honest fixture: the arms below
+        # were symlinking the developer's actual home into a temp overlay on every run.
+        os.environ["HOME"] = contained_home
+
+        seen.clear()
+        run_dir13 = os.path.join(repo_root, "artifacts", "run13")
+        os.makedirs(run_dir13)
+        r.run_id, r.run_dir = "run13", run_dir13
+        stuck13: list = []
+        leaked13 = False
+
+        def _no_home_removal13(p):
+            if "ase-home-" in p:
+                stuck13.append(p)
+                return False
+            return _orig_remove(p)
+
+        runner_mod._remove = _no_home_removal13
+        try:
+            cell13 = r._run_cell(ModelTarget(), spec_secret)
+        finally:
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            # Read the premise BEFORE tearing it down: an earlier draft deleted the leaked
+            # HOME here and then asked whether the token was in it.
+            home13 = seen.get("home") or ""
+            leaked13 = bool(home13) and os.path.isfile(
+                os.path.join(home13, "agent-cache.txt"))
+            for p in stuck13:
+                if os.path.basename(p).startswith("ase-home-"):
+                    _try(lambda p=p: shutil.rmtree(p, ignore_errors=True))
+        err13 = cell13.run_result.error or ""
+        _check("relocate.child_writable_home_is_credential_bearing_after_the_run",
+               leaked13 and cell13.passed is False
+               and "could have written this cell's resolved credentials" in err13
+               and "no resolved credentials are in it" not in err13,
+               f"the agent copied its token into $HOME and the removal failed: a directory "
+               f"the child can write is credential-bearing from the moment the cell HAS "
+               f"credentials, so it fails the cell and its sentence claims reach rather than "
+               f"denying contents the harness stopped controlling at launch. "
+               f"leaked={leaked13} passed={cell13.passed} err={err13[:130]!r}",
+               failures, verbose)
+
+        # Acknowledgement moved to the last statement before the return because everything
+        # between the writes and there can still raise — and `_failed_cell` REWRITES
+        # result.json, so an early ack erases the finding rather than merely omitting it.
+        class _DoneExplodes:
+            def __init__(self):
+                self.calls = 0
+
+            def update(self, **kw):
+                pass
+
+            def done(self, **kw):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("selftest: progress.done exploded")
+
+        seen.clear()
+        run_dir14 = os.path.join(repo_root, "artifacts", "run14")
+        os.makedirs(run_dir14)
+        r.run_id, r.run_dir = "run14", run_dir14
+        r.progress = _DoneExplodes()
+        runner_mod._remove = lambda p: False if "ase-mcp-" in p else _orig_remove(p)
+        try:
+            cell14 = r._run_cell(ModelTarget(), spec5, cell_idx=1)
+        finally:
+            r.progress = _saved_progress
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            s14 = seen.get("scratch") or ""
+            if os.path.basename(s14).startswith("ase-mcp-"):
+                _try(lambda: shutil.rmtree(s14, ignore_errors=True))
+        res14 = _try(lambda: open(os.path.join(cell14.artifacts_dir, "result.json")).read(), "")
+        _check("relocate.cleanup_note_survives_a_raise_after_the_artifacts",
+               bool(seen.get("scratch")) and "progress.done exploded" in res14
+               and "MCP scratch directory" in res14,
+               f"the artifact writes had all returned and the note was still not safe: the "
+               f"judge artifacts and `progress.done` come after them, and a raise there "
+               f"reaches the path that REBUILDS result.json. Acknowledge where nothing is "
+               f"left to go wrong: in_result_json={'MCP scratch directory' in res14} "
+               f"res={res14[:120]!r}", failures, verbose)
+
+        # The scrub's verdict is the one finding that CANNOT be recomputed: it reports what
+        # it already deleted, so a rescan after a raise sees a clean tree and says nothing.
+        seen.clear()
+        run_dir15 = os.path.join(repo_root, "artifacts", "run15")
+        os.makedirs(run_dir15)
+        r.run_id, r.run_dir = "run15", run_dir15
+        seen["make_special"] = True
+        r.progress = _DoneExplodes()
+        try:
+            cell15 = r._run_cell(ModelTarget(), spec_secret, cell_idx=1)
+        finally:
+            r.progress = _saved_progress
+            r._secrets = r._run_secrets = ()
+            os.environ.pop("ASE_SELFTEST_TOKEN", None)
+        res15 = _try(lambda: open(os.path.join(cell15.artifacts_dir, "result.json")).read(), "")
+        ws15 = os.path.join(cell15.artifacts_dir, "workspace")
+        _check("relocate.scrub_verdict_survives_a_raise_that_rebuilds_the_result",
+               "progress.done exploded" in res15 and "could not certify" in res15
+               and "sock" in res15 and not os.path.lexists(os.path.join(ws15, "sock")),
+               f"the scrub removed an artifact it could not certify and then a later raise "
+               f"rebuilt the result: rescanning finds the tree clean, so the deletion goes "
+               f"unreported unless the original verdict rode the same protocol as the purge "
+               f"failures. An evidence deletion that nothing records is worse than either "
+               f"outcome it chose between. res={res15[:150]!r}", failures, verbose)
+
+        # The overlay masks READS. Its unmasked entries are symlinks into the real home, so
+        # a token written through one lands where nothing this run deletes or scrubs can
+        # reach — and deleting a symlink certifies nothing about its target.
+        seen.clear()
+        run_dir16 = os.path.join(repo_root, "artifacts", "run16")
+        os.makedirs(run_dir16)
+        r.run_id, r.run_dir = "run16", run_dir16
+        os.makedirs(os.path.join(contained_home, "cache"), exist_ok=True)  # one passthrough
+        os.environ["ASE_SELFTEST_TOKEN"] = "sk-secret-abcdef"
+        try:
+            cell16 = r._run_cell(ModelTarget(), spec_secret)
+        finally:
+            r._secrets = r._run_secrets = ()
+            _try(lambda: os.rmdir(os.path.join(contained_home, "cache")))
+        err16 = cell16.run_result.error or ""
+        _check("mcp.credential_run_is_refused_when_home_writes_escape_the_overlay",
+               cell16.passed is False and "interpolates a credential" in err16
+               and "cache" in err16 and "Refusing" in err16
+               and seen.get("cwd") is None,
+               f"a cell that resolves a `${{VAR}}` under a symlink overlay is refused before "
+               f"the agent starts, naming the entries that lead out: the harness will not "
+               f"go hunting through the user's home afterwards, so 'run it and scrub' is "
+               f"not on the table and 'run it and delete the overlay' certifies nothing. "
+               f"ran={seen.get('cwd') is not None} passed={cell16.passed} "
+               f"err={err16[:150]!r}", failures, verbose)
+
+        # A credential too short to redact is still a credential. This is the arm that would
+        # have caught gating on `bool(secrets)` — the redaction set is empty here.
+        seen.clear()
+        run_dir18 = os.path.join(repo_root, "artifacts", "run18")
+        os.makedirs(run_dir18)
+        r.run_id, r.run_dir = "run18", run_dir18
+        os.environ["ASE_SELFTEST_SHORT"] = "ab"
+        spec_short = EvalSpec(
+            name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"),
+            mcp_servers=parse_mcp_servers(
+                {"echo": {"command": "/bin/echo", "env": {"TOKEN": "${ASE_SELFTEST_SHORT}"}}},
+                where="selftest"))
+        os.makedirs(os.path.join(contained_home, "cache"), exist_ok=True)
+        try:
+            cell18 = r._run_cell(ModelTarget(), spec_short)
+        finally:
+            os.environ.pop("ASE_SELFTEST_SHORT", None)
+            r._secrets = r._run_secrets = ()
+            _try(lambda: os.rmdir(os.path.join(contained_home, "cache")))
+        err18 = cell18.run_result.error or ""
+        _check("mcp.short_credential_run_is_refused_like_any_other",
+               cell18.passed is False and "interpolates a credential" in err18
+               and seen.get("cwd") is None,
+               f"the resolved value is two characters, so the redaction set is EMPTY — and "
+               f"the token is no less a token. Gating exposure on what can be scrubbed "
+               f"would have let this one run and leak: ran={seen.get('cwd') is not None} "
+               f"err={err18[:110]!r}", failures, verbose)
+
+        # And a declaration that interpolates NOTHING must not be treated as credentialed.
+        seen.clear()
+        run_dir17 = os.path.join(repo_root, "artifacts", "run17")
+        os.makedirs(run_dir17)
+        r.run_id, r.run_dir = "run17", run_dir17
+        stuck17: list = []
+
+        def _no_home_removal17(p):
+            if "ase-home-" in p:
+                stuck17.append(p)
+                return False
+            return _orig_remove(p)
+
+        runner_mod._remove = _no_home_removal17
+        try:
+            cell17 = r._run_cell(ModelTarget(), spec5)  # `mcp_servers`, but no ${VAR}
+        finally:
+            runner_mod._remove = _orig_remove
+            r._secrets = r._run_secrets = ()
+            for p in stuck17:
+                if os.path.basename(p).startswith("ase-home-"):
+                    _try(lambda p=p: shutil.rmtree(p, ignore_errors=True))
+        err17 = cell17.run_result.error or ""
+        warns17 = " ".join(cell17.run_result.warnings or [])
+        _check("mcp.home_severity_follows_interpolation_not_declaration",
+               bool(seen.get("cwd")) and "the isolated HOME" not in err17
+               and "the isolated HOME could not be removed" in warns17
+               and "resolved credentials into it" not in warns17,
+               f"declaring a server is not handling a secret: `{{'echo': {{'command': "
+               f"'/bin/echo'}}}}` interpolates nothing, so a stubborn HOME is a leaked "
+               f"tempdir and must not fail the cell claiming the agent could have written "
+               f"credentials it was never given. Gated on `${{VAR}}` in the declaration, "
+               f"not on `bool(secrets)` — short values are excluded from redaction on "
+               f"purpose and are still credentials. err={err17[:90]!r} "
+               f"warnings={warns17[:110]!r}", failures, verbose)
     finally:
         runner_mod.execute = orig_execute
+        if real_home_env is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = real_home_env
+        os.environ.pop("ASE_SELFTEST_TOKEN", None)
+        shutil.rmtree(contained_home, ignore_errors=True)
         shutil.rmtree(repo_root, ignore_errors=True)
 
 
@@ -1068,6 +1752,56 @@ def _check_mcp_hermetic_paths(failures, verbose):
                none_home is None and none_env == {},
                "an adapter without masks gets no overlay (runs against the real HOME)",
                failures, verbose)
+
+        # What the overlay lets a write REACH, which is a different question from what it
+        # lets the model read — and the one the harness had never asked.
+        from .isolation import build_isolated_home, home_write_escapes
+        esc_home = tempfile.mkdtemp(prefix="ase-esc-")
+        beyond = tempfile.mkdtemp(prefix="ase-beyond-")
+        # A symlink BEHIND the escape, reachable only by following it. The walk must not:
+        # the overlay is small and the real home is not, and a path found that way is not a
+        # path the overlay actually offers. Not a loop back into `real` — `followlinks=True`
+        # would spin on a cycle forever, which is a worse way to learn the same thing.
+        os.symlink(beyond, os.path.join(real, ".fakecli", "plugins", "elsewhere"))
+        # A link with nothing at the other end: no target to inspect, and a write through it
+        # CREATES one outside the overlay.
+        os.symlink(os.path.join(beyond, "nope"), os.path.join(real, ".fakecli", "dangling"))
+        try:
+            build_isolated_home(esc_home, [".fakecli/skills"], set(), [], real_home=real)
+            # Links that stay INSIDE, one live and one dangling. Both are spelled with the
+            # tempdir's `/var/...` path while `realpath` reports `/private/var/...`, so a
+            # check that canonicalizes only one side calls them escapes — which is how a
+            # materialized HOME would fail to lift the refusal it is supposed to lift.
+            os.symlink(os.path.join(esc_home, ".fakecli", "skills"),
+                       os.path.join(esc_home, ".fakecli", "inside-live"))
+            os.symlink(os.path.join(esc_home, ".fakecli", "not-created-yet"),
+                       os.path.join(esc_home, ".fakecli", "inside-dangling"))
+            escapes = home_write_escapes(esc_home)
+            skills = os.path.join(esc_home, ".fakecli", "skills")
+            rel = [os.path.join(".fakecli", n)
+                   for n in ("auth.json", "dangling", "mcp.json", "plugins")]
+            _check("mcp_masked_home.write_escapes_are_any_symlink_out_of_the_overlay",
+                   escapes == rel and os.path.isdir(skills) and not os.path.islink(skills),
+                   f"every name that leads out, whatever is at the far end. A directory "
+                   f"symlink lets a token be PLANTED outside; a file symlink lets one be "
+                   f"written OVER an existing file, which is the same leak and was missed "
+                   f"by filtering on target type; a dangling one has no target to classify "
+                   f"and a write creates it. The masked skills dir is materialized, so it "
+                   f"is not a way out — and each escape is reported once rather than once "
+                   f"per entry behind it, since the walk must not descend through what it "
+                   f"is reporting. Links that stay inside are NOT escapes, live or "
+                   f"dangling — `/var` vs `/private/var` is the same directory, and a check "
+                   f"that canonicalizes one side only would refuse the very HOME that is "
+                   f"supposed to lift the refusal. escapes={escapes}", failures, verbose)
+            _check("mcp_masked_home.contained_overlay_reports_no_escapes",
+                   home_write_escapes(tempfile.mkdtemp(prefix="ase-empty-")) == []
+                   and home_write_escapes(None) == [],
+                   "an overlay with nothing symlinked out reports nothing, so the refusal "
+                   "this feeds lifts itself once the HOME is materialized instead of "
+                   "needing the check removed", failures, verbose)
+        finally:
+            shutil.rmtree(esc_home, ignore_errors=True)
+            shutil.rmtree(beyond, ignore_errors=True)
     finally:
         if old_var is None:
             os.environ.pop("FAKECLI_HOME", None)
@@ -2374,6 +3108,854 @@ def _check_exec_timeout_group_kill(failures, verbose):
     _check_exec_process_tree_handles(failures, verbose)
 
 
+def _check_version_provenance_shared(failures, verbose):
+    """The tiers, the warn-once bookkeeping and the "no version source" case, in base.py.
+
+    These are the parts every adapter shares, so a defect here is a defect in all four at
+    once. Two of them are the kind that fail SILENTLY, which is why they get arms rather
+    than trust: a denylist that can never match looks exactly like an empty denylist, and
+    a warn-once key that forgets the agent looks exactly like a matrix that had nothing to
+    warn about.
+    """
+    import io
+    import sys
+
+    from .adapters import base as _b
+
+    print("version provenance (shared):")
+
+    # --- a denylist an adapter can never enforce is refused at construction -----------
+    # The trap: check_denied() is reached with None on every run of an adapter that has no
+    # version source, so every denied entry silently fails to fire. Whoever added the entry
+    # gets no signal — a denylist that never matches is indistinguishable from one with
+    # nothing to match. This has to be a construction error or it is nothing.
+    unenforceable = ""
+    try:
+        _b.VersionProvenance(agent="ghost", verified=("1.0.0",), verified_on="2026-01-01",
+                             clear_hint="h", unreadable="no source in the stream",
+                             denied={"6.6.6": "loads a server silently"})
+    except ValueError as exc:
+        unenforceable = str(exc)
+    # ...and the same declaration WITHOUT the denylist is fine, so the arm is pinning the
+    # combination rather than just "unreadable adapters cannot be built".
+    built_ok = True
+    try:
+        _b.VersionProvenance(agent="ghost", verified=("1.0.0",), verified_on="2026-01-01",
+                             clear_hint="h", unreadable="no source in the stream")
+    except ValueError:
+        built_ok = False
+    # --- an UNKNOWN version is a denial too, once anything is denylisted --------------
+    # Review found this hole: check_denied used to return successfully whenever the version
+    # was None, so a run that completed normally, produced a good MCP witness and stated no
+    # version passed — while excluding nothing. "Could not read the version" is not
+    # evidence the version was fine, and the denylist tier covers exactly the defects the
+    # witness cannot see, so a clean witness says nothing about it either.
+    armed = _b.VersionProvenance(agent="armed", verified=("1.0.0",), verified_on="d",
+                                 clear_hint="h", denied={"6.6.6": "loads a server"})
+    unarmed = _b.VersionProvenance(agent="unarmed", verified=("1.0.0",), verified_on="d",
+                                   clear_hint="h")
+
+    def _denied_msg(prov, version, completed):
+        try:
+            prov.check_denied(version, completed=completed)
+        except RuntimeError as exc:
+            return str(exc)
+        return ""
+
+    unknown_completed = _denied_msg(armed, None, True)
+    unknown_crashed = _denied_msg(armed, None, False)
+    unknown_no_denylist = _denied_msg(unarmed, None, True)
+    known_good = _denied_msg(armed, "1.0.0", True)
+    _check("provenance.unknown_version_fails_closed_when_anything_is_denied",
+           "never stated which" in unknown_completed
+           and unknown_crashed == "" and unknown_no_denylist == "" and known_good == "",
+           f"a COMPLETED run that states no version fails closed while any build is "
+           f"denylisted, since nothing about it excludes those builds; a run that crashed "
+           f"before emitting telemetry does not ({unknown_crashed == ''}), because failing "
+           f"it by version would report 'denylisted build' for what is a crash; and with "
+           f"an empty denylist an unknown version is merely unknown "
+           f"({unknown_no_denylist == ''}), which keeps every adapter's normal state quiet",
+           failures, verbose)
+
+    _check("provenance.unenforceable_denylist_is_refused",
+           "can never fire" in unenforceable and built_ok,
+           f"declaring a denylist alongside `unreadable` raises at construction "
+           f"({unenforceable[:60]!r}), because such entries are reached only with a "
+           f"version that never arrives; the same adapter without a denylist builds fine",
+           failures, verbose)
+
+    # --- warn-once is keyed PER ADAPTER ---------------------------------------------
+    # A global key would mean the first runner in a mixed matrix silences every other
+    # runner's notice — each would be a different CLI with a different unverified build,
+    # and only one of them would ever be reported.
+    a = _b.VersionProvenance(agent="agent_a", verified=("1.0.0",), verified_on="d",
+                             clear_hint="hint A")
+    b = _b.VersionProvenance(agent="agent_b", verified=("1.0.0",), verified_on="d",
+                             clear_hint="hint B")
+    saved_warned = set(_b._WARNED_VERSIONS)
+    saved_err = sys.stderr
+    try:
+        _b._WARNED_VERSIONS.clear()
+        sys.stderr = io.StringIO()
+        a.warn_drift("9.9.9")
+        b.warn_drift("9.9.9")      # same version, different agent -> must still warn
+        a.warn_drift("9.9.9")      # repeat of a already-warned pair -> silent
+        mixed = sys.stderr.getvalue()
+    finally:
+        sys.stderr = saved_err
+        _b._WARNED_VERSIONS.clear()
+        _b._WARNED_VERSIONS.update(saved_warned)
+    _check("provenance.warn_once_is_keyed_per_adapter",
+           mixed.count("warning:") == 2
+           and "agent_a" in mixed and "agent_b" in mixed,
+           f"two runners on the same unverified version each warn once ("
+           f"{mixed.count('warning:')} warnings), rather than the first one silencing "
+           f"the second — the key is (agent, version), not version", failures, verbose)
+
+    # --- the "no version source" notice -------------------------------------------
+    # It must not read as drift ("you are on an unverified build"), because there is no
+    # build to name and nothing for the reader to go and look up. It must say WHY, or
+    # "unknown" is unactionable, and it must not claim any runtime evidence it never saw.
+    ghost = _b.VersionProvenance(
+        agent="ghost", verified=("1.0.0",), verified_on="2026-01-01",
+        clear_hint="check `ghost --version` out of band",
+        unreadable="the stream states no version",
+        witness_held="  The runtime witness held.",
+        witness_absent="  No witness.")
+    saved_warned = set(_b._WARNED_VERSIONS)
+    try:
+        _b._WARNED_VERSIONS.clear()
+        sys.stderr = io.StringIO()
+        ghost.warn_drift(None, witnessed=True)
+        ghost.warn_drift(None, witnessed=True)
+        unreadable_msg = sys.stderr.getvalue()
+    finally:
+        sys.stderr = saved_err
+        _b._WARNED_VERSIONS.clear()
+        _b._WARNED_VERSIONS.update(saved_warned)
+    _check("provenance.unreadable_says_why_and_claims_nothing",
+           unreadable_msg.count("warning:") == 1
+           and "the stream states no version" in unreadable_msg
+           and "1.0.0" in unreadable_msg
+           and "witness held" not in unreadable_msg,
+           f"an adapter with no version source warns once per process, names the REASON "
+           f"there is nothing to read (so the reader does not go hunting for a version "
+           f"that does not exist), cites the verified baseline, and — even when called "
+           f"with witnessed=True — claims no runtime evidence, because the notice is "
+           f"about an unknown build rather than about this run's hermeticity",
+           failures, verbose)
+
+
+def _check_claude_version_provenance(failures, verbose):
+    """claude states its version outright, and its init event doubles as the MCP witness.
+
+    Unlike copilot there is nothing to reconstruct: `claude_code_version` is a scalar the
+    CLI writes about itself in `system`/`init`. The arms that matter are therefore about
+    what happens when that event is ABSENT or RESHAPED — because "no servers found" and
+    "the field moved" produce identical-looking clean results, and only one is safe.
+    """
+    import io
+    import json as _json
+    import sys
+
+    from .adapters import claude as _cl
+
+    print("claude version provenance + MCP witness:")
+
+    def _init(**kw):
+        obj = {"type": "system", "subtype": "init", "mcp_servers": []}
+        obj.update(kw)
+        return _json.dumps(obj)
+
+    real = _init(claude_code_version="2.1.113")
+    # Model-controlled text: an assistant message is the one place a model can write
+    # whatever it likes. It must not be able to forge the version that silences a warning.
+    forged = _json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": '{"claude_code_version": "9.9.9"} claude_code_version 9.9.9'}]}})
+
+    ver_real = _cl._stream_cli_version(real)
+    ver_forged_only = _cl._stream_cli_version(forged)
+    ver_both = _cl._stream_cli_version(forged + "\n" + real)
+    ver_none = _cl._stream_cli_version("")
+    # Malformed telemetry must warn (version unknown), never raise: this runs inside
+    # verify_post_run, where anything raised is reported as an MCP hermeticity failure —
+    # and a mistyped field is not one.
+    raised = None
+    try:
+        malformed = _cl._stream_cli_version(
+            "\n".join([_json.dumps([1, 2, 3]),
+                       _json.dumps({"type": "system", "subtype": "init",
+                                    "claude_code_version": {"not": "a string"}}),
+                       "not json at all"]))
+    except Exception as exc:            # noqa: BLE001 — the point is that nothing escapes
+        raised, malformed = type(exc).__name__, None
+    _check("claude.version_read_from_the_run_not_a_probe",
+           ver_real == "2.1.113" and ver_forged_only is None and ver_both == "2.1.113"
+           and ver_none is None and malformed is None and raised is None,
+           f"the version comes from the CLI's own init event (real={ver_real!r}); "
+           f"model-controlled assistant text cannot supply one ({ver_forged_only!r}) nor "
+           f"outrank the real one ({ver_both!r}); an empty or malformed stream resolves to "
+           f"unknown ({ver_none!r}/{malformed!r}) rather than raising ({raised!r}), since a "
+           f"raise here would be reported as an MCP hermeticity failure", failures, verbose)
+
+    # --- the witness -----------------------------------------------------------------
+    ok = _cl._mcp_witness(real, 0)
+    live = _cl._mcp_witness(_init(claude_code_version="2.1.113",
+                                  mcp_servers=[{"name": "leaky"}]), 0)
+    # The field renamed/reshaped out from under the check, on a run that completed: this
+    # is the ABA-shaped failure — it yields an empty server list, which reads exactly like
+    # a hermetic run.
+    reshaped = _cl._mcp_witness(
+        _json.dumps({"type": "system", "subtype": "init", "mcpServers": []}), 0)
+    # A run that never got as far as its init event is EXCUSED, not failed — a crash is
+    # not evidence of a leak. But it is also not evidence of hermeticity, hence witnessed
+    # is False and the drift notice must not claim otherwise.
+    crashed = _cl._mcp_witness("", 1)
+    completed_silently = _cl._mcp_witness("", 0)
+    # --- evidence arriving AFTER the first init event still counts -------------------
+    # Review reproduced both halves of this: a stream whose opening init reported an empty
+    # server list and whose second reported a live one passed verification, and the version
+    # reader took whichever build the stream OPENED with. An adapter that reads only the
+    # start of a stream can be told anything by the rest of it.
+    two_inits_live = _init(claude_code_version="2.1.113") + "\n" + _init(
+        claude_code_version="2.1.113", mcp_servers=[{"name": "late"}])
+    two_inits_reshaped = _init(claude_code_version="2.1.113") + "\n" + _json.dumps(
+        {"type": "system", "subtype": "init", "mcp_servers": "not-a-list"})
+    late = _cl._mcp_witness(two_inits_live, 0)
+    late_reshaped = _cl._mcp_witness(two_inits_reshaped, 0)
+    # Disagreeing versions resolve to unknown rather than to the first one seen — a stream
+    # that tells two stories about what ran has established neither.
+    ver_disagree = _cl._stream_cli_version(
+        _init(claude_code_version="2.1.113") + "\n" + _init(claude_code_version="9.9.9"))
+    ver_repeat = _cl._stream_cli_version(
+        _init(claude_code_version="2.1.113") + "\n" + _init(claude_code_version="2.1.113"))
+    late_leak = ""
+    try:
+        _cl.ClaudeAdapter().verify_post_run([], None, cwd=".", stdout=two_inits_live,
+                                            exit_code=0)
+    except RuntimeError as exc:
+        late_leak = str(exc)
+    _check("claude.evidence_after_the_first_init_still_counts",
+           late[1] == ["late"] and late_reshaped[0] is not None
+           and ver_disagree is None and ver_repeat == "2.1.113"
+           and "late" in late_leak,
+           f"a server named by a LATER init event is still reported {late[1]} and still "
+           f"fails the run, rather than the check having made up its mind on the first "
+           f"event; a reshaped list anywhere is a violation ({late_reshaped[0]!r}); and "
+           f"disagreeing versions resolve to unknown ({ver_disagree!r}) while a repeated "
+           f"identical one does not ({ver_repeat!r})", failures, verbose)
+
+    _check("claude.mcp_witness_fails_closed",
+           ok == (None, [], True, {})
+           and live[0] is None and live[1] == ["leaky"]
+           # The message must NAME the reshape, not merely be non-empty: a fallback path
+           # ("no init event at all") also yields a violation here, so `is not None` alone
+           # passes for the wrong reason and would survive the field-check being removed.
+           and reshaped[0] is not None and "mcp_servers" in reshaped[0]
+           and reshaped[2] is False
+           and crashed == (None, [], False, {})
+           and completed_silently[0] is not None,
+           f"a hermetic run witnesses an empty server list {ok}; a loaded server is "
+           f"surfaced {live}; a RESHAPED field fails closed rather than reading as clean "
+           f"{reshaped[0]!r}; a run that died before its init event is excused {crashed} "
+           f"while one that exited 0 with no witness at all is not "
+           f"{completed_silently[0]!r}", failures, verbose)
+
+    # --- the tiers, end to end through verify_post_run --------------------------------
+    from .adapters import base as _b
+    saved_denied = dict(_cl._DENIED_VERSIONS)
+    saved_warned = set(_b._WARNED_VERSIONS)
+    saved_err = sys.stderr
+    adapter = _cl.ClaudeAdapter()
+    try:
+        _cl._DENIED_VERSIONS.clear()
+        _cl._DENIED_VERSIONS["6.6.6"] = "loads MCP servers past --strict-mcp-config"
+        denied = ""
+        try:
+            adapter.verify_post_run([], None, cwd=".",
+                                    stdout=_init(claude_code_version="6.6.6"), exit_code=0)
+        except RuntimeError as exc:
+            denied = str(exc)
+        # A verified build that witnessed clean is entirely silent.
+        _b._WARNED_VERSIONS.clear()
+        sys.stderr = io.StringIO()
+        adapter.verify_post_run([], None, cwd=".", stdout=real, exit_code=0)
+        quiet = sys.stderr.getvalue()
+        # An unverified build warns once and does not claim evidence it lacks.
+        sys.stderr = io.StringIO()
+        adapter.verify_post_run([], None, cwd=".",
+                                stdout=_init(claude_code_version="9.9.9"), exit_code=0)
+        adapter.verify_post_run([], None, cwd=".",
+                                stdout=_init(claude_code_version="9.9.9"), exit_code=0)
+        warned = sys.stderr.getvalue()
+        # A live server fails the run outright.
+        leaked = ""
+        try:
+            adapter.verify_post_run([], None, cwd=".",
+                                    stdout=_init(claude_code_version="2.1.113",
+                                                 mcp_servers=[{"name": "leaky"}]),
+                                    exit_code=0)
+        except RuntimeError as exc:
+            leaked = str(exc)
+        # END TO END, the reviewer's reproduction: a run that COMPLETED with a clean
+        # witness but stated no version must fail closed while anything is denylisted.
+        # Testing check_denied directly is not enough — the defect that got shipped was in
+        # verify_post_run's wiring, and a `completed=False` hardcoded here would restore it
+        # while every isolated arm stayed green (confirmed by mutation R4).
+        no_version_completed = ""
+        try:
+            adapter.verify_post_run(
+                [], None, cwd=".",
+                stdout=_json.dumps({"type": "system", "subtype": "init",
+                                    "mcp_servers": []}), exit_code=0)
+        except RuntimeError as exc:
+            no_version_completed = str(exc)
+        # A run that died before its init event is excused from the witness — so it
+        # reaches the drift notice with NO MCP evidence at all. Claiming "the runtime
+        # witness held" there would be the notice inventing the very check it is warning
+        # about, which is the sentence a reader would quote to justify shipping. It must
+        # also NOT be failed by version: no telemetry here means a crash, not a denied
+        # build. Guarded so that a defect making it raise is reported as an arm failure
+        # rather than crashing the selftest — a crash is a red signal of the wrong kind,
+        # and it hides which arm was supposed to catch it.
+        _b._WARNED_VERSIONS.clear()
+        sys.stderr = io.StringIO()
+        crashed_run_raised = ""
+        try:
+            adapter.verify_post_run([], None, cwd=".", stdout="", exit_code=1)
+        except RuntimeError as exc:
+            crashed_run_raised = str(exc)
+        unwitnessed = sys.stderr.getvalue()
+    finally:
+        sys.stderr = saved_err
+        _cl._DENIED_VERSIONS.clear()
+        _cl._DENIED_VERSIONS.update(saved_denied)
+        _b._WARNED_VERSIONS.clear()
+        _b._WARNED_VERSIONS.update(saved_warned)
+    _check("claude.version_tiers",
+           "denylist" in denied and "AFTER the fact" in denied
+           and quiet == ""
+           and warned.count("warning:") == 1 and "9.9.9" in warned
+           and "strict-mcp-config" in warned
+           and "witness held" in warned
+           and "leaky" in leaked and "not MCP-hermetic" in leaked
+           and "never stated which" in no_version_completed
+           and crashed_run_raised == ""
+           and "witness held" not in unwitnessed
+           and "no MCP server list at all" in unwitnessed,
+           f"a denylisted build fails the run by name and says plainly that this is "
+           f"detection after the CLI already ran; a verified build that witnessed clean "
+           f"is silent; an unverified one warns ONCE per process and names the flag the "
+           f"whole argument rests on; a run that actually loaded a server fails outright; "
+           f"a COMPLETED run that states no version fails closed through verify_post_run "
+           f"while a crashed one does not; and a run that never produced a witness says so "
+           f"rather than claiming one held — a security notice that overstates its own "
+           f"evidence is worse than none",
+           failures, verbose)
+
+
+def _check_unreadable_version_adapters(failures, verbose):
+    """codex and antigravity cannot know which build ran — and say so rather than guess.
+
+    Both were checked empirically (see the constants in each adapter). The risk this arm
+    guards is not that they report the wrong version; it is that someone later "fixes" the
+    warning by wiring in a `--version` probe, which would report a build the run may never
+    have used, or adds a denylist entry that silently never fires.
+    """
+    import io
+    import sys
+
+    from .adapters import antigravity as _ag
+    from .adapters import base as _b
+    from .adapters import codex as _cx
+
+    print("codex/antigravity version provenance:")
+
+    # codex's verify_post_run now also re-checks MCP state, which shells out to the real
+    # binary; stub the enumeration so this arm tests provenance only (the re-check has its
+    # own arms below).
+    class _QuietCodex(_cx.CodexAdapter):
+        def _mcp_disable_args(self, cwd=None, env=None):
+            return []
+
+    opts = _cx.RunOptions()
+    saved_warned = set(_b._WARNED_VERSIONS)
+    saved_err = sys.stderr
+    try:
+        _b._WARNED_VERSIONS.clear()
+        sys.stderr = io.StringIO()
+        _QuietCodex().verify_post_run([], opts, cwd=".", stdout="", exit_code=0)
+        _QuietCodex().verify_post_run([], opts, cwd=".", stdout="", exit_code=0)
+        _ag.AntigravityAdapter().verify_post_run([], opts, cwd=".", stdout="", exit_code=0)
+        both = sys.stderr.getvalue()
+    finally:
+        sys.stderr = saved_err
+        _b._WARNED_VERSIONS.clear()
+        _b._WARNED_VERSIONS.update(saved_warned)
+
+    _check("codex_antigravity.version_unreadable_is_stated_not_guessed",
+           both.count("warning:") == 2
+           and "--ephemeral" in both and "0.140.0" in both
+           and "1.1.1" in both
+           and _cx._PROVENANCE.unreadable is not None
+           and _ag._PROVENANCE.unreadable is not None
+           and not _cx._PROVENANCE.denied and not _ag._PROVENANCE.denied,
+           f"each warns once per process ({both.count('warning:')} total) and names why "
+           f"there is no version to read — codex's points at the `--ephemeral` flag this "
+           f"harness itself passes, which is the actionable part: the version is "
+           f"purchasable only by giving up the isolation it buys. Neither carries a "
+           f"denylist, which VersionProvenance would reject as unenforceable anyway",
+           failures, verbose)
+
+    # antigravity's constant must track the build its CHANNEL INVENTORY was established
+    # against (1.1.1), not the newer build that merely happens to be installed (1.1.2) —
+    # listing the latter because it "seems fine" is the constant blessing an unknown
+    # state, which is the prose-rot failure it was introduced to stop.
+    _check("antigravity.constant_tracks_the_verified_build_not_the_installed_one",
+           _ag._VERIFIED_VERSIONS == ("1.1.1",)
+           and "1.1.2" not in _ag._VERIFIED_VERSIONS,
+           f"antigravity records {_ag._VERIFIED_VERSIONS} — the build whose customization "
+           f"roots and plugin mcp_config channel were confirmed with live sentinel "
+           f"servers — so the newer installed build warns instead of being silently "
+           f"blessed", failures, verbose)
+
+
+def _check_matrix_consistency(failures, verbose):
+    """A matrix claims its cells are comparable. This checks that they actually were.
+
+    "Model A beat model B" silently requires the cells to differ ONLY in the model. Three
+    things can drift underneath that without failing any cell: the CLI rewriting itself
+    mid-matrix (the failure that started this work — copilot went 1.0.64 → 1.0.72 in four
+    days), the MCP server set changing, and a cell falling back to non-isolated.
+
+    Reported, never enforced: the cells have already run and been paid for, and each is
+    still individually valid. What is prevented is reading the DIFFERENCE between them as
+    caused by the variable under test.
+    """
+    import io
+    import os
+    import shutil
+    import sys
+    import tempfile as _tempfile
+
+    from . import runner as runner_mod
+    from .schema import RunResult
+
+    print("matrix consistency:")
+
+    root = _tempfile.mkdtemp(prefix="ase-cons-")
+
+    def _cell(version=None, argv=(), isolated=True, name="e"):
+        rr = RunResult(agent="copilot", eval_name=name, prompt="", workdir="",
+                       argv=list(argv))
+        rr.cli_version = version
+        return runner_mod.CellResult(
+            agent="copilot", model="m", eval_name=name, skill=None, passed=True,
+            run_result=rr, isolated=isolated)
+
+    def _consistency(cells, agent="copilot"):
+        r = runner_mod.Runner(agent, models=["m"],
+                              artifacts_root=os.path.join(root, "a"),
+                              run_id="c", skills_root=root)
+        err = io.StringIO()
+        saved, sys.stderr = sys.stderr, err
+        try:
+            out = r._consistency(cells)
+            r._warn_inconsistent(out)
+        finally:
+            sys.stderr = saved
+        return out, err.getvalue()
+
+    try:
+        # copilot's own spelling — the fixture must use the adapter's real flag or
+        # mcp_servers_seen reads nothing and the arm passes for the wrong reason.
+        disabled = ["--disable-mcp-server", "known"]
+        # The motivating case: an auto-update mid-matrix. Every cell passes.
+        drifted, drift_msg = _consistency([
+            _cell("1.0.64", disabled), _cell("1.0.72", disabled)])
+        # Uniform on all three axes.
+        uniform, uniform_msg = _consistency([
+            _cell("1.0.72", disabled), _cell("1.0.72", disabled)])
+        # A cell that fell back to non-isolated saw skills its siblings did not.
+        iso_drift, _ = _consistency([
+            _cell("1.0.72", disabled), _cell("1.0.72", disabled, isolated=False)])
+        # Different configurations: one cell had a server the other did not.
+        srv_drift, _ = _consistency([
+            _cell("1.0.72", disabled),
+            _cell("1.0.72", ["--disable-mcp-server", "other"])])
+        # UNKNOWN IS NOT AGREEMENT. Every codex/agy matrix looks like this, and it must
+        # not report a verified-uniform version — that would be a green line standing in
+        # for a check that could not run.
+        unknown, unknown_msg = _consistency([_cell(None, []), _cell(None, [])], "codex")
+        # One readable cell + one unreadable one is not a version CHANGE either; there is
+        # simply nothing to compare against. It must not be reported as drift.
+        partial, partial_msg = _consistency([_cell("1.0.72", disabled), _cell(None, disabled)])
+        # Server names are arbitrary JSON object keys for copilot, so a name can contain
+        # any separator. Joining the set into a string made {"a,b"} and {"a","b"} the same
+        # value — two genuinely different configurations reported as consistent. The sets
+        # are kept structurally for exactly this.
+        ambiguous, _ = _consistency([
+            _cell("1.0.72", ["--disable-mcp-server", "a,b"]),
+            _cell("1.0.72", ["--disable-mcp-server", "a", "--disable-mcp-server", "b"])])
+        # UNKNOWN IS NOT AGREEMENT ON *EVERY* AXIS, not just the version that motivated
+        # the tri-state. Found in review: gating `verified` on the CLI version alone let a
+        # matrix whose MCP axis was never read report the green primary state anyway, one
+        # field away from `mcp_server_set_unknown_cells: 2`. claude reaches that state by
+        # taking a --mcp-config it cannot resolve to names.
+        opaque_mcp, opaque_msg = _consistency(
+            [_cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"]),
+             _cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"])], "claude")
+        # ...and the other side of that rule: an adapter that can PROVE it ran no servers
+        # says [] and stays verified. Without this, the stricter rule above would park
+        # every claude matrix at "unverified" forever, which is just the green light's
+        # useless twin.
+        proven_empty, proven_msg = _consistency(
+            [_cell("2.1.113", ["--strict-mcp-config"]),
+             _cell("2.1.113", ["--strict-mcp-config"])], "claude")
+        claude_ad = runner_mod.get_adapter("claude")
+        claude_seen = (
+            claude_ad.mcp_servers_seen(["--strict-mcp-config"]),
+            claude_ad.mcp_servers_seen(["--strict-mcp-config", "--mcp-config", "x.json"]),
+            claude_ad.mcp_servers_seen(["--strict-mcp-config", "--mcp-config=x.json"]),
+            claude_ad.mcp_servers_seen(["-p", "hi"]),
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    _check("runner.matrix_consistency_flags_mid_matrix_drift",
+           drifted["comparability"] == "drift"
+           and any("1.0.64" in d and "1.0.72" in d for d in drifted["drift"])
+           and "not strictly comparable" in drift_msg
+           and uniform["comparability"] == "verified" and uniform_msg == ""
+           and iso_drift["comparability"] == "drift"
+           and any("isolation varied" in d for d in iso_drift["drift"])
+           and srv_drift["comparability"] == "drift"
+           and any("MCP server set varied" in d for d in srv_drift["drift"])
+           and ambiguous["comparability"] == "drift"
+           and ambiguous["mcp_server_sets"] == [["a", "b"], ["a,b"]],
+           f"a matrix straddling a CLI auto-update is reported as not comparable even "
+           f"though every cell passed ({drifted['cli_versions']}), and so is one where "
+           f"isolation or the MCP server set varied; a uniform matrix says nothing at all "
+           f"({uniform_msg!r}). Server sets are compared STRUCTURALLY, so a name "
+           f"containing the separator ({{'a,b'}} vs {{'a','b'}}) is not collapsed into "
+           f"agreement — {ambiguous['mcp_server_sets']}", failures, verbose)
+
+    _check("runner.unknown_version_is_not_reported_as_agreement",
+           unknown["comparability"] == "unverified"
+           and unknown["cli_version_verified"] is False
+           and unknown["cli_version_unknown_cells"] == 2
+           and unknown["drift"] == [] and unknown_msg == ""
+           and partial["comparability"] == "unverified"
+           and partial["drift"] == [],
+           f"a matrix where no cell states its version (every codex/agy run) reports "
+           f"comparability={unknown['comparability']!r} — NOT a green 'verified', since "
+           f"absence of evidence is not agreement, and not 'drift' either, since nothing "
+           f"actually differed. The tri-state carries that in the PRIMARY field, so "
+           f"automation reading it cannot mistake an uncheckable matrix for a checked "
+           f"one; one readable cell beside an unreadable one is likewise unverified "
+           f"({partial['cli_versions']})",
+           failures, verbose)
+
+    _check("runner.verified_requires_every_axis_known",
+           opaque_mcp["comparability"] == "unverified"
+           and opaque_mcp["cli_version_verified"] is True
+           and opaque_mcp["mcp_server_set_verified"] is False
+           and opaque_mcp["mcp_server_set_unknown_cells"] == 2
+           and opaque_mcp["drift"] == [] and opaque_msg == "",
+           f"a matrix whose CLI version is known and uniform but whose MCP configuration "
+           f"was never read reports comparability={opaque_mcp['comparability']!r}, not "
+           f"'verified'. Gating the primary state on the version axis alone rebuilt the "
+           f"misleading green one field over: cli_version_verified="
+           f"{opaque_mcp['cli_version_verified']} beside mcp_server_set_unknown_cells="
+           f"{opaque_mcp['mcp_server_set_unknown_cells']}. Every axis must be positively "
+           f"known before the matrix claims its cells were compared", failures, verbose)
+
+    _check("runner.claude_proves_empty_mcp_set_rather_than_reporting_unknown",
+           claude_seen == ([], None, None, None)
+           and proven_empty["comparability"] == "verified"
+           and proven_empty["mcp_server_sets"] == [[]]
+           and proven_empty["mcp_server_set_unknown_cells"] == 0
+           and proven_empty["mcp_server_set_verified"] is True
+           and proven_msg == "",
+           f"claude reports [] — not unknown — when argv PROVES no server could load "
+           f"(--strict-mcp-config with no --mcp-config), so its matrices still reach "
+           f"'verified' ({proven_empty['comparability']!r}) under the every-axis rule. It "
+           f"falls back to unknown the moment argv stops proving it: a --mcp-config in "
+           f"either spelling, or a missing --strict-mcp-config — {claude_seen}. Proving "
+           f"the empty set and admitting ignorance are different claims and this is where "
+           f"they part", failures, verbose)
+
+
+def _check_parallel_requires_isolation(failures, verbose):
+    """Concurrent cells share mutable CLI configuration — isolated or not.
+
+    An isolated home is a symlink OVERLAY, not a copy: `isolation._overlay` wholesale-
+    symlinks every entry it is not told to mask, so two isolated cells' `.codex/config.toml`
+    are two paths to one real file. The first version of this guard gated on isolation,
+    believing a private home made concurrency safe; review disproved it, and the arm below
+    now proves the sharing directly rather than assuming either way.
+
+    So the property that matters is per-cell MATERIALIZED config (`parallel_safe_config`),
+    which no real adapter can currently claim — `--jobs>1` is therefore refused outright.
+    It was an unenforced invariant before that: DEFAULT_JOBS is 1, so the harness was safe
+    by accident, and `jobs` is a scenario-override key, so YAML could raise it without
+    anyone passing a flag.
+    """
+    import os
+    import shutil
+    import tempfile as _tempfile
+
+    from . import runner as runner_mod
+    from .isolation import build_isolated_home
+
+    print("parallel cells require materialized config:")
+
+    root = _tempfile.mkdtemp(prefix="ase-par-")
+
+    def _mk(jobs, isolated):
+        return runner_mod.Runner("claude", models=["m1"],
+                                 artifacts_root=os.path.join(root, "artifacts"),
+                                 run_id="par", skills_root=root,
+                                 jobs=jobs, isolated=isolated)
+
+    def _run(jobs, isolated):
+        """Empty spec list: run() reaches the guard before it would execute any cell, so
+        this exercises the refusal without launching a CLI."""
+        try:
+            _mk(jobs, isolated).run([])
+        except RuntimeError as exc:
+            return str(exc)
+        return ""
+
+    # The load-bearing case, and the one an earlier revision of this arm got WRONG: an
+    # isolated home is a symlink overlay, so parallel ISOLATED cells share every config
+    # file the overlay does not explicitly mask. Proven directly below rather than asserted,
+    # because the whole guard rests on it.
+    shared_home = _tempfile.mkdtemp(prefix="ase-shared-")
+    os.makedirs(os.path.join(shared_home, ".codex"))
+    with open(os.path.join(shared_home, ".codex", "config.toml"), "w") as fh:
+        fh.write("original\n")
+    cells = []
+    for i in range(2):
+        h = _tempfile.mkdtemp(prefix=f"ase-cell{i}-")
+        build_isolated_home(h, [".codex/skills"], set(), [], shared_home)
+        cells.append(os.path.join(h, ".codex", "config.toml"))
+    with open(cells[0], "w") as fh:                       # cell A writes...
+        fh.write("[mcp_servers.sneaky]\n")
+    leaked_to_sibling = "sneaky" in open(cells[1]).read()  # ...cell B sees it
+    leaked_to_real = "sneaky" in open(
+        os.path.join(shared_home, ".codex", "config.toml")).read()
+
+    try:
+        refused_isolated = _run(4, True)
+        refused_unisolated = _run(4, False)
+        # Serial must keep working in BOTH modes: --jobs 1 is the default and the whole
+        # workaround, and non-isolated serial is a documented opt-out. A guard that broke
+        # either would be worse than the hole it closes.
+        serial_isolated = _run(1, True)
+        serial_unisolated = _run(1, False)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(shared_home, ignore_errors=True)
+
+    _check("runner.isolated_homes_share_config_between_cells",
+           leaked_to_sibling and leaked_to_real,
+           f"an isolated home is a symlink OVERLAY, not a copy: a write through one cell's "
+           f"overlay is visible through another's ({leaked_to_sibling}) and lands in the "
+           f"real home ({leaked_to_real}). This is the fact the parallelism guard rests "
+           f"on — asserted directly, because an earlier revision assumed the opposite and "
+           f"gated on isolation instead of on the adapter", failures, verbose)
+
+    _check("runner.parallel_refused_until_config_is_materialized",
+           "refusing to run 4 cells in parallel" in refused_isolated
+           and "--jobs 1" in refused_isolated
+           and "parallel_safe_config" in refused_isolated
+           and refused_unisolated != ""
+           and serial_isolated == "" and serial_unisolated == "",
+           f"--jobs>1 is refused for a runner whose config is not materialized per cell — "
+           f"ISOLATED included, since isolation does not stop the sharing — and the message "
+           f"names what would lift it. Both serial modes still run",
+           failures, verbose)
+
+
+def _check_codex_post_run_mcp_recheck(failures, verbose):
+    """codex closes the launch window it used to leave open.
+
+    Everything codex verified before this ran from build_argv — `_verify_all_mcp_disabled`
+    is post-*enumeration*, pre-*launch*, despite the name. A server added to config between
+    building argv and codex reading its config at startup was never named on the disable
+    set and loaded live, with nothing checking afterwards. copilot has closed this window
+    since Phase 0.
+
+    The two halves are deliberately unequal and the arms pin that: codex's stream evidence
+    is presence-only (it emits nothing when a server *starts* — verified live against a
+    sentinel stdio server it launched silently), so re-enumeration carries the load.
+    """
+    import json as _json
+
+    print("codex post-run MCP re-check:")
+
+    from .adapters import codex as _cx
+
+    opts = _cx.RunOptions()
+
+    def _adapter(enumerated):
+        """A codex adapter whose post-run enumeration reports `enumerated`."""
+        class _Stub(_cx.CodexAdapter):
+            def _mcp_disable_args(self, cwd=None, env=None):
+                if enumerated is None:
+                    raise RuntimeError("`codex mcp list --json` did not return a list")
+                return [t for n in enumerated
+                        for t in ("-c", f"mcp_servers.{n}.enabled=false")]
+        return _Stub()
+
+    def _run(adapter, argv, stdout=""):
+        try:
+            adapter.verify_post_run(argv, opts, cwd=".", stdout=stdout, exit_code=0)
+        except RuntimeError as exc:
+            return str(exc)
+        return ""
+
+    launched = ["-c", "mcp_servers.known.enabled=false"]
+
+    # Nothing moved: the same server set is configured now as at launch.
+    clean = _run(_adapter(["known"]), launched)
+    # A server appeared in the launch window — configured now, not disabled on the argv
+    # that actually ran. This is the defect the whole check exists for.
+    appeared = _run(_adapter(["known", "sneaky"]), launched)
+    # Enumeration itself stopped working after the run: hermeticity is no longer
+    # ESTABLISHABLE, which is not the same as established, so it fails closed.
+    unenumerable = _run(_adapter(None), launched)
+    _check("codex.post_run_reenumeration_narrows_the_launch_window",
+           clean == "" and "sneaky" in appeared and "not provably MCP-hermetic" in appeared
+           and "no longer is" in unenumerable,
+           f"a run whose configured server set is unchanged passes; one where a server "
+           f"appeared after argv was built fails, naming it; and an enumeration that stops "
+           f"working post-run fails closed rather than assuming the pre-launch check still "
+           f"holds", failures, verbose)
+
+    # --- the residual gap, asserted as a KNOWN HOLE rather than as correct behaviour ---
+    # A server added after argv was built, started by codex, then removed again before this
+    # check re-enumerates passes both halves whenever the model never called one of its
+    # tools: the stream is silent (codex emits nothing when a server STARTS — established
+    # live) and re-enumeration sees the restored config.
+    #
+    # An earlier revision asserted this same outcome with a comment saying the stream half
+    # covered it. That is true of copilot, whose witness names every server it brought up;
+    # it is false for codex, and the claim contradicted this file's own finding. Review
+    # caught it. The arm is kept — the behaviour is real and worth pinning so a future
+    # change to it is deliberate — but it is NAMED as a gap, so nobody reads a green
+    # selftest as evidence the window is shut.
+    #
+    # If this ever goes red because codex grew a server-start event, that is not a
+    # regression: it means the hole can be closed. Rewrite the check to use it.
+    idle_server_reverted = _run(_adapter([]), launched, stdout="")
+    _check("codex.KNOWN_GAP_idle_server_reverted_before_recheck_is_undetectable",
+           idle_server_reverted == "",
+           f"DOCUMENTED HOLE, not a passing property: a server that started during the run "
+           f"and was removed before the post-run enumeration goes unreported when the model "
+           f"never called it. Both halves are blind — no tool call means no stream evidence, "
+           f"and codex emits nothing when a server starts, so absence of evidence is not "
+           f"evidence of absence here. Closing it needs a materialized private config for "
+           f"the child (see verify_post_run, DESIGN_MCP_Support.md §1); until then a green "
+           f"codex run means 'no leak was detected', NOT 'no server ran'", failures, verbose)
+
+    # --- the stream half: presence proves a leak, absence proves nothing --------------
+    # Shapes taken verbatim from a live codex 0.140.0 run against a sentinel stdio server.
+    leak = "\n".join([
+        _json.dumps({"type": "item.started", "item": {
+            "id": "item_1", "type": "mcp_tool_call", "server": "sentinel",
+            "tool": "sentinel_ping", "status": "in_progress"}}),
+        _json.dumps({"type": "item.completed", "item": {
+            "id": "item_1", "type": "mcp_tool_call", "server": "sentinel",
+            "tool": "sentinel_ping", "status": "failed",
+            "error": {"message": "user cancelled MCP tool call"}}}),
+    ])
+    # A call the approval policy REFUSED still proves the server was live and reachable —
+    # verified: this is exactly what the sentinel run produced.
+    streamed = _run(_adapter(["known"]), launched, stdout=leak)
+    calls = _cx._mcp_tool_calls(leak)
+    # ONLY the failed completion, with no preceding item.started. The distinction is not
+    # academic: the sentinel run produced exactly this outcome (the approval policy
+    # cancelled the call), and a check that counted only successful calls would report a
+    # clean run while a server had been live and reachable for the whole session. With
+    # both events present an arm cannot tell the two rules apart — the started event
+    # carries it either way — so this fixture is what makes the claim testable.
+    refused_only = _cx._mcp_tool_calls(_json.dumps({
+        "type": "item.completed", "item": {
+            "id": "item_1", "type": "mcp_tool_call", "server": "sentinel",
+            "tool": "sentinel_ping", "status": "failed",
+            "error": {"message": "user cancelled MCP tool call"}}}))
+    # Deduped across item.started/item.completed rather than reported twice.
+    native_only = _cx._mcp_tool_calls(_json.dumps({"type": "item.completed", "item": {
+        "type": "command_execution", "command": "ls"}}))
+    # Malformed telemetry must not raise: this runs inside verify_post_run, where a raise
+    # is reported as an MCP hermeticity failure, and a mistyped item is not one.
+    raised = None
+    try:
+        malformed = _cx._mcp_tool_calls(
+            "\n".join([_json.dumps([1, 2]), _json.dumps({"item": "not-a-dict"}),
+                       "not json"]))
+    except Exception as exc:  # noqa: BLE001 — the point is that nothing escapes
+        raised, malformed = type(exc).__name__, None
+
+    _check("codex.stream_reports_mcp_tool_calls_as_leaks",
+           calls == ["sentinel/sentinel_ping"] and "sentinel/sentinel_ping" in streamed
+           and "not MCP-hermetic" in streamed
+           and refused_only == ["sentinel/sentinel_ping"]
+           and native_only == [] and malformed == [] and raised is None,
+           f"an mcp_tool_call in the run's own stream fails the run even though the "
+           f"config re-reads clean ({calls}) — testimony a later edit cannot retract — and "
+           f"a call the approval policy REFUSED still counts, since the server was live to "
+           f"refuse it; native tool items are not leaks ({native_only}); malformed "
+           f"telemetry yields no leak report ({malformed!r}) rather than raising "
+           f"({raised!r})", failures, verbose)
+
+    # --- the re-check must run in the CHILD's context, not the harness's --------------
+    # Enumerating with the harness's own cwd/env can resolve a different server set
+    # entirely (trusted-project configs, $CODEX_HOME), so a missing RunOptions is a
+    # fail-closed condition rather than a silent fallback to os.environ.
+    # The EXCEPTION TYPE is asserted, not just the message. Removing the guard yields an
+    # AttributeError whose text also contains "effective_env", so a message-only assertion
+    # passes on the broken code — the arm would then be pinning the crash rather than the
+    # deliberate refusal. Every caller of verify_post_run treats RuntimeError as "this run
+    # is not provably hermetic"; an AttributeError is an unhandled bug.
+    no_opts_type, no_opts = "", ""
+    try:
+        _adapter(["known"]).verify_post_run(launched, None, cwd=".", stdout="")
+    except Exception as exc:  # noqa: BLE001 — the type is exactly what is under test
+        no_opts_type, no_opts = type(exc).__name__, str(exc)
+    _check("codex.post_run_recheck_requires_the_childs_context",
+           no_opts_type == "RuntimeError" and "effective_env" in no_opts,
+           f"re-checking without the RunOptions the invocation was built from fails "
+           f"closed with a deliberate RuntimeError ({no_opts_type}), rather than quietly "
+           f"enumerating against the harness's environment — which resolves a different "
+           f"set of servers than the run saw — or crashing with an AttributeError that "
+           f"no caller is prepared to read as a hermeticity failure", failures, verbose)
+
+    # --- argv spellings the comparison depends on ------------------------------------
+    # Under-counting what argv disabled makes a correctly-disabled server read as "new",
+    # failing hermetic runs. codex accepts all four spellings (verified 0.140.0), so all
+    # four have to be read back.
+    spellings = [
+        _cx._disabled_server_names(["-c", "mcp_servers.a.enabled=false"]),
+        _cx._disabled_server_names(["-cmcp_servers.a.enabled=false"]),
+        _cx._disabled_server_names(["--config", "mcp_servers.a.enabled=false"]),
+        _cx._disabled_server_names(["--config=mcp_servers.a.enabled=false"]),
+    ]
+    quoted = _cx._disabled_server_names(["-c", 'mcp_servers."odd name".enabled=false'])
+    unrelated = _cx._disabled_server_names(
+        ["-c", 'model_reasoning_effort="low"', "-c", "memories.use_memories=false"])
+    _check("codex.disable_argv_is_read_back_in_every_spelling",
+           all(s == {"a"} for s in spellings) and quoted == {"odd name"}
+           and unrelated == set(),
+           f"all four `-c`/`--config` spellings codex accepts are read back "
+           f"({[sorted(s) for s in spellings]}), including the quoted-key form "
+           f"({sorted(quoted)}); unrelated overrides contribute nothing "
+           f"({sorted(unrelated)}). Under-counting here would fail hermetic runs by "
+           f"reading a disabled server as newly appeared", failures, verbose)
+
+
 def _check_copilot_version_provenance(failures, verbose):
     """Version drift is MESSAGED, never gated on — and the version is read from the run.
 
@@ -3531,24 +5113,7 @@ def _check_api_compat(failures, verbose):
         shutil.rmtree(repo_root, ignore_errors=True)
 
 
-def run_selftest(verbose: bool = False) -> int:
-    """Run the suite, then restore any adapter patch a raising check left installed.
-
-    The checks themselves live in _run_selftest_checks. This wrapper exists only so the
-    module-patch net (_MODULE_PATCHES) has ONE unconditional finally: the patches it
-    guards span most of the copilot section, and an exception escaping mid-section used
-    to leave e.g. a scoped _agent_definition_files bolted onto the adapter for the rest
-    of the process — harmless for the CLI, which exits, but this module is importable and
-    an embedding process would keep making adapter calls against the stub."""
-    try:
-        return _run_selftest_checks(verbose=verbose)
-    finally:
-        _restore_module_patches()
-
-
-def _run_selftest_checks(verbose: bool = False) -> int:
-    failures: list[str] = []
-
+def _check_cost_formatting(failures, verbose):
     # cost_str formatting
     print("cost formatting:")
     from .schema import RunResult as _RR
@@ -3564,6 +5129,8 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _check("cost.none", _RR(agent="x", eval_name="", prompt="", workdir="").cost_str == "",
            "empty cost_str", failures, verbose)
 
+
+def _check_claude_adapter(failures, verbose):
     # Claude
     print("claude adapter:")
     out = get_adapter("claude").parse(CLAUDE, "", 0)
@@ -3589,6 +5156,8 @@ def _run_selftest_checks(verbose: bool = False) -> int:
            f"resolved_model captured from the system/init event: {out.resolved_model!r}",
            failures, verbose)
 
+
+def _check_codex_adapter(failures, verbose):
     # Codex
     print("codex adapter:")
     out = get_adapter("codex").parse(CODEX, "", 0)
@@ -3932,7 +5501,14 @@ def _run_selftest_checks(verbose: bool = False) -> int:
            f"via the generic fallback instead of being silently dropped: {extra_paths}",
            failures, verbose)
 
+
+def _check_copilot_adapter(failures, verbose):
     # Copilot
+    import os
+    import shutil as _sh
+    import tempfile as _tmp
+
+    from .schema import RunResult as _RR
     print("copilot adapter:")
     out = get_adapter("copilot").parse(COPILOT, "", 0)
     cmds = [e.command for e in out.events if e.command]
@@ -5534,7 +7110,11 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _check("copilot.error_event", len(ft_errors) == 1 and ft_errors[0].is_error,
            f"an `error` event is surfaced: {ft_errors}", failures, verbose)
 
+
+def _check_antigravity_adapter(failures, verbose):
     # AntiGravity (3 shapes)
+    import os
+    import shutil as _sh
     print("antigravity adapter:")
     out = get_adapter("antigravity").parse(ANTIGRAVITY_STREAM, "", 0)
     cmds = [e.command for e in out.events if e.command]
@@ -5606,6 +7186,8 @@ def _run_selftest_checks(verbose: bool = False) -> int:
            f"never the shared temp root): {_fb_anchor}", failures, verbose)
     _sh.rmtree(_fb_anchor, ignore_errors=True)
 
+
+def _check_judge_verdict_extraction(failures, verbose):
     # judge JSON extraction (markdown fences, bare JSON, mixed text)
     print("judge verdict extraction:")
     from .judge import _extract_json
@@ -5624,6 +7206,8 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _check("judge.no_json", _extract_json("just plain text with no json") is None,
            "returns None for plain text", failures, verbose)
 
+
+def _check_schema_validator(failures, verbose):
     # schema validator fallback
     print("schema validator:")
     from .assertions import validate_schema
@@ -5635,6 +7219,8 @@ def _run_selftest_checks(verbose: bool = False) -> int:
                                {"type": "object", "required": ["name", "port"]})
     _check("schema.invalid", not bad, f"missing-required caught: {err}", failures, verbose)
 
+
+def _check_progress_indicator(failures, verbose):
     # progress indicator
     print("progress indicator:")
     import io
@@ -5651,6 +7237,8 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _check("progress.done", "✓" in output and "✗" in output,
            "done marks appear for pass and fail", failures, verbose)
 
+
+def _check_spec_validation(failures, verbose):
     # pre-flight spec validation
     print("spec validation:")
     from .spec import validate_spec
@@ -5851,6 +7439,8 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _check("validate.clean", vr9.ok and not vr9.warnings,
            f"clean spec: errors={vr9.errors} warnings={vr9.warnings}", failures, verbose)
 
+
+def _check_scenario_multi_model(failures, verbose):
     # scenario multi-model target (needs PyYAML)
     print("scenario multi-model:")
     try:
@@ -5927,59 +7517,98 @@ def _run_selftest_checks(verbose: bool = False) -> int:
                f"Scenario.models keeps working for old callers: {_scen.models}",
                failures, verbose)
 
+
+def run_selftest(verbose: bool = False) -> int:
+    """Run the suite, then restore any adapter patch a raising check left installed.
+
+    The checks themselves live in _run_selftest_checks. This wrapper exists only so the
+    module-patch net (_MODULE_PATCHES) has ONE unconditional finally: the patches it
+    guards span most of the copilot section, and an exception escaping mid-section used
+    to leave e.g. a scoped _agent_definition_files bolted onto the adapter for the rest
+    of the process — harmless for the CLI, which exits, but this module is importable and
+    an embedding process would keep making adapter calls against the stub."""
+    try:
+        return _run_selftest_checks(verbose=verbose)
+    finally:
+        _restore_module_patches()
+
+
+def _run_selftest_checks(verbose: bool = False) -> int:
+    failures: list[str] = []
+
+    _section(_check_cost_formatting, failures, verbose)
+    _section(_check_claude_adapter, failures, verbose)
+    _section(_check_codex_adapter, failures, verbose)
+    _section(_check_copilot_adapter, failures, verbose)
+    _section(_check_antigravity_adapter, failures, verbose)
+    _section(_check_judge_verdict_extraction, failures, verbose)
+    _section(_check_schema_validator, failures, verbose)
+    _section(_check_progress_indicator, failures, verbose)
+    _section(_check_spec_validation, failures, verbose)
+    _section(_check_scenario_multi_model, failures, verbose)
+
     # HOME isolation overlay + side-effect-free provisioning
-    _check_isolation(failures, verbose)
-    _check_provision(failures, verbose)
-    _check_workspace_reset(failures, verbose)
-    _check_snake_case_keys(failures, verbose)
-    _check_antigravity_transcript(failures, verbose)
+    _section(_check_isolation, failures, verbose)
+    _section(_check_provision, failures, verbose)
+    _section(_check_workspace_reset, failures, verbose)
+    _section(_check_snake_case_keys, failures, verbose)
+    _section(_check_antigravity_transcript, failures, verbose)
 
     # per-cell readable report
-    _check_report(failures, verbose)
+    _section(_check_report, failures, verbose)
 
     # artifact / trace path resolution (no false passes on seeded fixtures; workspace-relative;
     # symlink escapes via write-trace)
-    _check_path_resolution(failures, verbose)
-    _check_workspace_view_skill_dir_match(failures, verbose)
+    _section(_check_path_resolution, failures, verbose)
+    _section(_check_workspace_view_skill_dir_match, failures, verbose)
 
     # undeclared repo skills read via the real on-disk checkout (workspace-escape leak)
-    _check_leaked_skill_reads(failures, verbose)
-    _check_workspace_relocation(failures, verbose)
+    _section(_check_leaked_skill_reads, failures, verbose)
+    _section(_check_workspace_relocation, failures, verbose)
     # MCP hermeticity on the non-cell paths: masked-home overlay, probes, judge, fail-closed
-    _check_mcp_hermetic_paths(failures, verbose)
-    _check_parallel_cell_idx(failures, verbose)
-    _check_cell_crash_safety(failures, verbose)
+    _section(_check_mcp_hermetic_paths, failures, verbose)
+    _section(_check_parallel_cell_idx, failures, verbose)
+    _section(_check_cell_crash_safety, failures, verbose)
 
     # cli.py's pure helpers (YAML-error detection, --model/--all-models, models.yaml validation)
-    _check_cli_helpers(failures, verbose)
-    _check_progress_thread_safety(failures, verbose)
+    _section(_check_cli_helpers, failures, verbose)
+    _section(_check_progress_thread_safety, failures, verbose)
 
     # real pass/fail behavior for every deterministic assertion type
-    _check_assertion_pass_fail(failures, verbose)
+    _section(_check_assertion_pass_fail, failures, verbose)
 
     # verdict coercion edge cases (string "false", extra items)
-    _check_verdict_coercion(failures, verbose)
+    _section(_check_verdict_coercion, failures, verbose)
 
     # timeout kills the agent's whole process group, not just the direct child
-    _check_exec_timeout_group_kill(failures, verbose)
+    _section(_check_exec_timeout_group_kill, failures, verbose)
 
     # CLI version drift: read from the run, tiered, and auditable
-    _check_copilot_version_provenance(failures, verbose)
+    _section(_check_copilot_version_provenance, failures, verbose)
+    _section(_check_version_provenance_shared, failures, verbose)
+    _section(_check_claude_version_provenance, failures, verbose)
+    _section(_check_unreadable_version_adapters, failures, verbose)
+    _section(_check_matrix_consistency, failures, verbose)
+    _section(_check_parallel_requires_isolation, failures, verbose)
+    _section(_check_codex_post_run_mcp_recheck, failures, verbose)
+
+    # declared MCP servers: schema, secrets, injection, refusals
+    _section(_check_mcp_declared_servers, failures, verbose)
 
     # report inlining is capped per file; the judge's skip behavior is unchanged
-    _check_inline_truncation(failures, verbose)
+    _section(_check_inline_truncation, failures, verbose)
 
     # model-rejection annotation only fires on actual rejections
-    _check_model_error_heuristic(failures, verbose)
+    _section(_check_model_error_heuristic, failures, verbose)
 
     # scenario run-knob overrides are type-checked at load
-    _check_scenario_override_validation(failures, verbose)
+    _section(_check_scenario_override_validation, failures, verbose)
 
     # typed reasoning-effort knob: spec validation, Runner threading, per-adapter mapping
-    _check_reasoning_effort(failures, verbose)
+    _section(_check_reasoning_effort, failures, verbose)
 
     # deprecated pre-#67 module API (models= / .models / plain-id render columns)
-    _check_api_compat(failures, verbose)
+    _section(_check_api_compat, failures, verbose)
 
     print()
     if failures:
@@ -5987,3 +7616,938 @@ def _run_selftest_checks(verbose: bool = False) -> int:
         return 1
     print("SELFTEST PASSED")
     return 0
+
+
+def _check_mcp_declared_servers(failures, verbose):
+    """Declared `mcp_servers:` — schema, secrets, injection, and the refusals.
+
+    The through-line is that every way this feature can be WRONG is louder than the way it
+    is right. A misspelled key, a filter the runner cannot enforce, an adapter that cannot
+    inject at all, an unset credential — each fails before tokens are spent, because the
+    alternative in every case is a scenario that runs without the tool surface it declared
+    and fails somewhere unrecognizable.
+    """
+    import io as _io
+    import json as _json
+    import os
+    import shutil as _shutil
+    import stat as _stat
+    import sys as _sys
+    import tempfile as _tempfile
+    import threading as _threading
+
+    from . import runner as runner_mod
+    from . import xattrs as _xattrs
+    from .adapters import get_adapter
+    from .adapters.base import RunOptions
+    from .mcp import (parse_mcp_servers, redact, resolve_mcp_servers,
+                      validate_mcp_servers)
+
+    print("mcp declared servers:")
+
+    def _try(fn, default=None):
+        """Run fn, turning any exception into `default`.
+
+        Arms below assert on VALUES, and a mutation that makes production code raise
+        instead of returning the wrong value would otherwise abort this whole check with a
+        traceback — failing the selftest, but naming no invariant. Collapsing the raise
+        into a falsy value keeps the report pointed at the broken guarantee.
+        """
+        try:
+            return fn()
+        except Exception:
+            return default
+
+    # --- structure: everything checkable without the environment ---------------
+    rejected = {}
+    for label, raw in [
+        ("both_transports", {"e": {"command": "x", "url": "http://y"}}),
+        ("neither_transport", {"e": {}}),
+        ("claude_native_filter", {"e": {"command": "x", "allowedTools": ["a"]}}),
+        ("codex_native_filter", {"e": {"command": "x", "enabled_tools": ["a"]}}),
+        ("unknown_key", {"e": {"command": "x", "tolls": ["a"]}}),
+        ("name_with_space", {"bad name": {"command": "x"}}),
+        ("name_with_dunder", {"a__b": {"command": "x"}}),
+        ("bad_transport", {"e": {"url": "http://y", "transport": "grpc"}}),
+        ("stdio_key_on_remote", {"e": {"url": "http://y", "args": ["a"]}}),
+        ("remote_key_on_stdio", {"e": {"command": "x", "headers": {"a": "b"}}}),
+        ("not_a_mapping", {"e": ["command", "x"]}),
+    ]:
+        try:
+            parse_mcp_servers(raw, where="t")
+            rejected[label] = ""
+        except ValueError as exc:
+            rejected[label] = str(exc)
+    _check("mcp.schema_rejects_every_malformed_server",
+           all(rejected.values()),
+           f"each malformed server shape is a load error, not a silent default — "
+           f"{sorted(k for k, v in rejected.items() if not v) or 'all rejected'}",
+           failures, verbose)
+
+    # Rejection alone is not the guarantee here — an unknown-key error would also reject
+    # these. What the native-filter list buys is that the author is told the RIGHT thing:
+    # claude ACCEPTS `allowedTools` in an --mcp-config server object and silently ignores
+    # it, so the error has to name `tools:` as the working replacement rather than leaving
+    # someone to conclude the key was merely misspelled.
+    _check("mcp.native_filter_spellings_are_refused_by_name",
+           all("tools:" in rejected[k] and "silently IGNORES" in rejected[k]
+               for k in ("claude_native_filter", "codex_native_filter")),
+           f"a CLI-native filter spelling is refused with an error naming the portable "
+           f"`tools:` field and saying the CLI would have ignored it — "
+           f"{rejected['claude_native_filter'][:90]!r}", failures, verbose)
+
+    # A name carrying `__` would make `mcp__a__b__c` un-splittable back into server and
+    # tool — which is exactly the split the §6-C2 post-run allowlist check performs.
+    _check("mcp.server_name_cannot_contain_the_tool_name_separator",
+           rejected["name_with_dunder"],
+           "'a__b' is refused as a server name because claude spells MCP tools "
+           "mcp__<server>__<tool>; with a dunder in the name the two halves could not be "
+           "told apart afterwards", failures, verbose)
+
+    # --- interpolation, the secrets registry, and the redaction floor ----------
+    remote = parse_mcp_servers(
+        {"r": {"url": "https://h/${SEG}", "headers": {"Authorization": "Bearer ${TOK}"}}},
+        where="t")
+    env_ok = {"TOK": "sk-secret-abcdef", "SEG": "v1"}
+    res, secrets = resolve_mcp_servers(remote, env=env_ok)
+    missing_errs = _try(lambda: validate_mcp_servers(remote, env={"SEG": "v1"})[0], [])
+    _short_warns = _try(
+        lambda: validate_mcp_servers(remote, env={"TOK": "ab", "SEG": "v1"})[1], [])
+    _, short_secrets = resolve_mcp_servers(remote, env={"TOK": "ab", "SEG": "v1"})
+
+    _check("mcp.interpolates_from_process_env_and_registers_the_secret",
+           res["r"].headers["Authorization"] == "Bearer sk-secret-abcdef"
+           and res["r"].url == "https://h/v1"
+           and secrets == {"sk-secret-abcdef"},
+           f"${{VAR}} resolves in headers and the url, and the substituted VALUE (not the "
+           f"whole field) is registered for redaction — {secrets}. Registering the field "
+           f"would scrub 'Bearer ' out of unrelated text; registering the value scrubs the "
+           f"credential", failures, verbose)
+
+    _check("mcp.unset_variable_is_a_validation_error_naming_it",
+           len(missing_errs) == 1 and "TOK" in missing_errs[0],
+           f"an unset ${{VAR}} is reported by name before the run, not raised at load — "
+           f"raising would abort discovery of every OTHER eval in the directory over one "
+           f"unset variable: {missing_errs}", failures, verbose)
+
+    _check("mcp.too_short_to_redact_is_warned_and_left_alone",
+           short_secrets == set() and any("TOK" in w for w in _short_warns),
+           f"a 2-character secret is NOT added to the redaction set ({short_secrets}) and "
+           f"the author is told why — redacting it would rewrite every unrelated "
+           f"occurrence of those characters across the artifacts", failures, verbose)
+
+    # ...which makes the redaction set the wrong thing to ask "does this cell handle a
+    # secret". The exclusion above is about what can safely be REWRITTEN, not about what is
+    # confidential, and the two questions had been sharing one answer.
+    from .mcp import interpolated_refs
+    short_spec = parse_mcp_servers(
+        {"r": {"url": "https://h", "headers": {"Authorization": "${TOK}"}}}, where="t")
+    _, short_set = resolve_mcp_servers(short_spec, env={"TOK": "ab"})
+    plain_spec = parse_mcp_servers({"e": {"command": "/bin/echo"}}, where="t")
+    _check("mcp.short_interpolated_value_still_counts_as_a_credential",
+           interpolated_refs(short_spec) == ["r.headers.Authorization"]
+           and short_set == set() and interpolated_refs(plain_spec) == []
+           and interpolated_refs(None) == [],
+           f"a 2-character token is excluded from redaction and is still a credential, so "
+           f"exposure decisions read the DECLARATION for `${{VAR}}` rather than counting "
+           f"the redaction set: refs={interpolated_refs(short_spec)} "
+           f"redactable={short_set}. A server declared with no `${{VAR}}` at all handles "
+           f"nothing confidential and must not be treated as if it did", failures, verbose)
+
+    # `${VAR}` is honoured in credentials, never in `command`/`args`: substituting there
+    # would turn an environment variable into a way to choose what program executes.
+    stdio_var = parse_mcp_servers({"e": {"command": "${EVIL}", "args": ["${EVIL}"]}},
+                                  where="t")
+    res_v, sec_v = resolve_mcp_servers(stdio_var, env={"EVIL": "/bin/sh"})
+    _check("mcp.interpolation_cannot_choose_what_program_runs",
+           res_v["e"].command == "${EVIL}" and res_v["e"].args == ["${EVIL}"]
+           and sec_v == set(),
+           f"${{VAR}} stays literal in command/args ({res_v['e'].command!r}) — it is a "
+           f"credential mechanism, and honouring it there would let an env var select the "
+           f"executable, a categorically larger power than supplying a token",
+           failures, verbose)
+
+    # --- per-adapter: who can inject, who can enforce `tools:` -----------------
+    plain = parse_mcp_servers({"e": {"command": "python3"}}, where="t")
+    gated = parse_mcp_servers({"e": {"command": "python3", "tools": ["echo"]}}, where="t")
+    inject = {a: len(get_adapter(a).validate_mcp_support(plain)[0]) for a in
+              ("claude", "codex", "copilot", "antigravity")}
+    tools_claude = get_adapter("claude").validate_mcp_support(gated)[0]
+
+    _check("mcp.adapters_without_injection_refuse_rather_than_drop_the_servers",
+           inject["claude"] == 0 and all(inject[a] == 1 for a in
+                                         ("codex", "copilot", "antigravity")),
+           f"only claude accepts declared servers today, and the other three REFUSE the "
+           f"run instead of silently running without them — {inject}. Dropping them would "
+           f"grade a scenario that never had the tools it asked for, and every MCP "
+           f"assertion would fail for a reason that looks nothing like the cause",
+           failures, verbose)
+
+    _check("mcp.claude_refuses_tools_it_cannot_enforce",
+           len(tools_claude) == 1 and "C3" in tools_claude[0]
+           and "tools:" in tools_claude[0],
+           f"`tools:` on claude is a validation ERROR, not an accepted no-op: the only "
+           f"mechanism is deny-the-complement, which needs a tool list obtainable only "
+           f"from a second server instance that can answer differently than the one claude "
+           f"launches (§6-C2). The error points at C3 — {tools_claude}", failures, verbose)
+
+    # --- claude's config materialization --------------------------------------
+    scratch = _tempfile.mkdtemp(prefix="ase-mcptest-")
+    cl = get_adapter("claude")
+    resolved, _ = resolve_mcp_servers(
+        parse_mcp_servers({"echo": {"command": "python3", "args": ["s.py"],
+                                    "env": {"K": "V"}}}, where="t"), env={})
+    argv = _try(lambda: cl.build_argv(
+        "hi", RunOptions(mcp_servers=resolved, mcp_scratch_dir=scratch), cwd=scratch), [])
+    cfg_path = os.path.join(scratch, "mcp.json")
+    cfg = _try(lambda: _json.loads(open(cfg_path).read()))
+    mode = _try(lambda: os.stat(cfg_path).st_mode & 0o777)
+
+    _check("mcp.claude_writes_a_file_not_inline_json",
+           _flag_pair(argv, "--mcp-config", cfg_path)
+           and cfg == {"mcpServers": {"echo": {"command": "python3", "args": ["s.py"],
+                                               "env": {"K": "V"}}}},
+           f"the config goes to a FILE named on argv, never inline: argv is archived "
+           f"verbatim into result.json, so inline JSON would publish every resolved "
+           f"credential into the artifacts — {cfg}", failures, verbose)
+
+    _check("mcp.claude_config_is_not_world_readable",
+           mode == 0o600,
+           f"the scratch config is created 0600 in one step (O_CREAT with the mode, not "
+           f"write-then-chmod, which would leave a window where the credentials are "
+           f"readable) — got {oct(mode)}", failures, verbose)
+
+    # Any exception counts as "refused", but the MESSAGE has to explain itself: a bare
+    # TypeError from joining None would also stop the run, and would tell the operator
+    # nothing about why writing credentials into the workspace is refused.
+    no_scratch = None
+    try:
+        cl.build_argv("hi", RunOptions(mcp_servers=resolved), cwd=scratch)
+    except Exception as exc:
+        no_scratch = str(exc)
+    _check("mcp.claude_refuses_to_write_secrets_without_a_scratch_dir",
+           no_scratch is not None and "workspace" in no_scratch,
+           f"with no scratch dir the adapter RAISES rather than falling back to the "
+           f"workspace — the workspace is archived into artifacts and inlined into "
+           f"report.md, so that fallback would publish the credentials: {no_scratch!r}",
+           failures, verbose)
+
+    # `--strict-mcp-config` must survive injection, or the declared servers stop being the
+    # ONLY servers and the opt-in silently becomes an opt-in-plus-whatever-the-host-has.
+    _check("mcp.declared_servers_stay_hermetic",
+           "--strict-mcp-config" in argv,
+           "--mcp-config is paired with --strict-mcp-config, so declaring servers grants "
+           "exactly those and not the user's ambient ones", failures, verbose)
+
+    # --- the witness now permits declared servers, and only those --------------
+    init_echo = _json.dumps({"type": "system", "subtype": "init",
+                             "mcp_servers": [{"name": "echo", "status": "connected"}],
+                             "claude_code_version": "2.1.113"})
+    declared_ok = None
+    try:
+        cl.verify_post_run([], RunOptions(mcp_servers=resolved), cwd=scratch,
+                           stdout=init_echo, stderr="", exit_code=0)
+    except RuntimeError as exc:
+        declared_ok = str(exc)
+    undeclared = None
+    try:
+        cl.verify_post_run([], RunOptions(mcp_servers=resolved), cwd=scratch,
+                           stdout=_json.dumps(
+                               {"type": "system", "subtype": "init",
+                                "mcp_servers": [{"name": "echo"}, {"name": "sneaky"}],
+                                "claude_code_version": "2.1.113"}),
+                           stderr="", exit_code=0)
+    except RuntimeError as exc:
+        undeclared = str(exc)
+    none_opts = None
+    try:
+        cl.verify_post_run([], None, cwd=scratch, stdout=init_echo, stderr="",
+                           exit_code=0)
+    except RuntimeError as exc:
+        none_opts = str(exc)
+
+    _check("mcp.witness_permits_declared_servers_and_only_those",
+           declared_ok is None and undeclared is not None
+           and "sneaky" in undeclared and "echo" not in undeclared.split("server(s)")[1][:20],
+           f"a DECLARED server no longer fails the run (was: any named server was a "
+           f"kill-switch violation, so every intentional server failed closed), while an "
+           f"UNDECLARED one still does and is named — declared={declared_ok!r} "
+           f"undeclared={undeclared!r}", failures, verbose)
+
+    _check("mcp.witness_without_options_treats_everything_as_undeclared",
+           none_opts is not None,
+           f"called with no RunOptions (selftest, out-of-tree callers) the witness reads "
+           f"'nothing was declared' and fails on any reported server — defaulting the "
+           f"other way would let a missing argument silently permit any server at all: "
+           f"{none_opts!r}", failures, verbose)
+
+    # --- redaction reaches the artifacts, including nested and argv ------------
+    root = _tempfile.mkdtemp(prefix="ase-mcpred-")
+    r = runner_mod.Runner("claude", models=["m"], artifacts_root=os.path.join(root, "a"),
+                          run_id="c", skills_root=root)
+    r._secrets = ("sk-secret-abcdef",)
+    cell_dir = os.path.join(root, "cell")
+    os.makedirs(cell_dir, exist_ok=True)
+    r._rw(os.path.join(cell_dir, "t.txt"), "tool said sk-secret-abcdef back")
+    r._rwj(os.path.join(cell_dir, "t.json"),
+           {"argv": ["x", "--header", "Bearer sk-secret-abcdef"],
+            "events": [{"raw": {"deep": {"nested": "sk-secret-abcdef"}}}]})
+    txt = open(os.path.join(cell_dir, "t.txt")).read()
+    js = open(os.path.join(cell_dir, "t.json")).read()
+    js_obj = _json.loads(js)
+
+    _check("mcp.secrets_are_scrubbed_from_every_artifact_shape",
+           "sk-secret-abcdef" not in txt and "sk-secret-abcdef" not in js
+           and js_obj["argv"][2] == "Bearer «redacted»"
+           and js_obj["events"][0]["raw"]["deep"]["nested"] == "«redacted»",
+           f"redaction happens at the WRITERS, so it reaches argv, arbitrarily nested "
+           f"event payloads, and plain text alike without knowing any of their shapes — "
+           f"and covers the case no CLI flag can, a tool RESULT echoing a token back into "
+           f"the transcript. Structure survives: {js_obj['argv']}", failures, verbose)
+
+    # --- the same scrub, on secrets the JSON encoder RE-SPELLS -----------------
+    # Review reproduced this leak in both `_rwj` and the JSONL text path: the scrub used to
+    # search the SERIALIZED form for the RAW value, so any secret containing a quote, a
+    # backslash, a control character, or a non-ASCII byte was stored in an escaped spelling
+    # the search could not match, and sailed through in plain view. These are not exotic
+    # characters for a credential — a base64 secret can contain `/` and `+`, and a passphrase
+    # can contain anything at all.
+    tricky = ['tok"quote-abcdef', "tok\\slash-abcdef", "tökén-abcdef", "tok\nnewline-abcdef"]
+    r._secrets = tuple(tricky)
+    # The text path gets the secrets already JSON-ESCAPED, which is how they arrive in a
+    # CLI's own stdout.jsonl stream — the artifact this harness copies rather than authors.
+    r._rw(os.path.join(cell_dir, "esc.jsonl"),
+          "\n".join(_json.dumps({"result": t}) for t in tricky))
+    r._rwj(os.path.join(cell_dir, "esc.json"), {"argv": list(tricky), "n": {"deep": tricky}})
+    esc_txt = open(os.path.join(cell_dir, "esc.jsonl")).read()
+    esc_js = open(os.path.join(cell_dir, "esc.json")).read()
+    esc_obj = _json.loads(esc_js)
+    # Checked against BOTH spellings: the raw value and the encoder's version of it. Testing
+    # only the raw one would pass against the very bug this arm exists for.
+    escaped_forms = [_json.dumps(t)[1:-1] for t in tricky]
+    _check("mcp.redaction_survives_json_escaping",
+           all(t not in esc_txt and t not in esc_js for t in tricky)
+           and all(e not in esc_txt and e not in esc_js for e in escaped_forms)
+           and esc_obj["argv"] == ["«redacted»"] * len(tricky),
+           f"a secret containing a quote, backslash, control character or non-ASCII byte "
+           f"is scrubbed in every spelling it can reach disk in — the structured writer "
+           f"compares BEFORE serialization, and the text writer also matches the escaped "
+           f"form a CLI's own JSONL stream carries. argv={esc_obj['argv']}",
+           failures, verbose)
+
+    # Keys, not just values: a credential can be a dict key (an env map keyed by token, a
+    # header name) as easily as a leaf, and a walk that only visits values would miss it.
+    r._secrets = ("sk-secret-abcdef",)
+    r._rwj(os.path.join(cell_dir, "key.json"), {"sk-secret-abcdef": "v", "x": object()})
+    key_obj = _json.loads(open(os.path.join(cell_dir, "key.json")).read())
+    _check("mcp.redaction_covers_dict_keys_and_stringified_leaves",
+           "«redacted»" in key_obj and "sk-secret-abcdef" not in key_obj,
+           f"dict KEYS are scrubbed alongside values, and a leaf the encoder would render "
+           f"via default=str is rendered scrubbed — {sorted(key_obj)}", failures, verbose)
+
+    # A value that contains another must not be left half-rewritten by the shorter one.
+    overlap = redact("token=abcdef123456 short=abcdef",
+                     {"abcdef", "abcdef123456"})
+    _check("mcp.longest_secret_is_redacted_first",
+           overlap == "token=«redacted» short=«redacted»",
+           f"overlapping secrets are replaced longest-first, so the longer value is not "
+           f"left as '«redacted»123456' by the shorter one's pass — {overlap!r}",
+           failures, verbose)
+
+    # --- the archived workspace, the one artifact the runner does not WRITE ----
+    # It is moved into the artifact tree wholesale, so it never met `_rw`/`_rwj` and review
+    # found it kept credentials every other artifact had scrubbed: an MCP result can echo a
+    # token back and the agent can save it to a file.
+    ws = os.path.join(root, "ws")
+    os.makedirs(os.path.join(ws, "sub"), exist_ok=True)
+    open(os.path.join(ws, "notes.txt"), "w").write("the token is sk-secret-abcdef\n")
+    open(os.path.join(ws, "sub", "creds-sk-secret-abcdef.txt"), "w").write("x")
+    # Binary: a decode-then-scrub implementation skips or corrupts this one silently.
+    open(os.path.join(ws, "blob.bin"), "wb").write(b"\x00\xff" + b"sk-secret-abcdef" + b"\x00")
+    outside = os.path.join(root, "outside.txt")
+    open(outside, "w").write("sk-secret-abcdef untouched\n")
+    os.symlink(outside, os.path.join(ws, "link.txt"))
+    runner_mod._scrub_tree(ws, ("sk-secret-abcdef",))
+    ws_txt = open(os.path.join(ws, "notes.txt")).read()
+    ws_bin = open(os.path.join(ws, "blob.bin"), "rb").read()
+    ws_names = sorted(os.listdir(os.path.join(ws, "sub")))
+    _check("mcp.archived_workspace_is_scrubbed",
+           "sk-secret-abcdef" not in ws_txt and b"sk-secret-abcdef" not in ws_bin
+           and ws_bin.startswith(b"\x00\xff") and ws_names == ["creds-«redacted».txt"],
+           f"a credential the agent wrote into its workspace is scrubbed from file "
+           f"CONTENTS (text and binary alike, on bytes, so an undecodable file is not "
+           f"skipped) and from file NAMES — a redacted file whose own path spells out the "
+           f"token would be a scrub that only looks complete: {ws_names}",
+           failures, verbose)
+
+    _check("mcp.workspace_scrub_does_not_follow_symlinks",
+           open(outside).read() == "sk-secret-abcdef untouched\n"
+           and os.path.islink(os.path.join(ws, "link.txt")),
+           f"symlinks are not traversed: the target can sit outside the artifact tree, and "
+           f"reading through one would let a link the agent created pull arbitrary external "
+           f"content INTO the archive — the link is still a link afterwards, not a copy of "
+           f"what it pointed at: still_a_link={os.path.islink(os.path.join(ws, 'link.txt'))}",
+           failures, verbose)
+
+    # A HARDLINK has no target to refuse to follow — it IS the file, sharing one inode with
+    # every other name pointing at it. Review demonstrated an in-place rewrite reaching
+    # straight out of the artifact tree and overwriting an external file with «redacted».
+    ws2 = os.path.join(root, "ws2")
+    os.makedirs(ws2, exist_ok=True)
+    hard_outside = os.path.join(root, "hard-outside.txt")
+    open(hard_outside, "w").write("sk-secret-abcdef must survive\n")
+    before_ino = os.stat(hard_outside).st_ino
+    os.link(hard_outside, os.path.join(ws2, "hard.txt"))
+    runner_mod._scrub_tree(ws2, ("sk-secret-abcdef",))
+    hard_inside = open(os.path.join(ws2, "hard.txt")).read()
+    _check("mcp.workspace_scrub_breaks_hardlinks_instead_of_writing_through_them",
+           open(hard_outside).read() == "sk-secret-abcdef must survive\n"
+           and os.stat(hard_outside).st_ino == before_ino
+           and "sk-secret-abcdef" not in hard_inside,
+           f"the archived copy is scrubbed while the file the agent hardlinked to keeps its "
+           f"contents AND its inode — the replacement is written beside the original and "
+           f"renamed over it, so the artifact tree gets a new inode rather than the scrub "
+           f"mutating shared storage outside it: inside={hard_inside.strip()!r}",
+           failures, verbose)
+
+    # A symlink's TARGET STRING lives in the tree even though its contents do not, and
+    # `readlink` reads it straight back — an innocuously named link is as good a hiding
+    # place for a credential as a file containing one. Not following it is not scrubbing it.
+    ws3 = os.path.join(root, "ws3")
+    os.makedirs(ws3, exist_ok=True)
+    os.symlink("/tmp/sk-secret-abcdef/creds", os.path.join(ws3, "innocent"))
+    runner_mod._scrub_tree(ws3, ("sk-secret-abcdef",))
+    link_target = os.readlink(os.path.join(ws3, "innocent"))
+    _check("mcp.symlink_target_is_scrubbed_even_though_it_is_not_followed",
+           "sk-secret-abcdef" not in link_target and "«redacted»" in link_target,
+           f"the stored target of a symlink is redacted in place: skipping TRAVERSAL is "
+           f"correct (it can point outside the tree) but says nothing about the link's own "
+           f"metadata, which is archived and readable: {link_target!r}", failures, verbose)
+
+    # `os.walk` reports an unreadable directory to `onerror` and then yields NOTHING for it,
+    # which is indistinguishable from an empty one — a chmod 000 subtree was skipped in
+    # silence while the scrub reported success.
+    ws4 = os.path.join(root, "ws4")
+    hidden = os.path.join(ws4, "hidden")
+    os.makedirs(hidden, exist_ok=True)
+    open(os.path.join(hidden, "buried.txt"), "w").write("buried sk-secret-abcdef\n")
+    os.chmod(hidden, 0o000)
+    lost4 = runner_mod._scrub_tree(ws4, ("sk-secret-abcdef",))
+    _try(lambda: os.chmod(hidden, 0o700))  # a regression QUARANTINES it; don't crash the section
+    buried = _try(lambda: open(os.path.join(hidden, "buried.txt")).read(), "(unreadable)")
+    _check("mcp.unreadable_subtree_is_opened_rather_than_silently_skipped",
+           "sk-secret-abcdef" not in buried and lost4 == [],
+           f"permissions are repaired before the walk so an inaccessible subtree is scrubbed "
+           f"rather than passed over — the harness owns this tree, so they are its to "
+           f"restore, and an empty return means every byte really was examined: "
+           f"buried={buried.strip()!r} lost={lost4}", failures, verbose)
+
+    # A secret containing a separator spells itself out across a directory and its child
+    # while every individual component looks clean, so a per-component scrub certifies a
+    # tree whose own `find` output is the credential.
+    ws5 = os.path.join(root, "ws5")
+    os.makedirs(os.path.join(ws5, "tenantpart"), exist_ok=True)
+    open(os.path.join(ws5, "tenantpart", "secretpart"), "w").write("harmless\n")
+    runner_mod._scrub_tree(ws5, ("tenantpart/secretpart",))
+    ws5_paths = sorted(os.path.relpath(os.path.join(d, f), ws5)
+                       for d, _, fs in os.walk(ws5) for f in fs)
+    _check("mcp.secret_spanning_path_components_is_scrubbed",
+           not any("tenantpart/secretpart" in p for p in ws5_paths),
+           f"a slash-bearing secret is caught by checking the ASSEMBLED path, not one "
+           f"component at a time — the component that COMPLETES it is renamed, leaving the "
+           f"prefix (which is not itself a secret) alone: {ws5_paths}", failures, verbose)
+
+    # Fail closed on what cannot be certified. An artifact the scrub could not read or
+    # rewrite is deleted rather than published unchecked, and the caller is told which —
+    # a silent deletion would be worse than either outcome it is choosing between.
+    ws6 = os.path.join(root, "ws6")
+    os.makedirs(ws6, exist_ok=True)
+    open(os.path.join(ws6, "leaky.txt"), "w").write("tok sk-secret-abcdef\n")
+    open(os.path.join(ws6, "fine.txt"), "w").write("nothing to see\n")
+    _orig_scrub_file = runner_mod._scrub_file
+    runner_mod._scrub_file = lambda p, s: (
+        (_ for _ in ()).throw(OSError(30, "Read-only file system"))
+        if p.endswith("leaky.txt") else _orig_scrub_file(p, s))
+    try:
+        lost6 = runner_mod._scrub_tree(ws6, ("sk-secret-abcdef",))
+    finally:
+        runner_mod._scrub_file = _orig_scrub_file
+    _check("mcp.uncertifiable_artifact_is_removed_and_named",
+           lost6 == ["leaky.txt"]
+           and not os.path.exists(os.path.join(ws6, "leaky.txt"))
+           and os.path.exists(os.path.join(ws6, "fine.txt"))
+           and "leaky.txt" in runner_mod._scrub_note(lost6),
+           f"a file the scrub cannot rewrite is removed from the archive and RETURNED to "
+           f"the caller, which fails the cell with it named — the rest of the workspace is "
+           f"untouched, so failing closed costs one artifact rather than the run's whole "
+           f"evidence: lost={lost6}", failures, verbose)
+
+    # `os.path.isdir` FOLLOWS symlinks, so an agent that replaces its whole workspace with a
+    # link aims the entire scrub at whatever it points at — review had every file under an
+    # external directory rewritten to «redacted».
+    ws7 = os.path.join(root, "ws7")
+    ws7_target = os.path.join(root, "ws7-external")
+    os.makedirs(ws7_target, exist_ok=True)
+    open(os.path.join(ws7_target, "creds.txt"), "w").write("sk-secret-abcdef stays\n")
+    os.symlink(ws7_target, ws7)
+    lost7 = runner_mod._scrub_tree(ws7, ("sk-secret-abcdef",))
+    _check("mcp.workspace_root_must_itself_be_a_real_directory",
+           open(os.path.join(ws7_target, "creds.txt")).read() == "sk-secret-abcdef stays\n"
+           and lost7 and not os.path.islink(ws7) and os.path.isdir(ws7),
+           f"a workspace root that is not a real directory is dropped whole rather than "
+           f"walked — following it would let the agent point the scrub at any directory on "
+           f"the machine and rewrite it — and an empty directory is left behind so the "
+           f"report writer downstream still finds the shape it expects: lost={lost7}",
+           failures, verbose)
+
+    # Reading a 000-mode file needs a chmod, and a chmod changes the INODE — which is the
+    # same object every hardlink to it sees. Review watched an external file go 000 -> 600.
+    ws8 = os.path.join(root, "ws8")
+    os.makedirs(ws8, exist_ok=True)
+    locked_outside = os.path.join(root, "locked-outside.txt")
+    open(locked_outside, "w").write("sk-secret-abcdef stays\n")
+    os.link(locked_outside, os.path.join(ws8, "locked.txt"))
+    os.chmod(locked_outside, 0o000)
+    lost8 = runner_mod._scrub_tree(ws8, ("sk-secret-abcdef",))
+    mode8 = _stat.S_IMODE(os.stat(locked_outside).st_mode)
+    os.chmod(locked_outside, 0o600)
+    _check("mcp.permission_repair_never_widens_a_shared_inode",
+           mode8 == 0o000 and lost8 == ["locked.txt"]
+           and not os.path.exists(os.path.join(ws8, "locked.txt")),
+           f"an unreadable file with more than one name is quarantined rather than chmod-ed "
+           f"open: widening the mode would be a change visible through every OTHER name for "
+           f"that inode, i.e. outside the artifact tree, so the harness drops its own name "
+           f"and leaves the rest alone: external mode={mode8:04o} lost={lost8}",
+           failures, verbose)
+
+    # "Not a directory" is not the same claim as "a readable regular file". A FIFO makes
+    # `open(...).read()` wait for a writer that will never come, and review hung the scrub.
+    ws9 = os.path.join(root, "ws9")
+    os.makedirs(ws9, exist_ok=True)
+    os.mkfifo(os.path.join(ws9, "pipe"))
+    open(os.path.join(ws9, "ordinary.txt"), "w").write("tok sk-secret-abcdef\n")
+    box9: dict = {}
+    t9 = _threading.Thread(
+        target=lambda: box9.update(r=_try(lambda: runner_mod._scrub_tree(
+            ws9, ("sk-secret-abcdef",)), "(raised)")), daemon=True)
+    t9.start()
+    t9.join(20.0)
+    ord9 = _try(lambda: open(os.path.join(ws9, "ordinary.txt")).read(), "(unreadable)")
+    _check("mcp.special_files_are_removed_rather_than_read",
+           not t9.is_alive() and box9.get("r") == ["pipe"]
+           and not os.path.lexists(os.path.join(ws9, "pipe"))
+           and "sk-secret-abcdef" not in ord9,
+           f"entries are classified with `lstat`, so a FIFO/socket/device is removed and "
+           f"named instead of being opened — none of them holds archivable bytes and an "
+           f"`open` on one never returns, which would hang the whole run rather than fail "
+           f"it: returned={box9.get('r')} still_running={t9.is_alive()}", failures, verbose)
+
+    # On macOS a file's bytes are not all in the file: `xattr -w` parks a credential beside
+    # the data where no `read()` will show it, and `cp -p`/`ditto`/zip carry it along.
+    ws10 = os.path.join(root, "ws10")
+    ws10_sub = os.path.join(ws10, "sub")
+    os.makedirs(ws10_sub, exist_ok=True)
+    ws10_file = os.path.join(ws10, "plain.txt")
+    open(ws10_file, "w").write("nothing to see\n")
+    ws10_link = os.path.join(ws10, "plain.link")
+    os.symlink("plain.txt", ws10_link)
+    _try(lambda: _xattrs.setxattr(ws10_file, b"user.tok", b"sk-secret-abcdef"))
+    _try(lambda: _xattrs.setxattr(ws10_file, b"user.sk-secret-abcdef", b"in the NAME"))
+    _try(lambda: _xattrs.setxattr(ws10_sub, b"user.tok", b"sk-secret-abcdef"))
+    _try(lambda: _xattrs.setxattr(ws10_link, b"user.tok", b"sk-secret-abcdef"))
+    lost10 = runner_mod._scrub_tree(ws10, ("sk-secret-abcdef",))
+    left10 = []
+    for p in (ws10_file, ws10_sub, ws10_link):
+        for n in _try(lambda: _xattrs.listxattr(p), []):
+            left10.append((os.path.basename(p), n, _try(lambda: _xattrs.getxattr(p, n), b"")))
+    _check("mcp.extended_attributes_are_scrubbed_like_contents",
+           _xattrs.SUPPORTED and lost10 == []
+           and not any(b"sk-secret-abcdef" in n or b"sk-secret-abcdef" in v
+                       for _, n, v in left10)
+           and any(b"redacted" in n or b"redacted" in v for _, n, v in left10),
+           f"attribute VALUES and attribute NAMES are both scrubbed, on files, directories "
+           f"and symlinks alike — metadata is archived with the tree and is invisible to "
+           f"every check that reads a file's contents, so `lost == []` would otherwise be "
+           f"certifying bytes it never looked at: {left10}", failures, verbose)
+
+    # `chflags uchg` makes a file undeletable, and the old quarantine swallowed the failure:
+    # it reported the path as lost while leaving the raw secret sitting there.
+    ws11 = os.path.join(root, "ws11")
+    os.makedirs(ws11, exist_ok=True)
+    stuck11 = os.path.join(ws11, "immutable.txt")
+    open(stuck11, "w").write("tok sk-secret-abcdef\n")
+    _orig_scrub_file = runner_mod._scrub_file
+    runner_mod._scrub_file = lambda p, s: (
+        (_ for _ in ()).throw(OSError(30, "Read-only file system"))
+        if p.endswith("immutable.txt") else _orig_scrub_file(p, s))
+    _try(lambda: os.chflags(stuck11, _stat.UF_IMMUTABLE))
+    try:
+        lost11 = _try(lambda: runner_mod._scrub_tree(ws11, ("sk-secret-abcdef",)), "(raised)")
+    finally:
+        runner_mod._scrub_file = _orig_scrub_file
+        _try(lambda: os.chflags(stuck11, 0))  # never leave the selftest root undeletable
+    _check("mcp.quarantine_proves_the_deletion_rather_than_assuming_it",
+           lost11 == ["immutable.txt"] and not os.path.lexists(stuck11),
+           f"an immutable artifact is unlocked and actually removed — the result is the "
+           f"answer to `lexists`, not the absence of an exception, because a swallowed "
+           f"`unlink` failure reports a deletion that did not happen and publishes the "
+           f"secret under a clean-looking `lost` entry: lost={lost11} "
+           f"still_there={os.path.lexists(stuck11)}", failures, verbose)
+
+    # And when even that fails, the difference between "removed" and "still on disk" is the
+    # whole point — reporting the second as the first is the failure mode being fixed.
+    ws12 = os.path.join(root, "ws12")
+    os.makedirs(ws12, exist_ok=True)
+    open(os.path.join(ws12, "welded.txt"), "w").write("tok sk-secret-abcdef\n")
+    _orig_remove = runner_mod._remove
+    runner_mod._scrub_file = lambda p, s: (_ for _ in ()).throw(OSError(30, "Read-only"))
+    runner_mod._remove = lambda p: False
+    try:
+        note12 = runner_mod._scrub_and_note(ws12, ("sk-secret-abcdef",))
+        raised12 = _try(lambda: runner_mod._scrub_tree(ws12, ("sk-secret-abcdef",)), "(raised)")
+    finally:
+        runner_mod._scrub_file, runner_mod._remove = _orig_scrub_file, _orig_remove
+    _check("mcp.unremovable_leak_is_reported_as_a_leak_not_as_a_removal",
+           raised12 == "(raised)" and "welded.txt" in note12
+           and "still contains a declared secret" in note12,
+           f"an artifact that can be neither scrubbed nor deleted raises rather than "
+           f"joining the `lost` list, and the sentence the cell carries says the secret is "
+           f"STILL THERE instead of claiming a removal — a `lost` entry promises the "
+           f"artifact is gone: note={note12!r}", failures, verbose)
+
+    # One round of assembled-path reasoning is not enough: with two secrets declared,
+    # renaming a parent to remove the first CREATED the second across the new parent and an
+    # untouched child the bottom-up walk had already gone past.
+    # The second pair is independent of the first and forces a SECOND round: one pass over
+    # the tree repairs one spelling, so a check that runs once leaves the other standing.
+    ws13 = os.path.join(root, "ws13")
+    os.makedirs(os.path.join(ws13, "secretAAAAtailpart"), exist_ok=True)
+    os.makedirs(os.path.join(ws13, "otherpart"), exist_ok=True)
+    open(os.path.join(ws13, "secretAAAAtailpart", "childsecret"), "w").write("harmless\n")
+    open(os.path.join(ws13, "otherpart", "othersecret"), "w").write("harmless\n")
+    ws13_secrets = ("secretAAAA", "tailpart/childsecret", "otherpart/othersecret")
+    lost13 = runner_mod._scrub_tree(ws13, ws13_secrets)
+    ws13_paths = sorted(os.path.relpath(os.path.join(d, n), ws13).replace(os.sep, "/")
+                        for d, ds, fs in os.walk(ws13) for n in ds + fs)
+    _check("mcp.assembled_path_check_runs_to_a_fixed_point",
+           lost13 == []
+           and not any(runner_mod._spells_secret(p, ws13_secrets) for p in ws13_paths),
+           f"the tree is re-examined until no assembled path spells ANY declared secret, "
+           f"rather than each component being judged once on the way past — scrubbing one "
+           f"secret out of a name can complete a different one with a neighbour that has "
+           f"already been visited, and repairing one spelling per pass leaves every other "
+           f"one standing: {ws13_paths}", failures, verbose)
+
+    # `os.link(src, dst, follow_symlinks=False)` works on macOS, so "a symlink is not an
+    # object an unprivileged agent can share" was wrong: an external link hardlinked into the
+    # workspace had its metadata rewritten through the shared inode by an in-place setxattr.
+    ws14 = os.path.join(root, "ws14")
+    os.makedirs(ws14, exist_ok=True)
+    link_outside = os.path.join(root, "link-outside")
+    _try(lambda: os.symlink("/tmp/sk-secret-abcdef/creds", link_outside))
+    _try(lambda: _xattrs.setxattr(link_outside, b"user.tok", b"sk-secret-abcdef"))
+    ws14_copy = os.path.join(ws14, "copy")
+    shared14 = _try(lambda: (os.link(link_outside, ws14_copy, follow_symlinks=False),
+                             os.lstat(link_outside).st_ino == os.lstat(ws14_copy).st_ino)[1],
+                    "(cannot hardlink a symlink here)")
+    lost14 = runner_mod._scrub_tree(ws14, ("sk-secret-abcdef",))
+    out14 = (_try(lambda: os.readlink(link_outside), ""),
+             _try(lambda: _xattrs.getxattr(link_outside, b"user.tok"), b""))
+    in14 = (_try(lambda: os.readlink(ws14_copy), ""),
+            _try(lambda: [_xattrs.getxattr(ws14_copy, n) for n in _xattrs.listxattr(ws14_copy)],
+                 []))
+    _check("mcp.multiply_linked_symlink_is_replaced_not_edited",
+           shared14 is True and lost14 == []
+           and out14 == ("/tmp/sk-secret-abcdef/creds", b"sk-secret-abcdef")
+           and os.path.islink(ws14_copy) and "sk-secret-abcdef" not in in14[0]
+           and not any(b"sk-secret-abcdef" in v for v in in14[1])
+           and os.lstat(link_outside).st_ino != os.lstat(ws14_copy).st_ino,
+           f"a symlink is scrubbed by BUILDING A REPLACEMENT and renaming it over the old "
+           f"name, never by editing in place — a symlink CAN be hardlinked, so an in-place "
+           f"`setxattr` writes through to every other name for that inode, exactly as an "
+           f"in-place content rewrite did for regular files: shared_before={shared14} "
+           f"outside={out14} archived={in14} lost={lost14}", failures, verbose)
+
+    # Absence and refusal are different answers. A bare `except OSError: return []` gave them
+    # the same one, certifying a workspace it could not even stat.
+    ws15 = os.path.join(root, "ws15")
+    ws15_ws = os.path.join(ws15, "workspace")
+    os.makedirs(ws15_ws, exist_ok=True)
+    open(os.path.join(ws15_ws, "leak.txt"), "w").write("tok sk-secret-abcdef\n")
+    os.chmod(ws15, 0o000)
+    try:
+        lost15 = _try(lambda: runner_mod._scrub_tree(ws15_ws, ("sk-secret-abcdef",)), "(raised)")
+    finally:
+        _try(lambda: os.chmod(ws15, 0o700))
+    body15 = _try(lambda: open(os.path.join(ws15_ws, "leak.txt")).read(), "(unreadable)")
+    missing15 = runner_mod._scrub_tree(os.path.join(root, "ws15-never-existed"),
+                                       ("sk-secret-abcdef",))
+    _check("mcp.unreadable_root_is_repaired_or_reported_never_certified",
+           lost15 == [] and "sk-secret-abcdef" not in body15 and missing15 == [],
+           f"a root that cannot be stat-ed is repaired through its parent — `cell_dir` is "
+           f"this harness's own directory — and only a genuine ENOENT returns clean, because "
+           f"'nothing was archived' and 'I was refused' are opposite answers that an "
+           f"`except OSError` collapses into a clean bill of health: lost={lost15} "
+           f"body={body15.strip()!r} absent_root={missing15}", failures, verbose)
+
+    # The scratch dir holds the CLI config file carrying the INTERPOLATED credentials — the
+    # one place on disk where a resolved `${VAR}` is written in the clear — and it was
+    # removed with the same `ignore_errors=True` that let a locked exec dir survive a cell.
+    ws16 = os.path.join(root, "ws16")
+    os.makedirs(ws16, exist_ok=True)
+    open(os.path.join(ws16, "mcp.json"), "w").write('{"token": "sk-secret-abcdef"}')
+    os.chmod(ws16, 0o000)
+    gone16 = runner_mod._purge("the MCP scratch directory", ws16)
+    _try(lambda: os.chmod(ws16, 0o700))
+    ws17 = os.path.join(root, "ws17")
+    os.makedirs(ws17, exist_ok=True)
+    _orig_remove = runner_mod._remove
+    runner_mod._remove = lambda p: False
+    try:
+        stuck17 = runner_mod._purge("the MCP scratch directory", ws17)
+    finally:
+        runner_mod._remove = _orig_remove
+    absent17 = runner_mod._purge("the MCP scratch directory",
+                                 os.path.join(root, "ws17-never-existed"))
+    _check("mcp.credential_scratch_dir_removal_is_verified_not_best_effort",
+           gone16 == "" and not os.path.exists(ws16)
+           and ws17 in stuck17 and "resolved credentials" in stuck17 and absent17 == "",
+           f"a locked credentials directory is removed through the same outward-in "
+           f"escalation the workspace quarantine uses, and one that genuinely cannot go "
+           f"returns a sentence NAMING it rather than an empty answer — `rmtree(..., "
+           f"ignore_errors=True)` reports on the call, not on the directory: "
+           f"locked_removed={not os.path.exists(ws16)} stuck={stuck17[:80]!r} "
+           f"absent={absent17!r}", failures, verbose)
+
+    # --- the run summary, written after every cell cleared its secrets ---------
+    # `_secrets` is deliberately cell-scoped, so by the time the summary is written it is
+    # empty — review reproduced a credential republished through both summary.json and
+    # summary.md via `RunResult.error`, which carries a tail of the child's output.
+    srun = os.path.join(root, "summ")
+    r2 = runner_mod.Runner("claude", models=["m"], artifacts_root=srun, run_id="s",
+                           skills_root=root)
+    r2._secrets = ("sk-secret-abcdef",)
+    r2._run_secrets = ("sk-secret-abcdef",)
+    r2._secrets = ()          # exactly what _run_cell's finally leaves behind
+    err_rr = runner_mod.RunResult(agent="claude", eval_name="e", prompt="", workdir="")
+    err_rr.error = "child failed: Authorization: Bearer sk-secret-abcdef"
+    scell = runner_mod.CellResult(agent="claude", model="m", eval_name="e", skill=None,
+                                  passed=False, run_result=err_rr,
+                                  artifacts_dir=os.path.join(srun, "s", "c0"))
+    _serr = _io.StringIO()
+    _saved, _sys.stderr = _sys.stderr, _serr
+    try:
+        r2._write_summary([scell], [])
+    finally:
+        _sys.stderr = _saved
+    sum_js = open(os.path.join(srun, "s", "summary.json")).read()
+    sum_md = open(os.path.join(srun, "s", "summary.md")).read()
+    # Parsed, not grepped: `_write_json` writes with ensure_ascii, so the marker itself
+    # lands as `«redacted»` and a raw substring test for it would read as a miss.
+    sum_err = _json.loads(sum_js)["cells"][0]["error"]
+    _check("mcp.run_summary_is_scrubbed_after_cells_clear_their_secrets",
+           "sk-secret-abcdef" not in sum_js and "sk-secret-abcdef" not in sum_md
+           and sum_err.endswith("«redacted»"),
+           f"summary.json and summary.md are scrubbed against the RUN-scoped union of "
+           f"every cell's secrets, because they are written long after the last cell "
+           f"cleared its own registry and they AGGREGATE cells — one cell's set would "
+           f"leave the others exposed. json_clean={'sk-secret-abcdef' not in sum_js} "
+           f"md_clean={'sk-secret-abcdef' not in sum_md}", failures, verbose)
+
+    # --- named is not the same as usable --------------------------------------
+    # `status` used to be discarded, so a server reported as failed counted as successfully
+    # present: not undeclared, so no violation, and not missing, so not even a warning.
+    def _witness_warnings(servers):
+        buf = _io.StringIO()
+        saved, _sys.stderr = _sys.stderr, buf
+        try:
+            cl.verify_post_run(
+                [], RunOptions(mcp_servers=resolved), cwd=scratch,
+                stdout=_json.dumps({"type": "system", "subtype": "init",
+                                    "mcp_servers": servers,
+                                    "claude_code_version": "2.1.113"}),
+                stderr="", exit_code=0)
+        except RuntimeError as exc:
+            return f"RAISED {exc}"
+        finally:
+            _sys.stderr = saved
+        return buf.getvalue()
+
+    w_failed = _witness_warnings([{"name": "echo", "status": "failed"}])
+    w_nostatus = _witness_warnings([{"name": "echo"}])
+    w_connected = _witness_warnings([{"name": "echo", "status": "connected"}])
+    # An UNDECLARED server still fails the run no matter how sick it claims to be — the
+    # hermeticity violation is that it was there at all, and a status field is attacker-
+    # controlled input from the server's own host.
+    w_undeclared_failed = _witness_warnings(
+        [{"name": "echo", "status": "connected"}, {"name": "sneaky", "status": "failed"}])
+    _check("mcp.declared_server_must_be_reported_connected",
+           "echo" in w_failed and "failed" in w_failed
+           and "echo" in w_nostatus and w_connected == ""
+           and w_undeclared_failed.startswith("RAISED") and "sneaky" in w_undeclared_failed,
+           f"a DECLARED server reported in any state but `connected` gets a durable "
+           f"warning instead of passing as present — an unknown state warns too, since a "
+           f"status this adapter does not recognise is not evidence of health — while a "
+           f"healthy one is silent and an UNDECLARED one still fails the run whatever its "
+           f"status says: failed={w_failed.strip()[:70]!r} clean={w_connected!r}",
+           failures, verbose)
+
+    # --- the refusals hold off the CLI path ------------------------------------
+    # They used to live only in the CLI's pre-flight, so `Runner.run()` and any direct
+    # caller could run an adapter that cannot inject servers with `mcp_servers:` quietly
+    # dropped, or claude with `tools:` quietly unenforced — the exact degradations the
+    # validation claims to refuse.
+    from . import exec as exec_mod
+    gated = parse_mcp_servers({"e": {"command": "true", "tools": ["echo"]}}, where="t")
+    plain = parse_mcp_servers({"e": {"command": "true"}}, where="t")
+
+    def _prog_run(agent, servers):
+        d = _tempfile.mkdtemp(prefix="ase-mcpprog-")
+        try:
+            ex = exec_mod.execute(
+                get_adapter(agent), "hi",
+                RunOptions(mcp_servers=servers, mcp_scratch_dir=d),
+                cwd=d, timeout=5)
+            return ex.result.error or ""
+        except Exception as exc:                # noqa: BLE001 — a raise is also a refusal
+            return f"RAISED {exc}"
+        finally:
+            _shutil.rmtree(d, ignore_errors=True)
+
+    prog_unsupported = _try(lambda: _prog_run("antigravity", plain), "")
+    prog_gated = _try(lambda: _prog_run("claude", gated), "")
+    _check("mcp.refusals_hold_on_the_programmatic_path",
+           "cannot inject MCP servers" in prog_unsupported
+           and "tools:" in prog_gated and "not implemented" in prog_gated,
+           f"an adapter that cannot inject declared servers, and claude with a `tools:` "
+           f"allowlist it cannot enforce, are BOTH refused without the CLI's pre-flight in "
+           f"the picture — re-asserted at the one choke point every invocation passes "
+           f"through, so the refusal cannot be routed around by calling Runner.run() or "
+           f"the adapter directly: unsupported={prog_unsupported[:60]!r} "
+           f"gated={prog_gated[:60]!r}", failures, verbose)
+
+    # --- a warning nobody can read afterwards is not a warning -----------------
+    # The server-health warning above went to the HARNESS process's stderr, which nothing
+    # archives — `execute()` captures the CHILD's. So the message claiming that assertions
+    # "will fail for a reason the results will not show" was itself that reason. It now
+    # rides the result into cell.json, report.md and summary.json. Driven end to end through
+    # `execute()` rather than by calling the collector directly, because the defect was
+    # never in the printing — it was in nothing being wired to listen.
+    from .notices import collecting as _collecting
+    from .notices import warn as _warn
+
+    from .adapters.base import Adapter as _Adapter
+    from .adapters.base import ParseOutput as _ParseOutput
+
+    class _WarningAdapter(_Adapter):
+        name = "warnadapter"
+        binary = _sys.executable
+        skills_subdir = ".x/skills"
+
+        def build_argv(self, prompt, opts, *, cwd):
+            return [_sys.executable, "-c", ""]
+
+        def parse(self, stdout, stderr, exit_code, *, opts=None):
+            return _ParseOutput(events=[], final_text="")
+
+        def verify_post_run(self, argv, opts, *, cwd, stdout, stderr, exit_code=None):
+            _warn("warning: [warnadapter] server 'echo' was reported but not connected")
+            raise RuntimeError("and then the verification failed")
+
+    wd = _tempfile.mkdtemp(prefix="ase-warn-")
+    try:
+        wex = exec_mod.execute(_WarningAdapter(), "hi", RunOptions(), cwd=wd, timeout=10)
+        wrr = wex.result
+        wcell = runner_mod.CellResult(agent="claude", model="m", eval_name="e",
+                                      skill=None, passed=False, run_result=wrr,
+                                      artifacts_dir=os.path.join(wd, "c0"))
+        wreport = _try(lambda: runner_mod.render_report(wcell), "")
+        wrun = runner_mod.Runner("claude", models=["m"], artifacts_root=wd,
+                                 run_id="w", skills_root=root)
+        _wbuf = _io.StringIO()
+        _wsaved, _sys.stderr = _sys.stderr, _wbuf
+        try:
+            wrun._write_summary([wcell], [])
+        finally:
+            _sys.stderr = _wsaved
+        wsum = _json.loads(open(os.path.join(wd, "w", "summary.json")).read())
+        wsum_warn = wsum["cells"][0].get("warnings")
+    finally:
+        _shutil.rmtree(wd, ignore_errors=True)
+    _check("mcp.post_run_warnings_survive_the_process_that_printed_them",
+           any("not connected" in w for w in wrr.warnings)
+           and "not connected" in wreport
+           and wsum_warn is not None and any("not connected" in w for w in wsum_warn)
+           and wrr.error and "and then the verification failed" in wrr.error,
+           f"a warning raised during post-run verification is recorded on the RESULT and "
+           f"reaches report.md and summary.json, not just the operator's terminal — and a "
+           f"warning emitted BEFORE the verification went on to raise is kept too, since "
+           f"the last finding failing does not unsay the earlier ones: "
+           f"warnings={wrr.warnings} error={(wrr.error or '')[:50]!r}", failures, verbose)
+
+    # The mechanism working proves nothing about its CALLERS still using it, so claude's own
+    # health warning is re-run inside a window and the drift warning — whose terminal output
+    # is rate-limited once per (agent, version) — is emitted twice.
+    _cbuf = _io.StringIO()
+    _csaved, _sys.stderr = _sys.stderr, _cbuf
+    try:
+        with _collecting() as claude_durable:
+            _try(lambda: cl.verify_post_run(
+                [], RunOptions(mcp_servers=resolved), cwd=scratch,
+                stdout=_json.dumps({"type": "system", "subtype": "init",
+                                    "mcp_servers": [{"name": "echo", "status": "failed"}],
+                                    "claude_code_version": "9.9.9-unverified"}),
+                stderr="", exit_code=0))
+        with _collecting() as drift_second:
+            _try(lambda: cl.verify_post_run(
+                [], RunOptions(mcp_servers=resolved), cwd=scratch,
+                stdout=_json.dumps({"type": "system", "subtype": "init",
+                                    "mcp_servers": [{"name": "echo", "status": "connected"}],
+                                    "claude_code_version": "9.9.9-unverified"}),
+                stderr="", exit_code=0))
+    finally:
+        _sys.stderr = _csaved
+    drift_echoes = _cbuf.getvalue().count("9.9.9-unverified")
+    _check("mcp.rate_limited_warnings_still_record_on_every_cell",
+           any("not as connected" in w for w in claude_durable)
+           and any("9.9.9-unverified" in w for w in claude_durable)
+           and any("9.9.9-unverified" in w for w in drift_second)
+           and drift_echoes == 1,
+           f"claude's health and version-drift warnings both reach the collector, and the "
+           f"drift warning's once-per-version suppression governs the TERMINAL only — a "
+           f"matrix where cell 1 carries the finding and cells 2..n look clean would "
+           f"misreport what happened to them: echoes={drift_echoes} "
+           f"second_cell={[w[:40] for w in drift_second]}", failures, verbose)
+
+    # Parallel cells share one process stderr, so the collector is thread-local: a
+    # redirect_stderr at the call site would have attributed one cell's warnings to another.
+    import threading as _threading
+    _cross: dict = {}
+
+    def _collect_one(tag, bar):
+        with _collecting() as got:
+            # Both windows must be OPEN before either warns, or the threads just take
+            # turns and a process-wide sink would pass by luck of the scheduler.
+            _try(lambda: bar.wait(5.0))
+            _warn(f"warning: from-{tag}")
+            _try(lambda: bar.wait(5.0))
+            _cross[tag] = list(got)
+
+    _bar = _threading.Barrier(2)
+    _t1 = _threading.Thread(target=_collect_one, args=("a", _bar))
+    _t2 = _threading.Thread(target=_collect_one, args=("b", _bar))
+    _wbuf2 = _io.StringIO()
+    _wsaved2, _sys.stderr = _sys.stderr, _wbuf2
+    try:
+        _t1.start(); _t2.start(); _t1.join(10.0); _t2.join(10.0)
+    finally:
+        _sys.stderr = _wsaved2
+    _check("mcp.warning_collection_is_per_cell_not_per_process",
+           _cross.get("a") == ["warning: from-a"] and _cross.get("b") == ["warning: from-b"],
+           f"two collection windows open at once in different threads each capture only "
+           f"their own warnings — cells run in parallel and stderr is process-global, so a "
+           f"process-wide capture would file one cell's findings on another's result: "
+           f"{_cross}", failures, verbose)
+
+    _shutil.rmtree(scratch, ignore_errors=True)
+    _shutil.rmtree(root, ignore_errors=True)

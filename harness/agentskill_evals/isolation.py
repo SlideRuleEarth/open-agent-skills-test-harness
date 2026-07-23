@@ -170,6 +170,56 @@ def build_isolated_home(
     return dest_home
 
 
+def home_write_escapes(home: Optional[str]) -> list[str]:
+    """Overlay paths a write would travel to land in the REAL home.
+
+    The overlay masks what the model can READ. It was never a boundary on what the model can
+    WRITE: step 1 of `_overlay` passes every unmasked real-HOME entry through as a symlink,
+    so `$HOME/.cache/x` IS `~/.cache/x`. Review wrote a token through one of those and
+    watched the overlay's removal succeed while the token stayed in the real home — outside
+    every directory this harness deletes and outside the workspace it scrubs.
+
+    Returns HOME-relative paths of EVERY symlink resolving outside *home*, sorted —
+    whatever it points at. The first version reported only directory symlinks, reasoning
+    that a file symlink can be clobbered but not used to plant a new file. Clobbering is the
+    leak: review symlinked a `state.json`, the gate reported nothing, and writing through it
+    replaced the real file's contents with the token. A dangling symlink is worse still — it
+    has no target to inspect and a write CREATES one outside. "What kind of thing is at the
+    other end" is not the question; "does this name lead out of the tree we can account for"
+    is, and it has the same answer for all three.
+
+    Walks the overlay, never through it (``followlinks=False``): the cost is the materialized
+    part of the tree, not the real home hanging off its symlinks.
+    """
+    if not home or not os.path.isdir(home):
+        return []
+    # Both sides canonicalized, because only one of them was: `realpath` resolves symlinks
+    # and `abspath` does not, so on macOS a link pointing inside its OWN overlay compared
+    # `/private/var/.../home/x` against a root of `/var/.../home` and was reported as an
+    # escape. That is the safe direction to be wrong in — it over-refuses — but it would
+    # have made the structural lifting condition unreachable, since a materialized HOME is
+    # exactly where safe internal links start appearing.
+    root = os.path.realpath(home)
+    # normcase folds case on Windows, where the filesystem does too, and is a no-op on
+    # POSIX. Deliberately not a blanket `lower()` on darwin: APFS is usually case-
+    # insensitive but can be case-sensitive, and folding there would make an OUTSIDE path
+    # compare as inside. Over-refusing costs a run; under-refusing leaks the token.
+    root_key = os.path.normcase(root)
+    inside = root_key + os.sep
+    found: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in list(dirnames) + list(filenames):
+            path = os.path.join(dirpath, name)
+            if not os.path.islink(path):
+                continue
+            # realpath, not lstat: a dangling link still resolves to the path a write would
+            # create, and that path is exactly what needs to be inside the overlay.
+            target = os.path.normcase(os.path.realpath(path))
+            if target != root_key and not target.startswith(inside):
+                found.append(os.path.relpath(path, root))
+    return sorted(found)
+
+
 def _validate_mask_subpath(sub: str) -> None:
     """Masks are opened for writing (O_TRUNC) at the joined path — an absolute,
     drive-anchored, or ``..``-traversing subpath would clobber a file outside the overlay.

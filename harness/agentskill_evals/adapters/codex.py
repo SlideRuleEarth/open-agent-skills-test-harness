@@ -27,10 +27,58 @@ import sys
 from typing import Any, Mapping, Optional
 
 from ..schema import EventKind, NormalizedEvent
-from .base import Adapter, ParseOutput, ProbeResult, RunOptions, extract_command, extract_path, iter_jsonl, try_load_json, warn_unknown_usage
+from .base import (Adapter, ParseOutput, ProbeResult, RunOptions, VersionProvenance,
+                   extract_command, extract_path, iter_jsonl, try_load_json,
+                   warn_unknown_usage)
 
 
 _KNOWN_USAGE_KEYS = {"input_tokens", "output_tokens", "reasoning_tokens", "total_tokens"}
+
+# --- CLI version provenance (see base.VersionProvenance) ---------------------------
+#
+# 0.140.0: the build every finding in this file was established against; confirmed the
+#          installed build on 2026-07-21 (`codex --version` -> codex-cli 0.140.0, and a
+#          rollout written by a live run recorded cli_version 0.140.0).
+_VERIFIED_VERSIONS = ("0.140.0",)
+_VERIFIED_ON = "2026-07-21"
+
+# Why there is no version to read, established by experiment on 2026-07-21 rather than
+# assumed — and worth stating precisely, because it is a trade-off this harness CHOSE
+# rather than a limitation codex imposes:
+#
+#   * `codex exec --json` names no version anywhere in its stream. A complete successful
+#     run emits exactly four events — thread.started (thread_id only), turn.started,
+#     item.completed, turn.completed — and none carries one.
+#   * codex DOES record it, in the rollout file's `session_meta.cli_version`, keyed by an
+#     `id` equal to the stream's thread_id. That would qualify: it is written by the run
+#     being judged, so it has the same epistemics as any other run telemetry.
+#   * But `--ephemeral`, which this adapter passes deliberately for isolation, suppresses
+#     the rollout entirely. Verified both directions: with `--ephemeral` no rollout file
+#     appears for the run's thread_id; without it one does, carrying cli_version.
+#
+# So the version is purchasable only by giving up the isolation `--ephemeral` buys, and
+# that is the wrong trade — hermeticity is the property under test, provenance is the
+# audit trail for it. A `codex --version` probe is not an alternative: the standing rule
+# is that a fact learned by executing the program again may not clear a security decision,
+# and since a probe could only ever be allowed to WARN, it buys nothing over this.
+_VERSION_UNREADABLE = (
+    "`codex exec --json` emits no version in its stream, and the one place codex records "
+    "it (session_meta.cli_version in the rollout file) is suppressed by the `--ephemeral` "
+    "flag this adapter passes for isolation"
+)
+
+_PROVENANCE = VersionProvenance(
+    agent="codex",
+    verified=_VERIFIED_VERSIONS,
+    verified_on=_VERIFIED_ON,
+    unreadable=_VERSION_UNREADABLE,
+    analysis="MCP hermeticity analysis",
+    clear_hint=(
+        "There is nothing to clear per-run. Check `codex --version` against the list "
+        "above out of band; if it differs, re-establish the findings in adapters/codex.py "
+        "(each is marked with the version it was verified on) and update "
+        "_VERIFIED_VERSIONS."),
+)
 
 # What `codex mcp add` accepts as a server name (verified 0.140.0: "use letters, numbers,
 # '-', '_'") — exactly the TOML bare-key charset, so any addable name works in an unquoted
@@ -47,6 +95,81 @@ _BARE_KEY_RE = re.compile(r"[A-Za-z0-9_-]+\Z")
 # attached value (`-cKEY=VAL` parses, verified 0.140.0).
 _CONFIG_CHANNEL_LONG = ("--config", "--profile", "--cd", "--enable")
 _CONFIG_CHANNEL_SHORT = ("-c", "-p", "-C")
+
+
+# A `-c mcp_servers.<name>.enabled=false` disable, in either spelling the adapter can
+# emit: a bare TOML key, or the quoted form used for names outside [A-Za-z0-9_-] (which
+# makes codex refuse its config outright — fail closed — but still has to be parsed back
+# out of argv here, or the post-run comparison would read it as "never disabled" and fail
+# the run for the wrong reason).
+_DISABLE_RE = re.compile(
+    r"^mcp_servers\.(?:\"([^\"]+)\"|([A-Za-z0-9_-]+))\.enabled=false$")
+
+
+def _disabled_server_names(argv: list[str]) -> set[str]:
+    """The MCP server names an argv actually disables.
+
+    Both `-c VALUE` and the attached `-cVALUE` spelling are read (codex accepts both,
+    verified 0.140.0), as are `--config VALUE` and `--config=VALUE`. This adapter only
+    ever emits the two-token `-c` form, but the comparison this feeds is a security check:
+    reading fewer spellings than codex accepts would silently under-count what was
+    disabled, and under-counting here means failing runs that were fine — or, if the
+    asymmetry ever ran the other way, passing runs that were not.
+    """
+    names: set[str] = set()
+    pending = False
+    for tok in argv:
+        value = None
+        if pending:
+            value, pending = tok, False
+        elif tok in ("-c", "--config"):
+            pending = True
+            continue
+        elif tok.startswith("-c") and len(tok) > 2:
+            value = tok[2:]
+        elif tok.startswith("--config="):
+            value = tok[len("--config="):]
+        if value is None:
+            continue
+        m = _DISABLE_RE.match(value)
+        if m:
+            names.add(m.group(1) or m.group(2))
+    return names
+
+
+def _mcp_tool_calls(stdout: str) -> list[str]:
+    """MCP tool calls codex reported making, as ``server/tool``.
+
+    Verified live against codex 0.140.0 with a sentinel stdio server: the item shape is
+    ``{"type": "mcp_tool_call", "server": ..., "tool": ..., "status": ...}``, emitted on
+    both ``item.started`` and ``item.completed``. Taken from the run's own stream, so
+    unlike anything read off disk afterwards it cannot be retracted by a later edit.
+
+    **Presence proves a leak; absence proves nothing.** codex emits no event when it
+    *starts* an MCP server — the same live test showed it launching the sentinel and
+    exchanging ``initialize``/``tools/list`` with it while the stream stayed silent — so a
+    server that ran for the whole session but was never called is invisible here. This is
+    strictly weaker than copilot's ``session.mcp_servers_loaded`` witness, and is why the
+    re-enumeration half of ``verify_post_run`` carries the load rather than being a
+    belt-and-braces addition.
+
+    A call that FAILED still counts: the sentinel's call came back "user cancelled MCP
+    tool call" (the approval policy refused it) and that is still proof the server was
+    live and reachable. Never raises — malformed telemetry is not a leak report.
+    """
+    found: list[str] = []
+    for obj in iter_jsonl(stdout):
+        if not isinstance(obj, dict):
+            continue
+        item = obj.get("item")
+        if not isinstance(item, dict):
+            continue
+        if (item.get("type") or item.get("item_type")) != "mcp_tool_call":
+            continue
+        label = f"{item.get('server') or '?'}/{item.get('tool') or '?'}"
+        if label not in found:
+            found.append(label)
+    return found
 
 
 def _config_channel_token(extra_args: list[str]) -> Optional[str]:
@@ -112,6 +235,11 @@ class CodexAdapter(Adapter):
                 if tokens:
                     return ProbeResult(accepted=True, cost_usd=None)
         return ProbeResult(accepted=True)
+
+    def mcp_servers_seen(self, argv: list[str]) -> Optional[list[str]]:
+        """The servers this run disabled by name — codex's record of what its configuration
+        held at launch. Same reader the post-run re-check uses."""
+        return sorted(_disabled_server_names(argv))
 
     def format_skill(self, skill: str) -> str:
         # Mirrors the OpenAI example which referenced skills as "$skill-name".
@@ -295,6 +423,101 @@ class CodexAdapter(Adapter):
         argv += opts.extra_args
         argv += [prompt]  # prompt is positional and must come last
         return argv
+
+    def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str,
+                        stdout: str = "", stderr: str = "", exit_code: int = 0) -> None:
+        """Narrow the launch window on codex's MCP kill switch, then record that this run's
+        build is unidentifiable.
+
+        NARROW, not close. **There is a residual case this cannot detect, by construction**
+        — see "The hole that stays open" below. Read that before quoting this method as
+        evidence a codex run was MCP-hermetic.
+
+        The gap this exists for: everything codex verified before now ran from
+        ``build_argv`` — ``_verify_all_mcp_disabled`` is a post-*enumeration*, pre-*launch*
+        check, despite its name. Between building argv and codex actually reading its
+        config at startup, a server added to config.toml (or to a trusted project's
+        `.codex/config.toml`, or via `$CODEX_HOME`) is a server the launched
+        ``-c ...enabled=false`` set does not name, so it loads live. copilot has closed
+        this window since Phase 0; codex never did.
+
+        Two checks:
+
+        1. **Stream evidence** (survives a revert, presence-only). A file edit undone
+           before exit re-reads as clean, so re-enumeration alone can be defeated by a
+           change that does not outlive the run. Testimony the CLI already emitted cannot
+           be retracted that way. codex's testimony is far weaker than copilot's: copilot
+           emits ``session.mcp_servers_loaded`` naming every server it brought up, so a
+           clean run is positively witnessed, whereas codex emits **nothing at all when a
+           server starts** — verified live against a sentinel stdio server, which codex
+           launched and handed ``initialize``/``tools/list`` without a single stream event.
+           The only MCP trace is an ``mcp_tool_call`` item, which appears **only if the
+           model actually called a tool**. Presence proves a leak; absence proves nothing.
+
+        2. **Re-enumeration.** The whole disable set is rebuilt from codex's own effective
+           view, in the child's exact cwd/env, and any server configured now that argv did
+           not disable fails the run. Blind to a change reverted before it runs.
+
+        **The hole that stays open.** These two do NOT cover each other's blind spots —
+        that is true of copilot, and porting the claim here was wrong. A server added after
+        argv was built, started by codex, and removed again before this method
+        re-enumerates is invisible to *both* checks whenever the model never calls one of
+        its tools: check 1 sees nothing because no tool call happened and startup emits no
+        event, and check 2 sees the restored config. Since it is exactly the *idle* server
+        that goes unseen, and since a server does not need to be called to act — the
+        sentinel received ``initialize``/``tools/list`` and could have done anything at
+        startup, running as the agent for the whole session — this residue is not a corner
+        case that only matters to a pedant.
+
+        What it would take to actually close it: give the child a *materialized* private
+        config rather than one it shares with the host, so there is no file an outside
+        writer can add a server to mid-run. That is a real change to codex's isolation
+        story (``$CODEX_HOME`` currently mirrors the user's, which is what keeps auth
+        working) and is deliberately not attempted here. Until then this is detection with
+        a known blind spot, and ``DESIGN_MCP_Support.md`` §1 states the narrowed guarantee.
+
+        Detection, not prevention, and the same live test shows why that is not a
+        formality: ``--ask-for-approval never`` cancelled the sentinel's tool *call* but
+        did nothing about its *startup* — the server process ran as the agent for the whole
+        session. By the time either check fires, that has already happened; what is
+        prevented is the result counting.
+        """
+        if opts is None:  # pragma: no cover — programming error, not a runtime state
+            raise RuntimeError(
+                "codex's post-run MCP re-check needs the RunOptions the invocation was "
+                "built from: its enumeration only matches codex's effective view when it "
+                "runs in the child's exact cwd and env (opts.effective_env). Failing "
+                "closed rather than re-checking against the harness's own environment, "
+                "which can resolve a different set of servers entirely."
+            )
+        called = _mcp_tool_calls(stdout)
+        if called:
+            raise RuntimeError(
+                f"codex's own event stream reports MCP tool call(s) {', '.join(called)} "
+                "during this run, but a hermetic invocation disables every configured "
+                "server before launch. The config on disk may read clean now — a server "
+                "added inside the launch window and removed before exit would — but the "
+                "run itself was not MCP-hermetic, and this is testimony the CLI already "
+                "emitted, which a later edit cannot retract."
+            )
+        try:
+            after = _disabled_server_names(
+                self._mcp_disable_args(cwd=cwd, env=opts.effective_env))
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "the invocation was built while MCP hermeticity was enforceable, but "
+                f"re-checking after the run it no longer is: {exc}"
+            ) from None
+        new = sorted(after - _disabled_server_names(argv))
+        if new:
+            raise RuntimeError(
+                f"MCP server(s) {', '.join(new)} are configured now but were not when the "
+                "invocation was built, so the launched `-c mcp_servers.<name>.enabled="
+                "false` set does not name them: codex reads its config at startup, after "
+                "the harness enumerated, so a server added in that window loads "
+                "un-disabled. This run is not provably MCP-hermetic."
+            )
+        _PROVENANCE.warn_drift(None)
 
     def parse(self, stdout: str, stderr: str, exit_code: int,
                *, opts: Optional[RunOptions] = None) -> ParseOutput:

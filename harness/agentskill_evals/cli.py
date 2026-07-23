@@ -477,6 +477,13 @@ def cmd_run(args) -> int:
     has_errors = False
     for s in specs:
         vr = validate_spec(s, available_skills=valid_skills, judge_enabled=do_judge)
+        # Adapter-aware MCP checks live here, not in validate_spec: whether `mcp_servers:`
+        # can be injected at all, and whether `tools:` would actually be enforced, are
+        # properties of the selected runner, and spec.py must not import adapters.
+        if s.mcp_servers:
+            mcp_errors, mcp_warnings = get_adapter(agent).validate_mcp_support(s.mcp_servers)
+            vr.errors.extend(mcp_errors)
+            vr.warnings.extend(mcp_warnings)
         label = f"{s.name}" + (f" ({s.source_path})" if s.source_path else "")
         for e in vr.errors:
             print(f"error: {label}: {e}", file=sys.stderr)
@@ -523,6 +530,24 @@ def cmd_run(args) -> int:
 
     max_cells = args.max_cells if args.max_cells is not None else int(ov.get("max_cells", DEFAULT_MAX_CELLS))
     jobs = args.jobs if args.jobs is not None else int(ov.get("jobs", DEFAULT_JOBS))
+    # Runner.run() refuses this too — that is the real guard, and it covers programmatic
+    # callers. Repeating it here is purely for the operator: catching it before the plan is
+    # printed turns a traceback after "Plan: N cells" into the same clean `error:` line
+    # every other misconfiguration gets. `jobs` is resolved by this point including the
+    # scenario-file override, so a YAML that sets `jobs:` lands here as well.
+    #
+    # Gated on the adapter, NOT on isolation: an isolated home is a symlink overlay, so
+    # unmasked config files are shared between cells regardless (see Runner.run).
+    if jobs > 1 and not getattr(get_adapter(agent), "parallel_safe_config", False):
+        print(f"error: --jobs {jobs} is not supported for {agent}: its CLI configuration "
+              "is not materialized per cell, so concurrent cells share it and corrupt "
+              "each other's results nondeterministically.\n"
+              "  Isolation does not fix this — an isolated home is a symlink overlay, so "
+              "any config file it does not explicitly mask is a symlink to the one real "
+              "file, and a write through one cell is visible to all of them.\n"
+              "  Use --jobs 1 (the default).",
+              file=sys.stderr)
+        return 2
     n_eligible = sum(1 for s in specs if s.agents is None or agent in s.agents)
     n_cells = n_eligible * len(targets)
     model_labels = [t.label for t in targets]

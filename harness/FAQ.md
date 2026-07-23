@@ -69,6 +69,22 @@ test declares.
 agent also sees whatever skills you've installed globally — the test's skills *plus* every
 other repo skill on your machine. (Handy for reproducing "works on my box" differences.)
 
+`--no-isolated` changes what the agent can *see*, not where it *runs*. Every cell still
+executes in a throwaway temp directory that gets moved into `artifacts/` afterwards, so the
+agent never has a filesystem path into the results tree.
+
+The isolated HOME is a mask, not a sandbox. It controls which skills and MCP configs the
+agent discovers; everything else in your home is passed through as a symlink, so a write to
+`$HOME/.cache/x` really does land in `~/.cache/x` — and a write to a passed-through *file*
+overwrites the real one. That is fine for an ordinary run and not
+fine for one holding a credential, so a scenario whose `mcp_servers:` interpolates a
+`${VAR}` is **refused** rather than run: once a tool result can hand the token to the model,
+the model can write it somewhere this harness neither deletes nor scrubs, and deleting the
+overlay afterwards proves nothing about where the symlinks pointed. Declaring an MCP server
+with no `${VAR}` is unaffected. Lifting this needs the HOME's writable state materialized
+(see DESIGN_MCP_Support.md §5.3); it is not something `--no-isolated` works around, since
+that hands over the real home with no overlay at all.
+
 **Why isolation is the default**
 
 Agents discover skills from several places — the current project *and* your personal (global)

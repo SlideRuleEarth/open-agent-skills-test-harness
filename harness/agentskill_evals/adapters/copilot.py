@@ -55,12 +55,14 @@ from .base import (
     ParseOutput,
     ProbeResult,
     RunOptions,
+    VersionProvenance,
     extract_command,
     extract_path,
     iter_jsonl,
     try_load_json,
     warn_unknown_usage,
 )
+from .base import _WARNED_VERSIONS as _base_warned_versions
 
 _SHELL_TOOLS = {"shell", "bash", "run_command"}
 _FILE_TOOLS = {"write", "edit", "create", "multi_edit"}
@@ -353,96 +355,68 @@ def _stream_cli_version(stdout: str) -> Optional[str]:
     return seen.pop() if len(seen) == 1 else None
 
 
-# Versions already warned about, so the drift notice fires once per process rather than
-# once per cell — a warning repeated on every run of a matrix is one nobody reads.
-_WARNED_VERSIONS: set[str] = set()
+# The tiers, the warn-once bookkeeping and the message shape now live in base.py — see
+# VersionProvenance there for what each tier is and (importantly) which of them are
+# prevention rather than detection. Only the two things that are genuinely copilot's stay
+# here: where the version is read from (_stream_cli_version) and what a reader should DO
+# about a warning. `denied=_DENIED_VERSIONS` passes the dict by reference deliberately, so
+# an entry added to that module-level table takes effect without rebuilding this object.
+_PROVENANCE = VersionProvenance(
+    agent="copilot",
+    verified=_VERIFIED_VERSIONS,
+    verified_on=_VERIFIED_ON,
+    denied=_DENIED_VERSIONS,
+    analysis="MCP hermeticity analysis",
+    witness_held=(
+        "  The runtime witness held, so the channels this adapter KNOWS ABOUT were "
+        "disabled and none loaded. That does NOT cover a discovery channel ADDED after "
+        f"{_VERIFIED_VERSIONS[-1]}: a new one would never have been enumerated, and no "
+        "runtime check can see a check that was never written."),
+    witness_absent=(
+        "  This run produced no MCP witness at all — it did not complete normally, which "
+        "is allowed but proves nothing about its MCP host. So the channels this adapter "
+        "knows about were NOT confirmed inert here, and a channel ADDED after "
+        f"{_VERIFIED_VERSIONS[-1]} would be invisible on top of that."),
+    clear_hint=(
+        "To clear it: `agentskill-evals verify-copilot-channels` (audits the CLI "
+        "bundle against the known channel inventory), then add the version to "
+        "_VERIFIED_VERSIONS in adapters/copilot.py."),
+)
+
+# Aliased rather than re-declared: the warn-once table is shared across adapters (keyed by
+# agent, so runners don't silence each other) and tests reach for it under this name.
+_WARNED_VERSIONS = _base_warned_versions
 
 
-def _check_cli_version_denied(version: Optional[str]) -> None:
-    """Fail a run that turns out to have executed a build KNOWN to break a hermeticity
-    assumption.
+def _check_cli_version_denied(version: Optional[str], *, completed: bool = False) -> None:
+    """Fail a run that executed a build KNOWN to break a hermeticity assumption.
 
-    POST-RUN DETECTION, NOT PREVENTION, and the distinction is not pedantic: by the time
-    this fires the CLI has already run to completion. If the denylisted defect is that a
-    build silently loads an MCP server, that server has already been reachable for the
-    whole run and whatever it did is already done. What this buys is that the run is
-    reported as FAILED rather than passing — the result never enters the record as
-    evidence — not that the build was kept away from anything.
+    Post-run detection, not prevention — see ``VersionProvenance.check_denied``. Worth
+    restating why it cannot be moved earlier for *this* CLI specifically: the npm metadata
+    names a version the executable no longer is (verified: package.json said 1.0.63 while
+    the SEA had been rewritten in place), no file the harness can read states what the
+    binary will resolve, and a preflight probe resolves its app root by a different path
+    than the real argv, so it can honestly report a version the run does not use.
 
-    It cannot be moved earlier, and that is a property of copilot rather than a shortcut
-    taken here. The executing version is knowable only from the run's own stream: the npm
-    metadata names a version the executable no longer is (verified: package.json said
-    1.0.63 while the SEA had been rewritten in place), no file the harness can read states
-    what the binary will resolve, and the branch's standing rule bars clearing a security
-    decision with a fact learned by executing the same program a second time — a preflight
-    probe resolves its app root by a different path than the real argv, so it can honestly
-    report a version the run does not use. A pre-launch gate here would therefore be
-    guessing with more ceremony.
-
-    It still runs BEFORE the contract evidence, because it covers precisely what that
+    It is reported BEFORE the contract evidence because it covers precisely what that
     evidence cannot: a defect that leaves the MCP witness perfectly intact (broken plugin
-    masking, say) fires no runtime check at all. Once a human finds such a build it is
-    recorded in ``_DENIED_VERSIONS`` and refused by name, rather than waiting for a
-    violation that never comes. Keeping the tiers honest about *when* they act is what
-    stops "the denylist covers it" from being read as "that build cannot run here".
+    masking, say) fires no runtime check at all. *completed* comes from that same witness
+    and decides whether an UNKNOWN version fails closed — see check_denied.
     """
-    if version is not None and version in _DENIED_VERSIONS:
-        raise RuntimeError(
-            f"this run executed copilot {version}, which is on this adapter's denylist: "
-            f"{_DENIED_VERSIONS[version]}. That defect leaves the MCP witness intact, so "
-            "no runtime check catches it — the run is failed by version instead. Note "
-            "this is detection AFTER the fact: the version is only readable from the "
-            "run's own output, so the CLI has already executed and any side effect of "
-            "that defect has already happened; what is prevented is the RESULT counting. "
-            "Pin a different CLI build before running again."
-        )
+    _PROVENANCE.check_denied(version, completed=completed)
 
 
 def _warn_cli_version_drift(version: Optional[str], *, agent: str = "copilot",
                             witnessed: bool = False) -> None:
-    """Warn once per version that a run executed a build the analysis has not been checked
-    against. A WARNING, not a failure — and deliberately so.
+    """Warn once per version that a run executed an unverified build.
 
-    What a newer build can do, and what nothing at runtime can see, is introduce a
-    discovery channel that was never enumerated because no code was ever written to
-    enumerate it. You cannot detect the absence of a check you never wrote. The message
-    says that explicitly, because the danger is a green run being read as covering it.
-
-    *witnessed* decides which half of that it is entitled to claim. A run that did not
-    complete is excused from producing a witness, so this is reached with no MCP evidence
-    at all — and "the runtime witness held, so the channels this adapter knows about were
-    disabled and none loaded" would then be describing a check that never ran. A security
-    notice that overstates its own evidence is worse than none: it is the sentence a
-    reader would use to justify shipping.
-
-    Once per version per process, not per cell: a warning repeated across every cell of a
-    model matrix is one that gets filtered out, which defeats the purpose.
+    *witnessed* decides which half of the notice it is entitled to claim: a run that did
+    not complete is excused from producing a witness, so this is reached with no MCP
+    evidence at all, and "the runtime witness held" would then describe a check that never
+    ran. A security notice that overstates its own evidence is worse than none — it is the
+    sentence a reader would use to justify shipping.
     """
-    if version is not None and version in _VERIFIED_VERSIONS:
-        return
-    key = version or ""
-    if key in _WARNED_VERSIONS:
-        return
-    _WARNED_VERSIONS.add(key)
-    ran = f"CLI {version}" if version else "a CLI whose version could not be determined"
-    established = (
-        "  The runtime witness held, so the channels this adapter KNOWS ABOUT were "
-        "disabled and none loaded. That does NOT cover a discovery channel ADDED after "
-        f"{_VERIFIED_VERSIONS[-1]}: a new one would never have been enumerated, and no "
-        "runtime check can see a check that was never written.\n"
-        if witnessed else
-        "  This run produced no MCP witness at all — it did not complete normally, which "
-        "is allowed but proves nothing about its MCP host. So the channels this adapter "
-        "knows about were NOT confirmed inert here, and a channel ADDED after "
-        f"{_VERIFIED_VERSIONS[-1]} would be invisible on top of that.\n")
-    print(
-        f"warning: [{agent}] this run executed {ran}; the MCP hermeticity analysis was "
-        f"verified against {'/'.join(_VERIFIED_VERSIONS)} ({_VERIFIED_ON}).\n"
-        + established +
-        "  To clear it: `agentskill-evals verify-copilot-channels` (audits the CLI "
-        "bundle against the known channel inventory), then add the version to "
-        "_VERIFIED_VERSIONS in adapters/copilot.py.",
-        file=sys.stderr)
+    _PROVENANCE.warn_drift(version, witnessed=witnessed)
 
 
 def _bundle_search_roots(env_map: Optional[Mapping[str, str]] = None) -> list[str]:
@@ -1710,6 +1684,11 @@ class CopilotAdapter(Adapter):
                                    premium_requests=float(pr) if pr is not None else None)
         return ProbeResult(accepted=True)
 
+    def mcp_servers_seen(self, argv: list[str]) -> Optional[list[str]]:
+        """The servers this run disabled by name — copilot's record of what its
+        configuration held at launch. Same reader the post-run re-check uses."""
+        return sorted(_disabled_server_names(argv))
+
     def format_skill(self, skill: str) -> str:
         return f"/{skill}"
 
@@ -1820,9 +1799,13 @@ class CopilotAdapter(Adapter):
         # A build KNOWN to break an assumption is refused first: that is the one tier the
         # runtime contract cannot reach, since such a defect leaves the witness intact.
         # Everything after this point is contract evidence, which is version-independent.
+        # The witness is computed before the denylist check but raised after it: the check
+        # needs to know whether the run got far enough to be judged (an unknown version
+        # fails closed on a completed run once anything is denylisted), while a denial
+        # still has to be reported ahead of any contract failure found on the same run.
         version = _stream_cli_version(stdout)
-        _check_cli_version_denied(version)
         broken, live, witnessed = _mcp_witness(stdout, exit_code)
+        _check_cli_version_denied(version, completed=witnessed)
         if broken is not None:
             raise RuntimeError(
                 f"copilot's MCP witness does not hold: {broken}. The run finished "
@@ -2013,4 +1996,7 @@ class CopilotAdapter(Adapter):
             premium_requests=premium_requests,
             duration_ms=duration_ms,
             resolved_model=resolved_model,
+            # Same reader the hermeticity check uses, so the recorded build is the one the
+            # verification was reasoning about rather than a second determination of it.
+            cli_version=_stream_cli_version(stdout),
         )

@@ -61,7 +61,9 @@ CLI flags override the file (`CLI > scenario > default`). See
    path relationship to this repo's checkout** so there's no real repo root above it for any
    skill-discovery mechanism — `.git`-aware or a general-purpose file-browsing agent doing
    plain absolute-path `list_dir`s — to walk up into. Together these make normal skill discovery
-   see only what's provisioned plus the agent's vendor skills (`--no-isolated` opts out).
+   see only what's provisioned plus the agent's vendor skills (`--no-isolated` opts out of the
+   HOME masking; the tempdir workspace is **not** optional, and never was a skill-visibility
+   measure only — a cwd inside `artifacts/` is a cwd the agent can write `../` into).
    This is skill-visibility isolation, not an OS-level filesystem jail; deliberate broad-disk
    searches can still find the real checkout, and the harness downgrades a cell's `isolated`
    flag if the captured trace shows an undeclared repo-skill read.

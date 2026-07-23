@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .adapters.base import Adapter, RunOptions
+from .notices import collecting
 from .schema import RunResult
 
 
@@ -123,6 +124,18 @@ def execute(
     # when it can't guarantee a hermetic invocation (e.g. MCP servers it can't enumerate).
     opts = dataclasses.replace(opts, effective_env=env)
     try:
+        # The MCP refusals used to live only in the CLI's pre-flight, which meant the
+        # supported programmatic path (Runner.run, or any direct caller) could run an
+        # adapter that cannot inject servers with `mcp_servers:` quietly dropped, or Claude
+        # with `tools:` quietly unenforced — the exact degradations that validation claims
+        # to refuse (found in review). Re-asserted HERE because this is the one choke point
+        # every invocation passes through, and because raising inside the argv-construction
+        # block reuses the fail-closed path below: an invocation that cannot be built to the
+        # scenario's spec becomes a failed run, not a silently weaker one.
+        if getattr(opts, "mcp_servers", None):
+            mcp_errors, _ = adapter.validate_mcp_support(opts.mcp_servers)
+            if mcp_errors:
+                raise RuntimeError("; ".join(mcp_errors))
         argv = adapter.build_argv(prompt, opts, cwd=cwd)
     except Exception as exc:
         rr.error = f"could not construct a hermetic invocation: {exc}"
@@ -167,6 +180,7 @@ def execute(
         rr.premium_requests = parsed.premium_requests
         rr.duration_ms = parsed.duration_ms
         rr.resolved_model = parsed.resolved_model
+        rr.cli_version = parsed.cli_version
     except Exception as exc:  # parsing must never crash a run
         rr.error = (rr.error + "; " if rr.error else "") + f"parse failed: {exc}"
 
@@ -185,12 +199,19 @@ def execute(
     # the child's own report of the servers it brought up still shows it. Detection, not
     # prevention: a server started inside the window already ran. It is appended, never
     # substituted, so a timeout or a nonzero exit keeps its own diagnosis alongside.
-    try:
-        adapter._verify_post_run_compat(argv, opts, cwd=cwd, stdout=stdout,
-                                        stderr=stderr, exit_code=code)
-    except Exception as exc:
-        rr.error = ((rr.error + "; " if rr.error else "")
-                    + f"MCP hermeticity was not confirmed after the run: {exc}")
+    # Anything the verification WARNS about is collected onto the result as well as printed:
+    # its whole purpose is to explain a result, and stderr of the harness process is not
+    # archived anywhere. Thread-local, so parallel cells cannot collect each other's.
+    with collecting() as warned:
+        try:
+            adapter._verify_post_run_compat(argv, opts, cwd=cwd, stdout=stdout,
+                                            stderr=stderr, exit_code=code)
+        except Exception as exc:
+            rr.error = ((rr.error + "; " if rr.error else "")
+                        + f"MCP hermeticity was not confirmed after the run: {exc}")
+    # Whatever was warned BEFORE a raise is kept too: the verification reports several
+    # independent findings and the last one failing does not unsay the earlier ones.
+    rr.warnings.extend(warned)
 
     return ExecResult(rr, stdout, stderr)
 
