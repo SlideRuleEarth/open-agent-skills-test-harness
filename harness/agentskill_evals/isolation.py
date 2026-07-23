@@ -193,8 +193,19 @@ def home_write_escapes(home: Optional[str]) -> list[str]:
     """
     if not home or not os.path.isdir(home):
         return []
-    root = os.path.abspath(home)
-    inside = root + os.sep
+    # Both sides canonicalized, because only one of them was: `realpath` resolves symlinks
+    # and `abspath` does not, so on macOS a link pointing inside its OWN overlay compared
+    # `/private/var/.../home/x` against a root of `/var/.../home` and was reported as an
+    # escape. That is the safe direction to be wrong in — it over-refuses — but it would
+    # have made the structural lifting condition unreachable, since a materialized HOME is
+    # exactly where safe internal links start appearing.
+    root = os.path.realpath(home)
+    # normcase folds case on Windows, where the filesystem does too, and is a no-op on
+    # POSIX. Deliberately not a blanket `lower()` on darwin: APFS is usually case-
+    # insensitive but can be case-sensitive, and folding there would make an OUTSIDE path
+    # compare as inside. Over-refusing costs a run; under-refusing leaks the token.
+    root_key = os.path.normcase(root)
+    inside = root_key + os.sep
     found: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         for name in list(dirnames) + list(filenames):
@@ -203,8 +214,8 @@ def home_write_escapes(home: Optional[str]) -> list[str]:
                 continue
             # realpath, not lstat: a dangling link still resolves to the path a write would
             # create, and that path is exactly what needs to be inside the overlay.
-            target = os.path.realpath(path)
-            if target != root and not target.startswith(inside):
+            target = os.path.normcase(os.path.realpath(path))
+            if target != root_key and not target.startswith(inside):
                 found.append(os.path.relpath(path, root))
     return sorted(found)
 

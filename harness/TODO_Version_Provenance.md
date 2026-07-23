@@ -420,6 +420,18 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   is only ever "does this name lead out of the tree I can account for". The type of the
   destination never entered into it.
 
+  And once the question was finally right, the comparison answering it was wrong: `realpath`
+  on one side, `abspath` on the other. On macOS `/var` is a symlink to `/private/var`, so a
+  link pointing inside its *own* overlay compared as outside. The error direction was safe —
+  over-refusal — which is exactly why it could have sat there indefinitely: the check would
+  have kept refusing correctly for every case anyone tested, and failed only at the moment
+  a materialized HOME with safe internal links was supposed to make it stop refusing. A
+  guard whose failure mode is "too strict" still has to be right, because the plan for
+  removing it is that it stops firing on its own. The fix canonicalizes both sides, and
+  case-folds with `normcase` rather than `lower()`: folding on a case-sensitive volume would
+  make an outside path compare as inside, which is the direction that leaks rather than the
+  one that annoys.
+
   Smaller, same round, same shape: the severity upgrade was gated on `mcp_servers` being
   *declared* rather than on a `${VAR}` being *interpolated*, so a cell that handled no
   credential at all was failed for possibly leaking one. And the obvious fix — `bool(secrets)`

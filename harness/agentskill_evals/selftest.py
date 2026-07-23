@@ -1768,6 +1768,14 @@ def _check_mcp_hermetic_paths(failures, verbose):
         os.symlink(os.path.join(beyond, "nope"), os.path.join(real, ".fakecli", "dangling"))
         try:
             build_isolated_home(esc_home, [".fakecli/skills"], set(), [], real_home=real)
+            # Links that stay INSIDE, one live and one dangling. Both are spelled with the
+            # tempdir's `/var/...` path while `realpath` reports `/private/var/...`, so a
+            # check that canonicalizes only one side calls them escapes — which is how a
+            # materialized HOME would fail to lift the refusal it is supposed to lift.
+            os.symlink(os.path.join(esc_home, ".fakecli", "skills"),
+                       os.path.join(esc_home, ".fakecli", "inside-live"))
+            os.symlink(os.path.join(esc_home, ".fakecli", "not-created-yet"),
+                       os.path.join(esc_home, ".fakecli", "inside-dangling"))
             escapes = home_write_escapes(esc_home)
             skills = os.path.join(esc_home, ".fakecli", "skills")
             rel = [os.path.join(".fakecli", n)
@@ -1781,7 +1789,10 @@ def _check_mcp_hermetic_paths(failures, verbose):
                    f"and a write creates it. The masked skills dir is materialized, so it "
                    f"is not a way out — and each escape is reported once rather than once "
                    f"per entry behind it, since the walk must not descend through what it "
-                   f"is reporting. escapes={escapes}", failures, verbose)
+                   f"is reporting. Links that stay inside are NOT escapes, live or "
+                   f"dangling — `/var` vs `/private/var` is the same directory, and a check "
+                   f"that canonicalizes one side only would refuse the very HOME that is "
+                   f"supposed to lift the refusal. escapes={escapes}", failures, verbose)
             _check("mcp_masked_home.contained_overlay_reports_no_escapes",
                    home_write_escapes(tempfile.mkdtemp(prefix="ase-empty-")) == []
                    and home_write_escapes(None) == [],
