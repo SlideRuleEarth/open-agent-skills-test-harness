@@ -958,6 +958,13 @@ def _check_workspace_relocation(failures, verbose):
     real_home_env = os.environ.get("HOME")
     contained_home = tempfile.mkdtemp(prefix="ase-fakehome-")
     seen: dict = {}
+    # OFF until HOME is repointed at the small `contained_home` fixture below. `_fake_execute`
+    # runs for EVERY cell, and the first ones (run1, the relocate cells) overlay the real `~`;
+    # walking one of those with `home_write_escapes` is cheap at followlinks=False but a
+    # whole-real-home traversal under the M65 mutation (followlinks=True) — which wedged the
+    # mutation suite at 100% CPU until this gate was added. Only run19/20/21 read the result,
+    # and they run against `contained_home`, so the walk stays inside a tempdir.
+    capture_escapes = [False]
     orig_execute = runner_mod.execute
 
     def _try(fn, default=None):
@@ -990,6 +997,18 @@ def _check_workspace_relocation(failures, verbose):
             mask = os.path.join(opts.home, ".fakecli", "mcp.json")
             if os.path.isfile(mask) and not os.path.islink(mask):
                 seen["mask_content"] = open(mask).read()
+            # Read the HOME's shape here, for the same reason the mask is read here: the
+            # runner deletes it as soon as execute() returns, and these are claims about
+            # what the agent was handed. Captured BEFORE the write below, so `home_entries`
+            # is what the HARNESS built rather than what this fake then added to it.
+            from .isolation import home_write_escapes as _hwe
+            if capture_escapes[0]:            # never walk a real-home overlay (see gate above)
+                seen["escapes"] = _hwe(opts.home)
+            seen["iso_env"] = dict(opts.isolation_env or {})
+            seen["home_entries"] = sorted(_try(lambda: os.listdir(opts.home), []) or [])
+            auth = os.path.join(opts.home, ".fakecli", "real-auth.json")
+            seen["auth_is_link"] = os.path.islink(auth)
+            seen["auth_content"] = _try(lambda: open(auth).read(), "")
             # $HOME is WRITABLE by the child, so the harness knows this directory's initial
             # contents and not its final ones. Every real agent does this — caches, session
             # state — and any of it can be a copy of what the agent was handed.
@@ -997,6 +1016,13 @@ def _check_workspace_relocation(failures, verbose):
                 f.write("tok sk-secret-abcdef\n")
         with open(os.path.join(cwd, "run.py"), "w") as f:
             f.write("print('hi')\n")
+        # A tool that dumps its environment lands an adapter's credential env var in the
+        # workspace, which is archived and scrubbed. Written ONLY when the arm set the var —
+        # every other cell leaves it unset, so this is a no-op for them.
+        _oauth = os.environ.get("ASE_SELFTEST_OAUTH")
+        if _oauth:
+            with open(os.path.join(cwd, "leaked-env.txt"), "w") as f:
+                f.write(f"CLAUDE_CODE_OAUTH_TOKEN={_oauth}\n")
         # A cwd is a place the agent can WRITE, so `..` is part of the attack surface, not
         # just `list_dir`'s. Written every time: the arms below assert where it landed.
         with open(os.path.join(cwd, "..", "above-cwd.txt"), "w") as f:
@@ -1476,6 +1502,9 @@ def _check_workspace_relocation(failures, verbose):
         # Pointing HOME at an empty directory is also the honest fixture: the arms below
         # were symlinking the developer's actual home into a temp overlay on every run.
         os.environ["HOME"] = contained_home
+        # Safe from here on: every overlay is now built from `contained_home` (a small
+        # tempdir), so walking one — even with the M65 followlinks mutation — stays bounded.
+        capture_escapes[0] = True
 
         seen.clear()
         run_dir13 = os.path.join(repo_root, "artifacts", "run13")
@@ -1607,6 +1636,308 @@ def _check_workspace_relocation(failures, verbose):
                f"ran={seen.get('cwd') is not None} passed={cell16.passed} "
                f"err={err16[:150]!r}", failures, verbose)
 
+        # ...and the refusal LIFTS ITSELF once the home is contained, with the refusal
+        # untouched: it simply stops finding anything. Same fixture as run16 — a real home
+        # holding an entry the overlay would pass through — differing only in that the
+        # adapter has now declared its contained surface.
+        seen.clear()
+        run_dir19 = os.path.join(repo_root, "artifacts", "run19")
+        os.makedirs(run_dir19)
+        r.run_id, r.run_dir = "run19", run_dir19
+        os.makedirs(os.path.join(contained_home, "cache"), exist_ok=True)
+        os.makedirs(os.path.join(contained_home, ".fakecli"), exist_ok=True)
+        with open(os.path.join(contained_home, ".fakecli", "real-auth.json"), "w") as f:
+            f.write('{"token": "from-the-real-home"}')
+
+        class _ContainedFakeAdapter(_MaskingFakeAdapter):
+            contained_home_subpaths = [".fakecli/real-auth.json"]
+
+        prior_adapter19 = r.adapter
+        r.adapter = _ContainedFakeAdapter()
+        try:
+            cell19 = r._run_cell(ModelTarget(), spec_secret)
+        finally:
+            r.adapter = prior_adapter19
+            r._secrets = r._run_secrets = ()
+            _try(lambda: os.rmdir(os.path.join(contained_home, "cache")))
+        err19 = cell19.run_result.error or ""
+        _check("mcp.credential_run_is_permitted_once_the_home_is_contained",
+               bool(seen.get("cwd")) and "interpolates a credential" not in err19
+               and seen.get("escapes") == []
+               and "cache" not in (seen.get("home_entries") or [])
+               and seen.get("auth_is_link") is False
+               and "from-the-real-home" in (seen.get("auth_content") or ""),
+               f"the SAME cell run16 refuses must run once the adapter declares a contained "
+               f"surface, and it must be the containment doing it rather than an exemption: "
+               f"no entry the real home has passes through (`cache` is gone), the declared "
+               f"auth is a real file holding the real bytes rather than a symlink to them, "
+               f"and home_write_escapes() — the refusal's own condition — is empty. "
+               f"ran={seen.get('cwd') is not None} escapes={seen.get('escapes')!r} "
+               f"entries={(seen.get('home_entries') or [])[:6]} "
+               f"auth_is_link={seen.get('auth_is_link')} err={err19[:110]!r}",
+               failures, verbose)
+
+        # An EMPTY declaration is a positive claim ("this CLI needs nothing"), not an absent
+        # one — it is claude's real answer, and `if contained_subpaths:` would silently
+        # demote it to the uncontained overlay and re-refuse the run. run16 covers the other
+        # half: `None` (unmapped adapter) still refuses.
+        seen.clear()
+        run_dir20 = os.path.join(repo_root, "artifacts", "run20")
+        os.makedirs(run_dir20)
+        r.run_id, r.run_dir = "run20", run_dir20
+        os.makedirs(os.path.join(contained_home, "cache"), exist_ok=True)
+
+        class _EmptyContainedFakeAdapter(_MaskingFakeAdapter):
+            contained_home_subpaths: list = []
+
+        prior_adapter20 = r.adapter
+        r.adapter = _EmptyContainedFakeAdapter()
+        try:
+            cell20 = r._run_cell(ModelTarget(), spec_secret)
+        finally:
+            r.adapter = prior_adapter20
+            r._secrets = r._run_secrets = ()
+            _try(lambda: os.rmdir(os.path.join(contained_home, "cache")))
+            _try(lambda: shutil.rmtree(os.path.join(contained_home, ".fakecli"),
+                                       ignore_errors=True))
+        err20 = cell20.run_result.error or ""
+        _check("mcp.empty_contained_declaration_contains_rather_than_refuses",
+               bool(seen.get("cwd")) and "interpolates a credential" not in err20
+               and seen.get("escapes") == []
+               and "cache" not in (seen.get("home_entries") or []),
+               f"declaring [] means the CLI needs nothing from the real home, which is the "
+               f"STRONGEST containment available and the measured answer for claude — an "
+               f"empty home that still runs. Distinguished from `None` by identity, not "
+               f"truthiness: collapsing the two would refuse every run of the one adapter "
+               f"this work exists to unblock. ran={seen.get('cwd') is not None} "
+               f"escapes={seen.get('escapes')!r} "
+               f"entries={(seen.get('home_entries') or [])[:6]} err={err20[:110]!r}",
+               failures, verbose)
+
+        # A custom config home ($CODEX_HOME and friends) is MIRRORED, and the mirror is
+        # built with the wholesale symlink pass — so mirroring one into a contained home
+        # hands back every escape containment just removed, one level down and out of sight.
+        # The mirror lands INSIDE the isolated home, which is what makes this invisible: the
+        # home still looks materialized from the top.
+        seen.clear()
+        run_dir21 = os.path.join(repo_root, "artifacts", "run21")
+        os.makedirs(run_dir21)
+        r.run_id, r.run_dir = "run21", run_dir21
+        custom21 = tempfile.mkdtemp(prefix="ase-custom21-")
+        with open(os.path.join(custom21, "auth.json"), "w") as f:
+            f.write('{"token": "custom-home-auth"}')
+
+        class _CustomHomeContainedAdapter(_MaskingFakeAdapter):
+            contained_home_subpaths: list = []
+            isolation_config_homes = [("FAKECLI_HOME21", ".fakecli", None)]
+
+        prior_adapter21 = r.adapter
+        r.adapter = _CustomHomeContainedAdapter()
+        os.environ["FAKECLI_HOME21"] = custom21
+        try:
+            cell21 = r._run_cell(ModelTarget(), spec_secret)
+        finally:
+            r.adapter = prior_adapter21
+            os.environ.pop("FAKECLI_HOME21", None)
+            r._secrets = r._run_secrets = ()
+            shutil.rmtree(custom21, ignore_errors=True)
+        err21 = cell21.run_result.error or ""
+        _check("mcp.contained_home_does_not_mirror_a_custom_config_home",
+               bool(seen.get("cwd")) and seen.get("escapes") == []
+               and "FAKECLI_HOME21" not in (seen.get("iso_env") or {})
+               and "interpolates a credential" not in err21,
+               f"the mirror is built by the same wholesale-symlink pass containment exists "
+               f"to switch off, and it is created INSIDE the isolated home — so mirroring "
+               f"one would reintroduce every escape a level down while the home still looked "
+               f"materialized from the top. Contained cells mirror nothing and leave the var "
+               f"unset, which makes adapter.env() clear it so the CLI falls back to the "
+               f"contained HOME: the run loses the custom config, it does not gain a way "
+               f"out. ran={seen.get('cwd') is not None} escapes={seen.get('escapes')!r} "
+               f"iso_env={seen.get('iso_env')!r} err={err21[:90]!r}", failures, verbose)
+
+        # P1: an adapter-declared credential ENV VAR is redacted from artifacts even with no
+        # `mcp_servers` at all. claude's CLAUDE_CODE_OAUTH_TOKEN reaches the child through
+        # env()'s process-env passthrough, so a tool that echoes it lands it in the workspace
+        # — and the interpolation scrub set never sees it, so before the fix it archived
+        # verbatim. The value is seated in the redaction registry at the top of the cell body.
+        from .mcp import REDACTED
+        seen.clear()
+        run_dir22 = os.path.join(repo_root, "artifacts", "run22")
+        os.makedirs(run_dir22)
+        r.run_id, r.run_dir = "run22", run_dir22
+        oauth_val = "oauth-tok-9f8e7d6c5b4a3210deadbeef"   # long enough to be redactable
+        os.environ["ASE_SELFTEST_OAUTH"] = oauth_val
+
+        class _OAuthFakeAdapter(_FakeAdapter):
+            credential_env_vars = ["ASE_SELFTEST_OAUTH"]
+            # Mapped (empty surface, like claude), so a credential env var contains the HOME
+            # rather than refusing the cell — this arm needs it to COMPLETE and archive.
+            contained_home_subpaths: list = []
+
+        prior_adapter22 = r.adapter
+        r.adapter = _OAuthFakeAdapter()
+        spec22 = EvalSpec(name="demo", prompt="hi",
+                          source_path=os.path.join(repo_root, "demo.yaml"),
+                          assertions=[{"type": "file_exists", "path": "run.py"}])
+        try:
+            cell22 = r._run_cell(ModelTarget(), spec22)
+        finally:
+            r.adapter = prior_adapter22
+            os.environ.pop("ASE_SELFTEST_OAUTH", None)
+            r._secrets = r._run_secrets = ()
+        leaked22 = _try(lambda: open(os.path.join(
+            cell22.artifacts_dir, "workspace", "leaked-env.txt")).read(), "")
+        _check("mcp.adapter_credential_env_var_is_redacted",
+               bool(leaked22) and oauth_val not in leaked22 and REDACTED in leaked22
+               and cell22.passed,
+               f"an adapter that declares a credential env var has its VALUE seated in the "
+               f"redaction set BEFORE the run — no `mcp_servers` here, so nothing else would "
+               f"register it — and a tool that echoes it into the workspace is scrubbed. The "
+               f"token reaches the child via env() but the `${{VAR}}` scrub set never sees it, "
+               f"so without this it archives verbatim. archived={leaked22[:70]!r}",
+               failures, verbose)
+
+        # P1: a contained HOME that COPIES adapter auth is credential-bearing from the copy,
+        # not from the later MCP-resolution upgrade. This crashes IN THAT WINDOW — an unset
+        # `${VAR}` makes `resolved_mcp_servers()` raise after the auth was copied but before
+        # the upgrade — and forces removal to fail, so the copied auth stays on disk. The
+        # warning must name the copied credential, not claim "no resolved credentials are in
+        # it" (the pre-fix `_TEMPDIR_TAIL` lie the reviewer reproduced).
+        seen.clear()
+        run_dir23 = os.path.join(repo_root, "artifacts", "run23")
+        os.makedirs(run_dir23)
+        r.run_id, r.run_dir = "run23", run_dir23
+        os.makedirs(os.path.join(contained_home, ".fakecli"), exist_ok=True)
+        with open(os.path.join(contained_home, ".fakecli", "real-auth.json"), "w") as f:
+            f.write('{"token": "contained-auth-secret"}')
+        os.environ.pop("ASE_UNSET_VAR_P1B", None)   # the interpolation must FAIL to resolve
+        spec23 = EvalSpec(
+            name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"),
+            mcp_servers=parse_mcp_servers(
+                {"echo": {"command": "/bin/echo", "env": {"TOKEN": "${ASE_UNSET_VAR_P1B}"}}},
+                where="selftest"))
+
+        class _AuthContainedAdapter(_MaskingFakeAdapter):
+            contained_home_subpaths = [".fakecli/real-auth.json"]
+
+        stuck23: list = []
+
+        def _no_home_removal23(p):
+            if "ase-home-" in p:
+                stuck23.append(p)
+                return False
+            return _orig_remove(p)
+
+        prior_adapter23 = r.adapter
+        r.adapter = _AuthContainedAdapter()
+        runner_mod._remove = _no_home_removal23
+        try:
+            cell23 = r._run_cell(ModelTarget(), spec23)
+        finally:
+            runner_mod._remove = _orig_remove
+            r.adapter = prior_adapter23
+            r._secrets = r._run_secrets = ()
+            home23 = stuck23[0] if stuck23 else ""
+            auth23 = os.path.join(home23, ".fakecli", "real-auth.json")
+            auth_on_disk23 = os.path.isfile(auth23)
+            auth_content23 = _try(lambda: open(auth23).read(), "") if home23 else ""
+            for p in stuck23:
+                if os.path.basename(p).startswith("ase-home-"):
+                    _try(lambda p=p: shutil.rmtree(p, ignore_errors=True))
+            _try(lambda: shutil.rmtree(os.path.join(contained_home, ".fakecli"),
+                                       ignore_errors=True))
+        say23 = (cell23.run_result.error or "") + " " + " ".join(
+            cell23.run_result.warnings or [])
+        _check("mcp.contained_home_that_copies_auth_is_credential_bearing_before_the_copy",
+               cell23.passed is False and auth_on_disk23
+               and "contained-auth-secret" in auth_content23
+               and "copied this adapter's long-lived auth/config" in say23
+               and "no resolved credentials are in it" not in say23,
+               f"the crash lands in the window between building the contained HOME (auth "
+               f"already copied in) and the MCP-resolution upgrade, and removal fails — so the "
+               f"adapter's long-lived auth is on disk. Registered credential-bearing from "
+               f"CREATION, it fails the cell and its sentence names the copied credential; the "
+               f"pre-fix non-fatal registration warned 'no resolved credentials are in it' "
+               f"over a real one. on_disk={auth_on_disk23} passed={cell23.passed} "
+               f"say={say23[:150]!r}", failures, verbose)
+
+        # P1: an adapter credential ENV VAR triggers containment on its own, with NO
+        # `mcp_servers` at all. Before this, containment keyed only on an interpolated
+        # `${VAR}`, so an ordinary claude run with the OAuth token set got the symlink overlay
+        # and the child could write the token through `$HOME/.cache` into the real home. Here
+        # the real home has a `cache` dir that the overlay WOULD pass through; contained, it
+        # does not, and nothing leads out.
+        seen.clear()
+        run_dir24 = os.path.join(repo_root, "artifacts", "run24")
+        os.makedirs(run_dir24)
+        r.run_id, r.run_dir = "run24", run_dir24
+        os.makedirs(os.path.join(contained_home, "cache"), exist_ok=True)   # a passthrough
+        os.environ["ASE_SELFTEST_OAUTH"] = "oauth-tok-containment-4a5b6c7d8e9f"
+
+        class _EnvCredContainedAdapter(_MaskingFakeAdapter):
+            credential_env_vars = ["ASE_SELFTEST_OAUTH"]
+            contained_home_subpaths: list = []      # mapped, empty surface — like claude
+
+        prior_adapter24 = r.adapter
+        r.adapter = _EnvCredContainedAdapter()
+        spec24 = EvalSpec(name="demo", prompt="hi",       # NO mcp_servers on purpose
+                          source_path=os.path.join(repo_root, "demo.yaml"),
+                          assertions=[{"type": "file_exists", "path": "run.py"}])
+        try:
+            cell24 = r._run_cell(ModelTarget(), spec24)
+        finally:
+            r.adapter = prior_adapter24
+            os.environ.pop("ASE_SELFTEST_OAUTH", None)
+            r._secrets = r._run_secrets = ()
+            _try(lambda: os.rmdir(os.path.join(contained_home, "cache")))
+        _check("mcp.credential_env_var_triggers_containment_without_mcp_servers",
+               cell24.passed and seen.get("escapes") == []
+               and "cache" not in (seen.get("home_entries") or []),
+               f"a credential env var makes the cell credential-bearing on its own, so its "
+               f"HOME is contained even with no `mcp_servers`: the real home's `cache` does "
+               f"not pass through and nothing leads out. Gating containment on the "
+               f"interpolated `${{VAR}}` alone left an ordinary token-set run on the symlink "
+               f"overlay, where the child wrote the token into the real home. "
+               f"passed={cell24.passed} escapes={seen.get('escapes')!r} "
+               f"entries={(seen.get('home_entries') or [])[:6]}", failures, verbose)
+
+        # P1: the same credential env var, under `isolated: false`, is REFUSED — that mode
+        # hands the agent the real home with no overlay at all, so a token in the child
+        # environment has nowhere safe to live. The refusal must name the env-var source, not
+        # talk about an `${VAR}` that isn't there.
+        seen.clear()
+        run_dir25 = os.path.join(repo_root, "artifacts", "run25")
+        os.makedirs(run_dir25)
+        r.run_id, r.run_dir = "run25", run_dir25
+        os.environ["ASE_SELFTEST_OAUTH"] = "oauth-tok-noniso-1a2b3c4d5e6f"
+
+        class _EnvCredAdapter(_MaskingFakeAdapter):
+            credential_env_vars = ["ASE_SELFTEST_OAUTH"]
+
+        prior_adapter25, prior_isolated25 = r.adapter, r.isolated
+        r.adapter = _EnvCredAdapter()
+        r.isolated = False
+        spec25 = EvalSpec(name="demo", prompt="hi",
+                          source_path=os.path.join(repo_root, "demo.yaml"),
+                          assertions=[{"type": "file_exists", "path": "run.py"}])
+        try:
+            cell25 = r._run_cell(ModelTarget(), spec25)
+        finally:
+            r.adapter, r.isolated = prior_adapter25, prior_isolated25
+            os.environ.pop("ASE_SELFTEST_OAUTH", None)
+            r._secrets = r._run_secrets = ()
+        err25 = cell25.run_result.error or ""
+        _check("mcp.credential_env_var_run_is_refused_under_isolated_false",
+               cell25.passed is False and seen.get("cwd") is None
+               and "passes a credential env var to the agent" in err25
+               and "no isolated HOME" in err25,
+               f"`isolated: false` gives the agent the real home with no overlay, so an env "
+               f"credential the harness forwarded has nowhere the run deletes or scrubs — "
+               f"refused before the agent starts, exactly as an interpolated `${{VAR}}` is. "
+               f"The message names the env-var source rather than an absent interpolation. "
+               f"ran={seen.get('cwd') is not None} passed={cell25.passed} "
+               f"err={err25[:120]!r}", failures, verbose)
+
         # A credential too short to redact is still a credential. This is the arm that would
         # have caught gating on `bool(secrets)` — the redaction set is empty here.
         seen.clear()
@@ -1696,6 +2027,15 @@ def _check_mcp_hermetic_paths(failures, verbose):
 
     from .adapters.base import Adapter, ParseOutput, ProbeResult
     from .isolation import build_mcp_masked_home
+
+    def _try(fn, default=None):
+        """Run fn, turning any exception into `default` — the arms below assert on VALUES,
+        and a mutation that makes production code raise (or that removes a file these read)
+        would otherwise abort the section and take its siblings with it."""
+        try:
+            return fn()
+        except Exception:
+            return default
 
     print("MCP hermetic paths (masked-home overlay, probes, judge, fail-closed):")
 
@@ -1799,6 +2139,170 @@ def _check_mcp_hermetic_paths(failures, verbose):
                    "an overlay with nothing symlinked out reports nothing, so the refusal "
                    "this feeds lifts itself once the HOME is materialized instead of "
                    "needing the check removed", failures, verbose)
+
+            # --- contained mode: build the same hostile home so nothing leads out --------
+            # The fixture is adversarial on purpose. The real home now also holds a vendor
+            # skill, a vendor skill that is ITSELF a symlink out of the home, a plugin
+            # package, and — inside a DECLARED subpath, so the copy actually walks onto it —
+            # a FIFO. Contained mode has to yield escapes == [] anyway, and has to get past
+            # the FIFO without opening it.
+            #
+            # A FIFO and not a socket, inverting this suite's usual rule, because here the
+            # blocking IS the defect under test. `open()` on a socket fails ENXIO at once,
+            # so `_materialize`'s `except OSError` would swallow it and a socket could not
+            # tell a working kind-check from a missing one. A FIFO blocks forever instead,
+            # which no exception handler saves you from — so the build runs on a thread and
+            # the arm asserts it FINISHED. That is the same 20s-join shape
+            # `mcp.special_files_are_removed_rather_than_read` uses, for the same reason.
+            import threading as _threading
+            os.makedirs(os.path.join(real, ".fakecli", "skills", "vendor-skill"))
+            with open(os.path.join(real, ".fakecli", "skills", "vendor-skill",
+                                   "SKILL.md"), "w") as fh:
+                fh.write("vendor content\n")
+            with open(os.path.join(beyond, "BEYOND.md"), "w") as fh:
+                fh.write("beyond content\n")
+            os.symlink(beyond, os.path.join(real, ".fakecli", "skills", "linked-skill"))
+            os.makedirs(os.path.join(real, ".fakecli", "state"))
+            with open(os.path.join(real, ".fakecli", "state", "keep.txt"), "w") as fh:
+                fh.write("state content\n")
+            os.mkfifo(os.path.join(real, ".fakecli", "state", "pipe"))
+            con_home = tempfile.mkdtemp(prefix="ase-con-")
+            try:
+                box: dict = {}
+
+                def _build_contained():
+                    box["r"] = _try(lambda: build_isolated_home(
+                        con_home, [".fakecli/skills"], set(), [], real_home=real,
+                        plugin_registry_subpaths=[".fakecli/plugins"],
+                        config_file_masks={".fakecli/mcp.json": "{}"},
+                        plugin_config_masks={"mcp_config.json": "{}"},
+                        contained_subpaths=[".fakecli/auth.json", ".fakecli/state"]))
+
+                t_con = _threading.Thread(target=_build_contained, daemon=True)
+                t_con.start()
+                t_con.join(20.0)
+                con_escapes = _try(lambda: home_write_escapes(con_home), None)
+                fk = os.path.join(con_home, ".fakecli")
+                _check("contained_home.no_name_leads_out_of_a_hostile_real_home",
+                       con_escapes == []
+                       and not os.path.exists(os.path.join(fk, "dangling"))
+                       and not os.path.exists(os.path.join(fk, "sk"))
+                       and os.path.isfile(os.path.join(fk, "auth.json"))
+                       and not os.path.islink(os.path.join(fk, "auth.json"))
+                       and open(os.path.join(fk, "mcp.json")).read() == "{}",
+                       f"a real home carrying an outward symlink, a dangling symlink and a "
+                       f"FIFO still yields a home with no name leading out: the wholesale "
+                       f"pass is off, so nothing exists that was not asked for, the declared "
+                       f"auth is a real file rather than a link to one, and the config mask "
+                       f"still applies. This is the condition the refusal reads — an "
+                       f"exemption would have satisfied the refusal without satisfying this. "
+                       f"escapes={con_escapes}", failures, verbose)
+                _check("contained_home.declared_directory_is_copied_by_content",
+                       os.path.isdir(os.path.join(fk, "state"))
+                       and not os.path.islink(os.path.join(fk, "state"))
+                       and _try(lambda: open(os.path.join(fk, "state",
+                                                          "keep.txt")).read(), "")
+                       == "state content\n",
+                       f"a declared subpath naming a DIRECTORY is reproduced as a real "
+                       f"directory of real files, recursively — not linked, and not skipped "
+                       f"for being a directory rather than the auth file the field was "
+                       f"written for.", failures, verbose)
+
+                vendor = os.path.join(fk, "skills", "vendor-skill", "SKILL.md")
+                linked = os.path.join(fk, "skills", "linked-skill")
+                _check("contained_home.vendor_skills_are_copied_not_symlinked",
+                       not os.path.islink(os.path.join(fk, "skills", "vendor-skill"))
+                       and _try(lambda: open(vendor).read(), "") == "vendor content\n"
+                       and not os.path.islink(linked)
+                       and _try(lambda: open(os.path.join(linked, "BEYOND.md")).read(), "")
+                       == "beyond content\n",
+                       f"the skills dir is rebuilt entry by entry, so it mints its OWN "
+                       f"outward symlinks — one per vendor skill — and reading contained "
+                       f"mode as 'skip the wholesale pass in _overlay' leaves every one of "
+                       f"them in place. Contained, each is copied by content, including a "
+                       f"vendor skill that is itself a link out of the home: the bytes "
+                       f"arrive, the way back out does not. "
+                       f"linked_is_link={os.path.islink(linked)}", failures, verbose)
+
+                p1 = os.path.join(fk, "plugins", "p1")
+                _check("contained_home.plugin_packages_are_copied_not_symlinked",
+                       os.path.isdir(p1) and not os.path.islink(p1)
+                       and os.path.isfile(os.path.join(p1, "plugin.json"))
+                       and not os.path.islink(os.path.join(p1, "plugin.json"))
+                       and _try(lambda: open(os.path.join(p1, "mcp_config.json")).read(),
+                                "") == "{}",
+                       f"the plugin registry is the second site that mints its own outward "
+                       f"symlinks, two per package, and it is masked rather than skipped so "
+                       f"it is easy to assume it was already handled. Its pass-throughs copy "
+                       f"too, and its per-plugin MCP mask still lands.", failures, verbose)
+
+                # NB: there is deliberately no arm asserting the FIFO was skipped "without
+                # being opened". `_materialize` copies via `shutil.copyfile`, which raises
+                # `SpecialFileError` (an OSError subclass) on a FIFO before opening it, and a
+                # socket fails ENXIO — both swallowed by `_materialize`'s `except OSError`.
+                # So removing the explicit `S_ISREG` guard is unobservable from userspace
+                # (its only unique job is device nodes, which need root to create), which
+                # makes any such arm decorative. The FIFO stays in the fixture as a realistic
+                # hostile-home element the two arms above must survive, and the build runs on
+                # a thread with a bounded join purely as insurance: if a future refactor ever
+                # replaced copyfile with a raw open, the suite would fail on the join rather
+                # than hang. `box` and `t_con` are consumed by that safety check, not an arm.
+                if t_con.is_alive() or box.get("r") != con_home:
+                    _check("contained_home.build_did_not_hang_on_a_special_file",
+                           False,
+                           f"the contained build did not finish within the join window — a "
+                           f"special file in the real home blocked it (finished="
+                           f"{not t_con.is_alive()} returned={box.get('r') == con_home}). "
+                           f"This is the hang insurance, not a behavioural arm.",
+                           failures, verbose)
+
+                # Found by this suite's own fixture declaring `.fakecli/plugins` twice: the
+                # copy leaf displaced the registry leaf, the per-plugin MCP mask never ran,
+                # and the home was still perfectly contained. Containment and hermeticity
+                # are different properties and satisfying one must not quietly cost the
+                # other, so a collision is a contract error rather than a race.
+                def _collide(subs):
+                    d = tempfile.mkdtemp(prefix="ase-collide-")
+                    try:
+                        build_isolated_home(
+                            d, [".fakecli/skills"], set(), [], real_home=real,
+                            plugin_registry_subpaths=[".fakecli/plugins"],
+                            config_file_masks={".fakecli/mcp.json": "{}"},
+                            contained_subpaths=subs)
+                        return None
+                    except Exception as exc:
+                        # Broad on purpose: the arm passes only when the message says
+                        # "collides"/"descends through", so any OTHER exception string fails
+                        # it cleanly. Catching just ValueError let last-write-wins reintroduce
+                        # a `_FileMaskLeaf[...]=` TypeError that escaped and CRASHED the whole
+                        # section instead of reddening this one arm — the mutation went
+                        # uncaught-by-its-arm as a result.
+                        return str(exc)
+                    finally:
+                        shutil.rmtree(d, ignore_errors=True)
+
+                over_mask = _collide([".fakecli/mcp.json"])
+                over_registry = _collide([".fakecli/plugins"])
+                over_skills = _collide([".fakecli/skills"])
+                through_mask = _collide([".fakecli/mcp.json/deeper"])
+                ok_sibling = _collide([".fakecli/auth.json"])
+                _check("contained_home.copy_declaration_may_not_displace_a_mask",
+                       all(m and "collides" in m
+                           for m in (over_mask, over_registry, over_skills))
+                       and (through_mask or "").find("descends through") >= 0
+                       and ok_sibling is None,
+                       f"a contained subpath naming a masked path is refused at BUILD time, "
+                       f"in all four shapes: over a config mask, over a plugin registry, "
+                       f"over a skills dir, and descending through one. Last-write-wins "
+                       f"would have replaced a neutral '{{}}' with a faithful copy of the "
+                       f"user's real MCP config — a hermeticity regression that leaves the "
+                       f"home fully contained and therefore looks like it worked. A "
+                       f"non-colliding sibling still builds. "
+                       f"mask={str(over_mask)[:60]!r} through={str(through_mask)[:60]!r} "
+                       f"sibling={ok_sibling!r}", failures, verbose)
+            finally:
+                _try(lambda: os.unlink(os.path.join(real, ".fakecli", "state", "pipe")))
+                shutil.rmtree(con_home, ignore_errors=True)
         finally:
             shutil.rmtree(esc_home, ignore_errors=True)
             shutil.rmtree(beyond, ignore_errors=True)

@@ -398,6 +398,20 @@ class Runner:
         model = target.model
         model_label = target.label
 
+        # Adapter-declared credential env vars (e.g. claude's CLAUDE_CODE_OAUTH_TOKEN) reach
+        # the child through env()'s process-env passthrough, so a CLI or tool that echoes one
+        # would archive it verbatim — the interpolated-`${VAR}` scrub set never sees it. Read
+        # their VALUES from THIS process's environment and seat them in the redaction registry
+        # HERE, before the run and before any `_rw`/`_scrub_and_note`/summary write. Set now
+        # even though the MCP block below reassigns `_secrets`: it UNIONS `env_secrets` back
+        # in, so a non-MCP cell (which never reaches that block) is still covered. A name that
+        # is unset contributes nothing — there is no credential to redact.
+        cred_env_present = [name for name in getattr(adapter, "credential_env_vars", None) or []
+                            if os.environ.get(name)]
+        env_secrets = tuple(dict.fromkeys(os.environ[name] for name in cred_env_present))
+        self._secrets = env_secrets
+        self._run_secrets = tuple(dict.fromkeys(self._run_secrets + env_secrets))
+
         def _phase(phase: str):
             if p:
                 p.update(cell=cell_idx, phase=phase,
@@ -420,6 +434,12 @@ class Runner:
         # 3) render prompt (fill {skill}/{skills} for this adapter)
         prompt = self._render_prompt(spec)
 
+        # Which declared MCP fields carry a `${VAR}`. Resolved HERE rather than at the point
+        # of use below, because it decides what KIND of HOME this cell needs and the HOME is
+        # built first. `${VAR}` in the declaration, not `bool(secrets)`: the redaction set
+        # omits values under MIN_REDACTABLE_LEN and a short credential is still a credential.
+        interpolated = interpolated_refs(spec.mcp_servers) if spec.mcp_servers else []
+
         # 4) isolate HOME so the model sees only the provisioned skills (+ the surface's
         #    vendor skills), not this repo's globally-installed skills.
         iso_home = None
@@ -434,14 +454,40 @@ class Runner:
         # (DESIGN_MCP_Support.md, Phase 0).
         cfg_masks = dict(getattr(adapter, "isolation_config_masks", {}) or {})
         plugin_cfg_masks = dict(getattr(adapter, "plugin_registry_config_masks", {}) or {})
-        if self.isolated and (adapter.global_skills_subpaths or cfg_masks or plugin_cfg_masks):
+        # A cell holding a credential needs a HOME with no way out of it, not the symlink
+        # overlay — see isolation.py's contained mode and `_refuse_uncontained_home`. The
+        # adapter declares the surface; None means it has not been mapped, so containment is
+        # unavailable and the refusal below still fires. Contained mode is NOT applied to
+        # credential-free cells: it is stricter (a CLI needing something undeclared errors),
+        # and every existing scenario is entitled to the overlay it was verified against.
+        # Two sources of credentials the child can reach: an interpolated ${VAR} in
+        # `mcp_servers`, and an adapter-declared credential env var that is set (env() forwards
+        # it to the child). BOTH need the same containment — a plain symlink overlay lets the
+        # child write either back into the real HOME — and this decision is INDEPENDENT of
+        # whether the cell declares MCP servers: an ordinary claude run has the OAuth token
+        # and no `mcp_servers` at all, which gating on `interpolated` alone left uncontained.
+        has_credentials = bool(interpolated) or bool(cred_env_present)
+        contained_subs = getattr(adapter, "contained_home_subpaths", None)
+        contain_home = has_credentials and contained_subs is not None
+        # A non-empty contained surface means `build_isolated_home` will COPY the adapter's
+        # long-lived auth/config into the HOME below. That directory is credential-bearing
+        # from the copy onward — before the agent runs, before any `${VAR}` resolves — so its
+        # registration must say so from creation, not be a non-fatal "leaked tempdir" that
+        # only gets upgraded once MCP resolution reaches it. A crash in that window otherwise
+        # left the copied auth on disk under a warning claiming no credentials were present.
+        materializes_auth = contain_home and bool(contained_subs)
+        if self.isolated and (adapter.global_skills_subpaths or cfg_masks or plugin_cfg_masks
+                              or contain_home):
             iso_home = tempfile.mkdtemp(prefix="ase-home-")
             # Registered at creation, like the scratch dir and for the same reason: what
             # follows — the overlay build, `_phase`, the effort resolution — can raise, and
             # until this line the only thing that knew the directory existed was a local in
-            # the frame the raise unwinds. Non-fatal: it holds config masks and symlinks
-            # into the real home, so a stubborn one is a leaked tempdir, not a leaked secret.
-            cleanup.own("the isolated HOME", iso_home, fatal=False)
+            # the frame the raise unwinds. Fatal + credential-bearing when it will hold copied
+            # auth (see `materializes_auth` above); otherwise non-fatal — it holds only config
+            # masks and symlinks into the real home, so a stubborn one is a leaked tempdir,
+            # not a leaked secret.
+            cleanup.own("the isolated HOME", iso_home, fatal=materializes_auth,
+                        tail=_CONTAINED_TAIL if materializes_auth else None)
             seed_dirs = declared_dirs if self.provision else []
             try:
                 build_isolated_home(
@@ -451,9 +497,17 @@ class Runner:
                     repo_root=self._repo_root,
                     config_file_masks=cfg_masks,
                     plugin_config_masks=plugin_cfg_masks,
+                    contained_subpaths=contained_subs if contain_home else None,
                 )
                 cfg_root = None
-                for var, replaces, skills_sub in config_home_entries(adapter):
+                # A custom config home is MIRRORED with the wholesale symlink pass, so every
+                # mirror is a fresh set of escapes — mirroring one into a contained home
+                # would undo the containment entirely. Contained cells mirror nothing and
+                # leave the var unset in `isolation_env`, which makes adapter.env() clear it
+                # so the CLI falls back to the contained HOME. Fails closed: the run loses
+                # the custom config, it does not gain a way out.
+                for var, replaces, skills_sub in ([] if contain_home
+                                                  else config_home_entries(adapter)):
                     custom = os.environ.get(var)
                     if custom and os.path.isdir(custom):
                         if cfg_root is None:
@@ -517,28 +571,42 @@ class Runner:
         try:
             if spec.mcp_servers:
                 mcp_resolved, secrets = spec.resolved_mcp_servers()
-                self._secrets = tuple(secrets)
+                # Union, not overwrite: `env_secrets` (the adapter's credential env vars,
+                # seated above) must survive alongside the interpolated `${VAR}` values, or a
+                # cell that has both would stop redacting the token the moment it resolved a
+                # server credential.
+                self._secrets = tuple(dict.fromkeys(env_secrets + tuple(secrets)))
                 self._run_secrets = tuple(dict.fromkeys(self._run_secrets + self._secrets))
                 mcp_scratch = tempfile.mkdtemp(prefix="ase-mcp-")
                 # Registered the moment it exists rather than once it holds something: the
                 # window between the two is where the credentials get written into it.
-                # `${VAR}` in the DECLARATION, not `bool(secrets)`: the redaction set omits
-                # values under MIN_REDACTABLE_LEN, and a short credential is still a
+                # `interpolated` was resolved before the HOME was built (it decides whether
+                # the HOME must be contained); the property it encodes is unchanged — it is
+                # `${VAR}` in the DECLARATION, not `bool(secrets)`, because the redaction set
+                # omits values under MIN_REDACTABLE_LEN and a short credential is still a
                 # credential. Review failed a cell for credentials it could not have had
                 # because the only question asked was whether `mcp_servers` was present.
-                interpolated = interpolated_refs(spec.mcp_servers)
                 cleanup.own("the MCP scratch directory", mcp_scratch,
                             tail=_CREDENTIAL_TAIL if interpolated else _CONFIG_TAIL)
-                if interpolated:
-                    _refuse_uncontained_home(iso_home, spec.name, interpolated)
-                    # This cell HAS credentials, which changes what the isolated HOME is.
-                    # It was registered as a leaked-tempdir risk because the harness built
-                    # it out of masks and symlinks — but it is `$HOME` for a child that can
-                    # write, and review's agent copied its resolved token straight into it,
-                    # then watched a failed removal report that no credentials were
-                    # present. What a writable directory contains is decided after the
-                    # harness stops looking, so from here it is the scratch dir's equal.
-                    cleanup.own("the isolated HOME", iso_home, tail=_EXPOSED_TAIL)
+            # Containment decision for EVERY child-reachable credential — an interpolated
+            # `mcp_servers` `${VAR}` or an adapter credential env var — and OUTSIDE the
+            # `spec.mcp_servers` guard, because an env-var credential exists whether or not the
+            # cell declares servers. Refuses the run when the HOME cannot contain the writes
+            # (no HOME under `isolated: false`, an unmapped adapter, or a symlink overlay whose
+            # entries escape); for a contained HOME it returns and the run proceeds.
+            if has_credentials:
+                _refuse_uncontained_home(iso_home, spec.name,
+                                         list(interpolated) + list(cred_env_present),
+                                         _cred_source(interpolated, cred_env_present))
+                # This cell HAS credentials, which changes what the isolated HOME is. The
+                # harness knows its INITIAL contents (masks, or copied auth) and not its final
+                # ones: it is `$HOME` for a child that can write, and review's agent copied a
+                # resolved token straight into one, then watched a failed removal report that
+                # no credentials were present. `_CONTAINED_TAIL` when the harness itself copied
+                # real auth in; `_EXPOSED_TAIL` for an empty contained surface, where the only
+                # reach is what the agent could have written.
+                cleanup.own("the isolated HOME", iso_home,
+                            tail=_CONTAINED_TAIL if materializes_auth else _EXPOSED_TAIL)
             opts = RunOptions(
                 model=model,
                 auto_approve=self.auto_approve,
@@ -561,11 +629,11 @@ class Runner:
             # leaves this function, and a note in a local leaves with it — which is exactly
             # how a failed scratch removal came to be reported as nothing at all.
             cleanup.purge(mcp_scratch)
-            # The isolated HOME carries config masks and symlinks into the real home, not
-            # resolved secrets, so a stubborn one warns instead of failing the cell — the
-            # `fatal=False` it was registered with. It gets the same verified removal and
-            # the same durable record all the same: "best effort" was never the intent
-            # here, it was just what `ignore_errors=True` happened to mean.
+            # Same verified removal and durable record whatever severity the HOME was
+            # registered with: a plain overlay carries only masks and symlinks into the real
+            # home, so a stubborn one warns (`fatal=False`); a contained HOME that
+            # materialized real auth fails the cell (`fatal=_CONTAINED_TAIL`). Either way
+            # "best effort" was never the intent, it was just what `ignore_errors=True` meant.
             cleanup.purge(iso_home)
         rr = ex.result
 
@@ -1600,18 +1668,43 @@ _EXPOSED_TAIL = ("the agent had it as $HOME and could have written this cell's r
                  "credentials into it; delete it before sharing this machine's state")
 _CONFIG_TAIL = ("this cell interpolated no ${VAR}, so no credential is in it — but it holds "
                 "MCP configuration the harness wrote outside the workspace")
+# A contained HOME with a non-empty declared surface: the harness COPIED the adapter's
+# long-lived auth/config into it (no outward symlink can hold that — isolation.py contained
+# mode), so it is credential-bearing from the moment of the copy, before the agent runs and
+# before this cell resolves any `${VAR}`. Distinct from `_TEMPDIR_TAIL`, whose "no resolved
+# credentials are in it" is a lie for this directory: the credential the harness put there
+# is on disk regardless of what the agent did.
+_CONTAINED_TAIL = ("the harness copied this adapter's long-lived auth/config into it to make "
+                   "a contained HOME, and the agent had it as $HOME; delete it before "
+                   "sharing this machine's state")
 
 
-def _refuse_uncontained_home(home: Optional[str], eval_name: str, refs: list[str]) -> None:
+def _cred_source(interpolated: list[str], env_names: list[str]) -> str:
+    """Phrase naming where a cell's child-reachable credentials come from, for the refusal.
+
+    Two independent sources, either or both: an interpolated `${VAR}` in `mcp_servers`, and an
+    adapter credential env var that env() forwards to the child (claude's
+    CLAUDE_CODE_OAUTH_TOKEN). The MCP wording is kept verbatim so a purely-MCP refusal reads
+    exactly as it did before this second source existed."""
+    parts = []
+    if interpolated:
+        parts.append("interpolates a credential into `mcp_servers`")
+    if env_names:
+        parts.append("passes a credential env var to the agent")
+    return " and ".join(parts)
+
+
+def _refuse_uncontained_home(home: Optional[str], eval_name: str, refs: list[str],
+                             source: str) -> None:
     """Fail a credential-bearing cell whose $HOME has write paths into the real home.
 
     The isolated HOME is a symlink overlay: it masks what the model can READ, and passes
-    every unmasked real-home entry through as a symlink. So a model that has just been given
-    a token — an MCP tool result can hand it straight back — can write it to
-    `$HOME/<anything>/token` and have it land in the real home, outside every directory this
-    runner deletes and outside the workspace it scrubs. Review demonstrated exactly that, and
-    the overlay's removal still reported success: deleting a symlink certifies nothing about
-    its target.
+    every unmasked real-home entry through as a symlink. So a model that has a credential —
+    an MCP tool result can hand a token back, or the adapter passed one in the child
+    environment (claude's OAuth token) — can write it to `$HOME/<anything>/token` and have it
+    land in the real home, outside every directory this runner deletes and outside the
+    workspace it scrubs. Review demonstrated both, and the overlay's removal still reported
+    success: deleting a symlink certifies nothing about its target.
 
     Refused rather than warned, and refused rather than run-and-scrubbed, because there is
     nothing to scrub — the harness does not know which of the real home's directories were
@@ -1620,25 +1713,25 @@ def _refuse_uncontained_home(home: Optional[str], eval_name: str, refs: list[str
 
     The check is structural, not a blanket ban, so it lifts itself once the writable HOME
     state is materialized (DESIGN_MCP_Support.md §5.3) instead of needing this code deleted.
+    `source` names the credential origin (see `_cred_source`) so the message is accurate
+    whether it fired on an MCP `${VAR}`, an env-var credential, or both.
     """
     if not home:
         raise RuntimeError(
-            f"{eval_name!r} interpolates a credential into `mcp_servers` "
-            f"({', '.join(refs)}) but this cell has no isolated HOME, so the agent runs "
-            f"against the real one: anything it writes there outlives the run and the "
-            f"harness cannot certify otherwise. Refusing rather than reporting a contained "
-            f"run — remove the `${{VAR}}` or run with isolation available.")
+            f"{eval_name!r} {source} ({', '.join(refs)}) but this cell has no isolated HOME, "
+            f"so the agent runs against the real one: anything it writes there outlives the "
+            f"run and the harness cannot certify otherwise. Refusing rather than reporting a "
+            f"contained run — remove the credential or run with isolation available.")
     escapes = home_write_escapes(home)
     if not escapes:
         return
     raise RuntimeError(
-        f"{eval_name!r} interpolates a credential into `mcp_servers` ({', '.join(refs)}) "
-        f"and its isolated HOME is a symlink overlay: {len(escapes)} of its entries "
-        f"({_shown(escapes[:3])}) resolve outside it, so a token the agent writes through "
-        f"one lands outside every directory this run deletes and outside the workspace it "
-        f"scrubs — planted in a passed-through directory, or written over a passed-through "
-        f"file. Removing the overlay cannot certify those targets. Refusing the run rather "
-        f"than reporting it as contained.")
+        f"{eval_name!r} {source} ({', '.join(refs)}) and its isolated HOME is a symlink "
+        f"overlay: {len(escapes)} of its entries ({_shown(escapes[:3])}) resolve outside "
+        f"it, so a token the agent writes through one lands outside every directory this run "
+        f"deletes and outside the workspace it scrubs — planted in a passed-through "
+        f"directory, or written over a passed-through file. Removing the overlay cannot "
+        f"certify those targets. Refusing the run rather than reporting it as contained.")
 
 
 def _purge(label: str, path: Optional[str], tail: str = _CREDENTIAL_TAIL) -> str:

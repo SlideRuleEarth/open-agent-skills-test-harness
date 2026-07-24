@@ -209,6 +209,28 @@ class ClaudeAdapter(Adapter):
     # CLAUDE_CONFIG_DIR overrides ~/.claude (skills under it). Under isolation it's mirrored +
     # repointed (custom config dir kept, skills masked), else cleared to the isolated home.
     isolation_config_homes = [("CLAUDE_CONFIG_DIR", ".claude", "skills")]
+    # Nothing. Measured against 2.1.113 on macOS, 2026-07-23: an empty HOME with only the
+    # masked skills dir runs, emits its `system`/`init` event with `claude_code_version`
+    # intact (so version provenance still reads the executing build), and answers.
+    #
+    # The reason it costs nothing is worth writing down, because it is macOS-specific and
+    # will not hold for every adapter. claude's HOME-side auth is the login KEYCHAIN, at
+    # ~/Library/Keychains — redirect HOME and it reports "Not logged in", and the only way to
+    # symlink it back is an outward symlink, which a contained home cannot have. The keychain
+    # is also uncopyable in practice: it is every password on the machine, and a copy is not
+    # auto-unlocked, so a headless run would block on a password prompt. So auth arrives
+    # instead as CLAUDE_CODE_OAUTH_TOKEN in the environment (verified: authenticates against
+    # a wholly empty home), which the operator exports like any other harness credential and
+    # which base.env() already passes through. The harness deliberately does NOT read the
+    # keychain itself — acquiring that capability silently is not something a test harness
+    # should do, and the token never touches disk this way.
+    contained_home_subpaths: list[str] = []
+    # The token that authenticates the contained (or any) HOME arrives here, and env() passes
+    # it to the child. Register it for redaction so a run that echoes it — claude logging its
+    # environment, a tool dumping env — cannot archive it verbatim. It is the credential the
+    # contained-HOME design deliberately introduced into the child environment; leaving it out
+    # of the scrub set would undo the containment the design bought.
+    credential_env_vars = ["CLAUDE_CODE_OAUTH_TOKEN"]
 
     supports_output_schema = True
     # `--effort <level>` (verified 2026-07-08: choices low|medium|high|xhigh|max — the
