@@ -342,14 +342,14 @@ MUTATIONS = [
     # The HOME keeps the severity the harness gave it when it built the masks, ignoring that
     # the child then had it as $HOME with write access.
     ("M60-writable-home-keeps-its-creation-severity", RUNNER,
-     '                    cleanup.own("the isolated HOME", iso_home,\n'
-     "                                tail=_CONTAINED_TAIL if materializes_auth else _EXPOSED_TAIL)",
-     "                    pass",
+     '                cleanup.own("the isolated HOME", iso_home,\n'
+     "                            tail=_CONTAINED_TAIL if materializes_auth else _EXPOSED_TAIL)",
+     "                pass",
      "relocate.child_writable_home_is_credential_bearing_after_the_run"),
     # Escalated in severity but still claiming the directory holds nothing.
     ("M61-exposed-home-denies-its-contents", RUNNER,
-     "                                tail=_CONTAINED_TAIL if materializes_auth else _EXPOSED_TAIL)",
-     "                                tail=_TEMPDIR_TAIL)",
+     "                            tail=_CONTAINED_TAIL if materializes_auth else _EXPOSED_TAIL)",
+     "                            tail=_TEMPDIR_TAIL)",
      "relocate.child_writable_home_is_credential_bearing_after_the_run"),
     # Acknowledged once the artifact writes return — but the judge artifacts and
     # `progress.done` come after them, and a raise there rebuilds the result.
@@ -369,9 +369,13 @@ MUTATIONS = [
      "        if _record_notes(rr, pending):",
      "relocate.scrub_verdict_survives_a_raise_that_rebuilds_the_result"),
     # --- round 10: the overlay bounds reads, not writes; declaring != interpolating ------
+    # Re-anchored after P1 unified the credential sources: the refusal call moved out of the
+    # `if interpolated:` block and now spans three lines. Same defect, same arm.
     ("M64-credential-run-not-refused", RUNNER,
-     "                    _refuse_uncontained_home(iso_home, spec.name, interpolated)",
-     "                    pass",
+     "                _refuse_uncontained_home(iso_home, spec.name,\n"
+     "                                         list(interpolated) + list(cred_env_present),\n"
+     "                                         _cred_source(interpolated, cred_env_present))",
+     "                pass",
      "mcp.credential_run_is_refused_when_home_writes_escape_the_overlay"),
     # The detector follows the symlinks it is meant to report, so it descends into the real
     # home and reports its contents instead of the one entry that leads there.
@@ -429,15 +433,15 @@ MUTATIONS = [
     # Containment never engages, so a credential cell keeps hitting the refusal it is now
     # entitled to pass. The whole feature, reduced to one constant.
     ("M72-contained-mode-never-engaged", RUNNER,
-     "\n        contain_home = bool(interpolated) and contained_subs is not None",
+     "\n        contain_home = has_credentials and contained_subs is not None",
      "\n        contain_home = False",
      "mcp.credential_run_is_permitted_once_the_home_is_contained"),
     # `is not None` -> truthiness. Reads an EMPTY declaration as an absent one, which is
     # precisely claude's answer (it needs nothing from the real home), so the one adapter
     # this work exists to unblock silently stays refused while every other arm passes.
     ("M73-empty-declaration-read-as-unmapped", RUNNER,
-     "\n        contain_home = bool(interpolated) and contained_subs is not None",
-     "\n        contain_home = bool(interpolated) and bool(contained_subs)",
+     "\n        contain_home = has_credentials and contained_subs is not None",
+     "\n        contain_home = has_credentials and bool(contained_subs)",
      "mcp.empty_contained_declaration_contains_rather_than_refuses"),
     # The custom config home is mirrored anyway. The mirror is built by the wholesale
     # symlink pass and lands INSIDE the contained home, so every escape comes back one level
@@ -505,9 +509,12 @@ MUTATIONS = [
     # --- P1 credential-handling fixes -------------------------------------------------
     # No adapter credential env var enters the redaction set, so an echoed
     # CLAUDE_CODE_OAUTH_TOKEN archives verbatim — the interpolation scrub set never sees it.
+    # Re-anchored after P1c split names from values. Targets `env_secrets` alone so the
+    # redaction set empties while `cred_env_present` (and thus containment) is untouched —
+    # isolating the defect to the arm about redaction.
     ("M81-adapter-credential-env-var-not-redacted", RUNNER,
-     '            v for name in getattr(adapter, "credential_env_vars", None) or []',
-     "            v for name in []",
+     "\n        env_secrets = tuple(dict.fromkeys(os.environ[name] for name in cred_env_present))",
+     "\n        env_secrets = ()",
      "mcp.adapter_credential_env_var_is_redacted"),
     # The contained HOME that COPIED real auth is registered non-fatal at creation (the
     # pre-fix behaviour), so a crash before the MCP-resolution upgrade leaves the copied auth
@@ -517,6 +524,20 @@ MUTATIONS = [
      "                        tail=_CONTAINED_TAIL if materializes_auth else None)",
      '            cleanup.own("the isolated HOME", iso_home, fatal=False)',
      "mcp.contained_home_that_copies_auth_is_credential_bearing_before_the_copy"),
+    # An adapter credential env var no longer makes the cell credential-bearing, so an
+    # ordinary token-set run with no `mcp_servers` drops back to the symlink overlay — the
+    # containment gap the child exploited to write the OAuth token into the real home.
+    ("M83-env-credential-does-not-trigger-containment", RUNNER,
+     "        has_credentials = bool(interpolated) or bool(cred_env_present)",
+     "        has_credentials = bool(interpolated)",
+     "mcp.credential_env_var_triggers_containment_without_mcp_servers"),
+    # Containment still considers env creds (contain_home does), but the REFUSAL only fires
+    # for an interpolated `${VAR}`, so an env-credential cell that cannot be contained
+    # (`isolated: false`, unmapped adapter) runs uncontained instead of being refused.
+    ("M84-env-credential-refusal-not-triggered", RUNNER,
+     "\n            if has_credentials:",
+     "\n            if interpolated:",
+     "mcp.credential_env_var_run_is_refused_under_isolated_false"),
 ]
 
 

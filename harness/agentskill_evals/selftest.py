@@ -1770,6 +1770,9 @@ def _check_workspace_relocation(failures, verbose):
 
         class _OAuthFakeAdapter(_FakeAdapter):
             credential_env_vars = ["ASE_SELFTEST_OAUTH"]
+            # Mapped (empty surface, like claude), so a credential env var contains the HOME
+            # rather than refusing the cell — this arm needs it to COMPLETE and archive.
+            contained_home_subpaths: list = []
 
         prior_adapter22 = r.adapter
         r.adapter = _OAuthFakeAdapter()
@@ -1857,6 +1860,83 @@ def _check_workspace_relocation(failures, verbose):
                f"pre-fix non-fatal registration warned 'no resolved credentials are in it' "
                f"over a real one. on_disk={auth_on_disk23} passed={cell23.passed} "
                f"say={say23[:150]!r}", failures, verbose)
+
+        # P1: an adapter credential ENV VAR triggers containment on its own, with NO
+        # `mcp_servers` at all. Before this, containment keyed only on an interpolated
+        # `${VAR}`, so an ordinary claude run with the OAuth token set got the symlink overlay
+        # and the child could write the token through `$HOME/.cache` into the real home. Here
+        # the real home has a `cache` dir that the overlay WOULD pass through; contained, it
+        # does not, and nothing leads out.
+        seen.clear()
+        run_dir24 = os.path.join(repo_root, "artifacts", "run24")
+        os.makedirs(run_dir24)
+        r.run_id, r.run_dir = "run24", run_dir24
+        os.makedirs(os.path.join(contained_home, "cache"), exist_ok=True)   # a passthrough
+        os.environ["ASE_SELFTEST_OAUTH"] = "oauth-tok-containment-4a5b6c7d8e9f"
+
+        class _EnvCredContainedAdapter(_MaskingFakeAdapter):
+            credential_env_vars = ["ASE_SELFTEST_OAUTH"]
+            contained_home_subpaths: list = []      # mapped, empty surface — like claude
+
+        prior_adapter24 = r.adapter
+        r.adapter = _EnvCredContainedAdapter()
+        spec24 = EvalSpec(name="demo", prompt="hi",       # NO mcp_servers on purpose
+                          source_path=os.path.join(repo_root, "demo.yaml"),
+                          assertions=[{"type": "file_exists", "path": "run.py"}])
+        try:
+            cell24 = r._run_cell(ModelTarget(), spec24)
+        finally:
+            r.adapter = prior_adapter24
+            os.environ.pop("ASE_SELFTEST_OAUTH", None)
+            r._secrets = r._run_secrets = ()
+            _try(lambda: os.rmdir(os.path.join(contained_home, "cache")))
+        _check("mcp.credential_env_var_triggers_containment_without_mcp_servers",
+               cell24.passed and seen.get("escapes") == []
+               and "cache" not in (seen.get("home_entries") or []),
+               f"a credential env var makes the cell credential-bearing on its own, so its "
+               f"HOME is contained even with no `mcp_servers`: the real home's `cache` does "
+               f"not pass through and nothing leads out. Gating containment on the "
+               f"interpolated `${{VAR}}` alone left an ordinary token-set run on the symlink "
+               f"overlay, where the child wrote the token into the real home. "
+               f"passed={cell24.passed} escapes={seen.get('escapes')!r} "
+               f"entries={(seen.get('home_entries') or [])[:6]}", failures, verbose)
+
+        # P1: the same credential env var, under `isolated: false`, is REFUSED — that mode
+        # hands the agent the real home with no overlay at all, so a token in the child
+        # environment has nowhere safe to live. The refusal must name the env-var source, not
+        # talk about an `${VAR}` that isn't there.
+        seen.clear()
+        run_dir25 = os.path.join(repo_root, "artifacts", "run25")
+        os.makedirs(run_dir25)
+        r.run_id, r.run_dir = "run25", run_dir25
+        os.environ["ASE_SELFTEST_OAUTH"] = "oauth-tok-noniso-1a2b3c4d5e6f"
+
+        class _EnvCredAdapter(_MaskingFakeAdapter):
+            credential_env_vars = ["ASE_SELFTEST_OAUTH"]
+
+        prior_adapter25, prior_isolated25 = r.adapter, r.isolated
+        r.adapter = _EnvCredAdapter()
+        r.isolated = False
+        spec25 = EvalSpec(name="demo", prompt="hi",
+                          source_path=os.path.join(repo_root, "demo.yaml"),
+                          assertions=[{"type": "file_exists", "path": "run.py"}])
+        try:
+            cell25 = r._run_cell(ModelTarget(), spec25)
+        finally:
+            r.adapter, r.isolated = prior_adapter25, prior_isolated25
+            os.environ.pop("ASE_SELFTEST_OAUTH", None)
+            r._secrets = r._run_secrets = ()
+        err25 = cell25.run_result.error or ""
+        _check("mcp.credential_env_var_run_is_refused_under_isolated_false",
+               cell25.passed is False and seen.get("cwd") is None
+               and "passes a credential env var to the agent" in err25
+               and "no isolated HOME" in err25,
+               f"`isolated: false` gives the agent the real home with no overlay, so an env "
+               f"credential the harness forwarded has nowhere the run deletes or scrubs — "
+               f"refused before the agent starts, exactly as an interpolated `${{VAR}}` is. "
+               f"The message names the env-var source rather than an absent interpolation. "
+               f"ran={seen.get('cwd') is not None} passed={cell25.passed} "
+               f"err={err25[:120]!r}", failures, verbose)
 
         # A credential too short to redact is still a credential. This is the arm that would
         # have caught gating on `bool(secrets)` — the redaction set is empty here.
