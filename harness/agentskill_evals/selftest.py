@@ -1016,6 +1016,13 @@ def _check_workspace_relocation(failures, verbose):
                 f.write("tok sk-secret-abcdef\n")
         with open(os.path.join(cwd, "run.py"), "w") as f:
             f.write("print('hi')\n")
+        # A tool that dumps its environment lands an adapter's credential env var in the
+        # workspace, which is archived and scrubbed. Written ONLY when the arm set the var —
+        # every other cell leaves it unset, so this is a no-op for them.
+        _oauth = os.environ.get("ASE_SELFTEST_OAUTH")
+        if _oauth:
+            with open(os.path.join(cwd, "leaked-env.txt"), "w") as f:
+                f.write(f"CLAUDE_CODE_OAUTH_TOKEN={_oauth}\n")
         # A cwd is a place the agent can WRITE, so `..` is part of the attack surface, not
         # just `list_dir`'s. Written every time: the arms below assert where it landed.
         with open(os.path.join(cwd, "..", "above-cwd.txt"), "w") as f:
@@ -1747,6 +1754,109 @@ def _check_workspace_relocation(failures, verbose):
                f"contained HOME: the run loses the custom config, it does not gain a way "
                f"out. ran={seen.get('cwd') is not None} escapes={seen.get('escapes')!r} "
                f"iso_env={seen.get('iso_env')!r} err={err21[:90]!r}", failures, verbose)
+
+        # P1: an adapter-declared credential ENV VAR is redacted from artifacts even with no
+        # `mcp_servers` at all. claude's CLAUDE_CODE_OAUTH_TOKEN reaches the child through
+        # env()'s process-env passthrough, so a tool that echoes it lands it in the workspace
+        # — and the interpolation scrub set never sees it, so before the fix it archived
+        # verbatim. The value is seated in the redaction registry at the top of the cell body.
+        from .mcp import REDACTED
+        seen.clear()
+        run_dir22 = os.path.join(repo_root, "artifacts", "run22")
+        os.makedirs(run_dir22)
+        r.run_id, r.run_dir = "run22", run_dir22
+        oauth_val = "oauth-tok-9f8e7d6c5b4a3210deadbeef"   # long enough to be redactable
+        os.environ["ASE_SELFTEST_OAUTH"] = oauth_val
+
+        class _OAuthFakeAdapter(_FakeAdapter):
+            credential_env_vars = ["ASE_SELFTEST_OAUTH"]
+
+        prior_adapter22 = r.adapter
+        r.adapter = _OAuthFakeAdapter()
+        spec22 = EvalSpec(name="demo", prompt="hi",
+                          source_path=os.path.join(repo_root, "demo.yaml"),
+                          assertions=[{"type": "file_exists", "path": "run.py"}])
+        try:
+            cell22 = r._run_cell(ModelTarget(), spec22)
+        finally:
+            r.adapter = prior_adapter22
+            os.environ.pop("ASE_SELFTEST_OAUTH", None)
+            r._secrets = r._run_secrets = ()
+        leaked22 = _try(lambda: open(os.path.join(
+            cell22.artifacts_dir, "workspace", "leaked-env.txt")).read(), "")
+        _check("mcp.adapter_credential_env_var_is_redacted",
+               bool(leaked22) and oauth_val not in leaked22 and REDACTED in leaked22
+               and cell22.passed,
+               f"an adapter that declares a credential env var has its VALUE seated in the "
+               f"redaction set BEFORE the run — no `mcp_servers` here, so nothing else would "
+               f"register it — and a tool that echoes it into the workspace is scrubbed. The "
+               f"token reaches the child via env() but the `${{VAR}}` scrub set never sees it, "
+               f"so without this it archives verbatim. archived={leaked22[:70]!r}",
+               failures, verbose)
+
+        # P1: a contained HOME that COPIES adapter auth is credential-bearing from the copy,
+        # not from the later MCP-resolution upgrade. This crashes IN THAT WINDOW — an unset
+        # `${VAR}` makes `resolved_mcp_servers()` raise after the auth was copied but before
+        # the upgrade — and forces removal to fail, so the copied auth stays on disk. The
+        # warning must name the copied credential, not claim "no resolved credentials are in
+        # it" (the pre-fix `_TEMPDIR_TAIL` lie the reviewer reproduced).
+        seen.clear()
+        run_dir23 = os.path.join(repo_root, "artifacts", "run23")
+        os.makedirs(run_dir23)
+        r.run_id, r.run_dir = "run23", run_dir23
+        os.makedirs(os.path.join(contained_home, ".fakecli"), exist_ok=True)
+        with open(os.path.join(contained_home, ".fakecli", "real-auth.json"), "w") as f:
+            f.write('{"token": "contained-auth-secret"}')
+        os.environ.pop("ASE_UNSET_VAR_P1B", None)   # the interpolation must FAIL to resolve
+        spec23 = EvalSpec(
+            name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"),
+            mcp_servers=parse_mcp_servers(
+                {"echo": {"command": "/bin/echo", "env": {"TOKEN": "${ASE_UNSET_VAR_P1B}"}}},
+                where="selftest"))
+
+        class _AuthContainedAdapter(_MaskingFakeAdapter):
+            contained_home_subpaths = [".fakecli/real-auth.json"]
+
+        stuck23: list = []
+
+        def _no_home_removal23(p):
+            if "ase-home-" in p:
+                stuck23.append(p)
+                return False
+            return _orig_remove(p)
+
+        prior_adapter23 = r.adapter
+        r.adapter = _AuthContainedAdapter()
+        runner_mod._remove = _no_home_removal23
+        try:
+            cell23 = r._run_cell(ModelTarget(), spec23)
+        finally:
+            runner_mod._remove = _orig_remove
+            r.adapter = prior_adapter23
+            r._secrets = r._run_secrets = ()
+            home23 = stuck23[0] if stuck23 else ""
+            auth23 = os.path.join(home23, ".fakecli", "real-auth.json")
+            auth_on_disk23 = os.path.isfile(auth23)
+            auth_content23 = _try(lambda: open(auth23).read(), "") if home23 else ""
+            for p in stuck23:
+                if os.path.basename(p).startswith("ase-home-"):
+                    _try(lambda p=p: shutil.rmtree(p, ignore_errors=True))
+            _try(lambda: shutil.rmtree(os.path.join(contained_home, ".fakecli"),
+                                       ignore_errors=True))
+        say23 = (cell23.run_result.error or "") + " " + " ".join(
+            cell23.run_result.warnings or [])
+        _check("mcp.contained_home_that_copies_auth_is_credential_bearing_before_the_copy",
+               cell23.passed is False and auth_on_disk23
+               and "contained-auth-secret" in auth_content23
+               and "copied this adapter's long-lived auth/config" in say23
+               and "no resolved credentials are in it" not in say23,
+               f"the crash lands in the window between building the contained HOME (auth "
+               f"already copied in) and the MCP-resolution upgrade, and removal fails — so the "
+               f"adapter's long-lived auth is on disk. Registered credential-bearing from "
+               f"CREATION, it fails the cell and its sentence names the copied credential; the "
+               f"pre-fix non-fatal registration warned 'no resolved credentials are in it' "
+               f"over a real one. on_disk={auth_on_disk23} passed={cell23.passed} "
+               f"say={say23[:150]!r}", failures, verbose)
 
         # A credential too short to redact is still a credential. This is the arm that would
         # have caught gating on `bool(secrets)` — the redaction set is empty here.

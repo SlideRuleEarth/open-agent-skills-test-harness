@@ -143,6 +143,15 @@ class Adapter(ABC):
     # it. Verified for claude 2.1.113 on 2026-07-23: [] runs, because it authenticates from
     # CLAUDE_CODE_OAUTH_TOKEN in the environment rather than from anything under HOME.
     contained_home_subpaths: Optional[list[str]] = None
+    # Environment variable NAMES this adapter passes into the child CLI that carry a
+    # credential — e.g. claude's CLAUDE_CODE_OAUTH_TOKEN, which `env()` forwards through the
+    # process-env passthrough. The runner reads each name from its OWN environment at cell
+    # time and enters the VALUE into the redaction registry BEFORE the run and before any
+    # artifact is written, so a CLI or tool that echoes one (into stdout, a transcript, an
+    # error) gets it scrubbed like an interpolated `${VAR}`. Names, never values: the value
+    # is read from os.environ per cell and is never committed here. A name that is unset in
+    # the environment contributes nothing (there is no credential to redact).
+    credential_env_vars: list[str] = []
     # Whether two cells of this runner may execute CONCURRENTLY without sharing mutable
     # configuration. Default False, and every adapter here is currently False.
     #

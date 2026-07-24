@@ -324,27 +324,32 @@ MUTATIONS = [
      "        cleanup.acknowledge(pending)\n\n        cell = CellResult(",
      "relocate.cleanup_note_survives_the_crash_rewriting_result_json"),
     # The isolated HOME goes back to being a bare local, owned by nothing until the guard.
+    # Re-anchored after the P1b contained-HOME change split the creation registration across
+    # two lines and made its severity conditional (`materializes_auth`). These arms exercise
+    # the non-materialize path, where that condition is False and the behaviour is unchanged.
     ("M58-isolated-home-registered-late", RUNNER,
-     '            cleanup.own("the isolated HOME", iso_home, fatal=False)',
+     '            cleanup.own("the isolated HOME", iso_home, fatal=materializes_auth,\n'
+     "                        tail=_CONTAINED_TAIL if materializes_auth else None)",
      "            pass",
      "relocate.isolated_home_is_owned_from_the_moment_it_exists"),
     # A leaked temp directory reported as a leaked credential: fails the cell and says the
     # config-mask overlay held secrets, neither of which is true.
     ("M59-isolated-home-failure-is-fatal", RUNNER,
-     '            cleanup.own("the isolated HOME", iso_home, fatal=False)',
-     '            cleanup.own("the isolated HOME", iso_home)',
+     "            cleanup.own(\"the isolated HOME\", iso_home, fatal=materializes_auth,",
+     '            cleanup.own("the isolated HOME", iso_home, fatal=True,',
      "relocate.stubborn_isolated_home_warns_rather_than_failing_the_cell"),
     # --- round 9: contents are not fixed at creation; the last safe moment is the return --
     # The HOME keeps the severity the harness gave it when it built the masks, ignoring that
     # the child then had it as $HOME with write access.
     ("M60-writable-home-keeps-its-creation-severity", RUNNER,
-     '                cleanup.own("the isolated HOME", iso_home, tail=_EXPOSED_TAIL)',
-     "                pass",
+     '                    cleanup.own("the isolated HOME", iso_home,\n'
+     "                                tail=_CONTAINED_TAIL if materializes_auth else _EXPOSED_TAIL)",
+     "                    pass",
      "relocate.child_writable_home_is_credential_bearing_after_the_run"),
     # Escalated in severity but still claiming the directory holds nothing.
     ("M61-exposed-home-denies-its-contents", RUNNER,
-     '                cleanup.own("the isolated HOME", iso_home, tail=_EXPOSED_TAIL)',
-     '                cleanup.own("the isolated HOME", iso_home, tail=_TEMPDIR_TAIL)',
+     "                                tail=_CONTAINED_TAIL if materializes_auth else _EXPOSED_TAIL)",
+     "                                tail=_TEMPDIR_TAIL)",
      "relocate.child_writable_home_is_credential_bearing_after_the_run"),
     # Acknowledged once the artifact writes return — but the judge artifacts and
     # `progress.done` come after them, and a raise there rebuilds the result.
@@ -497,6 +502,21 @@ MUTATIONS = [
      '    if _remove(path):\n        return ""\n    return f"{label} could not be removed',
      '    if True:\n        return ""\n    return f"{label} could not be removed',
      "mcp.credential_scratch_dir_removal_is_verified_not_best_effort"),
+    # --- P1 credential-handling fixes -------------------------------------------------
+    # No adapter credential env var enters the redaction set, so an echoed
+    # CLAUDE_CODE_OAUTH_TOKEN archives verbatim — the interpolation scrub set never sees it.
+    ("M81-adapter-credential-env-var-not-redacted", RUNNER,
+     '            v for name in getattr(adapter, "credential_env_vars", None) or []',
+     "            v for name in []",
+     "mcp.adapter_credential_env_var_is_redacted"),
+    # The contained HOME that COPIED real auth is registered non-fatal at creation (the
+    # pre-fix behaviour), so a crash before the MCP-resolution upgrade leaves the copied auth
+    # on disk under a warning claiming no credentials are present.
+    ("M82-contained-home-with-copied-auth-registered-nonfatal", RUNNER,
+     '            cleanup.own("the isolated HOME", iso_home, fatal=materializes_auth,\n'
+     "                        tail=_CONTAINED_TAIL if materializes_auth else None)",
+     '            cleanup.own("the isolated HOME", iso_home, fatal=False)',
+     "mcp.contained_home_that_copies_auth_is_credential_bearing_before_the_copy"),
 ]
 
 

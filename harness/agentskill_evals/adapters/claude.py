@@ -225,6 +225,12 @@ class ClaudeAdapter(Adapter):
     # keychain itself — acquiring that capability silently is not something a test harness
     # should do, and the token never touches disk this way.
     contained_home_subpaths: list[str] = []
+    # The token that authenticates the contained (or any) HOME arrives here, and env() passes
+    # it to the child. Register it for redaction so a run that echoes it — claude logging its
+    # environment, a tool dumping env — cannot archive it verbatim. It is the credential the
+    # contained-HOME design deliberately introduced into the child environment; leaving it out
+    # of the scrub set would undo the containment the design bought.
+    credential_env_vars = ["CLAUDE_CODE_OAUTH_TOKEN"]
 
     supports_output_schema = True
     # `--effort <level>` (verified 2026-07-08: choices low|medium|high|xhigh|max — the
