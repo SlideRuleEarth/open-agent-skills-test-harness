@@ -1023,6 +1023,13 @@ def _check_workspace_relocation(failures, verbose):
         if _oauth:
             with open(os.path.join(cwd, "leaked-env.txt"), "w") as f:
                 f.write(f"CLAUDE_CODE_OAUTH_TOKEN={_oauth}\n")
+        # A token the child received via `spec.env` (env_overrides), not the ambient process.
+        # Written from the SAME merged env the child sees, so the arm can prove detection and
+        # redaction track the child's effective environment rather than os.environ.
+        _specenv = (env_overrides or {}).get("ASE_SPECENV_TOK")
+        if _specenv:
+            with open(os.path.join(cwd, "specenv-leak.txt"), "w") as f:
+                f.write(f"CLAUDE_CODE_OAUTH_TOKEN={_specenv}\n")
         # A cwd is a place the agent can WRITE, so `..` is part of the attack surface, not
         # just `list_dir`'s. Written every time: the arms below assert where it landed.
         with open(os.path.join(cwd, "..", "above-cwd.txt"), "w") as f:
@@ -1937,6 +1944,48 @@ def _check_workspace_relocation(failures, verbose):
                f"The message names the env-var source rather than an absent interpolation. "
                f"ran={seen.get('cwd') is not None} passed={cell25.passed} "
                f"err={err25[:120]!r}", failures, verbose)
+
+        # P1: detection reads the CHILD's effective environment (os.environ overlaid with
+        # `spec.env`), not os.environ alone. Here the token is supplied ONLY through
+        # `spec.env` and is absent from the ambient process, so sampling os.environ would
+        # leave the cell uncontained and unredacted while the child still received the token.
+        seen.clear()
+        run_dir26 = os.path.join(repo_root, "artifacts", "run26")
+        os.makedirs(run_dir26)
+        r.run_id, r.run_dir = "run26", run_dir26
+        os.makedirs(os.path.join(contained_home, "cache"), exist_ok=True)   # a passthrough
+        os.environ.pop("ASE_SPECENV_TOK", None)     # ambient MUST be unset — spec.env only
+        specenv_tok = "specenv-tok-9a8b7c6d5e4f3021"
+
+        class _SpecEnvCredAdapter(_MaskingFakeAdapter):
+            credential_env_vars = ["ASE_SPECENV_TOK"]
+            contained_home_subpaths: list = []       # mapped — contains rather than refuses
+
+        prior_adapter26 = r.adapter
+        r.adapter = _SpecEnvCredAdapter()
+        spec26 = EvalSpec(name="demo", prompt="hi",
+                          source_path=os.path.join(repo_root, "demo.yaml"),
+                          env={"ASE_SPECENV_TOK": specenv_tok},   # token via spec.env only
+                          assertions=[{"type": "file_exists", "path": "run.py"}])
+        try:
+            cell26 = r._run_cell(ModelTarget(), spec26)
+        finally:
+            r.adapter = prior_adapter26
+            r._secrets = r._run_secrets = ()
+            _try(lambda: os.rmdir(os.path.join(contained_home, "cache")))
+        leaked26 = _try(lambda: open(os.path.join(
+            cell26.artifacts_dir, "workspace", "specenv-leak.txt")).read(), "")
+        _check("mcp.credential_detection_reads_the_childs_effective_environment",
+               cell26.passed and seen.get("escapes") == []
+               and "cache" not in (seen.get("home_entries") or [])
+               and bool(leaked26) and specenv_tok not in leaked26 and REDACTED in leaked26,
+               f"a credential supplied through `spec.env` (ambient unset) still contains the "
+               f"HOME and is still redacted, because detection reads the merged env the child "
+               f"receives — os.environ overlaid with spec.env — not os.environ alone. "
+               f"Sampling the process env left this token undetected: uncontained HOME, and "
+               f"the raw override in stdout and the real home. passed={cell26.passed} "
+               f"escapes={seen.get('escapes')!r} archived={leaked26[:70]!r}",
+               failures, verbose)
 
         # A credential too short to redact is still a credential. This is the arm that would
         # have caught gating on `bool(secrets)` — the redaction set is empty here.

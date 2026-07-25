@@ -513,7 +513,7 @@ MUTATIONS = [
     # redaction set empties while `cred_env_present` (and thus containment) is untouched —
     # isolating the defect to the arm about redaction.
     ("M81-adapter-credential-env-var-not-redacted", RUNNER,
-     "\n        env_secrets = tuple(dict.fromkeys(os.environ[name] for name in cred_env_present))",
+     "\n        env_secrets = tuple(dict.fromkeys(child_env[name] for name in cred_env_present))",
      "\n        env_secrets = ()",
      "mcp.adapter_credential_env_var_is_redacted"),
     # The contained HOME that COPIED real auth is registered non-fatal at creation (the
@@ -538,6 +538,13 @@ MUTATIONS = [
      "\n            if has_credentials:",
      "\n            if interpolated:",
      "mcp.credential_env_var_run_is_refused_under_isolated_false"),
+    # Detection samples the process env, not the child's effective env, so a token supplied
+    # only through `spec.env` is invisible: no containment, no refusal, no redaction, while
+    # the child still receives it and can write it into the real home.
+    ("M85-credential-detection-ignores-spec-env", RUNNER,
+     "\n        child_env = {**os.environ, **(spec.env or {})}",
+     "\n        child_env = dict(os.environ)",
+     "mcp.credential_detection_reads_the_childs_effective_environment"),
 ]
 
 

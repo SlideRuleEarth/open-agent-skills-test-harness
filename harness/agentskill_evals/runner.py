@@ -406,9 +406,18 @@ class Runner:
         # even though the MCP block below reassigns `_secrets`: it UNIONS `env_secrets` back
         # in, so a non-MCP cell (which never reaches that block) is still covered. A name that
         # is unset contributes nothing — there is no credential to redact.
+        # The child's environment is os.environ OVERLAID with `spec.env` — exec.execute does
+        # `base = dict(os.environ); base.update(env_overrides)` with `env_overrides=spec.env`.
+        # So a scenario `env:` can SET a credential var the ambient process lacks or REPLACE
+        # its value, and detection + redaction must read from that same merged env: sampling
+        # `os.environ` alone leaves a spec.env-supplied token undetected (no containment or
+        # refusal) and redacts the ambient value when spec.env overrode it. adapter.env()
+        # layers on top but touches only HOME/XDG/config-home vars, never credential vars, so
+        # it cannot add or drop a name from this set.
+        child_env = {**os.environ, **(spec.env or {})}
         cred_env_present = [name for name in getattr(adapter, "credential_env_vars", None) or []
-                            if os.environ.get(name)]
-        env_secrets = tuple(dict.fromkeys(os.environ[name] for name in cred_env_present))
+                            if child_env.get(name)]
+        env_secrets = tuple(dict.fromkeys(child_env[name] for name in cred_env_present))
         self._secrets = env_secrets
         self._run_secrets = tuple(dict.fromkeys(self._run_secrets + env_secrets))
 
