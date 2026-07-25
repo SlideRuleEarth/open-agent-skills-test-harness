@@ -5449,6 +5449,15 @@ def _check_reasoning_effort(failures, verbose):
     # ...and scope the (unbounded) custom-agent walk to this fixture's own tree, so an
     # ambient agents dir in a shared ancestor can't fail these argv checks closed
     _defs_real_eff = _cop_scope_agent_scan([_cop_eff_priv])
+    # codex's build_argv (below) enumerates configured MCP servers so it can disable them by
+    # name, which shells out to the real `codex` CLI. This selftest runs with zero agent CLIs
+    # installed (see the module docstring), so on any machine — or CI runner — without codex
+    # that enumeration fails closed and CRASHES this section before it can check a single
+    # effort mapping. The codex argv section stubs the same enumerator for the same reason;
+    # reasoning-effort mapping is independent of the MCP disable set, so [] is a faithful stand-in.
+    from .adapters.codex import CodexAdapter
+    _eff_orig_enum = CodexAdapter._configured_mcp_server_names
+    CodexAdapter._configured_mcp_server_names = lambda self, cwd=None, env=None: []
 
     # --- per-adapter argv mapping ---
     try:
@@ -5499,6 +5508,7 @@ def _check_reasoning_effort(failures, verbose):
         _unpatch_module_attr(_cop_mod_eff, "_odr_registry_command", _odr_real_eff)
         _cop_restore_agent_scan(_defs_real_eff)
         shutil.rmtree(_cop_eff_priv, ignore_errors=True)
+        CodexAdapter._configured_mcp_server_names = _eff_orig_enum
 
     # --- spec load: normalization + typed validation ---
     s = _spec_from_raw({"prompt": "p", "reasoning_effort": " HIGH "}, "/x.yaml")
