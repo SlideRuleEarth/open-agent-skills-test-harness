@@ -1,0 +1,113 @@
+# CI for the eval harness.
+#
+# Two tiers, matching how the project already draws the line (harness/TODO_Contained_HOME.md
+# §4, "Verification protocol"):
+#
+#   checks    — fast, on every push/PR: the parser selftest is THE gate (it needs no agent
+#               CLIs, no API keys, no network beyond the dep install), plus byte-compile and a
+#               whitespace/conflict-marker sweep of the diff.
+#   mutation  — slow (runs the full selftest once per mutation, ~80+ times), so NOT on every
+#               push. Runs nightly, on manual dispatch, and on a PR labelled `mutation-suite`.
+#               This is the structural answer to "someone has to remember to run mutate_mcp.py":
+#               an arm that nothing can break is decorative, and this reruns the proof.
+#
+# pyflakes is deliberately NOT a gate: §4 documents four pre-existing, intentional unused-import
+# lines, so a pyflakes failure here would be noise, not signal.
+#
+# Runs on macOS, not Linux. This harness targets macOS (the contained-HOME design turns on the
+# macOS login keychain), the selftest is verified on darwin, and some of its filesystem arms use
+# darwin semantics — xattrs on symlinks, hardlinked symlinks — that Linux does not share. The
+# first Linux run proved it by failing a symlink-scrub arm that passes on macOS. Running where
+# the suite is verified is the honest choice; macOS runners are free on this public repo.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 7 * * *" # nightly ~07:00 UTC — exercises the mutation suite off the critical path
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Collapse superseded runs on the same ref (a force-push or rapid PR pushes), but never let a
+  # push cancel a scheduled/manual run — those key on the unique run id instead of the ref.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'schedule' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: selftest + static checks (py${{ matrix.python-version }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Bracket the supported range: the floor from pyproject (requires-python >= 3.10) and a
+        # current release. A version-specific break shows up as one red cell, not a silent pass.
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the whitespace check can diff against the PR base commit.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: dev install (creates harness/.venv, editable + [schema] extra)
+        run: make -C harness dev
+
+      - name: parser selftest (the gate)
+        # Editable install, so the package imports regardless of cwd; run from the repo root.
+        run: harness/.venv/bin/python -m agentskill_evals selftest
+
+      - name: byte-compile the package
+        run: harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
+
+      - name: whitespace / conflict-marker check
+        # On a PR, sweep the whole PR range against its base; on a push, the pushed commit.
+        # `git diff --check` flags trailing whitespace, mangled indentation, and stray
+        # `<<<<<<<` conflict markers.
+        run: |
+          base='${{ github.event.pull_request.base.sha }}'
+          if [ -n "$base" ]; then
+            git diff --check "$base" '${{ github.sha }}'
+          else
+            git diff --check HEAD~1 HEAD || true
+          fi
+
+  mutation:
+    name: mutation suite (mutate_mcp)
+    runs-on: macos-latest
+    # Off the per-push critical path: nightly, on demand, or opt-in per PR via a label.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'mutation-suite'))
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: dev install (mutate_mcp copies harness/.venv into each work tree)
+        run: make -C harness dev
+
+      - name: run the mutation suite
+        # -u so the progress lines stream into the log instead of buffering until exit.
+        # Exit 0 only when every mutation is caught BY ITS NAMED ARM (see the script header).
+        run: python3 -u harness/tools/mutate_mcp.py | tee mutate.out
+
+      - name: upload mutation output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-output
+          path: mutate.out
