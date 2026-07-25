@@ -50,12 +50,36 @@ The overlay is built from cheap symlinks — only the small *declared* skills ar
 35 MB codex log dir costs nothing, and an agent writing inside a declared skill mutates the copy,
 never its source. ``shutil.rmtree`` removes the overlay by unlinking the symlinks (and deleting
 the copies) — it never recurses into the real HOME.
+
+**Contained mode (``contained_subpaths``):**
+
+The overlay above is a mask on what the model can READ. It was never a boundary on what the
+model can WRITE: those wholesale pass-through symlinks mean ``$HOME/.cache/x`` *is*
+``~/.cache/x``, so a run that has been handed a credential can write it into the real home,
+outside every directory the runner deletes (see ``home_write_escapes`` and the runner's
+``_refuse_uncontained_home``). Credential-bearing runs are refused for exactly that reason.
+
+Passing ``contained_subpaths`` builds the same tree with the wholesale symlink pass switched
+OFF: nothing exists in the home unless it was asked for, and everything that does exist is a
+real directory or a real file. The adapter names the HOME-relative paths its CLI genuinely
+needs, and those are **copied by content** — never linked, because this project's own escape
+rule is "any symlink resolving outside the overlay", so a contained home can contain no
+outward symlink at all, auth included. The two pass-through sites inside the masked dirs
+(vendor skills, and plugin packages) copy for the same reason.
+
+The result satisfies ``home_write_escapes() == []`` structurally, which is what lifts the
+refusal — the refusal is not special-cased, it simply stops finding anything. The failure
+mode is a CLI erroring because it needed something undeclared: that fails closed, which is
+the right direction, but it means the declared surface is empirical per adapter. For claude
+the answer turned out to be *nothing*: it authenticates from ``CLAUDE_CODE_OAUTH_TOKEN`` in
+the environment, so an empty home runs (verified live, 2.1.113, 2026-07-23).
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import stat
 import tempfile
 from typing import Any, Iterable, Mapping, Optional
 
@@ -64,6 +88,10 @@ from typing import Any, Iterable, Mapping, Optional
 # (one level deeper — see module docstring).
 _SKILLS_LEAF = object()
 _PLUGINS_LEAF = object()
+# Leaf for a *contained-mode copy*: the real HOME's object at this path, reproduced by
+# CONTENT inside the overlay (see module docstring). Distinct from `_FileMaskLeaf`, which
+# writes harness-supplied content and never reads the real file except through a callable.
+_COPY_LEAF = object()
 
 
 class _FileMaskLeaf:
@@ -119,6 +147,7 @@ def build_isolated_home(
     repo_root: Optional[str] = None,
     config_file_masks: Optional[Mapping[str, Optional[str]]] = None,
     plugin_config_masks: Optional[Mapping[str, str]] = None,
+    contained_subpaths: Optional[Iterable[str]] = None,
 ) -> str:
     """Build a symlink overlay of ``real_home`` at ``dest_home`` with masked skills dirs.
 
@@ -147,6 +176,16 @@ def build_isolated_home(
       plugin_config_masks: file names materialized (with the given content) inside every
         plugin of every ``plugin_registry_subpaths`` dir, e.g. ``{"mcp_config.json": "{}"}``
         — per-plugin MCP configs are a server-discovery channel of their own.
+      contained_subpaths: switches on **contained mode** (see module docstring). ``None``
+        keeps the wholesale symlink pass — the historical overlay, which cannot host a
+        credential-bearing run. A sequence (**including an empty one**) turns the pass off
+        and materializes only what is named: these HOME-relative paths are copied by
+        content, and the masked dirs' own pass-throughs copy too, so the home ends up with
+        no symlink resolving outside it. Empty is a real answer, not a no-op — it says the
+        CLI needs nothing from the real home. Same path rules as ``config_file_masks``
+        (relative, ``..``-free; ValueError otherwise), and additionally ValueError if one
+        collides with a skills dir, plugin registry or config mask — copying the real file
+        over a mask would undo the masking while still looking contained.
 
     Raises OSError if a symlink can't be created (e.g. Windows without privilege); the caller
     should fall back to a non-isolated run.
@@ -164,9 +203,17 @@ def build_isolated_home(
     for sub, content in (config_file_masks or {}).items():
         _validate_mask_subpath(sub)
         _insert_leaf(tree, [sub], _FileMaskLeaf(content))
+    # `is not None`, not truthiness: an empty sequence means "this CLI needs nothing from the
+    # real home", which is the strongest containment there is and must not read as "no
+    # containment asked for". claude is exactly that case.
+    contained = contained_subpaths is not None
+    for sub in (contained_subpaths or ()):
+        _validate_mask_subpath(sub)
+        _insert_copy_leaf(tree, sub)
 
-    os.makedirs(dest_home, exist_ok=True)
-    _overlay(real_home, dest_home, tree, repo_skills, declared, repo_root, plugin_masks)
+    os.makedirs(dest_home, mode=0o700 if contained else 0o777, exist_ok=True)
+    _overlay(real_home, dest_home, tree, repo_skills, declared, repo_root, plugin_masks,
+             contained)
     return dest_home
 
 
@@ -249,13 +296,49 @@ def _insert_leaf(tree: dict, subpaths: Iterable[str], leaf: object) -> None:
         node[parts[-1]] = leaf
 
 
+def _insert_copy_leaf(tree: dict, sub: str) -> None:
+    """Mark ``sub`` as a contained-mode copy, refusing to displace any other leaf.
+
+    ``_insert_leaf`` is last-write-wins, which is silently wrong for this leaf. A contained
+    subpath naming the same path as a *config mask* would replace the neutral ``{}`` with a
+    faithful copy of the user's REAL config — turning containment into a hermeticity
+    regression, and one that looks like it worked, because the copy is correct and the run
+    is contained. It is only the wrong CONTENT. Naming a skills dir or a plugin registry
+    likewise drops the masking those leaves exist to perform.
+
+    All three are adapter-contract errors rather than situations to resolve by declaration
+    order, so they fail the build. Called after the mask/skills/registry leaves are already
+    in the tree, which is what makes the collision visible here at all.
+    """
+    parts = [p for p in str(sub).replace("\\", "/").split("/") if p and p != "."]
+    node = tree
+    for i, part in enumerate(parts[:-1]):
+        nxt = node.setdefault(part, {})
+        if not isinstance(nxt, dict):
+            raise ValueError(
+                f"contained subpath {sub!r} descends through "
+                f"{'/'.join(parts[:i + 1])!r}, which is already masked — the mask would be "
+                f"replaced by a copy of the real file")
+        node = nxt
+    if parts[-1] in node:
+        raise ValueError(
+            f"contained subpath {sub!r} collides with a skills dir, plugin registry or "
+            f"config mask already declared at that path — declare one or the other, not "
+            f"both; copying the real file there would undo the masking")
+    node[parts[-1]] = _COPY_LEAF
+
+
 def _overlay(real_dir: str, dst_dir: str, tree: dict,
              repo_skills: set, declared: list, repo_root: Optional[str],
-             plugin_masks: Optional[dict] = None) -> None:
-    os.makedirs(dst_dir, exist_ok=True)
+             plugin_masks: Optional[dict] = None, contained: bool = False) -> None:
+    os.makedirs(dst_dir, mode=0o700 if contained else 0o777, exist_ok=True)
     special = set(tree)
     # 1) wholesale-symlink every real entry that isn't a special (skills/ancestor) path.
-    if os.path.isdir(real_dir):
+    #    Contained mode skips this pass entirely: it is the sole source of the outward
+    #    symlinks that make a home uncontainable, so nothing exists unless step 2 asks for
+    #    it. Guarded here rather than by handing this function an empty real_dir, because
+    #    step 2 still reads the real dir — masked skills dirs pass vendor skills through.
+    if os.path.isdir(real_dir) and not contained:
         for name in os.listdir(real_dir):
             if name in special:
                 continue
@@ -265,15 +348,18 @@ def _overlay(real_dir: str, dst_dir: str, tree: dict,
         real_child = os.path.join(real_dir, name)
         dst_child = os.path.join(dst_dir, name)
         if node is _SKILLS_LEAF:
-            _build_skills_dir(real_child, dst_child, repo_skills, declared, repo_root)
+            _build_skills_dir(real_child, dst_child, repo_skills, declared, repo_root,
+                              contained)
         elif node is _PLUGINS_LEAF:
             _mask_plugin_registry_dir(real_child, dst_child, repo_skills, repo_root,
-                                      plugin_masks)
+                                      plugin_masks, contained)
+        elif node is _COPY_LEAF:
+            _materialize(real_child, dst_child)
         elif isinstance(node, _FileMaskLeaf):
             _write_mask_file(dst_child, node.content, real_child)
         else:
             _overlay(real_child, dst_child, node, repo_skills, declared, repo_root,
-                     plugin_masks)
+                     plugin_masks, contained)
 
 
 def resolve_visible_skills(
@@ -341,10 +427,18 @@ def resolve_visible_skills(
 
 
 def _build_skills_dir(real_skills: str, dst_skills: str,
-                      repo_skills: set, declared: list, repo_root: Optional[str]) -> None:
+                      repo_skills: set, declared: list, repo_root: Optional[str],
+                      contained: bool = False) -> None:
     """Rebuild one skills dir: vendor/other entries passed through, repo skills dropped
-    (by name, or by symlink target for stale installs), declared skills added."""
-    os.makedirs(dst_skills, exist_ok=True)
+    (by name, or by symlink target for stale installs), declared skills added.
+
+    Under ``contained`` the vendor pass-through is a COPY rather than a symlink. This site is
+    easy to miss when reading contained mode as "skip the wholesale pass in ``_overlay``":
+    the skills dir is rebuilt entry by entry, so it mints its own outward symlinks — one per
+    vendor skill — and a home with those in it is exactly as uncontainable as one built the
+    old way. Vendor skills are small and read-only in practice, so copying them is cheap.
+    """
+    os.makedirs(dst_skills, mode=0o700 if contained else 0o777, exist_ok=True)
     placed: set = set()
     if os.path.isdir(real_skills):
         for name in os.listdir(real_skills):
@@ -352,7 +446,11 @@ def _build_skills_dir(real_skills: str, dst_skills: str,
                 continue  # drop this repo's skills; declared ones are re-added below
             if _is_stale_repo_link(os.path.join(real_skills, name), repo_root):
                 continue  # stale install of a renamed/removed repo skill
-            os.symlink(os.path.join(real_skills, name), os.path.join(dst_skills, name))
+            src, dst = os.path.join(real_skills, name), os.path.join(dst_skills, name)
+            if contained:
+                _materialize(src, dst)
+            else:
+                os.symlink(src, dst)
             placed.add(name)
     for src in declared:
         name = os.path.basename(os.path.normpath(src))
@@ -380,40 +478,110 @@ def _write_mask_file(path: str, content, real_path: Optional[str] = None) -> Non
         f.write(content)
 
 
+def _materialize(real: str, dst: str, _seen: Optional[frozenset] = None) -> None:
+    """Reproduce ``real`` at ``dst`` by CONTENT, creating no symlinks (contained mode).
+
+    ``shutil.copytree(symlinks=False)`` is nearly this, but it raises on a dangling link and
+    happily blocks on a FIFO; a HOME is a user's real directory and contains whatever it
+    contains. So the object kind is decided from a *followed* ``os.stat`` and only two kinds
+    are reproduced:
+
+      * directory → a real 0700 directory, recursed into;
+      * regular file → its bytes, at the owner bits it already had.
+
+    Everything else — FIFOs, sockets, devices, dangling links, links whose target is
+    unreadable — is SKIPPED on the stat, before any open. This explicit guard is
+    belt-and-suspenders for the two kinds that would otherwise be dangerous: a device node,
+    which `shutil.copyfile` would happily `read()` (and `/dev/zero` would copy forever), is
+    stopped only here. The FIFO and socket cases are ALSO covered downstream —
+    `shutil.copyfile` raises `SpecialFileError` on a FIFO before opening it, and a socket
+    open fails ENXIO — both landing in the `except OSError` below. That downstream coverage
+    is why the mutation suite has no arm for this line: removing it changes nothing a
+    userspace test can observe (a device node needs root to create). None of these kinds
+    carry configuration a CLI reads, so skipping them fails closed — the CLI errors on
+    something absent rather than the harness copying something exotic.
+
+    ``_seen`` carries the (dev, inode) of every directory on the path from the root, so a
+    symlink pointing back at an ancestor terminates instead of recursing until the name is
+    too long. Following links is the whole point — the content has to come from somewhere —
+    but it means the walk is over the *real* filesystem's graph, which can have cycles.
+    """
+    try:
+        st = os.stat(real)          # follows links; dangling, looping and unreadable raise
+    except OSError:
+        return
+    if stat.S_ISDIR(st.st_mode):
+        key = (st.st_dev, st.st_ino)
+        seen = _seen or frozenset()
+        if key in seen:
+            return                  # a link back onto an ancestor of this walk
+        os.makedirs(dst, mode=0o700, exist_ok=True)
+        try:
+            names = os.listdir(real)
+        except OSError:
+            return                  # unreadable dir: contained as an empty one
+        for name in names:
+            _materialize(os.path.join(real, name), os.path.join(dst, name), seen | {key})
+        return
+    if not stat.S_ISREG(st.st_mode):
+        return                      # FIFO/socket/device: skipped WITHOUT being opened
+    try:
+        shutil.copyfile(real, dst, follow_symlinks=True)
+    except OSError:
+        return
+    # Owner bits only. A contained home holds whatever auth the adapter declared, and it
+    # lives in a world-traversable temp root; group/other are dropped rather than carried
+    # over from a real file that may well be 0644.
+    os.chmod(dst, stat.S_IMODE(st.st_mode) & 0o700)
+
+
 def _mask_plugin_registry_dir(real_dir: str, dst_dir: str, repo_skills: set,
                               repo_root: Optional[str],
-                              plugin_masks: Optional[dict] = None) -> None:
+                              plugin_masks: Optional[dict] = None,
+                              contained: bool = False) -> None:
     """Rebuild one plugin-registry dir: each child is a whole plugin package, passed through
     untouched (plugin.json, metadata, …) except its nested ``skills/``, where this repo's own
     skills are dropped, and any ``plugin_masks`` names (e.g. the plugin's own
     ``mcp_config.json``), materialized with the mask content instead of symlinked. Skills
     handling is mask-only — declared skills aren't re-added here; they're already injected
     once via the primary skills dir, so duplicating them into every unrelated vendor
-    plugin's skills/ would just be clutter."""
+    plugin's skills/ would just be clutter.
+
+    Under ``contained`` every pass-through here is a copy instead of a symlink, for the same
+    reason as ``_build_skills_dir``: this function mints outward symlinks of its own, two per
+    plugin package, and they escape a contained home just as thoroughly as the wholesale
+    pass would have."""
     plugin_masks = plugin_masks or {}
-    os.makedirs(dst_dir, exist_ok=True)
+    os.makedirs(dst_dir, mode=0o700 if contained else 0o777, exist_ok=True)
     if not os.path.isdir(real_dir):
         return
     for plugin_name in os.listdir(real_dir):
         real_plugin = os.path.join(real_dir, plugin_name)
         dst_plugin = os.path.join(dst_dir, plugin_name)
         if not os.path.isdir(real_plugin):
-            os.symlink(real_plugin, dst_plugin)
+            if contained:
+                _materialize(real_plugin, dst_plugin)
+            else:
+                os.symlink(real_plugin, dst_plugin)
             continue
-        os.makedirs(dst_plugin, exist_ok=True)
+        os.makedirs(dst_plugin, mode=0o700 if contained else 0o777, exist_ok=True)
         for name in os.listdir(real_plugin):
             if name == "skills":
                 continue
             if name in plugin_masks:
                 _write_mask_file(os.path.join(dst_plugin, name), plugin_masks[name])
                 continue
-            os.symlink(os.path.join(real_plugin, name), os.path.join(dst_plugin, name))
+            src, dst = os.path.join(real_plugin, name), os.path.join(dst_plugin, name)
+            if contained:
+                _materialize(src, dst)
+            else:
+                os.symlink(src, dst)
         real_skills = os.path.join(real_plugin, "skills")
         if os.path.isdir(real_skills):
             # mask-only: an empty `declared` makes _build_skills_dir's re-add step a no-op,
             # leaving just its drop-repo-skills/symlink-the-rest behavior.
             _build_skills_dir(real_skills, os.path.join(dst_plugin, "skills"), repo_skills,
-                              [], repo_root)
+                              [], repo_root, contained)
 
 
 def reroot_config_masks(masks: Mapping[str, Optional[str]], replaces: Optional[str]) -> dict:

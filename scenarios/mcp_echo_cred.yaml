@@ -1,0 +1,54 @@
+# mcp_echo_cred.yaml — the CREDENTIAL half of the MCP story: a declared server whose config
+# interpolates a `${VAR}`, so the cell requires a CONTAINED HOME (isolation.py contained mode)
+# rather than the symlink overlay, and — before #81 — was refused outright.
+#
+# Run (BOTH vars exported):
+#   ASE_ECHO_TOKEN=sk-<anything-distinctive> \
+#   CLAUDE_CODE_OAUTH_TOKEN=$(security find-generic-password -s 'Claude Code-credentials' -w \
+#       | python3 -c 'import json,sys;print(json.load(sys.stdin)["claudeAiOauth"]["accessToken"])') \
+#   agentskill-evals run --config scenarios/mcp_echo_cred.yaml
+#
+# NOT a CI scenario: it needs a real credential in the environment, which CI does not have,
+# and claude's contained HOME needs CLAUDE_CODE_OAUTH_TOKEN because claude authenticates from
+# the macOS login keychain, not from HOME (see TODO_Contained_HOME.md §0). The CI-safe
+# positive test is mcp_echo_smoke.yaml, which interpolates nothing and takes the plain overlay.
+#
+# HOW THIS DIFFERS FROM mcp_echo_smoke.yaml
+# Identical server, prompt, and assertions — the ONLY change is `env: {ECHO_TOKEN: ${VAR}}`.
+# That single interpolated field is what `interpolated_refs()` detects, which is what forces
+# the contained-HOME path. The echo server ignores the env var; its presence in the
+# DECLARATION is the whole point. A PASS here means: the run was NOT refused (containment
+# engaged, so `home_write_escapes()` returned []), and the resolved token reached no artifact
+# (verify with `grep -rF "$ASE_ECHO_TOKEN" artifacts/<run>` → nothing).
+
+name: mcp_echo_cred
+description: >
+  Credential-bearing declared-MCP run for the claude runner: the server env interpolates a
+  ${VAR}, so the cell needs a contained HOME. Proves the refusal lifts and the resolved token
+  reaches no artifact and no real-home file.
+
+target:
+  runner: claude
+  model:
+    - claude-haiku-4-5
+
+skills:
+
+mcp_servers:
+  echo:
+    command: python3
+    # Resolved against this file's directory and absolutized (see spec.resolved_files), same
+    # as mcp_echo_smoke.yaml — the agent runs in a tempdir workspace with no path relationship
+    # to this repo.
+    args: [../harness/fixtures/echo_mcp_server.py]
+    env:
+      ECHO_TOKEN: "${ASE_ECHO_TOKEN}"
+
+assertions:
+  - { type: no_error }
+  - { type: used_tool, name: mcp__echo__echo }
+  - { type: final_contains, contains: "porcupine" }
+
+prompt: |
+  Use the `echo` MCP tool to echo the exact text `porcupine-42` and then tell me
+  precisely what the tool returned.

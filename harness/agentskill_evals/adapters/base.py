@@ -127,6 +127,31 @@ class Adapter(ABC):
     # (isolation.build_mcp_masked_home). Adapters with a working flag-level kill-switch
     # (claude --strict-mcp-config, codex per-server disables) don't need one.
     isolation_config_masks: dict[str, Optional[str]] = {}
+    # HOME-relative paths this CLI genuinely needs from the real home, for a CONTAINED home
+    # (isolation.py's contained mode) — the home a credential-bearing run requires. They are
+    # COPIED, never symlinked: the escape rule this harness enforces is "any symlink
+    # resolving outside the overlay", so a contained home can hold no outward symlink at
+    # all, auth included.
+    #
+    # None is not "nothing needed" — it is "this adapter has not been mapped", and it fails
+    # closed: containment is unavailable, so runner._refuse_uncontained_home keeps refusing
+    # this adapter's credential-bearing cells. An empty list is the positive claim that the
+    # CLI needs nothing, which is a real and verifiable answer.
+    #
+    # Determining it is empirical per adapter and needs live runs — the failure mode is the
+    # CLI erroring on something undeclared, which fails closed but only shows up by running
+    # it. Verified for claude 2.1.113 on 2026-07-23: [] runs, because it authenticates from
+    # CLAUDE_CODE_OAUTH_TOKEN in the environment rather than from anything under HOME.
+    contained_home_subpaths: Optional[list[str]] = None
+    # Environment variable NAMES this adapter passes into the child CLI that carry a
+    # credential — e.g. claude's CLAUDE_CODE_OAUTH_TOKEN, which `env()` forwards through the
+    # process-env passthrough. The runner reads each name from its OWN environment at cell
+    # time and enters the VALUE into the redaction registry BEFORE the run and before any
+    # artifact is written, so a CLI or tool that echoes one (into stdout, a transcript, an
+    # error) gets it scrubbed like an interpolated `${VAR}`. Names, never values: the value
+    # is read from os.environ per cell and is never committed here. A name that is unset in
+    # the environment contributes nothing (there is no credential to redact).
+    credential_env_vars: list[str] = []
     # Whether two cells of this runner may execute CONCURRENTLY without sharing mutable
     # configuration. Default False, and every adapter here is currently False.
     #
