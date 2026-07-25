@@ -123,6 +123,47 @@ These are settled. They cost ten review rounds; do not relitigate them in code.
 7. **A finding is forgotten only once it is on disk**, and acknowledged at the return, because
    `_failed_cell` *rewrites* `result.json` from a rebuilt result.
 
+### 3a. The credential-handling invariant (cost four review rounds; do not rediscover)
+
+**Credential presence, redaction values, containment, refusal, and cleanup severity must all
+derive from the same effective environment supplied to the child, after scenario overrides.**
+
+That environment is one expression: `child_env = {**os.environ, **(spec.env or {})}` — the merge
+`exec.execute` itself builds (`base = dict(os.environ); base.update(spec.env)`). Every credential
+decision in `_run_cell_body` reads from it. The four P1 findings this branch closed were each a
+different decision reading from a *narrower* source:
+
+- **Presence** (`has_credentials`) scans the adapter's `credential_env_vars` against `child_env`.
+  Sampling `os.environ` missed a token supplied only via `spec.env` (P1d): the child got it, the
+  harness didn't — so no containment, no refusal, no redaction, yet the token was delivered.
+- **Redaction values** are read `child_env[name]`, not `os.environ[name]`. A `spec.env` override
+  reaches the child, so redacting the ambient value scrubs the wrong string and leaks the real
+  one (P1a registered the env token at all; P1d fixed which value gets registered).
+- **Containment** (materialize a contained HOME) and **refusal** (`_refuse_uncontained_home`,
+  including under `isolated: false`) key off that same presence signal — an env credential
+  triggers them exactly as an interpolated `${VAR}` does, not only when `mcp_servers:`
+  interpolates (P1c).
+- **Cleanup severity** (`_CONTAINED_TAIL` + `fatal=` on the HOME registration, vs `_EXPOSED_TAIL`)
+  treats a HOME that *copies* long-lived auth as credential-bearing from the moment it is
+  registered, before the copy lands (P1b).
+
+Every hole had the same shape: a credential decision reading something narrower than the child's
+effective env (the process env alone, or an interpolated field alone). Don't reintroduce one.
+
+**`credential_env_vars` is a survival assertion.** Naming a variable there asserts that the
+adapter's `env()` forwards it into the child *unchanged* — it survives the transformation. The
+runner samples `child_env` **before** `adapter.env()` runs and trusts the value arrives, which
+holds only because `base.env()` mutates HOME/USERPROFILE/XDG/config-home vars and copies
+everything else through verbatim: it can neither add nor drop a credential name. A future adapter
+whose `env()` rewrote or stripped a declared credential var would break this — the harness would
+redact and contain on a value the child never received — so do not declare a variable the adapter
+transforms without also teaching detection about the transform.
+
+Locked by arms `credential_detection_reads_the_childs_effective_environment`,
+`credential_env_var_triggers_containment_without_mcp_servers`,
+`credential_env_var_run_is_refused_under_isolated_false`, `adapter_credential_env_var_is_redacted`,
+and `contained_home_that_copies_auth_is_credential_bearing_before_the_copy` (mutations M81–M85).
+
 ---
 
 ## 4. Verification protocol
