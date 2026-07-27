@@ -1045,14 +1045,37 @@ def _check_workspace_relocation(failures, verbose):
             # scrub treat every non-directory as a readable regular file wedged the whole
             # suite here. The one arm that must use a FIFO joins a 20s thread for this
             # reason; every other arm should simply not arm the trap.
+            # Bound RELATIVE, from inside the workspace. An AF_UNIX address is capped by
+            # sun_path — 104 bytes on darwin, 108 on Linux — and the workspace lives under
+            # TMPDIR, so the absolute form spent the budget on a path the test does not
+            # control: `<TMPDIR>/ase-ws-XXXXXXXX/workspace/sock` fits on a host whose TMPDIR
+            # is short and does not on one whose TMPDIR is deep (a container, a CI runner,
+            # anyone who exports their own). `bind("sock")` after chdir costs 4 bytes
+            # whatever TMPDIR is. Reproduced before the fix by padding TMPDIR: the bind
+            # failed, the fixture was silently absent, and
+            # relocate.scrub_verdict_survives_a_raise_that_rebuilds_the_result went red.
+            #
+            # And the failure is recorded rather than swallowed. `_try` turned an
+            # un-creatable fixture into an arm that fails on its assertion, which reads as
+            # "the scrub stopped reporting quarantines" — a defect in the code under test —
+            # when the truth is that the test never built the thing it was asserting about.
+            # A fixture that cannot be created has to say so in its own words.
             def _sock():
                 import socket as _socket
-                s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                prev = os.getcwd()
+                os.chdir(cwd)
                 try:
-                    s.bind(os.path.join(cwd, "sock"))
+                    s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                    try:
+                        s.bind("sock")
+                    finally:
+                        s.close()
                 finally:
-                    s.close()
-            _try(_sock)
+                    os.chdir(prev)
+            try:
+                _sock()
+            except OSError as exc:
+                seen["special_error"] = f"{type(exc).__name__}: {exc}"
         if seen.get("lock_exec_root") and os.path.basename(cwd) == "workspace":
             # The agent locks the directory it was handed. `rmtree(ignore_errors=True)` then
             # answers "did this raise" rather than "is it gone", and both secret-bearing
@@ -1611,11 +1634,15 @@ def _check_workspace_relocation(failures, verbose):
         _check("relocate.scrub_verdict_survives_a_raise_that_rebuilds_the_result",
                "progress.done exploded" in res15 and "could not certify" in res15
                and "sock" in res15 and not os.path.lexists(os.path.join(ws15, "sock")),
-               f"the scrub removed an artifact it could not certify and then a later raise "
-               f"rebuilt the result: rescanning finds the tree clean, so the deletion goes "
-               f"unreported unless the original verdict rode the same protocol as the purge "
-               f"failures. An evidence deletion that nothing records is worse than either "
-               f"outcome it chose between. res={res15[:150]!r}", failures, verbose)
+               "the scrub removed an artifact it could not certify and then a later raise "
+               "rebuilt the result: rescanning finds the tree clean, so the deletion goes "
+               "unreported unless the original verdict rode the same protocol as the purge "
+               "failures. An evidence deletion that nothing records is worse than either "
+               "outcome it chose between."
+               + (f" FIXTURE NOT CREATED ({seen['special_error']}) — this arm proves nothing "
+                  f"about the scrub; the socket it asserts on was never bound."
+                  if seen.get("special_error") else "")
+               + f" res={res15[:150]!r}", failures, verbose)
 
         # The overlay masks READS. Its unmasked entries are symlinks into the real home, so
         # a token written through one lands where nothing this run deletes or scrubs can
