@@ -67,17 +67,23 @@ does that in ~7 runs and lands on `~/Library`, then `~/Library/Keychains` confir
 tool drives the harness's own launch path (`build_isolated_home` → `adapter.env` →
 `adapter.build_argv` → `exec.run_captured`), so what it measures is what a cell would get.
 
-**All of this is macOS, and `contained_home_subpaths` is not platform-conditional.** The
-harness itself runs on macOS *and* Linux — only Windows is refused, and deliberately
-(`exec._unsupported_platform`: a Job Object cannot be assigned until `CreateProcess` returns,
-so a grandchild started in that window — an MCP server most of all — escapes it permanently).
-But the keychain is the whole reason three of these four surfaces are `[]`, and it has no
-Linux analogue: there the same CLIs must keep their credential somewhere else, plausibly a
-file under HOME or a Secret Service keyring, which is exactly the shape that makes a surface
-non-empty and brings the duplication cost back. So on Linux these declarations are unverified
-claims. The failure direction is safe — an under-declared surface means the CLI finds no
-credential and errors, failing the cell rather than leaking — but "safe" is not "true", and
-the fix is to re-run the probe per adapter there rather than to reason about it. Tracked in §6.
+**All of this was measured on macOS, and `contained_home_subpaths` is not platform-conditional
+— but the gap that leaves is narrower than it first looks.** The harness runs on macOS *and*
+Linux; only Windows is refused, and deliberately (`exec._unsupported_platform`: a Job Object
+cannot be assigned until `CreateProcess` returns, so a grandchild started in that window — an
+MCP server most of all — escapes it permanently).
+
+The machinery is portable: `isolation.py`'s containment path contains no platform branch at
+all. So is the recommended route — `[]` plus an environment token works anywhere, because the
+token comes from the environment rather than from HOME, and the keychain never enters into it.
+What does not port is the *negative* half of the finding: "the keychain is unreachable, so `[]`
+is the only answer." On Linux there is probably a credential file under HOME that would let a
+contained run work with no token exported, and nobody has looked; antigravity's `None` may be
+wrong in its own favour there for the same reason. These declarations are therefore **correct
+but incomplete** on Linux rather than false, and what is missing buys convenience, not safety.
+Tracked in §6, along with the ordering constraint that matters more than the mapping itself:
+the selftest is not Linux-clean, and a surface validated by a suite that does not pass is not
+a measurement.
 
 Three things worth carrying forward:
 
@@ -323,17 +329,39 @@ ABA fix and its route to `parallel_safe_config = True`.
 - ~~**codex cannot run a cell at all — fix the trust gate first.**~~ **Done (2026-07-27)** —
   `--skip-git-repo-check` on the cell and probe argv; see §0b for the reasoning and for why
   it is the flag rather than `git init`.
-- **Re-map every contained surface on Linux.** `contained_home_subpaths` is a plain class
-  attribute, so the macOS answers in §0b are what a Linux run gets too, and the reason three
-  of them are `[]` — the macOS login keychain — does not exist there. Expect at least claude
-  and copilot to need a non-empty surface on Linux, which is where the credential-duplication
-  and `_purge` story in §1 finally becomes real for more than codex. `probe_contained_home.py
-  --bisect` answers it per adapter in ~7 runs each; `--self-check` runs against a fixture
-  home, so it is usable on a CI box with nothing logged in. Make the field
-  platform-conditional only once the answers actually diverge — a `if sys.platform` written
-  ahead of the measurement would just be a second guess. Until then a wrong surface fails
-  closed (the CLI finds no credential and errors), which is the safe direction but is still
-  a claim the adapter has not earned.
+- **Map the FILE-based contained surfaces on Linux — but not before the selftest passes
+  there, and not before someone actually needs it.** Deliberately not scheduled; the trigger
+  is a real Linux cell run or Linux CI, not tidiness.
+
+  Scope it correctly, because the first version of this entry (and the summary that produced
+  it) got it wrong in the alarming direction. What is macOS-specific is **not** the surfaces
+  and **not** the machinery: `isolation.py`'s containment path has no platform branch at all
+  (the one `darwin` mention is a comment about `normcase`), and the `[]` + environment-token
+  route is platform-independent by construction — the token comes from the environment, never
+  from HOME, so the keychain never enters into it. A Linux operator who exports `GH_TOKEN` or
+  `CLAUDE_CODE_OAUTH_TOKEN` gets a working contained run today.
+
+  What is macOS-specific is the *negative* half of the claim: "the keychain is unreachable, so
+  `[]` is the only answer." On Linux there is probably a credential FILE under HOME that would
+  let a contained run work with no environment token at all, and it is unmapped. antigravity's
+  `None` may be wrong in the same direction and in its favour — it is refused today because
+  macOS gives it no route, and a Linux build storing a file would make it mappable. So the
+  declarations are **correct but incomplete** on Linux, not wrong, and the missing piece buys
+  convenience rather than safety.
+
+  **The ordering is the part worth writing down: the selftest must be Linux-clean FIRST.** The
+  suite is what proves the containment machinery is sound on a platform, and it is not clean
+  there — a Linux run fails a symlink-scrub arm that passes on macOS, because several
+  filesystem arms encode darwin semantics (xattrs on symlinks, hardlinked symlinks). Probing
+  first would produce surfaces validated by a suite that does not pass, which is a measurement
+  nobody can trust. Sequence: make the selftest Linux-clean → then `probe_contained_home.py
+  --bisect` per adapter (~7 runs each; `--self-check` needs no logins, so it works on a bare
+  CI box) → then decide whether the field needs to be platform-conditional. Write no
+  `if sys.platform` before that last step: ahead of the measurement it is just a second guess.
+
+  That Linux selftest failure is also why the parked CI workflow
+  (`harness/ci-selftest-mutation`) runs on macOS runners rather than Linux, and it is the
+  reason to fix, not a reason to switch platforms.
 - **Phase 1b codex** — `-c` mapping + canonical `mcp__server__tool` naming in its parser.
   Blocked on §9 probe #2 (whether TOML array/inline-table values survive `-c`). Pairs with
   `$CODEX_HOME` materialization, above.

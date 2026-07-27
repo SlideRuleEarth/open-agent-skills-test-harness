@@ -143,18 +143,23 @@ class Adapter(ABC):
     # it. Verified for claude 2.1.113 on 2026-07-23: [] runs, because it authenticates from
     # CLAUDE_CODE_OAUTH_TOKEN in the environment rather than from anything under HOME.
     #
-    # PLATFORM: every surface here was measured on **macOS only** (2026-07-27), and this
-    # field is not platform-conditional. Three of the four adapters resolve to [] because
-    # their credential is in the macOS login keychain, which a contained home cannot reach —
-    # a fact with no Linux analogue, where the same CLIs must keep their credential
-    # somewhere else (a file under HOME, or a Secret Service keyring). So a `[]` here is a
-    # claim about macOS that has NOT been checked on Linux, and the harness runs on Linux
-    # (only Windows is refused — see exec._unsupported_platform).
+    # PLATFORM: every surface here was measured on **macOS only** (2026-07-27) and this field
+    # is not platform-conditional, but read what that does and does not mean before acting on
+    # it. The containment machinery is portable (isolation.py has no platform branch), and so
+    # is the route these surfaces are built around: `[]` plus an environment token works on
+    # any platform, because the token comes from the environment rather than from HOME and
+    # the keychain never enters into it.
     #
-    # The failure direction is safe: an under-declared surface means the CLI finds no
-    # credential and errors, which fails the cell rather than leaking. It is still a false
-    # claim, so re-run tools/probe_contained_home.py per adapter before trusting these on
-    # Linux, and make the field platform-conditional if the answers diverge.
+    # What was measured on macOS is the NEGATIVE half — "the login keychain is unreachable
+    # from a contained home, so [] is the only answer". On Linux there is likely a credential
+    # FILE under HOME that would let a contained run work with no token exported, and nobody
+    # has looked. So these are correct-but-incomplete on Linux rather than wrong, and the
+    # missing piece buys convenience, not safety.
+    #
+    # Before mapping them there, make the selftest pass on Linux: it currently fails a
+    # symlink-scrub arm that passes on macOS (darwin xattr/hardlink semantics), and a surface
+    # validated by a suite that does not pass is not a measurement. See
+    # TODO_Contained_HOME.md §6.
     contained_home_subpaths: Optional[list[str]] = None
     # Environment variable NAMES this adapter passes into the child CLI that carry a
     # credential — e.g. claude's CLAUDE_CODE_OAUTH_TOKEN, which `env()` forwards through the
