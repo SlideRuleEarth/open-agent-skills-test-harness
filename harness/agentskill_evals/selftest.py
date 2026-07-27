@@ -5766,6 +5766,21 @@ def _check_codex_adapter(failures, verbose):
                "mcp_servers.user_srv.enabled=false" in pargv
                and "mcp_servers.other-srv.enabled=false" in pargv,
                f"per-name disables also passed on model probes: {pargv}", failures, verbose)
+        # Cells AND probes run in detached tempdirs that are not git repos, and codex
+        # refuses to start in one. Without this flag every codex run dies before reaching
+        # the model — which it did, unnoticed, from 2026-07-17 to 2026-07-27, because a
+        # cell that never starts looks like a cell that failed. Both argv builders are
+        # asserted: the probe path is the one whose failure is disguised as "model
+        # unavailable" rather than as a broken run.
+        _check("codex.skips_the_git_repo_trust_gate",
+               "--skip-git-repo-check" in kargv and "--skip-git-repo-check" in pargv,
+               f"codex will not start outside a git repo or trusted project, and every "
+               f"cell/probe workspace is a detached tempdir. The flag is deliberate rather "
+               f"than `git init`: codex reads a trusted project's .codex/config.toml from "
+               f"the git root above cwd, so creating a repo IN the workspace would open an "
+               f"MCP config channel inside the one directory the agent can write to. "
+               f"cell={'--skip-git-repo-check' in kargv} probe="
+               f"{'--skip-git-repo-check' in pargv}", failures, verbose)
         # a name outside codex's own `mcp add` charset can't be addressed by -c dotted
         # paths; the quoted form is emitted anyway so codex refuses to load its config —
         # the run fails closed instead of silently starting the server.
@@ -7783,6 +7798,101 @@ def _check_schema_validator(failures, verbose):
     _check("schema.invalid", not bad, f"missing-required caught: {err}", failures, verbose)
 
 
+def _check_declared_contained_surfaces(failures, verbose):
+    """The REAL adapters' declared contained surfaces, as opposed to the mechanism.
+
+    Every other contained-home arm drives a fake adapter, which proves the machinery and
+    proves nothing about what the four shipped adapters actually declare. Those declarations
+    are adapter-CONTRACT data: a subpath that collides with the adapter's own skills dir or
+    config mask is a build-time ValueError that would first surface on a live credential run,
+    which is the least convenient place to learn it.
+    """
+    print("declared contained surfaces:")
+    import os
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from .isolation import build_isolated_home, home_write_escapes
+
+    names = ("claude", "codex", "copilot", "antigravity")
+
+    # 1) Each declared surface BUILDS, and the result is contained. The fixture home holds
+    #    every declared subpath as a real file, so a surface naming something that collides
+    #    with a mask/skills leaf raises out of build_isolated_home rather than passing.
+    built_ok, escaped, errors = [], [], []
+    for name in names:
+        adapter = get_adapter(name)
+        subs = adapter.contained_home_subpaths
+        if subs is None:
+            continue                       # unmapped by design (antigravity) — nothing to build
+        fake_home = _tempfile.mkdtemp(prefix="ase-surface-home-")
+        dest = _tempfile.mkdtemp(prefix="ase-surface-dest-")
+        try:
+            for sub in subs:
+                path = os.path.join(fake_home, sub)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as fh:
+                    fh.write('{"token": "surface-fixture"}')
+            build_isolated_home(
+                dest, adapter.global_skills_subpaths, [], [], fake_home,
+                plugin_registry_subpaths=getattr(adapter, "global_plugin_registry_subpaths", []),
+                config_file_masks=dict(getattr(adapter, "isolation_config_masks", {}) or {}),
+                plugin_config_masks=dict(getattr(adapter, "plugin_registry_config_masks", {}) or {}),
+                contained_subpaths=subs,
+            )
+            built_ok.append(name)
+            if home_write_escapes(dest):
+                escaped.append(name)
+            for sub in subs:
+                # Copied by CONTENT, never linked — the escape rule is "any symlink out", so
+                # a surface that arrived as a symlink would be contained only by accident.
+                landed = os.path.join(dest, sub)
+                if not os.path.isfile(landed) or os.path.islink(landed):
+                    escaped.append(f"{name}:{sub}")
+        except Exception as exc:
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+        finally:
+            _shutil.rmtree(fake_home, ignore_errors=True)
+            _shutil.rmtree(dest, ignore_errors=True)
+
+    _check("contained.declared_surfaces_build_and_contain",
+           not errors and not escaped and "codex" in built_ok and "copilot" in built_ok,
+           f"every adapter that declares a contained surface must be able to BUILD it, and "
+           f"the result must hold no outward symlink and no linked-in credential. A subpath "
+           f"colliding with the adapter's own skills dir or config mask raises here instead "
+           f"of on the first live credential run. built={built_ok} "
+           f"escaped={escaped} errors={errors}", failures, verbose)
+
+    # 2) TODO_Contained_HOME.md §3a's survival assertion, which until now was only prose:
+    #    naming a variable in `credential_env_vars` asserts that this adapter's env() hands
+    #    it to the child UNCHANGED. The runner samples the value BEFORE env() runs and
+    #    redacts/contains on the strength of it, so an adapter that stripped or rewrote one
+    #    would have the harness scrubbing a string the child never received.
+    survived, mangled = [], []
+    for name in names:
+        adapter = get_adapter(name)
+        declared = list(getattr(adapter, "credential_env_vars", []) or [])
+        if not declared:
+            continue
+        home = _tempfile.mkdtemp(prefix="ase-surface-env-")
+        try:
+            sentinel = {var: f"sentinel-value-for-{var}" for var in declared}
+            out = adapter.env({**os.environ, **sentinel},
+                              RunOptions(home=home, isolation_env={}))
+            for var, value in sentinel.items():
+                (survived if out.get(var) == value else mangled).append(f"{name}:{var}")
+        finally:
+            _shutil.rmtree(home, ignore_errors=True)
+
+    _check("contained.declared_credential_env_vars_survive_adapter_env",
+           not mangled and any(s.startswith("copilot:") for s in survived)
+           and any(s.startswith("claude:") for s in survived),
+           f"`credential_env_vars` is a SURVIVAL assertion, not a list of interesting names: "
+           f"the runner reads each value from the child's effective env before env() runs and "
+           f"trusts it arrives unchanged. An adapter that popped or rewrote one would redact "
+           f"and contain on a value the child never got. survived={sorted(survived)} "
+           f"mangled={sorted(mangled)}", failures, verbose)
+
+
 def _check_progress_indicator(failures, verbose):
     # progress indicator
     print("progress indicator:")
@@ -8106,6 +8216,7 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _section(_check_antigravity_adapter, failures, verbose)
     _section(_check_judge_verdict_extraction, failures, verbose)
     _section(_check_schema_validator, failures, verbose)
+    _section(_check_declared_contained_surfaces, failures, verbose)
     _section(_check_progress_indicator, failures, verbose)
     _section(_check_spec_validation, failures, verbose)
     _section(_check_scenario_multi_model, failures, verbose)

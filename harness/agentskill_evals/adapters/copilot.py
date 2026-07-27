@@ -1470,6 +1470,33 @@ class CopilotAdapter(Adapter):
     # COPILOT_HOME replaces ~/.copilot wholesale (verified in 1.0.64's bundle) — without
     # mirroring it, a set var would bypass the masks above.
     isolation_config_homes = [("COPILOT_HOME", ".copilot", None)]
+    # Nothing — the same answer as claude, for the same macOS reason, and it was FOUND
+    # rather than assumed. Measured against 1.0.72 on macOS, 2026-07-27: a contained HOME
+    # with an empty surface plus GH_TOKEN in the environment authenticates and answers.
+    #
+    # Where the credential actually lives was settled by subtractive bisection over the real
+    # home's top-level entries (tools/probe_contained_home.py --bisect): masking ~/Library
+    # breaks authentication, and narrowing it, so does masking ~/Library/Keychains alone.
+    # copilot's stored login is in the macOS login keychain, not under ~/.copilot — worth
+    # stating because ~/.copilot/config.json LOOKS like the credential store (it is the file
+    # `_sanitized_copilot_config` preserves auth from) and a contained home that copied it
+    # still fails with "No authentication information found". Guessing produced two wrong
+    # answers here before the bisect produced the right one.
+    #
+    # The keychain is unreachable from a contained home by construction: reaching it needs
+    # ~/Library/Keychains, and a symlink there is an outward symlink, which a contained home
+    # cannot have. Copying is not an alternative — that file is every password on the
+    # machine. So auth arrives from the environment instead, which copilot documents as
+    # taking precedence over stored credentials, and which costs no credential duplication.
+    contained_home_subpaths: list[str] = []
+    # The three token variables copilot documents, in its own precedence order (`copilot
+    # help environment`, 1.0.72): "an authentication token that takes precedence over
+    # previously stored credentials". Declared so the runner registers whichever is set for
+    # redaction BEFORE the run, and so their presence triggers containment exactly as an
+    # interpolated ${VAR} does. env() forwards them unchanged — it drops only
+    # COPILOT_CLI_DIST_DIR and delegates the rest to base.env() — which is the survival
+    # assertion this list makes (see TODO_Contained_HOME.md §3a).
+    credential_env_vars = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
     # `--reasoning-effort <level>` (verified 2026-07-08: choices none|low|medium|high|
     # xhigh|max — the harness only passes the typed cross-runner subset low|medium|high).
     supports_reasoning_effort = True

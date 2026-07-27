@@ -142,6 +142,19 @@ class Adapter(ABC):
     # CLI erroring on something undeclared, which fails closed but only shows up by running
     # it. Verified for claude 2.1.113 on 2026-07-23: [] runs, because it authenticates from
     # CLAUDE_CODE_OAUTH_TOKEN in the environment rather than from anything under HOME.
+    #
+    # PLATFORM: every surface here was measured on **macOS only** (2026-07-27), and this
+    # field is not platform-conditional. Three of the four adapters resolve to [] because
+    # their credential is in the macOS login keychain, which a contained home cannot reach —
+    # a fact with no Linux analogue, where the same CLIs must keep their credential
+    # somewhere else (a file under HOME, or a Secret Service keyring). So a `[]` here is a
+    # claim about macOS that has NOT been checked on Linux, and the harness runs on Linux
+    # (only Windows is refused — see exec._unsupported_platform).
+    #
+    # The failure direction is safe: an under-declared surface means the CLI finds no
+    # credential and errors, which fails the cell rather than leaking. It is still a false
+    # claim, so re-run tools/probe_contained_home.py per adapter before trusting these on
+    # Linux, and make the field platform-conditional if the answers diverge.
     contained_home_subpaths: Optional[list[str]] = None
     # Environment variable NAMES this adapter passes into the child CLI that carry a
     # credential — e.g. claude's CLAUDE_CODE_OAUTH_TOKEN, which `env()` forwards through the
