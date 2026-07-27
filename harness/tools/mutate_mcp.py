@@ -43,6 +43,8 @@ CLAUDE = "agentskill_evals/adapters/claude.py"
 BASE = "agentskill_evals/adapters/base.py"
 MCP = "agentskill_evals/mcp.py"
 ISO = "agentskill_evals/isolation.py"
+CODEX = "agentskill_evals/adapters/codex.py"
+COPILOT = "agentskill_evals/adapters/copilot.py"
 
 MUTATIONS = [
     ("M1-witness-fails-any-server", CLAUDE,
@@ -545,6 +547,35 @@ MUTATIONS = [
      "\n        child_env = {**os.environ, **(spec.env or {})}",
      "\n        child_env = dict(os.environ)",
      "mcp.credential_detection_reads_the_childs_effective_environment"),
+    # An adapter declaring a contained subpath that collides with its own skills dir: the
+    # copy would displace the masking leaf, so the home is contained but the skills it
+    # exposes are the user's real ones. Nothing else in the suite exercises the SHIPPED
+    # adapters' declarations — every other contained-home arm drives a fake adapter.
+    ("M86-codex-contained-surface-collides-with-its-skills-dir", CODEX,
+     '\n    contained_home_subpaths: list[str] = [".codex/auth.json"]',
+     '\n    contained_home_subpaths: list[str] = [".codex/skills"]',
+     "contained.declared_surfaces_build_and_contain"),
+    # The §3a survival assertion, reintroduced as a real adapter defect: copilot's env()
+    # strips a variable the adapter DECLARES as a credential. The runner samples the value
+    # before env() runs, so it would redact and contain on a token the child never received.
+    ("M87-copilot-env-strips-a-declared-credential-var", COPILOT,
+     '\n    _BUILD_REDIRECT_VARS = ("COPILOT_CLI_DIST_DIR",)',
+     '\n    _BUILD_REDIRECT_VARS = ("COPILOT_CLI_DIST_DIR", "GH_TOKEN")',
+     "contained.declared_credential_env_vars_survive_adapter_env"),
+    # The trust gate, reintroduced: drop the flag from the cell argv and codex is back to
+    # refusing to start in the detached tempdir every cell runs in. This is the defect that
+    # sat unnoticed for ten days because a cell that never starts is indistinguishable from
+    # a cell that failed — the arm exists so it cannot sit unnoticed again.
+    ("M88-codex-cell-argv-loses-the-git-repo-trust-gate-flag", CODEX,
+     '\n                 "--skip-git-repo-check",\n                 "--json"]',
+     '\n                 "--json"]',
+     "codex.skips_the_git_repo_trust_gate"),
+    # Same defect on the probe path, which fails differently: a probe that dies on the gate
+    # is reported as an unavailable MODEL, so the cause is disguised rather than surfaced.
+    ("M89-codex-probe-argv-loses-the-git-repo-trust-gate-flag", CODEX,
+     '\n                "--skip-git-repo-check",\n                "--json", "-m", model, "say ok"]',
+     '\n                "--json", "-m", model, "say ok"]',
+     "codex.skips_the_git_repo_trust_gate"),
 ]
 
 

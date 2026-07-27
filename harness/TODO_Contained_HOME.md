@@ -34,11 +34,88 @@ live-verified. What changed:
   artifact and no real-home file. `mutate_mcp.py` gained a per-selftest `timeout` so a looping
   mutation can never again wedge the suite.
 
-**Still open — the next adapters.** codex ($CODEX_HOME), copilot, antigravity each need their
-contained surface mapped **empirically** (§5 step 4 / §6). Their auth may well live under HOME,
-so their `contained_home_subpaths` will be non-empty and the credential-duplication /
-`_purge`-cleanup story in §1 becomes real for them. The rest of this doc is the original
-handoff, still accurate for that work.
+---
+
+## 0b. STATUS — all four adapters are now mapped (2026-07-27)
+
+The prediction in the paragraph this replaces was **wrong in the interesting direction**, and
+the way it was wrong is the finding. It said the next adapters' auth "may well live under
+HOME, so their `contained_home_subpaths` will be non-empty and the credential-duplication
+story becomes real for them". Measured, on macOS:
+
+| adapter | credential store | surface | duplication |
+|---|---|---|---|
+| claude 2.1.113 | login keychain | `[]` + `CLAUDE_CODE_OAUTH_TOKEN` | none |
+| copilot 1.0.72 | login keychain | `[]` + `GH_TOKEN` (or `COPILOT_GITHUB_TOKEN`/`GITHUB_TOKEN`) | none |
+| antigravity 1.1.7 | login keychain | **unmapped (`None`) — no route exists** | n/a |
+| codex 0.140.0 | **file** (`~/.codex/auth.json`) | `[".codex/auth.json"]` | real |
+
+**Three of four keep auth in the macOS login keychain, which a contained home structurally
+cannot reach** — reaching it needs `~/Library/Keychains`, and that is an outward symlink,
+which containment forbids by its own escape rule. Copying is not the fallback: that file is
+every password on the machine. claude's note had already worked this out for claude; what is
+new is that it generalizes, and that it makes the env-var token the *normal* answer rather
+than a claude peculiarity. Materialize's headline cost — duplicating long-lived credentials —
+turns out to apply to exactly **one** adapter.
+
+**The method mattered more than any single answer.** Additive probing (guess a surface, see if
+it works) confirmed nothing and produced two wrong guesses for copilot — `.copilot/config.json`
+*looks* like the credential store, and the CLI's own error message points at `gh auth login`.
+What worked is **subtractive**: start from the overlay, which is known to work, and mask
+top-level HOME entries until auth breaks. `harness/tools/probe_contained_home.py --bisect`
+does that in ~7 runs and lands on `~/Library`, then `~/Library/Keychains` confirms it. The
+tool drives the harness's own launch path (`build_isolated_home` → `adapter.env` →
+`adapter.build_argv` → `exec.run_captured`), so what it measures is what a cell would get.
+
+Three things worth carrying forward:
+
+- **antigravity is a negative result, and it is recorded as one.** It has no env-var
+  credential (its 1.1.7 binary contains no `GEMINI_API_KEY`/`GOOGLE_API_KEY` string) and its
+  keychain is unreachable, so `contained_home_subpaths` stays `None` and the refusal keeps
+  firing — which is the correct outcome, not a gap. Note the failure mode if anyone forces
+  it: agy with no readable credential does not exit, it falls back to **interactive OAuth**
+  and opens a browser at a Google sign-in page. A headless cell hangs there for 60s. The
+  probe now suppresses browser launching by default for exactly this reason; the bisect that
+  discovered it opened a sign-in tab on the operator's machine first.
+- **codex is the one that pays.** It stores a file, and it reads no credential from the
+  environment at all — an invalid `OPENAI_API_KEY` produces a response byte-identical to
+  setting nothing, so the variable is never consulted in `exec` mode. The rotation hazard is
+  therefore live: the child can rewrite its copy, and a rotated refresh token dies with the
+  tempdir while the real store keeps the old one. Measured with `--rotation-check`: codex did
+  **not** rewrite the copy, and the real `auth.json` was byte-identical after a full run.
+  That is one run, whose token had last refreshed nine days earlier — it is not "codex never
+  rotates", and it should be re-checked rather than cited.
+- **codex cells could not run at all — found here, fixed here.** codex refuses to start
+  outside a git repo or trusted project, every cell workspace is a detached tempdir, and
+  nothing passed `--skip-git-repo-check`, so codex runs had been dying before reaching the
+  model since at least 2026-07-17. It failed identically under the plain overlay, so
+  containment did not cause it; mapping codex's surface is simply what made anyone look.
+  The flag is now on both the cell and probe argv, and `cheapshot_harness_smoke` on
+  gpt-5.4-mini passes **7/7** — the first codex cell this harness has completed.
+
+  The flag rather than `git init`, deliberately: both clear the gate (verified 0.140.0), but
+  codex resolves a *trusted project's* `.codex/config.toml` from the git root above cwd, and
+  that file contributes MCP servers — so creating a repo in the workspace would open a config
+  channel inside the one directory the agent can write to, after `_mcp_disable_args` has
+  already enumerated. What the flag gives up is codex's guardrail against editing files it
+  cannot roll back, which this harness does not rely on: the workspace is a throwaway tempdir
+  that gets archived, and the sandbox stays `workspace-write` with approvals off.
+
+  Worth noting how it hid for ten days: **a cell that never starts is indistinguishable from
+  a cell that failed.** The result was a red cell with an error string, which is what a bad
+  model answer also looks like. Arm `codex.skips_the_git_repo_trust_gate` exists so it cannot
+  hide again, on the probe path too — there the same defect is disguised as an *unavailable
+  model*, which is worse.
+
+Verification: selftest **477 arms** (474 on `main`, +3), `mutate_mcp.py` **88/88** caught by the intended arm
+(M86 codex-surface-collides-with-its-skills-dir, M87 copilot-env-strips-a-declared-credential-var,
+M88/M89 codex-loses-the-trust-gate-flag on the cell and probe argv), plus two live runs:
+`cheapshot_harness_smoke` on copilot with `GH_TOKEN` set, which ran **contained** rather than
+refused and left **zero** occurrences of the token across the artifact tree; and the same
+scenario on codex/gpt-5.4-mini, which passes **7/7**.
+
+The rest of this doc is the original handoff. §1's cost table is still the right analysis; it
+simply resolves to "free" for three adapters and "real" for one.
 
 ---
 
@@ -93,6 +170,7 @@ fails closed, which is right, but it is a slow live-run loop per adapter.
 | `interpolated_refs(servers)` | `agentskill_evals/mcp.py` | Which declared fields carry a `${VAR}`. The exposure gate. **Never** use `bool(secrets)` for this — short values are excluded from redaction on purpose and are still credentials. |
 | `build_isolated_home(...)` / `_overlay(...)` | `agentskill_evals/isolation.py` | The overlay builder you will be changing. `_overlay` step 1 is the wholesale symlink pass — the thing that creates every escape. |
 | `_CellCleanup` / `_purge` / `_remove` | `agentskill_evals/runner.py` | Registration + verified outward-in removal of credential directories, with findings that survive a crash. If you copy credentials anywhere, register the directory here. |
+| `probe_contained_home.py` | `harness/tools/` | Maps an adapter's contained surface against the real CLI, driving the harness's own launch path. `--bisect` is the subtractive search that finds where a CLI's credential lives; `--rotation-check` reports whether the child rewrote a copied credential; `--overlay` is the control that separates "containment broke it" from "already broken". Suppresses browser launching by default — a CLI that cannot authenticate may fall back to interactive OAuth. |
 | `_scrub_tree` and friends | `agentskill_evals/runner.py` | Archived-workspace scrub. Not in scope, but read `_scrub_file`/`_scrub_link` before writing any new filesystem traversal — they encode the object-kind inventory the hard way. |
 
 Adapter contract fields that declare HOME surface (`adapters/base.py`):
@@ -171,10 +249,10 @@ and `contained_home_that_copies_auth_is_credential_bearing_before_the_copy` (mut
 Non-negotiable, in this order. `SELFTEST PASSED` alone is not evidence.
 
 ```sh
-harness/.venv/bin/python -m agentskill_evals.cli selftest          # 461 at 5b9579e; 469 after claude
+harness/.venv/bin/python -m agentskill_evals.cli selftest          # 474 on main; 477 after the other three adapters + the codex trust gate
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 harness/.venv/bin/python -m pyflakes harness/agentskill_evals/*.py harness/agentskill_evals/adapters/*.py
-python3 harness/tools/mutate_mcp.py                               # 71/71 at 5b9579e; 79/79 after claude
+python3 harness/tools/mutate_mcp.py                               # 86/86 on main; 88/88 after the other three adapters + the codex trust gate
 git diff --check
 ```
 
@@ -230,6 +308,9 @@ ABA fix and its route to `parallel_safe_config = True`.
 
 ## 6. Then, in order
 
+- ~~**codex cannot run a cell at all — fix the trust gate first.**~~ **Done (2026-07-27)** —
+  `--skip-git-repo-check` on the cell and probe argv; see §0b for the reasoning and for why
+  it is the flag rather than `git init`.
 - **Phase 1b codex** — `-c` mapping + canonical `mcp__server__tool` naming in its parser.
   Blocked on §9 probe #2 (whether TOML array/inline-table values survive `-c`). Pairs with
   `$CODEX_HOME` materialization, above.

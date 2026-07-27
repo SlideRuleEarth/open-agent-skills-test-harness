@@ -193,6 +193,47 @@ class CodexAdapter(Adapter):
     # CODEX_HOME overrides ~/.codex (skills under $CODEX_HOME/skills). Under isolation it's
     # mirrored + repointed (custom home kept, skills masked), else cleared to the isolated home.
     isolation_config_homes = [("CODEX_HOME", ".codex", "skills")]
+    # Just the auth file. Measured against 0.140.0 on macOS, 2026-07-27: a contained HOME
+    # holding only `.codex/auth.json` authenticates and answers; an empty one gets
+    # "401 Unauthorized: Missing bearer" from wss://api.openai.com/v1/responses.
+    #
+    # Exercised by a real cell, not only by the probe: `cheapshot_harness_smoke` on
+    # gpt-5.4-mini passed 7/7 on 2026-07-27, the first codex cell this harness has completed.
+    # It could not before, for a reason unrelated to containment — codex refuses to start
+    # outside a git repo or trusted project, and every cell workspace is a detached tempdir,
+    # so codex runs had been failing before reaching the model since at least 2026-07-17.
+    # `--skip-git-repo-check` on the argv above is what fixed that; the surface here was
+    # first measured with that flag applied by hand, then re-measured without it once the
+    # adapter passed it itself.
+    #
+    # codex is the ODD ONE OUT here, and the difference is the whole cost story. claude,
+    # copilot and antigravity all keep their HOME-side credential in the macOS login
+    # keychain, which a contained home structurally cannot reach (see claude's note), so
+    # for them containment is free and auth arrives from the environment. codex stores a
+    # FILE — `codex doctor` reports "auth storage mode: File", and it holds a rotating
+    # `tokens.refresh_token` — and codex 0.140.0 reads no credential from the environment
+    # at all: an invalid OPENAI_API_KEY produces a response byte-identical to setting
+    # nothing, so the variable is never consulted in `exec` mode. Copying is therefore the
+    # only route, and this is the adapter where "materialize duplicates the user's
+    # long-lived credentials" stops being a hypothetical.
+    #
+    # `config.toml` is deliberately NOT here. Leaving it out costs the run the user's model
+    # and personality defaults, which is the hermetic answer, and it keeps the pre-launch
+    # MCP enumeration honest: `codex mcp list --json` runs with the child's env, so it sees
+    # the same empty config the child will, and disables nothing because there is nothing.
+    # Copying it would import the user's MCP servers into a home built to contain a
+    # credential — handled on argv, but pointlessly.
+    #
+    # THE ROTATION HAZARD, and what was actually observed. The child can write to its copy,
+    # and a refresh lands there and dies with the tempdir while the real store keeps the old
+    # token — if the issuer treats refresh tokens as single-use, that silently invalidates
+    # the user's real login. Measured on 2026-07-27 with tools/probe_contained_home.py
+    # --rotation-check: codex did NOT rewrite the copy during a complete run, and the real
+    # auth.json was byte-identical afterwards. That is an observation about ONE run whose
+    # token had last refreshed nine days earlier — it is emphatically not "codex never
+    # rotates", and a run that happens to straddle an access-token expiry may well rewrite
+    # it. Re-check with --rotation-check rather than trusting this line.
+    contained_home_subpaths: list[str] = [".codex/auth.json"]
     # No dedicated flag; the config.toml key `model_reasoning_effort` (settable per-run via
     # `-c`) reaches the API as `reasoning.effort` (verified 2026-07-08: the API echoes
     # supported values none|minimal|low|medium|high|xhigh on a bad one).
@@ -220,6 +261,11 @@ class CodexAdapter(Adapter):
                 "-c", "memories.use_memories=false",
                 "-c", "memories.generate_memories=false",
                 *self._mcp_disable_args(cwd=cwd, env=env),
+                # Same trust gate as build_argv, and probes hit it for the same reason:
+                # each runs in a fresh private temp workspace, which is not a git repo.
+                # A probe that dies on the gate reports the model as unavailable, which
+                # looks exactly like a model that does not exist.
+                "--skip-git-repo-check",
                 "--json", "-m", model, "say ok"]
 
     def _parse_probe_cost(self, output: str) -> ProbeResult:
@@ -414,6 +460,29 @@ class CodexAdapter(Adapter):
                  # trusted-project configs and env-overridden CODEX_HOMEs resolve
                  # exactly as they will in the run.
                  *self._mcp_disable_args(cwd=cwd, env=opts.effective_env),
+                 # codex refuses to start unless cwd is a git repo or a trusted project
+                 # ("Not inside a trusted directory and --skip-git-repo-check was not
+                 # specified"), and every cell runs in a detached tempdir that is neither —
+                 # so without this, codex cells fail before the model is ever reached
+                 # (observed in artifacts from 2026-07-17 through 2026-07-27, on the
+                 # contained home and the plain overlay alike).
+                 #
+                 # This is the flag rather than `git init`-ing the workspace, and the choice
+                 # is a hermeticity one, not a convenience one. Both clear the gate (verified
+                 # 0.140.0: a bare `git init` tempdir gets past it). But codex resolves a
+                 # TRUSTED PROJECT's `.codex/config.toml` from the git root above cwd, and
+                 # that file contributes MCP servers — so `git init` would plant a git root
+                 # inside the one directory the agent can write to, handing it a config
+                 # channel that does not exist today and that `_mcp_disable_args` enumerated
+                 # before the agent could create it. The flag opens nothing.
+                 #
+                 # What it gives up is codex's own guardrail against editing files in a
+                 # directory it cannot roll back — which is not a property this harness
+                 # relies on: the workspace is a throwaway tempdir that is archived
+                 # afterwards, and the sandbox is still `workspace-write` with approvals
+                 # off. Skipping a *trust* check would be a different matter; this one is a
+                 # version-control check.
+                 "--skip-git-repo-check",
                  "--json"]
         if opts.model:
             argv += ["-m", opts.model]

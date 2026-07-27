@@ -178,6 +178,30 @@ class AntigravityAdapter(Adapter):
     # isolation is the ONLY MCP-off mechanism on this runner: non-isolated runs can't be
     # made hermetic (the runner warns) and an overlay failure fails closed.
     plugin_registry_config_masks = {"mcp_config.json": '{"mcpServers": {}}'}
+    # UNMAPPED, and on macOS deliberately so — this is a negative result, not a gap nobody
+    # got to. None keeps containment unavailable, so runner._refuse_uncontained_home goes on
+    # refusing this adapter's credential-bearing cells, which is the correct outcome here.
+    #
+    # Measured against 1.1.7 on macOS, 2026-07-27. agy's credential is in the macOS login
+    # keychain: subtractive bisection over the real home (tools/probe_contained_home.py
+    # --bisect) lands on ~/Library, and masking ~/Library/Keychains alone reproduces it.
+    # That is the same store claude and copilot use, and it is equally unreachable from a
+    # contained home — a symlink to it is an outward symlink, and copying it means copying
+    # every password on the machine.
+    #
+    # What makes agy different from those two is that it has no way out. claude takes
+    # CLAUDE_CODE_OAUTH_TOKEN and copilot takes GH_TOKEN, so both authenticate from a wholly
+    # empty home; agy 1.1.7's binary contains no GEMINI_API_KEY or GOOGLE_API_KEY string at
+    # all, and with no readable credential it does not fail — it falls back to INTERACTIVE
+    # OAuth, printing a Google sign-in URL and opening the operator's browser. A headless
+    # matrix cell cannot answer that prompt, so a contained agy run does not merely lack
+    # auth, it hangs until its 60s login timeout.
+    #
+    # Two ways this could become mappable, neither of them free: agy grows an env-var
+    # credential (then this becomes [] like copilot's), or the harness gains a
+    # keychain-independent auth mode for it. Until one exists, credential-bearing agy cells
+    # SHOULD stay refused, and this None is the mechanism that refuses them.
+    contained_home_subpaths: Optional[list[str]] = None
     # agy also discovers MCP configs from the RUN WORKSPACE via --add-dir — outside the
     # HOME overlay's reach, so the runner neutralizes any *seeded* ones. It recognizes
     # FOUR customization roots (verified 1.1.1: a sentinel stdio server in each launched
