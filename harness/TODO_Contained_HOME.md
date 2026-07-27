@@ -67,6 +67,18 @@ does that in ~7 runs and lands on `~/Library`, then `~/Library/Keychains` confir
 tool drives the harness's own launch path (`build_isolated_home` → `adapter.env` →
 `adapter.build_argv` → `exec.run_captured`), so what it measures is what a cell would get.
 
+**All of this is macOS, and `contained_home_subpaths` is not platform-conditional.** The
+harness itself runs on macOS *and* Linux — only Windows is refused, and deliberately
+(`exec._unsupported_platform`: a Job Object cannot be assigned until `CreateProcess` returns,
+so a grandchild started in that window — an MCP server most of all — escapes it permanently).
+But the keychain is the whole reason three of these four surfaces are `[]`, and it has no
+Linux analogue: there the same CLIs must keep their credential somewhere else, plausibly a
+file under HOME or a Secret Service keyring, which is exactly the shape that makes a surface
+non-empty and brings the duplication cost back. So on Linux these declarations are unverified
+claims. The failure direction is safe — an under-declared surface means the CLI finds no
+credential and errors, failing the cell rather than leaking — but "safe" is not "true", and
+the fix is to re-run the probe per adapter there rather than to reason about it. Tracked in §6.
+
 Three things worth carrying forward:
 
 - **antigravity is a negative result, and it is recorded as one.** It has no env-var
@@ -311,6 +323,17 @@ ABA fix and its route to `parallel_safe_config = True`.
 - ~~**codex cannot run a cell at all — fix the trust gate first.**~~ **Done (2026-07-27)** —
   `--skip-git-repo-check` on the cell and probe argv; see §0b for the reasoning and for why
   it is the flag rather than `git init`.
+- **Re-map every contained surface on Linux.** `contained_home_subpaths` is a plain class
+  attribute, so the macOS answers in §0b are what a Linux run gets too, and the reason three
+  of them are `[]` — the macOS login keychain — does not exist there. Expect at least claude
+  and copilot to need a non-empty surface on Linux, which is where the credential-duplication
+  and `_purge` story in §1 finally becomes real for more than codex. `probe_contained_home.py
+  --bisect` answers it per adapter in ~7 runs each; `--self-check` runs against a fixture
+  home, so it is usable on a CI box with nothing logged in. Make the field
+  platform-conditional only once the answers actually diverge — a `if sys.platform` written
+  ahead of the measurement would just be a second guess. Until then a wrong surface fails
+  closed (the CLI finds no credential and errors), which is the safe direction but is still
+  a claim the adapter has not earned.
 - **Phase 1b codex** — `-c` mapping + canonical `mcp__server__tool` naming in its parser.
   Blocked on §9 probe #2 (whether TOML array/inline-table values survive `-c`). Pairs with
   `$CODEX_HOME` materialization, above.

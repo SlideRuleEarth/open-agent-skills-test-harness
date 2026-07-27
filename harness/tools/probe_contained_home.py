@@ -48,6 +48,7 @@ import os
 import shutil
 import sys
 import tempfile
+from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -310,6 +311,20 @@ def _self_check() -> int:
         isolation_config_masks: dict = {}
         plugin_registry_config_masks: dict = {}
 
+    # A FIXTURE home, not the operator's. The first version read `expanduser("~")` and then
+    # asserted that `.codex/auth.json` was in the candidate set — which made a check whose
+    # whole claim is determinism depend on whether whoever ran it happened to be logged into
+    # codex. On a clean CI account it failed. The tree below contains exactly what the checks
+    # talk about: some ordinary entries to search through, a reserved leaf for the fake
+    # adapter, and codex's real layout (a credential beside the skills dir the adapter owns).
+    home = tempfile.mkdtemp(prefix="probe-selfcheck-home-")
+    for rel in ("aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg", "hhh",
+                ".fake/skills", ".agents/skills", ".codex/skills"):
+        os.makedirs(os.path.join(home, rel), exist_ok=True)
+    for rel in (".codex/auth.json", ".codex/config.toml"):
+        with open(os.path.join(home, rel), "w", encoding="utf-8") as fh:
+            fh.write("{}")
+
     def drive(verdict_of, label):
         calls = []
 
@@ -322,12 +337,11 @@ def _self_check() -> int:
         buf = io.StringIO()
         try:
             with redirect_stdout(buf):
-                rc = _bisect(_FakeAdapter(), args)
+                rc = _bisect(_FakeAdapter(), args, real_home=home)
         finally:
             globals()["_run_once"] = orig
         return rc, buf.getvalue(), len(calls), label
 
-    home = os.path.expanduser("~")
     cands, unruled = _bisect_candidates(_FakeAdapter(), home)
     if not cands or not unruled:
         print(f"self-check cannot run: candidates={len(cands)} unruled={unruled}")
@@ -366,12 +380,18 @@ def _self_check() -> int:
     expect(rc == 0 and f"authenticates from ~/{target}" in out, lbl, out)
 
     # The reserved-root expansion is what puts a credential like codex's back in the search.
+    # Run against the FIXTURE, whose .codex/ mirrors the real layout, so the check means the
+    # same thing on a machine with no codex login as on the one it was written on.
     from agentskill_evals.adapters import get_adapter
     ccands, cunruled = _bisect_candidates(get_adapter("codex"), home)
     expect(".codex/auth.json" in ccands and ".codex/skills" not in ccands,
            "codex: auth.json is a candidate, skills stays reserved",
            f"{[c for c in ccands if c.startswith('.codex/')][:8]}")
+    expect(".codex/skills" in cunruled,
+           "codex: the skills dir it owns is reported as never ruled out",
+           f"{cunruled}")
 
+    shutil.rmtree(home, ignore_errors=True)
     print("SELF-CHECK PASSED" if not failures else f"SELF-CHECK FAILED: {failures}")
     return 0 if not failures else 1
 
@@ -423,7 +443,7 @@ def _bisect_candidates(adapter, real_home: str) -> tuple[list[str], list[str]]:
     return candidates, list(reserved_paths)
 
 
-def _bisect(adapter, args) -> int:
+def _bisect(adapter, args, real_home: Optional[str] = None) -> int:
     """Find the real-HOME entry the CLI authenticates from, by masking on the OVERLAY.
 
     Additive probing (contained mode + a guessed surface) can only confirm a guess. This is
@@ -432,7 +452,9 @@ def _bisect(adapter, args) -> int:
     reads its credential from — and it is found rather than assumed, which for two of these
     three CLIs is the difference between a mapped surface and a plausible story.
     """
-    real_home = os.path.expanduser("~")
+    # Injectable so `--self-check` can drive the search against a fixture tree instead of the
+    # operator's home — a deterministic check may not depend on what happens to be logged in.
+    real_home = real_home or os.path.expanduser("~")
     candidates, unruled_out = _bisect_candidates(adapter, real_home)
 
     print(f"=== bisect {adapter.name}: {len(candidates)} candidates "
