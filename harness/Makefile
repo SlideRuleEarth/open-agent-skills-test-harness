@@ -10,7 +10,7 @@ VENV   ?= .venv
 # Distribution / CLI name used with pipx — MUST match [project].name in pyproject.toml.
 DIST   ?= agentskill-evals
 
-.PHONY: help install dev selftest clean uninstall
+.PHONY: help install dev selftest mutation clean uninstall
 
 help: ## That's me!
 	@printf "\033[37m%-30s\033[0m %s\n" "#-----------------------------------------------------------------------------------------"
@@ -44,6 +44,17 @@ dev: ## Contributors: create $(VENV)/ and editable-install with extras
 
 selftest: ## Run the parser self-test (no agent CLIs or third-party deps required)
 	$(PYTHON) -m agentskill_evals selftest
+
+# Unlike `selftest`, this one NEEDS $(VENV): mutate_mcp copies the tree per mutation and runs
+# `$(VENV)/bin/python -m agentskill_evals selftest` inside each copy. Checked up front because
+# the alternative is discovering it as a FileNotFoundError once per mutation, which reads as
+# 80-odd broken mutations rather than one missing venv.
+mutation: ## Re-prove the self-test's arms by mutation (SLOW, ~10 min; run `make dev` first)
+	@test -x $(VENV)/bin/python || { \
+	  echo "mutation: $(VENV) is missing — run 'make dev' first (mutate_mcp runs the"; \
+	  echo "          self-test from $(VENV) inside each mutated copy of the tree)."; \
+	  exit 1; }
+	$(PYTHON) -u tools/mutate_mcp.py
 
 clean: ## Remove the dev venv, build outputs, and run artifacts
 	rm -rf $(VENV) build dist ./*.egg-info artifacts
