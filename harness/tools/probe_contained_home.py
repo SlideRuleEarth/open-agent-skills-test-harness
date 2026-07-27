@@ -28,8 +28,15 @@ worth understanding before typing one:
     check` hashes each copied file before and after and reports any that the child rewrote,
     which is how you find out whether a given CLI does this before it costs you a login.
 
-Output is redacted: every string of >= 8 chars found in a copied JSON credential file is
-scrubbed from the transcript before printing, same discipline as the runner's registry.
+Output is redacted from BOTH places a credential reaches the child: every string of >= 8 chars
+in a copied JSON credential file, and the value of every `credential_env_vars` name in the
+env the child is actually given. The second half is not an extra: the keychain finding makes
+an EMPTY surface plus an environment token the normal configuration, so a scrub that only
+read copied files would be empty on exactly the flow this tool exists to exercise.
+
+`--self-check` runs the bisect's decision rules against canned verdicts — no CLI, no network,
+nothing copied — and is the cheap way to confirm the search still refuses to draw conclusions
+it has not earned.
 """
 
 from __future__ import annotations
@@ -166,12 +173,14 @@ def _run_once(adapter, args, *, subs: list[str], masks: list[str], overlay: bool
     Returns a dict with `verdict` in WORKS / AUTH-FAIL / OTHER-FAIL / CONTAINMENT-BROKEN.
     """
     real_home = os.path.expanduser("~")
-    # Redaction needles come from the REAL files, read before anything runs — the copies are
-    # identical at that point, and reading the originals means a CLI that rewrites its copy
-    # cannot smuggle a value past the scrub by changing it mid-run.
+    # Redaction needles, from BOTH places a credential reaches the child. File needles come
+    # from the REAL files, read before anything runs — the copies are identical at that point,
+    # and reading the originals means a CLI that rewrites its copy cannot smuggle a value past
+    # the scrub by changing it mid-run.
     secrets: list[str] = []
     for sub in subs:
         secrets += _secrets_in(os.path.join(real_home, sub))
+    # The ENVIRONMENT needles are added below, once the child env exists — see there.
 
     cfg_masks = dict(getattr(adapter, "isolation_config_masks", {}) or {})
     # `None` content materializes the path as an empty real directory — the neutralizing form.
@@ -222,6 +231,19 @@ def _run_once(adapter, args, *, subs: list[str], masks: list[str], overlay: bool
             env["PATH"] = _no_browser_bin(ws) + os.pathsep + env.get("PATH", "")
             env["BROWSER"] = "true"
         opts.effective_env = env
+        # Environment credentials, read from the env the CHILD receives rather than from this
+        # process's — the same rule §3a makes for the runner's redaction registry, and for the
+        # same reason: an adapter's env() is free to rewrite or drop a variable, so sampling
+        # os.environ can register a value the child never got (or miss the one it did).
+        #
+        # Collecting needles only from COPIED FILES left this empty on exactly the flow the
+        # keychain finding makes normal: copilot and claude authenticate from an EMPTY surface
+        # plus a token in the environment, so `subs` is [] and nothing was ever scrubbed — with
+        # the CLI's argv, stdout and stderr printed verbatim just below.
+        for var in (getattr(adapter, "credential_env_vars", []) or []):
+            value = env.get(var)
+            if value:
+                secrets.append(value)
         argv = adapter.build_argv(args.prompt, opts, cwd=ws)
         if verbose:
             print(f"argv: {_redact(' '.join(argv), secrets)}")
@@ -264,6 +286,143 @@ def _run_once(adapter, args, *, subs: list[str], masks: list[str], overlay: bool
             shutil.rmtree(ws, ignore_errors=True)
 
 
+def _self_check() -> int:
+    """Exercise the bisect's decision rules with canned verdicts — no CLI, no network.
+
+    The two defects this pins were both invisible from inside a *passing* search: narrowing on
+    any non-WORKS verdict blames an arbitrary path for a startup error or a network blip, and
+    concluding "not under HOME" while reserved paths went unmasked contradicts a surface the
+    adapters themselves declare. Neither shows up in a live run that happens to go well, so
+    they get a deterministic check instead of a live one.
+    """
+    import io
+    import types
+    from contextlib import redirect_stdout
+
+    args = types.SimpleNamespace(rotation_check=False, model=None, prompt="p", extra_args="",
+                                 allow_browser=False, timeout=1, keep=False,
+                                 keep_credentials=False)
+
+    class _FakeAdapter:
+        name = "fake"
+        global_skills_subpaths = [".fake/skills"]
+        global_plugin_registry_subpaths: list = []
+        isolation_config_masks: dict = {}
+        plugin_registry_config_masks: dict = {}
+
+    def drive(verdict_of, label):
+        calls = []
+
+        def fake_run_once(adapter, a, *, subs, masks, overlay, verbose=False):
+            calls.append(list(masks))
+            return {"verdict": verdict_of(list(masks))}
+
+        orig = globals()["_run_once"]
+        globals()["_run_once"] = fake_run_once
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                rc = _bisect(_FakeAdapter(), args)
+        finally:
+            globals()["_run_once"] = orig
+        return rc, buf.getvalue(), len(calls), label
+
+    home = os.path.expanduser("~")
+    cands, unruled = _bisect_candidates(_FakeAdapter(), home)
+    if not cands or not unruled:
+        print(f"self-check cannot run: candidates={len(cands)} unruled={unruled}")
+        return 2
+    target = cands[len(cands) // 2]
+    failures = []
+
+    def expect(cond, label, detail):
+        print(f"  [{'ok' if cond else 'FAIL'}] {label}")
+        if not cond:
+            failures.append(f"{label}: {detail[:400]}")
+
+    # A non-auth verdict carries no information about WHERE the credential is.
+    rc, out, n, lbl = drive(lambda m: "WORKS" if not m else "OTHER-FAIL", "all-masked OTHER-FAIL")
+    expect(rc == 2 and "INCONCLUSIVE at all-masked" in out, lbl, out)
+
+    def mid_fail(kind):
+        def f(masks):
+            if not masks:
+                return "WORKS"
+            return "AUTH-FAIL" if len(masks) == len(cands) else kind
+        return f
+
+    for kind in ("OTHER-FAIL", "CONTAINMENT-BROKEN"):
+        rc, out, n, lbl = drive(mid_fail(kind), f"{kind} mid-search aborts")
+        expect(rc == 2 and "INCONCLUSIVE at" in out, lbl, out)
+
+    # Everything maskable masked and auth still works, with reserved paths never masked:
+    # inconclusive, NOT "the credential is not under HOME".
+    rc, out, n, lbl = drive(lambda m: "WORKS", "all-masked WORKS is inconclusive while paths remain")
+    expect(rc == 2 and "never masked" in out and "credential is NOT under HOME" not in out,
+           lbl, out)
+
+    # And the search still finds a real answer when the verdicts are genuine auth results.
+    rc, out, n, lbl = drive(lambda m: "AUTH-FAIL" if target in m else "WORKS", "narrows on AUTH-FAIL")
+    expect(rc == 0 and f"authenticates from ~/{target}" in out, lbl, out)
+
+    # The reserved-root expansion is what puts a credential like codex's back in the search.
+    from agentskill_evals.adapters import get_adapter
+    ccands, cunruled = _bisect_candidates(get_adapter("codex"), home)
+    expect(".codex/auth.json" in ccands and ".codex/skills" not in ccands,
+           "codex: auth.json is a candidate, skills stays reserved",
+           f"{[c for c in ccands if c.startswith('.codex/')][:8]}")
+
+    print("SELF-CHECK PASSED" if not failures else f"SELF-CHECK FAILED: {failures}")
+    return 0 if not failures else 1
+
+
+def _bisect_candidates(adapter, real_home: str) -> tuple[list[str], list[str]]:
+    """HOME-relative paths the bisect may mask, and the ones it can never rule out.
+
+    Split out from `_bisect` so the selection can be checked without spending a live run per
+    question — the defect it exists to prevent was invisible from inside a passing search.
+    """
+    # Paths the adapter itself owns in every run — skills dirs, plugin registries and config
+    # masks. Masking one would fight the adapter's own materialization, so they are excluded
+    # as candidates AND remembered, because "never masked" is precisely "never ruled out".
+    reserved_paths = sorted({
+        str(p).replace("\\", "/").strip("/")
+        for p in (list(adapter.global_skills_subpaths)
+                  + list(getattr(adapter, "global_plugin_registry_subpaths", []) or [])
+                  + list(getattr(adapter, "isolation_config_masks", {}) or {}))
+    })
+
+    def conflicts(cand: str) -> bool:
+        """True if masking `cand` would collide with a path the adapter owns — the candidate
+        IS one, contains one, or sits inside one."""
+        return any(cand == rp or rp.startswith(cand + "/") or cand.startswith(rp + "/")
+                   for rp in reserved_paths)
+
+    reserved_roots = {rp.split("/")[0] for rp in reserved_paths}
+    candidates = sorted(e for e in os.listdir(real_home) if e not in reserved_roots)
+
+    # Descend ONE level into each reserved root. Excluding a whole root because the adapter
+    # owns something inside it hides every sibling of that something — and for codex the
+    # hidden sibling is the credential itself: `.codex` is reserved for `.codex/skills`, so
+    # `.codex/auth.json` survived every masking run and the search could report "not under
+    # HOME" while that adapter declares exactly that path. Expanding to `.codex/auth.json`
+    # keeps the adapter's own leaves untouched and puts their siblings back in the search.
+    for root in sorted(reserved_roots):
+        root_dir = os.path.join(real_home, root)
+        if not os.path.isdir(root_dir):
+            continue
+        for child in sorted(os.listdir(root_dir)):
+            cand = f"{root}/{child}"
+            if not conflicts(cand):
+                candidates.append(cand)
+
+    # What remains un-neutralized: the adapter's own paths, and anything under a reserved root
+    # nesting deeper than one level. A credential in one of these is invisible to this search —
+    # copilot's `.copilot/config.json` mask is a SANITIZER that deliberately preserves auth,
+    # so this set is not hypothetical.
+    return candidates, list(reserved_paths)
+
+
 def _bisect(adapter, args) -> int:
     """Find the real-HOME entry the CLI authenticates from, by masking on the OVERLAY.
 
@@ -274,15 +433,22 @@ def _bisect(adapter, args) -> int:
     three CLIs is the difference between a mapped surface and a plausible story.
     """
     real_home = os.path.expanduser("~")
-    reserved = set()
-    for p in (list(adapter.global_skills_subpaths)
-              + list(getattr(adapter, "global_plugin_registry_subpaths", []) or [])
-              + list(getattr(adapter, "isolation_config_masks", {}) or {})):
-        reserved.add(str(p).replace("\\", "/").split("/")[0])
-    candidates = sorted(e for e in os.listdir(real_home) if e not in reserved)
+    candidates, unruled_out = _bisect_candidates(adapter, real_home)
 
-    print(f"=== bisect {adapter.name}: {len(candidates)} top-level candidates "
-          f"(reserved by the adapter, never masked: {sorted(reserved)})")
+    print(f"=== bisect {adapter.name}: {len(candidates)} candidates "
+          f"({len(candidates) - sum('/' in c for c in candidates)} top-level, "
+          f"{sum('/' in c for c in candidates)} expanded into reserved roots)")
+    print(f"    never masked, so never ruled out: {unruled_out}")
+
+    def _inconclusive(stage: str, verdict: str) -> int:
+        """A verdict that is neither WORKS nor AUTH-FAIL carries no information about WHERE
+        the credential is, so the search must stop rather than attribute a startup error,
+        a network blip or a broken containment to whichever half happened to be masked."""
+        print(f"INCONCLUSIVE at {stage}: verdict {verdict} is not an authentication result. "
+              f"A non-auth failure says the configuration is unusable, not that the masked "
+              f"paths hold the credential — narrowing on it would name an arbitrary path. "
+              f"Re-run when the underlying failure is understood.")
+        return 2
 
     base = _run_once(adapter, args, subs=[], masks=[], overlay=True)
     print(f"baseline overlay, nothing masked: {base['verdict']}")
@@ -293,28 +459,41 @@ def _bisect(adapter, args) -> int:
     allm = _run_once(adapter, args, subs=[], masks=candidates, overlay=True)
     print(f"overlay, ALL {len(candidates)} masked: {allm['verdict']}")
     if allm["verdict"] == "WORKS":
+        if unruled_out:
+            print(f"masking every maskable path still authenticates, but {len(unruled_out)} "
+                  f"path(s) were never masked: {unruled_out}. That is INCONCLUSIVE, not proof "
+                  f"the credential lives outside HOME — check these by hand (a config mask "
+                  f"that sanitizes rather than replaces can carry auth straight through).")
+            return 2
         print("masking every top-level entry still authenticates — the credential is NOT "
               "under HOME (keychain, or an absolute path elsewhere). That is itself the "
               "answer: this CLI's contained surface is [] for auth purposes.")
         return 0
+    if allm["verdict"] != "AUTH-FAIL":
+        return _inconclusive("all-masked", allm["verdict"])
 
-    # Invariant: masking `masked` breaks auth; masking nothing does not. Shrink `masked`.
+    # Invariant: masking `masked` breaks AUTH; masking nothing does not. Shrink `masked`.
     masked = list(candidates)
     while len(masked) > 1:
         half = len(masked) // 2
         left, right = masked[:half], masked[half:]
-        res = _run_once(adapter, args, subs=[], masks=left, overlay=True)
-        print(f"  masking {len(left):>3} of {len(masked):>3} -> {res['verdict']}")
-        if res["verdict"] != "WORKS":
-            masked = left            # breakage reproduces in the left half
+        lres = _run_once(adapter, args, subs=[], masks=left, overlay=True)
+        print(f"  masking {len(left):>3} of {len(masked):>3} -> {lres['verdict']}")
+        if lres["verdict"] == "AUTH-FAIL":
+            masked = left            # the auth failure reproduces in the left half
             continue
-        res = _run_once(adapter, args, subs=[], masks=right, overlay=True)
-        print(f"  masking {len(right):>3} of {len(masked):>3} -> {res['verdict']}")
-        if res["verdict"] != "WORKS":
+        if lres["verdict"] != "WORKS":
+            return _inconclusive(f"left half of {len(masked)}", lres["verdict"])
+        rres = _run_once(adapter, args, subs=[], masks=right, overlay=True)
+        print(f"  masking {len(right):>3} of {len(masked):>3} -> {rres['verdict']}")
+        if rres["verdict"] == "AUTH-FAIL":
             masked = right
             continue
-        # Neither half alone breaks it: the CLI reads more than one entry (e.g. a token in one
-        # place and a machine id in another). Report the pair rather than pretending it is one.
+        if rres["verdict"] != "WORKS":
+            return _inconclusive(f"right half of {len(masked)}", rres["verdict"])
+        # Both halves authenticate on their own: the CLI reads more than one entry (e.g. a
+        # token in one place and a machine id in another). Report the set rather than
+        # pretending it is one path.
         print(f"neither half alone breaks auth — the surface is SPLIT across "
               f"{len(masked)} entries: {masked}")
         return 0
@@ -325,7 +504,11 @@ def _bisect(adapter, args) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("adapter")
+    ap.add_argument("adapter", nargs="?",
+                    help="adapter to probe; omit with --self-check")
+    ap.add_argument("--self-check", action="store_true",
+                    help="check the bisect's decision rules against canned verdicts and exit. "
+                         "No CLI is launched and nothing is copied.")
     ap.add_argument("--subpaths", default="",
                     help="comma-separated HOME-relative paths to copy in (default: none, "
                          "i.e. the empty surface)")
@@ -362,6 +545,11 @@ def main() -> int:
     ap.add_argument("--keep-credentials", action="store_true",
                     help="with --keep, permit leaving COPIED CREDENTIALS on disk.")
     args = ap.parse_args()
+
+    if args.self_check:
+        return _self_check()
+    if not args.adapter:
+        ap.error("an adapter is required (or pass --self-check)")
 
     subs = [s.strip() for s in args.subpaths.split(",") if s.strip()]
     adapter = get_adapter(args.adapter)
