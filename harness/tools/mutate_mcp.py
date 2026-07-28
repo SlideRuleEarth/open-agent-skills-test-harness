@@ -718,7 +718,8 @@ MUTATIONS = [
     # mechanism while declaring no masks is cleared by any HOME, and the overlay it points
     # at materializes nothing. The run goes green having masked nothing at all.
     ("M107-mask-mechanism-not-checked-against-declared-masks", BASE,
-     "\n            if not (self.isolation_config_masks or plugin_masks_apply):",
+     "\n            if not (self.isolation_config_masks "
+     "or self.plugin_registry_config_masks):",
      "\n            if False:",
      "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
     # DECLARING a plugin mask taken as the mask having somewhere to act. With no
@@ -726,9 +727,17 @@ MUTATIONS = [
     # `build_mcp_masked_home` returns (None, {}) — so the adapter is cleared by an overlay
     # that was never built. The subtler half of the same self-contradiction.
     ("M112-plugin-masks-counted-without-a-registry-to-apply-them-in", BASE,
-     "\n            plugin_masks_apply = bool(self.plugin_registry_config_masks\n"
-     "                                      and self.global_plugin_registry_subpaths)",
-     "\n            plugin_masks_apply = bool(self.plugin_registry_config_masks)",
+     "\n            if (self.plugin_registry_config_masks\n"
+     "                    and not self.global_plugin_registry_subpaths):",
+     "\n            if False:",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # The SHIPPED case, and the reason the check is per-channel rather than aggregate:
+    # antigravity declares both kinds of mask, so losing its registry root orphans the plugin
+    # masks while `.gemini/config/mcp_config.json` keeps any "does it have masks" test happy.
+    # Fakes alone would not have caught this; the arm asserts the shipped adapters satisfy
+    # their own declarations for exactly that reason.
+    ("M113-antigravity-loses-the-registry-its-plugin-masks-need", AGY,
+     '\n    global_plugin_registry_subpaths = [".gemini/config/plugins"]', "",
      "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
     # The shipped mapping, pinned per adapter. Dropping a CLI declaration silently refuses a
     # run that is hermetic without the overlay (over-refusal, which removes the only working

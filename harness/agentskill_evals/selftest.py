@@ -9466,6 +9466,17 @@ def _check_mcp_declared_servers(failures, verbose):
         mcp_off_mechanism = _MCPOffMechanism.OVERLAY_MASKS
         plugin_registry_config_masks = {"mcp_config.json": '{"mcpServers": {}}'}
 
+    class _MixedOrphanMaskInjector(_FakeInjector):
+        """A direct mask that WORKS, beside plugin masks applied nowhere. The direct mask
+        satisfies any aggregate "does this adapter have masks that apply" test while the
+        plugin channel — a server-discovery channel of its own — stays unmasked, so covering
+        a different channel just stops anyone noticing. This is antigravity's exact shape
+        with its registry root removed, which is why the check is per-channel."""
+        name = "mixed-orphan-mask-injector"
+        mcp_off_mechanism = _MCPOffMechanism.OVERLAY_MASKS
+        isolation_config_masks = {".x/mcp.json": '{"mcpServers": {}}'}
+        plugin_registry_config_masks = {"mcp_config.json": '{"mcpServers": {}}'}
+
     class _MasklessMaskClaimInjector(_FakeInjector):
         """Names the overlay as its mechanism and declares NO masks at all — a declaration
         that contradicts itself. The overlay builds, the run goes green, and nothing was
@@ -9526,6 +9537,9 @@ def _check_mcp_declared_servers(failures, verbose):
         # ...and the same emptiness reached by a subtler route: masks that exist but have
         # nowhere to be applied, because no plugin-registry root is named.
         orphan_bare, orphan_iso = _both(_OrphanPluginMaskInjector)
+        # The one an AGGREGATE sufficiency test clears: a working direct mask standing beside
+        # orphaned plugin masks. Per-channel, or a covered channel launders an uncovered one.
+        mixed_bare, mixed_iso = _both(_MixedOrphanMaskInjector)
         # The mechanism's own builder agrees: with no registry root there is no overlay at
         # all. Asserted against `build_mcp_masked_home` rather than only against the guard,
         # so the two cannot drift into disagreeing about what a declared mask does.
@@ -9548,6 +9562,12 @@ def _check_mcp_declared_servers(failures, verbose):
                for a in ("claude", "codex", "copilot", "antigravity")}
     mechs = {a: getattr(get_adapter(a).mcp_off_mechanism, "value", None)
              for a in ("claude", "codex", "copilot", "antigravity")}
+    # The SHIPPED adapters must satisfy their own declarations: given an overlay, none may
+    # report a gap. Fakes alone would not have caught antigravity losing its registry root —
+    # its plugin masks would go orphaned while its direct `.gemini/config/mcp_config.json`
+    # mask kept any aggregate test happy, which is exactly the combination review found.
+    shipped_gaps = {a: get_adapter(a).mcp_off_gap("/tmp/ase-selftest-anywhere")
+                    for a in ("claude", "codex", "copilot", "antigravity")}
 
     _check("mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask",
            # overlay-masked: needs the overlay, allowed once it has one — both halves
@@ -9565,6 +9585,11 @@ def _check_mcp_declared_servers(failures, verbose):
            and refused(orphan_bare) and refused(orphan_iso)
            and "names no global_plugin_registry_subpaths" in orphan_iso
            and orphan_home is None and valid_home is not None
+           # ...and an orphaned plugin mask is not laundered by a direct mask that works
+           and refused(mixed_bare) and refused(mixed_iso)
+           and "masked nowhere" in mixed_iso
+           # every shipped adapter satisfies its own declaration
+           and all(g is None for g in shipped_gaps.values())
            and "has not been determined" in silent_iso
            and "declares no masks" in empty_iso
            and depends == {"claude": False, "codex": False,
@@ -9587,8 +9612,12 @@ def _check_mcp_declared_servers(failures, verbose):
            f"(iso={refused(empty_iso)}), and so is one whose masks have nowhere to be "
            f"applied — plugin masks with no registry root, where the builder returns no "
            f"overlay at all (iso={refused(orphan_iso)}, build={orphan_home!r} vs a rooted "
-           f"one at {type(valid_home).__name__}). Declaring a mask and the mask having "
-           f"somewhere to act are different claims. {mechs}", failures, verbose)
+           f"one at {type(valid_home).__name__}) — and NOT laundered by a direct mask that "
+           f"does work beside it (iso={refused(mixed_iso)}), since plugins are a discovery "
+           f"channel of their own and an aggregate 'has masks' test lets a covered channel "
+           f"stand in for an uncovered one. Declaring a mask and the mask having somewhere "
+           f"to act are different claims. The shipped adapters satisfy their own "
+           f"declarations: {shipped_gaps}. {mechs}", failures, verbose)
 
     # --- a warning nobody can read afterwards is not a warning -----------------
     # The server-health warning above went to the HARNESS process's stderr, which nothing
