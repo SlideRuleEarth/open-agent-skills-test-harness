@@ -943,31 +943,81 @@ class Runner:
             Sorting is over the values as given (strings or tuples), so callers keep
             whatever structure they passed in; nothing is stringified here.
             """
-            known = sorted({v for v in values if v is not None})
+            # Sorted on `repr`, which is a TOTAL order over every value this can be handed.
+            # Natural ordering is not: the axes carry strings on one and tuples on another,
+            # and two differently-shaped values in the SAME axis (a `("a",)` beside a
+            # `(("a", None),)`) make `<` raise TypeError. That crash lands in `_consistency`
+            # while it is describing a finished matrix, which is worse than any verdict it
+            # could have reported — the same reason `_server_pair` below tolerates a shape
+            # it does not model. Ordering is for stable display only; nothing reads it.
+            known = sorted({v for v in values if v is not None}, key=repr)
             return known, sum(1 for v in values if v is None)
 
         versions, versions_unknown = _spread([c.run_result.cli_version for c in results])
         servers_raw = []
         for c in results:
+            # The run's OWN account first, argv second. argv is a claim about what the
+            # invocation could have loaded; the init event is the run's report of what it
+            # did load, which is both stronger and the only source that can speak once
+            # `--mcp-config` is passed — argv then names a FILE, so this axis used to go
+            # unknown on exactly the runs that declare servers, and an MCP matrix could
+            # never read `verified`. A run that did not witness its host reports None and
+            # falls back, rather than contributing an empty set it never established.
+            witnessed = c.run_result.mcp_servers_witnessed
+            if witnessed is not None:
+                servers_raw.append(tuple(witnessed))
+                continue
             try:
                 seen = self.adapter.mcp_servers_seen(c.run_result.argv)
             except Exception:  # pragma: no cover — a reporting path must never fail a run
                 seen = None
+            # Normalized to the witness's `(name, status)` shape, with an unknown status,
+            # so the two sources are comparable when a matrix draws on both — which happens
+            # whenever one cell crashes before its init event and its siblings do not.
+            # Compared as name-only tuples on one side and pairs on the other, that cell
+            # would have been reported as DRIFT: a difference in evidence source
+            # masquerading as a difference in configuration.
+            #
             # Kept as a TUPLE, never joined into a string. Server names are arbitrary JSON
             # object keys for copilot, so a name may itself contain the separator: joining
             # on "," makes {"a,b"} and {"a","b"} the same value and reports two genuinely
             # different configurations as consistent. Tuples compare structurally and are
             # emitted below as JSON arrays.
-            servers_raw.append(None if seen is None else tuple(seen))
+            servers_raw.append(None if seen is None else tuple((n, None) for n in seen))
         servers, servers_unknown = _spread(servers_raw)
         isolation = sorted({bool(c.isolated) for c in results})
 
         drift = []
         if len(versions) > 1:
             drift.append(f"CLI version varied across cells: {', '.join(versions)}")
+        def _server_pair(entry):
+            """One entry as ``(name, status)``, whichever source produced it.
+
+            Tolerant of an entry that is not a pair, deliberately, and the tolerance is the
+            point rather than defensive habit. Every producer normalizes to `(name, status)`
+            today, so the fallback is unreachable — but everything below this line is a
+            REPORTING path, and unpacking an unmodelled shape would raise out of
+            `_consistency` while describing the run, turning a comparability note into a
+            crashed matrix. That is strictly worse than either answer it was choosing
+            between, and it is the same reason `mcp_servers_seen` above is already wrapped
+            in a try. Report what is there; never fail the report.
+            """
+            if isinstance(entry, tuple) and len(entry) == 2:
+                return entry[0], entry[1]
+            return entry, None
+
+        def _fmt_server(entry):
+            """`name(status)` so a matrix that differs only in HEALTH says so — two cells
+            both listing `echo`, one connected and one failed, did not run against the same
+            tool surface, and "varied: [echo]; [echo]" reads as a bug in the report rather
+            than as the finding it is."""
+            name, status = _server_pair(entry)
+            return f"{name}({status})" if status else str(name)
+
         if len(servers) > 1:
             drift.append("MCP server set varied across cells: "
-                         + "; ".join("[" + (", ".join(s) if s else "none") + "]"
+                         + "; ".join("[" + (", ".join(_fmt_server(e) for e in s)
+                                            if s else "none") + "]"
                                      for s in servers))
         if len(isolation) > 1:
             drift.append("isolation varied across cells: some ran isolated, some did not")
@@ -1008,8 +1058,17 @@ class Runner:
             "cli_version_unknown_cells": versions_unknown,
             "cli_version_verified": cli_verified,
             # JSON arrays, one per distinct set — never a joined string, since a server
-            # name can contain any separator (see _spread's caller).
-            "mcp_server_sets": [list(s) for s in servers],
+            # name can contain any separator (see _spread's caller). Names only, so the
+            # field keeps the shape it has always had; the statuses the comparison actually
+            # runs on are in `mcp_server_states` below rather than changing this one
+            # underneath a reader.
+            "mcp_server_sets": [[_server_pair(e)[0] for e in s] for s in servers],
+            # The values `mcp_server_set_verified` is computed from: `[name, status]` pairs,
+            # status null where the source was argv rather than the run's own witness. Split
+            # out because a matrix can now be UNVERIFIED on a name-identical set — same
+            # servers, different health — and a reader looking only at `mcp_server_sets`
+            # would see two identical arrays and no reason for the verdict.
+            "mcp_server_states": [[list(_server_pair(e)) for e in s] for s in servers],
             "mcp_server_set_unknown_cells": servers_unknown,
             "mcp_server_set_verified": mcp_verified,
             "isolation_uniform": len(isolation) <= 1,

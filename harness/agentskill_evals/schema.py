@@ -75,6 +75,11 @@ class RunResult:
     # Recorded per cell so a matrix can be checked for having run under ONE build — a
     # self-updating CLI can change mid-matrix, which silently makes cells incomparable.
     cli_version: Optional[str] = None
+    # MCP servers this run itself reported hosting, as (name, status) pairs, when its
+    # telemetry states them (claude's init event). None = the run said nothing readable,
+    # which the consistency check counts as an axis it could not compare rather than as
+    # agreement — see ParseOutput.mcp_servers_witnessed for why pairs rather than names.
+    mcp_servers_witnessed: Optional[tuple] = None
     stdout_path: Optional[str] = None
     stderr_path: Optional[str] = None
     timed_out: bool = False

@@ -576,6 +576,36 @@ MUTATIONS = [
      '\n                "--skip-git-repo-check",\n                "--json", "-m", model, "say ok"]',
      '\n                "--json", "-m", model, "say ok"]',
      "codex.skips_the_git_repo_trust_gate"),
+    # The whole contract of the reporting-path witness: an unwitnessed run must say None,
+    # not `()`. Collapsing them lets a cell that crashed before its init event contribute
+    # agreement it never established, and the matrix reads verified on its strength.
+    ("M90-unwitnessed-run-reports-an-empty-server-set", CLAUDE,
+     "\n    if violation is not None or not witnessed:\n        return None",
+     "\n    if violation is not None or not witnessed:\n        return ()",
+     "claude.witnessed_servers_distinguishes_none_from_empty"),
+    # Statuses dropped where the AXIS is built, so `echo` connected in one cell and failed
+    # in another compare equal and a matrix where one cell had no working tool surface
+    # reports as verified. Aimed at the consistency layer rather than at the claude helper:
+    # mutating the helper reddens its own arm first, which is a catch by the wrong test and
+    # leaves the matrix-scale property unproven.
+    ("M91-consistency-drops-witnessed-status", RUNNER,
+     "\n                servers_raw.append(tuple(witnessed))",
+     "\n                servers_raw.append(tuple((n, None) for n, _ in witnessed))",
+     "runner.mcp_axis_compares_server_health_not_just_names"),
+    # The consistency check ignoring the witness and falling back to argv alone — the state
+    # this work started from, where --mcp-config made the axis unreadable and no MCP matrix
+    # could ever reach `verified`.
+    ("M92-consistency-ignores-the-witness", RUNNER,
+     "\n            witnessed = c.run_result.mcp_servers_witnessed",
+     "\n            witnessed = None",
+     "runner.mcp_axis_reads_the_runs_own_witness_not_just_argv"),
+    # argv-derived names left in the bare-name shape while the witness yields pairs: a cell
+    # that crashed before its init event then differs from its siblings by EVIDENCE SOURCE,
+    # and the matrix reports drift that never happened.
+    ("M93-argv-fallback-shape-mismatches-the-witness", RUNNER,
+     "\n            servers_raw.append(None if seen is None else tuple((n, None) for n in seen))",
+     "\n            servers_raw.append(None if seen is None else tuple(seen))",
+     "runner.mcp_axis_reads_the_runs_own_witness_not_just_argv"),
 ]
 
 

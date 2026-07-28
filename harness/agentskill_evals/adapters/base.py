@@ -96,6 +96,21 @@ class ParseOutput:
     # and None is NOT interchangeable with a version: it means "unknown", which the
     # cross-cell consistency check must not treat as agreement.
     cli_version: Optional[str] = None
+    # The MCP servers the RUN ITSELF reported hosting, as (name, status) pairs — claude's
+    # `system`/`init` event, the same structural field the kill-switch witness reads. None
+    # means this run stated nothing readable, which is emphatically not the empty tuple:
+    # `()` is "the run said it hosted no servers" and None is "the run did not say", and
+    # the consistency check treats only the first as a comparison it could make.
+    #
+    # Why pairs and not names: two cells that both list `echo` but where one has it
+    # `connected` and the other `failed` did NOT run against the same tool surface, and an
+    # axis comparing names alone would call that matrix verified. Being named is not being
+    # usable — the same distinction `_mcp_witness` already draws per cell.
+    #
+    # Comparability reporting only, never a safety decision. Hermeticity is decided by
+    # `verify_post_run` off this same event; that a fact learned from the run may not CLEAR
+    # a security check (TODO_Contained_HOME.md §3) is why this stays on the reporting path.
+    mcp_servers_witnessed: Optional[tuple] = None
 
 
 class Adapter(ABC):

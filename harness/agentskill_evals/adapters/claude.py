@@ -202,6 +202,35 @@ def _mcp_witness(stdout: str,
     return (None, [], False, {})
 
 
+def _witnessed_servers(stdout: str, exit_code: int) -> Optional[tuple]:
+    """The servers this run reported hosting, as sorted ``(name, status)`` pairs.
+
+    ``None`` whenever the run did not actually witness its MCP host — it crashed before
+    the init event, or the event was reshaped so the field could not be read. That is the
+    whole point of the return type: `()` says "the run reported hosting nothing", None says
+    "the run did not report", and a matrix may only be called comparable on the first.
+    Collapsing them would let a crashed cell contribute agreement it never established,
+    which is the same defect the tri-state `comparability` exists to prevent.
+
+    Pairs rather than names because being NAMED is not being USABLE. A cell where `echo` is
+    `connected` and a sibling where `echo` is `failed` ran against different tool surfaces,
+    and a comparison over names alone would report that matrix as verified.
+
+    A violation is deliberately not raised here: this runs on the reporting path (`parse`),
+    where the rule is that malformed telemetry is an UNKNOWN rather than a failure. The
+    identical evidence is read again by `verify_post_run`, which is the layer allowed to
+    fail the run — and does, on exactly the reshaped event that makes this return None.
+    """
+    violation, live, witnessed, statuses = _mcp_witness(stdout, exit_code)
+    if violation is not None or not witnessed:
+        return None
+    # Keyed on the NAME alone: a status is `str | None`, and sorting raw pairs would compare
+    # those against each other the moment two names collided — `None < "connected"` is a
+    # TypeError, i.e. a crash on the reporting path. `live` is deduped today so it cannot
+    # happen, which is exactly the kind of guarantee that quietly stops holding.
+    return tuple(sorted(((name, statuses.get(name)) for name in live), key=lambda p: p[0]))
+
+
 class ClaudeAdapter(Adapter):
     name = "claude"
     binary = "claude"
@@ -605,4 +634,10 @@ class ClaudeAdapter(Adapter):
             # verification was reasoning about rather than a second, possibly different,
             # determination of it.
             cli_version=_stream_cli_version(stdout),
+            # Read from the SAME init event and the same helper as the kill-switch witness,
+            # for the same reason as cli_version above: what gets reported is the thing the
+            # verification reasoned about, not a second determination of it that could
+            # disagree. Comparability only — `verify_post_run` remains the sole consumer
+            # that can fail a run on this evidence.
+            mcp_servers_witnessed=_witnessed_servers(stdout, exit_code),
         )

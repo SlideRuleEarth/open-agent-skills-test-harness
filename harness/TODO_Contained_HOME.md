@@ -372,9 +372,12 @@ ABA fix and its route to `parallel_safe_config = True`.
 
 Smaller, unblocked:
 
-- Report the **witnessed** MCP server set from the init event so MCP matrices can reach
-  `verified`. Today `mcp_servers_seen()` returns `None` once `--mcp-config` is on argv, so
-  matrices read `unverified`.
+- ~~Report the **witnessed** MCP server set from the init event so MCP matrices can reach
+  `verified`.~~ **Done (2026-07-28)** — `ParseOutput.mcp_servers_witnessed` carries
+  `(name, status)` pairs from claude's init event along the path `cli_version` already
+  takes, and `_consistency` prefers it over argv. See `DESIGN_MCP_Support.md` §8 Phase 1 for
+  the three ways it could have manufactured a green (`None` vs `()`, pairs vs names, and one
+  shape across both evidence sources).
 - Portable `used_mcp_tool` assertion (§7) once a second adapter lands.
 - Refuse `isolated: false` combined with `mcp_servers:`.
 - Sweep for other default-held invariants (`judge`, `max_cells`, `provision`).
