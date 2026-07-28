@@ -270,7 +270,7 @@ Non-negotiable, in this order. `SELFTEST PASSED` alone is not evidence.
 harness/.venv/bin/python -m agentskill_evals.cli selftest          # 486 arms
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 harness/.venv/bin/python -m pyflakes harness/agentskill_evals/*.py harness/agentskill_evals/adapters/*.py
-python3 harness/tools/mutate_mcp.py                               # 112/112 caught by the intended arm
+python3 harness/tools/mutate_mcp.py                               # 113/113 caught by the intended arm
 git diff --check
 ```
 
@@ -426,6 +426,16 @@ Smaller, unblocked:
   **Latent until an adapter is both** — the mask-dependent adapters are exactly the ones
   that cannot inject, so `validate_mcp_support` refuses them first. It arms itself the day
   copilot or agy gains injection, which is why it went in before that rather than after.
+- **Route plugin-registry masks into custom config-home mirrors.** Both mirror builders —
+  `isolation.build_mcp_masked_home` and the runner's config-home mirror — forward only
+  `reroot_config_masks(...)`, never `plugin_registry_subpaths` / `plugin_config_masks`. An
+  adapter declaring both a plugin registry and a custom config home therefore gets a mirror
+  where the plugin MCP channel is unmasked, and the child is repointed at that mirror. Needs
+  a reroot for the registry subpaths (the `reroot_config_masks` prefix-strip, applied to
+  paths rather than mask keys) plus the two call sites. Unreachable today — agy declares the
+  plugin masks and no config home, the other three the reverse — and `Adapter.mcp_off_gap`
+  REFUSES the combination meanwhile, with an arm that reads the leak out of the builder.
+  Delete that refusal in the same commit that lands the routing; the arm will already be red.
 - Sweep for other default-held invariants (`judge`, `max_cells`, `provision`).
 - Report the `mcp_servers:` + no-overlay refusal in the **CLI pre-flight** as well, next to
   `validate_mcp_support` in `cmd_run` — today it surfaces as a failed cell per cell, where

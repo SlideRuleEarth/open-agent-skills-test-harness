@@ -298,6 +298,29 @@ class Adapter(ABC):
                         f"global_plugin_registry_subpaths for them to be applied in, so that "
                         f"discovery channel is masked nowhere — whatever other masks it "
                         f"declares for other channels")
+            # ...and a rooted plugin mask the overlay cannot carry into a CUSTOM config home.
+            # Both mirror builders forward only REROOTED DIRECT masks — `build_mcp_masked_home`
+            # and the runner's config-home mirror — and neither passes the registry roots or
+            # the plugin masks. So an adapter whose config-home var is set gets a mirror where
+            # that channel is unmasked, and the child is repointed at exactly that mirror
+            # (found in review, which read the live server back out of it).
+            #
+            # REFUSED rather than routed. Teaching the mirrors to carry plugin masks is
+            # isolation machinery on the path every isolated run takes, for a combination no
+            # shipped adapter has: antigravity declares the plugin masks and no config home,
+            # the other three the reverse. Recorded as a follow-up in TODO_Contained_HOME.md
+            # §6 — this refusal is what keeps it honest until then, and should be deleted in
+            # the same commit that routes them.
+            #
+            # Deliberately keyed on DECLARING a config home, not on the var being set right
+            # now: the child's environment is not an input here, and "unset at this moment"
+            # is not a property worth resting a guarantee on.
+            if self.plugin_registry_config_masks and config_home_entries(self):
+                return (f"{self.name} keeps its plugin-registry MCP channel masked through "
+                        f"the isolation overlay, but it also uses a custom config home, and "
+                        f"the mirror built for that home carries only the rerooted direct "
+                        f"masks — so with the config-home variable set the child is "
+                        f"repointed at a mirror where that channel is unmasked")
             # Past that, plugin masks are known to be rooted, so mere presence is sufficiency.
             if not (self.isolation_config_masks or self.plugin_registry_config_masks):
                 return (f"{self.name} declares its MCP-off guarantee lives in the isolation "

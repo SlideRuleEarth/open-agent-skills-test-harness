@@ -736,6 +736,13 @@ MUTATIONS = [
     # masks while `.gemini/config/mcp_config.json` keeps any "does it have masks" test happy.
     # Fakes alone would not have caught this; the arm asserts the shipped adapters satisfy
     # their own declarations for exactly that reason.
+    # A rooted plugin mask taken as covering the CUSTOM config home too. Both mirror
+    # builders forward only rerooted DIRECT masks, so the mirror the child is repointed at
+    # leaves that channel unmasked — the fourth way "declared" and "in effect" come apart.
+    ("M114-plugin-masks-assumed-to-reach-a-custom-config-home", BASE,
+     "\n            if self.plugin_registry_config_masks and config_home_entries(self):",
+     "\n            if False:",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
     ("M113-antigravity-loses-the-registry-its-plugin-masks-need", AGY,
      '\n    global_plugin_registry_subpaths = [".gemini/config/plugins"]', "",
      "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),

@@ -9477,6 +9477,17 @@ def _check_mcp_declared_servers(failures, verbose):
         isolation_config_masks = {".x/mcp.json": '{"mcpServers": {}}'}
         plugin_registry_config_masks = {"mcp_config.json": '{"mcpServers": {}}'}
 
+    class _CustomHomePluginMaskInjector(_FakeInjector):
+        """Correctly rooted plugin masks, PLUS a custom config home. The mirror built for
+        that home forwards only the rerooted direct masks, so the plugin channel is unmasked
+        in the very directory the child gets repointed at. Refused until the mirrors route
+        plugin masks too."""
+        name = "custom-home-plugin-mask-injector"
+        mcp_off_mechanism = _MCPOffMechanism.OVERLAY_MASKS
+        isolation_config_homes = [("ASE_SELFTEST_CFG_HOME", ".x", "skills")]
+        global_plugin_registry_subpaths = [".x/plugins"]
+        plugin_registry_config_masks = {"mcp_config.json": '{"mcpServers": {}}'}
+
     class _MasklessMaskClaimInjector(_FakeInjector):
         """Names the overlay as its mechanism and declares NO masks at all — a declaration
         that contradicts itself. The overlay builds, the run goes green, and nothing was
@@ -9549,6 +9560,33 @@ def _check_mcp_declared_servers(failures, verbose):
         for _h in (orphan_home, valid_home):
             if _h:
                 _shutil.rmtree(_h, ignore_errors=True)
+        # Rooted plugin masks + a custom config home: refused, and the reason is READ OUT of
+        # the builder rather than asserted in prose. With the var set, the mirror the child is
+        # repointed at still resolves the plugin config to the real, unmasked file. If anyone
+        # teaches the mirrors to route plugin masks, `mirror_leak` goes False, this goes red,
+        # and the refusal above should be deleted in that same commit.
+        cfg_bare, cfg_iso = _both(_CustomHomePluginMaskInjector)
+        _cfg_home = _tempfile.mkdtemp(prefix="ase-cfghome-")
+        _plug = os.path.join(_cfg_home, "plugins", "p")
+        os.makedirs(_plug)
+        with open(os.path.join(_plug, "mcp_config.json"), "w") as _fh:
+            _fh.write('{"mcpServers": {"live": {"command": "true"}}}')
+        _saved_cfg = os.environ.get("ASE_SELFTEST_CFG_HOME")
+        os.environ["ASE_SELFTEST_CFG_HOME"] = _cfg_home
+        try:
+            _mh, _menv = _masked_home(_CustomHomePluginMaskInjector())
+            _mirror = _menv.get("ASE_SELFTEST_CFG_HOME")
+            _leaked = os.path.join(_mirror or "", "plugins", "p", "mcp_config.json")
+            mirror_leak = bool(_mirror) and os.path.exists(_leaked) and \
+                "live" in open(_leaked).read()
+            if _mh:
+                _shutil.rmtree(_mh, ignore_errors=True)
+        finally:
+            if _saved_cfg is None:
+                os.environ.pop("ASE_SELFTEST_CFG_HOME", None)
+            else:
+                os.environ["ASE_SELFTEST_CFG_HOME"] = _saved_cfg
+            _shutil.rmtree(_cfg_home, ignore_errors=True)
     finally:
         _shutil.rmtree(_iso_home, ignore_errors=True)
     # Matched on the refusal's opening clause, which names the reason, rather than on the
@@ -9588,6 +9626,9 @@ def _check_mcp_declared_servers(failures, verbose):
            # ...and an orphaned plugin mask is not laundered by a direct mask that works
            and refused(mixed_bare) and refused(mixed_iso)
            and "masked nowhere" in mixed_iso
+           # ...nor carried into a custom config home the child is repointed at
+           and refused(cfg_bare) and refused(cfg_iso)
+           and "custom config home" in cfg_iso and mirror_leak is True
            # every shipped adapter satisfies its own declaration
            and all(g is None for g in shipped_gaps.values())
            and "has not been determined" in silent_iso
@@ -9616,8 +9657,12 @@ def _check_mcp_declared_servers(failures, verbose):
            f"does work beside it (iso={refused(mixed_iso)}), since plugins are a discovery "
            f"channel of their own and an aggregate 'has masks' test lets a covered channel "
            f"stand in for an uncovered one. Declaring a mask and the mask having somewhere "
-           f"to act are different claims. The shipped adapters satisfy their own "
-           f"declarations: {shipped_gaps}. {mechs}", failures, verbose)
+           f"to act are different claims — including acting in the directory the child is "
+           f"actually repointed at: a rooted plugin mask is not carried into a custom config "
+           f"home's mirror (iso={refused(cfg_iso)}), and the builder confirms it, the "
+           f"mirror still resolving the live server (leak={mirror_leak}). The shipped "
+           f"adapters satisfy their own declarations: {shipped_gaps}. {mechs}",
+           failures, verbose)
 
     # --- a warning nobody can read afterwards is not a warning -----------------
     # The server-health warning above went to the HARNESS process's stderr, which nothing
