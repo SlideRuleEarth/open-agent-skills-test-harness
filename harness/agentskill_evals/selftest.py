@@ -9411,23 +9411,57 @@ def _check_mcp_declared_servers(failures, verbose):
     # cannot inject, so `validate_mcp_support` refuses them one line earlier. So it is
     # modelled with an adapter that is both, which is precisely what copilot or antigravity
     # becomes on the day it gains injection. Neither fake is ever spawned.
-    _claude_cls = get_adapter("claude").__class__
+    from .adapters.base import Adapter as _BaseAdapter
+    from .adapters.base import ParseOutput as _BaseParseOutput
 
-    class _MaskedInjector(_claude_cls):
-        name = "masked-injector"
+    class _FakeInjector(_BaseAdapter):
+        """Minimal injecting adapter. Built on the BASE adapter, never on claude's: a claude
+        subclass inherits `--strict-mcp-config` and is therefore hermetic without the
+        overlay, so the first version of this fake modelled the opposite of the case it was
+        named for and the arm demonstrated the confusion rather than the rule (found in
+        review). None of these is ever spawned — `is_available` is False."""
+        name = "fake-injector"
+        binary = "true"
+        supports_mcp_injection = True
+
+        def build_argv(self, prompt, opts, *, cwd):
+            return ["true"]
+
+        def parse(self, stdout, stderr, exit_code, *, opts=None):
+            return _BaseParseOutput()
+
+        def is_available(self):
+            return False
+
+    class _MaskOnlyInjector(_FakeInjector):
+        """Its ONLY MCP-off mechanism is a config mask the overlay materializes — what
+        copilot becomes on gaining injection."""
+        name = "mask-only-injector"
         isolation_config_masks = {".x/mcp.json": '{"mcpServers": {}}'}
 
-        def is_available(self):
-            return False
+    class _PluginMaskOnlyInjector(_FakeInjector):
+        """The same, through the PLUGIN half alone — agy's shape, where servers arrive from
+        `plugins/<name>/mcp_config.json`. No shipped adapter declares this half by itself,
+        which is why the guard's coverage of it needs the same latent-adapter technique the
+        guard itself does (found in review): dropping it is a fail-open regression that
+        nothing else would notice."""
+        name = "plugin-mask-only-injector"
+        plugin_registry_config_masks = {"mcp_config.json": '{"mcpServers": {}}'}
 
-    class _FlagInjector(_claude_cls):
-        """Same adapter, kill-switch at the CLI level — it holds whatever HOME the child is
-        handed, so this one must NOT be refused. Without it the arm would pass for an
-        adapter that refused every non-isolated run, declared servers or not."""
+    class _FlagInjector(_FakeInjector):
+        """Kill-switch at the CLI level, so it holds whatever HOME the child is handed and
+        must NOT be refused — otherwise the rule is about isolation rather than about where
+        the switch lives, and claude's hermetic non-isolated run goes with it."""
         name = "flag-injector"
+        mcp_off_survives_without_isolation = True
 
-        def is_available(self):
-            return False
+    class _BeltAndBracesInjector(_FlagInjector):
+        """A complete CLI kill-switch AND a redundant mask. Hermetic without the overlay, so
+        allowed — the derived predicate refused it, because `bool(masks)` answers "HAS a
+        mask" rather than "DEPENDS on one" (found in review). copilot already carries masks
+        beside its argv disables, so this is not a hypothetical shape."""
+        name = "belt-and-braces-injector"
+        isolation_config_masks = {".x/mcp.json": '{"mcpServers": {}}'}
 
     def _prog_run_adapter(adapter, servers, home=None):
         d = _tempfile.mkdtemp(prefix="ase-mcpiso-")
@@ -9444,31 +9478,43 @@ def _check_mcp_declared_servers(failures, verbose):
 
     _iso_home = _tempfile.mkdtemp(prefix="ase-mcpisohome-")
     try:
-        masked_bare = _try(lambda: _prog_run_adapter(_MaskedInjector(), plain), "")
-        masked_iso = _try(lambda: _prog_run_adapter(_MaskedInjector(), plain,
+        masked_bare = _try(lambda: _prog_run_adapter(_MaskOnlyInjector(), plain), "")
+        masked_iso = _try(lambda: _prog_run_adapter(_MaskOnlyInjector(), plain,
                                                     home=_iso_home), "")
+        plugin_bare = _try(lambda: _prog_run_adapter(_PluginMaskOnlyInjector(), plain), "")
         flag_bare = _try(lambda: _prog_run_adapter(_FlagInjector(), plain), "")
+        belt_bare = _try(lambda: _prog_run_adapter(_BeltAndBracesInjector(), plain), "")
+        # An adapter that declares NOTHING is refused: the default is the fail-closed
+        # direction, and that is what makes a declared flag safe where a derived one was
+        # not. Forgetting it leaves False, and False refuses.
+        silent_bare = _try(lambda: _prog_run_adapter(_FakeInjector(), plain), "")
     finally:
         _shutil.rmtree(_iso_home, ignore_errors=True)
-    # DERIVED from the masks, so an adapter that grows one grows the rule with it. A
-    # hand-maintained boolean beside the masks drifts, and the drift fails open.
     depends = {a: get_adapter(a).mcp_off_depends_on_isolation
                for a in ("claude", "codex", "copilot", "antigravity")}
 
     _check("mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask",
-           "no isolated HOME" in masked_bare and "masked-injector" in masked_bare
+           "no isolated HOME" in masked_bare and "mask-only-injector" in masked_bare
+           and "no isolated HOME" in plugin_bare
+           and "no isolated HOME" in silent_bare
            and "no isolated HOME" not in masked_iso
            and "no isolated HOME" not in flag_bare
+           and "no isolated HOME" not in belt_bare
            and depends == {"claude": False, "codex": False,
                            "copilot": True, "antigravity": True},
-           f"declaring `mcp_servers:` states what this run's tool surface IS. On a runner "
-           f"whose MCP-off guarantee is a mask in the isolation overlay, a cell with no "
-           f"isolated HOME loads the user's real MCP configuration too, so the declared set "
-           f"is a subset of what ran and the scenario grades an experiment nobody described "
-           f"— refused ({masked_bare[:60]!r}), while the same adapter WITH an overlay is "
-           f"not ({masked_iso[:40]!r}). It stays a property of the kill-switch's LOCATION, "
-           f"not of isolation: an adapter whose switch is a CLI flag holds whatever HOME "
-           f"the child gets and is left alone ({flag_bare[:40]!r}). {depends}",
+           f"declaring `mcp_servers:` states what this run's tool surface IS. Where the "
+           f"MCP-off guarantee is a mask the overlay materializes, a cell with no isolated "
+           f"HOME loads the user's real MCP configuration too, so the declared set is a "
+           f"subset of what ran and the scenario grades an experiment nobody described — "
+           f"refused ({masked_bare[:50]!r}), through the PLUGIN half alone as well "
+           f"({'refused' if 'no isolated HOME' in plugin_bare else plugin_bare[:40]!r}), "
+           f"while the same adapter WITH an overlay is not ({masked_iso[:30]!r}). It stays "
+           f"a property of the kill-switch's LOCATION, not of isolation: a CLI-level switch "
+           f"holds whatever HOME the child gets and is left alone ({flag_bare[:30]!r}) — "
+           f"including alongside a redundant mask, which a `bool(masks)` predicate refused "
+           f"for HAVING one rather than DEPENDING on one ({belt_bare[:30]!r}). Declaring "
+           f"nothing refuses ({'refused' if 'no isolated HOME' in silent_bare else 'RAN'}), "
+           f"so the flag can only be forgotten in the safe direction. {depends}",
            failures, verbose)
 
     # --- a warning nobody can read afterwards is not a warning -----------------

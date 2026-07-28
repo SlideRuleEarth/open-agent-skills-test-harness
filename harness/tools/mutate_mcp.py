@@ -691,15 +691,33 @@ MUTATIONS = [
      "\n            if opts.home is None and adapter.mcp_off_depends_on_isolation:",
      "\n            if opts.home is None:",
      "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
-    # The dependence stops being derived from the masks. Any adapter answering False leaves
-    # both the refusal above and the runner's isolation-off warning silently inapplicable —
-    # the drift a hand-maintained boolean beside the masks would produce, in one step.
-    # (No mutation for dropping the `plugin_registry_config_masks` half alone: agy declares
-    #  both and copilot only the first, so no shipped adapter's answer changes and nothing
-    #  in userspace could observe it — the M78 situation. An arm there would be decorative.)
-    ("M104-mcp-off-dependence-not-derived-from-the-masks", BASE,
+    # The default flips to permissive. An adapter that declares nothing then runs its
+    # declared servers beside the user's own — and "declares nothing" is every adapter
+    # anyone adds next, which is exactly why the default is the whole safety of a DECLARED
+    # flag over a derived one.
+    ("M104-unmapped-adapter-defaults-to-permissive", BASE,
+     "\n    mcp_off_survives_without_isolation: bool = False",
+     "\n    mcp_off_survives_without_isolation: bool = True",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # Back to DERIVING it from the masks — the regression review found. `bool(masks)` answers
+    # "HAS a mask", not "DEPENDS on one": it refuses an adapter whose complete CLI
+    # kill-switch is backed by a redundant mask, and it clears one that declared nothing at
+    # all. Both directions wrong, from one expression.
+    ("M105-mcp-off-dependence-derived-from-mask-presence", BASE,
+     "\n        return not self.mcp_off_survives_without_isolation",
      "\n        return bool(self.isolation_config_masks or self.plugin_registry_config_masks)",
-     "\n        return False",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # The shipped mapping, pinned per adapter: dropping either declaration silently refuses
+    # a run that is hermetic without the overlay — over-refusal, which removes the only
+    # working non-isolated path rather than opening a hole, and so goes unnoticed until
+    # someone's scenario stops running.
+    ("M106-claude-stops-claiming-its-cli-kill-switch", CLAUDE,
+     "\n    mcp_off_survives_without_isolation = True",
+     "",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    ("M107-codex-stops-claiming-its-argv-kill-switch", CODEX,
+     "\n    mcp_off_survives_without_isolation = True",
+     "",
      "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
 ]
 

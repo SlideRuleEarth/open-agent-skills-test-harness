@@ -268,6 +268,13 @@ class ClaudeAdapter(Adapter):
 
     # Declared servers ride in on `--mcp-config` (stdio shape verified live, 2.1.113).
     supports_mcp_injection = True
+    # `--strict-mcp-config` ("Only use MCP servers from --mcp-config, ignoring all other MCP
+    # configurations") is a CLI flag, so it holds whatever HOME the child is handed — this
+    # adapter declares no config masks and needs none. A declared server set is therefore
+    # still the whole server set under `isolated: false`, which is why such a run is allowed
+    # rather than refused (see Adapter.mcp_off_survives_without_isolation). The claim rests
+    # entirely on that flag, which is exactly what _PROVENANCE re-checks per build.
+    mcp_off_survives_without_isolation = True
     # Per-server `tools:` is REFUSED here rather than half-enforced. The only claude
     # mechanism that gates MCP tools is `--disallowedTools` on the complement of the
     # allowlist (`--allowedTools` does nothing under --dangerously-skip-permissions —

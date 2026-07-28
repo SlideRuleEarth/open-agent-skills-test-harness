@@ -270,7 +270,7 @@ Non-negotiable, in this order. `SELFTEST PASSED` alone is not evidence.
 harness/.venv/bin/python -m agentskill_evals.cli selftest          # 486 arms
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 harness/.venv/bin/python -m pyflakes harness/agentskill_evals/*.py harness/agentskill_evals/adapters/*.py
-python3 harness/tools/mutate_mcp.py                               # 103/103 caught by the intended arm
+python3 harness/tools/mutate_mcp.py                               # 106/106 caught by the intended arm
 git diff --check
 ```
 
@@ -397,8 +397,12 @@ Smaller, unblocked:
   cell with no isolated HOME loads the user's real servers beside the declared ones and is
   refused; claude (`--strict-mcp-config`) and codex (per-server disables) hold whatever HOME
   the child is handed, and a blanket rule would have refused the one configuration that
-  works today for no safety gain. Derived from the masks (`mcp_off_depends_on_isolation`)
-  rather than declared, so an adapter that grows a mask grows the rule with it.
+  works today for no safety gain. **Declared** per adapter
+  (`mcp_off_survives_without_isolation`, default `False`) rather than derived from mask
+  presence: `bool(masks)` answers "has a mask", not "depends on one", and refused an adapter
+  whose complete CLI kill-switch was backed by a redundant one (found in review). The
+  fail-closed default is what makes declaring safe — forgetting the flag leaves `False`,
+  and `False` refuses.
   **Latent until an adapter is both** — the mask-dependent adapters are exactly the ones
   that cannot inject, so `validate_mcp_support` refuses them first. It arms itself the day
   copilot or agy gains injection, which is why it went in before that rather than after.

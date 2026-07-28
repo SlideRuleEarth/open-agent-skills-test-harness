@@ -212,20 +212,30 @@ class Adapter(ABC):
     # enumerating adapter like copilot handles seeded configs on argv instead).
     workspace_config_masks: dict[str, str] = {}
 
+    # Whether this adapter's MCP-off guarantee survives a run with NO isolation overlay —
+    # i.e. the kill-switch is at the CLI level (claude's `--strict-mcp-config`, codex's
+    # per-server disables, both of which hold whatever HOME the child is handed) rather than
+    # a config mask the overlay materializes.
+    #
+    # DECLARED, not derived. An earlier cut read `bool(isolation_config_masks or
+    # plugin_registry_config_masks)`, which answers "does this adapter HAVE a mask" — a
+    # different question from "does it DEPEND on one". An adapter with a complete CLI
+    # kill-switch AND a redundant mask is hermetic without isolation and would have been
+    # refused anyway (found in review), and belt-and-braces is a shape this project already
+    # uses: copilot carries masks beside its argv disables.
+    #
+    # The default is the fail-closed direction, and that is what makes declaring it safe.
+    # The drift that motivated deriving it — an adapter grows a mask and nobody updates the
+    # flag — cannot fail open from here, because forgetting leaves False and False refuses.
+    # A wrong `True` is the only dangerous value, and it is a claim about a CLI mechanism,
+    # which is the thing VersionProvenance already exists to re-verify per build.
+    mcp_off_survives_without_isolation: bool = False
+
     @property
     def mcp_off_depends_on_isolation(self) -> bool:
-        """Whether this adapter's MCP-off guarantee lives in the isolation overlay.
-
-        False means the kill-switch is at the CLI level and holds whatever HOME the child
-        is handed — claude's ``--strict-mcp-config``, codex's per-server disables. True
-        means the only thing keeping the user's real MCP configuration out of the run is a
-        mask in the overlay, so a run without one silently loads it.
-
-        DERIVED from the masks rather than declared beside them, because the two would drift
-        and the drift fails OPEN: an adapter that grows a mask and forgets the boolean keeps
-        every guard that reads it silently inapplicable. Nothing to forget this way.
-        """
-        return bool(self.isolation_config_masks or self.plugin_registry_config_masks)
+        """Whether the ONLY thing keeping the user's real MCP configuration out of a run is
+        a mask in the isolation overlay — so a run built without one silently loads it."""
+        return not self.mcp_off_survives_without_isolation
 
     supports_output_schema: bool = False
     # True if build_argv maps RunOptions.reasoning_effort onto a native flag/config of this

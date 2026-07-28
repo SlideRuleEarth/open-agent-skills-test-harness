@@ -193,6 +193,13 @@ class CodexAdapter(Adapter):
     # CODEX_HOME overrides ~/.codex (skills under $CODEX_HOME/skills). Under isolation it's
     # mirrored + repointed (custom home kept, skills masked), else cleared to the isolated home.
     isolation_config_homes = [("CODEX_HOME", ".codex", "skills")]
+    # MCP stays off through argv, not through the overlay: `--disable plugins` plus a
+    # per-server disable for every server enumerated by `codex mcp list --json` run with the
+    # CHILD's exact cwd and env — so with no isolated HOME it enumerates the real config and
+    # disables exactly what that run would otherwise load. Enumeration failure fails closed
+    # and a post-verify re-runs codex's own view. No config masks are declared or needed, so
+    # the guarantee does not depend on isolation existing.
+    mcp_off_survives_without_isolation = True
     # Just the auth file. Measured against 0.140.0 on macOS, 2026-07-27: a contained HOME
     # holding only `.codex/auth.json` authenticates and answers; an empty one gets
     # "401 Unauthorized: Missing bearer" from wss://api.openai.com/v1/responses.
