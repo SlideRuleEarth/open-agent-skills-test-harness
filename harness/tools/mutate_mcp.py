@@ -45,6 +45,7 @@ MCP = "agentskill_evals/mcp.py"
 ISO = "agentskill_evals/isolation.py"
 CODEX = "agentskill_evals/adapters/codex.py"
 COPILOT = "agentskill_evals/adapters/copilot.py"
+SCHEMA = "agentskill_evals/schema.py"
 
 MUTATIONS = [
     ("M1-witness-fails-any-server", CLAUDE,
@@ -589,9 +590,50 @@ MUTATIONS = [
     # mutating the helper reddens its own arm first, which is a catch by the wrong test and
     # leaves the matrix-scale property unproven.
     ("M91-consistency-drops-witnessed-status", RUNNER,
-     "\n                servers_raw.append(tuple(witnessed))",
-     "\n                servers_raw.append(tuple((n, None) for n, _ in witnessed))",
+     "\n                health_raw.append(None if any(st is None for _, st in pairs) "
+     "else pairs)",
+     "\n                health_raw.append(tuple((n, None) for n, _ in pairs))",
      "runner.mcp_axis_compares_server_health_not_just_names"),
+    # An UNSTATED status counted as a known one: two cells naming `echo` with no health
+    # given compare equal and the matrix reports verified, which is agreement invented out
+    # of silence. This is the defect review found in the first cut of this axis.
+    ("M94-unstated-health-counts-as-known", RUNNER,
+     "\n                health_raw.append(None if any(st is None for _, st in pairs) "
+     "else pairs)",
+     "\n                health_raw.append(pairs)",
+     "runner.mcp_axis_treats_unstated_health_as_unknown"),
+    # The other half of that finding: argv's disable set treated as health UNKNOWN rather
+    # than as nothing-to-state parks every codex and copilot matrix at unverified forever,
+    # over a question that cannot be asked about a server that was never started.
+    ("M95-argv-disable-set-treated-as-unknown-health", RUNNER,
+     "\n            health_raw.append(() if seen is not None else None)",
+     "\n            health_raw.append(None)",
+     "runner.mcp_axis_treats_unstated_health_as_unknown"),
+    # Two defences cover this one, so the mutation removes BOTH — the M53 shape. `set()` is
+    # undefined on an unhashable entry, and normalizing at ingestion is what stops one ever
+    # reaching it; either alone keeps a finished matrix reportable, which is the point, and
+    # is also why neither shows up as a defect on its own.
+    ("M96-unhashable-witness-entry-crashes-the-report", RUNNER,
+     ("\n            by_key: dict = {}\n            for v in values:\n"
+      "                if v is not None:\n                    by_key.setdefault(repr(v), v)\n"
+      "            known = [by_key[k] for k in sorted(by_key)]",
+      "\n                pairs = tuple((str(n), None if st is None else str(st))\n"
+      "                              for n, st in (_server_pair(e) for e in witnessed))"),
+     ("\n            known = sorted({v for v in values if v is not None}, key=repr)",
+      "\n                pairs = tuple(witnessed)"),
+     "runner.consistency_reports_rather_than_raising_on_an_unmodelled_witness"),
+    # The per-cell artifact losing the witness: the aggregate still lists the distinct
+    # states, but nothing says which cell produced which without re-parsing stdout.
+    ("M97-result-json-drops-the-witness", SCHEMA,
+     '\n            "mcp_servers_witnessed": witness_json(self.mcp_servers_witnessed),',
+     "",
+     "schema.run_result_records_its_provenance_per_cell"),
+    # null and [] collapsed in the artifact: "the run stated nothing" serialized as "it
+    # hosted no servers", which is the distinction the whole axis rests on.
+    ("M98-witness-json-collapses-none-into-empty", SCHEMA,
+     "\n    if witnessed is None:\n        return None",
+     "\n    if witnessed is None:\n        return []",
+     "schema.run_result_records_its_provenance_per_cell"),
     # The consistency check ignoring the witness and falling back to argv alone — the state
     # this work started from, where --mcp-config made the axis unreadable and no MCP matrix
     # could ever reach `verified`.
@@ -599,12 +641,12 @@ MUTATIONS = [
      "\n            witnessed = c.run_result.mcp_servers_witnessed",
      "\n            witnessed = None",
      "runner.mcp_axis_reads_the_runs_own_witness_not_just_argv"),
-    # argv-derived names left in the bare-name shape while the witness yields pairs: a cell
-    # that crashed before its init event then differs from its siblings by EVIDENCE SOURCE,
-    # and the matrix reports drift that never happened.
-    ("M93-argv-fallback-shape-mismatches-the-witness", RUNNER,
-     "\n            servers_raw.append(None if seen is None else tuple((n, None) for n in seen))",
-     "\n            servers_raw.append(None if seen is None else tuple(seen))",
+    # The witness's names not reduced to names, so a cell drawing on the witness compares
+    # `(name, status)` pairs against a sibling's bare argv names — a difference in EVIDENCE
+    # SOURCE reported as a difference in configuration.
+    ("M93-witness-names-not-reduced-to-names", RUNNER,
+     "\n                names_raw.append(tuple(n for n, _ in pairs))",
+     "\n                names_raw.append(pairs)",
      "runner.mcp_axis_reads_the_runs_own_witness_not_just_argv"),
 ]
 
