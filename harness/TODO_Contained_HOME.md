@@ -267,12 +267,18 @@ and `contained_home_that_copies_auth_is_credential_bearing_before_the_copy` (mut
 Non-negotiable, in this order. `SELFTEST PASSED` alone is not evidence.
 
 ```sh
-harness/.venv/bin/python -m agentskill_evals.cli selftest          # 474 on main; 477 after the other three adapters + the codex trust gate
+harness/.venv/bin/python -m agentskill_evals.cli selftest          # 485 arms
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 harness/.venv/bin/python -m pyflakes harness/agentskill_evals/*.py harness/agentskill_evals/adapters/*.py
-python3 harness/tools/mutate_mcp.py                               # 86/86 on main; 88/88 after the other three adapters + the codex trust gate
+python3 harness/tools/mutate_mcp.py                               # 100/100 caught by the intended arm
 git diff --check
 ```
+
+Those two counts are the floor as of the MCP witness axis, and they only ever go up: a lower
+number means arms or mutations were LOST, which is the one outcome neither command reports as
+a failure. Bump them in the same commit that adds arms. (They were previously written as
+"N on main; M after this change", which is a form that is stale the moment the change lands —
+and was, for two PRs.)
 
 Pre-existing pyflakes noise, leave alone: unused `load_spec` in `cli.py:22`, unused `Optional`
 in `adapters/__init__.py:9`, unused `os` in `adapters/codex.py:23`, and many "f-string is
@@ -303,7 +309,10 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   real-home overlay to a walk a mutation can turn recursive; the fix gated that capture to the
   small contained-home fixtures only. `mutate_mcp.py` now also bounds each selftest with a
   `timeout` (reported as `TIMEOUT`, counted as *uncaught*), so a looping mutation is a finding
-  rather than an infinite hang — but it is a backstop, not a licence to hang.
+  rather than an infinite hang — but it is a backstop, not a licence to hang. Each result line
+  also carries its selftest's wall time, and the summary names the slowest; read them against
+  the `baseline:` line. A mutation at several times baseline is already the M65 shape, just not
+  yet past the timeout, and that gap is the only warning anyone gets before it becomes a hang.
 
 ---
 
@@ -372,9 +381,15 @@ ABA fix and its route to `parallel_safe_config = True`.
 
 Smaller, unblocked:
 
-- Report the **witnessed** MCP server set from the init event so MCP matrices can reach
-  `verified`. Today `mcp_servers_seen()` returns `None` once `--mcp-config` is on argv, so
-  matrices read `unverified`.
+- ~~Report the **witnessed** MCP server set from the init event so MCP matrices can reach
+  `verified`.~~ **Done (2026-07-28)** — `ParseOutput.mcp_servers_witnessed` carries
+  `(name, status)` pairs from claude's init event along the path `cli_version` already takes,
+  and `_consistency` prefers it over argv. The set and the health are **two axes**, because
+  the first cut folded them together and manufactured both states it exists to prevent
+  (unstated health reading as agreement, and as drift). The third state is what makes the
+  split work and it is a property of the source: a witness that omits a status leaves health
+  *unknown*, while argv names servers it **disabled**, which never ran and so have no health
+  to state. See `DESIGN_MCP_Support.md` §8 Phase 1.
 - Portable `used_mcp_tool` assertion (§7) once a second adapter lands.
 - Refuse `isolated: false` combined with `mcp_servers:`.
 - Sweep for other default-held invariants (`judge`, `max_cells`, `provision`).

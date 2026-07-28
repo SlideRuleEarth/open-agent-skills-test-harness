@@ -3925,6 +3925,67 @@ def _check_claude_version_provenance(failures, verbose):
            f"disagreeing versions resolve to unknown ({ver_disagree!r}) while a repeated "
            f"identical one does not ({ver_repeat!r})", failures, verbose)
 
+    # --- the same evidence, on the REPORTING path ------------------------------------
+    # `_witnessed_servers` feeds the cross-cell comparability check rather than any safety
+    # decision. Its entire contract is the difference between "the run reported hosting
+    # nothing" and "the run did not report", because the consistency check may only call a
+    # matrix comparable on the first.
+    ws_empty = _cl._witnessed_servers(real, 0)
+    ws_live = _cl._witnessed_servers(
+        _init(claude_code_version="2.1.113",
+              mcp_servers=[{"name": "echo", "status": "connected"},
+                           {"name": "b", "status": "failed"}]), 0)
+    ws_crashed = _cl._witnessed_servers("", 1)
+    ws_reshaped = _cl._witnessed_servers(
+        _json.dumps({"type": "system", "subtype": "init", "mcpServers": []}), 0)
+    ws_nostatus = _cl._witnessed_servers(
+        _init(claude_code_version="2.1.113", mcp_servers=[{"name": "echo"}]), 0)
+
+    # The per-cell ARTIFACT. The matrix aggregate lists the distinct states a run contained
+    # but not which cell produced each, so two states meant re-parsing raw stdout to find
+    # out which run was which — the re-derivation the aggregate exists to spare a reader.
+    from .schema import RunResult as _RR, witness_json as _wj
+    _rr_seen = _RR(agent="claude", eval_name="e", prompt="", workdir="",
+                   cli_version="2.1.113", mcp_servers_witnessed=(("echo", "connected"),))
+    _rr_blind = _RR(agent="claude", eval_name="e", prompt="", workdir="")
+    _d_seen, _d_blind = _rr_seen.to_dict(), _rr_blind.to_dict()
+
+    # `.get`, not `[...]`: a key REMOVED from to_dict must fail this arm, not raise out of
+    # the section — a KeyError here is reported as the whole section crashing, which names
+    # neither the missing field nor the property that was lost.
+    _check("schema.run_result_records_its_provenance_per_cell",
+           _d_seen.get("mcp_servers_witnessed") == [["echo", "connected"]]
+           and _d_seen.get("cli_version") == "2.1.113"
+           and _d_blind.get("mcp_servers_witnessed", "MISSING") is None
+           and _d_blind.get("cli_version", "MISSING") is None
+           and _wj(()) == [] and _wj(None) is None,
+           f"result.json is the PER-CELL artifact, and it carried neither fact the matrix "
+           f"check compares on, so a reader who saw two states in the aggregate had to "
+           # `.get` in the MESSAGE too, not only in the condition. `_check`'s message is an
+           # f-string argument, so it is built EAGERLY — a bracket lookup here raises before
+           # the condition is ever consulted, and the removed field is reported as the whole
+           # section crashing rather than as this arm going red.
+           f"re-parse raw stdout to learn which cell produced which. Both are recorded now "
+           f"({_d_seen.get('mcp_servers_witnessed')}, {_d_seen.get('cli_version')!r}), and "
+           f"the null/empty distinction survives serialization — null is 'the run stated "
+           f"nothing' ({_d_blind.get('mcp_servers_witnessed', 'MISSING')!r}) and [] is 'it "
+           f"hosted none' ({_wj(())!r}), which is the distinction the whole axis rests on",
+           failures, verbose)
+
+    _check("claude.witnessed_servers_distinguishes_none_from_empty",
+           ws_empty == () and ws_crashed is None and ws_reshaped is None
+           and ws_live == (("b", "failed"), ("echo", "connected"))
+           and ws_nostatus == (("echo", None),),
+           f"`()` is 'the run reported hosting no servers' and None is 'the run did not "
+           f"report' — a crashed cell {ws_crashed!r} and one whose init event was reshaped "
+           f"{ws_reshaped!r} must not contribute an empty set they never established, or a "
+           f"matrix reads as agreed on the strength of a cell that said nothing. Statuses "
+           f"ride along because being NAMED is not being USABLE {ws_live}, and a missing "
+           f"status stays None rather than being invented {ws_nostatus}. Reshaped telemetry "
+           f"is UNKNOWN here rather than a failure: this is the reporting path, and "
+           f"verify_post_run reads the same event for the decision that may fail a run",
+           failures, verbose)
+
     _check("claude.mcp_witness_fails_closed",
            ok == (None, [], True, {})
            and live[0] is None and live[1] == ["leaky"]
@@ -4125,10 +4186,13 @@ def _check_matrix_consistency(failures, verbose):
 
     root = _tempfile.mkdtemp(prefix="ase-cons-")
 
-    def _cell(version=None, argv=(), isolated=True, name="e"):
+    def _cell(version=None, argv=(), isolated=True, name="e", witnessed=None):
         rr = RunResult(agent="copilot", eval_name=name, prompt="", workdir="",
                        argv=list(argv))
         rr.cli_version = version
+        # None (the default) is "this run stated nothing" — the argv fallback then applies,
+        # which is every pre-witness fixture in this section and every codex/copilot cell.
+        rr.mcp_servers_witnessed = witnessed
         return runner_mod.CellResult(
             agent="copilot", model="m", eval_name=name, skill=None, passed=True,
             run_result=rr, isolated=isolated)
@@ -4192,6 +4256,88 @@ def _check_matrix_consistency(failures, verbose):
         proven_empty, proven_msg = _consistency(
             [_cell("2.1.113", ["--strict-mcp-config"]),
              _cell("2.1.113", ["--strict-mcp-config"])], "claude")
+        # THE WITNESS. argv goes unknown the moment --mcp-config is passed (it names a
+        # file, not servers), so the axis was blind on exactly the runs that DECLARE
+        # servers and an MCP matrix could never reach `verified`. The run's own init event
+        # says what it actually hosted; opaque_mcp above is the same argv with no witness.
+        witnessed_ok, witnessed_msg = _consistency(
+            [_cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"],
+                   witnessed=(("echo", "connected"),)),
+             _cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"],
+                   witnessed=(("echo", "connected"),))], "claude")
+        # NAMED IS NOT USABLE, at matrix scale. Both cells list `echo`; one connected, one
+        # failed, so they did not run against the same tool surface. Comparing names alone
+        # calls this verified — the green light moving one field over, again.
+        health_drift, _ = _consistency(
+            [_cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"],
+                   witnessed=(("echo", "connected"),)),
+             _cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"],
+                   witnessed=(("echo", "failed"),))], "claude")
+        # IDENTITY IS NOT HEALTH. Both cells reported a connected server — they reported
+        # DIFFERENT servers. Health values have to carry the names they belong to (or
+        # `echo failed, other connected` would compare equal to its mirror), so a difference
+        # in the SET propagates into this axis and was announced as health drift as well:
+        # one finding counted twice, the second line asserting a difference in whether
+        # servers worked when nothing of the sort was shown (found in review).
+        set_drift_only, _ = _consistency(
+            [_cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"],
+                   witnessed=(("echo", "connected"),)),
+             _cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"],
+                   witnessed=(("other", "connected"),))], "claude")
+        # MIXED SOURCES MUST NOT READ AS DRIFT. One cell crashed before its init event, so
+        # it falls back to argv, which still PROVES the empty set under --strict-mcp-config
+        # with no --mcp-config. Compared as bare names on one side and pairs on the other,
+        # a difference in evidence source would masquerade as a difference in config.
+        mixed_src, mixed_msg = _consistency(
+            [_cell("2.1.113", ["--strict-mcp-config"], witnessed=()),
+             _cell("2.1.113", ["--strict-mcp-config"])], "claude")
+        # UNSTATED HEALTH IS UNKNOWN — not agreement, and not difference. Both cells name
+        # `echo` and neither says whether it worked; folding health into the server set made
+        # those compare equal and report `verified`, and made a stated status beside an
+        # unstated one report `drift`, inventing agreement and difference out of the same
+        # silence (found in review).
+        health_silent, health_silent_msg = _consistency(
+            [_cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"],
+                   witnessed=(("echo", None),)),
+             _cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"],
+                   witnessed=(("echo", None),))], "claude")
+        health_half, health_half_msg = _consistency(
+            [_cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"],
+                   witnessed=(("echo", "connected"),)),
+             _cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"],
+                   witnessed=(("echo", None),))], "claude")
+        # ...and the third state, without which the rule above parks every argv-only adapter
+        # at `unverified` forever: copilot's argv names servers it DISABLED. They never ran,
+        # so their health is not unknown — there is nothing to state. `[]`, not null.
+        health_na, _ = _consistency([_cell("1.0.72", disabled), _cell("1.0.72", disabled)])
+        # A FINISHED MATRIX MUST STAY REPORTABLE. Adapters build the witness themselves, so
+        # entries can arrive as lists, dicts or bare scalars. `_spread` deduped through
+        # `set()`, which is not merely unordered on those — it is undefined: an unhashable
+        # entry raised TypeError before any of the tolerance further down could apply, and
+        # the crash landed in the code describing a run that had already finished (found in
+        # review, which reproduced both the list and the dict).
+        # The raise is CAUGHT here rather than allowed to escape, because the fixture IS the
+        # call under test: letting it propagate aborts the section, and the suite then
+        # reports "matrix_consistency.CRASHED" — a red signal, but one that names neither
+        # the shape nor the guarantee. An arm that cannot distinguish "the thing I test
+        # crashed" from "my neighbour crashed" has not tested it.
+        unhashable = []
+        for w in ([["echo", "connected"]],              # entries as LISTS
+                  ({"name": "echo"},),                  # an entry as a DICT
+                  ("echo",)):                           # a bare scalar, no status at all
+            try:
+                unhashable.append(
+                    _consistency([_cell("2.1.113", ["--strict-mcp-config"], witnessed=w),
+                                  _cell("2.1.113", ["--strict-mcp-config"], witnessed=w)],
+                                 "claude")[0])
+            except Exception as exc:
+                unhashable.append({"raised": f"{type(exc).__name__}: {exc}"})
+        # An unwitnessed cell whose argv cannot answer either stays unknown rather than
+        # borrowing its sibling's answer.
+        half_blind, _ = _consistency(
+            [_cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"],
+                   witnessed=(("echo", "connected"),)),
+             _cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"])], "claude")
         claude_ad = runner_mod.get_adapter("claude")
         claude_seen = (
             claude_ad.mcp_servers_seen(["--strict-mcp-config"]),
@@ -4235,6 +4381,133 @@ def _check_matrix_consistency(failures, verbose):
            f"one; one readable cell beside an unreadable one is likewise unverified "
            f"({partial['cli_versions']})",
            failures, verbose)
+
+    _check("runner.mcp_axis_reads_the_runs_own_witness_not_just_argv",
+           witnessed_ok["comparability"] == "verified"
+           and witnessed_ok["mcp_server_set_verified"] is True
+           and witnessed_ok["mcp_server_set_unknown_cells"] == 0
+           and witnessed_ok["mcp_server_sets"] == [["echo"]]
+           and witnessed_ok["mcp_server_states"] == [[["echo", "connected"]]]
+           and witnessed_msg == ""
+           and mixed_src["comparability"] == "verified"
+           and mixed_src["drift"] == [] and mixed_msg == ""
+           and half_blind["comparability"] == "unverified"
+           and half_blind["mcp_server_set_unknown_cells"] == 1
+           and half_blind["drift"] == [],
+           f"argv names a FILE once --mcp-config is passed, so this axis went unknown on "
+           f"exactly the runs that declare servers and no MCP matrix could reach "
+           f"'verified' (opaque_mcp above, same argv, no witness). The run's own init "
+           f"event answers it: {witnessed_ok['comparability']!r} with "
+           f"states={witnessed_ok['mcp_server_states']}. A cell that crashed before its "
+           f"init event falls back to argv WITHOUT reading as drift "
+           f"({mixed_src['comparability']!r}, drift={mixed_src['drift']}) — a difference "
+           f"in evidence source is not a difference in configuration — and one whose argv "
+           f"cannot answer either stays unknown ({half_blind['comparability']!r}, "
+           f"unknown={half_blind['mcp_server_set_unknown_cells']}) rather than borrowing "
+           f"its sibling's answer", failures, verbose)
+
+    _check("runner.consistency_reports_rather_than_raising_on_an_unmodelled_witness",
+           not any("raised" in u for u in unhashable)
+           and all(u.get("comparability") in ("verified", "unverified") for u in unhashable)
+           and unhashable[0].get("mcp_server_sets") == [["echo"]]
+           and unhashable[0].get("mcp_server_states") == [[["echo", "connected"]]]
+           # The scalar and dict forms carry no readable status, so health is UNKNOWN —
+           # the tolerance must not invent one to keep the matrix green.
+           and unhashable[1].get("mcp_server_health_unknown_cells") == 2
+           and unhashable[2].get("mcp_server_health_unknown_cells") == 2,
+           f"an adapter builds this value itself, so entries can arrive as lists, dicts or "
+           f"bare scalars — and `set()` is not just unordered on those, it is UNDEFINED: an "
+           f"unhashable entry raised before any tolerance downstream could apply, in the "
+           f"code describing a run that had already finished. A crashed comparability note "
+           f"is worse than any verdict it was choosing between. Each shape now reports: "
+           f"{[u.get('comparability') or u.get('raised') for u in unhashable]}, and the ones "
+           f"with no readable status count as health-unknown "
+           f"({unhashable[1].get('mcp_server_health_unknown_cells')}, "
+           f"{unhashable[2].get('mcp_server_health_unknown_cells')}) rather than being "
+           f"invented into agreement", failures, verbose)
+
+    _check("runner.mcp_axis_treats_unstated_health_as_unknown",
+           health_silent["comparability"] == "unverified"
+           and health_silent["mcp_server_health_unknown_cells"] == 2
+           and health_silent["drift"] == [] and health_silent_msg == ""
+           and health_half["comparability"] == "unverified"
+           and health_half["mcp_server_health_unknown_cells"] == 1
+           and health_half["drift"] == [] and health_half_msg == ""
+           and health_na["comparability"] == "verified"
+           and health_na["mcp_server_health_unknown_cells"] == 0
+           and health_na["mcp_server_states"] == [[]],
+           f"two cells naming `echo` with no status stated agree about NOTHING, and folding "
+           f"health into the server set made them compare equal and report verified "
+           f"({health_silent['comparability']!r}, unknown="
+           f"{health_silent['mcp_server_health_unknown_cells']}); a stated status beside an "
+           f"unstated one is likewise not a demonstrated difference "
+           f"({health_half['comparability']!r}, drift={health_half['drift']}). Both are "
+           f"absent evidence, which the every-axis rule counts as unknown. The third state "
+           f"is what keeps the rule usable: argv names servers it DISABLED, which never "
+           f"ran, so there is no health to state rather than health unknown — without it "
+           f"every codex and copilot matrix parks at unverified forever "
+           f"({health_na['comparability']!r}, states={health_na['mcp_server_states']})",
+           failures, verbose)
+
+    _check("runner.mcp_axis_compares_server_health_not_just_names",
+           health_drift["comparability"] == "drift"
+           and health_drift["mcp_server_sets"] == [["echo"]]
+           and health_drift["mcp_server_states"] == [[["echo", "connected"]],
+                                                     [["echo", "failed"]]]
+           and any("echo(connected)" in d and "echo(failed)" in d
+                   for d in health_drift["drift"]),
+           f"both cells list `echo`, so a comparison over NAMES alone reports this matrix "
+           f"as verified — while one of them ran without the tool. Being named is not "
+           f"being usable, the same distinction the per-cell witness already draws, and "
+           f"at matrix scale it is the difference between 'comparable' and 'one of these "
+           f"had no MCP surface'. The drift line names the statuses because "
+           f"mcp_server_sets alone reads as two identical arrays: "
+           f"{health_drift['mcp_server_sets']} vs states="
+           f"{health_drift['mcp_server_states']}, drift={health_drift['drift']}",
+           failures, verbose)
+
+    _check("runner.mcp_set_verification_is_reported_separately_from_health",
+           health_silent["mcp_server_set_verified"] is True
+           and health_silent["mcp_server_set_unknown_cells"] == 0
+           and health_silent["mcp_server_sets"] == [["echo"]]
+           and health_silent["mcp_server_health_verified"] is False
+           and health_silent["comparability"] == "unverified"
+           and witnessed_ok["mcp_server_set_verified"] is True
+           and witnessed_ok["mcp_server_health_verified"] is True
+           and opaque_mcp["mcp_server_set_verified"] is False,
+           f"`mcp_server_set_verified` predates the health axis and consumers read it as a "
+           f"statement about the SET. Folding health into it made this matrix report "
+           f"sets={health_silent['mcp_server_sets']} with "
+           f"{health_silent['mcp_server_set_unknown_cells']} unknown cells beside "
+           f"set_verified=false — the set is not in doubt at all; what nobody stated is "
+           f"whether those servers worked, which is now its own field "
+           f"(health_verified={health_silent['mcp_server_health_verified']}). A field "
+           f"changes meaning under its readers exactly once, silently, and then every "
+           f"consumer of it is wrong. The two combine only in `comparability`, which stays "
+           f"{health_silent['comparability']!r}", failures, verbose)
+
+    _check("runner.mcp_health_is_only_compared_within_a_uniform_server_set",
+           set_drift_only["comparability"] == "drift"
+           and any("MCP server set varied" in d for d in set_drift_only["drift"])
+           and not any("health varied" in d for d in set_drift_only["drift"])
+           and set_drift_only["mcp_server_health_verified"] is False
+           # ...and the same gate on the positive verdict: two cells that each disabled a
+           # DIFFERENT server both have nothing outstanding, so health compares equal —
+           # while they share no server for that agreement to be about.
+           and srv_drift["mcp_server_health_verified"] is False
+           and srv_drift["mcp_server_states"] == [[]]
+           # The genuine finding is untouched: one set, two healths, still drift.
+           and health_drift["mcp_server_health_verified"] is False
+           and any("health varied" in d for d in health_drift["drift"]),
+           f"health values carry the names they belong to — they must, or `echo failed, "
+           f"other connected` would compare equal to its mirror — so a difference in the "
+           f"SET propagates here and was announced twice: once truthfully as a set "
+           f"difference and once as health drift between cells that both reported a "
+           f"connected server ({set_drift_only['drift']}). Health is a claim ABOUT a server "
+           f"set, so neither its drift nor its agreement means anything without a common "
+           f"one; `true` there would be a green field standing in for a comparison with no "
+           f"ground to run on ({srv_drift['mcp_server_health_verified']} on two cells that "
+           f"each state {srv_drift['mcp_server_states']})", failures, verbose)
 
     _check("runner.verified_requires_every_axis_known",
            opaque_mcp["comparability"] == "unverified"

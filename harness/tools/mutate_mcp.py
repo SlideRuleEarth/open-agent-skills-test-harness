@@ -26,12 +26,18 @@ is fine:
 Adding a mutation: keep it to the smallest edit that reintroduces the real defect, and point
 it at the one arm that should notice. If you cannot name that arm, the arm does not exist yet
 and writing it is the actual work.
+
+Every result line carries the wall time of the selftest run that produced it, and the summary
+names the slowest. Read those against the `baseline:` line: a mutation taking several times
+the baseline is a defect that costs runtime rather than one that reddens an arm, and it is
+the only notice anyone gets before it grows past `_SELFTEST_TIMEOUT` and reports as a hang.
 """
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 # Repo-relative: this file lives at <repo>/harness/tools/, so the harness package root is
@@ -45,6 +51,7 @@ MCP = "agentskill_evals/mcp.py"
 ISO = "agentskill_evals/isolation.py"
 CODEX = "agentskill_evals/adapters/codex.py"
 COPILOT = "agentskill_evals/adapters/copilot.py"
+SCHEMA = "agentskill_evals/schema.py"
 
 MUTATIONS = [
     ("M1-witness-fails-any-server", CLAUDE,
@@ -576,6 +583,100 @@ MUTATIONS = [
      '\n                "--skip-git-repo-check",\n                "--json", "-m", model, "say ok"]',
      '\n                "--json", "-m", model, "say ok"]',
      "codex.skips_the_git_repo_trust_gate"),
+    # The whole contract of the reporting-path witness: an unwitnessed run must say None,
+    # not `()`. Collapsing them lets a cell that crashed before its init event contribute
+    # agreement it never established, and the matrix reads verified on its strength.
+    ("M90-unwitnessed-run-reports-an-empty-server-set", CLAUDE,
+     "\n    if violation is not None or not witnessed:\n        return None",
+     "\n    if violation is not None or not witnessed:\n        return ()",
+     "claude.witnessed_servers_distinguishes_none_from_empty"),
+    # Statuses dropped where the AXIS is built, so `echo` connected in one cell and failed
+    # in another compare equal and a matrix where one cell had no working tool surface
+    # reports as verified. Aimed at the consistency layer rather than at the claude helper:
+    # mutating the helper reddens its own arm first, which is a catch by the wrong test and
+    # leaves the matrix-scale property unproven.
+    ("M91-consistency-drops-witnessed-status", RUNNER,
+     "\n                health_raw.append(None if any(st is None for _, st in pairs) "
+     "else pairs)",
+     "\n                health_raw.append(tuple((n, None) for n, _ in pairs))",
+     "runner.mcp_axis_compares_server_health_not_just_names"),
+    # An UNSTATED status counted as a known one: two cells naming `echo` with no health
+    # given compare equal and the matrix reports verified, which is agreement invented out
+    # of silence. This is the defect review found in the first cut of this axis.
+    ("M94-unstated-health-counts-as-known", RUNNER,
+     "\n                health_raw.append(None if any(st is None for _, st in pairs) "
+     "else pairs)",
+     "\n                health_raw.append(pairs)",
+     "runner.mcp_axis_treats_unstated_health_as_unknown"),
+    # The other half of that finding: argv's disable set treated as health UNKNOWN rather
+    # than as nothing-to-state parks every codex and copilot matrix at unverified forever,
+    # over a question that cannot be asked about a server that was never started.
+    ("M95-argv-disable-set-treated-as-unknown-health", RUNNER,
+     "\n            health_raw.append(() if seen is not None else None)",
+     "\n            health_raw.append(None)",
+     "runner.mcp_axis_treats_unstated_health_as_unknown"),
+    # Two defences cover this one, so the mutation removes BOTH — the M53 shape. `set()` is
+    # undefined on an unhashable entry, and normalizing at ingestion is what stops one ever
+    # reaching it; either alone keeps a finished matrix reportable, which is the point, and
+    # is also why neither shows up as a defect on its own.
+    ("M96-unhashable-witness-entry-crashes-the-report", RUNNER,
+     ("\n            by_key: dict = {}\n            for v in values:\n"
+      "                if v is not None:\n                    by_key.setdefault(repr(v), v)\n"
+      "            known = [by_key[k] for k in sorted(by_key)]",
+      "\n                pairs = tuple((str(n), None if st is None else str(st))\n"
+      "                              for n, st in (_server_pair(e) for e in witnessed))"),
+     ("\n            known = sorted({v for v in values if v is not None}, key=repr)",
+      "\n                pairs = tuple(witnessed)"),
+     "runner.consistency_reports_rather_than_raising_on_an_unmodelled_witness"),
+    # The per-cell artifact losing the witness: the aggregate still lists the distinct
+    # states, but nothing says which cell produced which without re-parsing stdout.
+    ("M97-result-json-drops-the-witness", SCHEMA,
+     '\n            "mcp_servers_witnessed": witness_json(self.mcp_servers_witnessed),',
+     "",
+     "schema.run_result_records_its_provenance_per_cell"),
+    # null and [] collapsed in the artifact: "the run stated nothing" serialized as "it
+    # hosted no servers", which is the distinction the whole axis rests on.
+    ("M98-witness-json-collapses-none-into-empty", SCHEMA,
+     "\n    if witnessed is None:\n        return None",
+     "\n    if witnessed is None:\n        return []",
+     "schema.run_result_records_its_provenance_per_cell"),
+    # The consistency check ignoring the witness and falling back to argv alone — the state
+    # this work started from, where --mcp-config made the axis unreadable and no MCP matrix
+    # could ever reach `verified`.
+    ("M92-consistency-ignores-the-witness", RUNNER,
+     "\n            witnessed = c.run_result.mcp_servers_witnessed",
+     "\n            witnessed = None",
+     "runner.mcp_axis_reads_the_runs_own_witness_not_just_argv"),
+    # The witness's names not reduced to names, so a cell drawing on the witness compares
+    # `(name, status)` pairs against a sibling's bare argv names — a difference in EVIDENCE
+    # SOURCE reported as a difference in configuration.
+    ("M93-witness-names-not-reduced-to-names", RUNNER,
+     "\n                names_raw.append(tuple(n for n, _ in pairs))",
+     "\n                names_raw.append(pairs)",
+     "runner.mcp_axis_reads_the_runs_own_witness_not_just_argv"),
+    # An existing field quietly narrowed: `mcp_server_set_verified` reports the SET, and
+    # folding the health verdict into it makes a matrix with a readable, uniform set report
+    # `false` beside `mcp_server_set_unknown_cells: 0`. Every consumer that already reads
+    # this field is then wrong, and nothing in the artifact says the meaning moved.
+    ("M99-set-verdict-narrowed-by-the-health-verdict", RUNNER,
+     '\n            "mcp_server_set_verified": mcp_set_verified,',
+     '\n            "mcp_server_set_verified": mcp_verified,',
+     "runner.mcp_set_verification_is_reported_separately_from_health"),
+    # Health drift asserted across a server set that itself varied. Health values carry
+    # their names, so the set difference propagates into this axis and is announced a second
+    # time as a difference in whether servers WORKED — which was never shown.
+    ("M100-health-drift-asserted-across-a-varying-server-set", RUNNER,
+     "\n        if len(servers) == 1 and len(health) > 1:",
+     "\n        if len(health) > 1:",
+     "runner.mcp_health_is_only_compared_within_a_uniform_server_set"),
+    # The same gate on the POSITIVE verdict, which fails the other way: two cells that each
+    # disabled a different server both have nothing outstanding, so health compares equal and
+    # reports verified — a green field on an axis whose two cells share no server at all.
+    ("M101-health-verified-without-a-common-server-set", RUNNER,
+     "\n        mcp_health_verified = (mcp_set_verified\n"
+     "                               and len(health) == 1 and health_unknown == 0)",
+     "\n        mcp_health_verified = (len(health) == 1 and health_unknown == 0)",
+     "runner.mcp_health_is_only_compared_within_a_uniform_server_set"),
 ]
 
 
@@ -589,21 +690,28 @@ _SELFTEST_TIMEOUT = 300
 
 
 def run(cwd):
+    """Run the selftest in `cwd`. Returns (returncode, output, elapsed_seconds).
+
+    Elapsed is measured with a monotonic clock so a wall-clock adjustment mid-suite (a run
+    this long can straddle one) cannot produce a negative or wildly inflated duration.
+    """
+    t0 = time.monotonic()
     try:
         p = subprocess.run(
             [str(cwd / ".venv/bin/python"), "-m", "agentskill_evals", "selftest"],
             cwd=cwd, capture_output=True, text=True, timeout=_SELFTEST_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return 124, "__TIMEOUT__"
-    return p.returncode, p.stdout + p.stderr
+        return 124, "__TIMEOUT__", time.monotonic() - t0
+    return p.returncode, p.stdout + p.stderr, time.monotonic() - t0
 
 
 def main():
+    started = time.monotonic()
     tmp = Path(tempfile.mkdtemp(prefix="mutate-mcp-"))
     work = tmp / "harness"
     shutil.copytree(HARNESS, work, symlinks=True,
                     ignore=shutil.ignore_patterns("__pycache__", "artifacts", "build"))
-    rc, out = run(work)
+    rc, out, baseline_s = run(work)
     if out == "__TIMEOUT__":
         print(f"BASELINE TIMED OUT after {_SELFTEST_TIMEOUT}s — the unmutated selftest hung, "
               f"so nothing below would prove anything.")
@@ -612,9 +720,12 @@ def main():
         print("BASELINE FAILED — mutations prove nothing:")
         print(out[-3000:])
         return 1
-    print("baseline: SELFTEST PASSED\n")
+    # The reference every per-mutation time below is read against; without it those numbers
+    # describe the machine, not the mutation.
+    print(f"baseline: SELFTEST PASSED in {baseline_s:.1f}s\n")
 
     caught = 0
+    slowest = (0.0, None)
     for mid, rel, find, repl, arm in MUTATIONS:
         path = work / rel
         original = path.read_text()
@@ -622,14 +733,20 @@ def main():
         # reintroducing the defect means removing both (see M53).
         edits = list(zip(find, repl)) if isinstance(find, tuple) else [(find, repl)]
         if any(f not in original for f, _ in edits):
-            print(f"{mid}: STALE ANCHOR — text not found in {rel}")
+            # No time to report, and "(0.0s)" would read as a suite that ran instantly rather
+            # than one that never started — the same lie the None/[] distinction exists to
+            # prevent elsewhere. Say which it is.
+            print(f"{mid}: STALE ANCHOR — text not found in {rel} (selftest not run)")
             continue
         mutated = original
         for f, r in edits:
             mutated = mutated.replace(f, r, 1)
         path.write_text(mutated)
-        rc, out = run(work)
+        rc, out, elapsed = run(work)
         path.write_text(original)
+        took = f"({elapsed:.1f}s)"
+        if elapsed > slowest[0]:
+            slowest = (elapsed, mid)
         failed = re.findall(r"\[FAIL\]\s+([^:]+):", out)
         if out == "__TIMEOUT__":
             # Not a clean catch: the arm never got to report because the selftest hung. A
@@ -637,15 +754,18 @@ def main():
             # the work (a thread + join), not by the suite's own timeout — so this counts as
             # uncaught and fails the run, forcing a real fix rather than masking the hang.
             print(f"{mid}: *** TIMEOUT *** selftest exceeded {_SELFTEST_TIMEOUT}s — the "
-                  f"defect hangs rather than reddening {arm}")
+                  f"defect hangs rather than reddening {arm} {took}")
         elif rc != 0 and arm in failed:
-            print(f"{mid}: CAUGHT by {arm}")
+            print(f"{mid}: CAUGHT by {arm} {took}")
             caught += 1
         elif rc != 0:
-            print(f"{mid}: failed, but NOT via {arm} -> {failed}")
+            print(f"{mid}: failed, but NOT via {arm} -> {failed} {took}")
         else:
-            print(f"{mid}: *** MISSED *** selftest still passes with the defect present")
+            print(f"{mid}: *** MISSED *** selftest still passes with the defect present {took}")
     print(f"\n{caught}/{len(MUTATIONS)} caught by the intended arm")
+    total = time.monotonic() - started
+    slow = f"slowest {slowest[1]} at {slowest[0]:.1f}s" if slowest[1] else "no mutation ran"
+    print(f"elapsed: {total / 60:.1f} min total, baseline {baseline_s:.1f}s, {slow}")
     shutil.rmtree(tmp, ignore_errors=True)
     return 0 if caught == len(MUTATIONS) else 1
 

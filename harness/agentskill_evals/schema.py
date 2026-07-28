@@ -54,6 +54,29 @@ class NormalizedEvent:
         }
 
 
+def witness_json(witnessed: Optional[tuple]) -> Optional[list]:
+    """``mcp_servers_witnessed`` as JSON: a list of ``[name, status]``, or null.
+
+    null is "the run stated nothing" — it crashed before its init event, or this adapter
+    has no witness at all — and is never "it hosted no servers", which is ``[]``. The
+    comparability check is built on exactly that difference, so an artifact that blurred
+    the two would misreport the thing it exists to record.
+
+    Tolerant of an entry that is not a pair for the same reason the consistency check is:
+    this runs while serializing a finished run, and raising here costs the artifact rather
+    than fixing the shape.
+    """
+    if witnessed is None:
+        return None
+    out = []
+    for entry in witnessed:
+        if isinstance(entry, (tuple, list)) and len(entry) == 2:
+            out.append([entry[0], entry[1]])
+        else:
+            out.append([entry, None])
+    return out
+
+
 @dataclass
 class RunResult:
     """The outcome of running one eval against one agent."""
@@ -75,6 +98,11 @@ class RunResult:
     # Recorded per cell so a matrix can be checked for having run under ONE build — a
     # self-updating CLI can change mid-matrix, which silently makes cells incomparable.
     cli_version: Optional[str] = None
+    # MCP servers this run itself reported hosting, as (name, status) pairs, when its
+    # telemetry states them (claude's init event). None = the run said nothing readable,
+    # which the consistency check counts as an axis it could not compare rather than as
+    # agreement — see ParseOutput.mcp_servers_witnessed for why pairs rather than names.
+    mcp_servers_witnessed: Optional[tuple] = None
     stdout_path: Optional[str] = None
     stderr_path: Optional[str] = None
     timed_out: bool = False
@@ -131,6 +159,13 @@ class RunResult:
             "premium_requests": self.premium_requests,
             "duration_ms": self.duration_ms,
             "resolved_model": self.resolved_model,
+            # The two per-cell provenance facts `Runner._consistency` compares matrices on.
+            # Both were missing here, so `result.json` — the per-cell artifact — recorded
+            # neither, and a reader who wanted to know which cell contributed which state
+            # had to re-parse raw stdout. That is precisely the re-derivation these fields
+            # exist to spare them. null on both means "not stated", never "none".
+            "cli_version": self.cli_version,
+            "mcp_servers_witnessed": witness_json(self.mcp_servers_witnessed),
             "stdout_path": self.stdout_path,
             "stderr_path": self.stderr_path,
             "timed_out": self.timed_out,

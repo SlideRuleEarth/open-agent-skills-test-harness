@@ -39,7 +39,7 @@ from .judge import Judge
 from .mcp import REDACTED, interpolated_refs, redact, redact_bytes, redact_obj
 from .notices import warn
 from .progress import Progress
-from .schema import EventKind, RunResult
+from .schema import EventKind, RunResult, witness_json
 from . import xattrs
 from .spec import EvalSpec, ModelTarget, repo_root_for, skill_names
 from .workspace_view import (
@@ -943,12 +943,77 @@ class Runner:
             Sorting is over the values as given (strings or tuples), so callers keep
             whatever structure they passed in; nothing is stringified here.
             """
-            known = sorted({v for v in values if v is not None})
+            # Deduped and ordered by `repr`, never by `set()` or `<`, and both halves of
+            # that matter for the same reason: everything here is describing a FINISHED
+            # matrix, so raising converts a comparability note into a crashed section —
+            # strictly worse than any verdict it was choosing between.
+            #
+            # `<` is not a total order over what the axes carry (strings on one, tuples on
+            # another; a `("a", None)` beside a `("a", "connected")` raises TypeError the
+            # moment their names tie). And `set()` is not even defined on it: an entry that
+            # arrives as a list or a dict is UNHASHABLE, which raised before any tolerance
+            # further down could apply — the hardening was real but sat behind a set
+            # comprehension that had already thrown (found in review). Keying on repr needs
+            # neither property from the values.
+            by_key: dict = {}
+            for v in values:
+                if v is not None:
+                    by_key.setdefault(repr(v), v)
+            known = [by_key[k] for k in sorted(by_key)]
             return known, sum(1 for v in values if v is None)
 
         versions, versions_unknown = _spread([c.run_result.cli_version for c in results])
-        servers_raw = []
+        # TWO axes, not one. Folding health into the server set made an UNSTATED status read
+        # as a known one: two cells whose witness named `echo` with no status compared equal
+        # and reported `verified`, and a `connected` beside an unstated one reported `drift`
+        # — inventing agreement and difference respectively out of the same silence (found
+        # in review). Absent health is neither.
+        #
+        # The third state is what makes this work, and it is a property of the SOURCE. A
+        # witness lists servers the run HOSTED, so a missing status is a fact nobody stated:
+        # unknown. argv lists servers the invocation DISABLED, which never ran, so their
+        # health is not unknown — it does not exist. Nothing is outstanding, and demanding
+        # it anyway would park every codex and copilot matrix at `unverified` over a
+        # question that cannot be asked about a server that was never started.
+        def _server_pair(entry):
+            """One witness entry as ``(name, status)``.
+
+            Tolerant of an entry that is not a pair, deliberately. Every adapter produces
+            pairs today, so the fallback is unreachable — but this whole method describes a
+            FINISHED matrix, and unpacking an unmodelled shape would raise out of it while
+            writing a comparability note, which is strictly worse than any verdict it was
+            choosing between. Same reason `mcp_servers_seen` below sits inside a try, and
+            the same reason `_spread` dedupes by repr rather than by `set()`.
+            """
+            if isinstance(entry, (tuple, list)) and len(entry) == 2:
+                return entry[0], entry[1]
+            return entry, None
+
+        names_raw: list = []
+        health_raw: list = []
         for c in results:
+            # The run's OWN account first, argv second. argv is a claim about what the
+            # invocation could have loaded; the init event is the run's report of what it
+            # did load, which is both stronger and the only source that can speak once
+            # `--mcp-config` is passed — argv then names a FILE, so this axis used to go
+            # unknown on exactly the runs that declare servers, and an MCP matrix could
+            # never read `verified`. A run that did not witness its host reports None and
+            # falls back, rather than contributing an empty set it never established.
+            witnessed = c.run_result.mcp_servers_witnessed
+            if witnessed is not None:
+                # Normalized HERE, not at the reporting end: `_spread` has to dedupe and
+                # order these, and an adapter handing over lists or dicts would reach it as
+                # something unhashable. Coerced to plain scalars in a tuple, which is both
+                # hashable and reprable whatever the adapter built.
+                pairs = tuple((str(n), None if st is None else str(st))
+                              for n, st in (_server_pair(e) for e in witnessed))
+                names_raw.append(tuple(n for n, _ in pairs))
+                # ONE unstated status makes the whole cell's health unknown. Partial health
+                # is not a weaker form of known health; it is a set the matrix cannot be
+                # compared on, and letting the stated half stand for the rest is how the
+                # silence gets a vote.
+                health_raw.append(None if any(st is None for _, st in pairs) else pairs)
+                continue
             try:
                 seen = self.adapter.mcp_servers_seen(c.run_result.argv)
             except Exception:  # pragma: no cover — a reporting path must never fail a run
@@ -958,8 +1023,13 @@ class Runner:
             # on "," makes {"a,b"} and {"a","b"} the same value and reports two genuinely
             # different configurations as consistent. Tuples compare structurally and are
             # emitted below as JSON arrays.
-            servers_raw.append(None if seen is None else tuple(seen))
-        servers, servers_unknown = _spread(servers_raw)
+            names_raw.append(None if seen is None else tuple(str(n) for n in seen))
+            # `()` — nothing outstanding — rather than None. These servers were disabled, so
+            # there is no health for a sibling cell to disagree with. This is the
+            # distinction that keeps argv-only adapters verifiable.
+            health_raw.append(() if seen is not None else None)
+        servers, servers_unknown = _spread(names_raw)
+        health, health_unknown = _spread(health_raw)
         isolation = sorted({bool(c.isolated) for c in results})
 
         drift = []
@@ -967,8 +1037,25 @@ class Runner:
             drift.append(f"CLI version varied across cells: {', '.join(versions)}")
         if len(servers) > 1:
             drift.append("MCP server set varied across cells: "
-                         + "; ".join("[" + (", ".join(s) if s else "none") + "]"
-                                     for s in servers))
+                         + "; ".join("[" + (", ".join(str(n) for n in s) if s else "none")
+                                     + "]" for s in servers))
+        # WITHIN ONE SERVER SET, and only there. Health values carry the names they belong to
+        # — they must, or `echo failed, other connected` and `echo connected, other failed`
+        # would compare equal — so a difference in the SET propagates into this axis as well:
+        # `echo(connected)` beside `other(connected)` differed in identity alone, yet was
+        # reported as health drift too, contradicting the "cells that agree on which servers"
+        # framing below and double-counting one finding as two (found in review). When the
+        # set itself varied, that line already says so and this one has no common subject.
+        if len(servers) == 1 and len(health) > 1:
+            # Reported separately from the set, because it is a separate finding: cells that
+            # agree on WHICH servers and differ on whether they worked are not a matrix with
+            # a configuration difference, they are a matrix where one cell had no tool
+            # surface. Folded into the set line it read as "varied: [echo]; [echo]", which
+            # looks like a bug in the report rather than the finding it is.
+            drift.append("MCP server health varied across cells: "
+                         + "; ".join("[" + (", ".join(f"{n}({st})" for n, st in h)
+                                            if h else "none") + "]"
+                                     for h in health))
         if len(isolation) > 1:
             drift.append("isolation varied across cells: some ran isolated, some did not")
 
@@ -976,7 +1063,28 @@ class Runner:
         # only shape that means the axis was actually compared; `len(...) <= 1` would
         # accept an axis where every cell was unreadable, which is the mistake below.
         cli_verified = len(versions) == 1 and versions_unknown == 0
-        mcp_verified = len(servers) == 1 and servers_unknown == 0
+        # TWO verdicts, published separately, combined ONLY for `comparability` below.
+        # `mcp_server_set_verified` predates the health axis and is read by consumers as a
+        # statement about the SET; folding health into it made a matrix report
+        # `mcp_server_set_unknown_cells: 0` and `mcp_server_sets: [["echo"]]` beside
+        # `mcp_server_set_verified: false`, which reads as the set being in doubt when what
+        # was missing is whether those servers worked (found in review). A field changes
+        # meaning under a reader exactly once, silently, and then every consumer of it is
+        # wrong.
+        mcp_set_verified = len(servers) == 1 and servers_unknown == 0
+        # Health is a claim ABOUT a server set, so it is only verifiable within a uniform
+        # one — the same reason the drift line above is gated. Two cells that each ran a
+        # different single server and each reported it healthy have not agreed on this axis;
+        # they have no common subject to agree about, and `true` there would be a green
+        # field standing in for a comparison that had no ground to run on. An unstated
+        # status is unknown here exactly as an unreadable version is unknown on that axis —
+        # see the two-axis note above for why `()` (disabled servers, no health to state) is
+        # not the same as None.
+        mcp_health_verified = (mcp_set_verified
+                               and len(health) == 1 and health_unknown == 0)
+        # Redundant as written, and deliberately so: `comparability` requires BOTH axes, and
+        # saying that here does not depend on health's own gate above staying where it is.
+        mcp_verified = mcp_set_verified and mcp_health_verified
         isolation_verified = len(isolation) == 1  # always readable; empty matrix aside
         # TRI-STATE, not a boolean. A boolean `consistent` reads true whenever nothing
         # DIFFERED — including when nothing could be compared at all, which is every codex
@@ -1008,10 +1116,27 @@ class Runner:
             "cli_version_unknown_cells": versions_unknown,
             "cli_version_verified": cli_verified,
             # JSON arrays, one per distinct set — never a joined string, since a server
-            # name can contain any separator (see _spread's caller).
+            # name can contain any separator (see _spread's caller). Names only, so the
+            # field keeps the shape it has always had; the statuses the comparison actually
+            # runs on are in `mcp_server_states` below rather than changing this one
+            # underneath a reader.
             "mcp_server_sets": [list(s) for s in servers],
             "mcp_server_set_unknown_cells": servers_unknown,
-            "mcp_server_set_verified": mcp_verified,
+            # The HEALTH axis, reported BESIDE the set rather than folded into it. `[]` is a
+            # cell with nothing to state — argv named servers it disabled, which never ran —
+            # while a cell whose witness left any status unstated contributes no value here
+            # and is counted in `mcp_server_health_unknown_cells` instead. A matrix can be
+            # unverified on a name-identical set for that reason alone, and a reader looking
+            # only at `mcp_server_sets` would see two identical arrays and no explanation.
+            "mcp_server_states": [[[n, st] for n, st in h] for h in health],
+            "mcp_server_health_unknown_cells": health_unknown,
+            # SET ONLY — the meaning this field has always had. True when every cell's server
+            # set was readable and they agreed, whatever is or is not known about health.
+            "mcp_server_set_verified": mcp_set_verified,
+            # ...and health as its own verdict beside it, rather than quietly narrowing the
+            # one above. False whenever the set is not uniform: there is then no common set
+            # for a health claim to be about.
+            "mcp_server_health_verified": mcp_health_verified,
             "isolation_uniform": len(isolation) <= 1,
         }
 
@@ -1061,6 +1186,13 @@ class Runner:
                     "isolated": c.isolated, "isolation_leaks": c.isolation_leaks,
                     # None where the runner's telemetry does not state it (codex, agy).
                     "cli_version": c.run_result.cli_version,
+                    # The witness PER CELL. The aggregate above lists the distinct states a
+                    # matrix contained but not which cell produced each, so a reader who saw
+                    # two states had to re-parse raw stdout to find out which run was which
+                    # — the exact re-derivation the aggregate exists to spare them. null
+                    # means the run stated nothing (crashed before its init event, or the
+                    # adapter has no witness at all), never "hosted no servers": that is [].
+                    "mcp_servers_witnessed": witness_json(c.run_result.mcp_servers_witnessed),
                     "ungraded": c.ungraded,
                     "passed": c.passed, "n_pass": c.n_pass, "n_total": c.n_total,
                     "error": c.run_result.error, "timed_out": c.run_result.timed_out,
