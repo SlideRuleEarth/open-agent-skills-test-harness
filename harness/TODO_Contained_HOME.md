@@ -267,12 +267,18 @@ and `contained_home_that_copies_auth_is_credential_bearing_before_the_copy` (mut
 Non-negotiable, in this order. `SELFTEST PASSED` alone is not evidence.
 
 ```sh
-harness/.venv/bin/python -m agentskill_evals.cli selftest          # 474 on main; 477 after the other three adapters + the codex trust gate
+harness/.venv/bin/python -m agentskill_evals.cli selftest          # 485 arms
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 harness/.venv/bin/python -m pyflakes harness/agentskill_evals/*.py harness/agentskill_evals/adapters/*.py
-python3 harness/tools/mutate_mcp.py                               # 86/86 on main; 88/88 after the other three adapters + the codex trust gate
+python3 harness/tools/mutate_mcp.py                               # 100/100 caught by the intended arm
 git diff --check
 ```
+
+Those two counts are the floor as of the MCP witness axis, and they only ever go up: a lower
+number means arms or mutations were LOST, which is the one outcome neither command reports as
+a failure. Bump them in the same commit that adds arms. (They were previously written as
+"N on main; M after this change", which is a form that is stale the moment the change lands —
+and was, for two PRs.)
 
 Pre-existing pyflakes noise, leave alone: unused `load_spec` in `cli.py:22`, unused `Optional`
 in `adapters/__init__.py:9`, unused `os` in `adapters/codex.py:23`, and many "f-string is

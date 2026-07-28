@@ -1039,7 +1039,14 @@ class Runner:
             drift.append("MCP server set varied across cells: "
                          + "; ".join("[" + (", ".join(str(n) for n in s) if s else "none")
                                      + "]" for s in servers))
-        if len(health) > 1:
+        # WITHIN ONE SERVER SET, and only there. Health values carry the names they belong to
+        # — they must, or `echo failed, other connected` and `echo connected, other failed`
+        # would compare equal — so a difference in the SET propagates into this axis as well:
+        # `echo(connected)` beside `other(connected)` differed in identity alone, yet was
+        # reported as health drift too, contradicting the "cells that agree on which servers"
+        # framing below and double-counting one finding as two (found in review). When the
+        # set itself varied, that line already says so and this one has no common subject.
+        if len(servers) == 1 and len(health) > 1:
             # Reported separately from the set, because it is a separate finding: cells that
             # agree on WHICH servers and differ on whether they worked are not a matrix with
             # a configuration difference, they are a matrix where one cell had no tool
@@ -1056,12 +1063,28 @@ class Runner:
         # only shape that means the axis was actually compared; `len(...) <= 1` would
         # accept an axis where every cell was unreadable, which is the mistake below.
         cli_verified = len(versions) == 1 and versions_unknown == 0
-        # BOTH halves, because a set nobody disputes says nothing about servers nobody
-        # could tell were working. An unstated status is unknown on this axis exactly as an
-        # unreadable version is unknown on that one — see the two-axis note above for why
-        # `()` (disabled servers, no health to state) is not the same as None.
-        mcp_verified = (len(servers) == 1 and servers_unknown == 0
-                        and len(health) == 1 and health_unknown == 0)
+        # TWO verdicts, published separately, combined ONLY for `comparability` below.
+        # `mcp_server_set_verified` predates the health axis and is read by consumers as a
+        # statement about the SET; folding health into it made a matrix report
+        # `mcp_server_set_unknown_cells: 0` and `mcp_server_sets: [["echo"]]` beside
+        # `mcp_server_set_verified: false`, which reads as the set being in doubt when what
+        # was missing is whether those servers worked (found in review). A field changes
+        # meaning under a reader exactly once, silently, and then every consumer of it is
+        # wrong.
+        mcp_set_verified = len(servers) == 1 and servers_unknown == 0
+        # Health is a claim ABOUT a server set, so it is only verifiable within a uniform
+        # one — the same reason the drift line above is gated. Two cells that each ran a
+        # different single server and each reported it healthy have not agreed on this axis;
+        # they have no common subject to agree about, and `true` there would be a green
+        # field standing in for a comparison that had no ground to run on. An unstated
+        # status is unknown here exactly as an unreadable version is unknown on that axis —
+        # see the two-axis note above for why `()` (disabled servers, no health to state) is
+        # not the same as None.
+        mcp_health_verified = (mcp_set_verified
+                               and len(health) == 1 and health_unknown == 0)
+        # Redundant as written, and deliberately so: `comparability` requires BOTH axes, and
+        # saying that here does not depend on health's own gate above staying where it is.
+        mcp_verified = mcp_set_verified and mcp_health_verified
         isolation_verified = len(isolation) == 1  # always readable; empty matrix aside
         # TRI-STATE, not a boolean. A boolean `consistent` reads true whenever nothing
         # DIFFERED — including when nothing could be compared at all, which is every codex
@@ -1107,8 +1130,13 @@ class Runner:
             # only at `mcp_server_sets` would see two identical arrays and no explanation.
             "mcp_server_states": [[[n, st] for n, st in h] for h in health],
             "mcp_server_health_unknown_cells": health_unknown,
-            # True only when the set AND the health were each positively known and uniform.
-            "mcp_server_set_verified": mcp_verified,
+            # SET ONLY — the meaning this field has always had. True when every cell's server
+            # set was readable and they agreed, whatever is or is not known about health.
+            "mcp_server_set_verified": mcp_set_verified,
+            # ...and health as its own verdict beside it, rather than quietly narrowing the
+            # one above. False whenever the set is not uniform: there is then no common set
+            # for a health claim to be about.
+            "mcp_server_health_verified": mcp_health_verified,
             "isolation_uniform": len(isolation) <= 1,
         }
 

@@ -4273,6 +4273,17 @@ def _check_matrix_consistency(failures, verbose):
                    witnessed=(("echo", "connected"),)),
              _cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"],
                    witnessed=(("echo", "failed"),))], "claude")
+        # IDENTITY IS NOT HEALTH. Both cells reported a connected server — they reported
+        # DIFFERENT servers. Health values have to carry the names they belong to (or
+        # `echo failed, other connected` would compare equal to its mirror), so a difference
+        # in the SET propagates into this axis and was announced as health drift as well:
+        # one finding counted twice, the second line asserting a difference in whether
+        # servers worked when nothing of the sort was shown (found in review).
+        set_drift_only, _ = _consistency(
+            [_cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"],
+                   witnessed=(("echo", "connected"),)),
+             _cell("2.1.113", ["--strict-mcp-config", "--mcp-config", "x.json"],
+                   witnessed=(("other", "connected"),))], "claude")
         # MIXED SOURCES MUST NOT READ AS DRIFT. One cell crashed before its init event, so
         # it falls back to argv, which still PROVES the empty set under --strict-mcp-config
         # with no --mcp-config. Compared as bare names on one side and pairs on the other,
@@ -4454,6 +4465,49 @@ def _check_matrix_consistency(failures, verbose):
            f"{health_drift['mcp_server_sets']} vs states="
            f"{health_drift['mcp_server_states']}, drift={health_drift['drift']}",
            failures, verbose)
+
+    _check("runner.mcp_set_verification_is_reported_separately_from_health",
+           health_silent["mcp_server_set_verified"] is True
+           and health_silent["mcp_server_set_unknown_cells"] == 0
+           and health_silent["mcp_server_sets"] == [["echo"]]
+           and health_silent["mcp_server_health_verified"] is False
+           and health_silent["comparability"] == "unverified"
+           and witnessed_ok["mcp_server_set_verified"] is True
+           and witnessed_ok["mcp_server_health_verified"] is True
+           and opaque_mcp["mcp_server_set_verified"] is False,
+           f"`mcp_server_set_verified` predates the health axis and consumers read it as a "
+           f"statement about the SET. Folding health into it made this matrix report "
+           f"sets={health_silent['mcp_server_sets']} with "
+           f"{health_silent['mcp_server_set_unknown_cells']} unknown cells beside "
+           f"set_verified=false — the set is not in doubt at all; what nobody stated is "
+           f"whether those servers worked, which is now its own field "
+           f"(health_verified={health_silent['mcp_server_health_verified']}). A field "
+           f"changes meaning under its readers exactly once, silently, and then every "
+           f"consumer of it is wrong. The two combine only in `comparability`, which stays "
+           f"{health_silent['comparability']!r}", failures, verbose)
+
+    _check("runner.mcp_health_is_only_compared_within_a_uniform_server_set",
+           set_drift_only["comparability"] == "drift"
+           and any("MCP server set varied" in d for d in set_drift_only["drift"])
+           and not any("health varied" in d for d in set_drift_only["drift"])
+           and set_drift_only["mcp_server_health_verified"] is False
+           # ...and the same gate on the positive verdict: two cells that each disabled a
+           # DIFFERENT server both have nothing outstanding, so health compares equal —
+           # while they share no server for that agreement to be about.
+           and srv_drift["mcp_server_health_verified"] is False
+           and srv_drift["mcp_server_states"] == [[]]
+           # The genuine finding is untouched: one set, two healths, still drift.
+           and health_drift["mcp_server_health_verified"] is False
+           and any("health varied" in d for d in health_drift["drift"]),
+           f"health values carry the names they belong to — they must, or `echo failed, "
+           f"other connected` would compare equal to its mirror — so a difference in the "
+           f"SET propagates here and was announced twice: once truthfully as a set "
+           f"difference and once as health drift between cells that both reported a "
+           f"connected server ({set_drift_only['drift']}). Health is a claim ABOUT a server "
+           f"set, so neither its drift nor its agreement means anything without a common "
+           f"one; `true` there would be a green field standing in for a comparison with no "
+           f"ground to run on ({srv_drift['mcp_server_health_verified']} on two cells that "
+           f"each state {srv_drift['mcp_server_states']})", failures, verbose)
 
     _check("runner.verified_requires_every_axis_known",
            opaque_mcp["comparability"] == "unverified"

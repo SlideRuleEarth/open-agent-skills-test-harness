@@ -654,6 +654,29 @@ MUTATIONS = [
      "\n                names_raw.append(tuple(n for n, _ in pairs))",
      "\n                names_raw.append(pairs)",
      "runner.mcp_axis_reads_the_runs_own_witness_not_just_argv"),
+    # An existing field quietly narrowed: `mcp_server_set_verified` reports the SET, and
+    # folding the health verdict into it makes a matrix with a readable, uniform set report
+    # `false` beside `mcp_server_set_unknown_cells: 0`. Every consumer that already reads
+    # this field is then wrong, and nothing in the artifact says the meaning moved.
+    ("M99-set-verdict-narrowed-by-the-health-verdict", RUNNER,
+     '\n            "mcp_server_set_verified": mcp_set_verified,',
+     '\n            "mcp_server_set_verified": mcp_verified,',
+     "runner.mcp_set_verification_is_reported_separately_from_health"),
+    # Health drift asserted across a server set that itself varied. Health values carry
+    # their names, so the set difference propagates into this axis and is announced a second
+    # time as a difference in whether servers WORKED — which was never shown.
+    ("M100-health-drift-asserted-across-a-varying-server-set", RUNNER,
+     "\n        if len(servers) == 1 and len(health) > 1:",
+     "\n        if len(health) > 1:",
+     "runner.mcp_health_is_only_compared_within_a_uniform_server_set"),
+    # The same gate on the POSITIVE verdict, which fails the other way: two cells that each
+    # disabled a different server both have nothing outstanding, so health compares equal and
+    # reports verified — a green field on an axis whose two cells share no server at all.
+    ("M101-health-verified-without-a-common-server-set", RUNNER,
+     "\n        mcp_health_verified = (mcp_set_verified\n"
+     "                               and len(health) == 1 and health_unknown == 0)",
+     "\n        mcp_health_verified = (len(health) == 1 and health_unknown == 0)",
+     "runner.mcp_health_is_only_compared_within_a_uniform_server_set"),
 ]
 
 
