@@ -9446,15 +9446,30 @@ def _check_mcp_declared_servers(failures, verbose):
         `plugins/<name>/mcp_config.json`. No shipped adapter declares this half by itself,
         which is why the guard's coverage of it needs the same latent-adapter technique the
         guard itself does (found in review): dropping it is a fail-open regression that
-        nothing else would notice."""
+        nothing else would notice.
+
+        It has to name a registry ROOT to be a valid adapter of this shape — that is where
+        the masks get materialized. The first version of this fake omitted it and was
+        therefore not the thing it claimed to model (also found in review)."""
         name = "plugin-mask-only-injector"
+        mcp_off_mechanism = _MCPOffMechanism.OVERLAY_MASKS
+        global_plugin_registry_subpaths = [".x/plugins"]
+        plugin_registry_config_masks = {"mcp_config.json": '{"mcpServers": {}}'}
+
+    class _OrphanPluginMaskInjector(_FakeInjector):
+        """Plugin masks with NO registry root — masks that have nowhere to be applied.
+        `build_mcp_masked_home` derives its registry list from
+        `global_plugin_registry_subpaths` and returns `(None, {})` when it is empty, so the
+        overlay this adapter names as its mechanism is never built. Declaring a mask and the
+        mask having somewhere to act are different claims."""
+        name = "orphan-plugin-mask-injector"
         mcp_off_mechanism = _MCPOffMechanism.OVERLAY_MASKS
         plugin_registry_config_masks = {"mcp_config.json": '{"mcpServers": {}}'}
 
     class _MasklessMaskClaimInjector(_FakeInjector):
-        """Names the overlay as its mechanism and declares NO masks — a declaration that
-        contradicts itself. The overlay builds, the run goes green, and nothing was ever
-        masked, so this is refused with or without a HOME."""
+        """Names the overlay as its mechanism and declares NO masks at all — a declaration
+        that contradicts itself. The overlay builds, the run goes green, and nothing was
+        ever masked, so this is refused with or without a HOME."""
         name = "maskless-mask-claim-injector"
         mcp_off_mechanism = _MCPOffMechanism.OVERLAY_MASKS
 
@@ -9508,6 +9523,18 @@ def _check_mcp_declared_servers(failures, verbose):
         # Names the overlay and declares no masks: a self-contradicting declaration, so the
         # overlay it points at delivers nothing. Refused either way as well.
         empty_bare, empty_iso = _both(_MasklessMaskClaimInjector)
+        # ...and the same emptiness reached by a subtler route: masks that exist but have
+        # nowhere to be applied, because no plugin-registry root is named.
+        orphan_bare, orphan_iso = _both(_OrphanPluginMaskInjector)
+        # The mechanism's own builder agrees: with no registry root there is no overlay at
+        # all. Asserted against `build_mcp_masked_home` rather than only against the guard,
+        # so the two cannot drift into disagreeing about what a declared mask does.
+        from .isolation import build_mcp_masked_home as _masked_home
+        orphan_home = _masked_home(_OrphanPluginMaskInjector())[0]
+        valid_home = _masked_home(_PluginMaskOnlyInjector())[0]
+        for _h in (orphan_home, valid_home):
+            if _h:
+                _shutil.rmtree(_h, ignore_errors=True)
     finally:
         _shutil.rmtree(_iso_home, ignore_errors=True)
     # Matched on the refusal's opening clause, which names the reason, rather than on the
@@ -9533,6 +9560,11 @@ def _check_mcp_declared_servers(failures, verbose):
            # unclassified, and a mask claim with no masks: refused either way
            and refused(silent_bare) and refused(silent_iso)
            and refused(empty_bare) and refused(empty_iso)
+           # masks that exist but have nowhere to be applied: refused either way, and the
+           # builder itself confirms there is no overlay to rely on
+           and refused(orphan_bare) and refused(orphan_iso)
+           and "names no global_plugin_registry_subpaths" in orphan_iso
+           and orphan_home is None and valid_home is not None
            and "has not been determined" in silent_iso
            and "declares no masks" in empty_iso
            and depends == {"claude": False, "codex": False,
@@ -9552,7 +9584,11 @@ def _check_mcp_declared_servers(failures, verbose):
            f"(iso={refused(silent_iso)}): a boolean made that state share a value with "
            f"'uses masks', so an overlay materializing nothing for it read as protection. "
            f"An overlay claim with no masks is refused for the same reason "
-           f"(iso={refused(empty_iso)}). {mechs}", failures, verbose)
+           f"(iso={refused(empty_iso)}), and so is one whose masks have nowhere to be "
+           f"applied — plugin masks with no registry root, where the builder returns no "
+           f"overlay at all (iso={refused(orphan_iso)}, build={orphan_home!r} vs a rooted "
+           f"one at {type(valid_home).__name__}). Declaring a mask and the mask having "
+           f"somewhere to act are different claims. {mechs}", failures, verbose)
 
     # --- a warning nobody can read afterwards is not a warning -----------------
     # The server-health warning above went to the HARNESS process's stderr, which nothing

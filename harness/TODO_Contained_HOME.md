@@ -270,7 +270,7 @@ Non-negotiable, in this order. `SELFTEST PASSED` alone is not evidence.
 harness/.venv/bin/python -m agentskill_evals.cli selftest          # 486 arms
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 harness/.venv/bin/python -m pyflakes harness/agentskill_evals/*.py harness/agentskill_evals/adapters/*.py
-python3 harness/tools/mutate_mcp.py                               # 110/110 caught by the intended arm
+python3 harness/tools/mutate_mcp.py                               # 111/111 caught by the intended arm
 git diff --check
 ```
 
@@ -416,7 +416,10 @@ Smaller, unblocked:
   *unclassified* share a value with *uses masks*, so an adapter nobody had classified was
   cleared by any isolated HOME — by an overlay materializing nothing for it (both found in
   review). `None` fails closed in BOTH directions, the same not-mapped-is-not-a-claim rule
-  `contained_home_subpaths` uses. The two `CLI` declarations are reviewed assertions, not
+  `contained_home_subpaths` uses. An `OVERLAY_MASKS` claim is checked against the masks it
+  names *and* against whether they have anywhere to act: plugin masks with no
+  `global_plugin_registry_subpaths` root are materialized nowhere, and
+  `build_mcp_masked_home` then builds no overlay at all. The two `CLI` declarations are reviewed assertions, not
   verified ones — see §4's note on what provenance does and does not buy.
   **Latent until an adapter is both** — the mask-dependent adapters are exactly the ones
   that cannot inject, so `validate_mcp_support` refuses them first. It arms itself the day

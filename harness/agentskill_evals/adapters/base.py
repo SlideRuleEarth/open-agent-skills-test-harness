@@ -273,11 +273,27 @@ class Adapter(ABC):
         if mech is MCPOffMechanism.CLI:
             return None                      # holds whatever HOME the child is handed
         if mech is MCPOffMechanism.OVERLAY_MASKS:
-            # A declaration that contradicts itself: the masks ARE the mechanism, so an
+            # A declaration that contradicts itself. The masks ARE the mechanism, so an
             # adapter naming them and declaring none has no mechanism at all. Checked rather
             # than assumed, because the failure is silent — the overlay builds, the run goes
             # green, and nothing was ever masked.
-            if not (self.isolation_config_masks or self.plugin_registry_config_masks):
+            #
+            # DECLARING a mask is not the same as the mask having somewhere to act, which is
+            # the subtler half (found in review). `plugin_registry_config_masks` are
+            # materialized inside each plugin of each `global_plugin_registry_subpaths`
+            # root; with no root there is no plugin to put them in, and
+            # `build_mcp_masked_home` derives its registry list from exactly that field and
+            # returns `(None, {})` when nothing is left — so the overlay this adapter claims
+            # to rely on is never even built.
+            plugin_masks_apply = bool(self.plugin_registry_config_masks
+                                      and self.global_plugin_registry_subpaths)
+            if not (self.isolation_config_masks or plugin_masks_apply):
+                if self.plugin_registry_config_masks:
+                    return (f"{self.name} declares its MCP-off guarantee lives in the "
+                            f"isolation overlay's config masks, but its only masks are "
+                            f"plugin-registry masks and it names no "
+                            f"global_plugin_registry_subpaths for them to be applied in, so "
+                            f"the overlay is never built and nothing is masked")
                 return (f"{self.name} declares its MCP-off guarantee lives in the isolation "
                         f"overlay's config masks but declares no masks, so nothing keeps "
                         f"the user's real MCP configuration out of this run")
