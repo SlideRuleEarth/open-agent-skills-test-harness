@@ -9400,6 +9400,77 @@ def _check_mcp_declared_servers(failures, verbose):
            f"the adapter directly: unsupported={prog_unsupported[:60]!r} "
            f"gated={prog_gated[:60]!r}", failures, verbose)
 
+    # --- a declared surface with no overlay is a different experiment ----------
+    # `isolated: false` is the documented opt-out from the overlay-build guard, and that is
+    # right for a run that says nothing about MCP. Combined with `mcp_servers:` it opts out
+    # of the guarantee in the same breath as declaring the surface being guaranteed, and
+    # nothing re-checked the combination: the declared servers would load ALONGSIDE the
+    # user's real ones, making the declared set a SUBSET of what ran.
+    #
+    # No shipped adapter can reach it — the mask-dependent ones are exactly the ones that
+    # cannot inject, so `validate_mcp_support` refuses them one line earlier. So it is
+    # modelled with an adapter that is both, which is precisely what copilot or antigravity
+    # becomes on the day it gains injection. Neither fake is ever spawned.
+    _claude_cls = get_adapter("claude").__class__
+
+    class _MaskedInjector(_claude_cls):
+        name = "masked-injector"
+        isolation_config_masks = {".x/mcp.json": '{"mcpServers": {}}'}
+
+        def is_available(self):
+            return False
+
+    class _FlagInjector(_claude_cls):
+        """Same adapter, kill-switch at the CLI level — it holds whatever HOME the child is
+        handed, so this one must NOT be refused. Without it the arm would pass for an
+        adapter that refused every non-isolated run, declared servers or not."""
+        name = "flag-injector"
+
+        def is_available(self):
+            return False
+
+    def _prog_run_adapter(adapter, servers, home=None):
+        d = _tempfile.mkdtemp(prefix="ase-mcpiso-")
+        try:
+            ex = exec_mod.execute(
+                adapter, "hi",
+                RunOptions(mcp_servers=servers, mcp_scratch_dir=d, home=home),
+                cwd=d, timeout=5)
+            return ex.result.error or ""
+        except Exception as exc:                # noqa: BLE001 — a raise is also a refusal
+            return f"RAISED {exc}"
+        finally:
+            _shutil.rmtree(d, ignore_errors=True)
+
+    _iso_home = _tempfile.mkdtemp(prefix="ase-mcpisohome-")
+    try:
+        masked_bare = _try(lambda: _prog_run_adapter(_MaskedInjector(), plain), "")
+        masked_iso = _try(lambda: _prog_run_adapter(_MaskedInjector(), plain,
+                                                    home=_iso_home), "")
+        flag_bare = _try(lambda: _prog_run_adapter(_FlagInjector(), plain), "")
+    finally:
+        _shutil.rmtree(_iso_home, ignore_errors=True)
+    # DERIVED from the masks, so an adapter that grows one grows the rule with it. A
+    # hand-maintained boolean beside the masks drifts, and the drift fails open.
+    depends = {a: get_adapter(a).mcp_off_depends_on_isolation
+               for a in ("claude", "codex", "copilot", "antigravity")}
+
+    _check("mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask",
+           "no isolated HOME" in masked_bare and "masked-injector" in masked_bare
+           and "no isolated HOME" not in masked_iso
+           and "no isolated HOME" not in flag_bare
+           and depends == {"claude": False, "codex": False,
+                           "copilot": True, "antigravity": True},
+           f"declaring `mcp_servers:` states what this run's tool surface IS. On a runner "
+           f"whose MCP-off guarantee is a mask in the isolation overlay, a cell with no "
+           f"isolated HOME loads the user's real MCP configuration too, so the declared set "
+           f"is a subset of what ran and the scenario grades an experiment nobody described "
+           f"— refused ({masked_bare[:60]!r}), while the same adapter WITH an overlay is "
+           f"not ({masked_iso[:40]!r}). It stays a property of the kill-switch's LOCATION, "
+           f"not of isolation: an adapter whose switch is a CLI flag holds whatever HOME "
+           f"the child gets and is left alone ({flag_bare[:40]!r}). {depends}",
+           failures, verbose)
+
     # --- a warning nobody can read afterwards is not a warning -----------------
     # The server-health warning above went to the HARNESS process's stderr, which nothing
     # archives — `execute()` captures the CHILD's. So the message claiming that assertions

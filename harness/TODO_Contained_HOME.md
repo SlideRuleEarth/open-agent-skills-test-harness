@@ -267,10 +267,10 @@ and `contained_home_that_copies_auth_is_credential_bearing_before_the_copy` (mut
 Non-negotiable, in this order. `SELFTEST PASSED` alone is not evidence.
 
 ```sh
-harness/.venv/bin/python -m agentskill_evals.cli selftest          # 485 arms
+harness/.venv/bin/python -m agentskill_evals.cli selftest          # 486 arms
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 harness/.venv/bin/python -m pyflakes harness/agentskill_evals/*.py harness/agentskill_evals/adapters/*.py
-python3 harness/tools/mutate_mcp.py                               # 100/100 caught by the intended arm
+python3 harness/tools/mutate_mcp.py                               # 103/103 caught by the intended arm
 git diff --check
 ```
 
@@ -391,8 +391,25 @@ Smaller, unblocked:
   *unknown*, while argv names servers it **disabled**, which never ran and so have no health
   to state. See `DESIGN_MCP_Support.md` §8 Phase 1.
 - Portable `used_mcp_tool` assertion (§7) once a second adapter lands.
-- Refuse `isolated: false` combined with `mcp_servers:`.
+- ~~Refuse `isolated: false` combined with `mcp_servers:`.~~ **Done (2026-07-28)**, narrowed
+  from the flat phrasing: the refusal is a property of where the adapter's **kill-switch
+  lives**, not of isolation. copilot and agy keep MCP off with masks in the overlay, so a
+  cell with no isolated HOME loads the user's real servers beside the declared ones and is
+  refused; claude (`--strict-mcp-config`) and codex (per-server disables) hold whatever HOME
+  the child is handed, and a blanket rule would have refused the one configuration that
+  works today for no safety gain. Derived from the masks (`mcp_off_depends_on_isolation`)
+  rather than declared, so an adapter that grows a mask grows the rule with it.
+  **Latent until an adapter is both** — the mask-dependent adapters are exactly the ones
+  that cannot inject, so `validate_mcp_support` refuses them first. It arms itself the day
+  copilot or agy gains injection, which is why it went in before that rather than after.
 - Sweep for other default-held invariants (`judge`, `max_cells`, `provision`).
+- Report the `mcp_servers:` + no-overlay refusal in the **CLI pre-flight** as well, next to
+  `validate_mcp_support` in `cmd_run` — today it surfaces as a failed cell per cell, where
+  the sibling MCP refusals surface before anything runs ("they will always fail and waste
+  tokens"). Deliberately not done with the refusal itself: nothing in the selftest drives
+  `cmd_run` (only `validate_spec`), so the pre-flight copy would be a second wording of the
+  rule with no arm to keep it honest. The blocker is the missing `cmd_run` harness, not the
+  check — build that first, or this lands decorative.
 
 Still open in `DESIGN_MCP_Support.md` §9: claude's `mcpServers` http/sse JSON shape; copilot's
 MCP tool-name format and plugin-declared server reach; agy's transcript tool-name format and

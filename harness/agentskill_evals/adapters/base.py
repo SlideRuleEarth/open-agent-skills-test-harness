@@ -212,6 +212,21 @@ class Adapter(ABC):
     # enumerating adapter like copilot handles seeded configs on argv instead).
     workspace_config_masks: dict[str, str] = {}
 
+    @property
+    def mcp_off_depends_on_isolation(self) -> bool:
+        """Whether this adapter's MCP-off guarantee lives in the isolation overlay.
+
+        False means the kill-switch is at the CLI level and holds whatever HOME the child
+        is handed — claude's ``--strict-mcp-config``, codex's per-server disables. True
+        means the only thing keeping the user's real MCP configuration out of the run is a
+        mask in the overlay, so a run without one silently loads it.
+
+        DERIVED from the masks rather than declared beside them, because the two would drift
+        and the drift fails OPEN: an adapter that grows a mask and forgets the boolean keeps
+        every guard that reads it silently inapplicable. Nothing to forget this way.
+        """
+        return bool(self.isolation_config_masks or self.plugin_registry_config_masks)
+
     supports_output_schema: bool = False
     # True if build_argv maps RunOptions.reasoning_effort onto a native flag/config of this
     # CLI. When False the option is silently ignored here — the CLI layer warns the user up

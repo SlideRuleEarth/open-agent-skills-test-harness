@@ -677,6 +677,30 @@ MUTATIONS = [
      "                               and len(health) == 1 and health_unknown == 0)",
      "\n        mcp_health_verified = (len(health) == 1 and health_unknown == 0)",
      "runner.mcp_health_is_only_compared_within_a_uniform_server_set"),
+    # `isolated: false` + `mcp_servers:` back to running: the declared servers load beside
+    # the user's real ones, so the set the scenario states is a SUBSET of what ran.
+    ("M102-declared-servers-run-without-the-overlay", "agentskill_evals/exec.py",
+     "\n            if opts.home is None and adapter.mcp_off_depends_on_isolation:",
+     "\n            if False:",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # The other direction, which is why the arm carries a flag-level adapter too: refusing
+    # EVERY non-isolated declared-server run makes the rule about isolation rather than about
+    # where the kill-switch lives, and takes claude's hermetic `--strict-mcp-config` run with
+    # it. Over-refusal is not the safe direction when it removes the only working path.
+    ("M103-every-non-isolated-declared-run-refused", "agentskill_evals/exec.py",
+     "\n            if opts.home is None and adapter.mcp_off_depends_on_isolation:",
+     "\n            if opts.home is None:",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # The dependence stops being derived from the masks. Any adapter answering False leaves
+    # both the refusal above and the runner's isolation-off warning silently inapplicable —
+    # the drift a hand-maintained boolean beside the masks would produce, in one step.
+    # (No mutation for dropping the `plugin_registry_config_masks` half alone: agy declares
+    #  both and copilot only the first, so no shipped adapter's answer changes and nothing
+    #  in userspace could observe it — the M78 situation. An arm there would be decorative.)
+    ("M104-mcp-off-dependence-not-derived-from-the-masks", BASE,
+     "\n        return bool(self.isolation_config_masks or self.plugin_registry_config_masks)",
+     "\n        return False",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
 ]
 
 
