@@ -26,12 +26,18 @@ is fine:
 Adding a mutation: keep it to the smallest edit that reintroduces the real defect, and point
 it at the one arm that should notice. If you cannot name that arm, the arm does not exist yet
 and writing it is the actual work.
+
+Every result line carries the wall time of the selftest run that produced it, and the summary
+names the slowest. Read those against the `baseline:` line: a mutation taking several times
+the baseline is a defect that costs runtime rather than one that reddens an arm, and it is
+the only notice anyone gets before it grows past `_SELFTEST_TIMEOUT` and reports as a hang.
 """
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 # Repo-relative: this file lives at <repo>/harness/tools/, so the harness package root is
@@ -661,21 +667,28 @@ _SELFTEST_TIMEOUT = 300
 
 
 def run(cwd):
+    """Run the selftest in `cwd`. Returns (returncode, output, elapsed_seconds).
+
+    Elapsed is measured with a monotonic clock so a wall-clock adjustment mid-suite (a run
+    this long can straddle one) cannot produce a negative or wildly inflated duration.
+    """
+    t0 = time.monotonic()
     try:
         p = subprocess.run(
             [str(cwd / ".venv/bin/python"), "-m", "agentskill_evals", "selftest"],
             cwd=cwd, capture_output=True, text=True, timeout=_SELFTEST_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return 124, "__TIMEOUT__"
-    return p.returncode, p.stdout + p.stderr
+        return 124, "__TIMEOUT__", time.monotonic() - t0
+    return p.returncode, p.stdout + p.stderr, time.monotonic() - t0
 
 
 def main():
+    started = time.monotonic()
     tmp = Path(tempfile.mkdtemp(prefix="mutate-mcp-"))
     work = tmp / "harness"
     shutil.copytree(HARNESS, work, symlinks=True,
                     ignore=shutil.ignore_patterns("__pycache__", "artifacts", "build"))
-    rc, out = run(work)
+    rc, out, baseline_s = run(work)
     if out == "__TIMEOUT__":
         print(f"BASELINE TIMED OUT after {_SELFTEST_TIMEOUT}s — the unmutated selftest hung, "
               f"so nothing below would prove anything.")
@@ -684,9 +697,12 @@ def main():
         print("BASELINE FAILED — mutations prove nothing:")
         print(out[-3000:])
         return 1
-    print("baseline: SELFTEST PASSED\n")
+    # The reference every per-mutation time below is read against; without it those numbers
+    # describe the machine, not the mutation.
+    print(f"baseline: SELFTEST PASSED in {baseline_s:.1f}s\n")
 
     caught = 0
+    slowest = (0.0, None)
     for mid, rel, find, repl, arm in MUTATIONS:
         path = work / rel
         original = path.read_text()
@@ -694,14 +710,20 @@ def main():
         # reintroducing the defect means removing both (see M53).
         edits = list(zip(find, repl)) if isinstance(find, tuple) else [(find, repl)]
         if any(f not in original for f, _ in edits):
-            print(f"{mid}: STALE ANCHOR — text not found in {rel}")
+            # No time to report, and "(0.0s)" would read as a suite that ran instantly rather
+            # than one that never started — the same lie the None/[] distinction exists to
+            # prevent elsewhere. Say which it is.
+            print(f"{mid}: STALE ANCHOR — text not found in {rel} (selftest not run)")
             continue
         mutated = original
         for f, r in edits:
             mutated = mutated.replace(f, r, 1)
         path.write_text(mutated)
-        rc, out = run(work)
+        rc, out, elapsed = run(work)
         path.write_text(original)
+        took = f"({elapsed:.1f}s)"
+        if elapsed > slowest[0]:
+            slowest = (elapsed, mid)
         failed = re.findall(r"\[FAIL\]\s+([^:]+):", out)
         if out == "__TIMEOUT__":
             # Not a clean catch: the arm never got to report because the selftest hung. A
@@ -709,15 +731,18 @@ def main():
             # the work (a thread + join), not by the suite's own timeout — so this counts as
             # uncaught and fails the run, forcing a real fix rather than masking the hang.
             print(f"{mid}: *** TIMEOUT *** selftest exceeded {_SELFTEST_TIMEOUT}s — the "
-                  f"defect hangs rather than reddening {arm}")
+                  f"defect hangs rather than reddening {arm} {took}")
         elif rc != 0 and arm in failed:
-            print(f"{mid}: CAUGHT by {arm}")
+            print(f"{mid}: CAUGHT by {arm} {took}")
             caught += 1
         elif rc != 0:
-            print(f"{mid}: failed, but NOT via {arm} -> {failed}")
+            print(f"{mid}: failed, but NOT via {arm} -> {failed} {took}")
         else:
-            print(f"{mid}: *** MISSED *** selftest still passes with the defect present")
+            print(f"{mid}: *** MISSED *** selftest still passes with the defect present {took}")
     print(f"\n{caught}/{len(MUTATIONS)} caught by the intended arm")
+    total = time.monotonic() - started
+    slow = f"slowest {slowest[1]} at {slowest[0]:.1f}s" if slowest[1] else "no mutation ran"
+    print(f"elapsed: {total / 60:.1f} min total, baseline {baseline_s:.1f}s, {slow}")
     shutil.rmtree(tmp, ignore_errors=True)
     return 0 if caught == len(MUTATIONS) else 1
 

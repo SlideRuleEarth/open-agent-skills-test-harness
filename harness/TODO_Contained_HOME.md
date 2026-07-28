@@ -303,7 +303,10 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   real-home overlay to a walk a mutation can turn recursive; the fix gated that capture to the
   small contained-home fixtures only. `mutate_mcp.py` now also bounds each selftest with a
   `timeout` (reported as `TIMEOUT`, counted as *uncaught*), so a looping mutation is a finding
-  rather than an infinite hang — but it is a backstop, not a licence to hang.
+  rather than an infinite hang — but it is a backstop, not a licence to hang. Each result line
+  also carries its selftest's wall time, and the summary names the slowest; read them against
+  the `baseline:` line. A mutation at several times baseline is already the M65 shape, just not
+  yet past the timeout, and that gap is the only warning anyone gets before it becomes a hang.
 
 ---
 
