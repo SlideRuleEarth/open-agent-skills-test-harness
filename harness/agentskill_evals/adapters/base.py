@@ -19,11 +19,30 @@ import shutil
 import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Mapping, Optional
 
 from ..isolation import build_mcp_masked_home, config_home_entries
 from ..notices import warn
 from ..schema import NormalizedEvent
+
+
+class MCPOffMechanism(str, Enum):
+    """How an adapter keeps the user's OWN MCP servers out of a run (the Phase 0 default).
+
+    There is deliberately no member for "not determined" — that is ``None`` on
+    ``Adapter.mcp_off_mechanism``, so the unclassified state cannot be spelled as a value
+    and accidentally read as one, exactly as ``contained_home_subpaths=None`` is not ``[]``.
+    """
+
+    #: A CLI flag or generated argv — claude's ``--strict-mcp-config``, codex's per-server
+    #: disables enumerated from the child's own env. Holds whatever HOME the child is handed,
+    #: so it survives a run with no isolation overlay.
+    CLI = "cli"
+    #: Config files the isolation overlay materializes with neutral content
+    #: (``isolation_config_masks`` / ``plugin_registry_config_masks``) — copilot, antigravity.
+    #: There is no such guarantee on a run built without an overlay.
+    OVERLAY_MASKS = "overlay_masks"
 
 
 @dataclass
@@ -212,30 +231,67 @@ class Adapter(ABC):
     # enumerating adapter like copilot handles seeded configs on argv instead).
     workspace_config_masks: dict[str, str] = {}
 
-    # Whether this adapter's MCP-off guarantee survives a run with NO isolation overlay —
-    # i.e. the kill-switch is at the CLI level (claude's `--strict-mcp-config`, codex's
-    # per-server disables, both of which hold whatever HOME the child is handed) rather than
-    # a config mask the overlay materializes.
+    # HOW this adapter keeps the user's own MCP servers out of a run — see MCPOffMechanism.
     #
-    # DECLARED, not derived. An earlier cut read `bool(isolation_config_masks or
-    # plugin_registry_config_masks)`, which answers "does this adapter HAVE a mask" — a
-    # different question from "does it DEPEND on one". An adapter with a complete CLI
-    # kill-switch AND a redundant mask is hermetic without isolation and would have been
-    # refused anyway (found in review), and belt-and-braces is a shape this project already
-    # uses: copilot carries masks beside its argv disables.
+    # THREE states, not two, and `None` is the one that matters. A boolean spelled
+    # "survives without isolation" made `False` mean both "keeps MCP off with overlay masks"
+    # and "nobody has ever determined how this adapter keeps MCP off", so the guard below
+    # cleared an UNCLASSIFIED adapter the moment a run had any isolated HOME at all — an
+    # overlay that materializes nothing protecting MCP config was read as protection,
+    # because a mask-dependent adapter would have been protected by one (found in review).
     #
-    # The default is the fail-closed direction, and that is what makes declaring it safe.
-    # The drift that motivated deriving it — an adapter grows a mask and nobody updates the
-    # flag — cannot fail open from here, because forgetting leaves False and False refuses.
-    # A wrong `True` is the only dangerous value, and it is a claim about a CLI mechanism,
-    # which is the thing VersionProvenance already exists to re-verify per build.
-    mcp_off_survives_without_isolation: bool = False
+    # It is the same distinction `contained_home_subpaths` draws with None-vs-[]: not
+    # mapped is not the same claim as mapped-and-needs-nothing, and only one of them may
+    # clear a check. DECLARED rather than derived from mask presence, because
+    # `bool(masks)` answers "does this adapter HAVE a mask" rather than "does it DEPEND on
+    # one" and refused a complete CLI kill-switch backed by a redundant mask (also found in
+    # review); belt-and-braces is a shape this project already uses, copilot carrying masks
+    # beside its argv disables.
+    #
+    # `None` is the fail-closed default in BOTH directions — isolated or not — so an
+    # adapter nobody has classified refuses declared servers outright rather than being
+    # cleared by an overlay that does nothing for it.
+    mcp_off_mechanism: Optional["MCPOffMechanism"] = None
 
     @property
     def mcp_off_depends_on_isolation(self) -> bool:
-        """Whether the ONLY thing keeping the user's real MCP configuration out of a run is
-        a mask in the isolation overlay — so a run built without one silently loads it."""
-        return not self.mcp_off_survives_without_isolation
+        """Whether a run without an isolation overlay loses this adapter's MCP-off
+        guarantee. True for UNCLASSIFIED as well as for OVERLAY_MASKS: an unclassified
+        adapter has no established guarantee to keep."""
+        return self.mcp_off_mechanism is not MCPOffMechanism.CLI
+
+    def mcp_off_gap(self, isolated_home: Optional[str]) -> Optional[str]:
+        """Why a DECLARED `mcp_servers:` set cannot be honoured on this run, or None if it
+        can. Declaring servers states what the run's tool surface IS, so anything the
+        harness cannot keep out makes the declared set a SUBSET of what actually ran.
+
+        Lives here rather than in exec.py because all three inputs are the adapter's own:
+        which mechanism it uses, whether that mechanism is consistent with what it declares,
+        and what the mechanism needs from the run.
+        """
+        mech = self.mcp_off_mechanism
+        if mech is MCPOffMechanism.CLI:
+            return None                      # holds whatever HOME the child is handed
+        if mech is MCPOffMechanism.OVERLAY_MASKS:
+            # A declaration that contradicts itself: the masks ARE the mechanism, so an
+            # adapter naming them and declaring none has no mechanism at all. Checked rather
+            # than assumed, because the failure is silent — the overlay builds, the run goes
+            # green, and nothing was ever masked.
+            if not (self.isolation_config_masks or self.plugin_registry_config_masks):
+                return (f"{self.name} declares its MCP-off guarantee lives in the isolation "
+                        f"overlay's config masks but declares no masks, so nothing keeps "
+                        f"the user's real MCP configuration out of this run")
+            if isolated_home is None:
+                return (f"{self.name} keeps MCP off through the isolation overlay's config "
+                        f"masks and this cell has no isolated HOME, so the declared servers "
+                        f"would load ALONGSIDE the user's real MCP configuration (user "
+                        f"config and plugin-declared servers)")
+            return None
+        return (f"how {self.name} keeps the user's own MCP servers out of a run has not "
+                f"been determined (Adapter.mcp_off_mechanism is unset), so the harness "
+                f"cannot state that the declared servers are the only ones that would "
+                f"load — an isolated HOME does not settle it, since this adapter declares "
+                f"no config masks for the overlay to materialize")
 
     supports_output_schema: bool = False
     # True if build_argv maps RunOptions.reasoning_effort onto a native flag/config of this

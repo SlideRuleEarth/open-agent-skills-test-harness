@@ -52,6 +52,7 @@ from typing import Any, Mapping, Optional
 from ..schema import EventKind, NormalizedEvent
 from .base import (
     Adapter,
+    MCPOffMechanism,
     ParseOutput,
     ProbeResult,
     RunOptions,
@@ -1467,6 +1468,13 @@ class CopilotAdapter(Adapter):
                               ".copilot/agents": None,
                               ".copilot/config.json": _sanitized_copilot_config,
                               ".copilot/settings.json": _sanitized_copilot_config}
+    # No flag disables copilot's plugin-declared MCP servers, and their names live inside
+    # plugin definitions the harness cannot enumerate — so the argv disables above cannot be
+    # AIMED at that channel and the masks are what closes it. That makes the whole MCP-off
+    # guarantee overlay-dependent even though most of it is argv: a non-isolated run keeps
+    # the argv layer and loses the only cover the plugin channel has (the runner warns, and
+    # a DECLARED `mcp_servers:` set is refused outright — see Adapter.mcp_off_mechanism).
+    mcp_off_mechanism = MCPOffMechanism.OVERLAY_MASKS
     # COPILOT_HOME replaces ~/.copilot wholesale (verified in 1.0.64's bundle) — without
     # mirroring it, a set var would bypass the masks above.
     isolation_config_homes = [("COPILOT_HOME", ".copilot", None)]

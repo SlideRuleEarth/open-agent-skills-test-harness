@@ -9412,6 +9412,7 @@ def _check_mcp_declared_servers(failures, verbose):
     # modelled with an adapter that is both, which is precisely what copilot or antigravity
     # becomes on the day it gains injection. Neither fake is ever spawned.
     from .adapters.base import Adapter as _BaseAdapter
+    from .adapters.base import MCPOffMechanism as _MCPOffMechanism
     from .adapters.base import ParseOutput as _BaseParseOutput
 
     class _FakeInjector(_BaseAdapter):
@@ -9437,6 +9438,7 @@ def _check_mcp_declared_servers(failures, verbose):
         """Its ONLY MCP-off mechanism is a config mask the overlay materializes — what
         copilot becomes on gaining injection."""
         name = "mask-only-injector"
+        mcp_off_mechanism = _MCPOffMechanism.OVERLAY_MASKS
         isolation_config_masks = {".x/mcp.json": '{"mcpServers": {}}'}
 
     class _PluginMaskOnlyInjector(_FakeInjector):
@@ -9446,14 +9448,22 @@ def _check_mcp_declared_servers(failures, verbose):
         guard itself does (found in review): dropping it is a fail-open regression that
         nothing else would notice."""
         name = "plugin-mask-only-injector"
+        mcp_off_mechanism = _MCPOffMechanism.OVERLAY_MASKS
         plugin_registry_config_masks = {"mcp_config.json": '{"mcpServers": {}}'}
+
+    class _MasklessMaskClaimInjector(_FakeInjector):
+        """Names the overlay as its mechanism and declares NO masks — a declaration that
+        contradicts itself. The overlay builds, the run goes green, and nothing was ever
+        masked, so this is refused with or without a HOME."""
+        name = "maskless-mask-claim-injector"
+        mcp_off_mechanism = _MCPOffMechanism.OVERLAY_MASKS
 
     class _FlagInjector(_FakeInjector):
         """Kill-switch at the CLI level, so it holds whatever HOME the child is handed and
         must NOT be refused — otherwise the rule is about isolation rather than about where
         the switch lives, and claude's hermetic non-isolated run goes with it."""
         name = "flag-injector"
-        mcp_off_survives_without_isolation = True
+        mcp_off_mechanism = _MCPOffMechanism.CLI
 
     class _BeltAndBracesInjector(_FlagInjector):
         """A complete CLI kill-switch AND a redundant mask. Hermetic without the overlay, so
@@ -9476,46 +9486,73 @@ def _check_mcp_declared_servers(failures, verbose):
         finally:
             _shutil.rmtree(d, ignore_errors=True)
 
+    # EVERY mechanism under BOTH HOME conditions. Testing only the bare case let a defect
+    # hide in the half nobody looked at: an UNCLASSIFIED adapter was cleared as soon as a run
+    # had any isolated HOME, because the guard asked "does this depend on isolation" and an
+    # overlay existed — while that overlay materializes no masks for an adapter that declares
+    # none, so it protected nothing (found in review). The `_iso` column is the finding.
     _iso_home = _tempfile.mkdtemp(prefix="ase-mcpisohome-")
     try:
-        masked_bare = _try(lambda: _prog_run_adapter(_MaskOnlyInjector(), plain), "")
-        masked_iso = _try(lambda: _prog_run_adapter(_MaskOnlyInjector(), plain,
-                                                    home=_iso_home), "")
-        plugin_bare = _try(lambda: _prog_run_adapter(_PluginMaskOnlyInjector(), plain), "")
-        flag_bare = _try(lambda: _prog_run_adapter(_FlagInjector(), plain), "")
-        belt_bare = _try(lambda: _prog_run_adapter(_BeltAndBracesInjector(), plain), "")
-        # An adapter that declares NOTHING is refused: the default is the fail-closed
-        # direction, and that is what makes a declared flag safe where a derived one was
-        # not. Forgetting it leaves False, and False refuses.
-        silent_bare = _try(lambda: _prog_run_adapter(_FakeInjector(), plain), "")
+        def _both(adapter_cls):
+            return (_try(lambda: _prog_run_adapter(adapter_cls(), plain), ""),
+                    _try(lambda: _prog_run_adapter(adapter_cls(), plain,
+                                                   home=_iso_home), ""))
+        masked_bare, masked_iso = _both(_MaskOnlyInjector)
+        plugin_bare, plugin_iso = _both(_PluginMaskOnlyInjector)
+        flag_bare, flag_iso = _both(_FlagInjector)
+        belt_bare, belt_iso = _both(_BeltAndBracesInjector)
+        # Declares NOTHING: refused either way, because "nobody determined how this adapter
+        # keeps MCP off" is not a weaker form of "it uses masks" — an overlay cannot supply
+        # a guarantee that was never established.
+        silent_bare, silent_iso = _both(_FakeInjector)
+        # Names the overlay and declares no masks: a self-contradicting declaration, so the
+        # overlay it points at delivers nothing. Refused either way as well.
+        empty_bare, empty_iso = _both(_MasklessMaskClaimInjector)
     finally:
         _shutil.rmtree(_iso_home, ignore_errors=True)
+    # Matched on the refusal's opening clause, which names the reason, rather than on the
+    # closing sentence: the first version of this predicate looked for a phrase that was one
+    # word off ("not the experiment" vs "would not be the experiment") and read every case
+    # as allowed — the arm went red rather than passing, but only because it also asserts
+    # the cases that must be REFUSED. A predicate that can only fail open is worth avoiding.
+    def refused(s):
+        return "declares this run's MCP surface" in s
     depends = {a: get_adapter(a).mcp_off_depends_on_isolation
                for a in ("claude", "codex", "copilot", "antigravity")}
+    mechs = {a: getattr(get_adapter(a).mcp_off_mechanism, "value", None)
+             for a in ("claude", "codex", "copilot", "antigravity")}
 
     _check("mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask",
-           "no isolated HOME" in masked_bare and "mask-only-injector" in masked_bare
-           and "no isolated HOME" in plugin_bare
-           and "no isolated HOME" in silent_bare
-           and "no isolated HOME" not in masked_iso
-           and "no isolated HOME" not in flag_bare
-           and "no isolated HOME" not in belt_bare
+           # overlay-masked: needs the overlay, allowed once it has one — both halves
+           refused(masked_bare) and "mask-only-injector" in masked_bare
+           and not refused(masked_iso)
+           and refused(plugin_bare) and not refused(plugin_iso)
+           # CLI-level: allowed either way, redundant mask or not
+           and not refused(flag_bare) and not refused(flag_iso)
+           and not refused(belt_bare) and not refused(belt_iso)
+           # unclassified, and a mask claim with no masks: refused either way
+           and refused(silent_bare) and refused(silent_iso)
+           and refused(empty_bare) and refused(empty_iso)
+           and "has not been determined" in silent_iso
+           and "declares no masks" in empty_iso
            and depends == {"claude": False, "codex": False,
-                           "copilot": True, "antigravity": True},
-           f"declaring `mcp_servers:` states what this run's tool surface IS. Where the "
-           f"MCP-off guarantee is a mask the overlay materializes, a cell with no isolated "
-           f"HOME loads the user's real MCP configuration too, so the declared set is a "
-           f"subset of what ran and the scenario grades an experiment nobody described — "
-           f"refused ({masked_bare[:50]!r}), through the PLUGIN half alone as well "
-           f"({'refused' if 'no isolated HOME' in plugin_bare else plugin_bare[:40]!r}), "
-           f"while the same adapter WITH an overlay is not ({masked_iso[:30]!r}). It stays "
-           f"a property of the kill-switch's LOCATION, not of isolation: a CLI-level switch "
-           f"holds whatever HOME the child gets and is left alone ({flag_bare[:30]!r}) — "
-           f"including alongside a redundant mask, which a `bool(masks)` predicate refused "
-           f"for HAVING one rather than DEPENDING on one ({belt_bare[:30]!r}). Declaring "
-           f"nothing refuses ({'refused' if 'no isolated HOME' in silent_bare else 'RAN'}), "
-           f"so the flag can only be forgotten in the safe direction. {depends}",
-           failures, verbose)
+                           "copilot": True, "antigravity": True}
+           and mechs == {"claude": "cli", "codex": "cli",
+                         "copilot": "overlay_masks", "antigravity": "overlay_masks"},
+           f"declaring `mcp_servers:` states what this run's tool surface IS, so anything "
+           f"the harness cannot keep out makes the declared set a SUBSET of what ran. THREE "
+           f"mechanisms, each checked with and without an overlay. Masks need one and are "
+           f"refused without it (bare={refused(masked_bare)} iso={refused(masked_iso)}), "
+           f"through the PLUGIN half alone as well (bare={refused(plugin_bare)} "
+           f"iso={refused(plugin_iso)}). A CLI-level switch holds whatever HOME the child "
+           f"gets and is left alone either way (bare={refused(flag_bare)} "
+           f"iso={refused(flag_iso)}) — including alongside a redundant mask, which a "
+           f"`bool(masks)` predicate refused for HAVING one rather than DEPENDING on one "
+           f"(iso={refused(belt_iso)}). And UNCLASSIFIED is refused with an overlay too "
+           f"(iso={refused(silent_iso)}): a boolean made that state share a value with "
+           f"'uses masks', so an overlay materializing nothing for it read as protection. "
+           f"An overlay claim with no masks is refused for the same reason "
+           f"(iso={refused(empty_iso)}). {mechs}", failures, verbose)
 
     # --- a warning nobody can read afterwards is not a warning -----------------
     # The server-health warning above went to the HARNESS process's stderr, which nothing

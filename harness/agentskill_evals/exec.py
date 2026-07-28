@@ -152,14 +152,19 @@ def execute(
             # inject, so `validate_mcp_support` above refuses them first. It arms itself the
             # moment copilot or antigravity gains injection, which is the point of putting
             # it in before that happens rather than after.
-            if opts.home is None and adapter.mcp_off_depends_on_isolation:
+            #
+            # The adapter decides, because all three inputs are its own; an earlier cut
+            # asked only `home is None and depends_on_isolation`, which cleared an
+            # UNCLASSIFIED adapter as soon as a run had any isolated HOME — an overlay that
+            # materializes no masks for it was read as protection because a mask-dependent
+            # adapter would have been protected by one (found in review).
+            gap = adapter.mcp_off_gap(opts.home)
+            if gap:
                 raise RuntimeError(
-                    f"`mcp_servers:` declares this run's MCP surface, but {adapter.name} "
-                    f"keeps MCP off through the isolation overlay's config masks and this "
-                    f"cell has no isolated HOME. The declared servers would load ALONGSIDE "
-                    f"the user's real MCP configuration (user config and plugin-declared "
-                    f"servers), so the run would not be the experiment the scenario "
-                    f"describes. Drop `isolated: false`, or drop `mcp_servers:`.")
+                    f"`mcp_servers:` declares this run's MCP surface, but {gap}. The "
+                    f"declared set would then be a SUBSET of what actually ran, so the run "
+                    f"would not be the experiment the scenario describes. Drop "
+                    f"`isolated: false`, or drop `mcp_servers:`.")
         argv = adapter.build_argv(prompt, opts, cwd=cwd)
     except Exception as exc:
         rr.error = f"could not construct a hermetic invocation: {exc}"

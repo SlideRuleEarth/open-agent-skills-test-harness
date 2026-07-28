@@ -270,7 +270,7 @@ Non-negotiable, in this order. `SELFTEST PASSED` alone is not evidence.
 harness/.venv/bin/python -m agentskill_evals.cli selftest          # 486 arms
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 harness/.venv/bin/python -m pyflakes harness/agentskill_evals/*.py harness/agentskill_evals/adapters/*.py
-python3 harness/tools/mutate_mcp.py                               # 106/106 caught by the intended arm
+python3 harness/tools/mutate_mcp.py                               # 110/110 caught by the intended arm
 git diff --check
 ```
 
@@ -283,6 +283,19 @@ and was, for two PRs.)
 Pre-existing pyflakes noise, leave alone: unused `load_spec` in `cli.py:22`, unused `Optional`
 in `adapters/__init__.py:9`, unused `os` in `adapters/codex.py:23`, and many "f-string is
 missing placeholders" in `selftest.py`.
+
+**What `VersionProvenance` does and does not buy.** It is an **audit trail plus a drift
+warning**, not verification, and anything written as though it re-checks a claim per build is
+overstating it (caught in review of #93). A build outside `_VERIFIED_VERSIONS` *warns and still
+runs*. claude's own `witness_held` text says the runtime witness cannot distinguish "the flag
+worked" from "a newer build grew a server source outside the flag's reach". codex has less
+again: `_VERSION_UNREADABLE` records that it cannot identify the build it just executed at all,
+because `--ephemeral` suppresses the only file that carries the version — so its sole check is
+an out-of-band `codex --version`. Reviewed assertions that rest on a CLI mechanism
+(`mcp_off_mechanism = CLI`, the `--strict-mcp-config` argument, codex's argv disables) are
+exactly that: **reviewed**. Nothing here would catch a wrong one. What the machinery buys is
+that an unaudited build is *visible* and that re-establishing a claim has a documented
+procedure (`clear_hint`).
 
 **Every new arm must be mutation-tested.** Add the mutation to `harness/tools/mutate_mcp.py`
 in the same commit as the arm. An arm nothing can break is decorative, and this project has
@@ -397,12 +410,14 @@ Smaller, unblocked:
   cell with no isolated HOME loads the user's real servers beside the declared ones and is
   refused; claude (`--strict-mcp-config`) and codex (per-server disables) hold whatever HOME
   the child is handed, and a blanket rule would have refused the one configuration that
-  works today for no safety gain. **Declared** per adapter
-  (`mcp_off_survives_without_isolation`, default `False`) rather than derived from mask
-  presence: `bool(masks)` answers "has a mask", not "depends on one", and refused an adapter
-  whose complete CLI kill-switch was backed by a redundant one (found in review). The
-  fail-closed default is what makes declaring safe — forgetting the flag leaves `False`,
-  and `False` refuses.
+  works today for no safety gain. Classified by a declared **tri-state**
+  (`mcp_off_mechanism`: `CLI`, `OVERLAY_MASKS`, or `None` for not-determined). Deriving it
+  from mask presence answered "has a mask" rather than "depends on one"; a boolean then made
+  *unclassified* share a value with *uses masks*, so an adapter nobody had classified was
+  cleared by any isolated HOME — by an overlay materializing nothing for it (both found in
+  review). `None` fails closed in BOTH directions, the same not-mapped-is-not-a-claim rule
+  `contained_home_subpaths` uses. The two `CLI` declarations are reviewed assertions, not
+  verified ones — see §4's note on what provenance does and does not buy.
   **Latent until an adapter is both** — the mask-dependent adapters are exactly the ones
   that cannot inject, so `validate_mcp_support` refuses them first. It arms itself the day
   copilot or agy gains injection, which is why it went in before that rather than after.

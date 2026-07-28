@@ -24,8 +24,8 @@ from typing import Any, Optional
 
 from ..notices import warn
 from ..schema import EventKind, NormalizedEvent
-from .base import (Adapter, ParseOutput, ProbeResult, RunOptions, VersionProvenance,
-                   extract_command, extract_path, iter_jsonl, warn_unknown_usage)
+from .base import (Adapter, MCPOffMechanism, ParseOutput, ProbeResult, RunOptions,
+                   VersionProvenance, extract_command, extract_path, iter_jsonl, warn_unknown_usage)
 
 _FILE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Create"}
 _READ_TOOLS = {"Read", "View"}
@@ -272,9 +272,16 @@ class ClaudeAdapter(Adapter):
     # configurations") is a CLI flag, so it holds whatever HOME the child is handed — this
     # adapter declares no config masks and needs none. A declared server set is therefore
     # still the whole server set under `isolated: false`, which is why such a run is allowed
-    # rather than refused (see Adapter.mcp_off_survives_without_isolation). The claim rests
-    # entirely on that flag, which is exactly what _PROVENANCE re-checks per build.
-    mcp_off_survives_without_isolation = True
+    # rather than refused (see Adapter.mcp_off_mechanism).
+    #
+    # This is a REVIEWED ASSERTION about that flag, not a verified one. _PROVENANCE is an
+    # audit trail plus a drift warning: a build outside _VERIFIED_VERSIONS warns and still
+    # runs, and the witness text above says outright that an empty server list cannot
+    # distinguish "the flag worked" from "a newer build grew a server source outside the
+    # flag's reach". Nothing here would catch a wrong value; what the provenance machinery
+    # buys is that an unaudited build is visible, and that re-establishing the claim has a
+    # documented procedure (clear_hint).
+    mcp_off_mechanism = MCPOffMechanism.CLI
     # Per-server `tools:` is REFUSED here rather than half-enforced. The only claude
     # mechanism that gates MCP tools is `--disallowedTools` on the complement of the
     # allowlist (`--allowedTools` does nothing under --dangerously-skip-permissions —

@@ -56,6 +56,7 @@ from typing import Any, Optional
 from ..schema import EventKind, NormalizedEvent
 from .base import (
     Adapter,
+    MCPOffMechanism,
     ParseOutput,
     RunOptions,
     VersionProvenance,
@@ -178,6 +179,10 @@ class AntigravityAdapter(Adapter):
     # isolation is the ONLY MCP-off mechanism on this runner: non-isolated runs can't be
     # made hermetic (the runner warns) and an overlay failure fails closed.
     plugin_registry_config_masks = {"mcp_config.json": '{"mcpServers": {}}'}
+    # Stated as a declaration and not only in prose above: the discovery file IS the only
+    # injection point, so there is no flag-level kill-switch to fall back on and the masks
+    # are the entire mechanism.
+    mcp_off_mechanism = MCPOffMechanism.OVERLAY_MASKS
     # UNMAPPED, and on macOS deliberately so — this is a negative result, not a gap nobody
     # got to. None keeps containment unavailable, so runner._refuse_uncontained_home goes on
     # refusing this adapter's credential-bearing cells, which is the correct outcome here.
