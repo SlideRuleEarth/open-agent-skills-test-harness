@@ -392,10 +392,17 @@ ABA fix and its route to `parallel_safe_config = True`.
 - **C3 harness-owned filtering proxy** — required before any scenario points `tools:` at a
   server its author does not control, and required for agy tool gating regardless.
   **Designed in `DESIGN_MCP_Support.md` §10 (2026-07-29); not built.** stdio only in the
-  first cut — remote `tools:` stays refused. Build order: probe C3-1 (how each CLI shuts
-  a stdio server down) → the proxy module + its arms, wired to nothing → the adapter
-  integration that unlocks `tools:`. The middle slice cannot affect any run, which is the
-  point: this is harness code in the request path of every gated cell.
+  first cut — remote `tools:` stays refused. Build order: probe **C3-0** (which MCP
+  protocol era each CLI speaks) → probe **C3-1** (how each CLI shuts a stdio server down)
+  → the proxy module + its arms, wired to nothing → the adapter integration that unlocks
+  `tools:`. The middle slice cannot affect any run, which is the point: this is harness
+  code in the request path of every gated cell.
+  C3-0 leads because MCP revision `2026-07-28` removed the `initialize` handshake in
+  favour of per-request `_meta`, added the `server/discover` probe, and forbade
+  server-initiated requests (§10.2). Era decides the correlation model, the anomaly set,
+  and what `fixtures/echo_mcp_server.py` — today legacy-only — has to impersonate, so
+  every later step is built against a guess until it is measured. Both probes can share
+  one shim.
 
 Smaller, unblocked:
 
