@@ -12,16 +12,22 @@ and records what that client did. Two questions, one process (DESIGN_MCP_Support
         leave that gate unimplementable.
 
   C3-1  How does the client shut a stdio server down? §10.5 fails a cell that has no clean
-        terminator, and that rule is only workable if clients close stdin and wait. The
-        spec says they SHOULD, but sanctions escalating to SIGTERM/SIGKILL, so what each
-        CLI actually does is a measurement rather than a reading.
+        terminator, and that rule is only workable if clients close stdin, or signal in a
+        way the server can catch. What each CLI does is a measurement, not a reading.
 
-It answers BOTH eras by default. A shim that spoke only one would hang the other client at
-its first request, and a timeout is indistinguishable from a finding — the measurement
-would be of this file rather than of the CLI.
+It answers BOTH eras. A shim that spoke only one would hang the other client at its first
+request, and a timeout is indistinguishable from a finding.
+
+CONFORMANCE MATTERS HERE, and an earlier revision of this file got it wrong. A client is
+entitled to a well-formed peer, and a tolerant client papering over a malformed server
+turns C3-1 into a measurement of that tolerance rather than of the shutdown path. So
+modern responses carry `resultType`, cacheable results (`server/discover`, `tools/list`)
+carry the `ttlMs`/`cacheScope` hints the spec makes MUST, and `subscriptions/listen`
+opens a real stream — acknowledgment first, graceful closure at the end — instead of
+being refused.
 
 Protocol: JSON-RPC 2.0 over stdio, ONE message per line. stdout carries protocol traffic
-and NOTHING else; the log goes to its own file, and diagnostics to stderr.
+and NOTHING else; the log goes to its own fd, and diagnostics to stderr.
 
 No third-party imports, by rule — this runs as a subprocess of an agent CLI on whatever
 interpreter `command:` resolves to.
@@ -44,34 +50,60 @@ MODE = os.environ.get("PROBE_MCP_MODE", "dual")
 IGNORE_SIGTERM = os.environ.get("PROBE_MCP_IGNORE_SIGTERM") == "1"
 MODERN_VERSION = "2026-07-28"
 LEGACY_FALLBACK = "2025-06-18"
+SUB_ID_KEY = "io.modelcontextprotocol/subscriptionId"
 
 _started = time.monotonic()
-_log_fh = None
-_era_recorded = False
+_log_fd = None
+_era = None               # negotiated era, set only when a request is ACCEPTED
+_subscriptions = {}       # listen-request id -> acknowledged notification filter
 
 
 def _log(event: str, **fields) -> None:
-    """Append one record. Flushed on every write, because the interesting outcome is a
-    process that dies without warning: anything still in a userspace buffer when SIGKILL
-    lands is exactly the evidence C3-1 needs."""
+    """Append one record with a single os.write().
+
+    Raw fd rather than a buffered file object, for two reasons that both matter to C3-1:
+    a small O_APPEND write is atomic and needs no flush, so a kill arriving mid-run cannot
+    erase what came before it; and it is safe to call from a signal handler, which buffered
+    JSON/file I/O is not."""
     rec = {"t": round(time.monotonic() - _started, 6), "event": event, **fields}
-    line = json.dumps(rec, sort_keys=True)
-    fh = _log_fh or sys.stderr
-    fh.write(line + "\n")
-    fh.flush()
+    data = (json.dumps(rec, sort_keys=True) + "\n").encode()
+    if _log_fd is not None:
+        os.write(_log_fd, data)
+    else:
+        os.write(2, data)
 
 
 def _send(msg: dict) -> None:
-    sys.stdout.write(json.dumps(msg) + "\n")
-    sys.stdout.flush()
+    os.write(1, (json.dumps(msg) + "\n").encode())
 
 
-def _result(req_id, result: dict) -> None:
-    _send({"jsonrpc": "2.0", "id": req_id, "result": result})
+def _result(req_id, payload: dict, *, cacheable: bool = False, sub_id=None) -> None:
+    """Send a result, shaped for the negotiated era.
+
+    Modern results MUST carry `resultType`; the operations listed as cacheable in the spec
+    (`server/discover`, `tools/list`, and the list/read family) MUST additionally carry
+    `ttlMs` and `cacheScope`. ttlMs=0 says "immediately stale", which is the honest answer
+    for a probe and keeps a client from caching a tool list across the measurement."""
+    if _era == "modern":
+        out = {"resultType": "complete"}
+        out.update(payload)
+        if cacheable:
+            out["ttlMs"] = 0
+            out["cacheScope"] = "public"
+        if sub_id is not None:
+            meta = dict(out.get("_meta") or {})
+            meta[SUB_ID_KEY] = sub_id
+            out["_meta"] = meta
+        payload = out
+    _send({"jsonrpc": "2.0", "id": req_id, "result": payload})
 
 
 def _error(req_id, code: int, message: str) -> None:
     _send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
+
+
+def _notify(method: str, params: dict) -> None:
+    _send({"jsonrpc": "2.0", "method": method, "params": params})
 
 
 TOOLS = [{
@@ -95,27 +127,35 @@ def _modern_version(msg: dict):
     return v if isinstance(v, str) else None
 
 
-def _record_era(msg: dict, method) -> None:
-    """First determination wins and is recorded once — era is a property of the server
-    process, not of an individual request."""
-    global _era_recorded
-    if _era_recorded:
-        return
-    modern = _modern_version(msg)
-    if modern is not None:
-        _era_recorded = True
-        _log("era", era="modern", version=modern, decided_by="_meta", first_method=method)
-    elif method == "initialize":
+def _attempt(msg: dict, method):
+    """What era this message CLAIMS. Distinct from what gets negotiated: under
+    PROBE_MCP_MODE the server refuses one era's opener, and recording the attempt as the
+    outcome would log the opposite of what the client actually fell back to."""
+    v = _modern_version(msg)
+    if v is not None:
+        return "modern", v, "_meta"
+    if method == "initialize":
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-        v = params.get("protocolVersion")
-        _era_recorded = True
-        _log("era", era="legacy", version=v if isinstance(v, str) else None,
-             decided_by="initialize", first_method=method)
+        pv = params.get("protocolVersion")
+        return "legacy", pv if isinstance(pv, str) else None, "initialize"
+    return None, None, None
+
+
+def _negotiate(msg: dict, method) -> None:
+    """Record the era ONLY on a request the server accepts. Called from each accepting
+    branch, after the refusal checks."""
+    global _era
+    if _era is not None:
+        return
+    era, version, how = _attempt(msg, method)
+    if era is None:
+        return
+    _era = era
+    _log("era", era=era, version=version, decided_by=how, first_method=method)
 
 
 def _discover() -> dict:
     return {
-        "resultType": "complete",
         "supportedVersions": [MODERN_VERSION],
         # Capabilities, deliberately NOT tool definitions. §10.6 rejected scanning results
         # for tool-shaped objects; this is the shape that an over-broad check trips on.
@@ -134,12 +174,36 @@ def _initialize(params: dict) -> dict:
     }
 
 
+def _open_subscription(req_id, params: dict) -> None:
+    """Acknowledge first, per spec: `notifications/subscriptions/acknowledged` MUST be the
+    first message on the stream, and the subscription id IS the listen request's id. The
+    request itself stays open — its JSON-RPC response is the graceful-closure signal, sent
+    at shutdown, not now."""
+    wanted = params.get("notifications") if isinstance(params.get("notifications"), dict) else {}
+    agreed = {k: v for k, v in wanted.items() if k == "toolsListChanged"}
+    _subscriptions[req_id] = agreed
+    _log("subscription_open", id=req_id, requested=wanted, acknowledged=agreed)
+    _notify("notifications/subscriptions/acknowledged",
+            {"_meta": {SUB_ID_KEY: req_id}, "notifications": agreed})
+
+
+def _close_subscriptions(reason: str) -> None:
+    """Graceful closure: the server SHOULD answer the original listen request with an empty
+    result before the stream ends. A client that gets it knows the subscription closed
+    cleanly rather than being dropped."""
+    for sub_id in list(_subscriptions):
+        del _subscriptions[sub_id]
+        _log("subscription_close", id=sub_id, reason=reason)
+        _result(sub_id, {}, sub_id=sub_id)
+
+
 def _on_signal(signum, _frame):
     name = signal.Signals(signum).name
     if signum == signal.SIGTERM and IGNORE_SIGTERM:
         _log("signal", signal=name, action="ignored")
         return
     _log("signal", signal=name, action="exiting")
+    _close_subscriptions("signal")
     _log("terminator", reason="signal", signal=name)
     os._exit(0)
 
@@ -176,33 +240,51 @@ def main() -> int:
         method = msg.get("method")
         req_id = msg.get("id")
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-        _record_era(msg, method)
 
         if req_id is None:
-            continue  # notification: never answer
+            # A notification is never answered — but `notifications/cancelled` still has to
+            # be OBSERVED, because it retires a subscription and frees its id for reuse.
+            if method == "notifications/cancelled":
+                cancelled = params.get("requestId")
+                if cancelled in _subscriptions:
+                    del _subscriptions[cancelled]
+                    _log("subscription_cancelled", id=cancelled)
+            continue
 
         if method == "server/discover":
             # In `legacy` mode this is refused, which is what a legacy server does and what
             # a dual-era client must fall back from. That fallback is a distinct code path
             # with its own failure modes (§10.9), so it needs to be reachable on purpose.
             if MODE == "legacy":
+                _log("refused", method=method, mode=MODE)
                 _error(req_id, -32601, "method not found: server/discover")
-            else:
-                _result(req_id, _discover())
+                continue
+            _negotiate(msg, method)
+            _result(req_id, _discover(), cacheable=True)
         elif method == "initialize":
             if MODE == "modern":
+                _log("refused", method=method, mode=MODE)
                 _error(req_id, -32601, "method not found: initialize")
-            else:
-                _result(req_id, _initialize(params))
+                continue
+            _negotiate(msg, method)
+            _result(req_id, _initialize(params))
+        elif method == "subscriptions/listen":
+            _negotiate(msg, method)
+            _open_subscription(req_id, params)
         elif method == "tools/list":
-            _result(req_id, {"tools": TOOLS})
+            _negotiate(msg, method)
+            _result(req_id, {"tools": TOOLS}, cacheable=True)
         elif method == "tools/call":
+            _negotiate(msg, method)
             _result(req_id, {"content": [{"type": "text", "text": "ok"}], "isError": False})
         elif method == "ping":
+            _negotiate(msg, method)
             _result(req_id, {})
         else:
+            _log("refused", method=method, mode=MODE)
             _error(req_id, -32601, f"method not found: {method}")
 
+    _close_subscriptions("stdin_eof")
     _log("terminator", reason="stdin_eof")
     return 0
 
@@ -210,7 +292,7 @@ def main() -> int:
 if __name__ == "__main__":
     path = os.environ.get("PROBE_MCP_LOG")
     if path:
-        _log_fh = open(path, "a", encoding="utf-8")  # noqa: SIM115 — lives for the process
+        _log_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         sys.exit(main())
     except (BrokenPipeError, KeyboardInterrupt):
