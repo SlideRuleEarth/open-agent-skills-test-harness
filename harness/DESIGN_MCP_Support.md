@@ -414,3 +414,20 @@ The audit log is a capability no CLI provides uniformly: wire-level, per call, w
 The proxy is a program with a defined wire protocol on both sides, so it is testable without any agent CLI: drive it with a scripted client over pipes and a fixture server, and assert the filtered list, the refused call, verbatim pass-through of a non-tool method, the notification rule, and a recorded anomaly plus failing verdict for each malformed case — including the envelope cases (batch array, response with no `id`, both-`result`-and-`error`) that a "no `id` means notification" reading would wave through.
 
 `fixtures/echo_mcp_server.py` provides the server side, but it is **legacy-only** — it answers `initialize` and knows nothing of `server/discover` or per-request `_meta`. Whatever C3-0 finds, the fixture needs a modern mode before the proxy's era handling can be tested at all; if the fleet turns out to be split, it needs both, since dual-era fallback is a behaviour with its own failure modes (notably the timeout path). Live verification against claude 2.1.113 comes after, and probe C3-0 then C3-1 come before the verdict rule is written.
+
+### 10.10 Sources
+
+This section is written against **MCP revision `2026-07-28`**, read on 2026-07-29 — one day after publication. That is unusually thin ice for a design to rest on, so the pages each rule came from are named here rather than left as prose. An implementer should re-read them before writing the code, not because the design is provisional, but because a revision that new can still acquire errata.
+
+| Page | What it grounds here |
+|---|---|
+| [`basic/versioning`](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning) | The modern/legacy/dual-era model, per-request `_meta` versioning, `UnsupportedProtocolVersionError`, and the client×server compatibility matrix — §10.2 |
+| [`basic/transports/stdio`](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio) | One message per line (hence no batches); "the server **MUST NOT** write JSON-RPC *requests* to stdout"; the `server/discover` fallback probe and its timeout case; the shutdown sequence and the `SIGTERM`/`SIGKILL` escalation; unexpected termination as a **restart** trigger — §10.4, §10.5, C3-1 |
+| [`basic/patterns/mrtr`](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr) | `InputRequiredResult`, `inputRequests`/`inputResponses`, and the rule that a retry **MUST** use a different JSON-RPC `id` — §10.2 |
+| [`client/sampling`](https://modelcontextprotocol.io/specification/2026-07-28/client/sampling) | Deprecation as of `2026-07-28` with a ≥12-month lifetime; the `tools` array whose definitions "don't need to correspond to registered tools"; the `sampling.tools` capability gate — §10.6 |
+| [`server/discover`](https://modelcontextprotocol.io/specification/2026-07-28/server/discover) | `DiscoverResult` shape and `supportedVersions`; servers **MUST** implement it. Note it advertises *capabilities*, not tools, so it is not a tool-leak channel — §10.2 |
+
+Two dependencies worth restating as risks rather than facts, because they are the ones most likely to move:
+
+- **Sampling's clock is running.** It is deprecated, not removed, and the ≥12-month floor puts removal no earlier than mid-2027. The §10.6 anomaly check should outlive it harmlessly, but the *justification* for it expires.
+- **The era split is a moving target, not a constant.** C3-0's answer is true on the day it is measured. §10.7 records era and version per run precisely so the design does not quietly rot back into an assumption once the probe is a year old.
