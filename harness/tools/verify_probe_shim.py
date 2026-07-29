@@ -221,7 +221,7 @@ check("then initialize works", "result" in by.get(2, {}), by.get(2))
 e = ev(recs, "era")
 check("exactly one era record", len(e) == 1, e)
 check("negotiated era is legacy", e and e[0]["era"] == "legacy", e)
-check("refusal was logged", len(ev(recs, "refused")) == 1, recs)
+check("refusal was logged", len(ev(recs, "violation")) + len(ev(recs, "refused")) == 1, recs)
 
 print("5. forced fallback the other way: modern mode must log MODERN")
 r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
@@ -238,11 +238,23 @@ r, n, recs, st = run([modern("subscriptions/listen", 1, notifications={"toolsLis
                   modern("tools/list", 2)])
 acks = [m for m in n if m.get("method") == "notifications/subscriptions/acknowledged"]
 check("acknowledgment sent", len(acks) == 1, n)
-# Asserted against the ORDERED stream: the spec makes the acknowledgment the FIRST message
-# on the subscription, and checking the split notification list would pass a late one.
-check("acknowledgment is first on the wire",
-      st and st[0].get("method") == "notifications/subscriptions/acknowledged",
-      [m.get("method") or m.get("id") for m in st])
+# Ordering is per SUBSCRIPTION, not per channel: on stdio every subscription shares one
+# pipe, and the spec explicitly permits other subscriptions' messages to interleave ahead
+# of an acknowledgment. Asserting "first on the wire" would be a stricter rule than the
+# protocol has, and would fail a conforming server that happened to interleave.
+def sub_stream(stream, sub_id):
+    out = []
+    for m in stream:
+        meta = (m.get("params") or m.get("result") or {}).get("_meta") or {}
+        if meta.get("io.modelcontextprotocol/subscriptionId") == sub_id:
+            out.append(m)
+    return out
+
+
+s1 = sub_stream(st, 1)
+check("acknowledgment is first WITHIN subscription 1",
+      s1 and s1[0].get("method") == "notifications/subscriptions/acknowledged",
+      [m.get("method") or m.get("id") for m in s1])
 check("ack carries subscriptionId == request id",
       acks and acks[0]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"] == 1, acks)
 check("ack reflects agreed filter",
@@ -303,41 +315,79 @@ check("closure was attempted before the write failed",
 check("terminator reason == broken_pipe",
       len(t) == 1 and t[0]["reason"] == "broken_pipe", t)
 
-print("14. negotiated era is ENFORCED: modern session refuses initialize")
+print("14. the OPENING request is validated too, not just later ones")
+# Scenario 15 below establishes a valid era first, so it structurally cannot catch an
+# opener that sets the very terms it should have been checked against.
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {
+    "_meta": {"io.modelcontextprotocol/protocolVersion": "2099-01-01",
+              "io.modelcontextprotocol/clientCapabilities": {}}}},
+    modern("tools/list", 2)])
+by = {m["id"]: m for m in r}
+check("unsupported opening version rejected", "error" in by.get(1, {}), by.get(1))
+check("rejected with -32022", by.get(1, {}).get("error", {}).get("code") == -32022, by.get(1))
+e = ev(recs, "era")
+check("rejected opener established NO era", len(e) == 1, e)
+check("the accepted retry set the era", e and e[0]["version"] == "2026-07-28", e)
+check("retry answered", "result" in by.get(2, {}), by.get(2))
+
+print("15. an opener with no metadata at all establishes nothing")
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                      modern("tools/list", 2)])
+by = {m["id"]: m for m in r}
+check("bare opener rejected", "error" in by.get(1, {}), by.get(1))
+check("no era recorded for it", len(ev(recs, "era")) == 1, ev(recs, "era"))
+check("and it was not served in legacy shape", "result" not in by.get(1, {}), by.get(1))
+
+print("16. clientCapabilities is required, not just protocolVersion")
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {
+    "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {
+        "_meta": {"io.modelcontextprotocol/clientCapabilities": {}}}},
+    modern("tools/list", 3)])
+by = {m["id"]: m for m in r}
+check("missing capabilities rejected", "error" in by.get(1, {}), by.get(1))
+check("... with -32602", by.get(1, {}).get("error", {}).get("code") == -32602, by.get(1))
+check("missing version rejected", "error" in by.get(2, {}), by.get(2))
+check("... also -32602", by.get(2, {}).get("error", {}).get("code") == -32602, by.get(2))
+check("well-formed modern request still works", "result" in by.get(3, {}), by.get(3))
+
+print("17. negotiated era is ENFORCED: modern-only mode refuses initialize")
 r, n, recs, st = run([modern("tools/list", 1),
                       {"jsonrpc": "2.0", "id": 2, "method": "initialize",
                        "params": {"protocolVersion": "2025-06-18"}},
-                      modern("ping", 3)])
+                      modern("ping", 3)], mode="modern")
 by = {m["id"]: m for m in r}
 check("era is modern", ev(recs, "era")[0]["era"] == "modern", recs)
 check("initialize rejected", "error" in by.get(2, {}), by.get(2))
-check("violation logged", len(ev(recs, "era_violation")) == 1, recs)
+check("violation logged", len(ev(recs, "violation")) == 1, recs)
 check("session still usable afterwards", "result" in by.get(3, {}), by.get(3))
 
-print("15. ... and a modern request without protocolVersion, or with a different one")
+print("18. ... and a version switch is refused whenever it appears")
 r, n, recs, st = run([modern("tools/list", 1),
                       {"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}},
                       {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {"_meta": {
-                          "io.modelcontextprotocol/protocolVersion": "2099-01-01"}}}])
+                          "io.modelcontextprotocol/protocolVersion": "2099-01-01",
+                          "io.modelcontextprotocol/clientCapabilities": {}}}}])
 by = {m["id"]: m for m in r}
-check("bare modern request rejected", "error" in by.get(2, {}), by.get(2))
+check("bare request after modern rejected", "error" in by.get(2, {}), by.get(2))
 check("version switch rejected", "error" in by.get(3, {}), by.get(3))
 check("version switch uses -32022",
       by.get(3, {}).get("error", {}).get("code") == -32022, by.get(3))
 check("supported list advertised",
       by.get(3, {}).get("error", {}).get("data", {}).get("supported") == ["2026-07-28"],
       by.get(3))
-check("both violations logged", len(ev(recs, "era_violation")) == 2, recs)
+check("both violations logged", len(ev(recs, "violation")) == 2, recs)
 
-print("16. ... and a legacy session refuses modern metadata")
+print("19. ... and a legacy-only server refuses modern metadata")
 r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
                        "params": {"protocolVersion": "2025-06-18"}},
                       modern("tools/list", 2),
-                      {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}}])
+                      {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}}],
+                     mode="legacy")
 by = {m["id"]: m for m in r}
 check("era is legacy", ev(recs, "era")[0]["era"] == "legacy", recs)
 check("modern request rejected", "error" in by.get(2, {}), by.get(2))
-check("violation logged", len(ev(recs, "era_violation")) == 1, recs)
+check("violation logged", len(ev(recs, "violation")) == 1, recs)
 check("plain legacy request still works", "result" in by.get(3, {}), by.get(3))
 
 print()

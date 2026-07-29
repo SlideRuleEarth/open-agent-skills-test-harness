@@ -78,14 +78,15 @@ def _send(msg: dict) -> None:
     os.write(1, (json.dumps(msg) + "\n").encode())
 
 
-def _result(req_id, payload: dict, *, cacheable: bool = False, sub_id=None) -> None:
+def _result(req_id, payload: dict, *, modern: bool, cacheable: bool = False,
+            sub_id=None) -> None:
     """Send a result, shaped for the negotiated era.
 
     Modern results MUST carry `resultType`; the operations listed as cacheable in the spec
     (`server/discover`, `tools/list`, and the list/read family) MUST additionally carry
     `ttlMs` and `cacheScope`. ttlMs=0 says "immediately stale", which is the honest answer
     for a probe and keeps a client from caching a tool list across the measurement."""
-    if _era == "modern":
+    if modern:
         out = {"resultType": "complete"}
         out.update(payload)
         if cacheable:
@@ -114,18 +115,35 @@ TOOLS = [{
 }]
 
 
+VER_KEY = "io.modelcontextprotocol/protocolVersion"
+CAP_KEY = "io.modelcontextprotocol/clientCapabilities"
+
+
+def _meta_of(msg: dict) -> dict:
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return {}
+    meta = params.get("_meta")
+    return meta if isinstance(meta, dict) else {}
+
+
 def _modern_version(msg: dict):
     """The modern era is declared by METADATA, not by method name (§10.2). `server/discover`
     is optional for clients, so a modern client may open with an ordinary `tools/list`;
     keying off the method would misclassify it as legacy."""
-    params = msg.get("params")
-    if not isinstance(params, dict):
-        return None
-    meta = params.get("_meta")
-    if not isinstance(meta, dict):
-        return None
-    v = meta.get("io.modelcontextprotocol/protocolVersion")
+    v = _meta_of(msg).get(VER_KEY)
     return v if isinstance(v, str) else None
+
+
+def _modern_intent(msg: dict) -> bool:
+    """Whether this request is TRYING to be modern.
+
+    Not the same as being well-formed: a request carrying `clientCapabilities` but no
+    `protocolVersion` is a modern request missing a required field, and must be rejected
+    as such rather than quietly served as legacy. Note `_meta` alone proves nothing —
+    codex and copilot both send a legacy `_meta.progressToken` (§9)."""
+    meta = _meta_of(msg)
+    return VER_KEY in meta or CAP_KEY in meta
 
 
 def _attempt(msg: dict, method):
@@ -155,42 +173,60 @@ def _negotiate(msg: dict, method) -> None:
     _log("era", era=era, version=version, decided_by=how, first_method=method)
 
 
-def _era_violation(req_id, msg: dict, method):
-    """Enforce the negotiated era on every later request, and answer as a real server would.
+def _reject(req_id, msg: dict, method):
+    """Validate EVERY request, including the one that establishes the era.
 
-    Recording the era once and then accepting anything would make this shim a worse peer
-    than the thing it measures: a modern session would answer `initialize`, and a legacy
-    session would take modern `_meta` traffic and reply in legacy shape. Worse for a
-    measuring instrument, a CLI that mixed eras would be silently absorbed instead of
-    showing up as the finding it is.
+    Enforcement used to start only after negotiation, which let the opening request set
+    the terms it was supposed to be checked against: an opener declaring `2099-01-01` was
+    accepted and recorded as the negotiated version, and a bare opener was served in legacy
+    shape having established nothing.
+
+    The check is per REQUEST, not per session, because that is what the revision actually
+    says: modern is stateless — "servers MUST NOT rely on prior requests over the same
+    connection to establish context ... every request supplies this metadata" — while a
+    dual-era server selects LEGACY semantics from an `initialize` and keeps them for the
+    stdio process. So a bare request is legacy only once `initialize` has selected it, and
+    a modern request is judged entirely on its own `_meta`.
 
     Returns True when the request was rejected and already answered."""
-    if _era is None:
-        return False
-    claimed = _modern_version(msg)
+    meta = _meta_of(msg)
 
-    if _era == "modern":
-        if method == "initialize":
-            _log("era_violation", why="initialize in a modern session", method=method)
-            _error(req_id, -32601, "method not found: initialize")
+    if _modern_intent(msg):
+        missing = [k for k in (VER_KEY, CAP_KEY) if k not in meta]
+        if missing:
+            # Both protocolVersion and clientCapabilities are required on every modern
+            # request, and the spec names the code: "A request missing any required field
+            # is malformed; the server MUST reject it with -32602".
+            _log("violation", why="modern request missing required _meta", method=method,
+                 missing=missing)
+            _error(req_id, -32602, f"missing required _meta: {', '.join(missing)}")
             return True
-        if claimed is None:
-            # Modern requests MUST carry _meta.protocolVersion; without it there is
-            # nothing to check a version gate against (§10.2).
-            _log("era_violation", why="modern request without protocolVersion", method=method)
-            _error(req_id, -32600, "missing _meta.io.modelcontextprotocol/protocolVersion")
-            return True
-        if claimed != _version:
-            _log("era_violation", why="version switched mid-session", method=method,
-                 negotiated=_version, claimed=claimed)
+        claimed = meta[VER_KEY]
+        if claimed != MODERN_VERSION:
+            _log("violation", why="unsupported protocol version", method=method,
+                 claimed=claimed)
             _send({"jsonrpc": "2.0", "id": req_id, "error": {
                 "code": -32022, "message": "Unsupported protocol version",
                 "data": {"supported": [MODERN_VERSION], "requested": claimed}}})
             return True
-    elif _era == "legacy" and claimed is not None:
-        _log("era_violation", why="modern metadata in a legacy session", method=method,
-             claimed=claimed)
-        _error(req_id, -32600, "modern request metadata on a legacy session")
+        if MODE == "legacy":
+            _log("violation", why="modern request to a legacy-only server", method=method)
+            _error(req_id, -32600, "this server implements only initialization-based versions")
+            return True
+        return False
+
+    if method == "initialize":
+        if MODE == "modern":
+            _log("violation", why="initialize to a modern-only server", method=method)
+            _error(req_id, -32601, "method not found: initialize")
+            return True
+        return False
+
+    # Neither modern metadata nor `initialize`: legal only after `initialize` selected
+    # legacy semantics for this process.
+    if _era != "legacy":
+        _log("violation", why="request before any era was established", method=method)
+        _error(req_id, -32602, "no protocol era established: send initialize or modern _meta")
         return True
     return False
 
@@ -215,14 +251,14 @@ def _initialize(params: dict) -> dict:
     }
 
 
-def _open_subscription(req_id, params: dict) -> None:
+def _open_subscription(req_id, params: dict, modern: bool) -> None:
     """Acknowledge first, per spec: `notifications/subscriptions/acknowledged` MUST be the
     first message on the stream, and the subscription id IS the listen request's id. The
     request itself stays open — its JSON-RPC response is the graceful-closure signal, sent
     at shutdown, not now."""
     wanted = params.get("notifications") if isinstance(params.get("notifications"), dict) else {}
     agreed = {k: v for k, v in wanted.items() if k == "toolsListChanged"}
-    _subscriptions[req_id] = agreed
+    _subscriptions[req_id] = (agreed, modern)
     _log("subscription_open", id=req_id, requested=wanted, acknowledged=agreed)
     _notify("notifications/subscriptions/acknowledged",
             {"_meta": {SUB_ID_KEY: req_id}, "notifications": agreed})
@@ -233,9 +269,9 @@ def _close_subscriptions(reason: str) -> None:
     result before the stream ends. A client that gets it knows the subscription closed
     cleanly rather than being dropped."""
     for sub_id in list(_subscriptions):
-        del _subscriptions[sub_id]
+        _, modern = _subscriptions.pop(sub_id)
         _log("subscription_close", id=sub_id, reason=reason)
-        _result(sub_id, {}, sub_id=sub_id)
+        _result(sub_id, {}, modern=modern, sub_id=sub_id)
 
 
 def _on_signal(signum, _frame):
@@ -292,8 +328,9 @@ def main() -> int:
                     _log("subscription_cancelled", id=cancelled)
             continue
 
-        if _era_violation(req_id, msg, method):
+        if _reject(req_id, msg, method):
             continue
+        is_modern = _modern_intent(msg)
 
         if method == "server/discover":
             # In `legacy` mode this is refused, which is what a legacy server does and what
@@ -304,26 +341,27 @@ def main() -> int:
                 _error(req_id, -32601, "method not found: server/discover")
                 continue
             _negotiate(msg, method)
-            _result(req_id, _discover(), cacheable=True)
+            _result(req_id, _discover(), modern=True, cacheable=True)
         elif method == "initialize":
             if MODE == "modern":
                 _log("refused", method=method, mode=MODE)
                 _error(req_id, -32601, "method not found: initialize")
                 continue
             _negotiate(msg, method)
-            _result(req_id, _initialize(params))
+            _result(req_id, _initialize(params), modern=False)
         elif method == "subscriptions/listen":
             _negotiate(msg, method)
-            _open_subscription(req_id, params)
+            _open_subscription(req_id, params, is_modern)
         elif method == "tools/list":
             _negotiate(msg, method)
-            _result(req_id, {"tools": TOOLS}, cacheable=True)
+            _result(req_id, {"tools": TOOLS}, modern=is_modern, cacheable=True)
         elif method == "tools/call":
             _negotiate(msg, method)
-            _result(req_id, {"content": [{"type": "text", "text": "ok"}], "isError": False})
+            _result(req_id, {"content": [{"type": "text", "text": "ok"}], "isError": False},
+                    modern=is_modern)
         elif method == "ping":
             _negotiate(msg, method)
-            _result(req_id, {})
+            _result(req_id, {}, modern=is_modern)
         else:
             _log("refused", method=method, mode=MODE)
             _error(req_id, -32601, f"method not found: {method}")
