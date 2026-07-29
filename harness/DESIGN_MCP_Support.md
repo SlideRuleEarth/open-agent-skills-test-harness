@@ -359,7 +359,8 @@ Classifying by "it has no `id`" alone would be the bug this rule exists to preve
 | `tools/call` **request** | if `params.name` is off-list, do **not** forward; answer the client with a JSON-RPC error and record it |
 | notification (`method`, no `id`) | forward verbatim, never answer — answering `notifications/initialized` is a protocol violation some clients treat as fatal |
 | server→client **request** | legacy era: forward verbatim. Modern era: **anomaly** — the spec forbids it |
-| everything else | forward verbatim: `server/discover`, `initialize`, `ping`, `resources/*`, `prompts/*`, `logging/*`, `completion/*` |
+| `server/discover` **response** | forward verbatim, but scan for tool *definitions* first — see the off-channel rule in §10.6 |
+| everything else | forward verbatim: `initialize`, `ping`, `resources/*`, `prompts/*`, `logging/*`, `completion/*` |
 
 Filtering responses requires correlating them to requests, so the proxy keeps in-flight `id` → method maps — **one per direction** (§10.2). Pagination therefore needs no special case: every `tools/list` response is filtered, whichever page it is. A response arriving with an `id` never requested *in that direction* is an anomaly, not a pass-through.
 
@@ -377,7 +378,7 @@ Each of these is an **anomaly**:
 - a `tools/list` result that is not shaped as expected;
 - a server-originated JSON-RPC request while in the modern era;
 - traffic in a protocol era the proxy was not built for (§10.2);
-- a tool-bearing sampling request (§10.6);
+- a tool definition arriving on any channel other than `tools/list` — sampling or `server/discover` (§10.6);
 - a spawn failure of the declared server;
 - **premature EOF, an unexpected child exit, or a write failure on either pipe.** A child that dies mid-request must not read as a quiet end of stream — the spec tells clients to *restart* a server that exits unexpectedly, so this is the case most easily mistaken for normality, and it is not covered by the spawn-failure or terminator checks.
 
@@ -397,6 +398,8 @@ The terminator rule also has an empirical dependency, recorded as **probe C3-1**
 - **Hard prevention, both directions.** An off-list tool is removed from what the model is shown, and an off-list `tools/call` never reaches the server. No enumeration, no complement, no drift window — this is a real boundary against a server the scenario author does not control, which is precisely what §6-C2 says `tools:` on claude is *not*.
 - **`tools:` gates the server's MCP tool surface — `tools/list` and `tools/call` — and nothing else.** It does not promise that no tool definition can reach a model by any route. **Sampling** is the concrete counterexample: a server may put its *own* `tools` array in a `sampling/createMessage` request, and those definitions are scoped to the sampling request — they "don't need to correspond to registered tools". Legacy carries it as a server-originated request; modern carries it inside `InputRequiredResult.inputRequests`. Sampling is deprecated as of `2026-07-28` but stays specified for at least twelve months, which is inside this harness's horizon.
   The proxy does not implement sampling, but it **detects and refuses** a tool-bearing sampling request as an anomaly. Exposure is conditional — a server MUST NOT send one unless the client declared the `sampling.tools` capability — but the check is nearly free, and a tool definition the model can act on that never appeared in any `tools/list` is precisely the silent wrongness §10.5 exists to prevent.
+- **The off-channel rule, stated once so it does not have to be rediscovered per method.** A tool definition reaching the client on *any* channel other than `tools/list` is an anomaly. Sampling is today's instance; `server/discover` is the other one to check, since it is the only other method whose result describes what a server can do. This is deliberately a standing rule rather than a per-method note, because the alternative is a prose claim that a given channel is safe — and a claim like that stays in the document looking authoritative long after a revision makes it false, which is the one failure mode nothing else in §10 would catch.
+  **The trap, for whoever implements it:** a `DiscoverResult` legitimately contains `"capabilities": {"tools": {}}`. That is a capability *flag* — the server saying it has a tool interface at all — not a tool definition. A check written as "a `tools` key is present" fires on **every modern handshake** and fails every run; the rule is *no tool definitions* (`name` + `inputSchema` shaped entries), not *no `tools` key*. The two mistakes fail in opposite directions: too loose forwards the definitions this rule exists to catch, too tight breaks every gated cell on the first message.
 - **Other channels pass through.** A server can still serve data through `resources/read`, `prompts/get`, or any future method, and the proxy forwards those verbatim. `tools:` is a **tool allowlist, not a capability sandbox**, and neither the schema docs nor the error messages may imply otherwise — the same rule §6-C3 already sets for C2.
 - **It does not make a hostile server safe to run.** It makes the *tool surface* the scenario declared the tool surface the model got.
 
@@ -413,6 +416,8 @@ The audit log is a capability no CLI provides uniformly: wire-level, per call, w
 
 The proxy is a program with a defined wire protocol on both sides, so it is testable without any agent CLI: drive it with a scripted client over pipes and a fixture server, and assert the filtered list, the refused call, verbatim pass-through of a non-tool method, the notification rule, and a recorded anomaly plus failing verdict for each malformed case — including the envelope cases (batch array, response with no `id`, both-`result`-and-`error`) that a "no `id` means notification" reading would wave through.
 
+The off-channel rule (§10.6) needs **two** arms, not one, because its two failure modes are opposite: a `DiscoverResult` carrying tool definitions must raise an anomaly, and an ordinary `DiscoverResult` whose `capabilities` merely contains `"tools": {}` must pass clean. An implementation that only ever gets the first arm is one over-broad key check away from failing every modern handshake, and no single-sided test would notice.
+
 `fixtures/echo_mcp_server.py` provides the server side, but it is **legacy-only** — it answers `initialize` and knows nothing of `server/discover` or per-request `_meta`. Whatever C3-0 finds, the fixture needs a modern mode before the proxy's era handling can be tested at all; if the fleet turns out to be split, it needs both, since dual-era fallback is a behaviour with its own failure modes (notably the timeout path). Live verification against claude 2.1.113 comes after, and probe C3-0 then C3-1 come before the verdict rule is written.
 
 ### 10.10 Sources
@@ -425,7 +430,7 @@ This section is written against **MCP revision `2026-07-28`**, read on 2026-07-2
 | [`basic/transports/stdio`](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio) | One message per line (hence no batches); "the server **MUST NOT** write JSON-RPC *requests* to stdout"; the `server/discover` fallback probe and its timeout case; the shutdown sequence and the `SIGTERM`/`SIGKILL` escalation; unexpected termination as a **restart** trigger — §10.4, §10.5, C3-1 |
 | [`basic/patterns/mrtr`](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr) | `InputRequiredResult`, `inputRequests`/`inputResponses`, and the rule that a retry **MUST** use a different JSON-RPC `id` — §10.2 |
 | [`client/sampling`](https://modelcontextprotocol.io/specification/2026-07-28/client/sampling) | Deprecation as of `2026-07-28` with a ≥12-month lifetime; the `tools` array whose definitions "don't need to correspond to registered tools"; the `sampling.tools` capability gate — §10.6 |
-| [`server/discover`](https://modelcontextprotocol.io/specification/2026-07-28/server/discover) | `DiscoverResult` shape and `supportedVersions`; servers **MUST** implement it. Note it advertises *capabilities*, not tools, so it is not a tool-leak channel — §10.2 |
+| [`server/discover`](https://modelcontextprotocol.io/specification/2026-07-28/server/discover) | `DiscoverResult` shape and `supportedVersions`; servers **MUST** implement it. As of this revision it advertises *capabilities*, not tool definitions — which is why §10.6 checks the response rather than trusting that to stay true — §10.2, §10.6 |
 
 Two dependencies worth restating as risks rather than facts, because they are the ones most likely to move:
 
