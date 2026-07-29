@@ -392,17 +392,25 @@ ABA fix and its route to `parallel_safe_config = True`.
 - **C3 harness-owned filtering proxy** — required before any scenario points `tools:` at a
   server its author does not control, and required for agy tool gating regardless.
   **Designed in `DESIGN_MCP_Support.md` §10 (2026-07-29); not built.** stdio only in the
-  first cut — remote `tools:` stays refused. Build order: probe **C3-0** (which MCP
-  protocol era each CLI speaks) → probe **C3-1** (how each CLI shuts a stdio server down)
-  → the proxy module + its arms, wired to nothing → the adapter integration that unlocks
-  `tools:`. The middle slice cannot affect any run, which is the point: this is harness
-  code in the request path of every gated cell.
-  C3-0 leads because MCP revision `2026-07-28` removed the `initialize` handshake in
-  favour of per-request `_meta`, added the `server/discover` probe, and forbade
-  server-initiated requests (§10.2). Era decides the correlation model, the anomaly set,
-  and what `fixtures/echo_mcp_server.py` — today legacy-only — has to impersonate, so
-  every later step is built against a guess until it is measured. Both probes can share
-  one shim.
+  first cut — remote `tools:` stays refused. Build order: ~~probe **C3-0**~~ →
+  ~~probe **C3-1**~~ → a **dual-era mode for `fixtures/echo_mcp_server.py`** → the proxy
+  module + its arms, wired to nothing → the adapter integration that unlocks `tools:`.
+  The middle slice cannot affect any run, which is the point: this is harness code in the
+  request path of every gated cell.
+  **Both probes resolved 2026-07-29** (`fixtures/probe_era_mcp_server.py`, results in
+  `DESIGN_MCP_Support.md` §9). Three findings changed the build:
+  1. **The fleet is split three ways.** claude and copilot `2025-11-25`, codex
+     `2025-06-18`, agy **`2026-07-28`** (modern). Dual-era is a day-one requirement, and
+     "legacy" is two implementations rather than one. The version allowlist is those
+     three exactly.
+  2. **The proxy MUST handle `SIGTERM`.** codex and copilot signal rather than closing
+     stdin; without handlers that write the terminator, §10.5's verdict rule fails every
+     clean cell on half the fleet.
+  3. **`subscriptions/listen` exists and agy uses it.** A request that is never answered
+     is normal, so the in-flight correlation map must not treat one as a leak or a
+     timeout.
+  The fixture step moved ahead of the proxy because agy being modern makes it a
+  prerequisite rather than a contingency.
 
 Smaller, unblocked:
 
