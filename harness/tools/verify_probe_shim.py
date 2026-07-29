@@ -44,8 +44,11 @@ def _pump(fh, q):
     "nothing to read" while a complete line is already sitting in the buffer. That is a
     hang, not a slow read, and it is exactly the failure this verifier is supposed to
     detect rather than suffer."""
-    for line in fh:
-        q.put(line)
+    try:
+        for line in fh:
+            q.put(line)
+    except (OSError, ValueError):
+        pass  # the departed-reader scenario closes this pipe underneath us, on purpose
     q.put(None)
 
 
@@ -61,12 +64,20 @@ def _readline(q, deadline):
     return "" if line is None else line.decode()
 
 
-def run(msgs, *, mode="dual", kill=None, ignore_sigterm=False, cancel=None):
+def run(msgs, *, mode="dual", kill=None, ignore_sigterm=False, cancel=None,
+        close_reader=False):
     """Send `msgs`, collect replies, then shut down via `kill` (a signal) or stdin close.
 
     `subscriptions/listen` deliberately gets no immediate reply — its JSON-RPC response IS
     the graceful-closure signal — so expected replies are computed per method rather than
-    per id. Waiting on it would hang, which is exactly the bug this rewrite fixes."""
+    per id. Waiting on it would hang, which is exactly the bug this rewrite fixes.
+
+    Returns (responses, notifications, records, stream). `stream` is every message in WIRE
+    ORDER: the split views lose ordering, and "the acknowledgment comes first" is a claim
+    about order, so asserting it against the split lists would pass for a late ack.
+
+    `close_reader` shuts the client's read side before shutdown, reproducing the departed
+    reader that produced agy's `broken_pipe` terminator in §9."""
     tmp = tempfile.mkdtemp(prefix="verify-shim-")
     log = os.path.join(tmp, "probe.jsonl")
     env = dict(os.environ, PROBE_MCP_LOG=log, PROBE_MCP_MODE=mode)
@@ -74,11 +85,15 @@ def run(msgs, *, mode="dual", kill=None, ignore_sigterm=False, cancel=None):
         env["PROBE_MCP_IGNORE_SIGTERM"] = "1"
 
     deadline = time.monotonic() + DEADLINE
-    responses, notifications = [], []
+    responses, notifications, stream = [], [], []
     p = subprocess.Popen([sys.executable, SHIM], stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     q = queue.Queue()
-    threading.Thread(target=_pump, args=(p.stdout, q), daemon=True).start()
+    # No pump in the departed-reader scenario: closing the pipe out from under a thread
+    # that is blocked reading it is a race, and it hangs rather than failing. Nothing is
+    # read there anyway — the whole point is that the client stopped listening.
+    if not close_reader:
+        threading.Thread(target=_pump, args=(p.stdout, q), daemon=True).start()
     try:
         pending = set()
         for m in msgs:
@@ -90,27 +105,35 @@ def run(msgs, *, mode="dual", kill=None, ignore_sigterm=False, cancel=None):
             p.stdin.write((json.dumps(m) + "\n").encode())
             p.stdin.flush()
 
-        while pending:
+        while pending and not close_reader:
             line = _readline(q, deadline)
             if not line:
                 break
             msg = json.loads(line)
+            stream.append(msg)
             if msg.get("id") is None:
                 notifications.append(msg)
             else:
                 responses.append(msg)
                 pending.discard(msg["id"])
 
+        if close_reader:
+            # Depart before the server finishes talking. Its next write — the graceful
+            # closure — then lands on a pipe with no reader.
+            time.sleep(0.2)
+            p.stdout.close()
+
         if kill:
             time.sleep(0.15)
             p.send_signal(kill)
         else:
             p.stdin.close()
-            while True:  # drain graceful-closure responses until EOF
+            while not close_reader:  # drain graceful-closure responses until EOF
                 line = _readline(q, deadline)
                 if line is None or line == "":
                     break
                 msg = json.loads(line)
+                stream.append(msg)
                 (notifications if msg.get("id") is None else responses).append(msg)
 
         try:
@@ -133,7 +156,7 @@ def run(msgs, *, mode="dual", kill=None, ignore_sigterm=False, cancel=None):
         if os.path.exists(log):
             recs = [json.loads(l) for l in open(log) if l.strip()]
         shutil.rmtree(tmp, ignore_errors=True)
-    return responses, notifications, recs
+    return responses, notifications, recs, stream
 
 
 def ev(recs, name):
@@ -155,7 +178,7 @@ def modern(method, mid, **extra):
 
 
 print("1. modern client that SKIPS server/discover (the P2 case)")
-r, n, recs = run([modern("tools/list", 1)])
+r, n, recs, st = run([modern("tools/list", 1)])
 e = ev(recs, "era")
 check("era decided", len(e) == 1, e)
 check("era == modern", e and e[0]["era"] == "modern", e)
@@ -164,7 +187,7 @@ check("decided by _meta not method", e and e[0]["decided_by"] == "_meta", e)
 check("tools/list answered", r and "tools" in r[0].get("result", {}), r)
 
 print("2. modern results are CONFORMING (P1: resultType + caching hints)")
-r, n, recs = run([modern("server/discover", 1), modern("tools/list", 2),
+r, n, recs, st = run([modern("server/discover", 1), modern("tools/list", 2),
                   modern("ping", 3), modern("tools/call", 4, name="probe_noop")])
 by = {m["id"]: m.get("result", {}) for m in r}
 check("discover has resultType", by.get(1, {}).get("resultType") == "complete", by.get(1))
@@ -178,7 +201,7 @@ check("ping has NO caching hints", "ttlMs" not in by.get(3, {}), by.get(3))
 check("tools/call has resultType", by.get(4, {}).get("resultType") == "complete", by.get(4))
 
 print("3. legacy client, and legacy results are NOT modern-shaped")
-r, n, recs = run([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
                    "params": {"protocolVersion": "2025-06-18"}},
                   {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}])
 e = ev(recs, "era")
@@ -189,7 +212,7 @@ check("initialize answered", "protocolVersion" in by.get(1, {}), by.get(1))
 check("no resultType leaked into legacy", "resultType" not in by.get(2, {}), by.get(2))
 
 print("4. forced fallback: legacy mode must log LEGACY, not the refused modern attempt")
-r, n, recs = run([modern("server/discover", 1),
+r, n, recs, st = run([modern("server/discover", 1),
                   {"jsonrpc": "2.0", "id": 2, "method": "initialize",
                    "params": {"protocolVersion": "2025-06-18"}}], mode="legacy")
 by = {m["id"]: m for m in r}
@@ -201,7 +224,7 @@ check("negotiated era is legacy", e and e[0]["era"] == "legacy", e)
 check("refusal was logged", len(ev(recs, "refused")) == 1, recs)
 
 print("5. forced fallback the other way: modern mode must log MODERN")
-r, n, recs = run([{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
                   modern("tools/list", 2)], mode="modern")
 by = {m["id"]: m for m in r}
 check("initialize refused", "error" in by.get(1, {}), by.get(1))
@@ -211,10 +234,15 @@ check("exactly one era record", len(e) == 1, e)
 check("negotiated era is modern", e and e[0]["era"] == "modern", e)
 
 print("6. subscriptions/listen: ack first, no immediate response, graceful closure at EOF")
-r, n, recs = run([modern("subscriptions/listen", 1, notifications={"toolsListChanged": True}),
+r, n, recs, st = run([modern("subscriptions/listen", 1, notifications={"toolsListChanged": True}),
                   modern("tools/list", 2)])
 acks = [m for m in n if m.get("method") == "notifications/subscriptions/acknowledged"]
 check("acknowledgment sent", len(acks) == 1, n)
+# Asserted against the ORDERED stream: the spec makes the acknowledgment the FIRST message
+# on the subscription, and checking the split notification list would pass a late one.
+check("acknowledgment is first on the wire",
+      st and st[0].get("method") == "notifications/subscriptions/acknowledged",
+      [m.get("method") or m.get("id") for m in st])
 check("ack carries subscriptionId == request id",
       acks and acks[0]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"] == 1, acks)
 check("ack reflects agreed filter",
@@ -227,7 +255,7 @@ check("subscription open+close logged",
       len(ev(recs, "subscription_open")) == 1 and len(ev(recs, "subscription_close")) == 1, recs)
 
 print("7. cancellation retires the subscription, and its id is then reusable")
-r, n, recs = run([modern("subscriptions/listen", 1, notifications={"toolsListChanged": True})],
+r, n, recs, st = run([modern("subscriptions/listen", 1, notifications={"toolsListChanged": True})],
                  cancel=[{"jsonrpc": "2.0", "method": "notifications/cancelled",
                           "params": dict(MODERN_META, requestId=1)},
                          modern("ping", 1)])
@@ -237,33 +265,80 @@ pings = [m for m in r if m.get("id") == 1 and "result" in m]
 check("id 1 reusable after cancel", len(pings) >= 1, r)
 
 print("8. notification is never answered")
-r, n, recs = run([{"jsonrpc": "2.0", "method": "notifications/initialized",
+r, n, recs, st = run([{"jsonrpc": "2.0", "method": "notifications/initialized",
                    "params": dict(MODERN_META)}, modern("ping", 1)])
 check("exactly one response (ping only)", len(r) == 1, r)
 check("no stray notifications", n == [], n)
 
 print("9. C3-1: stdin close -> clean terminator")
-r, n, recs = run([modern("ping", 1)])
+r, n, recs, st = run([modern("ping", 1)])
 check("stdin_eof logged", len(ev(recs, "stdin_eof")) == 1, recs)
 t = ev(recs, "terminator")
 check("terminator reason == stdin_eof", len(t) == 1 and t[0]["reason"] == "stdin_eof", t)
 
 print("10. C3-1: SIGTERM -> terminator names the signal")
-r, n, recs = run([modern("ping", 1)], kill=signal.SIGTERM)
+r, n, recs, st = run([modern("ping", 1)], kill=signal.SIGTERM)
 s, t = ev(recs, "signal"), ev(recs, "terminator")
 check("signal logged", s and s[0]["signal"] == "SIGTERM", recs)
 check("terminator reason == signal", len(t) == 1 and t[0]["reason"] == "signal", t)
 
 print("11. C3-1: SIGKILL -> NO terminator (absence is the answer)")
-r, n, recs = run([modern("ping", 1)], kill=signal.SIGKILL)
+r, n, recs, st = run([modern("ping", 1)], kill=signal.SIGKILL)
 check("start was logged", len(ev(recs, "start")) == 1, recs)
 check("no terminator", len(ev(recs, "terminator")) == 0, recs)
 
 print("12. escalation probe: SIGTERM ignored, process survives to be killed")
-r, n, recs = run([modern("ping", 1)], kill=signal.SIGTERM, ignore_sigterm=True)
+r, n, recs, st = run([modern("ping", 1)], kill=signal.SIGTERM, ignore_sigterm=True)
 s = ev(recs, "signal")
 check("SIGTERM logged as ignored", s and s[0]["action"] == "ignored", recs)
 check("no terminator (was killed)", len(ev(recs, "terminator")) == 0, recs)
+
+print("13. departed reader: graceful-closure write gets EPIPE (pins the agy §9 result)")
+r, n, recs, st = run([modern("subscriptions/listen", 1, notifications={"toolsListChanged": True}),
+                      modern("tools/list", 2)], close_reader=True)
+t = ev(recs, "terminator")
+check("subscription was open", len(ev(recs, "subscription_open")) == 1, recs)
+check("closure was attempted before the write failed",
+      len(ev(recs, "subscription_close")) == 1, recs)
+check("terminator reason == broken_pipe",
+      len(t) == 1 and t[0]["reason"] == "broken_pipe", t)
+
+print("14. negotiated era is ENFORCED: modern session refuses initialize")
+r, n, recs, st = run([modern("tools/list", 1),
+                      {"jsonrpc": "2.0", "id": 2, "method": "initialize",
+                       "params": {"protocolVersion": "2025-06-18"}},
+                      modern("ping", 3)])
+by = {m["id"]: m for m in r}
+check("era is modern", ev(recs, "era")[0]["era"] == "modern", recs)
+check("initialize rejected", "error" in by.get(2, {}), by.get(2))
+check("violation logged", len(ev(recs, "era_violation")) == 1, recs)
+check("session still usable afterwards", "result" in by.get(3, {}), by.get(3))
+
+print("15. ... and a modern request without protocolVersion, or with a different one")
+r, n, recs, st = run([modern("tools/list", 1),
+                      {"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}},
+                      {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {"_meta": {
+                          "io.modelcontextprotocol/protocolVersion": "2099-01-01"}}}])
+by = {m["id"]: m for m in r}
+check("bare modern request rejected", "error" in by.get(2, {}), by.get(2))
+check("version switch rejected", "error" in by.get(3, {}), by.get(3))
+check("version switch uses -32022",
+      by.get(3, {}).get("error", {}).get("code") == -32022, by.get(3))
+check("supported list advertised",
+      by.get(3, {}).get("error", {}).get("data", {}).get("supported") == ["2026-07-28"],
+      by.get(3))
+check("both violations logged", len(ev(recs, "era_violation")) == 2, recs)
+
+print("16. ... and a legacy session refuses modern metadata")
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-06-18"}},
+                      modern("tools/list", 2),
+                      {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}}])
+by = {m["id"]: m for m in r}
+check("era is legacy", ev(recs, "era")[0]["era"] == "legacy", recs)
+check("modern request rejected", "error" in by.get(2, {}), by.get(2))
+check("violation logged", len(ev(recs, "era_violation")) == 1, recs)
+check("plain legacy request still works", "result" in by.get(3, {}), by.get(3))
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")

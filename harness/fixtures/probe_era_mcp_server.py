@@ -55,6 +55,7 @@ SUB_ID_KEY = "io.modelcontextprotocol/subscriptionId"
 _started = time.monotonic()
 _log_fd = None
 _era = None               # negotiated era, set only when a request is ACCEPTED
+_version = None           # the exact negotiated version, enforced on later requests
 _subscriptions = {}       # listen-request id -> acknowledged notification filter
 
 
@@ -144,14 +145,54 @@ def _attempt(msg: dict, method):
 def _negotiate(msg: dict, method) -> None:
     """Record the era ONLY on a request the server accepts. Called from each accepting
     branch, after the refusal checks."""
-    global _era
+    global _era, _version
     if _era is not None:
         return
     era, version, how = _attempt(msg, method)
     if era is None:
         return
-    _era = era
+    _era, _version = era, version
     _log("era", era=era, version=version, decided_by=how, first_method=method)
+
+
+def _era_violation(req_id, msg: dict, method):
+    """Enforce the negotiated era on every later request, and answer as a real server would.
+
+    Recording the era once and then accepting anything would make this shim a worse peer
+    than the thing it measures: a modern session would answer `initialize`, and a legacy
+    session would take modern `_meta` traffic and reply in legacy shape. Worse for a
+    measuring instrument, a CLI that mixed eras would be silently absorbed instead of
+    showing up as the finding it is.
+
+    Returns True when the request was rejected and already answered."""
+    if _era is None:
+        return False
+    claimed = _modern_version(msg)
+
+    if _era == "modern":
+        if method == "initialize":
+            _log("era_violation", why="initialize in a modern session", method=method)
+            _error(req_id, -32601, "method not found: initialize")
+            return True
+        if claimed is None:
+            # Modern requests MUST carry _meta.protocolVersion; without it there is
+            # nothing to check a version gate against (§10.2).
+            _log("era_violation", why="modern request without protocolVersion", method=method)
+            _error(req_id, -32600, "missing _meta.io.modelcontextprotocol/protocolVersion")
+            return True
+        if claimed != _version:
+            _log("era_violation", why="version switched mid-session", method=method,
+                 negotiated=_version, claimed=claimed)
+            _send({"jsonrpc": "2.0", "id": req_id, "error": {
+                "code": -32022, "message": "Unsupported protocol version",
+                "data": {"supported": [MODERN_VERSION], "requested": claimed}}})
+            return True
+    elif _era == "legacy" and claimed is not None:
+        _log("era_violation", why="modern metadata in a legacy session", method=method,
+             claimed=claimed)
+        _error(req_id, -32600, "modern request metadata on a legacy session")
+        return True
+    return False
 
 
 def _discover() -> dict:
@@ -249,6 +290,9 @@ def main() -> int:
                 if cancelled in _subscriptions:
                     del _subscriptions[cancelled]
                     _log("subscription_cancelled", id=cancelled)
+            continue
+
+        if _era_violation(req_id, msg, method):
             continue
 
         if method == "server/discover":
