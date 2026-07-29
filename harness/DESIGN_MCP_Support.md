@@ -239,7 +239,7 @@ Hard prevention against a server the scenario author does not control needs the 
 **C3. A harness-owned filtering proxy — deferred, but the only mechanism that is both hard and uniform.**
 Rather than compiling `tools:` to four different native filters, the harness could launch its own stdio shim as the `command` the CLI actually starts; the shim spawns the declared server, filters `tools/list` responses down to the allowlist, and refuses off-list `tools/call` at the wire. That closes C2's drift window outright — there is exactly **one** server instance and the harness sits inside the connection, so there is no second execution to disagree with — and it is the only thing that would give **antigravity** tool gating at all (§2: no native filter exists there; today the schema can only warn). It would also produce wire-level MCP telemetry that no CLI reports uniformly, which is the same reason `--output-format json` became load-bearing for copilot.
 
-Deferred out of Phase 1 for two reasons: it puts harness-authored code in the request path of every gated run, where a bug is a silently wrong eval rather than a loud failure; and remote servers need it to be a transport *bridge* (stdio in, HTTP/SSE out), which is materially more than a pipe pump. → **Phase 1 ships C2's native mechanism with C2's stated guarantee.** Revisit before any scenario points `tools:` at a server its author does not control, and revisit for agy regardless — that adapter has no other path to tool gating.
+Deferred out of Phase 1 for two reasons: it puts harness-authored code in the request path of every gated run, where a bug is a silently wrong eval rather than a loud failure; and remote servers need it to be a transport *bridge* (stdio in, HTTP/SSE out), which is materially more than a pipe pump. → **Phase 1 ships C2's native mechanism with C2's stated guarantee.** Revisit before any scenario points `tools:` at a server its author does not control, and revisit for agy regardless — that adapter has no other path to tool gating. **The mechanism is now designed in §10** (stdio only in the first cut; remote `tools:` stays refused).
 
 **D. Where secrets interpolate: harness at load time vs CLI-native expansion.**
 CLI-native keeps values off disk but is inconsistent (copilot/agy have nothing). → **Hybrid**: harness interpolation as the uniform contract + fail-fast validation; adapters use native indirection where available (codex); redaction pass regardless.
@@ -304,3 +304,113 @@ CLI-native keeps values off disk but is inconsistent (copilot/agy have nothing).
    codex MCP tool-call event shape, for Phase 1's parser (resolved): `{"type": "mcp_tool_call", "server": ..., "tool": ..., "arguments": ..., "status": ...}`, emitted on both `item.started` and `item.completed`, with `server`/`tool` as separate fields rather than a canonical `mcp__server__tool` string.
 3. copilot: exact JSON key spelling in `mcp-config.json` (capture via `copilot mcp add` in a throwaway `COPILOT_HOME`); MCP tool-name format in its JSON events; whether `--disable-mcp-server` reaches plugin-declared servers (and under what naming) — for *custom-agent*-declared servers the flag is unusable for a different reason (resolved, Phase 0: `startServerOnce` *would* honor the disable set, but the names live in agent frontmatter and in remote org/enterprise listings the harness cannot read, so there is nothing to put on the flag — hence the fail-closed agent handling in §2/§8).
 4. agy: transcript tool-name format; `url` vs `serverUrl` for streamable HTTP vs SSE.
+5. **C3-0 — which MCP protocol era does each CLI speak?** Revision `2026-07-28` removes the `initialize` handshake in favour of per-request `_meta`, adds the `server/discover` probe, and forbids server-initiated requests (§10.2). A stdio shim that logs the first message each CLI sends — `server/discover`, `initialize`, or something else — and the `_meta.io.modelcontextprotocol/protocolVersion` on it answers this for all four adapters in one pass. **This is the first C3 measurement**: era determines the correlation model, the anomaly set, and what the test fixture must impersonate, so building any of them against an assumed era is building against a guess. Expect a split fleet mid-transition, and re-run it as CLIs upgrade — §10.7 makes the audit log carry the answer per run so it cannot silently expire.
+6. **C3-1 — how does each CLI shut an MCP stdio server down?** Closing the child's stdin (so it can write a final record), or a signal, or `SIGKILL` with no grace period? §10.5's verdict rule — absence of a clean terminator fails the cell — is only workable under the first. The spec says clients **SHOULD** close stdin and wait before escalating to `SIGTERM`/`SIGKILL`, but forced termination is a sanctioned fallback rather than a violation, so this stays a measurement. Under a hard kill the rule would fail every clean run and needs replacing rather than relaxing. Measure per adapter, before the verdict check is written; a shim that logs its shutdown path and exits is enough to answer it, and it can be the same shim as C3-0.
+
+## 10. C3 — the harness-owned filtering proxy (design)
+
+Decision recorded in §6-C3; this is the mechanism. **Scope of the first cut: stdio servers only.** A remote (`url:`) server with `tools:` stays the validation error it is today — the transport bridge is a separate piece of work and nothing should read "C3 landed" as "`tools:` works everywhere".
+
+### 10.1 What it is
+
+For a stdio server that declares `tools:`, the harness does not write the server's own `command` into the CLI's MCP config. It writes **its own shim**, which then spawns the declared server:
+
+```
+  agent CLI ──stdio──> agentskill_evals.mcp_proxy ──stdio──> the declared server
+```
+
+One server instance, with the harness inside the connection. That is the whole point, and it is what C2 cannot offer: C2 computes a deny-list from a **second** enumeration run, so a stateful server can advertise one tool set to the enumerator and another to the CLI (§6-C2). Here there is no second execution to disagree with, because the bytes the model sees are the bytes the proxy passed.
+
+It is also the only tool-gating mechanism that will ever exist for **antigravity**, which has no native filter at all (§2), and it is adapter-independent by construction: the proxy is just a command, so any adapter that can inject a stdio server gets filtering for free. `mcp_tool_filter` gains a fifth value, `"proxy"`.
+
+### 10.2 Protocol era — what the proxy speaks
+
+MCP revision **`2026-07-28`** is a breaking change, and an earlier draft of this section was written against the era it replaced:
+
+- There is **no `initialize` handshake**. Protocol version, client identity and client capabilities ride on *every request* in `_meta.io.modelcontextprotocol/*`.
+- Servers **MUST** implement `server/discover`. A dual-era stdio client probes with it and falls back to `initialize` on any non-modern error *or a timeout* — the fallback is deliberately not keyed to one error code.
+- Servers **MUST NOT** write JSON-RPC *requests* to stdout. Server→client interactions (sampling, elicitation, roots) are carried inside `InputRequiredResult` **responses**, and the client retries the original request as a new request with a **different `id`** (the MRTR pattern).
+
+Three consequences, each of which changes a rule stated elsewhere in this section:
+
+1. **Era is observed, never assumed.** Whichever of `server/discover` or `initialize` the client sends first fixes the era for that process lifetime; the audit log records the era and the negotiated protocol version. A proxy that assumed `initialize` would hang a modern client at its first request.
+2. **Correlation is direction-scoped.** Under legacy, *both* sides originate requests, so an `id` on a server→client request is not an unrequested `id` — the proxy keeps two in-flight maps, one per direction. Under modern, a server-originated request is itself an anomaly, because the spec forbids it.
+3. **Every `tools/call` retry is re-checked.** MRTR retries carry a new `id`, which the allowlist check handles for free by keying on `params.name` per request rather than on position in the stream.
+
+**Probe C3-0 (§9) comes before C3-1**: what era does each shipped CLI actually negotiate? Nothing here is worth building against a guess about which era claude 2.1.113 speaks, and during a transition the honest expectation is a split fleet. The proxy supports whichever eras the probe finds in use, and treats traffic in an era it was not built for as an anomaly rather than guessing at it.
+
+### 10.3 Launch and configuration
+
+The proxy reads a JSON config from a **file**, whose path is its sole argument, and the file lives in the per-cell `ase-mcp-` scratch dir: mode `0600`, outside the archived workspace, deleted on every exit path. It carries the real `command`/`args`/`env` plus the allowlist, so it carries **interpolated credentials** and gets exactly the handling the CLI's own MCP config gets, for the reason mutation M10 exists — argv is recorded in `result.json` and is readable by any local user through `ps`, and a secret must not be in either.
+
+The interpreter is `sys.executable`: the harness's own, the only one guaranteed to import `agentskill_evals`, and an absolute path outside HOME so a contained or masked home does not affect it.
+
+### 10.4 What is intercepted
+
+Newline-delimited JSON-RPC 2.0, one message per line, as the stdio binding specifies.
+
+**Parseable JSON is not a valid MCP message**, and the difference is load-bearing. Before any routing decision, each line must validate as an envelope: a JSON **object** (not an array); `"jsonrpc": "2.0"`; and *exactly one* of a request (`method` + `id`), a notification (`method`, no `id`), or a response (`id` + exactly one of `result`/`error`). A `tools/call` must additionally carry a string `params.name`. Anything else is an anomaly.
+
+Classifying by "it has no `id`" alone would be the bug this rule exists to prevent: a **malformed response that lost its `id`** would match the notification test and be forwarded verbatim down the never-answer path, unfiltered and unrecorded.
+
+| message | proxy behaviour |
+|---|---|
+| `tools/list` **response** | filter `result.tools` to the allowlist before forwarding |
+| `tools/call` **request** | if `params.name` is off-list, do **not** forward; answer the client with a JSON-RPC error and record it |
+| notification (`method`, no `id`) | forward verbatim, never answer — answering `notifications/initialized` is a protocol violation some clients treat as fatal |
+| server→client **request** | legacy era: forward verbatim. Modern era: **anomaly** — the spec forbids it |
+| everything else | forward verbatim: `server/discover`, `initialize`, `ping`, `resources/*`, `prompts/*`, `logging/*`, `completion/*` |
+
+Filtering responses requires correlating them to requests, so the proxy keeps in-flight `id` → method maps — **one per direction** (§10.2). Pagination therefore needs no special case: every `tools/list` response is filtered, whichever page it is. A response arriving with an `id` never requested *in that direction* is an anomaly, not a pass-through.
+
+### 10.5 Failure semantics — the deferral objection, answered
+
+C3 was deferred partly because it "puts harness-authored code in the request path of every gated run, where a bug is a silently wrong eval rather than a loud failure". That is the design constraint, not a caveat on it:
+
+> **The proxy never degrades. Anything it cannot handle with certainty becomes a failed cell, never unfiltered traffic.**
+
+Each of these is an **anomaly**:
+
+- an envelope that fails validation (§10.4), including a **JSON-RPC batch** — an array is not a legal MCP message on stdio at all ("Each message is a single JSON-RPC request, notification, or response"), so refusing it is conformance, not a v1 shortcut;
+- unparseable JSON in either direction;
+- a response whose `id` was never requested in that direction;
+- a `tools/list` result that is not shaped as expected;
+- a server-originated JSON-RPC request while in the modern era;
+- traffic in a protocol era the proxy was not built for (§10.2);
+- a tool-bearing sampling request (§10.6);
+- a spawn failure of the declared server;
+- **premature EOF, an unexpected child exit, or a write failure on either pipe.** A child that dies mid-request must not read as a quiet end of stream — the spec tells clients to *restart* a server that exits unexpectedly, so this is the case most easily mistaken for normality, and it is not covered by the spawn-failure or terminator checks.
+
+An anomaly is recorded and the proxy stops forwarding. It is **not** left to be inferred from the CLI's behaviour: the proxy writes an append-only audit log beside its config, and `verify_post_run` **fails the cell** unless, for every gated server, that log exists, parses, records no anomaly, and shows every proxy instance that started also terminating cleanly. Absence of a clean verdict is a failure — deliberately the same rule as copilot's, where a run that emitted its own `result` without ever emitting `session.mcp_servers_loaded` fails closed (§4).
+
+Two refinements that the naive form of that rule gets wrong:
+
+- **The invariant is about what was forwarded, not what was seen.** A proper-subset allowlist normally *means* the server advertises off-list tools and the proxy strips them, so "the log records no off-list advertisement" would reject exactly the case where filtering worked. The required evidence is that **no off-list advertisement was forwarded to the client**; a filtered source advertisement is an expected event and is recorded as one.
+- **The client may restart the proxy.** Because unexpected exit is a spec-sanctioned restart trigger, the log is append-only across instances and every record carries an instance id. The verdict is per instance, not "the file ends with a terminator".
+  **A later instance never heals an earlier one.** The cell verdict is the conjunction over every instance; one anomalous or unterminated instance fails the cell no matter how many clean instances follow it. This is the whole reason the rule is phrased per instance, and it is the form an implementation is most likely to get wrong — "find the latest verdict for this server", or a dedupe keyed on server name, would each silently let a clean restart paper over the exact failure the log exists to catch.
+  That requires knowing an instance existed, so **the start record is written before a single byte is forwarded.** Then the two cases partition cleanly: an instance that logged a start must also log a clean terminator, and an instance that died before logging anything cannot have forwarded anything either, so its absence from the log is not a gap in the evidence.
+
+The terminator rule also has an empirical dependency, recorded as **probe C3-1** in §9. The spec says a client **SHOULD** close stdin and wait before escalating to `SIGTERM`/`SIGKILL`, which is the behaviour the rule needs — but forced termination is a sanctioned path, not a violation, so what each CLI actually does is still a measurement. If a CLI kills without grace, "no terminator" is a false failure on every clean run, and the rule needs replacing rather than relaxing. **Measure before building the verdict check.**
+
+### 10.6 What the guarantee is, and is not
+
+- **Hard prevention, both directions.** An off-list tool is removed from what the model is shown, and an off-list `tools/call` never reaches the server. No enumeration, no complement, no drift window — this is a real boundary against a server the scenario author does not control, which is precisely what §6-C2 says `tools:` on claude is *not*.
+- **`tools:` gates the server's MCP tool surface — `tools/list` and `tools/call` — and nothing else.** It does not promise that no tool definition can reach a model by any route. **Sampling** is the concrete counterexample: a server may put its *own* `tools` array in a `sampling/createMessage` request, and those definitions are scoped to the sampling request — they "don't need to correspond to registered tools". Legacy carries it as a server-originated request; modern carries it inside `InputRequiredResult.inputRequests`. Sampling is deprecated as of `2026-07-28` but stays specified for at least twelve months, which is inside this harness's horizon.
+  The proxy does not implement sampling, but it **detects and refuses** a tool-bearing sampling request as an anomaly. Exposure is conditional — a server MUST NOT send one unless the client declared the `sampling.tools` capability — but the check is nearly free, and a tool definition the model can act on that never appeared in any `tools/list` is precisely the silent wrongness §10.5 exists to prevent.
+- **Other channels pass through.** A server can still serve data through `resources/read`, `prompts/get`, or any future method, and the proxy forwards those verbatim. `tools:` is a **tool allowlist, not a capability sandbox**, and neither the schema docs nor the error messages may imply otherwise — the same rule §6-C3 already sets for C2.
+- **It does not make a hostile server safe to run.** It makes the *tool surface* the scenario declared the tool surface the model got.
+
+### 10.7 Telemetry
+
+The audit log is a capability no CLI provides uniformly: wire-level, per call, with the server, the tool, whether it was allowed or refused, and when. Each instance additionally records the **observed era and negotiated protocol version** (§10.2) — which doubles as the standing answer to probe C3-0 as CLIs migrate, rather than a one-off measurement that silently expires. Recorded per cell like any other artifact and scrubbed by the same pass. It is stronger evidence than parsing a transcript for tool names, and it is the natural substrate for the portable `used_mcp_tool` assertion (§7) — which currently has to reconcile four naming conventions across four adapters, none of them the wire.
+
+### 10.8 What stays refused
+
+- `tools:` on a **remote** server — no bridge yet, so the allowlist could not be enforced; refusing is unchanged behaviour.
+- `tools:` on an adapter that cannot inject at all — unchanged; the server would not be there either way.
+
+### 10.9 Testing
+
+The proxy is a program with a defined wire protocol on both sides, so it is testable without any agent CLI: drive it with a scripted client over pipes and a fixture server, and assert the filtered list, the refused call, verbatim pass-through of a non-tool method, the notification rule, and a recorded anomaly plus failing verdict for each malformed case — including the envelope cases (batch array, response with no `id`, both-`result`-and-`error`) that a "no `id` means notification" reading would wave through.
+
+`fixtures/echo_mcp_server.py` provides the server side, but it is **legacy-only** — it answers `initialize` and knows nothing of `server/discover` or per-request `_meta`. Whatever C3-0 finds, the fixture needs a modern mode before the proxy's era handling can be tested at all; if the fleet turns out to be split, it needs both, since dual-era fallback is a behaviour with its own failure modes (notably the timeout path). Live verification against claude 2.1.113 comes after, and probe C3-0 then C3-1 come before the verdict rule is written.
