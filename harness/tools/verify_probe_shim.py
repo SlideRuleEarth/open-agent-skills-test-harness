@@ -177,6 +177,15 @@ def modern(method, mid, **extra):
             "params": dict(MODERN_META, **extra)}
 
 
+def legacy_init(mid, version="2025-11-25"):
+    """A COMPLETE legacy initialize. The legacy lifecycle requires protocolVersion,
+    capabilities and clientInfo, and the shim now enforces that — so scenarios cannot get
+    away with the partial params they used to send."""
+    return {"jsonrpc": "2.0", "id": mid, "method": "initialize", "params": {
+        "protocolVersion": version, "capabilities": {},
+        "clientInfo": {"name": "verify-probe-shim", "version": "1.0"}}}
+
+
 print("1. modern client that SKIPS server/discover (the P2 case)")
 r, n, recs, st = run([modern("tools/list", 1)])
 e = ev(recs, "era")
@@ -201,8 +210,7 @@ check("ping has NO caching hints", "ttlMs" not in by.get(3, {}), by.get(3))
 check("tools/call has resultType", by.get(4, {}).get("resultType") == "complete", by.get(4))
 
 print("3. legacy client, and legacy results are NOT modern-shaped")
-r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                   "params": {"protocolVersion": "2025-06-18"}},
+r, n, recs, st = run([legacy_init(1, "2025-06-18"),
                   {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}])
 e = ev(recs, "era")
 check("era == legacy", e and e[0]["era"] == "legacy", e)
@@ -213,8 +221,7 @@ check("no resultType leaked into legacy", "resultType" not in by.get(2, {}), by.
 
 print("4. forced fallback: legacy mode must log LEGACY, not the refused modern attempt")
 r, n, recs, st = run([modern("server/discover", 1),
-                  {"jsonrpc": "2.0", "id": 2, "method": "initialize",
-                   "params": {"protocolVersion": "2025-06-18"}}], mode="legacy")
+                  legacy_init(2, "2025-06-18")], mode="legacy")
 by = {m["id"]: m for m in r}
 check("discover refused", "error" in by.get(1, {}), by.get(1))
 check("then initialize works", "result" in by.get(2, {}), by.get(2))
@@ -362,7 +369,9 @@ check("initialize rejected", "error" in by.get(2, {}), by.get(2))
 check("violation logged", len(ev(recs, "violation")) == 1, recs)
 check("session still usable afterwards", "result" in by.get(3, {}), by.get(3))
 
-print("18. ... and a version switch is refused whenever it appears")
+print("18. ... and an UNSUPPORTED version is refused wherever it appears")
+# Not a "switch": nothing is stateful. Another version this shim implemented would be
+# judged on its own merits, request by request.
 r, n, recs, st = run([modern("tools/list", 1),
                       {"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}},
                       {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {"_meta": {
@@ -379,8 +388,7 @@ check("supported list advertised",
 check("both violations logged", len(ev(recs, "violation")) == 2, recs)
 
 print("19. ... and a legacy-only server refuses modern metadata")
-r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                       "params": {"protocolVersion": "2025-06-18"}},
+r, n, recs, st = run([legacy_init(1, "2025-06-18"),
                       modern("tools/list", 2),
                       {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}}],
                      mode="legacy")
@@ -389,6 +397,90 @@ check("era is legacy", ev(recs, "era")[0]["era"] == "legacy", recs)
 check("modern request rejected", "error" in by.get(2, {}), by.get(2))
 check("violation logged", len(ev(recs, "violation")) == 1, recs)
 check("plain legacy request still works", "result" in by.get(3, {}), by.get(3))
+
+print("20. dual mode is ORDER-INDEPENDENT: modern first, then initialize, then bare")
+r, n, recs, st = run([modern("tools/list", 1), legacy_init(2),
+                      {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}}])
+by = {m["id"]: m for m in r}
+check("modern request served", "result" in by.get(1, {}), by.get(1))
+check("initialize accepted", "result" in by.get(2, {}), by.get(2))
+check("bare request now legal", "result" in by.get(3, {}), by.get(3))
+check("both eras recorded", len(ev(recs, "era")) == 1 and len(ev(recs, "era_also")) == 1,
+      recs)
+
+print("21. ... and the other order, which must behave the same")
+r, n, recs, st = run([legacy_init(1), modern("tools/list", 2),
+                      {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}}])
+by = {m["id"]: m for m in r}
+check("initialize accepted", "result" in by.get(1, {}), by.get(1))
+check("modern request served", "result" in by.get(2, {}), by.get(2))
+check("bare request still legal", "result" in by.get(3, {}), by.get(3))
+check("modern reply is modern-shaped",
+      by.get(2, {}).get("result", {}).get("resultType") == "complete", by.get(2))
+
+print("22. the method must match the REQUEST's era, not the other way round")
+r, n, recs, st = run([modern("initialize", 1),
+                      legacy_init(2),
+                      {"jsonrpc": "2.0", "id": 3, "method": "server/discover",
+                       "params": {}}])
+by = {m["id"]: m for m in r}
+check("modern-metadata initialize is unknown", "error" in by.get(1, {}), by.get(1))
+check("... with -32601", by.get(1, {}).get("error", {}).get("code") == -32601, by.get(1))
+check("bare server/discover after legacy init is unknown", "error" in by.get(3, {}),
+      by.get(3))
+check("... and NOT a DiscoverResult", "result" not in by.get(3, {}), by.get(3))
+
+print("23. a legacy-only server must never emit a recognized MODERN error")
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {
+    "_meta": {"io.modelcontextprotocol/protocolVersion": "2099-01-01",
+              "io.modelcontextprotocol/clientCapabilities": {}}}}], mode="legacy")
+code = r and r[0].get("error", {}).get("code")
+check("rejected", r and "error" in r[0], r)
+check("NOT -32022 (that would identify it as modern)", code != -32022, r)
+check("plain method-not-found instead", code == -32601, r)
+
+print("24. presence is not validity")
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {
+    "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+              "io.modelcontextprotocol/clientCapabilities": None}}},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {
+        "_meta": {"io.modelcontextprotocol/protocolVersion": 20260728,
+                  "io.modelcontextprotocol/clientCapabilities": {}}}},
+    modern("tools/list", 3)])
+by = {m["id"]: m for m in r}
+check("null clientCapabilities rejected", "error" in by.get(1, {}), by.get(1))
+check("... with -32602", by.get(1, {}).get("error", {}).get("code") == -32602, by.get(1))
+check("numeric protocolVersion rejected", "error" in by.get(2, {}), by.get(2))
+check("... as malformed, not unsupported",
+      by.get(2, {}).get("error", {}).get("code") == -32602, by.get(2))
+check("well-formed request still works", "result" in by.get(3, {}), by.get(3))
+
+print("25. legacy initialize selects a SUPPORTED version rather than echoing")
+r, n, recs, st = run([legacy_init(1, "2099-01-01")])
+sel = r and r[0].get("result", {}).get("protocolVersion")
+check("did not echo the unsupported version", sel != "2099-01-01", r)
+check("selected one it implements", sel in ("2025-11-25", "2025-06-18"), r)
+li = ev(recs, "legacy_initialize")
+check("requested vs selected recorded", li and li[0]["requested"] == "2099-01-01"
+      and li[0]["selected"] == sel, li)
+check("downgrade flagged", li and li[0]["downgraded"] is True, li)
+
+print("26. ... and echoes a version it does support")
+r, n, recs, st = run([legacy_init(1, "2025-06-18")])
+check("supported request honoured",
+      r and r[0].get("result", {}).get("protocolVersion") == "2025-06-18", r)
+check("not flagged as a downgrade",
+      ev(recs, "legacy_initialize")[0]["downgraded"] is False, recs)
+
+print("27. legacy initialize requires its own params")
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-11-25"}},
+                      legacy_init(2)])
+by = {m["id"]: m for m in r}
+check("initialize without capabilities/clientInfo rejected", "error" in by.get(1, {}),
+      by.get(1))
+check("... with -32602", by.get(1, {}).get("error", {}).get("code") == -32602, by.get(1))
+check("complete initialize accepted", "result" in by.get(2, {}), by.get(2))
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")

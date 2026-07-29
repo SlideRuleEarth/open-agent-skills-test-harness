@@ -49,14 +49,25 @@ import time
 MODE = os.environ.get("PROBE_MCP_MODE", "dual")
 IGNORE_SIGTERM = os.environ.get("PROBE_MCP_IGNORE_SIGTERM") == "1"
 MODERN_VERSION = "2026-07-28"
-LEGACY_FALLBACK = "2025-06-18"
+# The legacy versions this shim actually implements. The legacy lifecycle says a server
+# returns the REQUESTED version only when it supports it, and otherwise answers with one it
+# does support — echoing anything back would turn C3-0's load-bearing version column into a
+# recording of the client's own guess. Both measured legacy versions are here (§9).
+LEGACY_VERSIONS = ("2025-11-25", "2025-06-18")
 SUB_ID_KEY = "io.modelcontextprotocol/subscriptionId"
 
 _started = time.monotonic()
 _log_fd = None
-_era = None               # negotiated era, set only when a request is ACCEPTED
-_version = None           # the exact negotiated version, enforced on later requests
-_subscriptions = {}       # listen-request id -> acknowledged notification filter
+# PROTOCOL STATE — exactly one flag, and it is the only thing the revision lets a server
+# carry across requests: an accepted `initialize` selects legacy semantics for the stdio
+# process. Modern carries no such state, so there is nothing else here.
+_legacy_initialized = False
+# TELEMETRY — what C3-0 reports. Deliberately NOT protocol state: a single `_era` used as
+# both made dispatch order-dependent, so a modern request followed by an accepted
+# `initialize` left legacy disabled and refused the bare requests that followed it.
+_first_era = None
+_seen_eras = set()
+_subscriptions = {}       # listen-request id -> (acknowledged filter, modern flag)
 
 
 def _log(event: str, **fields) -> None:
@@ -160,17 +171,24 @@ def _attempt(msg: dict, method):
     return None, None, None
 
 
-def _negotiate(msg: dict, method) -> None:
-    """Record the era ONLY on a request the server accepts. Called from each accepting
-    branch, after the refusal checks."""
-    global _era, _version
-    if _era is not None:
-        return
+def _observe(msg: dict, method) -> None:
+    """Record what era an ACCEPTED request spoke. Telemetry only — it gates nothing.
+
+    The first observation is what C3-0's table reports. Later *distinct* ones are logged
+    too rather than dropped: a client mixing eras is a finding, and a recorder that kept
+    only the first would hide exactly that."""
+    global _first_era
     era, version, how = _attempt(msg, method)
     if era is None:
         return
-    _era, _version = era, version
-    _log("era", era=era, version=version, decided_by=how, first_method=method)
+    key = (era, version)
+    if _first_era is None:
+        _first_era = key
+        _seen_eras.add(key)
+        _log("era", era=era, version=version, decided_by=how, first_method=method)
+    elif key not in _seen_eras:
+        _seen_eras.add(key)
+        _log("era_also", era=era, version=version, decided_by=how, method=method)
 
 
 def _reject(req_id, msg: dict, method):
@@ -192,6 +210,14 @@ def _reject(req_id, msg: dict, method):
     meta = _meta_of(msg)
 
     if _modern_intent(msg):
+        if MODE == "legacy":
+            # FIRST, before any modern-specific check. A legacy-only server must never
+            # emit a RECOGNIZED MODERN ERROR: the dual-era probe treats one as proof the
+            # server is modern and explicitly does not fall back, so answering -32022 here
+            # would misidentify this server and strand the client.
+            _log("violation", why="modern request to a legacy-only server", method=method)
+            _error(req_id, -32601, f"method not found: {method}")
+            return True
         missing = [k for k in (VER_KEY, CAP_KEY) if k not in meta]
         if missing:
             # Both protocolVersion and clientCapabilities are required on every modern
@@ -201,7 +227,16 @@ def _reject(req_id, msg: dict, method):
                  missing=missing)
             _error(req_id, -32602, f"missing required _meta: {', '.join(missing)}")
             return True
-        claimed = meta[VER_KEY]
+        claimed, caps = meta[VER_KEY], meta[CAP_KEY]
+        if not isinstance(claimed, str) or not isinstance(caps, dict):
+            # Present but the wrong type is malformed, not unsupported. Answering -32022
+            # for a numeric version would assert the server understood a version request
+            # it never actually received.
+            _log("violation", why="modern _meta field of the wrong type", method=method,
+                 version_type=type(claimed).__name__, caps_type=type(caps).__name__)
+            _error(req_id, -32602, "malformed _meta: protocolVersion must be a string and "
+                                   "clientCapabilities an object")
+            return True
         if claimed != MODERN_VERSION:
             _log("violation", why="unsupported protocol version", method=method,
                  claimed=claimed)
@@ -209,9 +244,12 @@ def _reject(req_id, msg: dict, method):
                 "code": -32022, "message": "Unsupported protocol version",
                 "data": {"supported": [MODERN_VERSION], "requested": claimed}}})
             return True
-        if MODE == "legacy":
-            _log("violation", why="modern request to a legacy-only server", method=method)
-            _error(req_id, -32600, "this server implements only initialization-based versions")
+        if method == "initialize":
+            # `initialize` does not exist in the modern revision. Serving it because the
+            # method name looks familiar would derive the era from the method, which is
+            # the rule this file exists to enforce the other way round.
+            _log("violation", why="initialize carrying modern metadata", method=method)
+            _error(req_id, -32601, "method not found: initialize")
             return True
         return False
 
@@ -220,11 +258,27 @@ def _reject(req_id, msg: dict, method):
             _log("violation", why="initialize to a modern-only server", method=method)
             _error(req_id, -32601, "method not found: initialize")
             return True
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        bad = [k for k, t in (("protocolVersion", str), ("capabilities", dict),
+                              ("clientInfo", dict)) if not isinstance(params.get(k), t)]
+        if bad:
+            _log("violation", why="legacy initialize missing required params",
+                 method=method, missing=bad)
+            _error(req_id, -32602, f"initialize requires {', '.join(bad)}")
+            return True
         return False
 
-    # Neither modern metadata nor `initialize`: legal only after `initialize` selected
+    if method == "server/discover":
+        # A modern-only method arriving with no modern metadata. A legacy server has never
+        # heard of it, and answering a DiscoverResult would again be reading the era off
+        # the method name.
+        _log("violation", why="server/discover without modern metadata", method=method)
+        _error(req_id, -32601, "method not found: server/discover")
+        return True
+
+    # Neither modern metadata nor `initialize`: legal only once `initialize` has selected
     # legacy semantics for this process.
-    if _era != "legacy":
+    if not _legacy_initialized:
         _log("violation", why="request before any era was established", method=method)
         _error(req_id, -32602, "no protocol era established: send initialize or modern _meta")
         return True
@@ -243,9 +297,14 @@ def _discover() -> dict:
 
 
 def _initialize(params: dict) -> dict:
+    global _legacy_initialized
     requested = params.get("protocolVersion")
+    selected = requested if requested in LEGACY_VERSIONS else LEGACY_VERSIONS[0]
+    _legacy_initialized = True
+    _log("legacy_initialize", requested=requested, selected=selected,
+         supported=list(LEGACY_VERSIONS), downgraded=selected != requested)
     return {
-        "protocolVersion": requested if isinstance(requested, str) else LEGACY_FALLBACK,
+        "protocolVersion": selected,
         "capabilities": {"tools": {"listChanged": False}},
         "serverInfo": {"name": "probe-era", "version": "1.0.0"},
     }
@@ -253,9 +312,10 @@ def _initialize(params: dict) -> dict:
 
 def _open_subscription(req_id, params: dict, modern: bool) -> None:
     """Acknowledge first, per spec: `notifications/subscriptions/acknowledged` MUST be the
-    first message on the stream, and the subscription id IS the listen request's id. The
-    request itself stays open — its JSON-RPC response is the graceful-closure signal, sent
-    at shutdown, not now."""
+    first message CARRYING THIS SUBSCRIPTION'S ID. Ordering is scoped per subscription and
+    not per channel — on stdio, other subscriptions' messages may legitimately interleave
+    ahead of it. The subscription id IS the listen request's id. The request itself stays
+    open; its JSON-RPC response is the graceful-closure signal, sent at shutdown, not now."""
     wanted = params.get("notifications") if isinstance(params.get("notifications"), dict) else {}
     agreed = {k: v for k, v in wanted.items() if k == "toolsListChanged"}
     _subscriptions[req_id] = (agreed, modern)
@@ -332,35 +392,28 @@ def main() -> int:
             continue
         is_modern = _modern_intent(msg)
 
+        # Everything below is REACHABLE ONLY IF _reject() passed it, so the mode and era
+        # rules live there and nowhere else. The MODE checks that used to sit in these two
+        # branches are gone rather than kept "for safety": they were unreachable, and the
+        # same rule stated in two places is the kind that drifts apart silently.
         if method == "server/discover":
-            # In `legacy` mode this is refused, which is what a legacy server does and what
-            # a dual-era client must fall back from. That fallback is a distinct code path
-            # with its own failure modes (§10.9), so it needs to be reachable on purpose.
-            if MODE == "legacy":
-                _log("refused", method=method, mode=MODE)
-                _error(req_id, -32601, "method not found: server/discover")
-                continue
-            _negotiate(msg, method)
-            _result(req_id, _discover(), modern=True, cacheable=True)
+            _observe(msg, method)
+            _result(req_id, _discover(), modern=is_modern, cacheable=True)
         elif method == "initialize":
-            if MODE == "modern":
-                _log("refused", method=method, mode=MODE)
-                _error(req_id, -32601, "method not found: initialize")
-                continue
-            _negotiate(msg, method)
+            _observe(msg, method)
             _result(req_id, _initialize(params), modern=False)
         elif method == "subscriptions/listen":
-            _negotiate(msg, method)
+            _observe(msg, method)
             _open_subscription(req_id, params, is_modern)
         elif method == "tools/list":
-            _negotiate(msg, method)
+            _observe(msg, method)
             _result(req_id, {"tools": TOOLS}, modern=is_modern, cacheable=True)
         elif method == "tools/call":
-            _negotiate(msg, method)
+            _observe(msg, method)
             _result(req_id, {"content": [{"type": "text", "text": "ok"}], "isError": False},
                     modern=is_modern)
         elif method == "ping":
-            _negotiate(msg, method)
+            _observe(msg, method)
             _result(req_id, {}, modern=is_modern)
         else:
             _log("refused", method=method, mode=MODE)
