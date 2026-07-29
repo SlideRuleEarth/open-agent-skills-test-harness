@@ -239,7 +239,7 @@ Hard prevention against a server the scenario author does not control needs the 
 **C3. A harness-owned filtering proxy — deferred, but the only mechanism that is both hard and uniform.**
 Rather than compiling `tools:` to four different native filters, the harness could launch its own stdio shim as the `command` the CLI actually starts; the shim spawns the declared server, filters `tools/list` responses down to the allowlist, and refuses off-list `tools/call` at the wire. That closes C2's drift window outright — there is exactly **one** server instance and the harness sits inside the connection, so there is no second execution to disagree with — and it is the only thing that would give **antigravity** tool gating at all (§2: no native filter exists there; today the schema can only warn). It would also produce wire-level MCP telemetry that no CLI reports uniformly, which is the same reason `--output-format json` became load-bearing for copilot.
 
-Deferred out of Phase 1 for two reasons: it puts harness-authored code in the request path of every gated run, where a bug is a silently wrong eval rather than a loud failure; and remote servers need it to be a transport *bridge* (stdio in, HTTP/SSE out), which is materially more than a pipe pump. → **Phase 1 ships C2's native mechanism with C2's stated guarantee.** Revisit before any scenario points `tools:` at a server its author does not control, and revisit for agy regardless — that adapter has no other path to tool gating.
+Deferred out of Phase 1 for two reasons: it puts harness-authored code in the request path of every gated run, where a bug is a silently wrong eval rather than a loud failure; and remote servers need it to be a transport *bridge* (stdio in, HTTP/SSE out), which is materially more than a pipe pump. → **Phase 1 ships C2's native mechanism with C2's stated guarantee.** Revisit before any scenario points `tools:` at a server its author does not control, and revisit for agy regardless — that adapter has no other path to tool gating. **The mechanism is now designed in §10** (stdio only in the first cut; remote `tools:` stays refused).
 
 **D. Where secrets interpolate: harness at load time vs CLI-native expansion.**
 CLI-native keeps values off disk but is inconsistent (copilot/agy have nothing). → **Hybrid**: harness interpolation as the uniform contract + fail-fast validation; adapters use native indirection where available (codex); redaction pass regardless.
@@ -304,3 +304,70 @@ CLI-native keeps values off disk but is inconsistent (copilot/agy have nothing).
    codex MCP tool-call event shape, for Phase 1's parser (resolved): `{"type": "mcp_tool_call", "server": ..., "tool": ..., "arguments": ..., "status": ...}`, emitted on both `item.started` and `item.completed`, with `server`/`tool` as separate fields rather than a canonical `mcp__server__tool` string.
 3. copilot: exact JSON key spelling in `mcp-config.json` (capture via `copilot mcp add` in a throwaway `COPILOT_HOME`); MCP tool-name format in its JSON events; whether `--disable-mcp-server` reaches plugin-declared servers (and under what naming) — for *custom-agent*-declared servers the flag is unusable for a different reason (resolved, Phase 0: `startServerOnce` *would* honor the disable set, but the names live in agent frontmatter and in remote org/enterprise listings the harness cannot read, so there is nothing to put on the flag — hence the fail-closed agent handling in §2/§8).
 4. agy: transcript tool-name format; `url` vs `serverUrl` for streamable HTTP vs SSE.
+5. **C3-1 — how does each CLI shut an MCP stdio server down?** Closing the child's stdin (so it can write a final record), or a signal, or `SIGKILL` with no grace period? §10.4's verdict rule — absence of a clean terminator fails the cell — is only workable under the first. Under the last it would fail every clean run, and the rule needs replacing rather than relaxing. Measure per adapter, before the verdict check is written; a shim that logs its shutdown path and exits is enough to answer it.
+
+## 10. C3 — the harness-owned filtering proxy (design)
+
+Decision recorded in §6-C3; this is the mechanism. **Scope of the first cut: stdio servers only.** A remote (`url:`) server with `tools:` stays the validation error it is today — the transport bridge is a separate piece of work and nothing should read "C3 landed" as "`tools:` works everywhere".
+
+### 10.1 What it is
+
+For a stdio server that declares `tools:`, the harness does not write the server's own `command` into the CLI's MCP config. It writes **its own shim**, which then spawns the declared server:
+
+```
+  agent CLI ──stdio──> agentskill_evals.mcp_proxy ──stdio──> the declared server
+```
+
+One server instance, with the harness inside the connection. That is the whole point, and it is what C2 cannot offer: C2 computes a deny-list from a **second** enumeration run, so a stateful server can advertise one tool set to the enumerator and another to the CLI (§6-C2). Here there is no second execution to disagree with, because the bytes the model sees are the bytes the proxy passed.
+
+It is also the only tool-gating mechanism that will ever exist for **antigravity**, which has no native filter at all (§2), and it is adapter-independent by construction: the proxy is just a command, so any adapter that can inject a stdio server gets filtering for free. `mcp_tool_filter` gains a fifth value, `"proxy"`.
+
+### 10.2 Launch and configuration
+
+The proxy reads a JSON config from a **file**, whose path is its sole argument, and the file lives in the per-cell `ase-mcp-` scratch dir: mode `0600`, outside the archived workspace, deleted on every exit path. It carries the real `command`/`args`/`env` plus the allowlist, so it carries **interpolated credentials** and gets exactly the handling the CLI's own MCP config gets, for the reason mutation M10 exists — argv is recorded in `result.json` and is readable by any local user through `ps`, and a secret must not be in either.
+
+The interpreter is `sys.executable`: the harness's own, the only one guaranteed to import `agentskill_evals`, and an absolute path outside HOME so a contained or masked home does not affect it.
+
+### 10.3 What is intercepted
+
+Newline-delimited JSON-RPC 2.0, as the stdio transport specifies.
+
+| message | proxy behaviour |
+|---|---|
+| `tools/list` **response** | filter `result.tools` to the allowlist before forwarding |
+| `tools/call` **request** | if `params.name` is off-list, do **not** forward; answer the client with a JSON-RPC error and record it |
+| any notification (no `id`) | forward verbatim, never answer — answering `notifications/initialized` is a protocol violation some clients treat as fatal |
+| everything else | forward verbatim: `initialize`, `ping`, `resources/*`, `prompts/*`, `logging/*`, `completion/*` |
+
+Filtering responses requires correlating them to requests, so the proxy keeps a map of in-flight request `id` → method and pops it on the matching response. Pagination therefore needs no special case: every `tools/list` response is filtered, whichever page it is. A response arriving with an `id` the proxy never saw is an **anomaly** (§10.4), not a pass-through.
+
+### 10.4 Failure semantics — the deferral objection, answered
+
+C3 was deferred partly because it "puts harness-authored code in the request path of every gated run, where a bug is a silently wrong eval rather than a loud failure". That is the design constraint, not a caveat on it:
+
+> **The proxy never degrades. Anything it cannot handle with certainty becomes a failed cell, never unfiltered traffic.**
+
+Concretely, each of these is an **anomaly**: unparseable JSON in either direction; a JSON-RPC batch (an array rather than an object — unhandled deliberately in v1, because guessing at element-wise semantics is exactly the kind of quiet wrongness this rule exists to prevent); a response whose `id` was never requested; a `tools/list` result that is not shaped as expected; a spawn failure of the declared server.
+
+An anomaly is recorded and the proxy stops forwarding. It is **not** left to be inferred from the CLI's behaviour: the proxy writes an append-only audit log beside its config, and `verify_post_run` **fails the cell** unless, for every gated server, that log exists, parses, records no anomaly and no off-list advertisement, and ends with a clean terminator. Absence of a clean verdict is a failure — deliberately the same rule as copilot's, where a run that emitted its own `result` without ever emitting `session.mcp_servers_loaded` fails closed (§4).
+
+That last clause has an empirical dependency, recorded as **probe C3-1** in §9: it only works if agent CLIs shut an MCP stdio server down by closing its stdin (letting the proxy write its terminator) rather than by signal. If a CLI `SIGKILL`s, "no terminator" would be a false failure on every clean run, and the terminator rule needs replacing rather than relaxing. **Measure before building the verdict check.**
+
+### 10.5 What the guarantee is, and is not
+
+- **Hard prevention, both directions.** An off-list tool is removed from what the model is shown, and an off-list `tools/call` never reaches the server. No enumeration, no complement, no drift window — this is a real boundary against a server the scenario author does not control, which is precisely what §6-C2 says `tools:` on claude is *not*.
+- **`tools:` gates tools, and only tools.** A server can still serve data through `resources/read`, `prompts/get`, or any future method, and the proxy forwards those verbatim. `tools:` is a **tool allowlist, not a capability sandbox**, and neither the schema docs nor the error messages may imply otherwise — the same rule §6-C3 already sets for C2.
+- **It does not make a hostile server safe to run.** It makes the *tool surface* the scenario declared the tool surface the model got.
+
+### 10.6 Telemetry
+
+The audit log is a capability no CLI provides uniformly: wire-level, per call, with the server, the tool, whether it was allowed or refused, and when. Recorded per cell like any other artifact and scrubbed by the same pass. It is stronger evidence than parsing a transcript for tool names, and it is the natural substrate for the portable `used_mcp_tool` assertion (§7) — which currently has to reconcile four naming conventions across four adapters, none of them the wire.
+
+### 10.7 What stays refused
+
+- `tools:` on a **remote** server — no bridge yet, so the allowlist could not be enforced; refusing is unchanged behaviour.
+- `tools:` on an adapter that cannot inject at all — unchanged; the server would not be there either way.
+
+### 10.8 Testing
+
+The proxy is a program with a defined wire protocol on both sides, so it is testable without any agent CLI: drive it with a scripted client over pipes and a fixture server, and assert the filtered list, the refused call, verbatim pass-through of a non-tool method, the notification rule, and a recorded anomaly plus failing verdict for each malformed case. `fixtures/echo_mcp_server.py` already provides the server side. Live verification against claude 2.1.113 with the echo fixture comes after, and probe C3-1 comes before the verdict rule is written.
