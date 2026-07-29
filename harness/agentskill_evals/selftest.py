@@ -9400,6 +9400,270 @@ def _check_mcp_declared_servers(failures, verbose):
            f"the adapter directly: unsupported={prog_unsupported[:60]!r} "
            f"gated={prog_gated[:60]!r}", failures, verbose)
 
+    # --- a declared surface with no overlay is a different experiment ----------
+    # `isolated: false` is the documented opt-out from the overlay-build guard, and that is
+    # right for a run that says nothing about MCP. Combined with `mcp_servers:` it opts out
+    # of the guarantee in the same breath as declaring the surface being guaranteed, and
+    # nothing re-checked the combination: the declared servers would load ALONGSIDE the
+    # user's real ones, making the declared set a SUBSET of what ran.
+    #
+    # No shipped adapter can reach it — the mask-dependent ones are exactly the ones that
+    # cannot inject, so `validate_mcp_support` refuses them one line earlier. So it is
+    # modelled with an adapter that is both, which is precisely what copilot or antigravity
+    # becomes on the day it gains injection. Neither fake is ever spawned.
+    from .adapters.base import Adapter as _BaseAdapter
+    from .adapters.base import MCPOffMechanism as _MCPOffMechanism
+    from .adapters.base import ParseOutput as _BaseParseOutput
+
+    class _FakeInjector(_BaseAdapter):
+        """Minimal injecting adapter. Built on the BASE adapter, never on claude's: a claude
+        subclass inherits `--strict-mcp-config` and is therefore hermetic without the
+        overlay, so the first version of this fake modelled the opposite of the case it was
+        named for and the arm demonstrated the confusion rather than the rule (found in
+        review). None of these is ever spawned — `is_available` is False."""
+        name = "fake-injector"
+        binary = "true"
+        supports_mcp_injection = True
+
+        def build_argv(self, prompt, opts, *, cwd):
+            return ["true"]
+
+        def parse(self, stdout, stderr, exit_code, *, opts=None):
+            return _BaseParseOutput()
+
+        def is_available(self):
+            return False
+
+    class _MaskOnlyInjector(_FakeInjector):
+        """Its ONLY MCP-off mechanism is a config mask the overlay materializes — what
+        copilot becomes on gaining injection."""
+        name = "mask-only-injector"
+        mcp_off_mechanism = _MCPOffMechanism.OVERLAY_MASKS
+        isolation_config_masks = {".x/mcp.json": '{"mcpServers": {}}'}
+
+    class _PluginMaskOnlyInjector(_FakeInjector):
+        """The same, through the PLUGIN half alone — agy's shape, where servers arrive from
+        `plugins/<name>/mcp_config.json`. No shipped adapter declares this half by itself,
+        which is why the guard's coverage of it needs the same latent-adapter technique the
+        guard itself does (found in review): dropping it is a fail-open regression that
+        nothing else would notice.
+
+        It has to name a registry ROOT to be a valid adapter of this shape — that is where
+        the masks get materialized. The first version of this fake omitted it and was
+        therefore not the thing it claimed to model (also found in review)."""
+        name = "plugin-mask-only-injector"
+        mcp_off_mechanism = _MCPOffMechanism.OVERLAY_MASKS
+        global_plugin_registry_subpaths = [".x/plugins"]
+        plugin_registry_config_masks = {"mcp_config.json": '{"mcpServers": {}}'}
+
+    class _OrphanPluginMaskInjector(_FakeInjector):
+        """Plugin masks with NO registry root — masks that have nowhere to be applied.
+        `build_mcp_masked_home` derives its registry list from
+        `global_plugin_registry_subpaths` and returns `(None, {})` when it is empty, so the
+        overlay this adapter names as its mechanism is never built. Declaring a mask and the
+        mask having somewhere to act are different claims."""
+        name = "orphan-plugin-mask-injector"
+        mcp_off_mechanism = _MCPOffMechanism.OVERLAY_MASKS
+        plugin_registry_config_masks = {"mcp_config.json": '{"mcpServers": {}}'}
+
+    class _MixedOrphanMaskInjector(_FakeInjector):
+        """A direct mask that WORKS, beside plugin masks applied nowhere. The direct mask
+        satisfies any aggregate "does this adapter have masks that apply" test while the
+        plugin channel — a server-discovery channel of its own — stays unmasked, so covering
+        a different channel just stops anyone noticing. This is antigravity's exact shape
+        with its registry root removed, which is why the check is per-channel."""
+        name = "mixed-orphan-mask-injector"
+        mcp_off_mechanism = _MCPOffMechanism.OVERLAY_MASKS
+        isolation_config_masks = {".x/mcp.json": '{"mcpServers": {}}'}
+        plugin_registry_config_masks = {"mcp_config.json": '{"mcpServers": {}}'}
+
+    class _CustomHomePluginMaskInjector(_FakeInjector):
+        """Correctly rooted plugin masks, PLUS a custom config home. The mirror built for
+        that home forwards only the rerooted direct masks, so the plugin channel is unmasked
+        in the very directory the child gets repointed at. Refused until the mirrors route
+        plugin masks too."""
+        name = "custom-home-plugin-mask-injector"
+        mcp_off_mechanism = _MCPOffMechanism.OVERLAY_MASKS
+        isolation_config_homes = [("ASE_SELFTEST_CFG_HOME", ".x", "skills")]
+        global_plugin_registry_subpaths = [".x/plugins"]
+        plugin_registry_config_masks = {"mcp_config.json": '{"mcpServers": {}}'}
+
+    class _MasklessMaskClaimInjector(_FakeInjector):
+        """Names the overlay as its mechanism and declares NO masks at all — a declaration
+        that contradicts itself. The overlay builds, the run goes green, and nothing was
+        ever masked, so this is refused with or without a HOME."""
+        name = "maskless-mask-claim-injector"
+        mcp_off_mechanism = _MCPOffMechanism.OVERLAY_MASKS
+
+    class _FlagInjector(_FakeInjector):
+        """Kill-switch at the CLI level, so it holds whatever HOME the child is handed and
+        must NOT be refused — otherwise the rule is about isolation rather than about where
+        the switch lives, and claude's hermetic non-isolated run goes with it."""
+        name = "flag-injector"
+        mcp_off_mechanism = _MCPOffMechanism.CLI
+
+    class _BeltAndBracesInjector(_FlagInjector):
+        """A complete CLI kill-switch AND a redundant mask. Hermetic without the overlay, so
+        allowed — the derived predicate refused it, because `bool(masks)` answers "HAS a
+        mask" rather than "DEPENDS on one" (found in review). copilot already carries masks
+        beside its argv disables, so this is not a hypothetical shape."""
+        name = "belt-and-braces-injector"
+        isolation_config_masks = {".x/mcp.json": '{"mcpServers": {}}'}
+
+    def _prog_run_adapter(adapter, servers, home=None):
+        d = _tempfile.mkdtemp(prefix="ase-mcpiso-")
+        try:
+            ex = exec_mod.execute(
+                adapter, "hi",
+                RunOptions(mcp_servers=servers, mcp_scratch_dir=d, home=home),
+                cwd=d, timeout=5)
+            return ex.result.error or ""
+        except Exception as exc:                # noqa: BLE001 — a raise is also a refusal
+            return f"RAISED {exc}"
+        finally:
+            _shutil.rmtree(d, ignore_errors=True)
+
+    # EVERY mechanism under BOTH HOME conditions. Testing only the bare case let a defect
+    # hide in the half nobody looked at: an UNCLASSIFIED adapter was cleared as soon as a run
+    # had any isolated HOME, because the guard asked "does this depend on isolation" and an
+    # overlay existed — while that overlay materializes no masks for an adapter that declares
+    # none, so it protected nothing (found in review). The `_iso` column is the finding.
+    _iso_home = _tempfile.mkdtemp(prefix="ase-mcpisohome-")
+    try:
+        def _both(adapter_cls):
+            return (_try(lambda: _prog_run_adapter(adapter_cls(), plain), ""),
+                    _try(lambda: _prog_run_adapter(adapter_cls(), plain,
+                                                   home=_iso_home), ""))
+        masked_bare, masked_iso = _both(_MaskOnlyInjector)
+        plugin_bare, plugin_iso = _both(_PluginMaskOnlyInjector)
+        flag_bare, flag_iso = _both(_FlagInjector)
+        belt_bare, belt_iso = _both(_BeltAndBracesInjector)
+        # Declares NOTHING: refused either way, because "nobody determined how this adapter
+        # keeps MCP off" is not a weaker form of "it uses masks" — an overlay cannot supply
+        # a guarantee that was never established.
+        silent_bare, silent_iso = _both(_FakeInjector)
+        # Names the overlay and declares no masks: a self-contradicting declaration, so the
+        # overlay it points at delivers nothing. Refused either way as well.
+        empty_bare, empty_iso = _both(_MasklessMaskClaimInjector)
+        # ...and the same emptiness reached by a subtler route: masks that exist but have
+        # nowhere to be applied, because no plugin-registry root is named.
+        orphan_bare, orphan_iso = _both(_OrphanPluginMaskInjector)
+        # The one an AGGREGATE sufficiency test clears: a working direct mask standing beside
+        # orphaned plugin masks. Per-channel, or a covered channel launders an uncovered one.
+        mixed_bare, mixed_iso = _both(_MixedOrphanMaskInjector)
+        # The mechanism's own builder agrees: with no registry root there is no overlay at
+        # all. Asserted against `build_mcp_masked_home` rather than only against the guard,
+        # so the two cannot drift into disagreeing about what a declared mask does.
+        from .isolation import build_mcp_masked_home as _masked_home
+        orphan_home = _masked_home(_OrphanPluginMaskInjector())[0]
+        valid_home = _masked_home(_PluginMaskOnlyInjector())[0]
+        for _h in (orphan_home, valid_home):
+            if _h:
+                _shutil.rmtree(_h, ignore_errors=True)
+        # Rooted plugin masks + a custom config home: refused, and the reason is READ OUT of
+        # the builder rather than asserted in prose. With the var set, the mirror the child is
+        # repointed at still resolves the plugin config to the real, unmasked file. If anyone
+        # teaches the mirrors to route plugin masks, `mirror_leak` goes False, this goes red,
+        # and the refusal above should be deleted in that same commit.
+        cfg_bare, cfg_iso = _both(_CustomHomePluginMaskInjector)
+        _cfg_home = _tempfile.mkdtemp(prefix="ase-cfghome-")
+        _plug = os.path.join(_cfg_home, "plugins", "p")
+        os.makedirs(_plug)
+        with open(os.path.join(_plug, "mcp_config.json"), "w") as _fh:
+            _fh.write('{"mcpServers": {"live": {"command": "true"}}}')
+        _saved_cfg = os.environ.get("ASE_SELFTEST_CFG_HOME")
+        os.environ["ASE_SELFTEST_CFG_HOME"] = _cfg_home
+        try:
+            _mh, _menv = _masked_home(_CustomHomePluginMaskInjector())
+            _mirror = _menv.get("ASE_SELFTEST_CFG_HOME")
+            _leaked = os.path.join(_mirror or "", "plugins", "p", "mcp_config.json")
+            mirror_leak = bool(_mirror) and os.path.exists(_leaked) and \
+                "live" in open(_leaked).read()
+            if _mh:
+                _shutil.rmtree(_mh, ignore_errors=True)
+        finally:
+            if _saved_cfg is None:
+                os.environ.pop("ASE_SELFTEST_CFG_HOME", None)
+            else:
+                os.environ["ASE_SELFTEST_CFG_HOME"] = _saved_cfg
+            _shutil.rmtree(_cfg_home, ignore_errors=True)
+    finally:
+        _shutil.rmtree(_iso_home, ignore_errors=True)
+    # Matched on the refusal's opening clause, which names the reason, rather than on the
+    # closing sentence: the first version of this predicate looked for a phrase that was one
+    # word off ("not the experiment" vs "would not be the experiment") and read every case
+    # as allowed — the arm went red rather than passing, but only because it also asserts
+    # the cases that must be REFUSED. A predicate that can only fail open is worth avoiding.
+    def refused(s):
+        return "declares this run's MCP surface" in s
+    depends = {a: get_adapter(a).mcp_off_depends_on_isolation
+               for a in ("claude", "codex", "copilot", "antigravity")}
+    mechs = {a: getattr(get_adapter(a).mcp_off_mechanism, "value", None)
+             for a in ("claude", "codex", "copilot", "antigravity")}
+    # The SHIPPED adapters must satisfy their own declarations: given an overlay, none may
+    # report a gap. Fakes alone would not have caught antigravity losing its registry root —
+    # its plugin masks would go orphaned while its direct `.gemini/config/mcp_config.json`
+    # mask kept any aggregate test happy, which is exactly the combination review found.
+    shipped_gaps = {a: get_adapter(a).mcp_off_gap("/tmp/ase-selftest-anywhere")
+                    for a in ("claude", "codex", "copilot", "antigravity")}
+
+    _check("mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask",
+           # overlay-masked: needs the overlay, allowed once it has one — both halves
+           refused(masked_bare) and "mask-only-injector" in masked_bare
+           and not refused(masked_iso)
+           and refused(plugin_bare) and not refused(plugin_iso)
+           # CLI-level: allowed either way, redundant mask or not
+           and not refused(flag_bare) and not refused(flag_iso)
+           and not refused(belt_bare) and not refused(belt_iso)
+           # unclassified, and a mask claim with no masks: refused either way
+           and refused(silent_bare) and refused(silent_iso)
+           and refused(empty_bare) and refused(empty_iso)
+           # masks that exist but have nowhere to be applied: refused either way, and the
+           # builder itself confirms there is no overlay to rely on
+           and refused(orphan_bare) and refused(orphan_iso)
+           and "names no global_plugin_registry_subpaths" in orphan_iso
+           and orphan_home is None and valid_home is not None
+           # ...and an orphaned plugin mask is not laundered by a direct mask that works
+           and refused(mixed_bare) and refused(mixed_iso)
+           and "masked nowhere" in mixed_iso
+           # ...nor carried into a custom config home the child is repointed at
+           and refused(cfg_bare) and refused(cfg_iso)
+           and "custom config home" in cfg_iso and mirror_leak is True
+           # every shipped adapter satisfies its own declaration
+           and all(g is None for g in shipped_gaps.values())
+           and "has not been determined" in silent_iso
+           and "declares no masks" in empty_iso
+           and depends == {"claude": False, "codex": False,
+                           "copilot": True, "antigravity": True}
+           and mechs == {"claude": "cli", "codex": "cli",
+                         "copilot": "overlay_masks", "antigravity": "overlay_masks"},
+           f"declaring `mcp_servers:` states what this run's tool surface IS, so anything "
+           f"the harness cannot keep out makes the declared set a SUBSET of what ran. THREE "
+           f"mechanisms, each checked with and without an overlay. Masks need one and are "
+           f"refused without it (bare={refused(masked_bare)} iso={refused(masked_iso)}), "
+           f"through the PLUGIN half alone as well (bare={refused(plugin_bare)} "
+           f"iso={refused(plugin_iso)}). A CLI-level switch holds whatever HOME the child "
+           f"gets and is left alone either way (bare={refused(flag_bare)} "
+           f"iso={refused(flag_iso)}) — including alongside a redundant mask, which a "
+           f"`bool(masks)` predicate refused for HAVING one rather than DEPENDING on one "
+           f"(iso={refused(belt_iso)}). And UNCLASSIFIED is refused with an overlay too "
+           f"(iso={refused(silent_iso)}): a boolean made that state share a value with "
+           f"'uses masks', so an overlay materializing nothing for it read as protection. "
+           f"An overlay claim with no masks is refused for the same reason "
+           f"(iso={refused(empty_iso)}), and so is one whose masks have nowhere to be "
+           f"applied — plugin masks with no registry root, where the builder returns no "
+           f"overlay at all (iso={refused(orphan_iso)}, build={orphan_home!r} vs a rooted "
+           f"one at {type(valid_home).__name__}) — and NOT laundered by a direct mask that "
+           f"does work beside it (iso={refused(mixed_iso)}), since plugins are a discovery "
+           f"channel of their own and an aggregate 'has masks' test lets a covered channel "
+           f"stand in for an uncovered one. Declaring a mask and the mask having somewhere "
+           f"to act are different claims — including acting in the directory the child is "
+           f"actually repointed at: a rooted plugin mask is not carried into a custom config "
+           f"home's mirror (iso={refused(cfg_iso)}), and the builder confirms it, the "
+           f"mirror still resolving the live server (leak={mirror_leak}). The shipped "
+           f"adapters satisfy their own declarations: {shipped_gaps}. {mechs}",
+           failures, verbose)
+
     # --- a warning nobody can read afterwards is not a warning -----------------
     # The server-health warning above went to the HARNESS process's stderr, which nothing
     # archives — `execute()` captures the CHILD's. So the message claiming that assertions

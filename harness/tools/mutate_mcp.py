@@ -51,6 +51,7 @@ MCP = "agentskill_evals/mcp.py"
 ISO = "agentskill_evals/isolation.py"
 CODEX = "agentskill_evals/adapters/codex.py"
 COPILOT = "agentskill_evals/adapters/copilot.py"
+AGY = "agentskill_evals/adapters/antigravity.py"
 SCHEMA = "agentskill_evals/schema.py"
 
 MUTATIONS = [
@@ -677,6 +678,91 @@ MUTATIONS = [
      "                               and len(health) == 1 and health_unknown == 0)",
      "\n        mcp_health_verified = (len(health) == 1 and health_unknown == 0)",
      "runner.mcp_health_is_only_compared_within_a_uniform_server_set"),
+    # `isolated: false` + `mcp_servers:` back to running: the declared servers load beside
+    # the user's real ones, so the set the scenario states is a SUBSET of what ran.
+    ("M102-declared-servers-run-without-the-overlay", "agentskill_evals/exec.py",
+     "\n            if gap:",
+     "\n            if False:",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # The guard stops being told what the run actually got, so every declared-server run is
+    # judged as if it had no overlay — over-refusal, which takes the working mask-dependent
+    # ISOLATED run with it. The verdict has to follow this run's HOME, not a constant.
+    ("M103-guard-ignores-the-runs-actual-home", "agentskill_evals/exec.py",
+     "\n            gap = adapter.mcp_off_gap(opts.home)",
+     "\n            gap = adapter.mcp_off_gap(None)",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # A CLI-level kill-switch made to require an overlay anyway — the over-refusal direction
+    # again, now expressed against the tri-state.
+    ("M104-cli-kill-switch-made-to-need-an-overlay", BASE,
+     "\n        if mech is MCPOffMechanism.CLI:\n            return None",
+     "\n        if mech is MCPOffMechanism.CLI and isolated_home is not None:\n"
+     "            return None",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # The unclassified default becomes a CLAIM. Every adapter anyone adds next declares
+    # nothing, so this is the difference between "new adapter fails closed" and "new adapter
+    # runs declared servers beside the user's own, isolated or not".
+    ("M105-unclassified-default-reads-as-a-cli-kill-switch", BASE,
+     '\n    mcp_off_mechanism: Optional["MCPOffMechanism"] = None',
+     '\n    mcp_off_mechanism: Optional["MCPOffMechanism"] = MCPOffMechanism.CLI',
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # The exact regression review found, reintroduced: UNCLASSIFIED folded into
+    # OVERLAY_MASKS, which is what a BOOLEAN made unavoidable by giving both states one
+    # value. An adapter nobody classified is then cleared by any isolated HOME — by an
+    # overlay that materializes nothing for it, since it declares no masks. Caught on the
+    # MESSAGE as well as the verdict: with no masks it still refuses, for the wrong reason.
+    ("M106-unclassified-folded-into-the-mask-dependent-state", BASE,
+     '\n    mcp_off_mechanism: Optional["MCPOffMechanism"] = None',
+     '\n    mcp_off_mechanism: Optional["MCPOffMechanism"] = MCPOffMechanism.OVERLAY_MASKS',
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # A self-contradicting declaration goes unchecked: an adapter naming the overlay as its
+    # mechanism while declaring no masks is cleared by any HOME, and the overlay it points
+    # at materializes nothing. The run goes green having masked nothing at all.
+    ("M107-mask-mechanism-not-checked-against-declared-masks", BASE,
+     "\n            if not (self.isolation_config_masks "
+     "or self.plugin_registry_config_masks):",
+     "\n            if False:",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # DECLARING a plugin mask taken as the mask having somewhere to act. With no
+    # `global_plugin_registry_subpaths` root there is no plugin to materialize it in, and
+    # `build_mcp_masked_home` returns (None, {}) — so the adapter is cleared by an overlay
+    # that was never built. The subtler half of the same self-contradiction.
+    ("M112-plugin-masks-counted-without-a-registry-to-apply-them-in", BASE,
+     "\n            if (self.plugin_registry_config_masks\n"
+     "                    and not self.global_plugin_registry_subpaths):",
+     "\n            if False:",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # The SHIPPED case, and the reason the check is per-channel rather than aggregate:
+    # antigravity declares both kinds of mask, so losing its registry root orphans the plugin
+    # masks while `.gemini/config/mcp_config.json` keeps any "does it have masks" test happy.
+    # Fakes alone would not have caught this; the arm asserts the shipped adapters satisfy
+    # their own declarations for exactly that reason.
+    # A rooted plugin mask taken as covering the CUSTOM config home too. Both mirror
+    # builders forward only rerooted DIRECT masks, so the mirror the child is repointed at
+    # leaves that channel unmasked — the fourth way "declared" and "in effect" come apart.
+    ("M114-plugin-masks-assumed-to-reach-a-custom-config-home", BASE,
+     "\n            if self.plugin_registry_config_masks and config_home_entries(self):",
+     "\n            if False:",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    ("M113-antigravity-loses-the-registry-its-plugin-masks-need", AGY,
+     '\n    global_plugin_registry_subpaths = [".gemini/config/plugins"]', "",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # The shipped mapping, pinned per adapter. Dropping a CLI declaration silently refuses a
+    # run that is hermetic without the overlay (over-refusal, which removes the only working
+    # non-isolated path rather than opening a hole, and so goes unnoticed until someone's
+    # scenario stops running); dropping a mask declaration drops that adapter to unclassified,
+    # which refuses it even WITH an overlay.
+    ("M108-claude-stops-declaring-its-cli-kill-switch", CLAUDE,
+     "\n    mcp_off_mechanism = MCPOffMechanism.CLI", "",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    ("M109-codex-stops-declaring-its-argv-kill-switch", CODEX,
+     "\n    mcp_off_mechanism = MCPOffMechanism.CLI", "",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    ("M110-copilot-stops-declaring-its-overlay-dependence", COPILOT,
+     "\n    mcp_off_mechanism = MCPOffMechanism.OVERLAY_MASKS", "",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    ("M111-antigravity-stops-declaring-its-overlay-dependence", AGY,
+     "\n    mcp_off_mechanism = MCPOffMechanism.OVERLAY_MASKS", "",
+     "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
 ]
 
 

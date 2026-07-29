@@ -267,10 +267,10 @@ and `contained_home_that_copies_auth_is_credential_bearing_before_the_copy` (mut
 Non-negotiable, in this order. `SELFTEST PASSED` alone is not evidence.
 
 ```sh
-harness/.venv/bin/python -m agentskill_evals.cli selftest          # 485 arms
+harness/.venv/bin/python -m agentskill_evals.cli selftest          # 486 arms
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 harness/.venv/bin/python -m pyflakes harness/agentskill_evals/*.py harness/agentskill_evals/adapters/*.py
-python3 harness/tools/mutate_mcp.py                               # 100/100 caught by the intended arm
+python3 harness/tools/mutate_mcp.py                               # 113/113 caught by the intended arm
 git diff --check
 ```
 
@@ -283,6 +283,19 @@ and was, for two PRs.)
 Pre-existing pyflakes noise, leave alone: unused `load_spec` in `cli.py:22`, unused `Optional`
 in `adapters/__init__.py:9`, unused `os` in `adapters/codex.py:23`, and many "f-string is
 missing placeholders" in `selftest.py`.
+
+**What `VersionProvenance` does and does not buy.** It is an **audit trail plus a drift
+warning**, not verification, and anything written as though it re-checks a claim per build is
+overstating it (caught in review of #93). A build outside `_VERIFIED_VERSIONS` *warns and still
+runs*. claude's own `witness_held` text says the runtime witness cannot distinguish "the flag
+worked" from "a newer build grew a server source outside the flag's reach". codex has less
+again: `_VERSION_UNREADABLE` records that it cannot identify the build it just executed at all,
+because `--ephemeral` suppresses the only file that carries the version — so its sole check is
+an out-of-band `codex --version`. Reviewed assertions that rest on a CLI mechanism
+(`mcp_off_mechanism = CLI`, the `--strict-mcp-config` argument, codex's argv disables) are
+exactly that: **reviewed**. Nothing here would catch a wrong one. What the machinery buys is
+that an unaudited build is *visible* and that re-establishing a claim has a documented
+procedure (`clear_hint`).
 
 **Every new arm must be mutation-tested.** Add the mutation to `harness/tools/mutate_mcp.py`
 in the same commit as the arm. An arm nothing can break is decorative, and this project has
@@ -391,8 +404,46 @@ Smaller, unblocked:
   *unknown*, while argv names servers it **disabled**, which never ran and so have no health
   to state. See `DESIGN_MCP_Support.md` §8 Phase 1.
 - Portable `used_mcp_tool` assertion (§7) once a second adapter lands.
-- Refuse `isolated: false` combined with `mcp_servers:`.
+- ~~Refuse `isolated: false` combined with `mcp_servers:`.~~ **Done (2026-07-28)**, narrowed
+  from the flat phrasing: the refusal is a property of where the adapter's **kill-switch
+  lives**, not of isolation. copilot and agy keep MCP off with masks in the overlay, so a
+  cell with no isolated HOME loads the user's real servers beside the declared ones and is
+  refused; claude (`--strict-mcp-config`) and codex (per-server disables) hold whatever HOME
+  the child is handed, and a blanket rule would have refused the one configuration that
+  works today for no safety gain. Classified by a declared **tri-state**
+  (`mcp_off_mechanism`: `CLI`, `OVERLAY_MASKS`, or `None` for not-determined). Deriving it
+  from mask presence answered "has a mask" rather than "depends on one"; a boolean then made
+  *unclassified* share a value with *uses masks*, so an adapter nobody had classified was
+  cleared by any isolated HOME — by an overlay materializing nothing for it (both found in
+  review). `None` fails closed in BOTH directions, the same not-mapped-is-not-a-claim rule
+  `contained_home_subpaths` uses. An `OVERLAY_MASKS` claim is checked against the masks it
+  names *and* against whether they have anywhere to act, **per channel**: plugin masks with
+  no `global_plugin_registry_subpaths` root are materialized nowhere. Aggregate sufficiency
+  is not enough — antigravity declares both kinds of mask, so losing its registry root left
+  its direct mask satisfying a "does it have masks" test while the plugin channel went
+  uncovered. The two `CLI` declarations are reviewed assertions, not
+  verified ones — see §4's note on what provenance does and does not buy.
+  **Latent until an adapter is both** — the mask-dependent adapters are exactly the ones
+  that cannot inject, so `validate_mcp_support` refuses them first. It arms itself the day
+  copilot or agy gains injection, which is why it went in before that rather than after.
+- **Route plugin-registry masks into custom config-home mirrors.** Both mirror builders —
+  `isolation.build_mcp_masked_home` and the runner's config-home mirror — forward only
+  `reroot_config_masks(...)`, never `plugin_registry_subpaths` / `plugin_config_masks`. An
+  adapter declaring both a plugin registry and a custom config home therefore gets a mirror
+  where the plugin MCP channel is unmasked, and the child is repointed at that mirror. Needs
+  a reroot for the registry subpaths (the `reroot_config_masks` prefix-strip, applied to
+  paths rather than mask keys) plus the two call sites. Unreachable today — agy declares the
+  plugin masks and no config home, the other three the reverse — and `Adapter.mcp_off_gap`
+  REFUSES the combination meanwhile, with an arm that reads the leak out of the builder.
+  Delete that refusal in the same commit that lands the routing; the arm will already be red.
 - Sweep for other default-held invariants (`judge`, `max_cells`, `provision`).
+- Report the `mcp_servers:` + no-overlay refusal in the **CLI pre-flight** as well, next to
+  `validate_mcp_support` in `cmd_run` — today it surfaces as a failed cell per cell, where
+  the sibling MCP refusals surface before anything runs ("they will always fail and waste
+  tokens"). Deliberately not done with the refusal itself: nothing in the selftest drives
+  `cmd_run` (only `validate_spec`), so the pre-flight copy would be a second wording of the
+  rule with no arm to keep it honest. The blocker is the missing `cmd_run` harness, not the
+  check — build that first, or this lands decorative.
 
 Still open in `DESIGN_MCP_Support.md` §9: claude's `mcpServers` http/sse JSON shape; copilot's
 MCP tool-name format and plugin-declared server reach; agy's transcript tool-name format and

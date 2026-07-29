@@ -224,8 +224,7 @@ class Runner:
                 "for a runner once its mutable config is materialized per cell — set "
                 "parallel_safe_config on the adapter then."
             )
-        if not self.isolated and (getattr(self.adapter, "isolation_config_masks", None)
-                                  or getattr(self.adapter, "plugin_registry_config_masks", None)):
+        if not self.isolated and self.adapter.mcp_off_depends_on_isolation:
             # This runner's MCP-off guarantee lives in the isolation overlay's config masks
             # (it has no complete CLI-level kill-switch) — surface the exposure once, up
             # front, instead of letting a non-isolated run silently load real MCP servers.

@@ -136,6 +136,35 @@ def execute(
             mcp_errors, _ = adapter.validate_mcp_support(opts.mcp_servers)
             if mcp_errors:
                 raise RuntimeError("; ".join(mcp_errors))
+            # A DECLARED server set is a statement about what this run's tool surface is.
+            # For a runner whose MCP-off guarantee lives in the isolation overlay, a cell
+            # with no isolated HOME loads the user's real MCP configuration too — so the
+            # declared set is a subset of what actually ran, and the scenario grades an
+            # experiment nobody described.
+            #
+            # The overlay-build failure path already fails closed here and names `isolated:
+            # false` as the documented opt-out. That is correct for a run that says nothing
+            # about MCP, and it is exactly the hole once one does: the escape hatch from the
+            # guard let a scenario opt out of the guarantee in the same breath as declaring
+            # the surface it was guaranteeing. Nothing re-checked the combination.
+            #
+            # Unreachable today — the mask-dependent adapters are also the ones that cannot
+            # inject, so `validate_mcp_support` above refuses them first. It arms itself the
+            # moment copilot or antigravity gains injection, which is the point of putting
+            # it in before that happens rather than after.
+            #
+            # The adapter decides, because all three inputs are its own; an earlier cut
+            # asked only `home is None and depends_on_isolation`, which cleared an
+            # UNCLASSIFIED adapter as soon as a run had any isolated HOME — an overlay that
+            # materializes no masks for it was read as protection because a mask-dependent
+            # adapter would have been protected by one (found in review).
+            gap = adapter.mcp_off_gap(opts.home)
+            if gap:
+                raise RuntimeError(
+                    f"`mcp_servers:` declares this run's MCP surface, but {gap}. The "
+                    f"declared set would then be a SUBSET of what actually ran, so the run "
+                    f"would not be the experiment the scenario describes. Drop "
+                    f"`isolated: false`, or drop `mcp_servers:`.")
         argv = adapter.build_argv(prompt, opts, cwd=cwd)
     except Exception as exc:
         rr.error = f"could not construct a hermetic invocation: {exc}"

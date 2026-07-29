@@ -19,11 +19,30 @@ import shutil
 import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Mapping, Optional
 
 from ..isolation import build_mcp_masked_home, config_home_entries
 from ..notices import warn
 from ..schema import NormalizedEvent
+
+
+class MCPOffMechanism(str, Enum):
+    """How an adapter keeps the user's OWN MCP servers out of a run (the Phase 0 default).
+
+    There is deliberately no member for "not determined" — that is ``None`` on
+    ``Adapter.mcp_off_mechanism``, so the unclassified state cannot be spelled as a value
+    and accidentally read as one, exactly as ``contained_home_subpaths=None`` is not ``[]``.
+    """
+
+    #: A CLI flag or generated argv — claude's ``--strict-mcp-config``, codex's per-server
+    #: disables enumerated from the child's own env. Holds whatever HOME the child is handed,
+    #: so it survives a run with no isolation overlay.
+    CLI = "cli"
+    #: Config files the isolation overlay materializes with neutral content
+    #: (``isolation_config_masks`` / ``plugin_registry_config_masks``) — copilot, antigravity.
+    #: There is no such guarantee on a run built without an overlay.
+    OVERLAY_MASKS = "overlay_masks"
 
 
 @dataclass
@@ -211,6 +230,113 @@ class Adapter(ABC):
     # only meaningful for runners with no CLI-level way to disable such servers (an
     # enumerating adapter like copilot handles seeded configs on argv instead).
     workspace_config_masks: dict[str, str] = {}
+
+    # HOW this adapter keeps the user's own MCP servers out of a run — see MCPOffMechanism.
+    #
+    # THREE states, not two, and `None` is the one that matters. A boolean spelled
+    # "survives without isolation" made `False` mean both "keeps MCP off with overlay masks"
+    # and "nobody has ever determined how this adapter keeps MCP off", so the guard below
+    # cleared an UNCLASSIFIED adapter the moment a run had any isolated HOME at all — an
+    # overlay that materializes nothing protecting MCP config was read as protection,
+    # because a mask-dependent adapter would have been protected by one (found in review).
+    #
+    # It is the same distinction `contained_home_subpaths` draws with None-vs-[]: not
+    # mapped is not the same claim as mapped-and-needs-nothing, and only one of them may
+    # clear a check. DECLARED rather than derived from mask presence, because
+    # `bool(masks)` answers "does this adapter HAVE a mask" rather than "does it DEPEND on
+    # one" and refused a complete CLI kill-switch backed by a redundant mask (also found in
+    # review); belt-and-braces is a shape this project already uses, copilot carrying masks
+    # beside its argv disables.
+    #
+    # `None` is the fail-closed default in BOTH directions — isolated or not — so an
+    # adapter nobody has classified refuses declared servers outright rather than being
+    # cleared by an overlay that does nothing for it.
+    mcp_off_mechanism: Optional["MCPOffMechanism"] = None
+
+    @property
+    def mcp_off_depends_on_isolation(self) -> bool:
+        """Whether a run without an isolation overlay loses this adapter's MCP-off
+        guarantee. True for UNCLASSIFIED as well as for OVERLAY_MASKS: an unclassified
+        adapter has no established guarantee to keep."""
+        return self.mcp_off_mechanism is not MCPOffMechanism.CLI
+
+    def mcp_off_gap(self, isolated_home: Optional[str]) -> Optional[str]:
+        """Why a DECLARED `mcp_servers:` set cannot be honoured on this run, or None if it
+        can. Declaring servers states what the run's tool surface IS, so anything the
+        harness cannot keep out makes the declared set a SUBSET of what actually ran.
+
+        Lives here rather than in exec.py because all three inputs are the adapter's own:
+        which mechanism it uses, whether that mechanism is consistent with what it declares,
+        and what the mechanism needs from the run.
+        """
+        mech = self.mcp_off_mechanism
+        if mech is MCPOffMechanism.CLI:
+            return None                      # holds whatever HOME the child is handed
+        if mech is MCPOffMechanism.OVERLAY_MASKS:
+            # A declaration that contradicts itself. The masks ARE the mechanism, so an
+            # adapter naming them and declaring none has no mechanism at all. Checked rather
+            # than assumed, because the failure is silent — the overlay builds, the run goes
+            # green, and nothing was ever masked.
+            #
+            # DECLARING a mask is not the same as the mask having somewhere to act, which is
+            # the subtler half. `plugin_registry_config_masks` are materialized inside each
+            # plugin of each `global_plugin_registry_subpaths` root; with no root there is no
+            # plugin to put them in, and `build_mcp_masked_home` derives its registry list
+            # from exactly that field.
+            #
+            # Checked ON ITS OWN, and BEFORE sufficiency. A first cut folded it into an
+            # aggregate — "are there masks that apply" — which a single working direct mask
+            # satisfies while the plugin masks beside it are applied nowhere (found in
+            # review). Plugins are a server-discovery channel of their OWN, so a direct mask
+            # covering a different channel is not a substitute; it just stops anyone noticing.
+            # antigravity declares both kinds, which makes this the live case rather than a
+            # hypothetical one: dropping its registry root would have been cleared by its
+            # `.gemini/config/mcp_config.json` mask.
+            if (self.plugin_registry_config_masks
+                    and not self.global_plugin_registry_subpaths):
+                return (f"{self.name} declares plugin-registry MCP config masks but names no "
+                        f"global_plugin_registry_subpaths for them to be applied in, so that "
+                        f"discovery channel is masked nowhere — whatever other masks it "
+                        f"declares for other channels")
+            # ...and a rooted plugin mask the overlay cannot carry into a CUSTOM config home.
+            # Both mirror builders forward only REROOTED DIRECT masks — `build_mcp_masked_home`
+            # and the runner's config-home mirror — and neither passes the registry roots or
+            # the plugin masks. So an adapter whose config-home var is set gets a mirror where
+            # that channel is unmasked, and the child is repointed at exactly that mirror
+            # (found in review, which read the live server back out of it).
+            #
+            # REFUSED rather than routed. Teaching the mirrors to carry plugin masks is
+            # isolation machinery on the path every isolated run takes, for a combination no
+            # shipped adapter has: antigravity declares the plugin masks and no config home,
+            # the other three the reverse. Recorded as a follow-up in TODO_Contained_HOME.md
+            # §6 — this refusal is what keeps it honest until then, and should be deleted in
+            # the same commit that routes them.
+            #
+            # Deliberately keyed on DECLARING a config home, not on the var being set right
+            # now: the child's environment is not an input here, and "unset at this moment"
+            # is not a property worth resting a guarantee on.
+            if self.plugin_registry_config_masks and config_home_entries(self):
+                return (f"{self.name} keeps its plugin-registry MCP channel masked through "
+                        f"the isolation overlay, but it also uses a custom config home, and "
+                        f"the mirror built for that home carries only the rerooted direct "
+                        f"masks — so with the config-home variable set the child is "
+                        f"repointed at a mirror where that channel is unmasked")
+            # Past that, plugin masks are known to be rooted, so mere presence is sufficiency.
+            if not (self.isolation_config_masks or self.plugin_registry_config_masks):
+                return (f"{self.name} declares its MCP-off guarantee lives in the isolation "
+                        f"overlay's config masks but declares no masks, so nothing keeps "
+                        f"the user's real MCP configuration out of this run")
+            if isolated_home is None:
+                return (f"{self.name} keeps MCP off through the isolation overlay's config "
+                        f"masks and this cell has no isolated HOME, so the declared servers "
+                        f"would load ALONGSIDE the user's real MCP configuration (user "
+                        f"config and plugin-declared servers)")
+            return None
+        return (f"how {self.name} keeps the user's own MCP servers out of a run has not "
+                f"been determined (Adapter.mcp_off_mechanism is unset), so the harness "
+                f"cannot state that the declared servers are the only ones that would "
+                f"load — an isolated HOME does not settle it, since this adapter declares "
+                f"no config masks for the overlay to materialize")
 
     supports_output_schema: bool = False
     # True if build_argv maps RunOptions.reasoning_effort onto a native flag/config of this

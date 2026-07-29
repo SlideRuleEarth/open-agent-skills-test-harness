@@ -27,8 +27,8 @@ import sys
 from typing import Any, Mapping, Optional
 
 from ..schema import EventKind, NormalizedEvent
-from .base import (Adapter, ParseOutput, ProbeResult, RunOptions, VersionProvenance,
-                   extract_command, extract_path, iter_jsonl, try_load_json,
+from .base import (Adapter, MCPOffMechanism, ParseOutput, ProbeResult, RunOptions,
+                   VersionProvenance, extract_command, extract_path, iter_jsonl, try_load_json,
                    warn_unknown_usage)
 
 
@@ -193,6 +193,18 @@ class CodexAdapter(Adapter):
     # CODEX_HOME overrides ~/.codex (skills under $CODEX_HOME/skills). Under isolation it's
     # mirrored + repointed (custom home kept, skills masked), else cleared to the isolated home.
     isolation_config_homes = [("CODEX_HOME", ".codex", "skills")]
+    # MCP stays off through argv, not through the overlay: `--disable plugins` plus a
+    # per-server disable for every server enumerated by `codex mcp list --json` run with the
+    # CHILD's exact cwd and env — so with no isolated HOME it enumerates the real config and
+    # disables exactly what that run would otherwise load. Enumeration failure fails closed
+    # and a post-verify re-runs codex's own view. No config masks are declared or needed, so
+    # the guarantee does not depend on isolation existing.
+    #
+    # A REVIEWED ASSERTION, established against 0.140.0 by hand. It gets less per-run
+    # backing than claude's, not more: `_VERSION_UNREADABLE` above records that this adapter
+    # cannot identify the build it just executed at all, so there is not even a drift
+    # warning tied to a run — only the out-of-band `codex --version` check in clear_hint.
+    mcp_off_mechanism = MCPOffMechanism.CLI
     # Just the auth file. Measured against 0.140.0 on macOS, 2026-07-27: a contained HOME
     # holding only `.codex/auth.json` authenticates and answers; an empty one gets
     # "401 Unauthorized: Missing bearer" from wss://api.openai.com/v1/responses.

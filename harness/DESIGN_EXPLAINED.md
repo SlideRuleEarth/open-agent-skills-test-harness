@@ -327,10 +327,11 @@ This is a nice bit of meta-engineering, and it's why the project trusts its own 
   never a silent skip.
 
 - **Mutation testing** ([`tools/mutate_mcp.py`](tools/mutate_mcp.py)). This tests the
-  *tests*. It deliberately breaks the production code in ~84 small ways ("what if this
-  security check were deleted?") and confirms that a specific self-test arm **catches**
-  each break. A test that nothing can break is decorative; mutation testing proves each
-  arm actually earns its keep.
+  *tests*. It deliberately breaks the production code in over a hundred small ways ("what
+  if this security check were deleted?") and confirms that a specific self-test arm
+  **catches** each break — the *named* one, not just "something went red". A test that
+  nothing can break is decorative; mutation testing proves each arm actually earns its
+  keep. Run it with `make mutation` (§11).
 
 - **A local pre-push git hook** (`.git/hooks/pre-push`). Since GitHub-hosted macOS
   runners aren't available for this org — and the self-test is verified on macOS, where
@@ -352,6 +353,10 @@ cd harness && make dev && . .venv/bin/activate
 
 # the self-test — no agent CLIs or API keys needed, runs in seconds
 python3 -m agentskill_evals selftest
+
+# mutation-test the self-test itself — SLOW (~11 min), needs `make dev` first.
+# Run it whenever you add or change an arm; it is not wired into the pre-push hook.
+make mutation
 
 # see what would run, and which skills the model would see — spends nothing
 agentskill-evals run --agent claude --skill sliderule-region-picker --dry-run
@@ -402,6 +407,7 @@ Grouped by the job each file does. Start with the **bold** ones.
 **Test the harness itself**
 - [`selftest.py`](agentskill_evals/selftest.py) — the self-test.
 - [`tools/mutate_mcp.py`](tools/mutate_mcp.py) — mutation testing.
+- [`tools/probe_contained_home.py`](tools/probe_contained_home.py) — measures what a CLI *actually* needs from your real home, by driving the harness's own launch path against a progressively emptier HOME. This is how each adapter's credential surface was determined; it answers questions no amount of reading the source can.
 
 ---
 
