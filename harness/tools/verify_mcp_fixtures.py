@@ -184,6 +184,13 @@ def modern(method, mid, **extra):
             "params": dict(MODERN_META, **extra)}
 
 
+def modern_noc(method, mid, **extra):
+    """Modern `_meta` with the version but NO clientCapabilities — the one direction the
+    echo fixture tolerates by design."""
+    return {"jsonrpc": "2.0", "id": mid, "method": method, "params": dict(
+        {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}, **extra)}
+
+
 def legacy_init(mid, version="2025-11-25"):
     """A COMPLETE legacy initialize. The legacy lifecycle requires protocolVersion,
     capabilities and clientInfo, and the shim now enforces that — so scenarios cannot get
@@ -655,7 +662,27 @@ r, n, recs, st = echo([{"jsonrpc": "2.0", "id": 1, "method": "initialize", "para
 check("null-version initialize is not a legacy handshake", r and "error" in r[0], r)
 check("... also -32602", r and r[0].get("error", {}).get("code") == -32602, r)
 
-print("E10. subscriptions/listen is declined, not faked")
+print("E10. capabilities without a version is a BROKEN modern request, not a legacy one")
+# Again exercised AFTER legacy initialization: before it, the request fails merely because
+# no era exists, which would pass against the bug rather than catching it.
+r, n, recs, st = echo([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": "2025-11-25"}},
+                       {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {
+                           "_meta": {"io.modelcontextprotocol/clientCapabilities": {}}}},
+                       {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}])
+by = {m["id"]: m for m in r}
+check("legacy initialization accepted", "result" in by.get(1, {}), by.get(1))
+check("capabilities-only request rejected", "error" in by.get(2, {}), by.get(2))
+check("... with -32602", by.get(2, {}).get("error", {}).get("code") == -32602, by.get(2))
+check("... and NOT served as a legacy tool list", "result" not in by.get(2, {}), by.get(2))
+check("a genuinely bare request is still legal", "result" in by.get(3, {}), by.get(3))
+# The tolerance runs one way only: version present, capabilities absent, still served.
+r, n, recs, st = echo([modern_noc("tools/list", 1)])
+check("version without capabilities is still tolerated", r and "result" in r[0], r)
+check("... and served in modern shape",
+      r and r[0]["result"].get("resultType") == "complete", r)
+
+print("E11. subscriptions/listen is declined, not faked")
 r, n, recs, st = echo([modern("subscriptions/listen", 1,
                               notifications={"toolsListChanged": True})])
 check("method not found", r and "error" in r[0], r)

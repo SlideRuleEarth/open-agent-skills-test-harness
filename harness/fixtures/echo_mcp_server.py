@@ -41,7 +41,10 @@ is a test double, not a measuring instrument. Where `probe_era_mcp_server.py` re
 client for any missing required `_meta` field because catching that is its entire job, this
 fixture tolerates a missing `clientCapabilities`: the version still identifies the era, so
 it can still answer conformantly, and a CLI quirk should not surface as a scenario failure
-attributed to the wrong thing. That leniency stops precisely at the protocol version.
+attributed to the wrong thing. The tolerance runs ONE WAY ONLY — version present and
+capabilities absent is served; capabilities present and version absent is a broken *modern*
+request and is refused, not quietly downgraded to legacy. That leniency stops precisely at
+the protocol version.
 Absent or malformed, there is no way to know which shape of reply would be correct, so
 guessing would produce exactly the malformed server this fixture must not be — C3-1
 established that cost the expensive way, when agy's measured shutdown path changed once the
@@ -75,6 +78,7 @@ LEGACY_VERSIONS = ("2025-11-25", "2025-06-18")
 # Phase 3 would look like a harness bug rather than a missing mode.
 MODERN_VERSION = "2026-07-28"
 VER_KEY = "io.modelcontextprotocol/protocolVersion"
+CAP_KEY = "io.modelcontextprotocol/clientCapabilities"
 # Methods that exist only in the modern revision, so a request for one carrying no modern
 # `_meta` is unknown rather than servable.
 MODERN_ONLY_METHODS = ("server/discover", "subscriptions/listen")
@@ -118,21 +122,37 @@ def _send(msg: dict) -> None:
 _ABSENT = object()
 
 
+def _meta_of(msg: dict) -> dict:
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return {}
+    meta = params.get("_meta")
+    return meta if isinstance(meta, dict) else {}
+
+
+def _modern_intent(msg: dict) -> bool:
+    """Whether this request is TRYING to be modern — the question that must be asked before
+    "is it well-formed", because otherwise a malformed modern request is indistinguishable
+    from a legacy one.
+
+    EITHER reserved key establishes the intent. The modern schema requires both, so a
+    request carrying `clientCapabilities` and no `protocolVersion` is a broken modern
+    request, not a legacy one; judging solely on the version key let exactly that shape be
+    served as legacy once an `initialize` had made the bare path legal.
+
+    Note `_meta` alone proves nothing: codex and copilot both send a legacy
+    `_meta.progressToken` (§9), which is why this tests the two reserved keys by name."""
+    meta = _meta_of(msg)
+    return VER_KEY in meta or CAP_KEY in meta
+
+
 def _claimed_version(msg: dict):
     """The protocol version this request declares, or `_ABSENT` if it declares none.
 
     A sentinel rather than `None`, because `None` is a value the client can actually send:
     `"protocolVersion": null` is a *present but malformed* field, and returning `None` for
-    it made it indistinguishable from an absent one. The absent path then read it as
-    legacy, so an explicit null was laundered into a successful legacy reply — including on
-    an `initialize` carrying modern `_meta`, which is not a legacy handshake at all."""
-    params = msg.get("params")
-    if not isinstance(params, dict):
-        return _ABSENT
-    meta = params.get("_meta")
-    if not isinstance(meta, dict):
-        return _ABSENT
-    return meta.get(VER_KEY, _ABSENT)
+    it made it indistinguishable from an absent one."""
+    return _meta_of(msg).get(VER_KEY, _ABSENT)
 
 
 def _reject(req_id, msg: dict, method) -> bool:
@@ -149,9 +169,13 @@ def _reject(req_id, msg: dict, method) -> bool:
     open a session, answered `server/discover` in a legacy shape that revision has no such
     result for, and served a modern-metadata `initialize` as a legacy handshake — the three
     era inversions §10.2 forbids, all from one missing distinction."""
-    claimed = _claimed_version(msg)
-
-    if claimed is not _ABSENT:
+    if _modern_intent(msg):
+        claimed = _claimed_version(msg)
+        if claimed is _ABSENT:
+            # Recognisably modern, and missing a field the schema requires. Serving it as
+            # legacy would answer a broken modern request in the wrong era's shape.
+            _error(req_id, -32602, f"missing required _meta: {VER_KEY}")
+            return True
         if not isinstance(claimed, str):
             _error(req_id, -32602, "malformed _meta: protocolVersion must be a string")
             return True
@@ -285,7 +309,9 @@ def main() -> int:
 
         if _reject(req_id, msg, method):
             continue
-        modern = _claimed_version(msg) == MODERN_VERSION
+        # `_reject` has already guaranteed that modern intent implies a supported
+        # version, so intent is the whole test by the time we get here.
+        modern = _modern_intent(msg)
 
         if method == "server/discover":
             _result(req_id, _discover(), modern=modern, cacheable=True)
