@@ -164,8 +164,8 @@ MUTATIONS = [
     # --- round 3: the four defects found reviewing cba3ab4 + de25c86 -----------------
     ("M26-scrub-writes-through-hardlinks", RUNNER,
      "    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or \".\", prefix=\".scrub-\")",
-     "    open(path, 'wb').write(scrubbed)\n    return\n"
-     "    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or \".\", prefix=\".scrub-\")",
+     ("    open(path, 'wb').write(scrubbed)\n    return\n"
+     "    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or \".\", prefix=\".scrub-\")"),
      "mcp.workspace_scrub_breaks_hardlinks_instead_of_writing_through_them"),
     ("M27-symlink-target-left-alone", RUNNER,
      "    clean = redact(target, secrets)",
@@ -180,10 +180,10 @@ MUTATIONS = [
      "    return False",
      "mcp.secret_spanning_path_components_is_scrubbed"),
     ("M30-uncertifiable-artifact-kept", RUNNER,
-     '        """Delete what could not be certified, and remember it for the caller."""\n'
-     "        lost.add(_rel(path))",
-     '        """Delete what could not be certified, and remember it for the caller."""\n'
-     "        return\n        lost.add(_rel(path))",
+     ('        """Delete what could not be certified, and remember it for the caller."""\n'
+     "        lost.add(_rel(path))"),
+     ('        """Delete what could not be certified, and remember it for the caller."""\n'
+     "        return\n        lost.add(_rel(path))"),
      "mcp.uncertifiable_artifact_is_removed_and_named"),
     ("M31-warnings-not-attached-to-the-result", "agentskill_evals/exec.py",
      "    rr.warnings.extend(warned)",
@@ -232,14 +232,14 @@ MUTATIONS = [
      "mcp.assembled_path_check_runs_to_a_fixed_point"),
     # --- round 5: the three defects found reviewing 930d5cd -------------------------
     ("M42-exec-dir-detached-only-when-isolated", RUNNER,
-     "        exec_root = tempfile.mkdtemp(prefix=\"ase-ws-\")\n"
+     ("        exec_root = tempfile.mkdtemp(prefix=\"ase-ws-\")\n"
      "        exec_ws = os.path.join(exec_root, \"workspace\")\n"
-     "        os.makedirs(exec_ws)",
-     "        exec_root = tempfile.mkdtemp(prefix=\"ase-ws-\")\n"
+     "        os.makedirs(exec_ws)"),
+     ("        exec_root = tempfile.mkdtemp(prefix=\"ase-ws-\")\n"
      "        exec_ws = os.path.join(exec_root, \"workspace\")\n"
      "        os.makedirs(exec_ws)\n"
      "        if not self.isolated:\n"
-     "            exec_ws = workspace",
+     "            exec_ws = workspace"),
      "relocate.exec_cwd_detached_even_when_not_isolated"),
     ("M43-exec-cwd-is-the-tempdir-root", RUNNER,
      "        exec_ws = os.path.join(exec_root, \"workspace\")\n        os.makedirs(exec_ws)",
@@ -250,14 +250,14 @@ MUTATIONS = [
      "    except OSError:\n        return []  # nothing was archived",
      "mcp.unreadable_root_is_repaired_or_reported_never_certified"),
     ("M45-symlink-xattrs-edited-in-place", RUNNER,
-     "        os.symlink(clean, tmp)\n"
+     ("        os.symlink(clean, tmp)\n"
      "        for name, value in clean_attrs:\n"
      "            xattrs.setxattr(tmp, name, value)\n"
-     "        os.replace(tmp, path)",
-     "        _scrub_xattrs(path, secrets)\n"
+     "        os.replace(tmp, path)"),
+     ("        _scrub_xattrs(path, secrets)\n"
      "        os.unlink(path)\n"
      "        os.symlink(clean, path)\n"
-     "        return",
+     "        return"),
      "mcp.multiply_linked_symlink_is_replaced_not_edited"),
     # --- round 6: the one defect found reviewing 1229b8e ----------------------------
     # The backstop in _run_cell's finally still removes the directory, so what this breaks is
@@ -271,11 +271,11 @@ MUTATIONS = [
      '    if shutil.rmtree(path, ignore_errors=True) is None:\n        return ""',
      "relocate.locked_exec_dir_is_actually_removed"),
     ("M47-undeletable-exec-dir-says-nothing", RUNNER,
-     '    if not path or not os.path.lexists(path):\n        return ""\n    if _remove(path):\n'
-     '        return ""',
-     '    if not path or not os.path.lexists(path):\n        return ""\n    if True:\n'
+     ('    if not path or not os.path.lexists(path):\n        return ""\n    if _remove(path):\n'
+     '        return ""'),
+     ('    if not path or not os.path.lexists(path):\n        return ""\n    if True:\n'
      "        shutil.rmtree(path, ignore_errors=True)\n"
-     '        return ""',
+     '        return ""'),
      "relocate.undeletable_exec_dir_is_durable_and_load_bearing"),
     ("M48-note-never-reaches-result-json", RUNNER,
      "        if rr.error != error_before or pending:",
@@ -283,17 +283,17 @@ MUTATIONS = [
      "relocate.undeletable_exec_dir_is_durable_and_load_bearing"),
     ("M49-scratch-dir-removed-best-effort", RUNNER,
      "            cleanup.purge(mcp_scratch)",
-     "            if mcp_scratch:\n"
-     "                shutil.rmtree(mcp_scratch, ignore_errors=True)",
+     ("            if mcp_scratch:\n"
+     "                shutil.rmtree(mcp_scratch, ignore_errors=True)"),
      "relocate.mcp_scratch_dir_removal_is_load_bearing"),
     # --- round 7: a note held in a frame the exception unwinds is a note nobody reads -----
     # The scratch failure is still RECORDED, and the success path still reports it; only the
     # crash path stops draining it. That is exactly the shape review found.
     ("M52-failed-cell-drops-the-cleanup-notes", RUNNER,
-     "        cleanup.note(_scrub_and_note(workspace, self._secrets))\n"
-     "        pending = cleanup.pending()\n        _record_notes(rr, pending)",
-     "        cleanup.note(_scrub_and_note(workspace, self._secrets))\n"
-     "        pending = []\n        _record_notes(rr, pending)",
+     ("        cleanup.note(_scrub_and_note(workspace, self._secrets))\n"
+     "        pending = cleanup.pending()\n        _record_notes(rr, pending)"),
+     ("        cleanup.note(_scrub_and_note(workspace, self._secrets))\n"
+     "        pending = []\n        _record_notes(rr, pending)"),
      "relocate.scratch_failure_survives_a_crashing_execute"),
     # A directory whose removal already escalated and failed stays registered: the outer
     # sweep retries what cannot work and reports the same sentence twice.
@@ -315,8 +315,8 @@ MUTATIONS = [
     # Registered only once the run is under way, so the window in which the directory exists
     # but nothing owns it reopens.
     ("M55-scratch-registered-too-late", RUNNER,
-     '                cleanup.own("the MCP scratch directory", mcp_scratch,\n'
-     "                            tail=_CREDENTIAL_TAIL if interpolated else _CONFIG_TAIL)",
+     ('                cleanup.own("the MCP scratch directory", mcp_scratch,\n'
+     "                            tail=_CREDENTIAL_TAIL if interpolated else _CONFIG_TAIL)"),
      "                pass",
      "relocate.scratch_dir_removed_even_if_the_run_never_starts"),
     # --- round 8: reading a note must not destroy it, and the HOME is a resource too ------
@@ -329,18 +329,18 @@ MUTATIONS = [
      "relocate.cleanup_note_is_acknowledged_only_once_it_is_on_disk"),
     # Acknowledged before the writes rather than after: same loss, one line earlier.
     ("M57-acknowledged-before-the-writes", RUNNER,
-     '            self._rwj(os.path.join(cell_dir, "result.json"), rr.to_dict())\n'
-     "\n        cell = CellResult(",
-     '            self._rwj(os.path.join(cell_dir, "result.json"), rr.to_dict())\n'
-     "        cleanup.acknowledge(pending)\n\n        cell = CellResult(",
+     ('            self._rwj(os.path.join(cell_dir, "result.json"), rr.to_dict())\n'
+     "\n        cell = CellResult("),
+     ('            self._rwj(os.path.join(cell_dir, "result.json"), rr.to_dict())\n'
+     "        cleanup.acknowledge(pending)\n\n        cell = CellResult("),
      "relocate.cleanup_note_survives_the_crash_rewriting_result_json"),
     # The isolated HOME goes back to being a bare local, owned by nothing until the guard.
     # Re-anchored after the P1b contained-HOME change split the creation registration across
     # two lines and made its severity conditional (`materializes_auth`). These arms exercise
     # the non-materialize path, where that condition is False and the behaviour is unchanged.
     ("M58-isolated-home-registered-late", RUNNER,
-     '            cleanup.own("the isolated HOME", iso_home, fatal=materializes_auth,\n'
-     "                        tail=_CONTAINED_TAIL if materializes_auth else None)",
+     ('            cleanup.own("the isolated HOME", iso_home, fatal=materializes_auth,\n'
+     "                        tail=_CONTAINED_TAIL if materializes_auth else None)"),
      "            pass",
      "relocate.isolated_home_is_owned_from_the_moment_it_exists"),
     # A leaked temp directory reported as a leaked credential: fails the cell and says the
@@ -353,8 +353,8 @@ MUTATIONS = [
     # The HOME keeps the severity the harness gave it when it built the masks, ignoring that
     # the child then had it as $HOME with write access.
     ("M60-writable-home-keeps-its-creation-severity", RUNNER,
-     '                cleanup.own("the isolated HOME", iso_home,\n'
-     "                            tail=_CONTAINED_TAIL if materializes_auth else _EXPOSED_TAIL)",
+     ('                cleanup.own("the isolated HOME", iso_home,\n'
+     "                            tail=_CONTAINED_TAIL if materializes_auth else _EXPOSED_TAIL)"),
      "                pass",
      "relocate.child_writable_home_is_credential_bearing_after_the_run"),
     # Escalated in severity but still claiming the directory holds nothing.
@@ -366,26 +366,26 @@ MUTATIONS = [
     # `progress.done` come after them, and a raise there rebuilds the result.
     ("M62-acknowledged-before-the-judge-and-progress", RUNNER,
      '\n        self._rw(os.path.join(cell_dir, "report.md"), render_report(cell))\n',
-     '\n        self._rw(os.path.join(cell_dir, "report.md"), render_report(cell))\n'
-     "        cleanup.acknowledge(pending)\n",
+     ('\n        self._rw(os.path.join(cell_dir, "report.md"), render_report(cell))\n'
+     "        cleanup.acknowledge(pending)\n"),
      "relocate.cleanup_note_survives_a_raise_after_the_artifacts"),
     # The scrub's verdict goes back to being a body local, so the rebuild rescans a tree the
     # scrub already cleaned and reports nothing about what it deleted.
     ("M63-scrub-verdict-outside-the-protocol", RUNNER,
-     "        cleanup.note(_scrub_and_note(workspace, self._secrets))\n"
+     ("        cleanup.note(_scrub_and_note(workspace, self._secrets))\n"
      "        pending = cleanup.pending()\n"
-     "        if _record_notes(rr, pending):",
-     "        scrub_note = _scrub_and_note(workspace, self._secrets)\n"
+     "        if _record_notes(rr, pending):"),
+     ("        scrub_note = _scrub_and_note(workspace, self._secrets)\n"
      "        pending = ([(True, scrub_note)] if scrub_note else []) + cleanup.pending()\n"
-     "        if _record_notes(rr, pending):",
+     "        if _record_notes(rr, pending):"),
      "relocate.scrub_verdict_survives_a_raise_that_rebuilds_the_result"),
     # --- round 10: the overlay bounds reads, not writes; declaring != interpolating ------
     # Re-anchored after P1 unified the credential sources: the refusal call moved out of the
     # `if interpolated:` block and now spans three lines. Same defect, same arm.
     ("M64-credential-run-not-refused", RUNNER,
-     "                _refuse_uncontained_home(iso_home, spec.name,\n"
+     ("                _refuse_uncontained_home(iso_home, spec.name,\n"
      "                                         list(interpolated) + list(cred_env_present),\n"
-     "                                         _cred_source(interpolated, cred_env_present))",
+     "                                         _cred_source(interpolated, cred_env_present))"),
      "                pass",
      "mcp.credential_run_is_refused_when_home_writes_escape_the_overlay"),
     # The detector follows the symlinks it is meant to report, so it descends into the real
@@ -399,15 +399,15 @@ MUTATIONS = [
     # file's contents with the token, which is the same leak by a different verb.
     ("M66-only-directory-symlinks-counted", ISO,
      "            if target != root_key and not target.startswith(inside):",
-     "            if (os.path.isdir(target) and target != root_key\n"
-     "                    and not target.startswith(inside)):",
+     ("            if (os.path.isdir(target) and target != root_key\n"
+     "                    and not target.startswith(inside)):"),
      "mcp_masked_home.write_escapes_are_any_symlink_out_of_the_overlay"),
     # Dangling links skipped: nothing to stat, so nothing to worry about — except that a
     # write through one creates the target it was missing, outside the overlay.
     ("M69-dangling-symlinks-skipped", ISO,
      "            if target != root_key and not target.startswith(inside):",
-     "            if (os.path.exists(target) and target != root_key\n"
-     "                    and not target.startswith(inside)):",
+     ("            if (os.path.exists(target) and target != root_key\n"
+     "                    and not target.startswith(inside)):"),
      "mcp_masked_home.write_escapes_are_any_symlink_out_of_the_overlay"),
     # Back to asking whether `mcp_servers` was declared rather than whether a ${VAR} was
     # interpolated, so a credential-free cell is failed for credentials it never had.
@@ -428,8 +428,8 @@ MUTATIONS = [
     # value too short to redact is treated as no credential at all.
     ("M68-exposure-gated-on-the-redaction-set", RUNNER,
      "\n        interpolated = interpolated_refs(spec.mcp_servers) if spec.mcp_servers else []",
-     "\n        interpolated = (sorted(spec.resolved_mcp_servers()[1])"
-     " if spec.mcp_servers else [])",
+     ("\n        interpolated = (sorted(spec.resolved_mcp_servers()[1])"
+     " if spec.mcp_servers else [])"),
      "mcp.short_credential_run_is_refused_like_any_other"),
     # Only the target canonicalized. On macOS `/var` is a symlink to `/private/var`, so a
     # link pointing inside its own overlay compares as outside — over-refusal, which is the
@@ -458,8 +458,8 @@ MUTATIONS = [
     # symlink pass and lands INSIDE the contained home, so every escape comes back one level
     # down while the home still looks materialized from the top.
     ("M74-custom-config-home-mirrored-into-a-contained-home", RUNNER,
-     "                for var, replaces, skills_sub in ([] if contain_home\n"
-     "                                                  else config_home_entries(adapter)):",
+     ("                for var, replaces, skills_sub in ([] if contain_home\n"
+     "                                                  else config_home_entries(adapter)):"),
      "                for var, replaces, skills_sub in config_home_entries(adapter):",
      "mcp.contained_home_does_not_mirror_a_custom_config_home"),
     # The wholesale symlink pass still runs under containment — the single line that makes
@@ -472,25 +472,25 @@ MUTATIONS = [
     # skip the wholesale pass": the skills dir is rebuilt entry by entry and mints one
     # outward symlink per vendor skill, all of them escapes.
     ("M76-vendor-skills-still-symlinked", ISO,
-     "            if contained:\n"
+     ("            if contained:\n"
      "                _materialize(src, dst)\n"
      "            else:\n"
      "                os.symlink(src, dst)\n"
-     "            placed.add(name)",
-     "            os.symlink(src, dst)\n"
-     "            placed.add(name)",
+     "            placed.add(name)"),
+     ("            os.symlink(src, dst)\n"
+     "            placed.add(name)"),
      "contained_home.vendor_skills_are_copied_not_symlinked"),
     # The same defect at the plugin registry, the second pass-through site — anchored on the
     # `src, dst =` line above it because the four lines that follow are byte-identical to
     # the skills-dir version at the same indentation (the substring-anchor trap).
     ("M77-plugin-contents-still-symlinked", ISO,
-     "            src, dst = os.path.join(real_plugin, name), os.path.join(dst_plugin, name)\n"
+     ("            src, dst = os.path.join(real_plugin, name), os.path.join(dst_plugin, name)\n"
      "            if contained:\n"
      "                _materialize(src, dst)\n"
      "            else:\n"
-     "                os.symlink(src, dst)",
-     "            src, dst = os.path.join(real_plugin, name), os.path.join(dst_plugin, name)\n"
-     "            os.symlink(src, dst)",
+     "                os.symlink(src, dst)"),
+     ("            src, dst = os.path.join(real_plugin, name), os.path.join(dst_plugin, name)\n"
+     "            os.symlink(src, dst)"),
      "contained_home.plugin_packages_are_copied_not_symlinked"),
     # (No M78: the `S_ISREG` guard in `_materialize` is intentionally NOT mutation-tested.
     #  `shutil.copyfile` raises SpecialFileError on a FIFO and a socket open fails ENXIO —
@@ -531,8 +531,8 @@ MUTATIONS = [
     # pre-fix behaviour), so a crash before the MCP-resolution upgrade leaves the copied auth
     # on disk under a warning claiming no credentials are present.
     ("M82-contained-home-with-copied-auth-registered-nonfatal", RUNNER,
-     '            cleanup.own("the isolated HOME", iso_home, fatal=materializes_auth,\n'
-     "                        tail=_CONTAINED_TAIL if materializes_auth else None)",
+     ('            cleanup.own("the isolated HOME", iso_home, fatal=materializes_auth,\n'
+     "                        tail=_CONTAINED_TAIL if materializes_auth else None)"),
      '            cleanup.own("the isolated HOME", iso_home, fatal=False)',
      "mcp.contained_home_that_copies_auth_is_credential_bearing_before_the_copy"),
     # An adapter credential env var no longer makes the cell credential-bearing, so an
@@ -598,16 +598,16 @@ MUTATIONS = [
     # mutating the helper reddens its own arm first, which is a catch by the wrong test and
     # leaves the matrix-scale property unproven.
     ("M91-consistency-drops-witnessed-status", RUNNER,
-     "\n                health_raw.append(None if any(st is None for _, st in pairs) "
-     "else pairs)",
+     ("\n                health_raw.append(None if any(st is None for _, st in pairs) "
+     "else pairs)"),
      "\n                health_raw.append(tuple((n, None) for n, _ in pairs))",
      "runner.mcp_axis_compares_server_health_not_just_names"),
     # An UNSTATED status counted as a known one: two cells naming `echo` with no health
     # given compare equal and the matrix reports verified, which is agreement invented out
     # of silence. This is the defect review found in the first cut of this axis.
     ("M94-unstated-health-counts-as-known", RUNNER,
-     "\n                health_raw.append(None if any(st is None for _, st in pairs) "
-     "else pairs)",
+     ("\n                health_raw.append(None if any(st is None for _, st in pairs) "
+     "else pairs)"),
      "\n                health_raw.append(pairs)",
      "runner.mcp_axis_treats_unstated_health_as_unknown"),
     # The other half of that finding: argv's disable set treated as health UNKNOWN rather
@@ -622,11 +622,11 @@ MUTATIONS = [
     # reaching it; either alone keeps a finished matrix reportable, which is the point, and
     # is also why neither shows up as a defect on its own.
     ("M96-unhashable-witness-entry-crashes-the-report", RUNNER,
-     ("\n            by_key: dict = {}\n            for v in values:\n"
+     (("\n            by_key: dict = {}\n            for v in values:\n"
       "                if v is not None:\n                    by_key.setdefault(repr(v), v)\n"
-      "            known = [by_key[k] for k in sorted(by_key)]",
-      "\n                pairs = tuple((str(n), None if st is None else str(st))\n"
-      "                              for n, st in (_server_pair(e) for e in witnessed))"),
+      "            known = [by_key[k] for k in sorted(by_key)]"),
+      ("\n                pairs = tuple((str(n), None if st is None else str(st))\n"
+      "                              for n, st in (_server_pair(e) for e in witnessed))")),
      ("\n            known = sorted({v for v in values if v is not None}, key=repr)",
       "\n                pairs = tuple(witnessed)"),
      "runner.consistency_reports_rather_than_raising_on_an_unmodelled_witness"),
@@ -675,8 +675,8 @@ MUTATIONS = [
     # disabled a different server both have nothing outstanding, so health compares equal and
     # reports verified — a green field on an axis whose two cells share no server at all.
     ("M101-health-verified-without-a-common-server-set", RUNNER,
-     "\n        mcp_health_verified = (mcp_set_verified\n"
-     "                               and len(health) == 1 and health_unknown == 0)",
+     ("\n        mcp_health_verified = (mcp_set_verified\n"
+     "                               and len(health) == 1 and health_unknown == 0)"),
      "\n        mcp_health_verified = (len(health) == 1 and health_unknown == 0)",
      "runner.mcp_health_is_only_compared_within_a_uniform_server_set"),
     # `isolated: false` + `mcp_servers:` back to running: the declared servers load beside
@@ -696,15 +696,15 @@ MUTATIONS = [
     # again, now expressed against the tri-state.
     ("M104-cli-kill-switch-made-to-need-an-overlay", BASE,
      "\n        if mech is MCPOffMechanism.CLI:\n            return None",
-     "\n        if mech is MCPOffMechanism.CLI and isolated_home is not None:\n"
-     "            return None",
+     ("\n        if mech is MCPOffMechanism.CLI and isolated_home is not None:\n"
+     "            return None"),
      "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
     # The unclassified default becomes a CLAIM. Every adapter anyone adds next declares
     # nothing, so this is the difference between "new adapter fails closed" and "new adapter
     # runs declared servers beside the user's own, isolated or not".
     ("M105-unclassified-default-reads-as-a-cli-kill-switch", BASE,
-     '\n    mcp_off_mechanism: Optional["MCPOffMechanism"] = None',
-     '\n    mcp_off_mechanism: Optional["MCPOffMechanism"] = MCPOffMechanism.CLI',
+     '\n    mcp_off_mechanism: MCPOffMechanism | None = None',
+     '\n    mcp_off_mechanism: MCPOffMechanism | None = MCPOffMechanism.CLI',
      "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
     # The exact regression review found, reintroduced: UNCLASSIFIED folded into
     # OVERLAY_MASKS, which is what a BOOLEAN made unavoidable by giving both states one
@@ -712,15 +712,15 @@ MUTATIONS = [
     # overlay that materializes nothing for it, since it declares no masks. Caught on the
     # MESSAGE as well as the verdict: with no masks it still refuses, for the wrong reason.
     ("M106-unclassified-folded-into-the-mask-dependent-state", BASE,
-     '\n    mcp_off_mechanism: Optional["MCPOffMechanism"] = None',
-     '\n    mcp_off_mechanism: Optional["MCPOffMechanism"] = MCPOffMechanism.OVERLAY_MASKS',
+     '\n    mcp_off_mechanism: MCPOffMechanism | None = None',
+     '\n    mcp_off_mechanism: MCPOffMechanism | None = MCPOffMechanism.OVERLAY_MASKS',
      "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
     # A self-contradicting declaration goes unchecked: an adapter naming the overlay as its
     # mechanism while declaring no masks is cleared by any HOME, and the overlay it points
     # at materializes nothing. The run goes green having masked nothing at all.
     ("M107-mask-mechanism-not-checked-against-declared-masks", BASE,
-     "\n            if not (self.isolation_config_masks "
-     "or self.plugin_registry_config_masks):",
+     ("\n            if not (self.isolation_config_masks "
+     "or self.plugin_registry_config_masks):"),
      "\n            if False:",
      "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
     # DECLARING a plugin mask taken as the mask having somewhere to act. With no
@@ -728,8 +728,8 @@ MUTATIONS = [
     # `build_mcp_masked_home` returns (None, {}) — so the adapter is cleared by an overlay
     # that was never built. The subtler half of the same self-contradiction.
     ("M112-plugin-masks-counted-without-a-registry-to-apply-them-in", BASE,
-     "\n            if (self.plugin_registry_config_masks\n"
-     "                    and not self.global_plugin_registry_subpaths):",
+     ("\n            if (self.plugin_registry_config_masks\n"
+     "                    and not self.global_plugin_registry_subpaths):"),
      "\n            if False:",
      "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
     # The SHIPPED case, and the reason the check is per-channel rather than aggregate:
@@ -768,8 +768,8 @@ MUTATIONS = [
     # call and comes back `exited with code 1`, with "Not logged in" buried in a truncated
     # JSON blob inside an assertion message.
     ("M115-contained-cell-with-no-credential-route-runs-anyway", RUNNER,
-     "\n                if (contain_home and required_cred\n"
-     "                        and not any(child_env.get(name) for name in required_cred)):",
+     ("\n                if (contain_home and required_cred\n"
+     "                        and not any(child_env.get(name) for name in required_cred)):"),
      "\n                if False:",
      "mcp.contained_home_without_its_credential_env_var_is_refused"),
     # Inverted: it fires when the credential IS present and stays silent when it is not —
@@ -785,18 +785,18 @@ MUTATIONS = [
     # adapter authenticating through a helper or socket that containment leaves intact gets
     # its working cell refused. Caught by the third arm case, which is that adapter.
     ("M117-requirement-inferred-from-the-forwarding-list", RUNNER,
-     '                required_cred = list(getattr(\n'
-     '                    adapter, "contained_home_required_credential_env_vars", None) or [])',
-     '                required_cred = list(getattr(\n'
-     '                    adapter, "credential_env_vars", None) or [])',
+     ('                required_cred = list(getattr(\n'
+     '                    adapter, "contained_home_required_credential_env_vars", None) or [])'),
+     ('                required_cred = list(getattr(\n'
+     '                    adapter, "credential_env_vars", None) or [])'),
      "mcp.contained_home_without_its_credential_env_var_is_refused"),
     # A required name that is not also a declared credential env var: the runner would refuse
     # a cell for the absence of a variable it never redacts and never contains on.
     ("M118-required-credential-outside-the-redacted-set", COPILOT,
-     '    contained_home_required_credential_env_vars = [\n'
-     '        "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]',
-     '    contained_home_required_credential_env_vars = [\n'
-     '        "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT"]',
+     ('    contained_home_required_credential_env_vars = [\n'
+     '        "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]'),
+     ('    contained_home_required_credential_env_vars = [\n'
+     '        "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT"]'),
      "contained.required_credential_env_vars_are_declared_and_answered"),
     # The unmapped default reinstated on an adapter that has an answer: an empty contained
     # surface severs every HOME-side route, so "nobody looked" is not a state it may be in.
@@ -818,32 +818,57 @@ MUTATIONS = [
     # Carried on the success path but not the crash path — the half where attribution matters
     # most, and the half a single-path test would never notice.
     ("M122-crashed-cell-loses-its-tags", RUNNER,
-     "                          scenario_path=getattr(spec, \"source_path\", None),\n"
-     "                          tags=list(spec.tags or []))",
+     ("                          scenario_path=getattr(spec, \"source_path\", None),\n"
+     "                          tags=list(spec.tags or []))"),
      "                          scenario_path=getattr(spec, \"source_path\", None))",
      "artifacts.spec_tags_are_recorded_per_cell"),
     # The rejection removed: `--config x --tag y` reads like a selection, silently runs the
     # scenario whatever its tags say, and bills a model call for it.
     ("M123-tag-with-config-is-silently-ignored-again", CLI,
-     "        if args.tag:\n"
-     "            # --tag filters DISCOVERED evals;",
-     "        if False:\n"
-     "            # --tag filters DISCOVERED evals;",
+     ("        if args.tag is not None:\n"
+      "            # --tag filters DISCOVERED evals;"),
+     ("        if False:\n"
+      "            # --tag filters DISCOVERED evals;"),
+     "cli.tag_with_config_is_refused_not_ignored"),
+    # The SUCCESS path's assignment, which M122's crash-path twin does not cover. Both cells
+    # shared an eval name and therefore an artifacts directory, so the crash cell overwrote
+    # the success cell's assertions.json before the arm read it and this mutation stayed
+    # green — the arm has three distinct names now, and this is what pins that (review,
+    # third round).
+    ("M125-successful-cell-loses-its-tags", RUNNER,
+     ("            seeded_paths=sorted(seeded_relpaths(spec)),\n"
+      "            tags=list(spec.tags or []),\n"),
+     "            seeded_paths=sorted(seeded_relpaths(spec)),\n",
+     "artifacts.spec_tags_are_recorded_per_cell"),
+    # The empty-form bypass — and it takes BOTH edits, which is the finding rather than an
+    # inconvenience. `nargs="*"` alone is harmless while the guard tests PRESENCE, and a
+    # truthiness guard alone is harmless while the parser cannot produce an empty list; each
+    # single-site version was written first and reported MISSED, correctly, because neither
+    # is a defect on its own. Restore both and a bare `--tag` is `[]` again — present but
+    # falsy — which walks past the refusal into a real scenario run (review, third round).
+    # Caught by the empty-form case in the arm, and by nothing else.
+    ("M126-bare-tag-is-present-but-falsy-again", CLI,
+     ('    sp.add_argument("--tag", nargs="+", help="only evals with one of these tags")',
+      ("        if args.tag is not None:\n"
+       "            # --tag filters DISCOVERED evals;")),
+     ('    sp.add_argument("--tag", nargs="*", help="only evals with one of these tags")',
+      ("        if args.tag:\n"
+       "            # --tag filters DISCOVERED evals;")),
      "cli.tag_with_config_is_refused_not_ignored"),
     # Still rejected, but only AFTER the scenario is read — so the flag no longer fails fast,
     # and a scenario that does not parse reports a file error for a run that was never going
     # to happen. Two edits, because reordering is a move: delete, then re-insert below the
     # load. The arm pins the order as well as the rejection, which is what catches this.
     ("M124-tag-rejection-happens-after-the-scenario-is-loaded", CLI,
-     ('        if args.tag:\n'
-      '            # --tag filters DISCOVERED evals; a scenario is selected by path and there is no\n',
+     (('        if args.tag is not None:\n'
+       '            # --tag filters DISCOVERED evals; a scenario is selected by path and there is no\n'),
       "        scenario = _load_scenario(args.config)\n"),
-     ('        if False:\n'
-      '            # --tag filters DISCOVERED evals; a scenario is selected by path and there is no\n',
-      "        scenario = _load_scenario(args.config)\n"
-      "        if args.tag:\n"
-      "            print('error: --tag does not select a scenario', file=sys.stderr)\n"
-      "            return 2\n"),
+     (('        if False:\n'
+       '            # --tag filters DISCOVERED evals; a scenario is selected by path and there is no\n'),
+      ("        scenario = _load_scenario(args.config)\n"
+       "        if args.tag is not None:\n"
+       "            print('error: --tag does not select a scenario', file=sys.stderr)\n"
+       "            return 2\n")),
      "cli.tag_with_config_is_refused_not_ignored"),
 ]
 

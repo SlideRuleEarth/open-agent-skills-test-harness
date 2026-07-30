@@ -2364,10 +2364,10 @@ def _check_mcp_hermetic_paths(failures, verbose):
                        and _try(lambda: open(os.path.join(fk, "state",
                                                           "keep.txt")).read(), "")
                        == "state content\n",
-                       f"a declared subpath naming a DIRECTORY is reproduced as a real "
-                       f"directory of real files, recursively — not linked, and not skipped "
-                       f"for being a directory rather than the auth file the field was "
-                       f"written for.", failures, verbose)
+                       "a declared subpath naming a DIRECTORY is reproduced as a real "
+                       "directory of real files, recursively — not linked, and not skipped "
+                       "for being a directory rather than the auth file the field was "
+                       "written for.", failures, verbose)
 
                 vendor = os.path.join(fk, "skills", "vendor-skill", "SKILL.md")
                 linked = os.path.join(fk, "skills", "linked-skill")
@@ -2392,10 +2392,10 @@ def _check_mcp_hermetic_paths(failures, verbose):
                        and not os.path.islink(os.path.join(p1, "plugin.json"))
                        and _try(lambda: open(os.path.join(p1, "mcp_config.json")).read(),
                                 "") == "{}",
-                       f"the plugin registry is the second site that mints its own outward "
-                       f"symlinks, two per package, and it is masked rather than skipped so "
-                       f"it is easy to assume it was already handled. Its pass-throughs copy "
-                       f"too, and its per-plugin MCP mask still lands.", failures, verbose)
+                       "the plugin registry is the second site that mints its own outward "
+                       "symlinks, two per package, and it is masked rather than skipped so "
+                       "it is easy to assume it was already handled. Its pass-throughs copy "
+                       "too, and its per-plugin MCP mask still lands.", failures, verbose)
 
                 # NB: there is deliberately no arm asserting the FIFO was skipped "without
                 # being opened". `_materialize` copies via `shutil.copyfile`, which raises
@@ -2486,10 +2486,10 @@ def _check_mcp_hermetic_paths(failures, verbose):
 
         def _probe_argv(self, model):
             return [sys.executable, "-c",
-                    "import os; home=os.environ.get('HOME',''); print('PROBEHOME='+home); "
+                    ("import os; home=os.environ.get('HOME',''); print('PROBEHOME='+home); "
                     "print('PROBECWD='+os.getcwd()); "
                     "print('PROBEMASK='+open(os.path.join(home,'.fakeprobe-mcp','mcp.json'))"
-                    ".read())"]
+                    ".read())")]
 
         def _parse_probe_cost(self, output):
             self.probe_output = output
@@ -3204,16 +3204,23 @@ def _check_spec_tags_reach_artifacts(failures, verbose):
         r._repo_skill_names, r.run_dir = set(), run_dir
         r._secrets = r._run_secrets = ()
 
-        tagged = EvalSpec(name="tagged", prompt="hi",
+        # DISTINCT names, because `cell_dir` is keyed on the eval name: reusing one for the
+        # success and crash runs pointed both at the same artifacts dir, so the crash
+        # overwrote the success cell's assertions.json before it was read and the arm went
+        # green with the success path's assignment deleted (review, third round).
+        tagged = EvalSpec(name="tagged-ok", prompt="hi",
                           source_path=os.path.join(repo_root, "regress_x.yaml"),
                           tags=["regression", "mcp"])
         untagged = EvalSpec(name="untagged", prompt="hi",
                             source_path=os.path.join(repo_root, "plain.yaml"))
+        tagged_crash = EvalSpec(name="tagged-crash", prompt="hi",
+                                source_path=os.path.join(repo_root, "regress_y.yaml"),
+                                tags=["regression", "mcp"])
 
         cell_ok = r._run_cell(ModelTarget(), tagged)
         cell_plain = r._run_cell(ModelTarget(), untagged)
         crashing[0] = True
-        cell_crash = r._run_cell(ModelTarget(), tagged)
+        cell_crash = r._run_cell(ModelTarget(), tagged_crash)
         crashing[0] = False
 
         def _aj(cell):
@@ -3221,28 +3228,39 @@ def _check_spec_tags_reach_artifacts(failures, verbose):
             return json.loads(open(path).read()) if os.path.isfile(path) else {}
 
         aj_ok, aj_plain, aj_crash = _aj(cell_ok), _aj(cell_plain), _aj(cell_crash)
-        r._write_summary([cell_ok, cell_plain, cell_crash], [tagged, untagged])
+        dirs = [cell_ok.artifacts_dir, cell_plain.artifacts_dir, cell_crash.artifacts_dir]
+        r._write_summary([cell_ok, cell_plain, cell_crash],
+                         [tagged, untagged, tagged_crash])
         summary = json.loads(open(os.path.join(run_dir, "summary.json")).read())
-        sum_tags = {c["eval"]: c.get("tags", "<MISSING>") for c in summary["cells"]}
+        # A LIST in the order the cells were passed, not a dict keyed by eval name: keying
+        # collapsed two cells into one entry, so the last one written decided the answer for
+        # both and half the assertion was unreachable — the same defect as the shared
+        # directory, one layer up.
+        sum_pairs = [(c["eval"], c.get("tags", "<MISSING>")) for c in summary["cells"]]
     finally:
         runner_mod.execute = orig_execute
         shutil.rmtree(repo_root, ignore_errors=True)
 
     _check("artifacts.spec_tags_are_recorded_per_cell",
-           aj_ok.get("tags") == ["regression", "mcp"]
+           len(set(dirs)) == 3
+           and aj_ok.get("tags") == ["regression", "mcp"]
            and aj_crash.get("tags") == ["regression", "mcp"]
            and aj_plain.get("tags") == []
-           and sum_tags.get("tagged") == ["regression", "mcp"]
-           and sum_tags.get("untagged") == [],
+           and sum_pairs == [("tagged-ok", ["regression", "mcp"]),
+                             ("untagged", []),
+                             ("tagged-crash", ["regression", "mcp"])],
            f"a scenario is selected by path and never discovered, so `tags:` has no other "
            f"consumer: unless they reach the artifacts, `tags: [regression]` is a mark "
            f"nothing can read and the documented two-mark convention rests on nothing. "
            f"Recorded in assertions.json and summary.json, on the crash path too — a cell "
            f"that died is exactly when it matters whether a regression broke or an "
            f"experiment failed — and `[]` for an untagged eval, which is a different claim "
-           f"from an artifact that could not say. run={aj_ok.get('tags')!r} "
+           f"from an artifact that could not say. The three cells must occupy three "
+           f"DIRECTORIES and three summary entries: sharing either lets one cell answer for "
+           f"another, and the half of this assertion aimed at the overwritten one can then "
+           f"never fail. dirs={len(set(dirs))} run={aj_ok.get('tags')!r} "
            f"crash={aj_crash.get('tags')!r} untagged={aj_plain.get('tags')!r} "
-           f"summary={sum_tags!r}", failures, verbose)
+           f"summary={sum_pairs!r}", failures, verbose)
 
 
 def _check_progress_thread_safety(failures, verbose):
@@ -3362,6 +3380,14 @@ def _check_cli_helpers(failures, verbose):
 
     rc_tag, err_tag = _cli(["run", "--config", "/nonexistent/scen.yaml",
                             "--tag", "regression"])
+    # The EMPTY form, which is where this first leaked. `nargs="*"` turned a bare `--tag`
+    # into `[]` — present but falsy — so the truthiness guard passed it through and the
+    # scenario ran (review, third round). Rejected at the parser now, so the message is
+    # argparse's rather than ours; what matters is that it names --tag and never reaches the
+    # scenario. `--config` last, so a parser that accepted the empty list would go on to
+    # load the (nonexistent) path and report a FILE error — making the two outcomes tell
+    # themselves apart.
+    rc_bare, err_bare = _cli(["run", "--tag", "--config", "/nonexistent/scen.yaml"])
     # ...and the same flag on the discovery path is untouched: it must still parse and reach
     # the filter. A blanket rejection of --tag would be an easy way to "fix" the above.
     rc_ok, err_ok = _cli(["run", "--agent", "claude", "--skill", "no-such-skill-xyz",
@@ -3369,12 +3395,16 @@ def _check_cli_helpers(failures, verbose):
     _check("cli.tag_with_config_is_refused_not_ignored",
            rc_tag == 2 and "--tag" in err_tag and "scenario" in err_tag
            and "no such file" not in err_tag.lower()
+           and rc_bare == 2 and "--tag" in err_bare
+           and "no such file" not in err_bare.lower()
            and rc_ok == 2 and "no evals found" in err_ok,
            f"a scenario is chosen by path and never discovered, so --tag has no candidate "
            f"set to narrow — passing it with --config must fail fast rather than run the "
            f"scenario and bill a model call for a selection that never happened. Refused "
-           f"BEFORE the scenario is read (a file error here would mean the check moved), and "
-           f"--tag on the discovery path still works. rc={rc_tag} err={err_tag[:150]!r} "
+           f"BEFORE the scenario is read (a file error here would mean the check moved), in "
+           f"the EMPTY form too — a bare `--tag` is present-but-falsy and slipped past a "
+           f"truthiness guard — and --tag on the discovery path still works. "
+           f"rc={rc_tag} err={err_tag[:150]!r} bare_rc={rc_bare} bare_err={err_bare[:90]!r} "
            f"discovery_rc={rc_ok} discovery_err={err_ok[:80]!r}", failures, verbose)
 
     # --model + --all-models: --model wins, and a warning is printed (not silently dropped)
@@ -4035,11 +4065,11 @@ def _check_version_provenance_shared(failures, verbose):
            and "the stream states no version" in unreadable_msg
            and "1.0.0" in unreadable_msg
            and "witness held" not in unreadable_msg,
-           f"an adapter with no version source warns once per process, names the REASON "
-           f"there is nothing to read (so the reader does not go hunting for a version "
-           f"that does not exist), cites the verified baseline, and — even when called "
-           f"with witnessed=True — claims no runtime evidence, because the notice is "
-           f"about an unknown build rather than about this run's hermeticity",
+           "an adapter with no version source warns once per process, names the REASON "
+           "there is nothing to read (so the reader does not go hunting for a version "
+           "that does not exist), cites the verified baseline, and — even when called "
+           "with witnessed=True — claims no runtime evidence, because the notice is "
+           "about an unknown build rather than about this run's hermeticity",
            failures, verbose)
 
 
@@ -4301,14 +4331,14 @@ def _check_claude_version_provenance(failures, verbose):
            and crashed_run_raised == ""
            and "witness held" not in unwitnessed
            and "no MCP server list at all" in unwitnessed,
-           f"a denylisted build fails the run by name and says plainly that this is "
-           f"detection after the CLI already ran; a verified build that witnessed clean "
-           f"is silent; an unverified one warns ONCE per process and names the flag the "
-           f"whole argument rests on; a run that actually loaded a server fails outright; "
-           f"a COMPLETED run that states no version fails closed through verify_post_run "
-           f"while a crashed one does not; and a run that never produced a witness says so "
-           f"rather than claiming one held — a security notice that overstates its own "
-           f"evidence is worse than none",
+           "a denylisted build fails the run by name and says plainly that this is "
+           "detection after the CLI already ran; a verified build that witnessed clean "
+           "is silent; an unverified one warns ONCE per process and names the flag the "
+           "whole argument rests on; a run that actually loaded a server fails outright; "
+           "a COMPLETED run that states no version fails closed through verify_post_run "
+           "while a crashed one does not; and a run that never produced a witness says so "
+           "rather than claiming one held — a security notice that overstates its own "
+           "evidence is worse than none",
            failures, verbose)
 
 
@@ -4842,9 +4872,9 @@ def _check_parallel_requires_isolation(failures, verbose):
            and "parallel_safe_config" in refused_isolated
            and refused_unisolated != ""
            and serial_isolated == "" and serial_unisolated == "",
-           f"--jobs>1 is refused for a runner whose config is not materialized per cell — "
-           f"ISOLATED included, since isolation does not stop the sharing — and the message "
-           f"names what would lift it. Both serial modes still run",
+           "--jobs>1 is refused for a runner whose config is not materialized per cell — "
+           "ISOLATED included, since isolation does not stop the sharing — and the message "
+           "names what would lift it. Both serial modes still run",
            failures, verbose)
 
 
@@ -4899,10 +4929,10 @@ def _check_codex_post_run_mcp_recheck(failures, verbose):
     _check("codex.post_run_reenumeration_narrows_the_launch_window",
            clean == "" and "sneaky" in appeared and "not provably MCP-hermetic" in appeared
            and "no longer is" in unenumerable,
-           f"a run whose configured server set is unchanged passes; one where a server "
-           f"appeared after argv was built fails, naming it; and an enumeration that stops "
-           f"working post-run fails closed rather than assuming the pre-launch check still "
-           f"holds", failures, verbose)
+           "a run whose configured server set is unchanged passes; one where a server "
+           "appeared after argv was built fails, naming it; and an enumeration that stops "
+           "working post-run fails closed rather than assuming the pre-launch check still "
+           "holds", failures, verbose)
 
     # --- the residual gap, asserted as a KNOWN HOLE rather than as correct behaviour ---
     # A server added after argv was built, started by codex, then removed again before this
@@ -4922,13 +4952,13 @@ def _check_codex_post_run_mcp_recheck(failures, verbose):
     idle_server_reverted = _run(_adapter([]), launched, stdout="")
     _check("codex.KNOWN_GAP_idle_server_reverted_before_recheck_is_undetectable",
            idle_server_reverted == "",
-           f"DOCUMENTED HOLE, not a passing property: a server that started during the run "
-           f"and was removed before the post-run enumeration goes unreported when the model "
-           f"never called it. Both halves are blind — no tool call means no stream evidence, "
-           f"and codex emits nothing when a server starts, so absence of evidence is not "
-           f"evidence of absence here. Closing it needs a materialized private config for "
-           f"the child (see verify_post_run, DESIGN_MCP_Support.md §1); until then a green "
-           f"codex run means 'no leak was detected', NOT 'no server ran'", failures, verbose)
+           "DOCUMENTED HOLE, not a passing property: a server that started during the run "
+           "and was removed before the post-run enumeration goes unreported when the model "
+           "never called it. Both halves are blind — no tool call means no stream evidence, "
+           "and codex emits nothing when a server starts, so absence of evidence is not "
+           "evidence of absence here. Closing it needs a materialized private config for "
+           "the child (see verify_post_run, DESIGN_MCP_Support.md §1); until then a green "
+           "codex run means 'no leak was detected', NOT 'no server ran'", failures, verbose)
 
     # --- the stream half: presence proves a leak, absence proves nothing --------------
     # Shapes taken verbatim from a live codex 0.140.0 run against a sentinel stdio server.
