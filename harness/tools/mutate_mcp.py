@@ -27,6 +27,20 @@ Adding a mutation: keep it to the smallest edit that reintroduces the real defec
 it at the one arm that should notice. If you cannot name that arm, the arm does not exist yet
 and writing it is the actual work.
 
+TWO ID PREFIXES, and they are counted and reported separately.
+
+  M<n>   a PRODUCTION mutation — the normal case, and what "N/N caught" is a claim about.
+         It perturbs the code under test and asks whether the instrument notices.
+  I<n>   an INSTRUMENT mutation — it perturbs `selftest.py` itself. Almost always the wrong
+         thing to write, because mutating the test to prove the test fails is circular and
+         establishes nothing about the code. It is legitimate only where the selftest has a
+         FEATURE of its own whose failure mode no production edit can reach: I1 is the arm
+         counter, which reports how many arms ran, and whose failure (it stops counting; the
+         banner still says PASSED; every arm still passes) is invisible from anywhere else.
+         If a new `I*` seems necessary, that is the moment to check you are not just testing
+         the test — the separate heading in the summary exists so this decision is made in
+         the open rather than by quietly appending to the list.
+
 Every result line carries the wall time of the selftest run that produced it, and the summary
 names the slowest. Read those against the `baseline:` line: a mutation taking several times
 the baseline is a defect that costs runtime rather than one that reddens an arm, and it is
@@ -54,6 +68,12 @@ COPILOT = "agentskill_evals/adapters/copilot.py"
 AGY = "agentskill_evals/adapters/antigravity.py"
 SCHEMA = "agentskill_evals/schema.py"
 CLI = "agentskill_evals/cli.py"
+# The suite mutates PRODUCTION code and asks whether the selftest notices. This one target
+# is the exception, and only for the arm counter: that counter is a feature of the selftest
+# whose failure mode (it stops counting, every arm still passes, the banner still says
+# PASSED) cannot be reached from anywhere else. Adding other mutations here would be testing
+# the test rather than the code, which is not what this tool is for.
+SELFTEST = "agentskill_evals/selftest.py"
 
 MUTATIONS = [
     ("M1-witness-fails-any-server", CLAUDE,
@@ -855,6 +875,13 @@ MUTATIONS = [
       ("        if args.tag:\n"
        "            # --tag filters DISCOVERED evals;")),
      "cli.tag_with_config_is_refused_not_ignored"),
+    # The arm counter stops counting. Every arm still passes and the banner still says
+    # PASSED, so without its own arm this is invisible — which is precisely the failure the
+    # counter was added to make visible (a section that silently stops running).
+    ("I1-arm-counter-stops-counting", SELFTEST,
+     "    global _ARMS_RUN\n    _ARMS_RUN += 1\n",
+     "    global _ARMS_RUN\n",
+     "selftest.arm_count_is_live"),
     # Still rejected, but only AFTER the scenario is read — so the flag no longer fails fast,
     # and a scenario that does not parse reports a file error for a run that was never going
     # to happen. Two edits, because reordering is a move: delete, then re-insert below the
@@ -917,9 +944,18 @@ def main():
     # describe the machine, not the mutation.
     print(f"baseline: SELFTEST PASSED in {baseline_s:.1f}s\n")
 
-    caught = 0
+    # Counted apart, and reported apart. An `I*` mutation perturbs the INSTRUMENT (the
+    # selftest itself) rather than the code under test, so folding it into one total would
+    # make "N/N caught" claim more production coverage than exists. Splitting it here is what
+    # keeps the exception visible at the point anyone reads the result, instead of only to
+    # someone who opens this file — and makes adding a second one a deliberate act that shows
+    # up in the output rather than a quiet edit to the list.
+    caught = {"M": 0, "I": 0}
+    totals = {"M": 0, "I": 0}
     slowest = (0.0, None)
     for mid, rel, find, repl, arm in MUTATIONS:
+        kind = "I" if mid.startswith("I") else "M"
+        totals[kind] += 1
         path = work / rel
         original = path.read_text()
         # `find`/`repl` may be tuples: some properties are now defended in two places, and
@@ -950,17 +986,23 @@ def main():
                   f"defect hangs rather than reddening {arm} {took}")
         elif rc != 0 and arm in failed:
             print(f"{mid}: CAUGHT by {arm} {took}")
-            caught += 1
+            caught[kind] += 1
         elif rc != 0:
             print(f"{mid}: failed, but NOT via {arm} -> {failed} {took}")
         else:
             print(f"{mid}: *** MISSED *** selftest still passes with the defect present {took}")
-    print(f"\n{caught}/{len(MUTATIONS)} caught by the intended arm")
+    print(f"\n{caught['M']}/{totals['M']} production mutations caught by the intended arm")
+    if totals["I"]:
+        print(f"{caught['I']}/{totals['I']} instrument mutation(s) caught — these perturb "
+              f"the selftest itself (see SELFTEST in the target list), and are NOT evidence "
+              f"of production coverage")
     total = time.monotonic() - started
     slow = f"slowest {slowest[1]} at {slowest[0]:.1f}s" if slowest[1] else "no mutation ran"
     print(f"elapsed: {total / 60:.1f} min total, baseline {baseline_s:.1f}s, {slow}")
     shutil.rmtree(tmp, ignore_errors=True)
-    return 0 if caught == len(MUTATIONS) else 1
+    # Both must be clean: an instrument mutation surviving means the arm guarding the
+    # selftest's own reporting is decorative, which is the same failure as any other MISSED.
+    return 0 if caught == totals else 1
 
 
 if __name__ == "__main__":

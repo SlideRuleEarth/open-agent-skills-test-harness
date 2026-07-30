@@ -15,6 +15,12 @@ dependencies = [
 
 [project.optional-dependencies]
 schema = ["jsonschema>=4.0"]  # stricter output_schema validation (a built-in fallback exists)
+# Contributor tooling. Ruff is pinned EXACTLY, and matches `required-version` below: a
+# family selector like "UP" gains rules between releases, so an unpinned Ruff turns a tool
+# upgrade into what looks like a code regression — and the lint contract here is "zero
+# findings means this change introduced none", which only holds if everyone runs the same
+# checker. `make dev` installs this; `make lint` runs it.
+dev = ["ruff==0.16.0"]
 
 [project.scripts]
 agentskill-evals = "agentskill_evals.cli:main"
@@ -33,6 +39,10 @@ packages = ["agentskill_evals", "agentskill_evals.adapters"]
 # regression rather than a pre-existing debt to scroll past. `ignore` is not a backlog:
 # each entry is a decision, and the reason is what stops it being re-litigated per machine.
 [tool.ruff]
+# Refuse to run under any other build, rather than silently producing a different answer.
+# Must stay in lockstep with the `dev` extra above — `make dev` installs exactly this, and
+# a mismatch errors out naming both versions instead of reporting findings nobody else sees.
+required-version = "==0.16.0"
 target-version = "py310"
 line-length = 100
 

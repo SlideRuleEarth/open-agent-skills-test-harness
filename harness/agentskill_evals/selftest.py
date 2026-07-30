@@ -102,7 +102,20 @@ COPILOT = """\
 """
 
 
+# Arms actually EXECUTED by this process, reported in the final line. The count is a floor
+# that only ever goes up, and it lived in TODO_Contained_HOME.md §4 as a hand-maintained
+# number — which was stale for two PRs running, because nothing makes forgetting it fail.
+# Counted here instead: the protocol can then say "compare against the last run" rather than
+# carry a literal, and a section that silently stopped running shows up as a DROP even
+# though every remaining arm passes. Not a constant, deliberately — a few arms are
+# conditional (PyYAML, platform), so two environments legitimately differ and only the
+# trend within one is evidence.
+_ARMS_RUN = 0
+
+
 def _check(name, cond, msg, failures, verbose):
+    global _ARMS_RUN
+    _ARMS_RUN += 1
     status = "ok" if cond else "FAIL"
     if verbose or not cond:
         print(f"  [{status}] {name}: {msg}")
@@ -8860,12 +8873,37 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     # deprecated pre-#67 module API (models= / .models / plain-id render columns)
     _section(_check_api_compat, failures, verbose)
 
+    # LAST, because it is about everything above it: the arm count reported in the banner is
+    # the only signal that a whole section stopped running, and a counter that silently
+    # stopped counting would report zero while every arm still passed — the exact shape of
+    # failure it exists to catch. The floor is loose on purpose (real drift is a section, ~10
+    # arms at least) so this never becomes a number to bump by hand, which is the maintenance
+    # burden that made the literal in TODO_Contained_HOME.md §4 go stale in the first place.
+    _section(_check_arm_counter, failures, verbose)
+
     print()
     if failures:
-        print(f"SELFTEST FAILED: {len(failures)} check(s): {', '.join(failures)}")
+        print(f"SELFTEST FAILED: {len(failures)} of {_ARMS_RUN} check(s): "
+              f"{', '.join(failures)}")
         return 1
-    print("SELFTEST PASSED")
+    # The banner keeps its exact prefix: the pre-push hook and mutate_mcp.py both read for
+    # `SELFTEST PASSED`, and the arm count is appended rather than folded into it.
+    print(f"SELFTEST PASSED — {_ARMS_RUN} arms")
     return 0
+
+
+def _check_arm_counter(failures, verbose):
+    """The banner's arm count must reflect arms that actually ran."""
+    print("arm counter:")
+    _check("selftest.arm_count_is_live",
+           _ARMS_RUN >= 400,
+           f"the run reports {_ARMS_RUN} arms, and the banner's count is what tells a "
+           f"reader that a section stopped running — a `SELFTEST PASSED` with a third of "
+           f"the suite silently skipped looks identical to a clean one otherwise. A "
+           f"counter that stopped incrementing would report a number nobody could act on, "
+           f"so the count is checked to be LIVE rather than merely printed. Floor is loose "
+           f"deliberately: it catches a dead counter or a lost section, and is not a number "
+           f"to maintain per commit", failures, verbose)
 
 
 def _check_mcp_declared_servers(failures, verbose):

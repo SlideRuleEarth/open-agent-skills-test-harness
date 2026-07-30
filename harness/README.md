@@ -48,10 +48,17 @@ root, prefix it with `make -C harness`):
 | Target | For | What it does |
 | --- | --- | --- |
 | `make install` | running the evals | Puts the `agentskill-evals` CLI on your PATH in an isolated env (pipx). |
-| `make dev` | editing the harness | Creates `.venv/` and editable-installs with the `[schema]` extra (adds `jsonschema`; a built-in fallback works without it). Activate with `. .venv/bin/activate`. |
+| `make dev` | editing the harness | Creates `.venv/` and editable-installs with the `[schema,dev]` extras — `jsonschema` (a built-in fallback works without it) and the **exact** Ruff `make lint` requires. Activate with `. .venv/bin/activate`. |
+| `make lint` | before pushing | Runs that pinned Ruff. The tree passes at **zero** findings, so anything it prints is a regression from your change, not existing debt. |
 
 Both pull in `pyyaml` for you. After `make install`, sanity-check with `agentskill-evals list-agents-configured-models
---skills-root ..`; `make help` lists the other targets (`selftest`, `clean`, `uninstall`).
+--skills-root ..`; `make help` lists the other targets (`selftest`, `lint`, `mutation`, `clean`, `uninstall`).
+
+> **Why Ruff is pinned to a single version.** `pyproject.toml` sets `required-version`, and a
+> different build simply refuses to run. Family selectors like `UP` gain rules between
+> releases, so an unpinned checker turns a tool upgrade into something indistinguishable from
+> a code regression — and "zero findings" is only a meaningful contract if everyone's checker
+> agrees. `make lint` deliberately uses `.venv/bin/ruff`, never one found on PATH.
 
 > **`make install` requires [pipx](https://pipx.pypa.io).** Install it with `brew install pipx`
 > (macOS) or `python3 -m pip install --user pipx && python3 -m pipx ensurepath`, then re-run
@@ -76,7 +83,7 @@ pipx install "git+https://github.com/SlideRuleEarth/open-agent-skills-test-harne
 uv tool install ./harness        # uv also manages the Python version
 
 # the hand-rolled venv that `make dev` automates:
-cd harness && python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[schema]"
+cd harness && python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[schema,dev]"
 
 # no install at all — run it as a module from inside harness/:
 python3 -m agentskill_evals selftest                                   # needs no dependencies

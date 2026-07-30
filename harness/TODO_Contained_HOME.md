@@ -283,22 +283,33 @@ plus `mcp.contained_home_without_its_credential_env_var_is_refused` and
 Non-negotiable, in this order. `SELFTEST PASSED` alone is not evidence.
 
 ```sh
-harness/.venv/bin/python -m agentskill_evals.cli selftest          # 486 arms
+cd harness && make dev          # once — creates .venv with the PINNED ruff (see below)
+
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 491 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
-harness/.venv/bin/python -m pyflakes harness/agentskill_evals/*.py harness/agentskill_evals/adapters/*.py
-python3 harness/tools/mutate_mcp.py                               # 113/113 caught by the intended arm
+cd harness && make lint                                       # ruff; must print "All checks passed!"
+python3 harness/tools/mutate_mcp.py                           # 125/125 production + 1/1 instrument
 git diff --check
 ```
 
-Those two counts are the floor as of the MCP witness axis, and they only ever go up: a lower
-number means arms or mutations were LOST, which is the one outcome neither command reports as
-a failure. Bump them in the same commit that adds arms. (They were previously written as
-"N on main; M after this change", which is a form that is stale the moment the change lands —
-and was, for two PRs.)
+**The arm count is now self-reported** — the selftest ends with `SELFTEST PASSED — N arms`.
+It used to live here as a hand-maintained literal and was stale for two PRs running, because
+nothing makes forgetting it fail; the number above is what one macOS run produced, kept only
+so a reader has something to compare against. Both counts are a FLOOR that only ever goes up:
+a lower one means arms or mutations were LOST, which is the single outcome neither command
+reports as a failure — and a whole section that silently stopped running now shows as a drop
+even though every remaining arm passes. A few arms are conditional (PyYAML, platform), so two
+machines legitimately differ by a couple; only the trend on ONE machine is evidence.
 
-Pre-existing pyflakes noise, leave alone: unused `load_spec` in `cli.py:22`, unused `Optional`
-in `adapters/__init__.py:9`, unused `os` in `adapters/codex.py:23`, and many "f-string is
-missing placeholders" in `selftest.py`.
+**Lint runs from `harness/.venv`, never an ambient ruff.** `pyproject.toml` pins
+`required-version = "==0.16.0"` against the `dev` extra that installs it, because a family
+selector like `UP` gains rules between releases — unpinned, a tool upgrade arrives looking
+exactly like a code regression. A mismatched build refuses to run and names both versions.
+The selected families are the ones this tree passes at **zero**, with no `ignore` list, so
+any finding is introduced by the change in front of you; what is deliberately not selected is
+listed in `pyproject.toml` with the reason. Ruff's `F` family subsumes pyflakes, which is why
+the separate pyflakes invocation (and the "pre-existing noise, leave alone" note that used to
+sit here) is gone — that noise was fixed rather than documented.
 
 **What `VersionProvenance` does and does not buy.** It is an **audit trail plus a drift
 warning**, not verification, and anything written as though it re-checks a claim per build is
@@ -316,6 +327,14 @@ procedure (`clear_hint`).
 **Every new arm must be mutation-tested.** Add the mutation to `harness/tools/mutate_mcp.py`
 in the same commit as the arm. An arm nothing can break is decorative, and this project has
 caught its own decorative arms four separate times.
+
+Mutations carry one of two ID prefixes and are **counted separately** in the summary. `M<n>`
+is the normal case: it perturbs production code, and it is what a coverage claim rests on.
+`I<n>` perturbs `selftest.py` itself, which is usually circular and proves nothing — it is
+legitimate only where the selftest has a feature of its own that no production edit can
+reach. There is exactly one (`I1`, the arm counter, whose failure mode is that it stops
+counting while the banner still says PASSED). The split reporting exists so a second one has
+to be argued for in the open rather than appended quietly to the list.
 
 Things that have gone wrong in the *tests*, so you can skip learning them again:
 
