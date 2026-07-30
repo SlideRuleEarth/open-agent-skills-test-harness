@@ -255,10 +255,26 @@ whose `env()` rewrote or stripped a declared credential var would break this —
 redact and contain on a value the child never received — so do not declare a variable the adapter
 transforms without also teaching detection about the transform.
 
+**...and it is not a statement about how the CLI authenticates.** It says these names are
+forwarded and must be redacted. It does not say they are the *only* way in, so it cannot be read
+as one: a CLI may authenticate through a credential helper, a socket, or a workload identity that
+a contained HOME leaves perfectly intact. `_refuse_uncredentialed_contained_home` — the preflight
+that refuses a contained cell with no credential route rather than spending a model call to
+rediscover "Not logged in" — therefore reads a **separate** adapter declaration,
+`contained_home_required_credential_env_vars`, whose whole content is that measured claim. Its
+default `None` means "unanswered" and fires nothing; `[]` is the positive "no env credential
+needed here"; a non-empty list is what the refusal acts on, and every name in it must also appear
+in `credential_env_vars`. Deriving the requirement from `credential_env_vars` plus an empty
+`contained_home_subpaths` was the first implementation and was wrong in the direction that costs a
+user a working run (review, PR #99) — mutation M117 is that exact inference, kept so it cannot
+come back.
+
 Locked by arms `credential_detection_reads_the_childs_effective_environment`,
 `credential_env_var_triggers_containment_without_mcp_servers`,
 `credential_env_var_run_is_refused_under_isolated_false`, `adapter_credential_env_var_is_redacted`,
-and `contained_home_that_copies_auth_is_credential_bearing_before_the_copy` (mutations M81–M85).
+and `contained_home_that_copies_auth_is_credential_bearing_before_the_copy` (mutations M81–M85),
+plus `mcp.contained_home_without_its_credential_env_var_is_refused` and
+`contained.required_credential_env_vars_are_declared_and_answered` (M115–M119).
 
 ---
 

@@ -50,6 +50,11 @@ guessing would produce exactly the malformed server this fixture must not be —
 established that cost the expensive way, when agy's measured shutdown path changed once the
 probe stopped being one.
 
+Two environment knobs, both off by default so the shape every existing check asserts is the
+one it gets: `ECHO_MCP_SERVER_NAME` sets the advertised `serverInfo.name`, and
+`ECHO_MCP_IDENTIFY=1` additionally puts that name in front of `echo`'s reply. The second
+exists because the first is invisible in a RESULT — see `IDENTIFY` below.
+
 No third-party imports, by rule: this runs as a subprocess of an agent CLI, inside a
 per-cell tempdir, on whatever interpreter `command:` resolves to. A dependency here would
 be a dependency of every scenario that uses it.
@@ -84,6 +89,15 @@ CAP_KEY = "io.modelcontextprotocol/clientCapabilities"
 MODERN_ONLY_METHODS = ("server/discover", "subscriptions/listen")
 
 SERVER_NAME = os.environ.get("ECHO_MCP_SERVER_NAME", "echo")
+
+# Opt-in: `echo` prefixes its reply with "<SERVER_NAME>:", putting the server's identity in
+# the RESULT rather than only in `serverInfo`. Without it, two instances under different
+# names are indistinguishable by their answers — echo is verbatim, so one process can serve
+# two aliases and produce exactly the output a correctly-routed pair would. That makes a
+# multi-server scenario unable to tell routing from a collision (review, PR #99). Off by
+# default, because the verbatim contract is what every other check and both `mcp_echo_*`
+# scenarios assert against.
+IDENTIFY = os.environ.get("ECHO_MCP_IDENTIFY") == "1"
 
 # Set by an accepted `initialize`, and the only state carried across requests. Modern
 # supplies its context per request; legacy semantics exist only once initialize selects
@@ -269,7 +283,9 @@ def _call_tool(params: dict) -> dict:
         text = args.get("text")
         if not isinstance(text, str):
             return _text("echo requires a string 'text' argument", is_error=True)
-        return _text(text)
+        # The prefix binds identity to payload in ONE reply, which is the property a routing
+        # test needs: a single process cannot answer with two different SERVER_NAMEs.
+        return _text(f"{SERVER_NAME}:{text}" if IDENTIFY else text)
     if name == "add":
         a, b = args.get("a"), args.get("b")
         if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):

@@ -2,21 +2,34 @@
 #
 # Naming: files named `regress_*.yaml` and tagged `regression` exist to pin behaviour that
 # already works, so a future change cannot quietly undo it. They are not feature demos and
-# not CI-discovered; run them explicitly, or select them with `--tag regression`.
+# not CI-discovered. Run them BY PATH — scenarios are never discovered, so `--tag` has no
+# candidate set to narrow and is rejected alongside `--config`; the filename prefix is what
+# makes `scenarios/regress_*.yaml` a usable glob.
 #
 #   agentskill-evals run --config scenarios/regress_mcp_two_servers.yaml
 #
 # WHAT THIS GUARDS, and why one server could never guard it.
 # Every live MCP run to date has declared exactly ONE server, which makes a whole class of
-# bug invisible: a config writer that emits only the last entry, a witness that compares
-# the first name instead of the set, a tool-namespacing scheme that collides when two
-# servers advertise identically-named tools. With one server, "handles the set correctly"
-# and "handles the singleton correctly" are the same observation. Here they are not.
+# bug invisible: a config writer that emits only the last entry, a tool-namespacing scheme
+# that collides when two servers advertise identically-named tools, a router that sends
+# both aliases to whichever process it started first. With one server, "handles the set
+# correctly" and "handles the singleton correctly" are the same observation. Here they are
+# not. (The WITNESS side of the set — that `mcp_servers_witnessed` reports two entries and
+# not just the first — is not tested here: selftest.py covers it offline against recorded
+# init events, and per the convention in scenarios/README.md an offline check that can see
+# the property is the one that should own it.)
 #
 # The two servers are the SAME fixture under different names, via ECHO_MCP_SERVER_NAME —
 # a knob `fixtures/echo_mcp_server.py` has always had and nothing exercised. Identical tool
 # sets are the point, not a shortcut: `echo` exists on both, so the only thing telling
 # `mcp__alpha__echo` from `mcp__beta__echo` is the per-server namespacing under test.
+#
+# ECHO_MCP_IDENTIFY is what makes the answer ATTRIBUTABLE, and it is not decoration. `echo`
+# is verbatim, so with it off a single process serving both aliases returns exactly what a
+# correctly-routed pair returns, and distinct payloads prove nothing about routing (review,
+# PR #99 — the earlier version of this file claimed otherwise). With it on, each reply is
+# prefixed with its own server's name, which one process cannot fake: SERVER_NAME is fixed
+# per process, so `alpha:wolverine-11` AND `beta:marmot-22` requires two of them.
 #
 # CI-safe: interpolates nothing, so it takes the ordinary isolation overlay rather than the
 # contained HOME (contrast mcp_echo_cred.yaml, which needs a real credential).
@@ -24,8 +37,8 @@
 name: regress_mcp_two_servers
 description: >
   Regression: two declared MCP servers in one cell. Proves the declared set survives config
-  writing, that both servers are reachable, and that identically-named tools stay
-  distinguishable through per-server namespacing.
+  writing, that both servers are reachable as separate processes, and that identically-named
+  tools stay distinguishable through per-server namespacing.
 
 tags: [regression, mcp]
 
@@ -44,23 +57,38 @@ mcp_servers:
     args: [../harness/fixtures/echo_mcp_server.py]
     env:
       ECHO_MCP_SERVER_NAME: alpha
+      ECHO_MCP_IDENTIFY: "1"
   beta:
     command: python3
     args: [../harness/fixtures/echo_mcp_server.py]
     env:
       ECHO_MCP_SERVER_NAME: beta
+      ECHO_MCP_IDENTIFY: "1"
 
 assertions:
   - { type: no_error }
   # Both, deliberately. Asserting one would pass on a config writer that dropped the other.
   - { type: used_tool, name: mcp__alpha__echo }
   - { type: used_tool, name: mcp__beta__echo }
-  # Distinct payloads, so a single server answering both calls cannot satisfy this.
-  - { type: final_contains, contains: "wolverine-11" }
-  - { type: final_contains, contains: "marmot-22" }
+  # Identity PAIRED with payload — the assertion the tool names above cannot make. A trace
+  # can carry both alias names while both calls land in one process; these cannot both hold
+  # unless two processes, named differently, each answered their own call.
+  #
+  # The prompt deliberately does NOT say the replies are prefixed, or what the prefix looks
+  # like. Describing the format would let a model that was handed a bare `wolverine-11`
+  # write `alpha:wolverine-11` anyway from the instructions alone — which would make a
+  # config writer that dropped `env:` on the way to the server look like a pass. The only
+  # place the model can learn these two strings is the tool results themselves.
+  - { type: final_contains, contains: "alpha:wolverine-11" }
+  - { type: final_contains, contains: "beta:marmot-22" }
 
 prompt: |
   You have two MCP servers available, `alpha` and `beta`. Each provides an `echo` tool.
 
   Call `alpha`'s echo tool with the exact text `wolverine-11`, then call `beta`'s echo tool
-  with the exact text `marmot-22`. Then report precisely what each tool returned.
+  with the exact text `marmot-22`.
+
+  Then report the two returned strings exactly as you received them, character for
+  character. Do not shorten, normalize, correct or summarize them, and do not assume you
+  know what they will say: report what each tool actually returned, even if it differs from
+  what you sent.

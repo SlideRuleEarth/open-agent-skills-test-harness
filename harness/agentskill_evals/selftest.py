@@ -2014,13 +2014,14 @@ def _check_workspace_relocation(failures, verbose):
                f"escapes={seen.get('escapes')!r} archived={leaked26[:70]!r}",
                failures, verbose)
 
-        # Containment engaged, but with an EMPTY surface and the adapter's credential env
-        # var unset — so nothing was copied in and nothing comes through the environment,
-        # and the CLI has no way to authenticate. Measured live before this check existed:
-        # the cell spent a model call to return `exited with code 1`, with the real cause
-        # ("Not logged in") buried in a truncated JSON blob inside an assertion message.
-        # Both directions are pinned, because a refusal that can only fire is as wrong as
-        # one that can never fire: the same cell with the var SET must still run.
+        # Containment engaged for an adapter that DECLARES the environment is all it has left
+        # there, with none of those variables set — so nothing was copied in, nothing comes
+        # through the environment, and the CLI has no way to authenticate. Measured live
+        # before this check existed: the cell spent a model call to return `exited with code
+        # 1`, with the real cause ("Not logged in") buried in a truncated JSON blob inside an
+        # assertion message. All three directions are pinned, because a refusal that can only
+        # fire is as wrong as one that can never fire: the same cell with the var SET must
+        # still run, and so must an adapter that never made the declaration.
         seen.clear()
         run_dir27 = os.path.join(repo_root, "artifacts", "run27")
         os.makedirs(run_dir27)
@@ -2030,9 +2031,11 @@ def _check_workspace_relocation(failures, verbose):
 
         class _EnvOnlyAuthAdapter(_MaskingFakeAdapter):
             # Empty surface = "mapped, copies nothing" — claude's shape, because its auth
-            # lives in the macOS keychain, which no contained home can reach.
+            # lives in the macOS keychain, which no contained home can reach. The empty
+            # surface is context, NOT the trigger: the declaration below is.
             contained_home_subpaths: list = []
             credential_env_vars = ["ASE_NOAUTH_CRED"]
+            contained_home_required_credential_env_vars = ["ASE_NOAUTH_CRED"]
 
         spec27 = EvalSpec(
             name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"),
@@ -2051,23 +2054,26 @@ def _check_workspace_relocation(failures, verbose):
             os.makedirs(run_dir28)
             r.run_id, r.run_dir = "run28", run_dir28
             cell28 = r._run_cell(ModelTarget(), spec27)
-            # Third case, and the only shape that can see the empty-surface condition at
-            # all: a NON-EMPTY contained surface with the credential var still unset. Auth
-            # gets copied in, so the env var was never the only route and refusing would be
-            # wrong. Without this the check is one-directional — the mutation that drops
-            # `not materializes_auth` survives, because both other cases have an empty
-            # surface and cannot tell the difference.
+            # Third case, and the only shape that can see WHERE the answer comes from: an
+            # adapter in exactly the arrangement of the first — empty contained surface,
+            # credential env var declared and unset — that has simply never declared what a
+            # contained home leaves it. It must RUN. `credential_env_vars` is a forwarding
+            # and redaction assertion; a CLI may authenticate through a helper or a socket
+            # that containment does not sever, so reading a refusal out of that list (or out
+            # of the empty surface) refuses working configurations. Without this case the
+            # check cannot tell the declaration from the inference it replaced.
             os.environ.pop("ASE_NOAUTH_CRED", None)
             seen.clear()
             run_dir29 = os.path.join(repo_root, "artifacts", "run29")
             os.makedirs(run_dir29)
             r.run_id, r.run_dir = "run29", run_dir29
 
-            class _MaterializedAuthAdapter(_MaskingFakeAdapter):
-                contained_home_subpaths = [".fakecli/real-auth.json"]
+            class _UndeclaredAuthAdapter(_MaskingFakeAdapter):
+                contained_home_subpaths: list = []
                 credential_env_vars = ["ASE_NOAUTH_CRED"]
+                # and no contained_home_required_credential_env_vars: unanswered, not "none".
 
-            r.adapter = _MaterializedAuthAdapter()
+            r.adapter = _UndeclaredAuthAdapter()
             cell29 = r._run_cell(ModelTarget(), spec27)
         finally:
             r.adapter = prior_adapter27
@@ -2079,17 +2085,18 @@ def _check_workspace_relocation(failures, verbose):
                cell27.passed is False and ran27 is False
                and "ASE_NOAUTH_CRED" in err27 and "contained HOME" in err27
                and cell28.passed and cell29.passed,
-               f"a cell that needs a contained HOME must be refused when the adapter's only "
-               f"authentication route — its credential env var — is unset, because an empty "
-               f"contained surface copies nothing in and the CLI would start with no "
-               f"credential at all. Refused BEFORE the model call, and the refusal names the "
-               f"variable rather than surfacing as a generic non-zero exit. The same cell "
-               f"with the variable set must still run, or the check is a blanket ban. "
-               f"An adapter whose contained surface COPIES auth in must not be refused "
-               f"either — the env var was never its only route. "
+               f"a cell that needs a contained HOME must be refused when the adapter DECLARES "
+               f"the environment is all containment leaves it and none of those variables is "
+               f"set — the CLI would start with no credential at all. Refused BEFORE the "
+               f"model call, and the refusal names the variable rather than surfacing as a "
+               f"generic non-zero exit. The same cell with the variable set must still run, "
+               f"or the check is a blanket ban. And an adapter that never made the "
+               f"declaration must run too, however suggestive its other fields look: "
+               f"`credential_env_vars` and an empty surface do not establish that the "
+               f"environment is the only route. "
                f"passed={cell27.passed} ran={ran27} refusal={err27[:140]!r} "
                f"ran_with_cred={getattr(cell28, 'passed', None)} "
-               f"ran_with_materialized_auth={getattr(cell29, 'passed', None)}",
+               f"ran_when_undeclared={getattr(cell29, 'passed', None)}",
                failures, verbose)
 
         # A credential too short to redact is still a credential. This is the arm that would
@@ -8269,6 +8276,34 @@ def _check_declared_contained_surfaces(failures, verbose):
            f"trusts it arrives unchanged. An adapter that popped or rewrote one would redact "
            f"and contain on a value the child never got. survived={sorted(survived)} "
            f"mangled={sorted(mangled)}", failures, verbose)
+
+    # 3) ...and the SEPARATE declaration the runner refuses on. Two properties, because the
+    #    two failures are opposite. A required name outside `credential_env_vars` would reach
+    #    the child unredacted and would not trigger containment at all — the runner would
+    #    refuse for the absence of a variable it never treats as a credential. And an adapter
+    #    whose contained surface copies NOTHING has severed every HOME-side route, so leaving
+    #    the question unanswered there is a gap: the answer may legitimately be `[]` (some
+    #    route outside HOME survives), but it has to be an answer, not a default.
+    stray, unanswered = [], []
+    for name in names:
+        adapter = get_adapter(name)
+        required = getattr(adapter, "contained_home_required_credential_env_vars", None)
+        declared = list(getattr(adapter, "credential_env_vars", []) or [])
+        stray += [f"{name}:{v}" for v in (required or []) if v not in declared]
+        surface = getattr(adapter, "contained_home_subpaths", None)
+        if surface == [] and declared and required is None:
+            unanswered.append(name)
+
+    _check("contained.required_credential_env_vars_are_declared_and_answered",
+           not stray and not unanswered
+           and getattr(get_adapter("claude"), "contained_home_required_credential_env_vars",
+                       None) == ["CLAUDE_CODE_OAUTH_TOKEN"],
+           f"the refusal reads `contained_home_required_credential_env_vars`, so every name "
+           f"in it must also be in `credential_env_vars` (or the runner refuses over a "
+           f"variable it neither redacts nor contains on), and an adapter whose contained "
+           f"surface copies nothing must actually answer the question rather than inherit "
+           f"the unmapped default — `[]` is a fine answer, silence is not. "
+           f"stray={sorted(stray)} unanswered={sorted(unanswered)}", failures, verbose)
 
 
 def _check_progress_indicator(failures, verbose):

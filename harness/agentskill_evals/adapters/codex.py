@@ -246,6 +246,11 @@ class CodexAdapter(Adapter):
     # rotates", and a run that happens to straddle an access-token expiry may well rewrite
     # it. Re-check with --rotation-check rather than trusting this line.
     contained_home_subpaths: list[str] = [".codex/auth.json"]
+    # Nothing from the environment: the copy above IS the credential, and the complete
+    # contained run measured on 2026-07-27 (see --rotation-check, above) authenticated from
+    # it with no token exported. The positive `[]` rather than the default `None`, so the
+    # preflight's silence here is a recorded answer instead of an unmapped adapter.
+    contained_home_required_credential_env_vars: list[str] = []
     # No dedicated flag; the config.toml key `model_reasoning_effort` (settable per-run via
     # `-c`) reaches the API as `reasoning.effort` (verified 2026-07-08: the API echoes
     # supported values none|minimal|low|medium|high|xhigh on a bad one).

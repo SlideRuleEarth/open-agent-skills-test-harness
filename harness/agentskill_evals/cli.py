@@ -324,6 +324,16 @@ def cmd_run(args) -> int:
             print("error: --config can't be combined with --skill/--evals — a scenario "
                   "defines its own eval.", file=sys.stderr)
             return 2
+        if args.tag:
+            # --tag filters DISCOVERED evals; a scenario is selected by path and there is no
+            # discovery step for it to narrow. Silently ignoring it was worse than it looks:
+            # `--config <one scenario> --tag regression` reads like a selection and runs the
+            # scenario whatever its tags say, so a mistyped tag, or a scenario that is not
+            # tagged at all, still costs a full run and reports as if it had been selected.
+            print("error: --tag filters evals found by discovery (--skill/--evals); a "
+                  "scenario is chosen by path, so --tag would change nothing here. Drop it, "
+                  "or pass the scenarios you want by path.", file=sys.stderr)
+            return 2
         scenario = _load_scenario(args.config)
         try:
             scenario_runner = get_adapter(scenario.runner).name

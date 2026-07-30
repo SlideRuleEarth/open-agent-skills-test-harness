@@ -767,24 +767,42 @@ MUTATIONS = [
     # call and comes back `exited with code 1`, with "Not logged in" buried in a truncated
     # JSON blob inside an assertion message.
     ("M115-contained-cell-with-no-credential-route-runs-anyway", RUNNER,
-     "\n                if (contain_home and not materializes_auth\n"
-     "                        and declared_cred and not cred_env_present):",
+     "\n                if (contain_home and required_cred\n"
+     "                        and not any(child_env.get(name) for name in required_cred)):",
      "\n                if False:",
      "mcp.contained_home_without_its_credential_env_var_is_refused"),
     # Inverted: it fires when the credential IS present and stays silent when it is not —
     # a refusal aimed at exactly the runs that can succeed. Caught only by the second half
     # of the arm, which is why that half exists.
     ("M116-refusal-fires-on-the-runs-that-can-authenticate", RUNNER,
-     "\n                        and declared_cred and not cred_env_present):",
-     "\n                        and declared_cred and cred_env_present):",
+     "\n                        and not any(child_env.get(name) for name in required_cred)):",
+     "\n                        and any(child_env.get(name) for name in required_cred)):",
      "mcp.contained_home_without_its_credential_env_var_is_refused"),
-    # The empty-surface condition dropped, so the check also fires for an adapter whose
-    # contained surface DOES copy auth in (codex's `.codex/auth.json`) — refusing a run
-    # that had a perfectly good credential route the env var was never needed for.
-    ("M117-refusal-ignores-whether-auth-was-materialized", RUNNER,
-     "\n                if (contain_home and not materializes_auth\n",
-     "\n                if (contain_home\n",
+    # The inference this check was rewritten to remove (review, PR #99): read the requirement
+    # out of `credential_env_vars` instead of the adapter's own answer. That list asserts
+    # forwarding and redaction — it does not say the environment is the ONLY route, so an
+    # adapter authenticating through a helper or socket that containment leaves intact gets
+    # its working cell refused. Caught by the third arm case, which is that adapter.
+    ("M117-requirement-inferred-from-the-forwarding-list", RUNNER,
+     '                required_cred = list(getattr(\n'
+     '                    adapter, "contained_home_required_credential_env_vars", None) or [])',
+     '                required_cred = list(getattr(\n'
+     '                    adapter, "credential_env_vars", None) or [])',
      "mcp.contained_home_without_its_credential_env_var_is_refused"),
+    # A required name that is not also a declared credential env var: the runner would refuse
+    # a cell for the absence of a variable it never redacts and never contains on.
+    ("M118-required-credential-outside-the-redacted-set", COPILOT,
+     '    contained_home_required_credential_env_vars = [\n'
+     '        "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]',
+     '    contained_home_required_credential_env_vars = [\n'
+     '        "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT"]',
+     "contained.required_credential_env_vars_are_declared_and_answered"),
+    # The unmapped default reinstated on an adapter that has an answer: an empty contained
+    # surface severs every HOME-side route, so "nobody looked" is not a state it may be in.
+    ("M119-contained-surface-with-no-recorded-auth-answer", CLAUDE,
+     '    contained_home_required_credential_env_vars = ["CLAUDE_CODE_OAUTH_TOKEN"]',
+     "    contained_home_required_credential_env_vars = None",
+     "contained.required_credential_env_vars_are_declared_and_answered"),
 ]
 
 

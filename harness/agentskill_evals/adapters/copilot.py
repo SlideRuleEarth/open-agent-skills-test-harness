@@ -1505,6 +1505,14 @@ class CopilotAdapter(Adapter):
     # COPILOT_CLI_DIST_DIR and delegates the rest to base.env() — which is the survival
     # assertion this list makes (see TODO_Contained_HOME.md §3a).
     credential_env_vars = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
+    # In a contained home they are also the only route, and ANY ONE of them suffices — the
+    # precedence order above decides which wins, not whether authentication happens at all.
+    # This is the bisect above read in the other direction, not a fresh claim: masking
+    # ~/Library/Keychains alone breaks authentication, the keychain is unreachable from a
+    # contained home by construction, and ~/.copilot/config.json demonstrably does not carry
+    # the login ("No authentication information found" with it copied in).
+    contained_home_required_credential_env_vars = [
+        "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
     # `--reasoning-effort <level>` (verified 2026-07-08: choices none|low|medium|high|
     # xhigh|max — the harness only passes the typed cross-runner subset low|medium|high).
     supports_reasoning_effort = True

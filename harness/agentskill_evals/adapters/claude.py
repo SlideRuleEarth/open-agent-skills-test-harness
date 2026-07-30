@@ -260,6 +260,14 @@ class ClaudeAdapter(Adapter):
     # contained-HOME design deliberately introduced into the child environment; leaving it out
     # of the scrub set would undo the containment the design bought.
     credential_env_vars = ["CLAUDE_CODE_OAUTH_TOKEN"]
+    # And in a CONTAINED home it is the only route, which is the measured half of the comment
+    # above rather than an inference from the empty surface: the keychain needs
+    # ~/Library/Keychains, an outward symlink a contained home cannot have, and nothing else
+    # under HOME carries a login. Confirmed from the failing direction on 2026-07-30 —
+    # scenarios/mcp_echo_cred.yaml with the variable unset spends the cell and comes back
+    # `exited with code 1` carrying "Not logged in · Please run /login"; with it set, the same
+    # cell passes. That run is what this preflight was written from.
+    contained_home_required_credential_env_vars = ["CLAUDE_CODE_OAUTH_TOKEN"]
 
     supports_output_schema = True
     # `--effort <level>` (verified 2026-07-08: choices low|medium|high|xhigh|max — the

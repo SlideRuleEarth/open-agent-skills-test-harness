@@ -72,7 +72,7 @@ def _readline(q, deadline):
 
 
 def run(msgs, *, mode="dual", kill=None, ignore_sigterm=False, cancel=None,
-        close_reader=False, server=SHIM):
+        close_reader=False, server=SHIM, extra_env=None):
     """Send `msgs`, collect replies, then shut down via `kill` (a signal) or stdin close.
 
     `subscriptions/listen` deliberately gets no immediate reply — its JSON-RPC response IS
@@ -90,6 +90,13 @@ def run(msgs, *, mode="dual", kill=None, ignore_sigterm=False, cancel=None,
     env = dict(os.environ, PROBE_MCP_LOG=log, PROBE_MCP_MODE=mode)
     if ignore_sigterm:
         env["PROBE_MCP_IGNORE_SIGTERM"] = "1"
+    # The echo fixture's own knobs. Cleared first and then set only from `extra_env`, so an
+    # ambient export cannot change what these checks measure — `env` starts as a copy of
+    # os.environ, and a shell with ECHO_MCP_IDENTIFY=1 set would otherwise redden every
+    # verbatim-echo assertion below with no indication why.
+    for knob in ("ECHO_MCP_SERVER_NAME", "ECHO_MCP_IDENTIFY"):
+        env.pop(knob, None)
+    env.update(extra_env or {})
 
     deadline = time.monotonic() + DEADLINE
     responses, notifications, stream = [], [], []
@@ -688,6 +695,47 @@ r, n, recs, st = echo([modern("subscriptions/listen", 1,
 check("method not found", r and "error" in r[0], r)
 check("... with -32601", r and r[0]["error"]["code"] == -32601, r)
 check("no acknowledgment emitted", n == [], n)
+
+# The knob regress_mcp_two_servers.yaml rests on. Its whole job is to make one instance's
+# reply distinguishable from another's, so the checks are: the identity reaches the RESULT,
+# it tracks SERVER_NAME rather than being a constant, and it is genuinely opt-in — the
+# default must stay verbatim, because two live scenarios and every E-check above assert
+# that shape.
+print("E12. the identity knob is opt-in and names the instance that answered")
+_call = {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+         "params": {"name": "echo", "arguments": {"text": "wolverine-11"}}}
+_init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2025-11-25"}}
+
+
+def _echo_text(**kw):
+    r, _n, _recs, _st = echo([_init, _call], **kw)
+    got = {m["id"]: m.get("result", {}) for m in r}
+    return got.get(3, {}).get("content", [{}])[0].get("text")
+
+
+check("default is verbatim (the contract two scenarios depend on)",
+      _echo_text() == "wolverine-11", "identity leaked into the default reply")
+check("named without the knob is STILL verbatim",
+      _echo_text(extra_env={"ECHO_MCP_SERVER_NAME": "alpha"}) == "wolverine-11",
+      "serverInfo alone must not change results — that is why the knob exists")
+check("with the knob, the reply names the instance",
+      _echo_text(extra_env={"ECHO_MCP_SERVER_NAME": "alpha",
+                            "ECHO_MCP_IDENTIFY": "1"}) == "alpha:wolverine-11",
+      "identity must reach the result, not only serverInfo")
+check("...and it is the instance's OWN name, not a constant",
+      _echo_text(extra_env={"ECHO_MCP_SERVER_NAME": "beta",
+                            "ECHO_MCP_IDENTIFY": "1"}) == "beta:wolverine-11",
+      "a fixed prefix would let one process satisfy a two-server routing assertion")
+# Modern era too: the scenario pins claude (legacy today), but the fleet is split and agy
+# is already modern, so a knob that worked on only one era would fail on the runner that
+# most needs it.
+r, _n, _recs, _st = echo([modern("tools/call", 5, name="echo",
+                                 arguments={"text": "marmot-22"})],
+                         extra_env={"ECHO_MCP_SERVER_NAME": "beta",
+                                    "ECHO_MCP_IDENTIFY": "1"})
+check("identity works in the modern era as well",
+      r and r[0].get("result", {}).get("content", [{}])[0].get("text") == "beta:marmot-22", r)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")

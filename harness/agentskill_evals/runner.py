@@ -606,17 +606,28 @@ class Runner:
                 _refuse_uncontained_home(iso_home, spec.name,
                                          list(interpolated) + list(cred_env_present),
                                          _cred_source(interpolated, cred_env_present))
-                # And the mirror-image failure: containment engaged, but with an EMPTY
-                # surface nothing was copied in, so an unset credential env var leaves the
-                # CLI no way to authenticate at all. Checked after the containment refusal
-                # because that one is about a token escaping and this one about there being
-                # no token — an uncontainable credential is the worse outcome and should
-                # keep reporting first.
-                declared_cred = list(getattr(adapter, "credential_env_vars", None) or [])
-                if (contain_home and not materializes_auth
-                        and declared_cred and not cred_env_present):
+                # And the mirror-image failure: containment engaged, and the adapter has
+                # DECLARED that a contained home leaves it nothing but the environment to
+                # authenticate from — with none of those variables set. Checked after the
+                # containment refusal because that one is about a token escaping and this one
+                # about there being no token; an uncontainable credential is the worse
+                # outcome and should keep reporting first.
+                #
+                # The adapter's own declaration, never derived from `credential_env_vars` or
+                # from an empty contained surface: those say what gets forwarded and what
+                # gets copied, not whether some route outside HOME (a helper, a socket, a
+                # workload identity) survives containment. Inferring it would refuse valid
+                # configurations. An adapter that has not answered contributes an empty list
+                # and is not checked.
+                required_cred = list(getattr(
+                    adapter, "contained_home_required_credential_env_vars", None) or [])
+                # `child_env`, matching `cred_env_present` above: a scenario `env:` can supply
+                # the credential the ambient process lacks, and reading os.environ alone would
+                # refuse a cell that was about to authenticate perfectly well.
+                if (contain_home and required_cred
+                        and not any(child_env.get(name) for name in required_cred)):
                     _refuse_uncredentialed_contained_home(
-                        spec.name, declared_cred, list(interpolated))
+                        spec.name, required_cred, list(interpolated))
                 # This cell HAS credentials, which changes what the isolated HOME is. The
                 # harness knows its INITIAL contents (masks, or copied auth) and not its final
                 # ones: it is `$HOME` for a child that can write, and review's agent copied a
@@ -1891,11 +1902,12 @@ def _refuse_uncredentialed_contained_home(eval_name: str, declared: list[str],
 
     The complement of `_refuse_uncontained_home`, and it fires on the opposite arrangement.
     That one refuses a credential the HOME cannot contain; this one refuses a containment
-    the credential cannot survive. A contained HOME with an EMPTY declared surface copies
-    nothing in — for claude that is deliberate, because its auth lives in the macOS login
-    keychain, which no contained home can reach (TODO_Contained_HOME.md §0) — so the
-    adapter's credential env var is the only route left. Unset, the CLI starts, finds
-    nothing, and exits.
+    the credential cannot survive. `declared` is the adapter's
+    `contained_home_required_credential_env_vars` — its own measured statement that
+    containment leaves it nothing but the environment to authenticate from. For claude and
+    copilot that is the macOS login keychain being unreachable from a contained home
+    (TODO_Contained_HOME.md §0); the point is that the ADAPTER says so, because a CLI may
+    hold a route containment does not cut and the runner cannot tell from here.
 
     Refused rather than run, because the failure is otherwise expensive and unreadable: the
     cell spends a model call to come back `exited with code 1`, with the real cause —
@@ -1903,17 +1915,18 @@ def _refuse_uncredentialed_contained_home(eval_name: str, declared: list[str],
     what this check was written from. The neighbouring `${VAR}` check already fails fast
     and names the variable; this makes the two consistent.
 
-    Deliberately narrow. It cannot fire when the surface is non-empty (codex copies
-    `.codex/auth.json`, so the env var is not the only route), when the var IS set, or when
-    the adapter declares none — silence there is a mapping question, not this check's.
+    Deliberately narrow: it cannot fire when one of the declared variables IS set, nor for
+    an adapter that declares none — an unanswered adapter is a mapping question, and this
+    check is not the place to guess at the answer.
     """
+    joined = ", ".join(declared)
     raise RuntimeError(
-        f"{eval_name!r} needs a contained HOME ({', '.join(refs)}) and this adapter "
-        f"authenticates only from the environment there, but none of {', '.join(declared)} "
-        f"is set. A contained HOME copies no long-lived auth in, so the CLI would start "
-        f"with no credential and fail partway through the cell. Export "
-        f"{declared[0]} before running, or drop the credential so the cell can take the "
-        f"ordinary isolation overlay.")
+        f"{eval_name!r} needs a contained HOME ({', '.join(refs)}) and this adapter declares "
+        f"that a contained HOME leaves it only the environment to authenticate from, but "
+        f"none of {joined} is set. The CLI would start with no credential and fail partway "
+        f"through the cell. Export "
+        f"{'one of ' + joined if len(declared) > 1 else declared[0]} before running, or drop "
+        f"the credential so the cell can take the ordinary isolation overlay.")
 
 
 def _purge(label: str, path: Optional[str], tail: str = _CREDENTIAL_TAIL) -> str:

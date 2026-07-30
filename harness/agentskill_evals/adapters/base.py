@@ -204,6 +204,30 @@ class Adapter(ABC):
     # is read from os.environ per cell and is never committed here. A name that is unset in
     # the environment contributes nothing (there is no credential to redact).
     credential_env_vars: list[str] = []
+    # Which of those variables a CONTAINED home leaves as the ONLY way to authenticate: at
+    # least one must be set there, or the CLI starts with no credential at all. This is a
+    # SEPARATE declaration from `credential_env_vars` on purpose. That list is a forwarding
+    # and redaction assertion (TODO_Contained_HOME.md §3a) — "env() hands these through, so
+    # scrub them" — and it says nothing about whether the CLI has some OTHER route: a
+    # credential helper, a socket, a workload identity, anything outside HOME that a
+    # contained home does not sever. Deriving "authenticates only from the environment"
+    # from an empty `contained_home_subpaths` would refuse those valid configurations, so
+    # the runner asks for the answer instead of inferring it.
+    #
+    # THREE states. `None` (the default) is "nobody has determined this adapter's contained
+    # authentication route", and it fails OPEN: the preflight simply does not fire, leaving
+    # the pre-existing behaviour where the CLI itself reports the problem. That direction is
+    # right because this check's whole stake is a wasted model call, not containment — the
+    # security decision is `_refuse_uncontained_home`, which is unaffected and still fails
+    # closed. `[]` is the positive claim that no environment credential is required (auth is
+    # copied in, or reached by a route containment does not cut). A non-empty list is the
+    # measured claim that these are all that is left, and the runner refuses a contained cell
+    # where none of them is set rather than spending a cell to rediscover it.
+    #
+    # Every name here must also appear in `credential_env_vars`, or the value would reach the
+    # child unredacted and its presence would not trigger containment in the first place.
+    # Checked across the real adapters by the selftest.
+    contained_home_required_credential_env_vars: Optional[list[str]] = None
     # Whether two cells of this runner may execute CONCURRENTLY without sharing mutable
     # configuration. Default False, and every adapter here is currently False.
     #

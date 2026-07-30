@@ -194,7 +194,15 @@ Mark them **both** ways, because the two marks do different jobs:
 | Mark | Who reads it |
 |---|---|
 | `regress_` filename prefix | a human scanning `scenarios/` — they sort together and are obvious in a diff |
-| `tags: [regression]` | the runner — `--tag regression` selects them, and nothing else has to change |
+| `tags: [regression]` | the artifacts — the tag is recorded with the run, so a result can be attributed to a regression rather than an experiment |
+
+**`--tag` does not select scenarios.** Scenarios are not discovered (see the top of this
+file), so there is no candidate set for a tag to narrow: `--tag` filters evals found under
+`--skill`/`--evals`, and passing it with `--config` is now an error rather than a flag that
+quietly does nothing. Run them by path — `for f in scenarios/regress_*.yaml; do
+agentskill-evals run --config "$f"; done` is the whole "suite", and the filename prefix is
+what makes that glob work. If regression scenarios ever need real collection, that means
+scenario-directory discovery, not a tag.
 
 Write one when a behaviour **needs a real CLI to observe**. If an offline check can see it,
 prefer that: `harness/agentskill_evals/selftest.py` for harness logic and
@@ -202,10 +210,20 @@ prefer that: `harness/agentskill_evals/selftest.py` for harness logic and
 nothing, where a scenario costs a model call every time it runs. A regression scenario
 earns its cost only when the thing under test is the agent CLI's own behaviour.
 
-State in a comment at the top **what would break unnoticed without it**. `regress_mcp_two_servers.yaml`
-is the worked example: every live MCP run before it declared exactly one server, which made
-a config writer that emits only the last entry — or a witness that compares the first name
-instead of the set — indistinguishable from correct.
+State in a comment at the top **what would break unnoticed without it**, and be exact about
+which part of that a live run can actually see. `regress_mcp_two_servers.yaml` is the worked
+example: every live MCP run before it declared exactly one server, so a config writer that
+emits only the last entry, or a namespacing scheme that collides on identically-named tools,
+was indistinguishable from correct. It deliberately does *not* claim the witness half of
+that — `mcp_servers_witnessed` reporting the set rather than the first name is checked
+offline in `selftest.py`, which is this convention applied to itself.
+
+The same discipline applies to the assertions. That scenario's first draft asserted two
+distinct echoed payloads and called that proof of routing; it was not, because the fixture
+echoes verbatim and one process serving both aliases returns exactly the same thing. Ask
+what a *broken* implementation would produce, and if the answer is "this", the assertion is
+measuring something else. The fix was to make each reply carry the identity of the server
+that produced it (`ECHO_MCP_IDENTIFY`), which one process cannot forge.
 
 ## Override precedence
 
