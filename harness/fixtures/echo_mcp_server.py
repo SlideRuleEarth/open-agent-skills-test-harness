@@ -46,9 +46,16 @@ import json
 import os
 import sys
 
-# Mirrored back to whatever the client asks for (see _initialize). Used only when the
-# client omits the field.
-_FALLBACK_PROTOCOL = "2025-06-18"
+# The legacy revisions this fixture actually implements — the two the shipped fleet was
+# measured speaking (§9: claude and copilot 2025-11-25, codex 2025-06-18). An earlier
+# version MIRRORED whatever the client asked for, so that a protocol bump in any CLI would
+# not turn into a mysterious scenario failure. That reasoning was wrong in a way worth
+# recording: mirroring `2099-01-01` claims to implement a revision this file has never
+# heard of, and a client that believes the claim gets a 2025-shaped answer to a 2099
+# request. Selecting from a set it really implements is what the legacy lifecycle asks
+# for, and a version mismatch is then visible instead of silently wrong. Extend this tuple
+# when a CLI moves.
+LEGACY_VERSIONS = ("2025-11-25", "2025-06-18")
 
 # Modern MCP (revision 2026-07-28) dropped the `initialize` handshake for per-request
 # `_meta`. Probe C3-0 measured the shipped fleet as SPLIT — claude and copilot on
@@ -57,8 +64,16 @@ _FALLBACK_PROTOCOL = "2025-06-18"
 # Phase 3 would look like a harness bug rather than a missing mode.
 MODERN_VERSION = "2026-07-28"
 VER_KEY = "io.modelcontextprotocol/protocolVersion"
+# Methods that exist only in the modern revision, so a request for one carrying no modern
+# `_meta` is unknown rather than servable.
+MODERN_ONLY_METHODS = ("server/discover", "subscriptions/listen")
 
 SERVER_NAME = os.environ.get("ECHO_MCP_SERVER_NAME", "echo")
+
+# Set by an accepted `initialize`, and the only state carried across requests. Modern
+# supplies its context per request; legacy semantics exist only once initialize selects
+# them, which is why "no modern metadata" cannot be read as "legacy".
+_legacy = None
 
 TOOLS = [
     {
@@ -89,18 +104,61 @@ def _send(msg: dict) -> None:
     sys.stdout.flush()
 
 
-def _modern_request(msg: dict) -> bool:
-    """Whether THIS request is modern, read off its own `_meta`.
-
-    Per request, not per session: modern MCP is stateless — "servers MUST NOT rely on
-    prior requests over the same connection to establish context" — so there is no
-    connection-wide era to consult. Reading it off the method name instead would misclassify
-    a modern client that skips `server/discover`, which the spec explicitly permits."""
+def _claimed_version(msg: dict):
+    """The protocol version this request declares, or None if it declares none."""
     params = msg.get("params")
     if not isinstance(params, dict):
-        return False
+        return None
     meta = params.get("_meta")
-    return isinstance(meta, dict) and isinstance(meta.get(VER_KEY), str)
+    if not isinstance(meta, dict):
+        return None
+    return meta.get(VER_KEY)
+
+
+def _reject(req_id, msg: dict, method) -> bool:
+    """Answer anything this fixture cannot serve conformantly. True if already answered.
+
+    This is where "lenient about input" stops, and the boundary is not a matter of taste:
+    **an absent protocol version cannot be tolerated, because without one there is no way
+    to know which conforming output to produce.** A missing `clientCapabilities` is
+    different — the version still identifies the era — so that stays tolerated, which is
+    the leniency a test double can actually afford.
+
+    An earlier version read "no modern metadata" as "legacy" and served it. Legacy
+    semantics do not exist until `initialize` selects them, so that let a bare `tools/list`
+    open a session, answered `server/discover` in a legacy shape that revision has no such
+    result for, and served a modern-metadata `initialize` as a legacy handshake — the three
+    era inversions §10.2 forbids, all from one missing distinction."""
+    claimed = _claimed_version(msg)
+
+    if claimed is not None:
+        if not isinstance(claimed, str):
+            _error(req_id, -32602, "malformed _meta: protocolVersion must be a string")
+            return True
+        if claimed != MODERN_VERSION:
+            _send({"jsonrpc": "2.0", "id": req_id, "error": {
+                "code": -32022, "message": "Unsupported protocol version",
+                "data": {"supported": [MODERN_VERSION], "requested": claimed}}})
+            return True
+        if method == "initialize":
+            _error(req_id, -32601, "method not found: initialize")
+            return True
+        return False
+
+    if method == "initialize":
+        if _legacy is not None:
+            _error(req_id, -32600, "already initialized")
+            return True
+        return False
+
+    if method in MODERN_ONLY_METHODS:
+        _error(req_id, -32601, f"method not found: {method}")
+        return True
+
+    if _legacy is None:
+        _error(req_id, -32602, "no protocol era established: send initialize or modern _meta")
+        return True
+    return False
 
 
 def _result(req_id, result: dict, *, modern: bool = False,
@@ -131,14 +189,15 @@ def _text(s: str, *, is_error: bool = False) -> dict:
 
 
 def _initialize(params: dict) -> dict:
-    # The client's requested version is MIRRORED rather than pinned. A server may answer
-    # with a version it prefers, and the client is then free to hang up — which for a test
-    # fixture would turn a protocol-revision bump in any of four CLIs into a mysterious
-    # scenario failure. Agreeing with the client keeps this instrument measuring the thing
-    # under test instead of itself.
+    """Select a legacy version this fixture implements, and record that legacy is now in
+    force. The legacy lifecycle returns the requested version only when it is supported;
+    otherwise the server answers with one it does support and the client decides."""
+    global _legacy
     requested = params.get("protocolVersion")
+    selected = requested if requested in LEGACY_VERSIONS else LEGACY_VERSIONS[0]
+    _legacy = {"version": selected, "capabilities": params.get("capabilities")}
     return {
-        "protocolVersion": requested if isinstance(requested, str) else _FALLBACK_PROTOCOL,
+        "protocolVersion": selected,
         "capabilities": {"tools": {"listChanged": False}},
         "serverInfo": {"name": SERVER_NAME, "version": "1.0.0"},
     }
@@ -204,7 +263,9 @@ def main() -> int:
         if req_id is None:
             continue
 
-        modern = _modern_request(msg)
+        if _reject(req_id, msg, method):
+            continue
+        modern = _claimed_version(msg) == MODERN_VERSION
 
         if method == "server/discover":
             _result(req_id, _discover(), modern=modern, cacheable=True)

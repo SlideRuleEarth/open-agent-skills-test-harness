@@ -542,7 +542,7 @@ r, n, recs, st = echo([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
                        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
                            "name": "echo", "arguments": {"text": "hi"}}}])
 by = {m["id"]: m.get("result", {}) for m in r}
-check("initialize mirrors the requested version",
+check("initialize selects the requested supported version",
       by.get(1, {}).get("protocolVersion") == "2025-11-25", by.get(1))
 check("both tools advertised",
       [t["name"] for t in by.get(2, {}).get("tools", [])] == ["echo", "add"], by.get(2))
@@ -585,7 +585,56 @@ check("bare request stays legacy-shaped", "resultType" not in by.get(2, {}), by.
 check("modern request is modern-shaped",
       by.get(3, {}).get("resultType") == "complete", by.get(3))
 
-print("E5. subscriptions/listen is declined, not faked")
+print("E5. an opener with no protocol version establishes nothing")
+# The echo half used to exercise only valid inputs, which is why two era inversions lived
+# here while the probe half already pinned the same rules.
+r, n, recs, st = echo([{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                       {"jsonrpc": "2.0", "id": 2, "method": "initialize",
+                        "params": {"protocolVersion": "2025-11-25"}},
+                       {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}])
+by = {m["id"]: m for m in r}
+check("bare opener rejected", "error" in by.get(1, {}), by.get(1))
+check("... and NOT served in legacy shape", "result" not in by.get(1, {}), by.get(1))
+check("initialize accepted", "result" in by.get(2, {}), by.get(2))
+check("bare request legal once legacy is established", "result" in by.get(3, {}), by.get(3))
+
+print("E6. the method must match the request's era")
+r, n, recs, st = echo([{"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {}},
+                       modern("initialize", 2),
+                       {"jsonrpc": "2.0", "id": 3, "method": "initialize",
+                        "params": {"protocolVersion": "2025-11-25"}},
+                       {"jsonrpc": "2.0", "id": 4, "method": "initialize",
+                        "params": {"protocolVersion": "2025-11-25"}}])
+by = {m["id"]: m for m in r}
+check("bare server/discover is unknown", "error" in by.get(1, {}), by.get(1))
+check("... NOT a legacy-shaped DiscoverResult", "result" not in by.get(1, {}), by.get(1))
+check("modern-metadata initialize is unknown", "error" in by.get(2, {}), by.get(2))
+check("... with -32601", by.get(2, {}).get("error", {}).get("code") == -32601, by.get(2))
+check("second initialize rejected", "error" in by.get(4, {}), by.get(4))
+
+print("E7. unsupported versions are refused, not impersonated")
+r, n, recs, st = echo([{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {
+    "_meta": {"io.modelcontextprotocol/protocolVersion": "2099-01-01"}}},
+    {"jsonrpc": "2.0", "id": 2, "method": "initialize",
+     "params": {"protocolVersion": "2099-01-01"}}])
+by = {m["id"]: m for m in r}
+check("unsupported modern version refused", "error" in by.get(1, {}), by.get(1))
+check("... with -32022", by.get(1, {}).get("error", {}).get("code") == -32022, by.get(1))
+check("... advertising what it does support",
+      by.get(1, {}).get("error", {}).get("data", {}).get("supported") == ["2026-07-28"],
+      by.get(1))
+sel = by.get(2, {}).get("result", {}).get("protocolVersion")
+check("legacy did not mirror an unknown revision", sel != "2099-01-01", by.get(2))
+check("legacy selected one it implements", sel in ("2025-11-25", "2025-06-18"), by.get(2))
+
+print("E8. missing clientCapabilities is still tolerated (the leniency that survives)")
+r, n, recs, st = echo([{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {
+    "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}}])
+check("served despite absent capabilities", r and "result" in r[0], r)
+check("and served in modern shape",
+      r and r[0]["result"].get("resultType") == "complete", r)
+
+print("E9. subscriptions/listen is declined, not faked")
 r, n, recs, st = echo([modern("subscriptions/listen", 1,
                               notifications={"toolsListChanged": True})])
 check("method not found", r and "error" in r[0], r)
