@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import os
 import shlex
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any
+from collections.abc import Iterable, Iterator
 
 # Budgets for the judge's compact view (the report passes None == no file-count cap).
 JUDGE_MAX_FILES = 60
@@ -182,7 +183,7 @@ def leaked_skill_reads(
     return hits
 
 
-def file_tree(workdir: str, extra: list[str] = (), max_files: Optional[int] = None,
+def file_tree(workdir: str, extra: list[str] = (), max_files: int | None = None,
               seeded: Iterable[str] = ()) -> str:
     """A flat listing of every file under `workdir` (skill dirs / noise excluded), plus any
     `extra` paths written outside it. `max_files=None` lists everything (the report); the judge
@@ -205,8 +206,8 @@ def file_tree(workdir: str, extra: list[str] = (), max_files: Optional[int] = No
     return "\n".join(lines) if lines else "  (workspace empty)"
 
 
-def inline_files(workdir: str, extra: list[str] = (), max_files: Optional[int] = None,
-                 max_bytes: Optional[int] = None, truncate: bool = False,
+def inline_files(workdir: str, extra: list[str] = (), max_files: int | None = None,
+                 max_bytes: int | None = None, truncate: bool = False,
                  seeded: Iterable[str] = ()) -> str:
     """Inline the contents of text files under `workdir` (and `extra`). With max_files None
     (the report) every text file is inlined; the judge passes small caps to keep its prompt
@@ -228,7 +229,7 @@ def inline_files(workdir: str, extra: list[str] = (), max_files: Optional[int] =
             size = os.path.getsize(path)
             if max_bytes is not None and size > max_bytes and not truncate:
                 return True
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            with open(path, encoding="utf-8", errors="replace") as fh:
                 body = fh.read(max_bytes) if max_bytes is not None else fh.read()
             if max_bytes is not None and size > max_bytes:
                 body += (f"\n… [truncated at {max_bytes} bytes of {size} — "

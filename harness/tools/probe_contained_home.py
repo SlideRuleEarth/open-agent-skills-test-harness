@@ -48,7 +48,6 @@ import os
 import shutil
 import sys
 import tempfile
-from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -80,7 +79,7 @@ def _secrets_in(path: str) -> list[str]:
     script recognizes the key it sits under.
     """
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             doc = json.load(fh)
     except Exception:
         return []
@@ -443,7 +442,7 @@ def _bisect_candidates(adapter, real_home: str) -> tuple[list[str], list[str]]:
     return candidates, list(reserved_paths)
 
 
-def _bisect(adapter, args, real_home: Optional[str] = None) -> int:
+def _bisect(adapter, args, real_home: str | None = None) -> int:
     """Find the real-HOME entry the CLI authenticates from, by masking on the OVERLAY.
 
     Additive probing (contained mode + a guessed surface) can only confirm a guess. This is

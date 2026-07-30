@@ -7,7 +7,7 @@ This export contains the **example skills** bundled with the open-agent-skills-t
 Each `.zip` file is one self-contained skill:
 
 | File | What it does |
-|---|---|
+| --- | --- |
 | `sliderule-pipeline-direct-request.zip` | Directives for orchestrating multi-step analyses as single scripts |
 | `sliderule-region-picker.zip` | Interactive map for defining geographic regions |
 

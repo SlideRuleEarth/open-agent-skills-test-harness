@@ -20,7 +20,8 @@ import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Mapping, Optional
+from typing import Any
+from collections.abc import Mapping
 
 from ..isolation import build_mcp_masked_home, config_home_entries
 from ..notices import warn
@@ -53,16 +54,16 @@ class RunOptions:
     native flags and ignores the rest.
     """
 
-    model: Optional[str] = None
+    model: str | None = None
     auto_approve: bool = True            # allow file/command execution without prompts
-    reasoning_effort: Optional[str] = None  # "low" | "medium" | "high" — thinking budget;
+    reasoning_effort: str | None = None  # "low" | "medium" | "high" — thinking budget;
                                             # mapped to a native flag only where the runner
                                             # has one (see supports_reasoning_effort)
-    output_schema: Optional[dict] = None  # JSON Schema for the final structured answer
-    allowed_tools: Optional[list[str]] = None
+    output_schema: dict | None = None  # JSON Schema for the final structured answer
+    allowed_tools: list[str] | None = None
     disable_tools: bool = False          # run reasoning-only (used by the judge)
     extra_args: list[str] = field(default_factory=list)  # raw flags appended verbatim
-    home: Optional[str] = None           # isolated HOME for this run (see isolation.py); None = real HOME
+    home: str | None = None           # isolated HOME for this run (see isolation.py); None = real HOME
     isolation_env: dict = field(default_factory=dict)  # config-home vars repointed at isolated mirrors
     # The exact environment the subprocess will receive — set by exec.execute() (from
     # os.environ + the scenario's env overrides + this adapter's env()) right before
@@ -70,15 +71,15 @@ class RunOptions:
     # enumerating MCP servers to disable) inspects the child's context, not the
     # harness's. None outside execute() (direct build_argv calls); adapters fall back
     # to os.environ then.
-    effective_env: Optional[dict] = None
+    effective_env: dict | None = None
     # Declared MCP servers for this run, already interpolated (name -> mcp.MCPServer).
     # Empty/None means MCP stays hermetically off — the Phase 0 default.
-    mcp_servers: Optional[dict] = None
+    mcp_servers: dict | None = None
     # Per-cell scratch dir for CLI config files carrying resolved secrets. Deliberately
     # OUTSIDE the workspace: the workspace is archived into artifacts and inlined into
     # report.md, which would publish the credentials this dir exists to keep out of them.
     # Created and removed by the runner; adapters only write into it.
-    mcp_scratch_dir: Optional[str] = None
+    mcp_scratch_dir: str | None = None
 
 
 @dataclass
@@ -86,8 +87,8 @@ class ProbeResult:
     """Outcome of probing a single model."""
 
     accepted: bool
-    cost_usd: Optional[float] = None
-    premium_requests: Optional[float] = None
+    cost_usd: float | None = None
+    premium_requests: float | None = None
 
     @property
     def cost_str(self) -> str:
@@ -105,16 +106,16 @@ class ParseOutput:
 
     events: list[NormalizedEvent] = field(default_factory=list)
     final_text: str = ""
-    structured_output: Optional[Any] = None
-    cost_usd: Optional[float] = None
-    premium_requests: Optional[float] = None
-    duration_ms: Optional[int] = None
-    resolved_model: Optional[str] = None
+    structured_output: Any | None = None
+    cost_usd: float | None = None
+    premium_requests: float | None = None
+    duration_ms: int | None = None
+    resolved_model: str | None = None
     # The CLI build that actually executed, when this runner's own telemetry states it.
     # None where it does not (codex, antigravity — see each adapter's VersionProvenance),
     # and None is NOT interchangeable with a version: it means "unknown", which the
     # cross-cell consistency check must not treat as agreement.
-    cli_version: Optional[str] = None
+    cli_version: str | None = None
     # The MCP servers the RUN ITSELF reported hosting, as (name, status) pairs — claude's
     # `system`/`init` event, the same structural field the kill-switch witness reads. None
     # means this run stated nothing readable, which is emphatically not the empty tuple:
@@ -129,7 +130,7 @@ class ParseOutput:
     # Comparability reporting only, never a safety decision. Hermeticity is decided by
     # `verify_post_run` off this same event; that a fact learned from the run may not CLEAR
     # a security check (TODO_Contained_HOME.md §3) is why this stays on the reporting path.
-    mcp_servers_witnessed: Optional[tuple] = None
+    mcp_servers_witnessed: tuple | None = None
 
 
 class Adapter(ABC):
@@ -160,7 +161,7 @@ class Adapter(ABC):
     # isolation overlay AND by the mask-only overlay probes/judge runs get
     # (isolation.build_mcp_masked_home). Adapters with a working flag-level kill-switch
     # (claude --strict-mcp-config, codex per-server disables) don't need one.
-    isolation_config_masks: dict[str, Optional[str]] = {}
+    isolation_config_masks: dict[str, str | None] = {}
     # HOME-relative paths this CLI genuinely needs from the real home, for a CONTAINED home
     # (isolation.py's contained mode) — the home a credential-bearing run requires. They are
     # COPIED, never symlinked: the escape rule this harness enforces is "any symlink
@@ -194,7 +195,7 @@ class Adapter(ABC):
     # symlink-scrub arm that passes on macOS (darwin xattr/hardlink semantics), and a surface
     # validated by a suite that does not pass is not a measurement. See
     # TODO_Contained_HOME.md §6.
-    contained_home_subpaths: Optional[list[str]] = None
+    contained_home_subpaths: list[str] | None = None
     # Environment variable NAMES this adapter passes into the child CLI that carry a
     # credential — e.g. claude's CLAUDE_CODE_OAUTH_TOKEN, which `env()` forwards through the
     # process-env passthrough. The runner reads each name from its OWN environment at cell
@@ -227,7 +228,7 @@ class Adapter(ABC):
     # Every name here must also appear in `credential_env_vars`, or the value would reach the
     # child unredacted and its presence would not trigger containment in the first place.
     # Checked across the real adapters by the selftest.
-    contained_home_required_credential_env_vars: Optional[list[str]] = None
+    contained_home_required_credential_env_vars: list[str] | None = None
     # Whether two cells of this runner may execute CONCURRENTLY without sharing mutable
     # configuration. Default False, and every adapter here is currently False.
     #
@@ -275,7 +276,7 @@ class Adapter(ABC):
     # `None` is the fail-closed default in BOTH directions — isolated or not — so an
     # adapter nobody has classified refuses declared servers outright rather than being
     # cleared by an overlay that does nothing for it.
-    mcp_off_mechanism: Optional["MCPOffMechanism"] = None
+    mcp_off_mechanism: MCPOffMechanism | None = None
 
     @property
     def mcp_off_depends_on_isolation(self) -> bool:
@@ -284,7 +285,7 @@ class Adapter(ABC):
         adapter has no established guarantee to keep."""
         return self.mcp_off_mechanism is not MCPOffMechanism.CLI
 
-    def mcp_off_gap(self, isolated_home: Optional[str]) -> Optional[str]:
+    def mcp_off_gap(self, isolated_home: str | None) -> str | None:
         """Why a DECLARED `mcp_servers:` set cannot be honoured on this run, or None if it
         can. Declaring servers states what the run's tool surface IS, so anything the
         harness cannot keep out makes the declared set a SUBSET of what actually ran.
@@ -374,12 +375,12 @@ class Adapter(ABC):
         """True if the agent's CLI is on PATH."""
         return bool(self.binary) and shutil.which(self.binary) is not None
 
-    def resolved_binary(self) -> Optional[str]:
+    def resolved_binary(self) -> str | None:
         return shutil.which(self.binary) if self.binary else None
 
     has_model_list: bool = False
 
-    def discover_models(self) -> Optional[list[str]]:
+    def discover_models(self) -> list[str] | None:
         """Probe the CLI for its available models.
 
         Returns a list of model id strings, or None if this adapter cannot
@@ -405,7 +406,7 @@ class Adapter(ABC):
         # Fresh private workspace: the probe's cwd AND its workspace anchor (agy's
         # --add-dir, copilot's workspace-config discovery root).
         probe_ws = tempfile.mkdtemp(prefix="ase-probe-")
-        masked_home: Optional[str] = None
+        masked_home: str | None = None
         try:
             try:
                 masked_home, iso_env = build_mcp_masked_home(self)
@@ -479,7 +480,7 @@ class Adapter(ABC):
                 shutil.rmtree(masked_home, ignore_errors=True)
             shutil.rmtree(probe_ws, ignore_errors=True)
 
-    def _probe_argv_compat(self, model: str, *, cwd: str, env: dict) -> Optional[list[str]]:
+    def _probe_argv_compat(self, model: str, *, cwd: str, env: dict) -> list[str] | None:
         """Call ``_probe_argv`` with the probe's execution context, tolerating out-of-tree
         adapters that still override the pre-Phase-0 ``_probe_argv(self, model)`` shape."""
         import inspect
@@ -495,8 +496,8 @@ class Adapter(ABC):
         """Extract cost info from probe output. Override per adapter."""
         return ProbeResult(accepted=True)
 
-    def _probe_argv(self, model: str, *, cwd: Optional[str] = None,
-                    env: Optional[dict] = None) -> Optional[list[str]]:
+    def _probe_argv(self, model: str, *, cwd: str | None = None,
+                    env: dict | None = None) -> list[str] | None:
         """Return the argv to probe whether *model* is accepted.
 
         Override per adapter.  Return None to skip probing. ``cwd`` is the fresh private
@@ -555,7 +556,7 @@ class Adapter(ABC):
 
     def _verify_post_run_compat(self, argv: list[str], opts: RunOptions, *, cwd: str,
                                 stdout: str, stderr: str,
-                                exit_code: Optional[int]) -> None:
+                                exit_code: int | None) -> None:
         """Call ``verify_post_run`` with the child's exit status, tolerating out-of-tree
         adapters that still override the pre-Phase-0 signature without ``exit_code``
         (same accommodation ``_probe_argv_compat`` makes)."""
@@ -565,7 +566,7 @@ class Adapter(ABC):
             kwargs["exit_code"] = exit_code
         return self.verify_post_run(argv, opts, **kwargs)
 
-    def mcp_servers_seen(self, argv: list[str]) -> Optional[list[str]]:
+    def mcp_servers_seen(self, argv: list[str]) -> list[str] | None:
         """The MCP servers this invocation knew about, read back off its own argv.
 
         For the runners that neutralize servers by NAME (codex, copilot) this is the
@@ -643,7 +644,7 @@ class Adapter(ABC):
 
     def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str,
                         stdout: str = "", stderr: str = "",
-                        exit_code: Optional[int] = None) -> None:
+                        exit_code: int | None = None) -> None:
         """Re-assert, after the child has exited, the premise ``argv`` was built on.
 
         ``build_argv`` reads filesystem state — config files, agent definitions — to
@@ -675,7 +676,7 @@ class Adapter(ABC):
         instead of a silently-passing run. Called by exec.execute() for eval runs and by
         probe_model for model probes. Default: no preflight state to re-check.
         """
-        return None
+        return
 
     def env(self, base_env: dict[str, str], opts: RunOptions) -> dict[str, str]:
         """Mutate/extend the subprocess environment.
@@ -706,7 +707,7 @@ class Adapter(ABC):
 
     @abstractmethod
     def parse(self, stdout: str, stderr: str, exit_code: int,
-               *, opts: Optional[RunOptions] = None) -> ParseOutput:
+               *, opts: RunOptions | None = None) -> ParseOutput:
         """Translate raw agent output into the normalized shape.
 
         ``opts`` is the same RunOptions the run was built from (``opts.home`` in
@@ -788,7 +789,7 @@ class VersionProvenance:
     # string is the REASON, and it is printed: "we don't know" is only actionable if it
     # says why, and whether that is a property of the CLI or a trade-off this harness
     # chose is exactly what a maintainer needs in order to revisit it.
-    unreadable: Optional[str] = None
+    unreadable: str | None = None
 
     def __post_init__(self) -> None:
         # A denylist on an adapter that can never learn the version is dead code that
@@ -811,7 +812,7 @@ class VersionProvenance:
                 "and the warning would carry no baseline to compare against."
             )
 
-    def check_denied(self, version: Optional[str], *, completed: bool = False) -> None:
+    def check_denied(self, version: str | None, *, completed: bool = False) -> None:
         """Fail a run that executed a build KNOWN to break an assumption — or that cannot
         show it did not.
 
@@ -870,7 +871,7 @@ class VersionProvenance:
                 "than removing the check."
             )
 
-    def warn_drift(self, version: Optional[str], *, witnessed: bool = False) -> None:
+    def warn_drift(self, version: str | None, *, witnessed: bool = False) -> None:
         """Warn once per version that a run executed a build the analysis has not been
         checked against. A WARNING, not a failure — and deliberately so.
 
@@ -943,7 +944,7 @@ def iter_jsonl(text: str):
             continue
 
 
-def try_load_json(text: str) -> Optional[Any]:
+def try_load_json(text: str) -> Any | None:
     """Best-effort: parse `text` as a single JSON value.
 
     Falls back to extracting the last balanced {...} or [...] block, which
@@ -974,7 +975,7 @@ _COMMAND_KEYS = ("command", "cmd", "script", "shell", "code", "args", "input", "
 _PATH_KEYS = ("file_path", "path", "filepath", "file", "filename", "target_file", "directory_path")
 
 
-def extract_command(obj: Any) -> Optional[str]:
+def extract_command(obj: Any) -> str | None:
     """Pull a shell-command string out of a tool-call argument object."""
     if isinstance(obj, str):
         return obj
@@ -989,7 +990,7 @@ def extract_command(obj: Any) -> Optional[str]:
     return None
 
 
-def extract_path(obj: Any) -> Optional[str]:
+def extract_path(obj: Any) -> str | None:
     """Pull a file path out of a tool-call argument object."""
     if not isinstance(obj, dict):
         return None

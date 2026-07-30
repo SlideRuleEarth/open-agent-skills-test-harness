@@ -45,7 +45,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 EVAL_SUFFIXES = (".yaml", ".yml", ".json")
 
@@ -55,7 +55,7 @@ EVAL_SUFFIXES = (".yaml", ".yml", ".json")
 REASONING_EFFORT_LEVELS = ("low", "medium", "high")
 
 
-def _normalize_effort(value, where: str) -> Optional[str]:
+def _normalize_effort(value, where: str) -> str | None:
     """Trim/lowercase and validate a reasoning-effort level; `where` prefixes the error so a
     typo (`reasoning_effort: hgih`) is a clean `error: ...` before any tokens are spent."""
     if value is None:
@@ -74,8 +74,8 @@ class ModelTarget:
     optional per-target reasoning effort, so a single run can compare e.g.
     claude-haiku-4.5@high against claude-opus-4.6@low. Effort resolves per cell as
     CLI --reasoning-effort > target > the spec's own `reasoning_effort:`."""
-    model: Optional[str] = None
-    reasoning_effort: Optional[str] = None
+    model: str | None = None
+    reasoning_effort: str | None = None
 
     @property
     def label(self) -> str:
@@ -130,23 +130,23 @@ class EvalSpec:
     description: str = ""
     skills: list[str] = field(default_factory=list)
     files: list[str] = field(default_factory=list)
-    fixture: Optional[str] = None
-    agents: Optional[list[str]] = None        # None = run on all CLI-selected agents
+    fixture: str | None = None
+    agents: list[str] | None = None        # None = run on all CLI-selected agents
     timeout_sec: int = 600
     tags: list[str] = field(default_factory=list)
     vars: dict[str, Any] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
-    reasoning_effort: Optional[str] = None    # one of REASONING_EFFORT_LEVELS, or None
+    reasoning_effort: str | None = None    # one of REASONING_EFFORT_LEVELS, or None
     assertions: list[dict] = field(default_factory=list)
     rubric: list[str] = field(default_factory=list)
-    output_schema: Optional[dict] = None
+    output_schema: dict | None = None
     # Declared MCP servers, PRE-interpolation — `${VAR}` is still literal here. Absent/empty
     # means MCP stays hermetically off, which is what every adapter's kill-switch enforces
     # (DESIGN_MCP_Support.md §4). Resolution happens per run via resolved_mcp_servers().
     mcp_servers: dict = field(default_factory=dict)
     # provenance (set by the loader)
-    source_path: Optional[str] = None
-    skill_name: Optional[str] = None
+    source_path: str | None = None
+    skill_name: str | None = None
 
     # --- derived ------------------------------------------------------------
 
@@ -185,7 +185,7 @@ class EvalSpec:
             out.append((src, dest))
         return out
 
-    def resolved_mcp_servers(self, env: Optional[dict] = None):
+    def resolved_mcp_servers(self, env: dict | None = None):
         """(servers with `${VAR}` substituted, values to redact from artifacts).
 
         Resolved per run rather than at load so an unset variable is a validation error
@@ -195,7 +195,7 @@ class EvalSpec:
         from .mcp import resolve_mcp_servers
         return resolve_mcp_servers(self.mcp_servers, env=env, base_dir=self.base_dir())
 
-    def resolved_fixture(self) -> Optional[str]:
+    def resolved_fixture(self) -> str | None:
         if not self.fixture:
             return None
         return self.fixture if os.path.isabs(self.fixture) else os.path.join(self.base_dir(), self.fixture)
@@ -248,8 +248,8 @@ class ValidationResult:
         return not self.errors
 
 
-def validate_spec(spec: "EvalSpec", *,
-                  available_skills: Optional[set[str]] = None,
+def validate_spec(spec: EvalSpec, *,
+                  available_skills: set[str] | None = None,
                   judge_enabled: bool = True) -> ValidationResult:
     """Check a spec for logical errors before spending tokens.
 
@@ -424,7 +424,7 @@ def validate_spec(spec: "EvalSpec", *,
 # ---------------------------------------------------------------------------
 
 def _load_raw(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         text = fh.read()
     if path.endswith((".yaml", ".yml")):
         try:
@@ -442,7 +442,7 @@ def _load_raw(path: str) -> dict:
     return data
 
 
-def _infer_skill_name(path: str) -> Optional[str]:
+def _infer_skill_name(path: str) -> str | None:
     """If the eval lives in <skill>/evals/<file>, return <skill>."""
     parent = os.path.dirname(os.path.abspath(path))
     if os.path.basename(parent) == "evals":
@@ -546,7 +546,7 @@ class Scenario:
     source_path: str
 
     @property
-    def models(self) -> list[Optional[str]]:
+    def models(self) -> list[str | None]:
         """Deprecated pre-#67 view of the target columns: model ids only (effort dropped)."""
         return [t.model for t in self.targets]
 
@@ -633,9 +633,9 @@ def skill_names(skills_root: str) -> list[str]:
 
 def discover_specs(
     *,
-    skills_root: Optional[str] = None,
-    skill: Optional[str] = None,
-    paths: Optional[list[str]] = None,
+    skills_root: str | None = None,
+    skill: str | None = None,
+    paths: list[str] | None = None,
 ) -> list[EvalSpec]:
     """Find eval files.
 

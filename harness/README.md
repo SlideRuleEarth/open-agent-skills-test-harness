@@ -30,7 +30,7 @@ evaluations").
 Each agent CLI speaks a different dialect of "structured output":
 
 | Agent | Invocation | Output |
-|-------|-----------|--------|
+| ------- | ----------- | -------- |
 | Claude Code | `claude -p … --output-format stream-json --verbose` | JSONL: `system`/`assistant`/`user`/`result`; tool calls in `tool_use` blocks; `--json-schema` → `structured_output` on the result event |
 | Codex | `codex --ask-for-approval never --sandbox workspace-write exec --json` | JSONL: `item.started`/`item.completed` with `item.type` = `command_execution`/`file_change`/`agent_message` |
 | AntiGravity | `agy -p "<prompt>" --output-format json --add-dir <workspace> --dangerously-skip-permissions` | one JSON object (`conversation_id`/`status`/`response`/`usage`) — the tool-call trace itself is read separately off disk, keyed by `conversation_id`; parse() falls back to JSONL → single JSON → raw text for older builds |
@@ -140,7 +140,7 @@ for AntiGravity) so the run is hermetic.
 ### Fields
 
 | field | meaning |
-|-------|---------|
+| ------- | --------- |
 | `name` | eval id (defaults to filename) |
 | `description` | what correct behavior looks like (given to the judge) |
 | `prompt` | the user message (legacy `query` also accepted) |
@@ -160,7 +160,7 @@ for AntiGravity) so the run is hermetic.
 ### Assertion types
 
 | type | checks |
-|------|--------|
+| ------ | -------- |
 | `file_exists` | `path` exists; optional `contains` / `matches` (regex) / `min_size` |
 | `file_absent` / `dir_exists` | workspace structure |
 | `ran_command` | a shell command matched `contains` / `matches` / `equals` (from the tool trace) |

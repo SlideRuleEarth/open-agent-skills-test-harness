@@ -23,7 +23,7 @@ import ctypes.util
 import errno
 import os
 
-__all__ = ["SUPPORTED", "listxattr", "getxattr", "setxattr", "removexattr"]
+__all__ = ["SUPPORTED", "getxattr", "listxattr", "removexattr", "setxattr"]
 
 _NOFOLLOW = 0x0001  # XATTR_NOFOLLOW, <sys/xattr.h> on darwin
 _libc = None

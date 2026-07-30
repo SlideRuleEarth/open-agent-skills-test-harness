@@ -44,7 +44,7 @@ HOME, so their `contained_home_subpaths` will be non-empty and the credential-du
 story becomes real for them". Measured, on macOS:
 
 | adapter | credential store | surface | duplication |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | claude 2.1.113 | login keychain | `[]` + `CLAUDE_CODE_OAUTH_TOKEN` | none |
 | copilot 1.0.72 | login keychain | `[]` + `GH_TOKEN` (or `COPILOT_GITHUB_TOKEN`/`GITHUB_TOKEN`) | none |
 | antigravity 1.1.7 | login keychain | **unmapped (`None`) — no route exists** | n/a |
@@ -158,7 +158,7 @@ the writes.**
 ### The open decision (SETTLED 2026-07-23 → materialize; see §0. Kept for the reasoning.)
 
 | | Materialize | Allowlist + verify |
-|---|---|---|
+| --- | --- | --- |
 | What | Build only the adapter's declared config surface. Real directories, files **copied**, no outward symlinks at all. | Keep declared auth files as symlinks; hash them before and after the run; fail the cell if content changed. |
 | Guarantee | Prevention | Detection after the fact |
 | Cost | Per-adapter empirical work: nobody knows what each CLI actually needs from HOME. Needs live runs. | Small; lands soon. |
@@ -182,7 +182,7 @@ fails closed, which is right, but it is a slow live-run loop per adapter.
 ## 2. What already exists (do not rebuild)
 
 | Thing | Where | What it does |
-|---|---|---|
+| --- | --- | --- |
 | `home_write_escapes(home)` | `agentskill_evals/isolation.py` | Every symlink in the overlay whose `realpath` falls outside it. **This is the lifting condition** — when it returns `[]`, the refusal stops firing on its own. Do not add special cases to it; make the HOME satisfy it. |
 | `_refuse_uncontained_home(home, eval_name, refs)` | `agentskill_evals/runner.py` | The refusal. Also refuses when `home is None` (no overlay = real HOME). |
 | `interpolated_refs(servers)` | `agentskill_evals/mcp.py` | Which declared fields carry a `${VAR}`. The exposure gate. **Never** use `bool(secrets)` for this — short values are excluded from redaction on purpose and are still credentials. |

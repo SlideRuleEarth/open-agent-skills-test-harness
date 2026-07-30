@@ -27,7 +27,6 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Optional
 
 from .adapters import get_adapter
 from .adapters.base import RunOptions
@@ -55,23 +54,23 @@ from .workspace_view import (
 @dataclass
 class CellResult:
     agent: str
-    model: Optional[str]
+    model: str | None
     eval_name: str
-    skill: Optional[str]
+    skill: str | None
     passed: bool
     run_result: RunResult
     # The target column's pinned effort (None = unpinned) — part of the cell's matrix
     # identity, so the same model can appear twice at different efforts.
-    reasoning_effort: Optional[str] = None
+    reasoning_effort: str | None = None
     # What the run actually used after resolution (CLI --reasoning-effort > target > spec).
-    effective_effort: Optional[str] = None
+    effective_effort: str | None = None
     assertions: list[AssertionResult] = field(default_factory=list)
-    judge_run_result: Optional[RunResult] = None
+    judge_run_result: RunResult | None = None
     artifacts_dir: str = ""
     isolated: bool = False
     ungraded: bool = False
     isolation_leaks: list[str] = field(default_factory=list)
-    scenario_path: Optional[str] = None
+    scenario_path: str | None = None
     # workspace-relative paths seeded before the run (fixture + files:) — inputs the report
     # annotates so they aren't mistaken for model output
     seeded_paths: list[str] = field(default_factory=list)
@@ -132,18 +131,18 @@ class Runner:
         self,
         agent: str,
         *,
-        targets: Optional[list[ModelTarget]] = None,
-        models: Optional[list[Optional[str]]] = None,
+        targets: list[ModelTarget] | None = None,
+        models: list[str | None] | None = None,
         artifacts_root: str,
         run_id: str,
         skills_root: str,
-        judge: Optional[Judge] = None,
+        judge: Judge | None = None,
         provision: bool = True,
         auto_approve: bool = True,
-        reasoning_effort: Optional[str] = None,
+        reasoning_effort: str | None = None,
         jobs: int = 1,
         isolated: bool = True,
-        progress: Optional[Progress] = None,
+        progress: Progress | None = None,
         command: str = "",
     ):
         if targets is None:
@@ -190,7 +189,7 @@ class Runner:
         self._run_secrets: tuple[str, ...] = ()
 
     @property
-    def models(self) -> list[Optional[str]]:
+    def models(self) -> list[str | None]:
         """Deprecated pre-#67 view of the target columns: model ids only (effort dropped)."""
         return [t.model for t in self.targets]
 
@@ -335,7 +334,7 @@ class Runner:
 
     def _failed_cell(self, target: ModelTarget, spec: EvalSpec, cell_idx: int,
                      cell_dir: str, exec_ws: str, exc: Exception,
-                     cleanup: "_CellCleanup") -> CellResult:
+                     cleanup: _CellCleanup) -> CellResult:
         """Best-effort CellResult for a cell that raised instead of completing normally — keeps
         one broken eval from aborting the whole run() batch, and still records something on disk
         (report.md/assertions.json) rather than leaving the cell's artifacts dir silently empty."""
@@ -399,7 +398,7 @@ class Runner:
 
     def _run_cell_body(self, target: ModelTarget, spec: EvalSpec, cell_idx: int,
                        cell_dir: str, workspace: str, exec_ws: str,
-                       exec_root: str, cleanup: "_CellCleanup") -> CellResult:
+                       exec_root: str, cleanup: _CellCleanup) -> CellResult:
         adapter = self.adapter
         p = self.progress
         model = target.model
@@ -1267,7 +1266,7 @@ def _as_targets(targets) -> list[ModelTarget]:
     return [t if isinstance(t, ModelTarget) else ModelTarget(t) for t in targets]
 
 
-def _judge_score(c: CellResult) -> Optional[tuple[int, int]]:
+def _judge_score(c: CellResult) -> tuple[int, int] | None:
     """(passed, total) rubric items from the judge, or None if no judge ran."""
     for a in c.judge_assertions:
         items = (a.details or {}).get("items", [])
@@ -1289,7 +1288,7 @@ def _score_parts(c: CellResult) -> str:
     return "  ".join(parts) if parts else f"{c.n_pass}/{c.n_total}"
 
 
-def _cell_text(c: Optional[CellResult]) -> str:
+def _cell_text(c: CellResult | None) -> str:
     if c is None:
         return "-"
     if c.run_result.error:
@@ -1300,7 +1299,7 @@ def _cell_text(c: Optional[CellResult]) -> str:
     return f"{'PASS' if c.passed else 'FAIL'}  {_score_parts(c)}{cost}"
 
 
-def _cell_mark(c: Optional[CellResult]) -> str:
+def _cell_mark(c: CellResult | None) -> str:
     if c is None:
         return "–"
     if c.run_result.error:
@@ -1343,14 +1342,14 @@ def render_matrix(results: list[CellResult], agent: str,
 
 def render_markdown(results: list[CellResult], agent: str,
                     targets: list[ModelTarget],
-                    run_dir: Optional[str] = None,
+                    run_dir: str | None = None,
                     command: str = "") -> str:
     targets = _as_targets(targets)
     by_key = {_cell_key(c): c for c in results}
     evals = sorted({c.eval_name for c in results})
     labels = [t.label for t in targets]
 
-    def _linked_mark(c: Optional[CellResult]) -> str:
+    def _linked_mark(c: CellResult | None) -> str:
         mark = _cell_mark(c)
         if run_dir and c is not None and c.artifacts_dir:
             rel = os.path.relpath(os.path.join(c.artifacts_dir, "report.md"), run_dir)
@@ -1361,9 +1360,9 @@ def render_markdown(results: list[CellResult], agent: str,
     if command:
         heading += f" ({command})"
     lines = [heading, "",
-             "Each cell links to a per-cell `report.md` — the prompt the model was given, "
+             ("Each cell links to a per-cell `report.md` — the prompt the model was given, "
              "its complete response (full transcript), and the workspace files after the "
-             "run (seeded inputs marked).", "",
+             "run (seeded inputs marked)."), "",
              "| eval | " + " | ".join(labels) + " |",
              "|" + "---|" * (len(labels) + 1)]
     for ev in evals:
@@ -1461,8 +1460,8 @@ def render_report(cell: CellResult) -> str:
         # analysis was not verified against).
         out.append(f"- **warning:** {w.strip()}")
     if cell.isolation_leaks:
-        out += ["", "> ⚠ **Isolation leak:** this run read undeclared skill(s) from the real "
-                    "repo checkout, bypassing HOME-based isolation:"]
+        out += ["", ("> ⚠ **Isolation leak:** this run read undeclared skill(s) from the real "
+                    "repo checkout, bypassing HOME-based isolation:")]
         for p in cell.isolation_leaks:
             out.append(f"> - `{p}`")
 
@@ -1487,8 +1486,8 @@ def render_report(cell: CellResult) -> str:
                           max_bytes=REPORT_MAX_INLINE_BYTES, truncate=True, seeded=seeded)
     if inline.strip():
         out += ["", inline]
-    out += ["", "_(Non-text files are listed above but not inlined; files seeded before the "
-                "run are marked as inputs.)_"]
+    out += ["", ("_(Non-text files are listed above but not inlined; files seeded before the "
+                "run are marked as inputs.)_")]
 
     out += ["", "## Judge verdict", ""]
     judge_a = next((a for a in cell.assertions if a.type == "llm_judge"), None)
@@ -1523,7 +1522,7 @@ def _safe(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
 
 
-def _model_seg(model: Optional[str]) -> str:
+def _model_seg(model: str | None) -> str:
     if not model:
         return "_default"
     safe = _safe(model)
@@ -1552,8 +1551,8 @@ _MODEL_ERR_KEYWORDS = ("not found", "unknown", "invalid", "unsupported",
                        "not available", "rejected")
 
 
-def _looks_like_model_error(error: Optional[str], stderr: Optional[str],
-                            model: Optional[str] = None) -> bool:
+def _looks_like_model_error(error: str | None, stderr: str | None,
+                            model: str | None = None) -> bool:
     blob = f"{error or ''} {stderr or ''}".lower()
     if any(p in blob for p in _MODEL_ERR_PHRASES):
         return True
@@ -1869,7 +1868,7 @@ def _cred_source(interpolated: list[str], env_names: list[str]) -> str:
     return " and ".join(parts)
 
 
-def _refuse_uncontained_home(home: Optional[str], eval_name: str, refs: list[str],
+def _refuse_uncontained_home(home: str | None, eval_name: str, refs: list[str],
                              source: str) -> None:
     """Fail a credential-bearing cell whose $HOME has write paths into the real home.
 
@@ -1942,7 +1941,7 @@ def _refuse_uncredentialed_contained_home(eval_name: str, declared: list[str],
         f"the credential so the cell can take the ordinary isolation overlay.")
 
 
-def _purge(label: str, path: Optional[str], tail: str = _CREDENTIAL_TAIL) -> str:
+def _purge(label: str, path: str | None, tail: str = _CREDENTIAL_TAIL) -> str:
     """Remove a directory that held credentials; return a sentence if it is still there.
 
     `shutil.rmtree(..., ignore_errors=True)` answers "did this raise", which is not the
@@ -1983,8 +1982,8 @@ class _CellCleanup:
         self._owned: list[tuple[str, str, bool, str]] = []
         self._notes: list[tuple[bool, str]] = []
 
-    def own(self, label: str, path: Optional[str], *, fatal: bool = True,
-            tail: Optional[str] = None) -> None:
+    def own(self, label: str, path: str | None, *, fatal: bool = True,
+            tail: str | None = None) -> None:
         """Register a directory as this cell's to remove; `None` is a no-op.
 
         `fatal` says what a failure to remove it MEANS. The credential directories fail the
@@ -2020,7 +2019,7 @@ class _CellCleanup:
         if text and (fatal, text) not in self._notes:
             self._notes.append((fatal, text))
 
-    def purge(self, path: Optional[str]) -> None:
+    def purge(self, path: str | None) -> None:
         """Remove one registered directory, keeping any failure; `None` is a no-op.
 
         Deliberately NOT a "purge everything" default: the callers pass a variable that is
@@ -2101,7 +2100,7 @@ def _all_offending_paths(root: str, secrets) -> list[str]:
     return [path for _, path in sorted(found)]
 
 
-def _first_offending_path(root: str, secrets) -> Optional[str]:
+def _first_offending_path(root: str, secrets) -> str | None:
     """The SHALLOWEST offending path, which is the one worth renaming.
 
     Shallowest rather than deepest because renaming one component fixes every path below

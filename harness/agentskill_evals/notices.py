@@ -21,7 +21,7 @@ from __future__ import annotations
 import sys
 import threading
 from contextlib import contextmanager
-from typing import Iterator
+from collections.abc import Iterator
 
 _local = threading.local()
 

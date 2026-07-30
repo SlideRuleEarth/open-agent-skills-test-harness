@@ -14,7 +14,6 @@ import subprocess
 import sys
 from ctypes import wintypes
 from dataclasses import dataclass
-from typing import Optional
 
 from .adapters.base import Adapter, RunOptions
 from .notices import collecting
@@ -61,7 +60,7 @@ class UnsupportedPlatform(OSError):
     """
 
 
-def _unsupported_platform() -> Optional[str]:
+def _unsupported_platform() -> str | None:
     """Why this platform cannot be used, or None if it can.
 
     Windows: a Job Object is the only thing that reliably kills a process tree there, and
@@ -372,7 +371,7 @@ def _win32_kernel32():  # pragma: no cover — win32 only; stubbed in the selfte
     return ctypes.WinDLL("kernel32", use_last_error=True)
 
 
-def _win32_assign_job(proc: subprocess.Popen) -> Optional[int]:
+def _win32_assign_job(proc: subprocess.Popen) -> int | None:
     """Put *proc* into a fresh Windows Job Object; return the job handle, or None.
 
     A Job Object is the only Windows mechanism that reliably kills a process TREE, and
@@ -485,7 +484,6 @@ def _win32_abandon(k32, job: int) -> None:  # pragma: no cover — win32 only
     has failed either way, and the run is refused either way. What matters is that the
     attempt is made in the right order."""
     _win32_sweep_job(job, k32)
-    return None
 
 
 def _win32_sweep_job(job: int, k32=None) -> bool:  # pragma: no cover — win32 only
@@ -585,8 +583,8 @@ class _ProcessTree:
         self._proc = proc
         # start_new_session was passed iff _HAS_KILLPG, so the pgid is the child's pid
         # exactly then. Never re-derived later; see the class docstring.
-        self._pgid: Optional[int] = proc.pid if _HAS_KILLPG else None
-        self._job: Optional[int] = (_win32_assign_job(proc)
+        self._pgid: int | None = proc.pid if _HAS_KILLPG else None
+        self._job: int | None = (_win32_assign_job(proc)
                                     if sys.platform == "win32" else None)
 
     @property

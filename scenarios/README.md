@@ -112,7 +112,7 @@ assertion has a `type` and type-specific fields. All types accept an optional
 ### Filesystem
 
 | Type | Required | Optional | Checks |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `file_exists` | `path` | `contains`, `matches`, `min_size` | File exists in workspace |
 | `file_absent` | `path` | | File does NOT exist |
 | `dir_exists` | `path` | | Directory exists |
@@ -120,7 +120,7 @@ assertion has a `type` and type-specific fields. All types accept an optional
 ### Tool / command trace
 
 | Type | Required | Optional | Checks |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `ran_command` | | `contains`, `matches`, `equals`, `ignore_case` | A shell command matched |
 | `used_tool` | `name` | | Tool name appeared in the trace |
 | `tool_count` | | `min`, `max` | Total tool calls within range |
@@ -131,7 +131,7 @@ These check whether the agent accessed a provisioned skill's files during the ru
 `path` is relative to the skill's `references/` or `scripts/` subdirectory.
 
 | Type | Required | Optional | Checks |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `skill_triggered` | `skill` | | Any access to files under the skill dir |
 | `skill_not_triggered` | `skill` | | No access to the skill dir |
 | `skill_reference_read` | `skill` | `path` | Read from `<skill>/references/` |
@@ -165,7 +165,7 @@ assertions:
 ### Process / output
 
 | Type | Required | Optional | Checks |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `exit_code` | | `equals` (default 0) | Process exit code |
 | `no_error` | | | Clean run: exit 0, no timeout, no harness error |
 | `final_contains` | | `contains`, `matches`, `equals`, `ignore_case` | Final answer text matches |
@@ -173,7 +173,7 @@ assertions:
 ### Schema + judge
 
 | Type | Required | Optional | Checks |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `output_matches_schema` | | `schema` | Structured output validates against JSON Schema |
 | `llm_judge` | | `rubric`, `threshold` | LLM judge grades rubric items |
 
@@ -192,7 +192,7 @@ something was verified once and would otherwise only be re-verified by accident.
 Mark them **both** ways, because the two marks do different jobs:
 
 | Mark | Who reads it |
-|---|---|
+| --- | --- |
 | `regress_` filename prefix | a human scanning `scenarios/` — they sort together and are obvious in a diff |
 | `tags: [regression]` | anyone reading the **results** — every cell records its tags in `assertions.json` and `summary.json`, so a result can be attributed to a regression rather than an experiment without going back to the YAML (which may have changed since) |
 

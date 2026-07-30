@@ -21,3 +21,48 @@ agentskill-evals = "agentskill_evals.cli:main"
 
 [tool.setuptools]
 packages = ["agentskill_evals", "agentskill_evals.adapters"]
+
+# --- lint --------------------------------------------------------------------------
+#
+# Pinned so the answer does not depend on whose editor is open. Without this every
+# developer's Ruff extension picks its own rule set, and the repo was reporting 500+
+# findings on one machine and a handful on another — which makes "the lint is clean" an
+# unanswerable claim rather than a false one.
+#
+# `select` is exactly what this tree passes at zero findings, so a new one is a real
+# regression rather than a pre-existing debt to scroll past. `ignore` is not a backlog:
+# each entry is a decision, and the reason is what stops it being re-litigated per machine.
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# EXACTLY the families this tree passes at ZERO findings — verified per family, not
+# guessed. That is the whole contract: a finding here is a regression introduced by the
+# change in front of you, never pre-existing debt to scroll past. An `ignore` list would
+# undo that, since every entry is a rule the config claims to enforce and doesn't; there
+# is deliberately none.
+#
+#   F, E4/E9   pyflakes + the syntax/import errors that are always bugs
+#   UP         PEP 585/604 typing — `X | None`, not `Optional[X]`. Enforced because the
+#              tree was 202 findings deep in mixed style and every new annotation drifted.
+#   ISC        implicit string concatenation in a collection, which is indistinguishable
+#              from a forgotten comma — and tools/mutate_mcp.py is one long list of
+#              multi-line string tuples where that mistake would silently merge entries.
+#   PIE A W G LOG PT FURB   clean already; enforced so they stay that way.
+#
+# NOT selected, each for a reason rather than as a backlog. SIM115 (90) is `open(p).read()`
+# in selftest assertions. RUF012 (72) wants ClassVar on the adapter declaration fields whose
+# None-vs-`[]` distinction adapters/base.py documents at length — more precise, but it
+# changes semantics on the dataclasses in that same file, so it is deliberate work and not a
+# lint fix. BLE001 (31) is the contract in cleanup and verification paths, where a raise
+# would be reported as the failure it was describing; those sites carry `# noqa: BLE001`
+# with the reason inline. I001 (29) would churn 29 files' imports for nothing. PL/S/TRY/SLF/
+# ARG/PTH run to hundreds and are style, not correctness, in a harness that shells out and
+# inspects returncodes by design.
+#
+# Note the interaction if anyone adds RUF100 (unused-noqa) later: it reads `# noqa: X` as
+# unused when X is not selected, so enabling it while BLE001 is off DELETES those annotated
+# suppressions and their rationale. That happened once here; it cost 16 hand-written
+# comments and was caught in the diff.
+select = ["F", "E4", "E9", "UP", "ISC", "PIE", "A", "W", "G", "LOG", "PT", "FURB"]

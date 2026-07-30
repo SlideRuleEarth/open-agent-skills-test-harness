@@ -47,7 +47,8 @@ import ntpath
 import os
 import re
 import sys
-from typing import Any, Mapping, Optional
+from typing import Any
+from collections.abc import Mapping
 
 from ..schema import EventKind, NormalizedEvent
 from .base import (
@@ -158,7 +159,7 @@ def _agent_definition_files(root: str) -> list[str]:
     return sorted(out)
 
 
-def _custom_agent_files(home: str, cwd: Optional[str]) -> list[str]:
+def _custom_agent_files(home: str, cwd: str | None) -> list[str]:
     """Every LOCAL custom-agent definition file discoverable for a run:
     ``<home>/agents`` plus the ``.github/agents`` / ``.claude/agents`` convention
     dirs of the PHYSICAL run cwd (``os.path.realpath`` — a cwd symlinked into a tree
@@ -299,7 +300,7 @@ _APP_ROOT_VERSION_RE = re.compile(
     r"[/\\]pkg[/\\][^/\\]+[/\\](" + _VERSION_DIR + r")[/\\]builtin[/\\]")
 
 
-def _app_root_version(path: str) -> Optional[str]:
+def _app_root_version(path: str) -> str | None:
     """The app-root version *path* was emitted out of, or None if it names no app root."""
     last = None
     for m in _APP_ROOT_VERSION_RE.finditer(path):
@@ -307,7 +308,7 @@ def _app_root_version(path: str) -> Optional[str]:
     return last
 
 
-def _stream_cli_version(stdout: str) -> Optional[str]:
+def _stream_cli_version(stdout: str) -> str | None:
     """The CLI version that actually EXECUTED, read out of the child's own stream.
 
     Same epistemics as the MCP witness, and for the same reason: the evidence comes from
@@ -389,7 +390,7 @@ _PROVENANCE = VersionProvenance(
 _WARNED_VERSIONS = _base_warned_versions
 
 
-def _check_cli_version_denied(version: Optional[str], *, completed: bool = False) -> None:
+def _check_cli_version_denied(version: str | None, *, completed: bool = False) -> None:
     """Fail a run that executed a build KNOWN to break a hermeticity assumption.
 
     Post-run detection, not prevention — see ``VersionProvenance.check_denied``. Worth
@@ -407,7 +408,7 @@ def _check_cli_version_denied(version: Optional[str], *, completed: bool = False
     _PROVENANCE.check_denied(version, completed=completed)
 
 
-def _warn_cli_version_drift(version: Optional[str], *, agent: str = "copilot",
+def _warn_cli_version_drift(version: str | None, *, agent: str = "copilot",
                             witnessed: bool = False) -> None:
     """Warn once per version that a run executed an unverified build.
 
@@ -420,7 +421,7 @@ def _warn_cli_version_drift(version: Optional[str], *, agent: str = "copilot",
     _PROVENANCE.warn_drift(version, witnessed=witnessed)
 
 
-def _bundle_search_roots(env_map: Optional[Mapping[str, str]] = None) -> list[str]:
+def _bundle_search_roots(env_map: Mapping[str, str] | None = None) -> list[str]:
     """The ``pkg`` roots a copilot app bundle can live under.
 
     Transcribed from the root list in 1.0.72's own loader rather than inferred:
@@ -456,7 +457,7 @@ def _bundle_search_roots(env_map: Optional[Mapping[str, str]] = None) -> list[st
     return roots
 
 
-def find_cli_bundles(env_map: Optional[Mapping[str, str]] = None
+def find_cli_bundles(env_map: Mapping[str, str] | None = None
                      ) -> list[tuple[str, str]]:
     """Every discoverable ``(version, app.js path)``, newest-sorting last.
 
@@ -566,7 +567,7 @@ _WITNESS_SENTINEL = "github-mcp-server"
 
 
 def _mcp_witness(stdout: str,
-                 exit_code: Optional[int]) -> tuple[Optional[str], list[str], bool]:
+                 exit_code: int | None) -> tuple[str | None, list[str], bool]:
     """Read copilot's MCP witness out of its own event stream.
 
     Returns ``(contract_violation, live_servers, witnessed)`` — the violation being
@@ -721,10 +722,10 @@ def _mcp_witness(stdout: str,
         return ("no well-formed session.mcp_servers_loaded event reached the harness",
                 _fmt_live(live), witnessed)
     if completed and not sentinel_seen:
-        return (f"session.mcp_servers_loaded never named the built-in "
+        return ((f"session.mcp_servers_loaded never named the built-in "
                 f"{_WITNESS_SENTINEL!r}, which a hermetic invocation always configures "
                 "and disables — so the event is not describing the MCP host this "
-                "adapter was verified against", _fmt_live(live), witnessed)
+                "adapter was verified against"), _fmt_live(live), witnessed)
     return None, _fmt_live(live), witnessed
 
 
@@ -816,13 +817,13 @@ def _jsonc_loads(text: str) -> Any:
     return json.loads(_jsonc_strip(text))
 
 
-def _load_copilot_config(path: str) -> Optional[Any]:
+def _load_copilot_config(path: str) -> Any | None:
     """``config.json`` parsed with copilot's JSONC tolerance — line/inline/block
     comments and trailing commas (the same live-verified grammar the user
     mcp-config.json gets, see _jsonc_strip) — or None when unreadable/unparseable
     (copilot's config loader treats an unparseable file as empty)."""
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             raw = f.read()
     except OSError:
         return None
@@ -914,7 +915,7 @@ _CONFIG_CHANNEL_LONG = ("--additional-mcp-config", "--agent", "--plugin-dir",
                         "--config-dir", "--prefer-version", "--output-format")
 
 
-def _config_channel_token(extra_args: list[str]) -> Optional[str]:
+def _config_channel_token(extra_args: list[str]) -> str | None:
     """The first extra_args token that opens a copilot configuration channel — or
     suppresses the output channel the post-run audit reads — or None. A token that merely
     LOOKS like one (e.g. a value following some unrelated flag) is reported too — that
@@ -978,7 +979,7 @@ def _js_trim(s: str) -> str:
     return s.strip(_JS_WS)
 
 
-def _odr_registry_command() -> Optional[str]:
+def _odr_registry_command() -> str | None:
     """The ODR command line from the registry, or None when the gate is off (non-win32,
     key/value absent). An unreadable key with the gate possibly on raises RuntimeError.
 
@@ -1031,7 +1032,7 @@ def _mcp_server_names(path: str) -> list[str]:
     BOM-prefixed workspace file left unparsed would MISS its servers (over-enumeration
     here is harmless, under-enumeration leaks)."""
     try:
-        with open(path, "r", encoding="utf-8-sig") as f:
+        with open(path, encoding="utf-8-sig") as f:
             data = json.load(f)
     except (OSError, ValueError):
         return []
@@ -1057,7 +1058,7 @@ def _user_mcp_server_names(path: str) -> list[str]:
     something is exactly the hole Phase 0 forbids. Only an ABSENT file is no
     servers."""
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             raw = f.read()
     except FileNotFoundError:
         return []
@@ -1251,7 +1252,7 @@ def _win_fully_qualified(path: str) -> bool:
     return tail[:1] in ("\\", "/")          # lettered X: — qualified only when rooted
 
 
-def _copilot_home(env_map: Mapping[str, str], cwd: Optional[str] = None) -> str:
+def _copilot_home(env_map: Mapping[str, str], cwd: str | None = None) -> str:
     """The directory copilot reads its user config (``mcp-config.json``, ``config.json``)
     from: ``$COPILOT_HOME`` when non-empty (an EMPTY value is unset to copilot too —
     verified 1.0.64: ``COPILOT_HOME=""`` falls back to ``$HOME/.copilot``), else
@@ -1556,14 +1557,14 @@ class CopilotAdapter(Adapter):
             env.pop(var, None)
         return env
 
-    def _probe_argv(self, model: str, *, cwd: Optional[str] = None,
-                    env: Optional[dict] = None):
+    def _probe_argv(self, model: str, *, cwd: str | None = None,
+                    env: dict | None = None):
         return [self.binary, "-p", "say ok", *self._HERMETIC,
                 *self._mcp_disable_args(cwd or os.getcwd(), env=env),
                 "--model", model, "--output-format", "json", "--allow-all"]
 
-    def _mcp_disable_args(self, cwd: Optional[str],
-                          env: Optional[Mapping[str, str]] = None) -> list[str]:
+    def _mcp_disable_args(self, cwd: str | None,
+                          env: Mapping[str, str] | None = None) -> list[str]:
         """``--disable-mcp-server <name>`` for every enumerable server: the built-in /
         feature-gated in-process servers (``_BUILTIN_MCP_SERVERS`` — unconditionally,
         since --disable-builtin-mcps names only github-mcp-server in 1.0.64), the user
@@ -1727,7 +1728,7 @@ class CopilotAdapter(Adapter):
                                    premium_requests=float(pr) if pr is not None else None)
         return ProbeResult(accepted=True)
 
-    def mcp_servers_seen(self, argv: list[str]) -> Optional[list[str]]:
+    def mcp_servers_seen(self, argv: list[str]) -> list[str] | None:
         """The servers this run disabled by name — copilot's record of what its
         configuration held at launch. Same reader the post-run re-check uses."""
         return sorted(_disabled_server_names(argv))
@@ -1776,7 +1777,7 @@ class CopilotAdapter(Adapter):
 
     def verify_post_run(self, argv: list[str], opts: RunOptions, *, cwd: str,
                         stdout: str = "", stderr: str = "",
-                        exit_code: Optional[int] = None) -> None:
+                        exit_code: int | None = None) -> None:
         """Audit the finished run two ways: what copilot SAID it loaded, and whether the
         state the disable set was computed from still says the same thing.
 
@@ -1896,7 +1897,7 @@ class CopilotAdapter(Adapter):
         _warn_cli_version_drift(version, agent=self.name, witnessed=witnessed)
 
     def parse(self, stdout: str, stderr: str, exit_code: int,
-               *, opts: Optional[RunOptions] = None) -> ParseOutput:
+               *, opts: RunOptions | None = None) -> ParseOutput:
         events: list[NormalizedEvent] = []
         final_text = ""
         structured: Any = None

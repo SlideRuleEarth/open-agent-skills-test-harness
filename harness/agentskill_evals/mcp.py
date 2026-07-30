@@ -22,7 +22,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 # Names ride into tool identifiers (`mcp__<server>__<tool>`), argv, and TOML dotted paths,
 # so the accepted set is the intersection of what all four CLIs take: codex's `mcp add`
@@ -66,13 +66,13 @@ class MCPServer:
     returns the substituted values alongside so they can be scrubbed from artifacts.
     """
     name: str
-    command: Optional[str] = None
+    command: str | None = None
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
-    url: Optional[str] = None
+    url: str | None = None
     transport: str = "http"
     headers: dict[str, str] = field(default_factory=dict)
-    tools: Optional[list[str]] = None   # None = no filter; [] = an explicit empty allowlist
+    tools: list[str] | None = None   # None = no filter; [] = an explicit empty allowlist
 
     @property
     def is_stdio(self) -> bool:
@@ -157,7 +157,7 @@ def parse_mcp_servers(raw: Any, *, where: str) -> dict[str, MCPServer]:
     return out
 
 
-def _str_or_none(value, where: str) -> Optional[str]:
+def _str_or_none(value, where: str) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str) or not value:
@@ -216,7 +216,7 @@ def _interpolatable(s: MCPServer) -> list[str]:
 
 
 def validate_mcp_servers(servers: dict[str, MCPServer], *,
-                         env: Optional[dict] = None) -> tuple[list[str], list[str]]:
+                         env: dict | None = None) -> tuple[list[str], list[str]]:
     """Adapter-independent checks. Returns (errors, warnings)."""
     environ = os.environ if env is None else env
     errors: list[str] = []
@@ -248,7 +248,7 @@ def validate_mcp_servers(servers: dict[str, MCPServer], *,
     return errors, warnings
 
 
-def interpolated_refs(servers: Optional[dict[str, MCPServer]]) -> list[str]:
+def interpolated_refs(servers: dict[str, MCPServer] | None) -> list[str]:
     """Which declared fields carry a `${VAR}`, i.e. will hold a credential once resolved.
 
     A property of the DECLARATION, so it needs no environment and cannot be confused with
@@ -274,8 +274,8 @@ def interpolated_refs(servers: Optional[dict[str, MCPServer]]) -> list[str]:
 
 
 def resolve_mcp_servers(servers: dict[str, MCPServer], *,
-                        env: Optional[dict] = None,
-                        base_dir: Optional[str] = None
+                        env: dict | None = None,
+                        base_dir: str | None = None
                         ) -> tuple[dict[str, MCPServer], set[str]]:
     """Substitute `${VAR}`, absolutize scenario-relative paths, collect the secrets.
 
@@ -319,7 +319,7 @@ def resolve_mcp_servers(servers: dict[str, MCPServer], *,
     return out, secrets
 
 
-def _abs_command(command: Optional[str], base_dir: Optional[str]) -> Optional[str]:
+def _abs_command(command: str | None, base_dir: str | None) -> str | None:
     """Absolutize only a path-shaped command naming a real file under the scenario dir.
 
     `python3` must stay a PATH lookup — rewriting it would break every host whose
@@ -333,7 +333,7 @@ def _abs_command(command: Optional[str], base_dir: Optional[str]) -> Optional[st
     return candidate if os.path.isfile(candidate) else command
 
 
-def _abs_arg(arg: str, base_dir: Optional[str]) -> str:
+def _abs_arg(arg: str, base_dir: str | None) -> str:
     if not base_dir or os.path.isabs(arg) or arg.startswith("-"):
         return arg
     candidate = os.path.join(base_dir, arg)
