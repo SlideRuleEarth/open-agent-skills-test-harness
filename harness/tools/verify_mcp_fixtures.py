@@ -634,7 +634,28 @@ check("served despite absent capabilities", r and "result" in r[0], r)
 check("and served in modern shape",
       r and r[0]["result"].get("resultType") == "complete", r)
 
-print("E9. subscriptions/listen is declined, not faked")
+print("E9. an explicit null version is malformed, not absent")
+# The laundering state specifically: AFTER a valid legacy initialization, where the
+# absent-version path is legal and would otherwise swallow a present-but-null field.
+r, n, recs, st = echo([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": "2025-11-25"}},
+                       {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {
+                           "_meta": {"io.modelcontextprotocol/protocolVersion": None}}},
+                       {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}])
+by = {m["id"]: m for m in r}
+check("legacy initialization accepted", "result" in by.get(1, {}), by.get(1))
+check("null version rejected even with legacy in force", "error" in by.get(2, {}), by.get(2))
+check("... with -32602 (malformed, not unsupported)",
+      by.get(2, {}).get("error", {}).get("code") == -32602, by.get(2))
+check("a genuinely bare request is still legal", "result" in by.get(3, {}), by.get(3))
+
+r, n, recs, st = echo([{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+    "protocolVersion": "2025-11-25",
+    "_meta": {"io.modelcontextprotocol/protocolVersion": None}}}])
+check("null-version initialize is not a legacy handshake", r and "error" in r[0], r)
+check("... also -32602", r and r[0].get("error", {}).get("code") == -32602, r)
+
+print("E10. subscriptions/listen is declined, not faked")
 r, n, recs, st = echo([modern("subscriptions/listen", 1,
                               notifications={"toolsListChanged": True})])
 check("method not found", r and "error" in r[0], r)

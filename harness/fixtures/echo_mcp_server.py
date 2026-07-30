@@ -22,19 +22,30 @@ newline-delimited JSON, not LSP-style Content-Length framing). stdout carries pr
 traffic and NOTHING else — any diagnostic goes to stderr, because a stray print would be
 parsed as a message and desync the peer.
 
-DUAL-ERA. It serves both the `initialize` handshake (legacy, 2025-11-25 and earlier) and
-per-request `_meta` (modern, 2026-07-28+), deciding per REQUEST from that request's own
-metadata rather than holding a session era. Probe C3-0 measured the shipped fleet as split
-across both, so a legacy-only fixture cannot serve all four CLIs.
+DUAL-ERA, over a bounded set of revisions. It implements the `initialize` handshake for the
+two legacy versions the shipped fleet was measured speaking (`2025-11-25`, `2025-06-18`)
+and per-request `_meta` for exactly `2026-07-28` — not "2026-07-28 and later", since a
+revision nobody has read cannot be served conformantly. Anything outside those sets is
+refused, modern with `-32022` and its supported list. Probe C3-0 measured the fleet as
+split across both eras (§9), so a legacy-only fixture cannot serve all four CLIs.
+
+Era comes from the request, with ONE piece of state. A modern request is judged entirely on
+its own `_meta`, because modern MCP is stateless. Legacy is the exception the spec carves
+out: `initialize` selects legacy semantics for the process, and the fixture remembers that,
+because bare later messages carry no metadata to re-derive it from. The corollary is the
+one an earlier revision of this file got wrong — **absence of modern metadata is not
+legacy.** Before an `initialize`, a bare request establishes nothing and is refused.
 
 It is LENIENT ABOUT INPUT AND STRICT ABOUT OUTPUT, and the asymmetry is deliberate — this
-is a test double, not a measuring instrument. `probe_era_mcp_server.py` rejects a client
-that omits a required `_meta` field, because catching that is its entire job; this fixture
-answers anyway, because a scenario here is testing the harness and a CLI quirk should not
-surface as a scenario failure attributed to the wrong thing. Its own replies stay
-conforming regardless: a malformed server changes client behaviour, which C3-1 established
-the expensive way when agy's measured shutdown path changed once the probe stopped being
-malformed. The version-mirroring in `_initialize` is the same principle, already applied.
+is a test double, not a measuring instrument. Where `probe_era_mcp_server.py` rejects a
+client for any missing required `_meta` field because catching that is its entire job, this
+fixture tolerates a missing `clientCapabilities`: the version still identifies the era, so
+it can still answer conformantly, and a CLI quirk should not surface as a scenario failure
+attributed to the wrong thing. That leniency stops precisely at the protocol version.
+Absent or malformed, there is no way to know which shape of reply would be correct, so
+guessing would produce exactly the malformed server this fixture must not be — C3-1
+established that cost the expensive way, when agy's measured shutdown path changed once the
+probe stopped being one.
 
 No third-party imports, by rule: this runs as a subprocess of an agent CLI, inside a
 per-cell tempdir, on whatever interpreter `command:` resolves to. A dependency here would
@@ -104,15 +115,24 @@ def _send(msg: dict) -> None:
     sys.stdout.flush()
 
 
+_ABSENT = object()
+
+
 def _claimed_version(msg: dict):
-    """The protocol version this request declares, or None if it declares none."""
+    """The protocol version this request declares, or `_ABSENT` if it declares none.
+
+    A sentinel rather than `None`, because `None` is a value the client can actually send:
+    `"protocolVersion": null` is a *present but malformed* field, and returning `None` for
+    it made it indistinguishable from an absent one. The absent path then read it as
+    legacy, so an explicit null was laundered into a successful legacy reply — including on
+    an `initialize` carrying modern `_meta`, which is not a legacy handshake at all."""
     params = msg.get("params")
     if not isinstance(params, dict):
-        return None
+        return _ABSENT
     meta = params.get("_meta")
     if not isinstance(meta, dict):
-        return None
-    return meta.get(VER_KEY)
+        return _ABSENT
+    return meta.get(VER_KEY, _ABSENT)
 
 
 def _reject(req_id, msg: dict, method) -> bool:
@@ -131,7 +151,7 @@ def _reject(req_id, msg: dict, method) -> bool:
     era inversions §10.2 forbids, all from one missing distinction."""
     claimed = _claimed_version(msg)
 
-    if claimed is not None:
+    if claimed is not _ABSENT:
         if not isinstance(claimed, str):
             _error(req_id, -32602, "malformed _meta: protocolVersion must be a string")
             return True
