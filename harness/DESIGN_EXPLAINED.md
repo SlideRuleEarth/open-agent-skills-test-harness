@@ -409,7 +409,7 @@ Grouped by the job each file does. Start with the **bold** ones.
 - [`tools/mutate_mcp.py`](tools/mutate_mcp.py) — mutation testing.
 - [`tools/probe_contained_home.py`](tools/probe_contained_home.py) — measures what a CLI *actually* needs from your real home, by driving the harness's own launch path against a progressively emptier HOME. This is how each adapter's credential surface was determined; it answers questions no amount of reading the source can.
 - [`fixtures/probe_era_mcp_server.py`](fixtures/probe_era_mcp_server.py) — the same idea aimed at the wire: an MCP server that measures the *CLI on the other end* — which version of the protocol it speaks, and how it shuts a server down. This is how we learned the four CLIs are not all speaking the same protocol, which a reasonable person would have assumed.
-- [`tools/verify_probe_shim.py`](tools/verify_probe_shim.py) — checks that instrument against a scripted client, because a measurement is only as good as the thing that took it.
+- [`tools/verify_mcp_fixtures.py`](tools/verify_mcp_fixtures.py) — drives both stdio fixtures against a scripted client, because a measurement is only as good as the thing that took it, and a test double only as good as its resemblance to a real server.
 
 ---
 

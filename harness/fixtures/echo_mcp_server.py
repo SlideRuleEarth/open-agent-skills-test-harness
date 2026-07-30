@@ -22,6 +22,34 @@ newline-delimited JSON, not LSP-style Content-Length framing). stdout carries pr
 traffic and NOTHING else — any diagnostic goes to stderr, because a stray print would be
 parsed as a message and desync the peer.
 
+DUAL-ERA, over a bounded set of revisions. It implements the `initialize` handshake for the
+two legacy versions the shipped fleet was measured speaking (`2025-11-25`, `2025-06-18`)
+and per-request `_meta` for exactly `2026-07-28` — not "2026-07-28 and later", since a
+revision nobody has read cannot be served conformantly. Anything outside those sets is
+refused, modern with `-32022` and its supported list. Probe C3-0 measured the fleet as
+split across both eras (§9), so a legacy-only fixture cannot serve all four CLIs.
+
+Era comes from the request, with ONE piece of state. A modern request is judged entirely on
+its own `_meta`, because modern MCP is stateless. Legacy is the exception the spec carves
+out: `initialize` selects legacy semantics for the process, and the fixture remembers that,
+because bare later messages carry no metadata to re-derive it from. The corollary is the
+one an earlier revision of this file got wrong — **absence of modern metadata is not
+legacy.** Before an `initialize`, a bare request establishes nothing and is refused.
+
+It is LENIENT ABOUT INPUT AND STRICT ABOUT OUTPUT, and the asymmetry is deliberate — this
+is a test double, not a measuring instrument. Where `probe_era_mcp_server.py` rejects a
+client for any missing required `_meta` field because catching that is its entire job, this
+fixture tolerates a missing `clientCapabilities`: the version still identifies the era, so
+it can still answer conformantly, and a CLI quirk should not surface as a scenario failure
+attributed to the wrong thing. The tolerance runs ONE WAY ONLY — version present and
+capabilities absent is served; capabilities present and version absent is a broken *modern*
+request and is refused, not quietly downgraded to legacy. That leniency stops precisely at
+the protocol version.
+Absent or malformed, there is no way to know which shape of reply would be correct, so
+guessing would produce exactly the malformed server this fixture must not be — C3-1
+established that cost the expensive way, when agy's measured shutdown path changed once the
+probe stopped being one.
+
 No third-party imports, by rule: this runs as a subprocess of an agent CLI, inside a
 per-cell tempdir, on whatever interpreter `command:` resolves to. A dependency here would
 be a dependency of every scenario that uses it.
@@ -32,11 +60,35 @@ import json
 import os
 import sys
 
-# Mirrored back to whatever the client asks for (see _initialize). Used only when the
-# client omits the field.
-_FALLBACK_PROTOCOL = "2025-06-18"
+# The legacy revisions this fixture actually implements — the two the shipped fleet was
+# measured speaking (§9: claude and copilot 2025-11-25, codex 2025-06-18). An earlier
+# version MIRRORED whatever the client asked for, so that a protocol bump in any CLI would
+# not turn into a mysterious scenario failure. That reasoning was wrong in a way worth
+# recording: mirroring `2099-01-01` claims to implement a revision this file has never
+# heard of, and a client that believes the claim gets a 2025-shaped answer to a 2099
+# request. Selecting from a set it really implements is what the legacy lifecycle asks
+# for, and a version mismatch is then visible instead of silently wrong. Extend this tuple
+# when a CLI moves.
+LEGACY_VERSIONS = ("2025-11-25", "2025-06-18")
+
+# Modern MCP (revision 2026-07-28) dropped the `initialize` handshake for per-request
+# `_meta`. Probe C3-0 measured the shipped fleet as SPLIT — claude and copilot on
+# 2025-11-25, codex on 2025-06-18, agy already modern (DESIGN_MCP_Support.md §9) — so a
+# legacy-only fixture would simply fail to serve agy, and any scenario reaching it under
+# Phase 3 would look like a harness bug rather than a missing mode.
+MODERN_VERSION = "2026-07-28"
+VER_KEY = "io.modelcontextprotocol/protocolVersion"
+CAP_KEY = "io.modelcontextprotocol/clientCapabilities"
+# Methods that exist only in the modern revision, so a request for one carrying no modern
+# `_meta` is unknown rather than servable.
+MODERN_ONLY_METHODS = ("server/discover", "subscriptions/listen")
 
 SERVER_NAME = os.environ.get("ECHO_MCP_SERVER_NAME", "echo")
+
+# Set by an accepted `initialize`, and the only state carried across requests. Modern
+# supplies its context per request; legacy semantics exist only once initialize selects
+# them, which is why "no modern metadata" cannot be read as "legacy".
+_legacy = None
 
 TOOLS = [
     {
@@ -67,7 +119,108 @@ def _send(msg: dict) -> None:
     sys.stdout.flush()
 
 
-def _result(req_id, result: dict) -> None:
+_ABSENT = object()
+
+
+def _meta_of(msg: dict) -> dict:
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return {}
+    meta = params.get("_meta")
+    return meta if isinstance(meta, dict) else {}
+
+
+def _modern_intent(msg: dict) -> bool:
+    """Whether this request is TRYING to be modern — the question that must be asked before
+    "is it well-formed", because otherwise a malformed modern request is indistinguishable
+    from a legacy one.
+
+    EITHER reserved key establishes the intent. The modern schema requires both, so a
+    request carrying `clientCapabilities` and no `protocolVersion` is a broken modern
+    request, not a legacy one; judging solely on the version key let exactly that shape be
+    served as legacy once an `initialize` had made the bare path legal.
+
+    Note `_meta` alone proves nothing: codex and copilot both send a legacy
+    `_meta.progressToken` (§9), which is why this tests the two reserved keys by name."""
+    meta = _meta_of(msg)
+    return VER_KEY in meta or CAP_KEY in meta
+
+
+def _claimed_version(msg: dict):
+    """The protocol version this request declares, or `_ABSENT` if it declares none.
+
+    A sentinel rather than `None`, because `None` is a value the client can actually send:
+    `"protocolVersion": null` is a *present but malformed* field, and returning `None` for
+    it made it indistinguishable from an absent one."""
+    return _meta_of(msg).get(VER_KEY, _ABSENT)
+
+
+def _reject(req_id, msg: dict, method) -> bool:
+    """Answer anything this fixture cannot serve conformantly. True if already answered.
+
+    This is where "lenient about input" stops, and the boundary is not a matter of taste:
+    **an absent protocol version cannot be tolerated, because without one there is no way
+    to know which conforming output to produce.** A missing `clientCapabilities` is
+    different — the version still identifies the era — so that stays tolerated, which is
+    the leniency a test double can actually afford.
+
+    An earlier version read "no modern metadata" as "legacy" and served it. Legacy
+    semantics do not exist until `initialize` selects them, so that let a bare `tools/list`
+    open a session, answered `server/discover` in a legacy shape that revision has no such
+    result for, and served a modern-metadata `initialize` as a legacy handshake — the three
+    era inversions §10.2 forbids, all from one missing distinction."""
+    if _modern_intent(msg):
+        claimed = _claimed_version(msg)
+        if claimed is _ABSENT:
+            # Recognisably modern, and missing a field the schema requires. Serving it as
+            # legacy would answer a broken modern request in the wrong era's shape.
+            _error(req_id, -32602, f"missing required _meta: {VER_KEY}")
+            return True
+        if not isinstance(claimed, str):
+            _error(req_id, -32602, "malformed _meta: protocolVersion must be a string")
+            return True
+        if claimed != MODERN_VERSION:
+            _send({"jsonrpc": "2.0", "id": req_id, "error": {
+                "code": -32022, "message": "Unsupported protocol version",
+                "data": {"supported": [MODERN_VERSION], "requested": claimed}}})
+            return True
+        if method == "initialize":
+            _error(req_id, -32601, "method not found: initialize")
+            return True
+        return False
+
+    if method == "initialize":
+        if _legacy is not None:
+            _error(req_id, -32600, "already initialized")
+            return True
+        return False
+
+    if method in MODERN_ONLY_METHODS:
+        _error(req_id, -32601, f"method not found: {method}")
+        return True
+
+    if _legacy is None:
+        _error(req_id, -32602, "no protocol era established: send initialize or modern _meta")
+        return True
+    return False
+
+
+def _result(req_id, result: dict, *, modern: bool = False,
+            cacheable: bool = False) -> None:
+    """Send a result, shaped for the era of the request being answered.
+
+    Modern results MUST carry `resultType`, and the operations the caching spec lists —
+    `server/discover` and `tools/list` among them — MUST additionally carry `ttlMs` and
+    `cacheScope`. `ttlMs: 0` means "immediately stale", which is the right answer for a
+    fixture: a client caching this tool list across a scenario would be answering from
+    memory rather than from the server the scenario is exercising."""
+    if modern:
+        out = {"resultType": "complete"}
+        out.update(result)
+        if cacheable:
+            out["ttlMs"] = 0
+            out["cacheScope"] = "public"
+        result = out
     _send({"jsonrpc": "2.0", "id": req_id, "result": result})
 
 
@@ -80,16 +233,32 @@ def _text(s: str, *, is_error: bool = False) -> dict:
 
 
 def _initialize(params: dict) -> dict:
-    # The client's requested version is MIRRORED rather than pinned. A server may answer
-    # with a version it prefers, and the client is then free to hang up — which for a test
-    # fixture would turn a protocol-revision bump in any of four CLIs into a mysterious
-    # scenario failure. Agreeing with the client keeps this instrument measuring the thing
-    # under test instead of itself.
+    """Select a legacy version this fixture implements, and record that legacy is now in
+    force. The legacy lifecycle returns the requested version only when it is supported;
+    otherwise the server answers with one it does support and the client decides."""
+    global _legacy
     requested = params.get("protocolVersion")
+    selected = requested if requested in LEGACY_VERSIONS else LEGACY_VERSIONS[0]
+    _legacy = {"version": selected, "capabilities": params.get("capabilities")}
     return {
-        "protocolVersion": requested if isinstance(requested, str) else _FALLBACK_PROTOCOL,
+        "protocolVersion": selected,
         "capabilities": {"tools": {"listChanged": False}},
         "serverInfo": {"name": SERVER_NAME, "version": "1.0.0"},
+    }
+
+
+def _discover() -> dict:
+    """The modern opener. Servers MUST implement it; clients MAY skip it, which is why the
+    era is decided by `_meta` and not by seeing this method arrive.
+
+    It advertises CAPABILITIES, not tool definitions — the tool surface still comes from
+    `tools/list`, so this is not a second channel a `tools:` allowlist would have to gate
+    (DESIGN_MCP_Support.md §10.6)."""
+    return {
+        "supportedVersions": [MODERN_VERSION],
+        "capabilities": {"tools": {}},
+        "_meta": {"io.modelcontextprotocol/serverInfo": {
+            "name": SERVER_NAME, "version": "1.0.0"}},
     }
 
 
@@ -138,15 +307,27 @@ def main() -> int:
         if req_id is None:
             continue
 
-        if method == "initialize":
+        if _reject(req_id, msg, method):
+            continue
+        # `_reject` has already guaranteed that modern intent implies a supported
+        # version, so intent is the whole test by the time we get here.
+        modern = _modern_intent(msg)
+
+        if method == "server/discover":
+            _result(req_id, _discover(), modern=modern, cacheable=True)
+        elif method == "initialize":
             _result(req_id, _initialize(params))
         elif method == "tools/list":
-            _result(req_id, {"tools": TOOLS})
+            _result(req_id, {"tools": TOOLS}, modern=modern, cacheable=True)
         elif method == "tools/call":
-            _result(req_id, _call_tool(params))
+            _result(req_id, _call_tool(params), modern=modern)
         elif method == "ping":
-            _result(req_id, {})
+            _result(req_id, {}, modern=modern)
         else:
+            # `subscriptions/listen` lands here on purpose: agy opens one (§9), this
+            # fixture has nothing to push, and its `capabilities` never advertise the
+            # feature. Method-not-found is the honest answer, and agy was measured
+            # carrying on past exactly that reply.
             _error(req_id, -32601, f"method not found: {method}")
     return 0
 
