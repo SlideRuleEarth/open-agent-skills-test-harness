@@ -194,12 +194,13 @@ Mark them **both** ways, because the two marks do different jobs:
 | Mark | Who reads it |
 |---|---|
 | `regress_` filename prefix | a human scanning `scenarios/` — they sort together and are obvious in a diff |
-| `tags: [regression]` | the artifacts — the tag is recorded with the run, so a result can be attributed to a regression rather than an experiment |
+| `tags: [regression]` | anyone reading the **results** — every cell records its tags in `assertions.json` and `summary.json`, so a result can be attributed to a regression rather than an experiment without going back to the YAML (which may have changed since) |
 
 **`--tag` does not select scenarios.** Scenarios are not discovered (see the top of this
 file), so there is no candidate set for a tag to narrow: `--tag` filters evals found under
-`--skill`/`--evals`, and passing it with `--config` is now an error rather than a flag that
-quietly does nothing. Run them by path — `for f in scenarios/regress_*.yaml; do
+`--skill`/`--evals`, and passing it with `--config` is an error rather than a flag that
+quietly does nothing — it would otherwise read like a selection and bill a model call for
+one that never happened. Run them by path — `for f in scenarios/regress_*.yaml; do
 agentskill-evals run --config "$f"; done` is the whole "suite", and the filename prefix is
 what makes that glob work. If regression scenarios ever need real collection, that means
 scenario-directory discovery, not a tag.
@@ -218,12 +219,23 @@ was indistinguishable from correct. It deliberately does *not* claim the witness
 that — `mcp_servers_witnessed` reporting the set rather than the first name is checked
 offline in `selftest.py`, which is this convention applied to itself.
 
-The same discipline applies to the assertions. That scenario's first draft asserted two
-distinct echoed payloads and called that proof of routing; it was not, because the fixture
-echoes verbatim and one process serving both aliases returns exactly the same thing. Ask
-what a *broken* implementation would produce, and if the answer is "this", the assertion is
-measuring something else. The fix was to make each reply carry the identity of the server
-that produced it (`ECHO_MCP_IDENTIFY`), which one process cannot forge.
+The same discipline applies to the assertions, and it took two passes to get right — both
+failures worth knowing, because they are the ones that look like tests and are not.
+
+1. The first draft asserted two distinct echoed payloads and called that proof of routing.
+   It was not: the fixture echoes verbatim, so one process serving both aliases returns
+   exactly what a correctly-routed pair returns.
+2. The fix prefixed each reply with the server's **name** — and the prompt has to name the
+   servers, so the expected string was a concatenation of two things the model had already
+   been handed. A model given a bare `wolverine-11` will label it `alpha:wolverine-11`
+   unasked, so the assertion still passed with identity never reaching a tool result.
+
+The rule both violate: **ask what a broken implementation would produce, and remember the
+model is part of the implementation.** An agent will helpfully reconstruct anything it can
+infer from its prompt, so a live assertion is only evidence if its expected value is
+*unreachable* except through the mechanism under test. `ECHO_MCP_IDENTITY` takes an opaque
+marker (`kestrel-9f3a`) that appears nowhere in the prompt, which is why the third version
+holds.
 
 ## Override precedence
 

@@ -92,9 +92,9 @@ def run(msgs, *, mode="dual", kill=None, ignore_sigterm=False, cancel=None,
         env["PROBE_MCP_IGNORE_SIGTERM"] = "1"
     # The echo fixture's own knobs. Cleared first and then set only from `extra_env`, so an
     # ambient export cannot change what these checks measure — `env` starts as a copy of
-    # os.environ, and a shell with ECHO_MCP_IDENTIFY=1 set would otherwise redden every
+    # os.environ, and a shell with ECHO_MCP_IDENTITY set would otherwise redden every
     # verbatim-echo assertion below with no indication why.
-    for knob in ("ECHO_MCP_SERVER_NAME", "ECHO_MCP_IDENTIFY"):
+    for knob in ("ECHO_MCP_SERVER_NAME", "ECHO_MCP_IDENTITY"):
         env.pop(knob, None)
     env.update(extra_env or {})
 
@@ -701,7 +701,7 @@ check("no acknowledgment emitted", n == [], n)
 # it tracks SERVER_NAME rather than being a constant, and it is genuinely opt-in — the
 # default must stay verbatim, because two live scenarios and every E-check above assert
 # that shape.
-print("E12. the identity knob is opt-in and names the instance that answered")
+print("E12. the identity marker is opt-in, opaque, and names the instance that answered")
 _call = {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
          "params": {"name": "echo", "arguments": {"text": "wolverine-11"}}}
 _init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -716,26 +716,35 @@ def _echo_text(**kw):
 
 check("default is verbatim (the contract two scenarios depend on)",
       _echo_text() == "wolverine-11", "identity leaked into the default reply")
-check("named without the knob is STILL verbatim",
+check("a named server without the marker is STILL verbatim",
       _echo_text(extra_env={"ECHO_MCP_SERVER_NAME": "alpha"}) == "wolverine-11",
-      "serverInfo alone must not change results — that is why the knob exists")
-check("with the knob, the reply names the instance",
-      _echo_text(extra_env={"ECHO_MCP_SERVER_NAME": "alpha",
-                            "ECHO_MCP_IDENTIFY": "1"}) == "alpha:wolverine-11",
+      "serverInfo alone must not change results — that is why the marker exists")
+check("with the marker, the reply carries it",
+      _echo_text(extra_env={"ECHO_MCP_IDENTITY": "kestrel-9f3a"}) == "kestrel-9f3a:wolverine-11",
       "identity must reach the result, not only serverInfo")
-check("...and it is the instance's OWN name, not a constant",
-      _echo_text(extra_env={"ECHO_MCP_SERVER_NAME": "beta",
-                            "ECHO_MCP_IDENTIFY": "1"}) == "beta:wolverine-11",
+check("...and it is the instance's OWN marker, not a constant",
+      _echo_text(extra_env={"ECHO_MCP_IDENTITY": "quarry-7b1c"}) == "quarry-7b1c:wolverine-11",
       "a fixed prefix would let one process satisfy a two-server routing assertion")
+# The marker is INDEPENDENT of the advertised name. A scenario needs to assert on something
+# the agent cannot reconstruct from its prompt, and the prompt necessarily contains the
+# server aliases — so a marker derived from SERVER_NAME would be guessable and prove
+# nothing (review, second round). This is the check that would fail if it were re-derived.
+check("the marker is not derived from the server name",
+      _echo_text(extra_env={"ECHO_MCP_SERVER_NAME": "alpha",
+                            "ECHO_MCP_IDENTITY": "kestrel-9f3a"}) == "kestrel-9f3a:wolverine-11",
+      "SERVER_NAME must not reach the prefix — a guessable marker is not evidence")
+check("an empty marker is off, not an empty prefix",
+      _echo_text(extra_env={"ECHO_MCP_IDENTITY": ""}) == "wolverine-11",
+      "an unset-looking value must not produce ':wolverine-11'")
 # Modern era too: the scenario pins claude (legacy today), but the fleet is split and agy
 # is already modern, so a knob that worked on only one era would fail on the runner that
 # most needs it.
 r, _n, _recs, _st = echo([modern("tools/call", 5, name="echo",
                                  arguments={"text": "marmot-22"})],
-                         extra_env={"ECHO_MCP_SERVER_NAME": "beta",
-                                    "ECHO_MCP_IDENTIFY": "1"})
+                         extra_env={"ECHO_MCP_IDENTITY": "quarry-7b1c"})
 check("identity works in the modern era as well",
-      r and r[0].get("result", {}).get("content", [{}])[0].get("text") == "beta:marmot-22", r)
+      r and r[0].get("result", {}).get("content", [{}])[0].get("text")
+      == "quarry-7b1c:marmot-22", r)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")

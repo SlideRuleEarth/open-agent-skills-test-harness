@@ -24,12 +24,26 @@
 # sets are the point, not a shortcut: `echo` exists on both, so the only thing telling
 # `mcp__alpha__echo` from `mcp__beta__echo` is the per-server namespacing under test.
 #
-# ECHO_MCP_IDENTIFY is what makes the answer ATTRIBUTABLE, and it is not decoration. `echo`
+# ECHO_MCP_IDENTITY is what makes the answer ATTRIBUTABLE, and it is not decoration. `echo`
 # is verbatim, so with it off a single process serving both aliases returns exactly what a
 # correctly-routed pair returns, and distinct payloads prove nothing about routing (review,
-# PR #99 — the earlier version of this file claimed otherwise). With it on, each reply is
-# prefixed with its own server's name, which one process cannot fake: SERVER_NAME is fixed
-# per process, so `alpha:wolverine-11` AND `beta:marmot-22` requires two of them.
+# PR #99 — the first version of this file claimed otherwise). With it on, each reply carries
+# its own process's marker, so both assertions can hold only if two differently-marked
+# processes each answered their own call.
+#
+# The markers are OPAQUE and appear nowhere in the prompt, which is the second half of the
+# same lesson. The first fix prefixed replies with the server's NAME — and the prompt has to
+# name the servers, so `alpha:wolverine-11` was a concatenation of two strings the model had
+# already been given: a model handed a bare `wolverine-11` by a config writer that dropped
+# `env:` could label it that way unprompted, and the assertion would pass with identity
+# never having reached a tool result at all (review, second round). `kestrel-9f3a` and
+# `quarry-7b1c` are reconstructible from nothing. Their only route into the final text is a
+# tool result, so if `env:` is dropped BOTH assertions fail, and if the two servers collapse
+# into one process the second one does.
+#
+# Keep them out of the prompt. Adding them there — even as "you may see a prefix like
+# kestrel-9f3a" — silently converts this back into a test the model can pass by writing what
+# it was told.
 #
 # CI-safe: interpolates nothing, so it takes the ordinary isolation overlay rather than the
 # contained HOME (contrast mcp_echo_cred.yaml, which needs a real credential).
@@ -57,30 +71,27 @@ mcp_servers:
     args: [../harness/fixtures/echo_mcp_server.py]
     env:
       ECHO_MCP_SERVER_NAME: alpha
-      ECHO_MCP_IDENTIFY: "1"
+      # Opaque on purpose — see the header. Not `alpha`, not derived from it.
+      ECHO_MCP_IDENTITY: kestrel-9f3a
   beta:
     command: python3
     args: [../harness/fixtures/echo_mcp_server.py]
     env:
       ECHO_MCP_SERVER_NAME: beta
-      ECHO_MCP_IDENTIFY: "1"
+      ECHO_MCP_IDENTITY: quarry-7b1c
 
 assertions:
   - { type: no_error }
   # Both, deliberately. Asserting one would pass on a config writer that dropped the other.
   - { type: used_tool, name: mcp__alpha__echo }
   - { type: used_tool, name: mcp__beta__echo }
-  # Identity PAIRED with payload — the assertion the tool names above cannot make. A trace
-  # can carry both alias names while both calls land in one process; these cannot both hold
-  # unless two processes, named differently, each answered their own call.
-  #
-  # The prompt deliberately does NOT say the replies are prefixed, or what the prefix looks
-  # like. Describing the format would let a model that was handed a bare `wolverine-11`
-  # write `alpha:wolverine-11` anyway from the instructions alone — which would make a
-  # config writer that dropped `env:` on the way to the server look like a pass. The only
-  # place the model can learn these two strings is the tool results themselves.
-  - { type: final_contains, contains: "alpha:wolverine-11" }
-  - { type: final_contains, contains: "beta:marmot-22" }
+  # Marker PAIRED with payload — the assertion the tool names above cannot make. A trace can
+  # carry both alias names while both calls land in one process; these cannot both hold
+  # unless two differently-marked processes each answered their own call. Neither string is
+  # derivable from the prompt, so the only way either reaches the final text is a tool
+  # result: this is the pair that fails if `env:` is dropped on the way to the server.
+  - { type: final_contains, contains: "kestrel-9f3a:wolverine-11" }
+  - { type: final_contains, contains: "quarry-7b1c:marmot-22" }
 
 prompt: |
   You have two MCP servers available, `alpha` and `beta`. Each provides an `echo` tool.

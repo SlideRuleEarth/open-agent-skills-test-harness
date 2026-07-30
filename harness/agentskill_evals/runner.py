@@ -75,6 +75,13 @@ class CellResult:
     # workspace-relative paths seeded before the run (fixture + files:) — inputs the report
     # annotates so they aren't mistaken for model output
     seeded_paths: list[str] = field(default_factory=list)
+    # The spec's `tags:`, carried through to the artifacts. Until now nothing but the
+    # `--tag` discovery filter read them, so a `regression` tag was a claim no reader could
+    # act on — and for a scenario, which is selected by path and never discovered, it had no
+    # consumer at all (review, second round). Recorded per cell so a result can be attributed
+    # to a regression rather than an experiment without re-reading the source YAML, which
+    # may have changed since.
+    tags: list[str] = field(default_factory=list)
 
     @property
     def n_pass(self) -> int:
@@ -339,7 +346,8 @@ class Runner:
                           skill=spec.skill_name, passed=False, run_result=rr,
                           reasoning_effort=target.reasoning_effort,
                           artifacts_dir=cell_dir,
-                          scenario_path=getattr(spec, "source_path", None))
+                          scenario_path=getattr(spec, "source_path", None),
+                          tags=list(spec.tags or []))
         # Preserve whatever the run produced before crashing: move exec_ws into
         # cell_dir/workspace (as the success path does) instead of letting _run_cell's
         # finally delete it — partial output is exactly the evidence needed to debug the
@@ -774,6 +782,7 @@ class Runner:
             isolated=home_isolated, ungraded=ungraded, isolation_leaks=leaks,
             scenario_path=getattr(spec, "source_path", None),
             seeded_paths=sorted(seeded_relpaths(spec)),
+            tags=list(spec.tags or []),
         )
         # Attach the judge's run BEFORE rendering, so report.md's verdict line shows the
         # combined agent+judge cost (previously only summary.* had it).
@@ -884,6 +893,10 @@ class Runner:
                 "effective_effort": cell.effective_effort,
                 "eval": cell.eval_name,
                 "skill": cell.skill,
+                # What the spec declared this run to BE (e.g. `regression`) — see
+                # CellResult.tags. Always present, `[]` when untagged, so a reader can tell
+                # "declared nothing" from an older artifact that could not say.
+                "tags": cell.tags,
                 "isolated": cell.isolated,
                 "isolation_leaks": cell.isolation_leaks,
                 "ungraded": cell.ungraded,
@@ -1203,7 +1216,7 @@ class Runner:
                     "agent": c.agent, "model": c.model,
                     "reasoning_effort": c.reasoning_effort,
                     "effective_effort": c.effective_effort,
-                    "eval": c.eval_name, "skill": c.skill,
+                    "eval": c.eval_name, "skill": c.skill, "tags": c.tags,
                     "isolated": c.isolated, "isolation_leaks": c.isolation_leaks,
                     # None where the runner's telemetry does not state it (codex, agy).
                     "cli_version": c.run_result.cli_version,

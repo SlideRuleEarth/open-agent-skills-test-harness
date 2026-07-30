@@ -3154,6 +3154,97 @@ def _check_cell_crash_safety(failures, verbose):
         shutil.rmtree(repo_root, ignore_errors=True)
 
 
+def _check_spec_tags_reach_artifacts(failures, verbose):
+    """`tags:` must survive into the artifacts, on both the normal and the crash path.
+
+    scenarios/README.md documents two marks for a regression scenario — the `regress_`
+    filename prefix and `tags: [regression]` — and says the second is what lets a RESULT be
+    attributed. That was untrue when written: `tags` was read only by the `--tag` discovery
+    filter, which scenarios never go through (they are selected by path), so for a scenario
+    the tag had no consumer anywhere and the documented convention rested on nothing (review,
+    second round). This is the arm that makes the claim real.
+
+    The crash path matters as much as the normal one: a cell that died is exactly when a
+    reader needs to know whether a regression broke or an experiment failed, and it builds
+    its CellResult in a different place from the success path."""
+    import json
+    import os
+    import shutil
+    import tempfile
+
+    import agentskill_evals.runner as runner_mod
+    from .exec import ExecResult
+    from .schema import RunResult
+    from .spec import EvalSpec, ModelTarget
+
+    print("spec tags reach the artifacts:")
+    repo_root = tempfile.mkdtemp(prefix="ase-repo-tags-")
+    orig_execute = runner_mod.execute
+    crashing = [False]
+
+    def _tagging_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides,
+                         agent_name, eval_name):
+        if crashing[0]:
+            raise RuntimeError("simulated crash")
+        return ExecResult(result=RunResult(agent=agent_name, eval_name=eval_name,
+                                           prompt=prompt, workdir=cwd, final_text="done"),
+                          stdout="", stderr="")
+
+    runner_mod.execute = _tagging_execute
+    try:
+        run_dir = os.path.join(repo_root, "artifacts", "runtags")
+        os.makedirs(run_dir)
+        r = runner_mod.Runner.__new__(runner_mod.Runner)
+        r.agent, r.adapter, r.targets = "fake", _FakeAdapter(), [ModelTarget()]
+        r.artifacts_root = os.path.join(repo_root, "artifacts")
+        r.run_id, r.skills_root, r.judge = "runtags", repo_root, None
+        r.provision, r.command, r.auto_approve = False, "", True
+        r.reasoning_effort = None
+        r.jobs, r.isolated, r.progress = 1, False, None
+        r._repo_skill_names, r.run_dir = set(), run_dir
+        r._secrets = r._run_secrets = ()
+
+        tagged = EvalSpec(name="tagged", prompt="hi",
+                          source_path=os.path.join(repo_root, "regress_x.yaml"),
+                          tags=["regression", "mcp"])
+        untagged = EvalSpec(name="untagged", prompt="hi",
+                            source_path=os.path.join(repo_root, "plain.yaml"))
+
+        cell_ok = r._run_cell(ModelTarget(), tagged)
+        cell_plain = r._run_cell(ModelTarget(), untagged)
+        crashing[0] = True
+        cell_crash = r._run_cell(ModelTarget(), tagged)
+        crashing[0] = False
+
+        def _aj(cell):
+            path = os.path.join(cell.artifacts_dir, "assertions.json")
+            return json.loads(open(path).read()) if os.path.isfile(path) else {}
+
+        aj_ok, aj_plain, aj_crash = _aj(cell_ok), _aj(cell_plain), _aj(cell_crash)
+        r._write_summary([cell_ok, cell_plain, cell_crash], [tagged, untagged])
+        summary = json.loads(open(os.path.join(run_dir, "summary.json")).read())
+        sum_tags = {c["eval"]: c.get("tags", "<MISSING>") for c in summary["cells"]}
+    finally:
+        runner_mod.execute = orig_execute
+        shutil.rmtree(repo_root, ignore_errors=True)
+
+    _check("artifacts.spec_tags_are_recorded_per_cell",
+           aj_ok.get("tags") == ["regression", "mcp"]
+           and aj_crash.get("tags") == ["regression", "mcp"]
+           and aj_plain.get("tags") == []
+           and sum_tags.get("tagged") == ["regression", "mcp"]
+           and sum_tags.get("untagged") == [],
+           f"a scenario is selected by path and never discovered, so `tags:` has no other "
+           f"consumer: unless they reach the artifacts, `tags: [regression]` is a mark "
+           f"nothing can read and the documented two-mark convention rests on nothing. "
+           f"Recorded in assertions.json and summary.json, on the crash path too — a cell "
+           f"that died is exactly when it matters whether a regression broke or an "
+           f"experiment failed — and `[]` for an untagged eval, which is a different claim "
+           f"from an artifact that could not say. run={aj_ok.get('tags')!r} "
+           f"crash={aj_crash.get('tags')!r} untagged={aj_plain.get('tags')!r} "
+           f"summary={sum_tags!r}", failures, verbose)
+
+
 def _check_progress_thread_safety(failures, verbose):
     """Under --jobs>1, every worker thread shares one Progress instance. Before the fix, update()
     mutated shared state under a lock but then printed OUTSIDE it — another thread's update()
@@ -3244,6 +3335,47 @@ def _check_cli_helpers(failures, verbose):
                    "expected malformed YAML to raise", failures, verbose)
     elif verbose:
         print("  [skipped — PyYAML not installed] cli.is_yaml_error.real_yaml_error")
+
+    # `--tag` with `--config` is REJECTED rather than ignored. The filter lives in the
+    # discovery branch, so with a scenario it never ran at all: `--config x.yaml --tag
+    # regression` reads like a selection, ran the scenario whatever its tags said, and cost a
+    # full model call doing it. Driven through `main()` — the real argv path, so the arm
+    # covers the parser wiring too, not a hand-built Namespace that cannot go stale.
+    #
+    # The path deliberately does NOT exist. That pins the ORDER as well as the rejection: the
+    # refusal must come before the scenario is loaded, or this reports a file error instead.
+    from .cli import main as _cli_main
+
+    def _cli(argv):
+        """rc + stderr, with SystemExit caught. `_load_scenario` exits rather than returning,
+        so a check that MOVED below it would raise straight through this arm and abort the
+        section — reporting as a suite crash rather than as this assertion failing, which is
+        the one thing a test must never do to its own mutation."""
+        buf, out = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(out):
+                return _cli_main(argv), buf.getvalue()
+        except SystemExit as exc:
+            return exc.code, buf.getvalue()
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}\n{buf.getvalue()}"
+
+    rc_tag, err_tag = _cli(["run", "--config", "/nonexistent/scen.yaml",
+                            "--tag", "regression"])
+    # ...and the same flag on the discovery path is untouched: it must still parse and reach
+    # the filter. A blanket rejection of --tag would be an easy way to "fix" the above.
+    rc_ok, err_ok = _cli(["run", "--agent", "claude", "--skill", "no-such-skill-xyz",
+                          "--tag", "regression", "--dry-run"])
+    _check("cli.tag_with_config_is_refused_not_ignored",
+           rc_tag == 2 and "--tag" in err_tag and "scenario" in err_tag
+           and "no such file" not in err_tag.lower()
+           and rc_ok == 2 and "no evals found" in err_ok,
+           f"a scenario is chosen by path and never discovered, so --tag has no candidate "
+           f"set to narrow — passing it with --config must fail fast rather than run the "
+           f"scenario and bill a model call for a selection that never happened. Refused "
+           f"BEFORE the scenario is read (a file error here would mean the check moved), and "
+           f"--tag on the discovery path still works. rc={rc_tag} err={err_tag[:150]!r} "
+           f"discovery_rc={rc_ok} discovery_err={err_ok[:80]!r}", failures, verbose)
 
     # --model + --all-models: --model wins, and a warning is printed (not silently dropped)
     cfg = ModelsConfig({"claude": ["a", "b"]}, {"claude": "a"}, {}, [])
@@ -8656,6 +8788,7 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _section(_check_mcp_hermetic_paths, failures, verbose)
     _section(_check_parallel_cell_idx, failures, verbose)
     _section(_check_cell_crash_safety, failures, verbose)
+    _section(_check_spec_tags_reach_artifacts, failures, verbose)
 
     # cli.py's pure helpers (YAML-error detection, --model/--all-models, models.yaml validation)
     _section(_check_cli_helpers, failures, verbose)

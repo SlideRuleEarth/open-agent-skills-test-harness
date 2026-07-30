@@ -53,6 +53,7 @@ CODEX = "agentskill_evals/adapters/codex.py"
 COPILOT = "agentskill_evals/adapters/copilot.py"
 AGY = "agentskill_evals/adapters/antigravity.py"
 SCHEMA = "agentskill_evals/schema.py"
+CLI = "agentskill_evals/cli.py"
 
 MUTATIONS = [
     ("M1-witness-fails-any-server", CLAUDE,
@@ -803,6 +804,47 @@ MUTATIONS = [
      '    contained_home_required_credential_env_vars = ["CLAUDE_CODE_OAUTH_TOKEN"]',
      "    contained_home_required_credential_env_vars = None",
      "contained.required_credential_env_vars_are_declared_and_answered"),
+    # `tags:` stops reaching the per-cell artifact, so a result can no longer say whether it
+    # was a regression or an experiment — the state the second mark was documented as fixing
+    # while nothing actually read it (review, second round).
+    ("M120-cell-artifact-drops-the-spec-tags", RUNNER,
+     '                "tags": cell.tags,\n',
+     "",
+     "artifacts.spec_tags_are_recorded_per_cell"),
+    ("M121-summary-drops-the-spec-tags", RUNNER,
+     '                    "eval": c.eval_name, "skill": c.skill, "tags": c.tags,',
+     '                    "eval": c.eval_name, "skill": c.skill,',
+     "artifacts.spec_tags_are_recorded_per_cell"),
+    # Carried on the success path but not the crash path — the half where attribution matters
+    # most, and the half a single-path test would never notice.
+    ("M122-crashed-cell-loses-its-tags", RUNNER,
+     "                          scenario_path=getattr(spec, \"source_path\", None),\n"
+     "                          tags=list(spec.tags or []))",
+     "                          scenario_path=getattr(spec, \"source_path\", None))",
+     "artifacts.spec_tags_are_recorded_per_cell"),
+    # The rejection removed: `--config x --tag y` reads like a selection, silently runs the
+    # scenario whatever its tags say, and bills a model call for it.
+    ("M123-tag-with-config-is-silently-ignored-again", CLI,
+     "        if args.tag:\n"
+     "            # --tag filters DISCOVERED evals;",
+     "        if False:\n"
+     "            # --tag filters DISCOVERED evals;",
+     "cli.tag_with_config_is_refused_not_ignored"),
+    # Still rejected, but only AFTER the scenario is read — so the flag no longer fails fast,
+    # and a scenario that does not parse reports a file error for a run that was never going
+    # to happen. Two edits, because reordering is a move: delete, then re-insert below the
+    # load. The arm pins the order as well as the rejection, which is what catches this.
+    ("M124-tag-rejection-happens-after-the-scenario-is-loaded", CLI,
+     ('        if args.tag:\n'
+      '            # --tag filters DISCOVERED evals; a scenario is selected by path and there is no\n',
+      "        scenario = _load_scenario(args.config)\n"),
+     ('        if False:\n'
+      '            # --tag filters DISCOVERED evals; a scenario is selected by path and there is no\n',
+      "        scenario = _load_scenario(args.config)\n"
+      "        if args.tag:\n"
+      "            print('error: --tag does not select a scenario', file=sys.stderr)\n"
+      "            return 2\n"),
+     "cli.tag_with_config_is_refused_not_ignored"),
 ]
 
 
