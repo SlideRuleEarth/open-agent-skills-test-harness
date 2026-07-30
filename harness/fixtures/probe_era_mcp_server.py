@@ -58,10 +58,13 @@ SUB_ID_KEY = "io.modelcontextprotocol/subscriptionId"
 
 _started = time.monotonic()
 _log_fd = None
-# PROTOCOL STATE — exactly one flag, and it is the only thing the revision lets a server
-# carry across requests: an accepted `initialize` selects legacy semantics for the stdio
-# process. Modern carries no such state, so there is nothing else here.
-_legacy_initialized = False
+# PROTOCOL STATE. Modern is stateless; LEGACY retains what its `initialize` negotiated.
+# A boolean was not enough: later legacy messages carry no metadata at all, so the
+# negotiated VERSION is the only thing that says which legacy revision to read them under
+# — and this shim implements two. Anything reading later bare traffic needs this, which is
+# why the proxy must keep the same state rather than a flag (§10.2).
+# None until `initialize`; then {"version", "capabilities", "clientInfo"}.
+_legacy = None
 # TELEMETRY — what C3-0 reports. Deliberately NOT protocol state: a single `_era` used as
 # both made dispatch order-dependent, so a modern request followed by an accepted
 # `initialize` left legacy disabled and refused the bare requests that followed it.
@@ -171,24 +174,32 @@ def _attempt(msg: dict, method):
     return None, None, None
 
 
-def _observe(msg: dict, method) -> None:
+def _observe(msg: dict, method, *, version=None, requested=None) -> None:
     """Record what era an ACCEPTED request spoke. Telemetry only — it gates nothing.
+
+    `version` overrides what the request claimed, and legacy `initialize` passes the
+    SELECTED version here. Recording the requested one would put the client's guess in
+    C3-0's load-bearing column: ask for `2099-01-01`, get `2025-11-25` in the reply, and
+    the table would still have said 2099. What the two parties ended up speaking is the
+    measurement; what one of them opened with is context, kept as `requested`.
 
     The first observation is what C3-0's table reports. Later *distinct* ones are logged
     too rather than dropped: a client mixing eras is a finding, and a recorder that kept
     only the first would hide exactly that."""
     global _first_era
-    era, version, how = _attempt(msg, method)
+    era, claimed, how = _attempt(msg, method)
     if era is None:
         return
+    version = claimed if version is None else version
+    extra = {} if requested is None else {"requested": requested}
     key = (era, version)
     if _first_era is None:
         _first_era = key
         _seen_eras.add(key)
-        _log("era", era=era, version=version, decided_by=how, first_method=method)
+        _log("era", era=era, version=version, decided_by=how, first_method=method, **extra)
     elif key not in _seen_eras:
         _seen_eras.add(key)
-        _log("era_also", era=era, version=version, decided_by=how, method=method)
+        _log("era_also", era=era, version=version, decided_by=how, method=method, **extra)
 
 
 def _reject(req_id, msg: dict, method):
@@ -258,6 +269,15 @@ def _reject(req_id, msg: dict, method):
             _log("violation", why="initialize to a modern-only server", method=method)
             _error(req_id, -32601, "method not found: initialize")
             return True
+        if _legacy is not None:
+            # Legacy initialization happens once per connection. Accepting a second one
+            # would let a client renegotiate the version mid-stream — and every bare
+            # message already sent would retroactively belong to a different revision
+            # than the one it was read under.
+            _log("violation", why="initialize after legacy is already initialized",
+                 method=method, negotiated=_legacy["version"])
+            _error(req_id, -32600, "already initialized")
+            return True
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         bad = [k for k, t in (("protocolVersion", str), ("capabilities", dict),
                               ("clientInfo", dict)) if not isinstance(params.get(k), t)]
@@ -278,7 +298,7 @@ def _reject(req_id, msg: dict, method):
 
     # Neither modern metadata nor `initialize`: legal only once `initialize` has selected
     # legacy semantics for this process.
-    if not _legacy_initialized:
+    if _legacy is None:
         _log("violation", why="request before any era was established", method=method)
         _error(req_id, -32602, "no protocol era established: send initialize or modern _meta")
         return True
@@ -296,18 +316,23 @@ def _discover() -> dict:
     }
 
 
-def _initialize(params: dict) -> dict:
-    global _legacy_initialized
+def _initialize(params: dict):
+    """Select a version, store the legacy state it establishes, and return (payload,
+    selected, requested). Selection happens BEFORE the caller records the era, so the
+    telemetry carries what was agreed rather than what was asked for."""
+    global _legacy
     requested = params.get("protocolVersion")
     selected = requested if requested in LEGACY_VERSIONS else LEGACY_VERSIONS[0]
-    _legacy_initialized = True
+    _legacy = {"version": selected,
+               "capabilities": params.get("capabilities"),
+               "clientInfo": params.get("clientInfo")}
     _log("legacy_initialize", requested=requested, selected=selected,
          supported=list(LEGACY_VERSIONS), downgraded=selected != requested)
     return {
         "protocolVersion": selected,
         "capabilities": {"tools": {"listChanged": False}},
         "serverInfo": {"name": "probe-era", "version": "1.0.0"},
-    }
+    }, selected, requested
 
 
 def _open_subscription(req_id, params: dict, modern: bool) -> None:
@@ -400,8 +425,9 @@ def main() -> int:
             _observe(msg, method)
             _result(req_id, _discover(), modern=is_modern, cacheable=True)
         elif method == "initialize":
-            _observe(msg, method)
-            _result(req_id, _initialize(params), modern=False)
+            payload, selected, requested = _initialize(params)
+            _observe(msg, method, version=selected, requested=requested)
+            _result(req_id, payload, modern=False)
         elif method == "subscriptions/listen":
             _observe(msg, method)
             _open_subscription(req_id, params, is_modern)

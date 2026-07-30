@@ -464,6 +464,12 @@ li = ev(recs, "legacy_initialize")
 check("requested vs selected recorded", li and li[0]["requested"] == "2099-01-01"
       and li[0]["selected"] == sel, li)
 check("downgrade flagged", li and li[0]["downgraded"] is True, li)
+# The PRIMARY record is what C3-0's table reads. Asserting only the secondary
+# `legacy_initialize` event let a wrong `era.version` pass unnoticed.
+e = ev(recs, "era")
+check("era.version is the SELECTED version", e and e[0]["version"] == sel, e)
+check("era.version is not the client's guess", e and e[0]["version"] != "2099-01-01", e)
+check("era retains what was requested", e and e[0].get("requested") == "2099-01-01", e)
 
 print("26. ... and echoes a version it does support")
 r, n, recs, st = run([legacy_init(1, "2025-06-18")])
@@ -472,7 +478,20 @@ check("supported request honoured",
 check("not flagged as a downgrade",
       ev(recs, "legacy_initialize")[0]["downgraded"] is False, recs)
 
-print("27. legacy initialize requires its own params")
+print("27. legacy initialization happens ONCE; a second is a lifecycle violation")
+r, n, recs, st = run([legacy_init(1, "2025-06-18"), legacy_init(2, "2025-11-25"),
+                      {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}}])
+by = {m["id"]: m for m in r}
+check("first initialize accepted", "result" in by.get(1, {}), by.get(1))
+check("second initialize rejected", "error" in by.get(2, {}), by.get(2))
+check("renegotiation did not happen",
+      len(ev(recs, "legacy_initialize")) == 1, ev(recs, "legacy_initialize"))
+check("and was not recorded as another era", len(ev(recs, "era_also")) == 0, recs)
+check("violation logged", any(v.get("why", "").startswith("initialize after legacy")
+                              for v in ev(recs, "violation")), ev(recs, "violation"))
+check("session still usable on the negotiated version", "result" in by.get(3, {}), by.get(3))
+
+print("28. legacy initialize requires its own params")
 r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
                        "params": {"protocolVersion": "2025-11-25"}},
                       legacy_init(2)])
