@@ -282,13 +282,17 @@ plus `mcp.contained_home_without_its_credential_env_var_is_refused` and
 
 Non-negotiable, in this order. `SELFTEST PASSED` alone is not evidence.
 
-```sh
-cd harness && make dev          # once — creates .venv with the PINNED ruff (see below)
+Run from the REPO ROOT. `make -C`, not `cd harness &&` — a `cd` persists for the rest of the
+block, so the line after it looked for `harness/harness/.venv/bin/python` and the block could
+not be pasted as written (review, fifth round).
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 491 here
+```sh
+make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
+
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 492 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
-cd harness && make lint                                       # ruff; must print "All checks passed!"
-python3 harness/tools/mutate_mcp.py                           # 125/125 production + 1/1 instrument
+make -C harness lint                                          # ruff; must print "All checks passed!"
+python3 harness/tools/mutate_mcp.py                           # 125/125 production + 2/2 instrument
 git diff --check
 ```
 
@@ -332,9 +336,11 @@ Mutations carry one of two ID prefixes and are **counted separately** in the sum
 is the normal case: it perturbs production code, and it is what a coverage claim rests on.
 `I<n>` perturbs `selftest.py` itself, which is usually circular and proves nothing — it is
 legitimate only where the selftest has a feature of its own that no production edit can
-reach. There is exactly one (`I1`, the arm counter, whose failure mode is that it stops
-counting while the banner still says PASSED). The split reporting exists so a second one has
-to be argued for in the open rather than appended quietly to the list.
+reach. Both current entries are the arm counter: `I1` stops it counting, `I2` reverts it to a
+process-lifetime total, and each leaves every arm passing while the banner reports a
+plausible wrong number. The classification is enforced, not conventional — `mutate_mcp.py`
+refuses to start if an `I*` targets anything but the selftest, or an `M*` targets it, because
+either mistake miscounts exactly what the split reporting exists to keep straight.
 
 Things that have gone wrong in the *tests*, so you can skip learning them again:
 

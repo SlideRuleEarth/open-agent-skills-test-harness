@@ -34,12 +34,18 @@ TWO ID PREFIXES, and they are counted and reported separately.
   I<n>   an INSTRUMENT mutation — it perturbs `selftest.py` itself. Almost always the wrong
          thing to write, because mutating the test to prove the test fails is circular and
          establishes nothing about the code. It is legitimate only where the selftest has a
-         FEATURE of its own whose failure mode no production edit can reach: I1 is the arm
-         counter, which reports how many arms ran, and whose failure (it stops counting; the
-         banner still says PASSED; every arm still passes) is invisible from anywhere else.
+         FEATURE of its own whose failure mode no production edit can reach. Both current
+         entries are the ARM COUNTER, which is such a feature: I1 stops it counting and I2
+         reverts it to a process-lifetime total, and each failure leaves every arm passing
+         and the banner reporting a plausible wrong number.
          If a new `I*` seems necessary, that is the moment to check you are not just testing
          the test — the separate heading in the summary exists so this decision is made in
          the open rather than by quietly appending to the list.
+
+The prefix is NOT taken on trust: `_classify` refuses to start if an `I*` targets anything
+but SELFTEST, or an `M*` targets it. A convention relating two independent facts holds only
+until someone types the wrong letter, and either direction miscounts exactly what the split
+reporting exists to keep straight.
 
 Every result line carries the wall time of the selftest run that produced it, and the summary
 names the slowest. Read those against the `baseline:` line: a mutation taking several times
@@ -882,6 +888,13 @@ MUTATIONS = [
      "    global _ARMS_RUN\n    _ARMS_RUN += 1\n",
      "    global _ARMS_RUN\n",
      "selftest.arm_count_is_live"),
+    # The delta collapses back to the raw process-lifetime counter, so a second
+    # `run_selftest()` in one interpreter reports the sum of both runs while every arm still
+    # passes and the number still looks plausible (491, then 982 — found in review).
+    ("I2-arm-count-reverts-to-process-lifetime", SELFTEST,
+     "    return _ARMS_RUN - start\n",
+     "    return _ARMS_RUN\n",
+     "selftest.arm_count_is_per_run_not_per_process"),
     # Still rejected, but only AFTER the scenario is read — so the flag no longer fails fast,
     # and a scenario that does not parse reports a file error for a run that was never going
     # to happen. Two edits, because reordering is a move: delete, then re-insert below the
@@ -925,8 +938,33 @@ def run(cwd):
     return p.returncode, p.stdout + p.stderr, time.monotonic() - t0
 
 
+def _classify(mid, rel):
+    """`M` or `I` for one mutation, refusing any entry where the two disagree.
+
+    The prefix and the target are independent facts, so a convention relating them holds
+    only until someone types the wrong letter — at which point an `M` aimed at the selftest
+    is counted as production coverage, or an `I` aimed at production is excused from it.
+    Both directions are exactly the miscount the split reporting exists to prevent, so the
+    ID is checked against the file rather than trusted (review, fifth round).
+
+    Raises rather than warns: a suite that reports a wrong total is worse than one that
+    refuses to start, and this runs before the 12-minute baseline so the cost is a second.
+    """
+    kind = "I" if mid.startswith("I") else "M"
+    if (rel == SELFTEST) != (kind == "I"):
+        raise SystemExit(
+            f"mutation {mid!r} is misclassified: an `I*` id means it perturbs the INSTRUMENT "
+            f"and must target {SELFTEST}, and an `M*` id means it perturbs production and "
+            f"must not. This one is {mid[0]}* against {rel}. Rename it, or retarget it — "
+            f"the two totals are only meaningful while the id and the file agree.")
+    return kind
+
+
 def main():
     started = time.monotonic()
+    # Before the baseline, which costs a selftest run: a misclassified entry makes every
+    # number below it wrong, so it is worth nothing to discover that at the end.
+    kinds = {mid: _classify(mid, rel) for mid, rel, _f, _r, _a in MUTATIONS}
     tmp = Path(tempfile.mkdtemp(prefix="mutate-mcp-"))
     work = tmp / "harness"
     shutil.copytree(HARNESS, work, symlinks=True,
@@ -954,7 +992,7 @@ def main():
     totals = {"M": 0, "I": 0}
     slowest = (0.0, None)
     for mid, rel, find, repl, arm in MUTATIONS:
-        kind = "I" if mid.startswith("I") else "M"
+        kind = kinds[mid]                    # validated against `rel` before the baseline
         totals[kind] += 1
         path = work / rel
         original = path.read_text()

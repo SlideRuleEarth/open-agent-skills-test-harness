@@ -113,6 +113,19 @@ COPILOT = """\
 _ARMS_RUN = 0
 
 
+def _arms_since(start: int) -> int:
+    """Arms run since `start` — the per-run figure, from a process-lifetime counter.
+
+    A DELTA rather than a reset, because a reset is a second step someone has to remember:
+    `_ARMS_RUN` was previously read raw, so a second `run_selftest()` in one process reported
+    491 then 982, and the banner silently stopped being the per-run measurement its own
+    documentation described (review, fifth round). Subtracting the value captured at entry
+    cannot be forgotten separately from reporting it — the arithmetic IS the reset, and it
+    is on the same line as the number it corrects.
+    """
+    return _ARMS_RUN - start
+
+
 def _check(name, cond, msg, failures, verbose):
     global _ARMS_RUN
     _ARMS_RUN += 1
@@ -8796,6 +8809,9 @@ def run_selftest(verbose: bool = False) -> int:
 
 def _run_selftest_checks(verbose: bool = False) -> int:
     failures: list[str] = []
+    # Captured at entry, subtracted at the banner: `_ARMS_RUN` counts for the life of the
+    # PROCESS, and this function is public API an embedder can call more than once.
+    arms_before = _ARMS_RUN
 
     _section(_check_cost_formatting, failures, verbose)
     _section(_check_claude_adapter, failures, verbose)
@@ -8881,19 +8897,19 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     # burden that made the literal in TODO_Contained_HOME.md §4 go stale in the first place.
     _section(_check_arm_counter, failures, verbose)
 
+    arms = _arms_since(arms_before)
     print()
     if failures:
-        print(f"SELFTEST FAILED: {len(failures)} of {_ARMS_RUN} check(s): "
-              f"{', '.join(failures)}")
+        print(f"SELFTEST FAILED: {len(failures)} of {arms} check(s): {', '.join(failures)}")
         return 1
     # The banner keeps its exact prefix: the pre-push hook and mutate_mcp.py both read for
     # `SELFTEST PASSED`, and the arm count is appended rather than folded into it.
-    print(f"SELFTEST PASSED — {_ARMS_RUN} arms")
+    print(f"SELFTEST PASSED — {arms} arms")
     return 0
 
 
 def _check_arm_counter(failures, verbose):
-    """The banner's arm count must reflect arms that actually ran."""
+    """The banner's arm count must be live, and must be PER RUN rather than per process."""
     print("arm counter:")
     _check("selftest.arm_count_is_live",
            _ARMS_RUN >= 400,
@@ -8904,6 +8920,23 @@ def _check_arm_counter(failures, verbose):
            f"so the count is checked to be LIVE rather than merely printed. Floor is loose "
            f"deliberately: it catches a dead counter or a lost section, and is not a number "
            f"to maintain per commit", failures, verbose)
+
+    # ...and that it MEASURES ONE RUN. `_ARMS_RUN` counts for the life of the process, so a
+    # banner reading it raw double-counts on the second `run_selftest()` in one interpreter
+    # — 491, then 982 — while every arm still passes and the number still looks plausible.
+    # Found in review by calling the public function twice. Checked here through the same
+    # arithmetic the banner uses, so a mutation that drops the subtraction reddens this.
+    here = _ARMS_RUN
+    _check("selftest.arm_count_is_per_run_not_per_process",
+           _arms_since(here) == 0 and _arms_since(0) == here and _arms_since(10) == here - 10,
+           f"the banner reports arms for THIS run, and `_ARMS_RUN` is a process-lifetime "
+           f"counter — so the figure must be a delta against the value captured when the "
+           f"run started, or a second call in one process reports the sum of both and the "
+           f"banner silently stops being the measurement its own documentation describes. "
+           f"A delta rather than a reset because a reset is a step that can be forgotten "
+           f"separately from the reporting: from={here} "
+           f"since_here={_arms_since(here)} since_zero={_arms_since(0)}",
+           failures, verbose)
 
 
 def _check_mcp_declared_servers(failures, verbose):
