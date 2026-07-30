@@ -763,6 +763,28 @@ MUTATIONS = [
     ("M111-antigravity-stops-declaring-its-overlay-dependence", AGY,
      "\n    mcp_off_mechanism = MCPOffMechanism.OVERLAY_MASKS", "",
      "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # The check is simply gone. Measured live before it existed: the cell spends a model
+    # call and comes back `exited with code 1`, with "Not logged in" buried in a truncated
+    # JSON blob inside an assertion message.
+    ("M115-contained-cell-with-no-credential-route-runs-anyway", RUNNER,
+     "\n                if (contain_home and not materializes_auth\n"
+     "                        and declared_cred and not cred_env_present):",
+     "\n                if False:",
+     "mcp.contained_home_without_its_credential_env_var_is_refused"),
+    # Inverted: it fires when the credential IS present and stays silent when it is not —
+    # a refusal aimed at exactly the runs that can succeed. Caught only by the second half
+    # of the arm, which is why that half exists.
+    ("M116-refusal-fires-on-the-runs-that-can-authenticate", RUNNER,
+     "\n                        and declared_cred and not cred_env_present):",
+     "\n                        and declared_cred and cred_env_present):",
+     "mcp.contained_home_without_its_credential_env_var_is_refused"),
+    # The empty-surface condition dropped, so the check also fires for an adapter whose
+    # contained surface DOES copy auth in (codex's `.codex/auth.json`) — refusing a run
+    # that had a perfectly good credential route the env var was never needed for.
+    ("M117-refusal-ignores-whether-auth-was-materialized", RUNNER,
+     "\n                if (contain_home and not materializes_auth\n",
+     "\n                if (contain_home\n",
+     "mcp.contained_home_without_its_credential_env_var_is_refused"),
 ]
 
 

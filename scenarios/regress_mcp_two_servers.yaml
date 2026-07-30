@@ -1,0 +1,66 @@
+# regress_mcp_two_servers.yaml — REGRESSION: `mcp_servers:` carries a SET, not a singleton.
+#
+# Naming: files named `regress_*.yaml` and tagged `regression` exist to pin behaviour that
+# already works, so a future change cannot quietly undo it. They are not feature demos and
+# not CI-discovered; run them explicitly, or select them with `--tag regression`.
+#
+#   agentskill-evals run --config scenarios/regress_mcp_two_servers.yaml
+#
+# WHAT THIS GUARDS, and why one server could never guard it.
+# Every live MCP run to date has declared exactly ONE server, which makes a whole class of
+# bug invisible: a config writer that emits only the last entry, a witness that compares
+# the first name instead of the set, a tool-namespacing scheme that collides when two
+# servers advertise identically-named tools. With one server, "handles the set correctly"
+# and "handles the singleton correctly" are the same observation. Here they are not.
+#
+# The two servers are the SAME fixture under different names, via ECHO_MCP_SERVER_NAME —
+# a knob `fixtures/echo_mcp_server.py` has always had and nothing exercised. Identical tool
+# sets are the point, not a shortcut: `echo` exists on both, so the only thing telling
+# `mcp__alpha__echo` from `mcp__beta__echo` is the per-server namespacing under test.
+#
+# CI-safe: interpolates nothing, so it takes the ordinary isolation overlay rather than the
+# contained HOME (contrast mcp_echo_cred.yaml, which needs a real credential).
+
+name: regress_mcp_two_servers
+description: >
+  Regression: two declared MCP servers in one cell. Proves the declared set survives config
+  writing, that both servers are reachable, and that identically-named tools stay
+  distinguishable through per-server namespacing.
+
+tags: [regression, mcp]
+
+target:
+  runner: claude
+  model:
+    - claude-haiku-4-5
+
+skills:
+
+mcp_servers:
+  alpha:
+    command: python3
+    # Resolved against this file's directory and absolutized (see spec.resolved_files) —
+    # the agent runs in a tempdir workspace with no path relationship to this repo.
+    args: [../harness/fixtures/echo_mcp_server.py]
+    env:
+      ECHO_MCP_SERVER_NAME: alpha
+  beta:
+    command: python3
+    args: [../harness/fixtures/echo_mcp_server.py]
+    env:
+      ECHO_MCP_SERVER_NAME: beta
+
+assertions:
+  - { type: no_error }
+  # Both, deliberately. Asserting one would pass on a config writer that dropped the other.
+  - { type: used_tool, name: mcp__alpha__echo }
+  - { type: used_tool, name: mcp__beta__echo }
+  # Distinct payloads, so a single server answering both calls cannot satisfy this.
+  - { type: final_contains, contains: "wolverine-11" }
+  - { type: final_contains, contains: "marmot-22" }
+
+prompt: |
+  You have two MCP servers available, `alpha` and `beta`. Each provides an `echo` tool.
+
+  Call `alpha`'s echo tool with the exact text `wolverine-11`, then call `beta`'s echo tool
+  with the exact text `marmot-22`. Then report precisely what each tool returned.

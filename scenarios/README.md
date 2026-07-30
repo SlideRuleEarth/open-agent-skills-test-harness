@@ -183,6 +183,30 @@ Name files so a newcomer knows what each is for: **`<what>_on_<runner>-<model>.y
 `pipeline+region-picker_on_claude-haiku.yaml`, `full-pipeline_on_codex-gpt5.5.yaml`. The target also lives
 inside the file; the filename just makes the directory self-describing at a glance.
 
+### Regression scenarios — `regress_*.yaml` + `tags: [regression]`
+
+A **regression scenario** pins behaviour that *already works*, so a later change cannot
+quietly undo it. It is not a feature demo and not a place to explore: it exists because
+something was verified once and would otherwise only be re-verified by accident.
+
+Mark them **both** ways, because the two marks do different jobs:
+
+| Mark | Who reads it |
+|---|---|
+| `regress_` filename prefix | a human scanning `scenarios/` — they sort together and are obvious in a diff |
+| `tags: [regression]` | the runner — `--tag regression` selects them, and nothing else has to change |
+
+Write one when a behaviour **needs a real CLI to observe**. If an offline check can see it,
+prefer that: `harness/agentskill_evals/selftest.py` for harness logic and
+`harness/tools/verify_mcp_fixtures.py` for the stdio fixtures both run in seconds and cost
+nothing, where a scenario costs a model call every time it runs. A regression scenario
+earns its cost only when the thing under test is the agent CLI's own behaviour.
+
+State in a comment at the top **what would break unnoticed without it**. `regress_mcp_two_servers.yaml`
+is the worked example: every live MCP run before it declared exactly one server, which made
+a config writer that emits only the last entry — or a witness that compares the first name
+instead of the set — indistinguishable from correct.
+
 ## Override precedence
 
 For a single run: **CLI flag > scenario file > models.yaml > built-in default**. So

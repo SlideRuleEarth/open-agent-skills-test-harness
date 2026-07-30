@@ -2014,6 +2014,84 @@ def _check_workspace_relocation(failures, verbose):
                f"escapes={seen.get('escapes')!r} archived={leaked26[:70]!r}",
                failures, verbose)
 
+        # Containment engaged, but with an EMPTY surface and the adapter's credential env
+        # var unset — so nothing was copied in and nothing comes through the environment,
+        # and the CLI has no way to authenticate. Measured live before this check existed:
+        # the cell spent a model call to return `exited with code 1`, with the real cause
+        # ("Not logged in") buried in a truncated JSON blob inside an assertion message.
+        # Both directions are pinned, because a refusal that can only fire is as wrong as
+        # one that can never fire: the same cell with the var SET must still run.
+        seen.clear()
+        run_dir27 = os.path.join(repo_root, "artifacts", "run27")
+        os.makedirs(run_dir27)
+        r.run_id, r.run_dir = "run27", run_dir27
+        os.environ["ASE_NOAUTH_MCP"] = "mcp-tok-4f2a"
+        os.environ.pop("ASE_NOAUTH_CRED", None)          # the credential route: UNSET
+
+        class _EnvOnlyAuthAdapter(_MaskingFakeAdapter):
+            # Empty surface = "mapped, copies nothing" — claude's shape, because its auth
+            # lives in the macOS keychain, which no contained home can reach.
+            contained_home_subpaths: list = []
+            credential_env_vars = ["ASE_NOAUTH_CRED"]
+
+        spec27 = EvalSpec(
+            name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"),
+            mcp_servers=parse_mcp_servers(
+                {"echo": {"command": "/bin/echo", "env": {"T": "${ASE_NOAUTH_MCP}"}}},
+                where="selftest"))
+        prior_adapter27 = r.adapter
+        r.adapter = _EnvOnlyAuthAdapter()
+        try:
+            cell27 = r._run_cell(ModelTarget(), spec27)
+            ran27 = seen.get("cwd") is not None
+            # ...and the SAME cell runs once the credential is actually available.
+            os.environ["ASE_NOAUTH_CRED"] = "cred-tok-8b31"
+            seen.clear()
+            run_dir28 = os.path.join(repo_root, "artifacts", "run28")
+            os.makedirs(run_dir28)
+            r.run_id, r.run_dir = "run28", run_dir28
+            cell28 = r._run_cell(ModelTarget(), spec27)
+            # Third case, and the only shape that can see the empty-surface condition at
+            # all: a NON-EMPTY contained surface with the credential var still unset. Auth
+            # gets copied in, so the env var was never the only route and refusing would be
+            # wrong. Without this the check is one-directional — the mutation that drops
+            # `not materializes_auth` survives, because both other cases have an empty
+            # surface and cannot tell the difference.
+            os.environ.pop("ASE_NOAUTH_CRED", None)
+            seen.clear()
+            run_dir29 = os.path.join(repo_root, "artifacts", "run29")
+            os.makedirs(run_dir29)
+            r.run_id, r.run_dir = "run29", run_dir29
+
+            class _MaterializedAuthAdapter(_MaskingFakeAdapter):
+                contained_home_subpaths = [".fakecli/real-auth.json"]
+                credential_env_vars = ["ASE_NOAUTH_CRED"]
+
+            r.adapter = _MaterializedAuthAdapter()
+            cell29 = r._run_cell(ModelTarget(), spec27)
+        finally:
+            r.adapter = prior_adapter27
+            r._secrets = r._run_secrets = ()
+            os.environ.pop("ASE_NOAUTH_MCP", None)
+            os.environ.pop("ASE_NOAUTH_CRED", None)
+        err27 = cell27.run_result.error or ""
+        _check("mcp.contained_home_without_its_credential_env_var_is_refused",
+               cell27.passed is False and ran27 is False
+               and "ASE_NOAUTH_CRED" in err27 and "contained HOME" in err27
+               and cell28.passed and cell29.passed,
+               f"a cell that needs a contained HOME must be refused when the adapter's only "
+               f"authentication route — its credential env var — is unset, because an empty "
+               f"contained surface copies nothing in and the CLI would start with no "
+               f"credential at all. Refused BEFORE the model call, and the refusal names the "
+               f"variable rather than surfacing as a generic non-zero exit. The same cell "
+               f"with the variable set must still run, or the check is a blanket ban. "
+               f"An adapter whose contained surface COPIES auth in must not be refused "
+               f"either — the env var was never its only route. "
+               f"passed={cell27.passed} ran={ran27} refusal={err27[:140]!r} "
+               f"ran_with_cred={getattr(cell28, 'passed', None)} "
+               f"ran_with_materialized_auth={getattr(cell29, 'passed', None)}",
+               failures, verbose)
+
         # A credential too short to redact is still a credential. This is the arm that would
         # have caught gating on `bool(secrets)` — the redaction set is empty here.
         seen.clear()
