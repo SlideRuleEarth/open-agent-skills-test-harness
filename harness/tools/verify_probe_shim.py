@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""Verify fixtures/probe_era_mcp_server.py by driving it as a scripted client.
+
+The C3-0/C3-1 results table in DESIGN_MCP_Support.md §9 is only as trustworthy as the
+instrument that produced it: if the shim misreads an era, every row is wrong and nothing
+downstream would notice. This is that instrument's own check, kept in the repo so the
+measurement is reproducible rather than resting on a scratch file that no longer exists.
+
+Fixtures carry no selftest arms and are not mutation targets, so this lives in tools/
+alongside the other runnable verifiers rather than in the arm count.
+
+Drives the shim over pipes — no agent CLI, no network, a few seconds. Everything runs
+behind a DEADLINE and the child is always reaped: a shim that stops answering must fail a
+check, not hang the verifier, since a hang is the failure mode a broken instrument is
+most likely to produce.
+
+    python tools/verify_probe_shim.py     # exits non-zero on any failure
+"""
+from __future__ import annotations
+
+import json
+import os
+import queue
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SHIM = os.path.join(os.path.dirname(HERE), "fixtures", "probe_era_mcp_server.py")
+DEADLINE = 10.0
+
+MODERN_META = {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                         "io.modelcontextprotocol/clientCapabilities": {}}}
+
+
+def _pump(fh, q):
+    """Read lines on a background thread and hand them over. Deliberately NOT select() on
+    the pipe: `readline()` fills an 8 KiB userspace buffer, so a single syscall can pull
+    several messages in at once and leave the kernel pipe empty — select() then reports
+    "nothing to read" while a complete line is already sitting in the buffer. That is a
+    hang, not a slow read, and it is exactly the failure this verifier is supposed to
+    detect rather than suffer."""
+    try:
+        for line in fh:
+            q.put(line)
+    except (OSError, ValueError):
+        pass  # the departed-reader scenario closes this pipe underneath us, on purpose
+    q.put(None)
+
+
+def _readline(q, deadline):
+    """One line, "" at EOF, None once the deadline passes."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    try:
+        line = q.get(timeout=remaining)
+    except queue.Empty:
+        return None
+    return "" if line is None else line.decode()
+
+
+def run(msgs, *, mode="dual", kill=None, ignore_sigterm=False, cancel=None,
+        close_reader=False):
+    """Send `msgs`, collect replies, then shut down via `kill` (a signal) or stdin close.
+
+    `subscriptions/listen` deliberately gets no immediate reply — its JSON-RPC response IS
+    the graceful-closure signal — so expected replies are computed per method rather than
+    per id. Waiting on it would hang, which is exactly the bug this rewrite fixes.
+
+    Returns (responses, notifications, records, stream). `stream` is every message in WIRE
+    ORDER: the split views lose ordering, and "the acknowledgment comes first" is a claim
+    about order, so asserting it against the split lists would pass for a late ack.
+
+    `close_reader` shuts the client's read side before shutdown, reproducing the departed
+    reader that produced agy's `broken_pipe` terminator in §9."""
+    tmp = tempfile.mkdtemp(prefix="verify-shim-")
+    log = os.path.join(tmp, "probe.jsonl")
+    env = dict(os.environ, PROBE_MCP_LOG=log, PROBE_MCP_MODE=mode)
+    if ignore_sigterm:
+        env["PROBE_MCP_IGNORE_SIGTERM"] = "1"
+
+    deadline = time.monotonic() + DEADLINE
+    responses, notifications, stream = [], [], []
+    p = subprocess.Popen([sys.executable, SHIM], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    q = queue.Queue()
+    # No pump in the departed-reader scenario: closing the pipe out from under a thread
+    # that is blocked reading it is a race, and it hangs rather than failing. Nothing is
+    # read there anyway — the whole point is that the client stopped listening.
+    if not close_reader:
+        threading.Thread(target=_pump, args=(p.stdout, q), daemon=True).start()
+    try:
+        pending = set()
+        for m in msgs:
+            p.stdin.write((json.dumps(m) + "\n").encode())
+            p.stdin.flush()
+            if m.get("id") is not None and m.get("method") != "subscriptions/listen":
+                pending.add(m["id"])
+        for m in (cancel or []):
+            p.stdin.write((json.dumps(m) + "\n").encode())
+            p.stdin.flush()
+
+        while pending and not close_reader:
+            line = _readline(q, deadline)
+            if not line:
+                break
+            msg = json.loads(line)
+            stream.append(msg)
+            if msg.get("id") is None:
+                notifications.append(msg)
+            else:
+                responses.append(msg)
+                pending.discard(msg["id"])
+
+        if close_reader:
+            # Depart before the server finishes talking. Its next write — the graceful
+            # closure — then lands on a pipe with no reader.
+            time.sleep(0.2)
+            p.stdout.close()
+
+        if kill:
+            time.sleep(0.15)
+            p.send_signal(kill)
+        else:
+            p.stdin.close()
+            while not close_reader:  # drain graceful-closure responses until EOF
+                line = _readline(q, deadline)
+                if line is None or line == "":
+                    break
+                msg = json.loads(line)
+                stream.append(msg)
+                (notifications if msg.get("id") is None else responses).append(msg)
+
+        try:
+            # A signalled child needs only a moment to prove whether it honoured the
+            # signal; waiting out the full deadline on the ignore-SIGTERM case would add
+            # ten seconds to every run to learn nothing more.
+            p.wait(timeout=1.5 if kill else max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait(timeout=5)
+        for fh in (p.stdin, p.stdout, p.stderr):
+            try:
+                fh.close()
+            except (OSError, ValueError):
+                pass
+        recs = []
+        if os.path.exists(log):
+            recs = [json.loads(l) for l in open(log) if l.strip()]
+        shutil.rmtree(tmp, ignore_errors=True)
+    return responses, notifications, recs, stream
+
+
+def ev(recs, name):
+    return [r for r in recs if r["event"] == name]
+
+
+fails = []
+
+
+def check(label, cond, detail=""):
+    print(f"  {'ok  ' if cond else 'FAIL'} {label}{'' if cond else '  <- ' + str(detail)[:300]}")
+    if not cond:
+        fails.append(label)
+
+
+def modern(method, mid, **extra):
+    return {"jsonrpc": "2.0", "id": mid, "method": method,
+            "params": dict(MODERN_META, **extra)}
+
+
+def legacy_init(mid, version="2025-11-25"):
+    """A COMPLETE legacy initialize. The legacy lifecycle requires protocolVersion,
+    capabilities and clientInfo, and the shim now enforces that — so scenarios cannot get
+    away with the partial params they used to send."""
+    return {"jsonrpc": "2.0", "id": mid, "method": "initialize", "params": {
+        "protocolVersion": version, "capabilities": {},
+        "clientInfo": {"name": "verify-probe-shim", "version": "1.0"}}}
+
+
+print("1. modern client that SKIPS server/discover (the P2 case)")
+r, n, recs, st = run([modern("tools/list", 1)])
+e = ev(recs, "era")
+check("era decided", len(e) == 1, e)
+check("era == modern", e and e[0]["era"] == "modern", e)
+check("exact version captured", e and e[0]["version"] == "2026-07-28", e)
+check("decided by _meta not method", e and e[0]["decided_by"] == "_meta", e)
+check("tools/list answered", r and "tools" in r[0].get("result", {}), r)
+
+print("2. modern results are CONFORMING (P1: resultType + caching hints)")
+r, n, recs, st = run([modern("server/discover", 1), modern("tools/list", 2),
+                  modern("ping", 3), modern("tools/call", 4, name="probe_noop")])
+by = {m["id"]: m.get("result", {}) for m in r}
+check("discover has resultType", by.get(1, {}).get("resultType") == "complete", by.get(1))
+check("discover has ttlMs", "ttlMs" in by.get(1, {}), by.get(1))
+check("discover has cacheScope", by.get(1, {}).get("cacheScope") == "public", by.get(1))
+check("tools/list has resultType", by.get(2, {}).get("resultType") == "complete", by.get(2))
+check("tools/list has ttlMs", "ttlMs" in by.get(2, {}), by.get(2))
+check("tools/list has cacheScope", by.get(2, {}).get("cacheScope") == "public", by.get(2))
+check("ping has resultType", by.get(3, {}).get("resultType") == "complete", by.get(3))
+check("ping has NO caching hints", "ttlMs" not in by.get(3, {}), by.get(3))
+check("tools/call has resultType", by.get(4, {}).get("resultType") == "complete", by.get(4))
+
+print("3. legacy client, and legacy results are NOT modern-shaped")
+r, n, recs, st = run([legacy_init(1, "2025-06-18"),
+                  {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}])
+e = ev(recs, "era")
+check("era == legacy", e and e[0]["era"] == "legacy", e)
+check("legacy version captured", e and e[0]["version"] == "2025-06-18", e)
+by = {m["id"]: m.get("result", {}) for m in r}
+check("initialize answered", "protocolVersion" in by.get(1, {}), by.get(1))
+check("no resultType leaked into legacy", "resultType" not in by.get(2, {}), by.get(2))
+
+print("4. forced fallback: legacy mode must log LEGACY, not the refused modern attempt")
+r, n, recs, st = run([modern("server/discover", 1),
+                  legacy_init(2, "2025-06-18")], mode="legacy")
+by = {m["id"]: m for m in r}
+check("discover refused", "error" in by.get(1, {}), by.get(1))
+check("then initialize works", "result" in by.get(2, {}), by.get(2))
+e = ev(recs, "era")
+check("exactly one era record", len(e) == 1, e)
+check("negotiated era is legacy", e and e[0]["era"] == "legacy", e)
+check("refusal was logged", len(ev(recs, "violation")) + len(ev(recs, "refused")) == 1, recs)
+
+print("5. forced fallback the other way: modern mode must log MODERN")
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                  modern("tools/list", 2)], mode="modern")
+by = {m["id"]: m for m in r}
+check("initialize refused", "error" in by.get(1, {}), by.get(1))
+check("then modern request works", "result" in by.get(2, {}), by.get(2))
+e = ev(recs, "era")
+check("exactly one era record", len(e) == 1, e)
+check("negotiated era is modern", e and e[0]["era"] == "modern", e)
+
+print("6. subscriptions/listen: ack first, no immediate response, graceful closure at EOF")
+r, n, recs, st = run([modern("subscriptions/listen", 1, notifications={"toolsListChanged": True}),
+                  modern("tools/list", 2)])
+acks = [m for m in n if m.get("method") == "notifications/subscriptions/acknowledged"]
+check("acknowledgment sent", len(acks) == 1, n)
+# Ordering is per SUBSCRIPTION, not per channel: on stdio every subscription shares one
+# pipe, and the spec explicitly permits other subscriptions' messages to interleave ahead
+# of an acknowledgment. Asserting "first on the wire" would be a stricter rule than the
+# protocol has, and would fail a conforming server that happened to interleave.
+def sub_stream(stream, sub_id):
+    out = []
+    for m in stream:
+        meta = (m.get("params") or m.get("result") or {}).get("_meta") or {}
+        if meta.get("io.modelcontextprotocol/subscriptionId") == sub_id:
+            out.append(m)
+    return out
+
+
+s1 = sub_stream(st, 1)
+check("acknowledgment is first WITHIN subscription 1",
+      s1 and s1[0].get("method") == "notifications/subscriptions/acknowledged",
+      [m.get("method") or m.get("id") for m in s1])
+check("ack carries subscriptionId == request id",
+      acks and acks[0]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"] == 1, acks)
+check("ack reflects agreed filter",
+      acks and acks[0]["params"]["notifications"] == {"toolsListChanged": True}, acks)
+closing = [m for m in r if m.get("id") == 1]
+check("graceful closure response sent", len(closing) == 1, r)
+check("closure carries subscriptionId", closing and
+      closing[0]["result"]["_meta"]["io.modelcontextprotocol/subscriptionId"] == 1, closing)
+check("subscription open+close logged",
+      len(ev(recs, "subscription_open")) == 1 and len(ev(recs, "subscription_close")) == 1, recs)
+
+print("7. cancellation retires the subscription, and its id is then reusable")
+r, n, recs, st = run([modern("subscriptions/listen", 1, notifications={"toolsListChanged": True})],
+                 cancel=[{"jsonrpc": "2.0", "method": "notifications/cancelled",
+                          "params": dict(MODERN_META, requestId=1)},
+                         modern("ping", 1)])
+check("cancellation observed", len(ev(recs, "subscription_cancelled")) == 1, recs)
+check("no graceful closure after cancel", len(ev(recs, "subscription_close")) == 0, recs)
+pings = [m for m in r if m.get("id") == 1 and "result" in m]
+check("id 1 reusable after cancel", len(pings) >= 1, r)
+
+print("8. notification is never answered")
+r, n, recs, st = run([{"jsonrpc": "2.0", "method": "notifications/initialized",
+                   "params": dict(MODERN_META)}, modern("ping", 1)])
+check("exactly one response (ping only)", len(r) == 1, r)
+check("no stray notifications", n == [], n)
+
+print("9. C3-1: stdin close -> clean terminator")
+r, n, recs, st = run([modern("ping", 1)])
+check("stdin_eof logged", len(ev(recs, "stdin_eof")) == 1, recs)
+t = ev(recs, "terminator")
+check("terminator reason == stdin_eof", len(t) == 1 and t[0]["reason"] == "stdin_eof", t)
+
+print("10. C3-1: SIGTERM -> terminator names the signal")
+r, n, recs, st = run([modern("ping", 1)], kill=signal.SIGTERM)
+s, t = ev(recs, "signal"), ev(recs, "terminator")
+check("signal logged", s and s[0]["signal"] == "SIGTERM", recs)
+check("terminator reason == signal", len(t) == 1 and t[0]["reason"] == "signal", t)
+
+print("11. C3-1: SIGKILL -> NO terminator (absence is the answer)")
+r, n, recs, st = run([modern("ping", 1)], kill=signal.SIGKILL)
+check("start was logged", len(ev(recs, "start")) == 1, recs)
+check("no terminator", len(ev(recs, "terminator")) == 0, recs)
+
+print("12. escalation probe: SIGTERM ignored, process survives to be killed")
+r, n, recs, st = run([modern("ping", 1)], kill=signal.SIGTERM, ignore_sigterm=True)
+s = ev(recs, "signal")
+check("SIGTERM logged as ignored", s and s[0]["action"] == "ignored", recs)
+check("no terminator (was killed)", len(ev(recs, "terminator")) == 0, recs)
+
+print("13. departed reader: graceful-closure write gets EPIPE (pins the agy §9 result)")
+r, n, recs, st = run([modern("subscriptions/listen", 1, notifications={"toolsListChanged": True}),
+                      modern("tools/list", 2)], close_reader=True)
+t = ev(recs, "terminator")
+check("subscription was open", len(ev(recs, "subscription_open")) == 1, recs)
+check("closure was attempted before the write failed",
+      len(ev(recs, "subscription_close")) == 1, recs)
+check("terminator reason == broken_pipe",
+      len(t) == 1 and t[0]["reason"] == "broken_pipe", t)
+
+print("14. the OPENING request is validated too, not just later ones")
+# Scenario 15 below establishes a valid era first, so it structurally cannot catch an
+# opener that sets the very terms it should have been checked against.
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {
+    "_meta": {"io.modelcontextprotocol/protocolVersion": "2099-01-01",
+              "io.modelcontextprotocol/clientCapabilities": {}}}},
+    modern("tools/list", 2)])
+by = {m["id"]: m for m in r}
+check("unsupported opening version rejected", "error" in by.get(1, {}), by.get(1))
+check("rejected with -32022", by.get(1, {}).get("error", {}).get("code") == -32022, by.get(1))
+e = ev(recs, "era")
+check("rejected opener established NO era", len(e) == 1, e)
+check("the accepted retry set the era", e and e[0]["version"] == "2026-07-28", e)
+check("retry answered", "result" in by.get(2, {}), by.get(2))
+
+print("15. an opener with no metadata at all establishes nothing")
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                      modern("tools/list", 2)])
+by = {m["id"]: m for m in r}
+check("bare opener rejected", "error" in by.get(1, {}), by.get(1))
+check("no era recorded for it", len(ev(recs, "era")) == 1, ev(recs, "era"))
+check("and it was not served in legacy shape", "result" not in by.get(1, {}), by.get(1))
+
+print("16. clientCapabilities is required, not just protocolVersion")
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {
+    "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {
+        "_meta": {"io.modelcontextprotocol/clientCapabilities": {}}}},
+    modern("tools/list", 3)])
+by = {m["id"]: m for m in r}
+check("missing capabilities rejected", "error" in by.get(1, {}), by.get(1))
+check("... with -32602", by.get(1, {}).get("error", {}).get("code") == -32602, by.get(1))
+check("missing version rejected", "error" in by.get(2, {}), by.get(2))
+check("... also -32602", by.get(2, {}).get("error", {}).get("code") == -32602, by.get(2))
+check("well-formed modern request still works", "result" in by.get(3, {}), by.get(3))
+
+print("17. negotiated era is ENFORCED: modern-only mode refuses initialize")
+r, n, recs, st = run([modern("tools/list", 1),
+                      {"jsonrpc": "2.0", "id": 2, "method": "initialize",
+                       "params": {"protocolVersion": "2025-06-18"}},
+                      modern("ping", 3)], mode="modern")
+by = {m["id"]: m for m in r}
+check("era is modern", ev(recs, "era")[0]["era"] == "modern", recs)
+check("initialize rejected", "error" in by.get(2, {}), by.get(2))
+check("violation logged", len(ev(recs, "violation")) == 1, recs)
+check("session still usable afterwards", "result" in by.get(3, {}), by.get(3))
+
+print("18. ... and an UNSUPPORTED version is refused wherever it appears")
+# Not a "switch": nothing is stateful. Another version this shim implemented would be
+# judged on its own merits, request by request.
+r, n, recs, st = run([modern("tools/list", 1),
+                      {"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}},
+                      {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {"_meta": {
+                          "io.modelcontextprotocol/protocolVersion": "2099-01-01",
+                          "io.modelcontextprotocol/clientCapabilities": {}}}}])
+by = {m["id"]: m for m in r}
+check("bare request after modern rejected", "error" in by.get(2, {}), by.get(2))
+check("version switch rejected", "error" in by.get(3, {}), by.get(3))
+check("version switch uses -32022",
+      by.get(3, {}).get("error", {}).get("code") == -32022, by.get(3))
+check("supported list advertised",
+      by.get(3, {}).get("error", {}).get("data", {}).get("supported") == ["2026-07-28"],
+      by.get(3))
+check("both violations logged", len(ev(recs, "violation")) == 2, recs)
+
+print("19. ... and a legacy-only server refuses modern metadata")
+r, n, recs, st = run([legacy_init(1, "2025-06-18"),
+                      modern("tools/list", 2),
+                      {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}}],
+                     mode="legacy")
+by = {m["id"]: m for m in r}
+check("era is legacy", ev(recs, "era")[0]["era"] == "legacy", recs)
+check("modern request rejected", "error" in by.get(2, {}), by.get(2))
+check("violation logged", len(ev(recs, "violation")) == 1, recs)
+check("plain legacy request still works", "result" in by.get(3, {}), by.get(3))
+
+print("20. dual mode is ORDER-INDEPENDENT: modern first, then initialize, then bare")
+r, n, recs, st = run([modern("tools/list", 1), legacy_init(2),
+                      {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}}])
+by = {m["id"]: m for m in r}
+check("modern request served", "result" in by.get(1, {}), by.get(1))
+check("initialize accepted", "result" in by.get(2, {}), by.get(2))
+check("bare request now legal", "result" in by.get(3, {}), by.get(3))
+check("both eras recorded", len(ev(recs, "era")) == 1 and len(ev(recs, "era_also")) == 1,
+      recs)
+
+print("21. ... and the other order, which must behave the same")
+r, n, recs, st = run([legacy_init(1), modern("tools/list", 2),
+                      {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}}])
+by = {m["id"]: m for m in r}
+check("initialize accepted", "result" in by.get(1, {}), by.get(1))
+check("modern request served", "result" in by.get(2, {}), by.get(2))
+check("bare request still legal", "result" in by.get(3, {}), by.get(3))
+check("modern reply is modern-shaped",
+      by.get(2, {}).get("result", {}).get("resultType") == "complete", by.get(2))
+
+print("22. the method must match the REQUEST's era, not the other way round")
+r, n, recs, st = run([modern("initialize", 1),
+                      legacy_init(2),
+                      {"jsonrpc": "2.0", "id": 3, "method": "server/discover",
+                       "params": {}}])
+by = {m["id"]: m for m in r}
+check("modern-metadata initialize is unknown", "error" in by.get(1, {}), by.get(1))
+check("... with -32601", by.get(1, {}).get("error", {}).get("code") == -32601, by.get(1))
+check("bare server/discover after legacy init is unknown", "error" in by.get(3, {}),
+      by.get(3))
+check("... and NOT a DiscoverResult", "result" not in by.get(3, {}), by.get(3))
+
+print("22b. ... and that gate covers EVERY modern-only method, not just discover")
+# subscriptions/listen was introduced in 2026-07-28 and REPLACED the legacy
+# resources/subscribe. The first version of this gate named server/discover alone and let
+# this one through, serving a modern-only method under legacy semantics.
+r, n, recs, st = run([legacy_init(1),
+                      {"jsonrpc": "2.0", "id": 2, "method": "subscriptions/listen",
+                       "params": {"notifications": {"toolsListChanged": True}}}])
+by = {m["id"]: m for m in r}
+check("bare subscriptions/listen is unknown", "error" in by.get(2, {}), by.get(2))
+check("... with -32601", by.get(2, {}).get("error", {}).get("code") == -32601, by.get(2))
+check("no acknowledgment emitted",
+      not [m for m in n if str(m.get("method", "")).startswith("notifications/subscriptions")], n)
+check("no subscription opened", len(ev(recs, "subscription_open")) == 0, recs)
+check("no graceful closure either", len(ev(recs, "subscription_close")) == 0, recs)
+
+print("23. a legacy-only server must never emit a recognized MODERN error")
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {
+    "_meta": {"io.modelcontextprotocol/protocolVersion": "2099-01-01",
+              "io.modelcontextprotocol/clientCapabilities": {}}}}], mode="legacy")
+code = r and r[0].get("error", {}).get("code")
+check("rejected", r and "error" in r[0], r)
+check("NOT -32022 (that would identify it as modern)", code != -32022, r)
+check("plain method-not-found instead", code == -32601, r)
+
+print("24. presence is not validity")
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {
+    "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+              "io.modelcontextprotocol/clientCapabilities": None}}},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {
+        "_meta": {"io.modelcontextprotocol/protocolVersion": 20260728,
+                  "io.modelcontextprotocol/clientCapabilities": {}}}},
+    modern("tools/list", 3)])
+by = {m["id"]: m for m in r}
+check("null clientCapabilities rejected", "error" in by.get(1, {}), by.get(1))
+check("... with -32602", by.get(1, {}).get("error", {}).get("code") == -32602, by.get(1))
+check("numeric protocolVersion rejected", "error" in by.get(2, {}), by.get(2))
+check("... as malformed, not unsupported",
+      by.get(2, {}).get("error", {}).get("code") == -32602, by.get(2))
+check("well-formed request still works", "result" in by.get(3, {}), by.get(3))
+
+print("25. legacy initialize selects a SUPPORTED version rather than echoing")
+r, n, recs, st = run([legacy_init(1, "2099-01-01")])
+sel = r and r[0].get("result", {}).get("protocolVersion")
+check("did not echo the unsupported version", sel != "2099-01-01", r)
+check("selected one it implements", sel in ("2025-11-25", "2025-06-18"), r)
+li = ev(recs, "legacy_initialize")
+check("requested vs selected recorded", li and li[0]["requested"] == "2099-01-01"
+      and li[0]["selected"] == sel, li)
+check("downgrade flagged", li and li[0]["downgraded"] is True, li)
+# The PRIMARY record is what C3-0's table reads. Asserting only the secondary
+# `legacy_initialize` event let a wrong `era.version` pass unnoticed.
+e = ev(recs, "era")
+check("era.version is the SELECTED version", e and e[0]["version"] == sel, e)
+check("era.version is not the client's guess", e and e[0]["version"] != "2099-01-01", e)
+check("era retains what was requested", e and e[0].get("requested") == "2099-01-01", e)
+
+print("26. ... and echoes a version it does support")
+r, n, recs, st = run([legacy_init(1, "2025-06-18")])
+check("supported request honoured",
+      r and r[0].get("result", {}).get("protocolVersion") == "2025-06-18", r)
+check("not flagged as a downgrade",
+      ev(recs, "legacy_initialize")[0]["downgraded"] is False, recs)
+
+print("27. legacy initialization happens ONCE; a second is a lifecycle violation")
+r, n, recs, st = run([legacy_init(1, "2025-06-18"), legacy_init(2, "2025-11-25"),
+                      {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}}])
+by = {m["id"]: m for m in r}
+check("first initialize accepted", "result" in by.get(1, {}), by.get(1))
+check("second initialize rejected", "error" in by.get(2, {}), by.get(2))
+check("renegotiation did not happen",
+      len(ev(recs, "legacy_initialize")) == 1, ev(recs, "legacy_initialize"))
+check("and was not recorded as another era", len(ev(recs, "era_also")) == 0, recs)
+check("violation logged", any(v.get("why", "").startswith("initialize after legacy")
+                              for v in ev(recs, "violation")), ev(recs, "violation"))
+check("session still usable on the negotiated version", "result" in by.get(3, {}), by.get(3))
+
+print("28. legacy initialize requires its own params")
+r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-11-25"}},
+                      legacy_init(2)])
+by = {m["id"]: m for m in r}
+check("initialize without capabilities/clientInfo rejected", "error" in by.get(1, {}),
+      by.get(1))
+check("... with -32602", by.get(1, {}).get("error", {}).get("code") == -32602, by.get(1))
+check("complete initialize accepted", "result" in by.get(2, {}), by.get(2))
+
+print()
+print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")
+sys.exit(1 if fails else 0)
