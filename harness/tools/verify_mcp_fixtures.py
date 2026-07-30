@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Verify fixtures/probe_era_mcp_server.py by driving it as a scripted client.
+"""Verify the stdio MCP fixtures by driving them as a scripted client.
+
+Two servers, one driver: `probe_era_mcp_server.py` (the C3-0/C3-1 measuring instrument)
+and `echo_mcp_server.py` (the test double behind the mcp_echo_* scenarios). They are
+checked together because they share a wire protocol and the same conformance obligations;
+two copies of the driver would let them drift apart on exactly the details that matter.
 
 The C3-0/C3-1 results table in DESIGN_MCP_Support.md §9 is only as trustworthy as the
 instrument that produced it: if the shim misreads an era, every row is wrong and nothing
@@ -14,7 +19,7 @@ behind a DEADLINE and the child is always reaped: a shim that stops answering mu
 check, not hang the verifier, since a hang is the failure mode a broken instrument is
 most likely to produce.
 
-    python tools/verify_probe_shim.py     # exits non-zero on any failure
+    python tools/verify_mcp_fixtures.py   # exits non-zero on any failure
 """
 from __future__ import annotations
 
@@ -30,7 +35,9 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SHIM = os.path.join(os.path.dirname(HERE), "fixtures", "probe_era_mcp_server.py")
+FIXTURES = os.path.join(os.path.dirname(HERE), "fixtures")
+SHIM = os.path.join(FIXTURES, "probe_era_mcp_server.py")
+ECHO = os.path.join(FIXTURES, "echo_mcp_server.py")
 DEADLINE = 10.0
 
 MODERN_META = {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
@@ -65,7 +72,7 @@ def _readline(q, deadline):
 
 
 def run(msgs, *, mode="dual", kill=None, ignore_sigterm=False, cancel=None,
-        close_reader=False):
+        close_reader=False, server=SHIM):
     """Send `msgs`, collect replies, then shut down via `kill` (a signal) or stdin close.
 
     `subscriptions/listen` deliberately gets no immediate reply — its JSON-RPC response IS
@@ -86,7 +93,7 @@ def run(msgs, *, mode="dual", kill=None, ignore_sigterm=False, cancel=None,
 
     deadline = time.monotonic() + DEADLINE
     responses, notifications, stream = [], [], []
-    p = subprocess.Popen([sys.executable, SHIM], stdin=subprocess.PIPE,
+    p = subprocess.Popen([sys.executable, server], stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     q = queue.Queue()
     # No pump in the departed-reader scenario: closing the pipe out from under a thread
@@ -515,6 +522,75 @@ check("initialize without capabilities/clientInfo rejected", "error" in by.get(1
       by.get(1))
 check("... with -32602", by.get(1, {}).get("error", {}).get("code") == -32602, by.get(1))
 check("complete initialize accepted", "result" in by.get(2, {}), by.get(2))
+
+
+
+# ---------------------------------------------------------------------------
+# fixtures/echo_mcp_server.py — the test double behind the mcp_echo_* scenarios.
+# Two live scenarios depend on its LEGACY behaviour, so those arms are regression
+# tests first and conformance tests second.
+# ---------------------------------------------------------------------------
+
+def echo(msgs, **kw):
+    return run(msgs, server=ECHO, **kw)
+
+
+print("E1. legacy path is UNCHANGED (two scenarios depend on it)")
+r, n, recs, st = echo([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": "2025-11-25"}},
+                       {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+                       {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                           "name": "echo", "arguments": {"text": "hi"}}}])
+by = {m["id"]: m.get("result", {}) for m in r}
+check("initialize mirrors the requested version",
+      by.get(1, {}).get("protocolVersion") == "2025-11-25", by.get(1))
+check("both tools advertised",
+      [t["name"] for t in by.get(2, {}).get("tools", [])] == ["echo", "add"], by.get(2))
+check("echo returns its text",
+      by.get(3, {}).get("content", [{}])[0].get("text") == "hi", by.get(3))
+check("no resultType leaked into legacy", "resultType" not in by.get(2, {}), by.get(2))
+check("no caching hints leaked into legacy", "ttlMs" not in by.get(2, {}), by.get(2))
+
+print("E2. modern path: server/discover, conforming and cacheable")
+r, n, recs, st = echo([modern("server/discover", 1)])
+res = r[0].get("result", {}) if r else {}
+check("DiscoverResult returned", res.get("resultType") == "complete", res)
+check("supportedVersions advertised", res.get("supportedVersions") == ["2026-07-28"], res)
+check("caching hints present", res.get("ttlMs") == 0 and res.get("cacheScope") == "public", res)
+check("advertises capabilities, NOT tool definitions",
+      res.get("capabilities") == {"tools": {}} and "tools" not in
+      [k for k in res if k != "capabilities"], res)
+
+print("E3. modern path: same tools, modern shape")
+r, n, recs, st = echo([modern("tools/list", 1), modern("ping", 2),
+                       modern("tools/call", 3, name="echo", arguments={"text": "hi"})])
+by = {m["id"]: m.get("result", {}) for m in r}
+check("tool set is identical across eras",
+      [t["name"] for t in by.get(1, {}).get("tools", [])] == ["echo", "add"], by.get(1))
+check("tools/list has resultType", by.get(1, {}).get("resultType") == "complete", by.get(1))
+check("tools/list has caching hints", "ttlMs" in by.get(1, {}), by.get(1))
+check("ping has resultType", by.get(2, {}).get("resultType") == "complete", by.get(2))
+check("ping has NO caching hints", "ttlMs" not in by.get(2, {}), by.get(2))
+check("tools/call has resultType", by.get(3, {}).get("resultType") == "complete", by.get(3))
+check("echo still echoes under modern",
+      by.get(3, {}).get("content", [{}])[0].get("text") == "hi", by.get(3))
+
+print("E4. era is per REQUEST, so a mixed connection is served correctly either way")
+r, n, recs, st = echo([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": "2025-11-25"}},
+                       {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+                       modern("tools/list", 3)])
+by = {m["id"]: m.get("result", {}) for m in r}
+check("bare request stays legacy-shaped", "resultType" not in by.get(2, {}), by.get(2))
+check("modern request is modern-shaped",
+      by.get(3, {}).get("resultType") == "complete", by.get(3))
+
+print("E5. subscriptions/listen is declined, not faked")
+r, n, recs, st = echo([modern("subscriptions/listen", 1,
+                              notifications={"toolsListChanged": True})])
+check("method not found", r and "error" in r[0], r)
+check("... with -32601", r and r[0]["error"]["code"] == -32601, r)
+check("no acknowledgment emitted", n == [], n)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")
