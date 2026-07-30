@@ -430,6 +430,21 @@ check("bare server/discover after legacy init is unknown", "error" in by.get(3, 
       by.get(3))
 check("... and NOT a DiscoverResult", "result" not in by.get(3, {}), by.get(3))
 
+print("22b. ... and that gate covers EVERY modern-only method, not just discover")
+# subscriptions/listen was introduced in 2026-07-28 and REPLACED the legacy
+# resources/subscribe. The first version of this gate named server/discover alone and let
+# this one through, serving a modern-only method under legacy semantics.
+r, n, recs, st = run([legacy_init(1),
+                      {"jsonrpc": "2.0", "id": 2, "method": "subscriptions/listen",
+                       "params": {"notifications": {"toolsListChanged": True}}}])
+by = {m["id"]: m for m in r}
+check("bare subscriptions/listen is unknown", "error" in by.get(2, {}), by.get(2))
+check("... with -32601", by.get(2, {}).get("error", {}).get("code") == -32601, by.get(2))
+check("no acknowledgment emitted",
+      not [m for m in n if str(m.get("method", "")).startswith("notifications/subscriptions")], n)
+check("no subscription opened", len(ev(recs, "subscription_open")) == 0, recs)
+check("no graceful closure either", len(ev(recs, "subscription_close")) == 0, recs)
+
 print("23. a legacy-only server must never emit a recognized MODERN error")
 r, n, recs, st = run([{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {
     "_meta": {"io.modelcontextprotocol/protocolVersion": "2099-01-01",

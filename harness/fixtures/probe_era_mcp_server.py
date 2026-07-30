@@ -55,6 +55,13 @@ MODERN_VERSION = "2026-07-28"
 # recording of the client's own guess. Both measured legacy versions are here (§9).
 LEGACY_VERSIONS = ("2025-11-25", "2025-06-18")
 SUB_ID_KEY = "io.modelcontextprotocol/subscriptionId"
+# Methods that exist ONLY in the modern revision, so a request for one carrying no modern
+# `_meta` is unknown rather than servable. `subscriptions/listen` belongs here for the same
+# reason `server/discover` does: it was introduced in 2026-07-28 and REPLACED the legacy
+# `resources/subscribe`, so serving it under legacy semantics would answer a method that
+# revision does not have. Keeping this as a set rather than a special case is the point —
+# the first version of this gate named one method and silently let the other through.
+MODERN_ONLY_METHODS = ("server/discover", "subscriptions/listen")
 
 _started = time.monotonic()
 _log_fd = None
@@ -288,12 +295,12 @@ def _reject(req_id, msg: dict, method):
             return True
         return False
 
-    if method == "server/discover":
+    if method in MODERN_ONLY_METHODS:
         # A modern-only method arriving with no modern metadata. A legacy server has never
-        # heard of it, and answering a DiscoverResult would again be reading the era off
-        # the method name.
-        _log("violation", why="server/discover without modern metadata", method=method)
-        _error(req_id, -32601, "method not found: server/discover")
+        # heard of it, and answering on the strength of the familiar name would be reading
+        # the era off the method — the inversion this whole function exists to prevent.
+        _log("violation", why="modern-only method without modern metadata", method=method)
+        _error(req_id, -32601, f"method not found: {method}")
         return True
 
     # Neither modern metadata nor `initialize`: legal only once `initialize` has selected
