@@ -74,6 +74,7 @@ COPILOT = "agentskill_evals/adapters/copilot.py"
 AGY = "agentskill_evals/adapters/antigravity.py"
 SCHEMA = "agentskill_evals/schema.py"
 CLI = "agentskill_evals/cli.py"
+PROXY = "agentskill_evals/mcp_proxy.py"
 # The suite mutates PRODUCTION code and asks whether the selftest notices. This one target
 # is the exception, and only for the arm counter: that counter is a feature of the selftest
 # whose failure mode (it stops counting, every arm still passes, the banner still says
@@ -884,6 +885,113 @@ MUTATIONS = [
     # The arm counter stops counting. Every arm still passes and the banner still says
     # PASSED, so without its own arm this is invisible — which is precisely the failure the
     # counter was added to make visible (a section that silently stops running).
+    # --- C3 proxy decision layer (DESIGN_MCP_Support.md §10) ------------------------------
+    # Every one of these is a way the proxy would DEGRADE — forward something it did not
+    # understand — rather than fail the cell, which is the single property §10.5 exists to
+    # guarantee. They are the reason the decision layer is pure: a mutation cannot reach
+    # logic that only a wire-level driver exercises.
+    #
+    # The naive envelope reading, "no `id` means notification": an id-less RESULT is accepted
+    # as a response instead of being refused, so a malformed frame gets forwarded.
+    ("M128-idless-result-accepted-as-a-response", PROXY,
+     '        return RESULT if has_id else Anomaly(MALFORMED, "result response with no `id`")',
+     "        return RESULT",
+     "proxy.envelope_shape_is_established_positively"),
+    # A null request id read as a notification, which puts it on the never-answer path.
+    ("M129-null-request-id-becomes-a-notification", PROXY,
+     "        if has_id:\n",
+     "        if has_id and msg['id'] is not None:\n",
+     "proxy.envelope_shape_is_established_positively"),
+    # A JSON-RPC batch stops being its own diagnosis. MCP's stdio binding allows exactly one
+    # message per line, so an array is a conformance refusal and the log must say which.
+    ("M130-batch-loses-its-own-diagnosis", PROXY,
+     ("    if isinstance(msg, list):\n"
+      '        return Anomaly(BATCH, "JSON-RPC batch: an array is not a legal MCP stdio '
+      'message")\n'),
+     "",
+     "proxy.envelope_shape_is_established_positively"),
+    # Era read off the method name: `initialize` is honoured even when the request declared
+    # itself modern — the exact inversion §10.2 forbids.
+    ("M131-modern-era-honours-initialize", PROXY,
+     '        return method != "initialize"',
+     "        return True",
+     "proxy.era_comes_from_metadata_not_method"),
+    # Modern-only collapses from a CATEGORY to one method, so a bare `subscriptions/listen`
+    # is answered under legacy semantics that have no such method — the probe shim's bug.
+    ("M132-modern-only-methods-collapse-to-one", PROXY,
+     '\nMODERN_ONLY_METHODS = ("server/discover", "subscriptions/listen")',
+     '\nMODERN_ONLY_METHODS = ("server/discover",)',
+     "proxy.era_comes_from_metadata_not_method"),
+    # The version gate relaxed: an unread revision is forwarded on the strength of looking
+    # modern. This is the mutation that stands in for every future revision.
+    ("M133-unimplemented-modern-version-forwarded", PROXY,
+     "    if claimed not in MODERN_VERSIONS:\n",
+     "    if False:\n",
+     "proxy.version_gate_fails_closed"),
+    ("M134-unimplemented-legacy-version-forwarded", PROXY,
+     "    if claimed not in LEGACY_VERSIONS:\n",
+     "    if False:\n",
+     "proxy.version_gate_fails_closed"),
+    # Partial modern metadata laundered into legacy: a capabilities-only request is read as
+    # a bare one instead of the broken modern request a server must reject.
+    ("M135-capabilities-without-a-version-is-laundered", PROXY,
+     "    return VER_KEY in meta or CAP_KEY in meta",
+     "    return VER_KEY in meta",
+     "proxy.partial_modern_metadata_is_not_legacy"),
+    # A structural scan reintroduced by the back door: an EMPTY `tools` array counts as a
+    # definition, so the capability flag in every modern handshake trips the check.
+    ("M136-empty-tools-array-counts-as-a-definition", PROXY,
+     "    return isinstance(value, list) and bool(value)",
+     "    return isinstance(value, list)",
+     "proxy.capabilities_are_not_tool_definitions"),
+    # The filter edits the message in place, so the source advertisement is destroyed and
+    # cannot be logged as the expected event §10.5 wants recorded.
+    ("M137-filter-mutates-the-source-message", PROXY,
+     "    out = dict(result)\n",
+     "    out = result\n",
+     "proxy.tools_result_is_filtered_or_refused_never_forwarded_unfiltered"),
+    # A nameless tool entry passes the shape check, so it is silently dropped by the filter
+    # rather than refused — a decision the proxy is not entitled to make.
+    ("M138-nameless-tool-entry-passes-the-shape-check", PROXY,
+     '    return all(isinstance(t, dict) and isinstance(t.get("name"), str) for t in tools)',
+     "    return True",
+     "proxy.tools_result_is_filtered_or_refused_never_forwarded_unfiltered"),
+    # Correlation collapses to one direction, so a server->client id reads as the client's.
+    ("M139-correlation-ignores-direction", PROXY,
+     ("    def method_for(self, direction: str, req_id: Any) -> str | None:\n"
+      "        return self._by_direction[direction].get(self._key(req_id))"),
+     ("    def method_for(self, direction: str, req_id: Any) -> str | None:\n"
+      '        return self._by_direction["c2s"].get(self._key(req_id))'),
+     "proxy.correlation_is_direction_scoped"),
+    # Retirement stops retiring, so a reused subscription id correlates against stale state.
+    ("M140-retired-subscription-id-stays-resident", PROXY,
+     "        return self._by_direction[direction].pop(self._key(req_id), None)",
+     "        return self._by_direction[direction].get(self._key(req_id))",
+     "proxy.subscriptions_retire_and_their_ids_become_reusable"),
+    # Graceful closure stops checking WHICH request it closes, so any empty result retires a
+    # subscription that is still open.
+    ("M141-graceful-closure-ignores-the-method", PROXY,
+     '    if method != "subscriptions/listen":\n        return False\n',
+     "",
+     "proxy.subscriptions_retire_and_their_ids_become_reusable"),
+    # A second `initialize` is accepted as a renegotiation, retroactively moving every
+    # message already exchanged to a revision it was not read under.
+    ("M142-second-initialize-accepted-as-renegotiation", PROXY,
+     "        if self.legacy_version is not None:\n",
+     "        if False:\n",
+     "proxy.legacy_state_is_a_version_and_initialize_happens_once"),
+    # Observed-version telemetry stops being a set of distinct eras.
+    ("M143-observed-versions-record-duplicates", PROXY,
+     ("        if version not in self.observed:\n"
+      "            self.observed.append(version)"),
+     "        self.observed.append(version)",
+     "proxy.legacy_state_is_a_version_and_initialize_happens_once"),
+    # The refusal stops saying the server was never contacted, so a scenario author debugs a
+    # server that never saw the call.
+    ("M144-refusal-hides-that-the-server-was-not-contacted", PROXY,
+     '                        f"server was not contacted"),',
+     '                        f"server was consulted"),',
+     "proxy.off_list_call_is_refused_without_reaching_the_server"),
     ("I1-arm-counter-stops-counting", SELFTEST,
      "    global _ARMS_RUN\n    _ARMS_RUN += 1\n",
      "    global _ARMS_RUN\n",
