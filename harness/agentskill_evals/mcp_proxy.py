@@ -964,6 +964,11 @@ def _decide_client_request(msg: dict, allowed: frozenset[str], state: ProtocolSt
         # whatever version is negotiated governs the RESPONSE, which is where tool definitions
         # actually live, and a negotiation this proxy cannot implement fails before any
         # response is forwarded.
+        #
+        # MEASURED (probe C3-2, §9): no shipped CLI pipelines — the three legacy ones wait,
+        # and agy sends no `initialize` at all. So this clause is defensive rather than
+        # load-bearing today, which is the reason to KEEP it: it costs one condition, and the
+        # failure it prevents is a cell failing for a reason no scenario author could see.
         return Fail(Anomaly(NO_ERA_ESTABLISHED,
                             f"{method!r} carries no modern `_meta` and no `initialize` has "
                             f"been sent, so no implemented protocol version governs it or is "

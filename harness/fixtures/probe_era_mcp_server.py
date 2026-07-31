@@ -37,17 +37,32 @@ Environment:
   PROBE_MCP_MODE           dual (default) | modern | legacy — which eras to serve, so the
                            dual-era FALLBACK path can be measured and not just the happy one
   PROBE_MCP_IGNORE_SIGTERM 1 to swallow SIGTERM, to see whether a client escalates to KILL
+  PROBE_MCP_INIT_DELAY_MS  hold the `initialize` RESPONSE this long and record what arrives
+                           meanwhile — C3-2, the pipelining measurement (0 = off)
+
+C3-2 AND WHY IT NEEDED AN INSTRUMENT CHANGE. "Does this client pipeline ordinary requests
+behind `initialize` without waiting for the response?" cannot be read off any earlier log
+from this shim, and the reason is structural rather than an oversight: a server ANSWERS
+`initialize` before it reads the next line, so by the time a pipelined request is read the
+era is established and nothing looks unusual. Arrival timestamps do not separate the two
+cases either — both show the next line being read right after the response goes out. The
+only way to see it is to hold the response and watch the pipe, which is what
+`PROBE_MCP_INIT_DELAY_MS` does. It matters because a PROXY is more exposed than the server
+it fronts: it reads lines serially without answering them, so a pipelined request reaches
+its era check with the negotiation still in flight (`DESIGN_MCP_Support.md` §10.2).
 """
 from __future__ import annotations
 
 import json
 import os
+import select
 import signal
 import sys
 import time
 
 MODE = os.environ.get("PROBE_MCP_MODE", "dual")
 IGNORE_SIGTERM = os.environ.get("PROBE_MCP_IGNORE_SIGTERM") == "1"
+INIT_DELAY_MS = int(os.environ.get("PROBE_MCP_INIT_DELAY_MS") or 0)
 MODERN_VERSION = "2026-07-28"
 # The legacy versions this shim actually implements. The legacy lifecycle says a server
 # returns the REQUESTED version only when it supports it, and otherwise answers with one it
@@ -377,8 +392,82 @@ def _on_signal(signum, _frame):
     os._exit(0)
 
 
+_STDIN = 0
+_rxbuf = b""
+
+
+def _fill(timeout: float | None) -> bool:
+    """Wait up to `timeout` seconds for bytes on stdin. True if any arrived.
+
+    False means the deadline passed OR stdin reached EOF; the caller distinguishes those by
+    looking at what it already has, which is all either of them needs.
+    """
+    global _rxbuf
+    try:
+        ready, _, _ = select.select([_STDIN], [], [], timeout)
+    except (OSError, ValueError):
+        return False
+    if not ready:
+        return False
+    chunk = os.read(_STDIN, 65536)
+    if not chunk:
+        return False
+    _rxbuf += chunk
+    return True
+
+
+def _readline() -> str:
+    """One line from stdin, or "" at EOF.
+
+    READS AT THE RAW FD, not through `sys.stdin`. A TextIOWrapper (and the BufferedReader
+    under it) pulls a chunk rather than a line, so a pipelined request can be sitting in
+    Python's buffer while `select` reports the pipe as quiet — which would make the C3-2
+    measurement below report "no pipelining" for a client that pipelines. One buffer, owned
+    here, is what makes "has anything arrived?" answerable at all.
+    """
+    global _rxbuf
+    while b"\n" not in _rxbuf:
+        if not _fill(None):
+            # EOF. Hand back a trailing partial line once, then nothing.
+            rest, _rxbuf = _rxbuf, b""
+            return rest.decode("utf-8", "replace")
+    line, _, _rxbuf = _rxbuf.partition(b"\n")
+    return line.decode("utf-8", "replace") + "\n"
+
+
+def _buffered_lines() -> list[str]:
+    """Complete lines already sitting in the buffer, without consuming them."""
+    return [ln.decode("utf-8", "replace")
+            for ln in _rxbuf.split(b"\n")[:-1] if ln.strip()]
+
+
+def _measure_pipelining(req_id) -> None:
+    """C3-2: hold the `initialize` response and record whatever the client sends meanwhile.
+
+    A client that waits sends nothing here. A client that pipelines has already written its
+    next request, so it lands in the buffer during the window. This is the only vantage point
+    from which the two differ — see the module docstring.
+    """
+    deadline = time.monotonic() + INIT_DELAY_MS / 1000.0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        _fill(remaining)
+    arrived = _buffered_lines()
+    methods = []
+    for raw in arrived:
+        try:
+            methods.append(json.loads(raw).get("method"))
+        except (json.JSONDecodeError, ValueError):
+            methods.append("<unparseable>")
+    _log("pipelining", initialize_id=req_id, held_ms=INIT_DELAY_MS,
+         pipelined=bool(arrived), count=len(arrived), methods=methods)
+
+
 def main() -> int:
-    _log("start", pid=os.getpid(), mode=MODE, ignore_sigterm=IGNORE_SIGTERM)
+    _log("start", pid=os.getpid(), mode=MODE, ignore_sigterm=IGNORE_SIGTERM,
+         init_delay_ms=INIT_DELAY_MS)
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         try:
             signal.signal(sig, _on_signal)
@@ -386,9 +475,10 @@ def main() -> int:
             pass
 
     while True:
-        # readline() rather than `for line in sys.stdin`: iteration reads ahead into a
-        # buffer, which would smear the timing this probe exists to measure.
-        line = sys.stdin.readline()
+        # Our own raw reader rather than `sys.stdin`: every layer above the fd reads ahead
+        # into a buffer this file cannot inspect, and C3-2 is precisely a question about what
+        # is in that buffer.
+        line = _readline()
         if line == "":
             _log("stdin_eof")
             break
@@ -434,6 +524,10 @@ def main() -> int:
         elif method == "initialize":
             payload, selected, requested = _initialize(params)
             _observe(msg, method, version=selected, requested=requested)
+            # C3-2 runs BETWEEN deciding the answer and sending it — that window is the whole
+            # measurement, and it is the only place a client's pipelining is observable.
+            if INIT_DELAY_MS > 0:
+                _measure_pipelining(req_id)
             _result(req_id, payload, modern=False)
         elif method == "subscriptions/listen":
             _observe(msg, method)

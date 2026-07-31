@@ -494,7 +494,15 @@ ABA fix and its route to `parallel_safe_config = True`.
   wire-level driver → the adapter integration that unlocks `tools:`.
   Everything before the last slice cannot affect any run, which is the point: this is harness
   code in the request path of every gated cell.
-  **Both probes resolved 2026-07-29** (`fixtures/probe_era_mcp_server.py`, results in
+  **Probe C3-2 resolved 2026-07-31** (`tools/probe_mcp_pipelining.py`): no CLI pipelines
+  requests behind `initialize`, so §10.2's allowance for a pending handshake is defensive
+  rather than load-bearing — kept, because `SHOULD NOT` is not `MUST NOT`. It needed a new
+  shim mode (`PROBE_MCP_INIT_DELAY_MS`) *and* a raw-fd read path in the shim, because
+  `sys.stdin.readline()` buffers a chunk rather than a line and would have hidden exactly the
+  bytes being measured. claude is free to probe (`claude mcp list` health-checks stdio
+  servers with a full handshake); the other three cost one cheap model call each.
+
+  **Both gating probes resolved 2026-07-29** (`fixtures/probe_era_mcp_server.py`, results in
   `DESIGN_MCP_Support.md` §9). Three findings changed the build:
   1. **The fleet is split three ways.** claude and copilot `2025-11-25`, codex
      `2025-06-18`, agy **`2026-07-28`** (modern). Dual-era is a day-one requirement, and
