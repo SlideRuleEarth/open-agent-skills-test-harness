@@ -894,8 +894,8 @@ MUTATIONS = [
     # The naive envelope reading, "no `id` means notification": an id-less RESULT is accepted
     # as a response instead of being refused, so a malformed frame gets forwarded.
     ("M128-idless-result-accepted-as-a-response", PROXY,
-     '        return RESULT if has_id else Anomaly(MALFORMED, "result response with no `id`")',
-     "        return RESULT",
+     '            return Anomaly(MALFORMED, "result response with no `id`")',
+     "            return RESULT",
      "proxy.envelope_shape_is_established_positively"),
     # A null request id read as a notification, which puts it on the never-answer path.
     ("M129-null-request-id-becomes-a-notification", PROXY,
@@ -928,7 +928,7 @@ MUTATIONS = [
      "    if claimed not in MODERN_VERSIONS:\n",
      "    if False:\n",
      "proxy.version_gate_fails_closed"),
-    ("M134-unimplemented-legacy-version-forwarded", PROXY,
+    ("M134-unimplemented-negotiated-version-forwarded", PROXY,
      "    if claimed not in LEGACY_VERSIONS:\n",
      "    if False:\n",
      "proxy.version_gate_fails_closed"),
@@ -979,19 +979,173 @@ MUTATIONS = [
     ("M142-second-initialize-accepted-as-renegotiation", PROXY,
      "        if self.legacy_version is not None:\n",
      "        if False:\n",
-     "proxy.legacy_state_is_a_version_and_initialize_happens_once"),
+     "proxy.legacy_state_is_the_negotiated_version_and_initialize_happens_once"),
     # Observed-version telemetry stops being a set of distinct eras.
     ("M143-observed-versions-record-duplicates", PROXY,
      ("        if version not in self.observed:\n"
       "            self.observed.append(version)"),
      "        self.observed.append(version)",
-     "proxy.legacy_state_is_a_version_and_initialize_happens_once"),
+     "proxy.legacy_state_is_the_negotiated_version_and_initialize_happens_once"),
     # The refusal stops saying the server was never contacted, so a scenario author debugs a
     # server that never saw the call.
     ("M144-refusal-hides-that-the-server-was-not-contacted", PROXY,
      '                        f"server was not contacted"),',
      '                        f"server was consulted"),',
      "proxy.off_list_call_is_refused_without_reaching_the_server"),
+    # --- the envelope's TYPED fields, each a distinct way through -------------------------
+    # A boolean id is accepted. `isinstance(True, int)` is true in Python, so this is the one
+    # illegal id that also aliases a legal one: id `True` and id `1` become the same entry.
+    ("M145-boolean-request-id-passes-as-an-integer", PROXY,
+     ("    return isinstance(value, str) or (isinstance(value, int) "
+      "and not isinstance(value, bool))"),
+     "    return isinstance(value, str) or isinstance(value, int)",
+     "proxy.envelope_shape_is_established_positively"),
+    # `params` may be any JSON. The schema says it is an object, and every reader below
+    # (`_meta`, `name`, `protocolVersion`) is written against that.
+    ("M146-params-need-not-be-an-object", PROXY,
+     '        if "params" in msg and not isinstance(msg["params"], dict):\n',
+     "        if False:\n",
+     "proxy.envelope_shape_is_established_positively"),
+    # An `error` object with no code or no message is forwarded as a valid error response,
+    # handing the client a reply it cannot interpret to a request the proxy did forward.
+    ("M147-error-object-fields-unchecked", PROXY,
+     ('    if not isinstance(err, dict):\n'
+      '        return False\n'
+      '    code = err.get("code")\n'
+      "    if not isinstance(code, int) or isinstance(code, bool):\n"
+      "        return False\n"
+      '    return isinstance(err.get("message"), str)'),
+     "    return isinstance(err, dict)",
+     "proxy.envelope_shape_is_established_positively"),
+    # A scalar `result` classifies as a result response, so every reader of `msg["result"]`
+    # downstream — the tools filter included — is working against something that is not a map.
+    ("M148-scalar-result-classifies-as-a-response", PROXY,
+     '        if not isinstance(msg["result"], dict):\n',
+     "        if False:\n",
+     "proxy.envelope_shape_is_established_positively"),
+    # --- the dispatcher: the decisions that only `decide()` can be asked about -------------
+    # The era/method check becomes advisory: a modern `initialize` or a bare
+    # `subscriptions/listen` is forwarded for the server to sort out, and a proxy that has
+    # lost track of the era no longer knows where tool definitions live.
+    ("M149-era-mismatch-is-forwarded-not-refused", PROXY,
+     "    if not method_matches_era(method, modern=modern):\n",
+     "    if False:\n",
+     "proxy.era_comes_from_metadata_not_method"),
+    # THE REVIEWED DEFECT, restored exactly: `inputRequests` read as a list. It is a map, so
+    # iteration walks the string KEYS, every entry fails `isinstance(req, dict)`, and a
+    # conforming tool-bearing sampling result reads as clean and reaches the model.
+    ("M150-input-requests-read-as-a-list", PROXY,
+     ('    if isinstance(result, dict) and "inputRequests" in result:\n'
+      '        requests = result["inputRequests"]\n'
+      "        if not isinstance(requests, dict):\n"
+      "            return Anomaly(BAD_INPUT_REQUESTS,\n"
+      '                           f"InputRequiredResult.inputRequests is "\n'
+      '                           f"{type(requests).__name__}, not the map of server-assigned '
+      'ids "\n'
+      '                           f"the schema defines; its tool-bearing entries cannot be '
+      'read")\n'
+      "        for key, req in requests.items():\n"
+      "            if not isinstance(req, dict):\n"
+      "                return Anomaly(BAD_INPUT_REQUESTS,\n"
+      '                               f"inputRequests[{key!r}] is {type(req).__name__}, "\n'
+      '                               f"not a request object")\n'),
+     ("    if isinstance(result, dict):\n"
+      '        for req in result.get("inputRequests") or []:\n'
+      "            if not isinstance(req, dict):\n"
+      "                continue\n"),
+     "proxy.modern_sampling_requests_are_a_keyed_map_not_a_list"),
+    # The id-less error loses its own diagnosis and is reported as a malformed frame, sending
+    # whoever reads the audit log after a framing bug that does not exist (§10.4).
+    ("M151-idless-error-diagnosed-as-a-bad-frame", PROXY,
+     ("        return Fail(Anomaly(UNCORRELATED,\n"
+      '                            "error response carries no `id`'),
+     ("        return Fail(Anomaly(MALFORMED,\n"
+      '                            "error response carries no `id`'),
+     "proxy.envelope_shape_is_established_positively"),
+    # A live id is silently overwritten: record `tools/list` on id 1, then `ping` on id 1, and
+    # the tool advertisement correlates as a `ping` and is forwarded UNFILTERED.
+    ("M152-live-request-id-is-overwritten", PROXY,
+     "        if key in live:\n",
+     "        if False:\n",
+     "proxy.a_live_request_id_is_never_silently_reused"),
+    # The closure stops naming WHICH subscription it closes, so a complete result carrying
+    # someone else's subscription id retires a subscription that is still open.
+    ("M153-closure-ignores-the-subscription-id", PROXY,
+     "    return meta.get(SUB_KEY) == msg.get(\"id\")",
+     "    return True",
+     "proxy.graceful_closure_is_the_conforming_shape_not_an_empty_object"),
+    # THE REVIEWED DEFECT, restored exactly: the closure must be a literally empty result.
+    # The spec says "empty" in prose and prints `resultType` + `_meta`, so this rejects every
+    # conforming shutdown — including our own probe shim's — and fails the cell that was
+    # closing cleanly.
+    ("M154-closure-must-be-a-literally-empty-result", PROXY,
+     ('    if result.get("resultType", "complete") != "complete":\n'
+      "        return False\n"
+      '    meta = result.get("_meta")\n'
+      "    if not isinstance(meta, dict):\n"
+      "        return False\n"
+      '    return meta.get(SUB_KEY) == msg.get("id")'),
+     "    return not result",
+     "proxy.graceful_closure_is_the_conforming_shape_not_an_empty_object"),
+    # THE REVIEWED DEFECT, restored exactly: the connection is read under the version the
+    # CLIENT PROPOSED rather than the one the server answered with. Every later legacy message
+    # is then interpreted under a revision that was never agreed.
+    ("M155-negotiated-version-is-the-clients-proposal", PROXY,
+     ("        self.pending_initialize = None\n"
+      "        self.legacy_version = negotiated\n"),
+     ("        self.legacy_version = self.pending_initialize\n"
+      "        self.pending_initialize = None\n"),
+     "proxy.legacy_state_is_the_negotiated_version_and_initialize_happens_once"),
+    # A second `initialize` sent before the first is answered slips through — the case a state
+    # holding only an ACCEPTED version cannot see.
+    ("M156-second-initialize-while-the-first-is-pending", PROXY,
+     "        if self.pending_initialize is not None:\n",
+     "        if False:\n",
+     "proxy.legacy_state_is_the_negotiated_version_and_initialize_happens_once"),
+    # The gate moves back onto the client's PROPOSAL, which fails a negotiation that was about
+    # to succeed: a client offering a revision this proxy has not read, answered by a server
+    # offering one it has, is ordinary and not an anomaly.
+    ("M157-proposed-version-is-gated-too", PROXY,
+     ('    if not isinstance(claimed, str) or not claimed:\n'
+      '        return Anomaly(MALFORMED, f"initialize protocolVersion is {claimed!r}")\n'
+      "    return claimed"),
+     ("    if claimed not in LEGACY_VERSIONS:\n"
+      '        return Anomaly(UNIMPLEMENTED_VERSION, f"proposed {claimed!r}")\n'
+      "    return claimed"),
+     "proxy.legacy_state_is_the_negotiated_version_and_initialize_happens_once"),
+    # The allowlist stops being consulted at all. This is the mutation the whole split exists
+    # for: with the arm calling `refusal_for` directly it was invisible, because a
+    # well-worded refusal nobody ever sends is still well worded (review, PR #100).
+    ("M158-off-list-call-is-forwarded", PROXY,
+     "        if name not in allowed:\n",
+     "        if False:\n",
+     "proxy.off_list_call_is_refused_without_reaching_the_server"),
+    # A `tools/call` with no string `params.name` is checked against the allowlist anyway, so
+    # the refusal names `None` instead of the envelope being refused as malformed (§10.4).
+    ("M159-tools-call-name-shape-unchecked", PROXY,
+     "        if not isinstance(name, str) or not name:\n",
+     "        if False:\n",
+     "proxy.off_list_call_is_refused_without_reaching_the_server"),
+    # A server-originated request is accepted with no legacy `initialize` in force, which the
+    # modern revision forbids outright.
+    ("M160-server-request-needs-no-legacy-state", PROXY,
+     "    if state.legacy_version is None:\n",
+     "    if False:\n",
+     "proxy.server_originated_requests_need_legacy_actually_in_force"),
+    # An uncorrelated response is forwarded instead of refused. A `tools/list` result on an id
+    # nobody requested has no correlated method, so it is not recognised as tool-bearing and
+    # goes through UNFILTERED — the guarantee defeated by a response the proxy cannot place.
+    ("M161-uncorrelated-response-is-forwarded", PROXY,
+     "    if method is None:\n",
+     "    if False:\n",
+     "proxy.tools_result_is_filtered_or_refused_never_forwarded_unfiltered"),
+    # Correlation looks in the SAME direction the response is travelling rather than the one
+    # the request came from, so nothing ever correlates and every tools/list response is
+    # either refused or (with M161) forwarded unfiltered.
+    ("M162-responses-correlate-in-their-own-direction", PROXY,
+     "_ORIGIN_OF = {C2S: S2C, S2C: C2S}",
+     "_ORIGIN_OF = {C2S: C2S, S2C: S2C}",
+     "proxy.tools_result_is_filtered_or_refused_never_forwarded_unfiltered"),
     ("I1-arm-counter-stops-counting", SELFTEST,
      "    global _ARMS_RUN\n    _ARMS_RUN += 1\n",
      "    global _ARMS_RUN\n",

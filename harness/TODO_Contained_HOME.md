@@ -289,10 +289,10 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 492 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 506 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 harness/tools/mutate_mcp.py                           # 125/125 production + 2/2 instrument
+python3 harness/tools/mutate_mcp.py                           # 160/160 production + 2/2 instrument
 git diff --check
 ```
 
@@ -344,22 +344,30 @@ either mistake miscounts exactly what the split reporting exists to keep straigh
 
 Things that have gone wrong in the *tests*, so you can skip learning them again:
 
-- **The recurring one, five times now: a check aimed BESIDE the thing that matters.** Every
+- **The recurring one, eight times now: a check aimed BESIDE the thing that matters.** Every
   instance looks like coverage and is not, and the shape is always the same — the arm and its
   mutation agree with each other while both sit one level away from where the defect lives.
   Seen as: an arm whose two cases could not see the condition they guarded (M117); a live
   assertion the model could satisfy from its prompt without the mechanism running at all
   (`regress_mcp_two_servers`, twice); two cells sharing an artifacts directory so the second
-  overwrote what the first was meant to prove (M125); and an arm exercising the delta HELPER
-  while the regression was the banner's ASSIGNMENT of it (I2). Each passed review of the code
-  and was caught only by someone asking the question below.
+  overwrote what the first was meant to prove (M125); an arm exercising the delta HELPER
+  while the regression was the banner's ASSIGNMENT of it (I2); an arm calling the proxy's
+  refusal FORMATTER, which is green whether or not any call is ever refused (M158); and — the
+  purest form of it — an arm that built `inputRequests` as an array because the code read it
+  as one, so the fixture and the defect were wrong together and agreed (M150). Each passed
+  review of the code and was caught only by someone asking the question below.
 
   **The test:** write out what a broken implementation would produce, and check your assertion
   rejects it. If the answer is "it produces exactly what I asserted", the assertion is
-  measuring something else. Two corollaries this project keeps rediscovering — a defect that
+  measuring something else. Three corollaries this project keeps rediscovering — a defect that
   passes THROUGH a helper is not tested by testing the helper, only by testing the site it
-  reached; and for anything with a model in the loop, the model is part of the implementation,
-  so an expected value it could reconstruct from its prompt is not evidence.
+  reached; for anything with a model in the loop, the model is part of the implementation, so
+  an expected value it could reconstruct from its prompt is not evidence; and where the
+  subject is a *specification*, the fixture must come from the spec rather than from the code,
+  because a fixture written to match the implementation cannot disagree with it. The
+  `inputRequests` case and the `{}` subscription closure were both that: hand-written fixtures
+  that encoded the same misreading as the code, where one look at the spec's own printed
+  example would have shown a map and a `resultType`.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s
@@ -448,12 +456,14 @@ ABA fix and its route to `parallel_safe_config = True`.
 - **Phase 3 antigravity** — MCP injection.
 - **C3 harness-owned filtering proxy** — required before any scenario points `tools:` at a
   server its author does not control, and required for agy tool gating regardless.
-  **Designed in `DESIGN_MCP_Support.md` §10 (2026-07-29); not built.** stdio only in the
+  **Designed in `DESIGN_MCP_Support.md` §10 (2026-07-29); being built.** stdio only in the
   first cut — remote `tools:` stays refused. Build order: ~~probe **C3-0**~~ →
-  ~~probe **C3-1**~~ → a **dual-era mode for `fixtures/echo_mcp_server.py`** → the proxy
-  module + its arms, wired to nothing → the adapter integration that unlocks `tools:`.
-  The middle slice cannot affect any run, which is the point: this is harness code in the
-  request path of every gated cell.
+  ~~probe **C3-1**~~ → ~~a **dual-era mode for `fixtures/echo_mcp_server.py`** (#98)~~ →
+  ~~the **decision layer** + its arms, wired to nothing (#100)~~ → the **I/O half** (spawn,
+  the two pumps, `SIGTERM`/`SIGINT` handlers, §10.5's shutdown, the audit log) plus a
+  wire-level driver → the adapter integration that unlocks `tools:`.
+  Everything before the last slice cannot affect any run, which is the point: this is harness
+  code in the request path of every gated cell.
   **Both probes resolved 2026-07-29** (`fixtures/probe_era_mcp_server.py`, results in
   `DESIGN_MCP_Support.md` §9). Three findings changed the build:
   1. **The fleet is split three ways.** claude and copilot `2025-11-25`, codex
