@@ -27,7 +27,6 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Optional
 
 from .adapters import get_adapter
 from .adapters.base import RunOptions
@@ -55,26 +54,33 @@ from .workspace_view import (
 @dataclass
 class CellResult:
     agent: str
-    model: Optional[str]
+    model: str | None
     eval_name: str
-    skill: Optional[str]
+    skill: str | None
     passed: bool
     run_result: RunResult
     # The target column's pinned effort (None = unpinned) — part of the cell's matrix
     # identity, so the same model can appear twice at different efforts.
-    reasoning_effort: Optional[str] = None
+    reasoning_effort: str | None = None
     # What the run actually used after resolution (CLI --reasoning-effort > target > spec).
-    effective_effort: Optional[str] = None
+    effective_effort: str | None = None
     assertions: list[AssertionResult] = field(default_factory=list)
-    judge_run_result: Optional[RunResult] = None
+    judge_run_result: RunResult | None = None
     artifacts_dir: str = ""
     isolated: bool = False
     ungraded: bool = False
     isolation_leaks: list[str] = field(default_factory=list)
-    scenario_path: Optional[str] = None
+    scenario_path: str | None = None
     # workspace-relative paths seeded before the run (fixture + files:) — inputs the report
     # annotates so they aren't mistaken for model output
     seeded_paths: list[str] = field(default_factory=list)
+    # The spec's `tags:`, carried through to the artifacts. Until now nothing but the
+    # `--tag` discovery filter read them, so a `regression` tag was a claim no reader could
+    # act on — and for a scenario, which is selected by path and never discovered, it had no
+    # consumer at all (review, second round). Recorded per cell so a result can be attributed
+    # to a regression rather than an experiment without re-reading the source YAML, which
+    # may have changed since.
+    tags: list[str] = field(default_factory=list)
 
     @property
     def n_pass(self) -> int:
@@ -125,18 +131,18 @@ class Runner:
         self,
         agent: str,
         *,
-        targets: Optional[list[ModelTarget]] = None,
-        models: Optional[list[Optional[str]]] = None,
+        targets: list[ModelTarget] | None = None,
+        models: list[str | None] | None = None,
         artifacts_root: str,
         run_id: str,
         skills_root: str,
-        judge: Optional[Judge] = None,
+        judge: Judge | None = None,
         provision: bool = True,
         auto_approve: bool = True,
-        reasoning_effort: Optional[str] = None,
+        reasoning_effort: str | None = None,
         jobs: int = 1,
         isolated: bool = True,
-        progress: Optional[Progress] = None,
+        progress: Progress | None = None,
         command: str = "",
     ):
         if targets is None:
@@ -183,7 +189,7 @@ class Runner:
         self._run_secrets: tuple[str, ...] = ()
 
     @property
-    def models(self) -> list[Optional[str]]:
+    def models(self) -> list[str | None]:
         """Deprecated pre-#67 view of the target columns: model ids only (effort dropped)."""
         return [t.model for t in self.targets]
 
@@ -328,7 +334,7 @@ class Runner:
 
     def _failed_cell(self, target: ModelTarget, spec: EvalSpec, cell_idx: int,
                      cell_dir: str, exec_ws: str, exc: Exception,
-                     cleanup: "_CellCleanup") -> CellResult:
+                     cleanup: _CellCleanup) -> CellResult:
         """Best-effort CellResult for a cell that raised instead of completing normally — keeps
         one broken eval from aborting the whole run() batch, and still records something on disk
         (report.md/assertions.json) rather than leaving the cell's artifacts dir silently empty."""
@@ -339,7 +345,8 @@ class Runner:
                           skill=spec.skill_name, passed=False, run_result=rr,
                           reasoning_effort=target.reasoning_effort,
                           artifacts_dir=cell_dir,
-                          scenario_path=getattr(spec, "source_path", None))
+                          scenario_path=getattr(spec, "source_path", None),
+                          tags=list(spec.tags or []))
         # Preserve whatever the run produced before crashing: move exec_ws into
         # cell_dir/workspace (as the success path does) instead of letting _run_cell's
         # finally delete it — partial output is exactly the evidence needed to debug the
@@ -391,7 +398,7 @@ class Runner:
 
     def _run_cell_body(self, target: ModelTarget, spec: EvalSpec, cell_idx: int,
                        cell_dir: str, workspace: str, exec_ws: str,
-                       exec_root: str, cleanup: "_CellCleanup") -> CellResult:
+                       exec_root: str, cleanup: _CellCleanup) -> CellResult:
         adapter = self.adapter
         p = self.progress
         model = target.model
@@ -606,6 +613,28 @@ class Runner:
                 _refuse_uncontained_home(iso_home, spec.name,
                                          list(interpolated) + list(cred_env_present),
                                          _cred_source(interpolated, cred_env_present))
+                # And the mirror-image failure: containment engaged, and the adapter has
+                # DECLARED that a contained home leaves it nothing but the environment to
+                # authenticate from — with none of those variables set. Checked after the
+                # containment refusal because that one is about a token escaping and this one
+                # about there being no token; an uncontainable credential is the worse
+                # outcome and should keep reporting first.
+                #
+                # The adapter's own declaration, never derived from `credential_env_vars` or
+                # from an empty contained surface: those say what gets forwarded and what
+                # gets copied, not whether some route outside HOME (a helper, a socket, a
+                # workload identity) survives containment. Inferring it would refuse valid
+                # configurations. An adapter that has not answered contributes an empty list
+                # and is not checked.
+                required_cred = list(getattr(
+                    adapter, "contained_home_required_credential_env_vars", None) or [])
+                # `child_env`, matching `cred_env_present` above: a scenario `env:` can supply
+                # the credential the ambient process lacks, and reading os.environ alone would
+                # refuse a cell that was about to authenticate perfectly well.
+                if (contain_home and required_cred
+                        and not any(child_env.get(name) for name in required_cred)):
+                    _refuse_uncredentialed_contained_home(
+                        spec.name, required_cred, list(interpolated))
                 # This cell HAS credentials, which changes what the isolated HOME is. The
                 # harness knows its INITIAL contents (masks, or copied auth) and not its final
                 # ones: it is `$HOME` for a child that can write, and review's agent copied a
@@ -752,6 +781,7 @@ class Runner:
             isolated=home_isolated, ungraded=ungraded, isolation_leaks=leaks,
             scenario_path=getattr(spec, "source_path", None),
             seeded_paths=sorted(seeded_relpaths(spec)),
+            tags=list(spec.tags or []),
         )
         # Attach the judge's run BEFORE rendering, so report.md's verdict line shows the
         # combined agent+judge cost (previously only summary.* had it).
@@ -862,6 +892,10 @@ class Runner:
                 "effective_effort": cell.effective_effort,
                 "eval": cell.eval_name,
                 "skill": cell.skill,
+                # What the spec declared this run to BE (e.g. `regression`) — see
+                # CellResult.tags. Always present, `[]` when untagged, so a reader can tell
+                # "declared nothing" from an older artifact that could not say.
+                "tags": cell.tags,
                 "isolated": cell.isolated,
                 "isolation_leaks": cell.isolation_leaks,
                 "ungraded": cell.ungraded,
@@ -1181,7 +1215,7 @@ class Runner:
                     "agent": c.agent, "model": c.model,
                     "reasoning_effort": c.reasoning_effort,
                     "effective_effort": c.effective_effort,
-                    "eval": c.eval_name, "skill": c.skill,
+                    "eval": c.eval_name, "skill": c.skill, "tags": c.tags,
                     "isolated": c.isolated, "isolation_leaks": c.isolation_leaks,
                     # None where the runner's telemetry does not state it (codex, agy).
                     "cli_version": c.run_result.cli_version,
@@ -1232,7 +1266,7 @@ def _as_targets(targets) -> list[ModelTarget]:
     return [t if isinstance(t, ModelTarget) else ModelTarget(t) for t in targets]
 
 
-def _judge_score(c: CellResult) -> Optional[tuple[int, int]]:
+def _judge_score(c: CellResult) -> tuple[int, int] | None:
     """(passed, total) rubric items from the judge, or None if no judge ran."""
     for a in c.judge_assertions:
         items = (a.details or {}).get("items", [])
@@ -1254,7 +1288,7 @@ def _score_parts(c: CellResult) -> str:
     return "  ".join(parts) if parts else f"{c.n_pass}/{c.n_total}"
 
 
-def _cell_text(c: Optional[CellResult]) -> str:
+def _cell_text(c: CellResult | None) -> str:
     if c is None:
         return "-"
     if c.run_result.error:
@@ -1265,7 +1299,7 @@ def _cell_text(c: Optional[CellResult]) -> str:
     return f"{'PASS' if c.passed else 'FAIL'}  {_score_parts(c)}{cost}"
 
 
-def _cell_mark(c: Optional[CellResult]) -> str:
+def _cell_mark(c: CellResult | None) -> str:
     if c is None:
         return "–"
     if c.run_result.error:
@@ -1308,14 +1342,14 @@ def render_matrix(results: list[CellResult], agent: str,
 
 def render_markdown(results: list[CellResult], agent: str,
                     targets: list[ModelTarget],
-                    run_dir: Optional[str] = None,
+                    run_dir: str | None = None,
                     command: str = "") -> str:
     targets = _as_targets(targets)
     by_key = {_cell_key(c): c for c in results}
     evals = sorted({c.eval_name for c in results})
     labels = [t.label for t in targets]
 
-    def _linked_mark(c: Optional[CellResult]) -> str:
+    def _linked_mark(c: CellResult | None) -> str:
         mark = _cell_mark(c)
         if run_dir and c is not None and c.artifacts_dir:
             rel = os.path.relpath(os.path.join(c.artifacts_dir, "report.md"), run_dir)
@@ -1326,9 +1360,9 @@ def render_markdown(results: list[CellResult], agent: str,
     if command:
         heading += f" ({command})"
     lines = [heading, "",
-             "Each cell links to a per-cell `report.md` — the prompt the model was given, "
+             ("Each cell links to a per-cell `report.md` — the prompt the model was given, "
              "its complete response (full transcript), and the workspace files after the "
-             "run (seeded inputs marked).", "",
+             "run (seeded inputs marked)."), "",
              "| eval | " + " | ".join(labels) + " |",
              "|" + "---|" * (len(labels) + 1)]
     for ev in evals:
@@ -1426,8 +1460,8 @@ def render_report(cell: CellResult) -> str:
         # analysis was not verified against).
         out.append(f"- **warning:** {w.strip()}")
     if cell.isolation_leaks:
-        out += ["", "> ⚠ **Isolation leak:** this run read undeclared skill(s) from the real "
-                    "repo checkout, bypassing HOME-based isolation:"]
+        out += ["", ("> ⚠ **Isolation leak:** this run read undeclared skill(s) from the real "
+                    "repo checkout, bypassing HOME-based isolation:")]
         for p in cell.isolation_leaks:
             out.append(f"> - `{p}`")
 
@@ -1452,8 +1486,8 @@ def render_report(cell: CellResult) -> str:
                           max_bytes=REPORT_MAX_INLINE_BYTES, truncate=True, seeded=seeded)
     if inline.strip():
         out += ["", inline]
-    out += ["", "_(Non-text files are listed above but not inlined; files seeded before the "
-                "run are marked as inputs.)_"]
+    out += ["", ("_(Non-text files are listed above but not inlined; files seeded before the "
+                "run are marked as inputs.)_")]
 
     out += ["", "## Judge verdict", ""]
     judge_a = next((a for a in cell.assertions if a.type == "llm_judge"), None)
@@ -1488,7 +1522,7 @@ def _safe(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
 
 
-def _model_seg(model: Optional[str]) -> str:
+def _model_seg(model: str | None) -> str:
     if not model:
         return "_default"
     safe = _safe(model)
@@ -1517,8 +1551,8 @@ _MODEL_ERR_KEYWORDS = ("not found", "unknown", "invalid", "unsupported",
                        "not available", "rejected")
 
 
-def _looks_like_model_error(error: Optional[str], stderr: Optional[str],
-                            model: Optional[str] = None) -> bool:
+def _looks_like_model_error(error: str | None, stderr: str | None,
+                            model: str | None = None) -> bool:
     blob = f"{error or ''} {stderr or ''}".lower()
     if any(p in blob for p in _MODEL_ERR_PHRASES):
         return True
@@ -1834,7 +1868,7 @@ def _cred_source(interpolated: list[str], env_names: list[str]) -> str:
     return " and ".join(parts)
 
 
-def _refuse_uncontained_home(home: Optional[str], eval_name: str, refs: list[str],
+def _refuse_uncontained_home(home: str | None, eval_name: str, refs: list[str],
                              source: str) -> None:
     """Fail a credential-bearing cell whose $HOME has write paths into the real home.
 
@@ -1874,7 +1908,40 @@ def _refuse_uncontained_home(home: Optional[str], eval_name: str, refs: list[str
         f"certify those targets. Refusing the run rather than reporting it as contained.")
 
 
-def _purge(label: str, path: Optional[str], tail: str = _CREDENTIAL_TAIL) -> str:
+def _refuse_uncredentialed_contained_home(eval_name: str, declared: list[str],
+                                          refs: list[str]) -> None:
+    """Fail a contained cell whose CLI has been left with no way to authenticate.
+
+    The complement of `_refuse_uncontained_home`, and it fires on the opposite arrangement.
+    That one refuses a credential the HOME cannot contain; this one refuses a containment
+    the credential cannot survive. `declared` is the adapter's
+    `contained_home_required_credential_env_vars` — its own measured statement that
+    containment leaves it nothing but the environment to authenticate from. For claude and
+    copilot that is the macOS login keychain being unreachable from a contained home
+    (TODO_Contained_HOME.md §0); the point is that the ADAPTER says so, because a CLI may
+    hold a route containment does not cut and the runner cannot tell from here.
+
+    Refused rather than run, because the failure is otherwise expensive and unreadable: the
+    cell spends a model call to come back `exited with code 1`, with the real cause —
+    "Not logged in" — buried inside a truncated JSON blob in an assertion message. That is
+    what this check was written from. The neighbouring `${VAR}` check already fails fast
+    and names the variable; this makes the two consistent.
+
+    Deliberately narrow: it cannot fire when one of the declared variables IS set, nor for
+    an adapter that declares none — an unanswered adapter is a mapping question, and this
+    check is not the place to guess at the answer.
+    """
+    joined = ", ".join(declared)
+    raise RuntimeError(
+        f"{eval_name!r} needs a contained HOME ({', '.join(refs)}) and this adapter declares "
+        f"that a contained HOME leaves it only the environment to authenticate from, but "
+        f"none of {joined} is set. The CLI would start with no credential and fail partway "
+        f"through the cell. Export "
+        f"{'one of ' + joined if len(declared) > 1 else declared[0]} before running, or drop "
+        f"the credential so the cell can take the ordinary isolation overlay.")
+
+
+def _purge(label: str, path: str | None, tail: str = _CREDENTIAL_TAIL) -> str:
     """Remove a directory that held credentials; return a sentence if it is still there.
 
     `shutil.rmtree(..., ignore_errors=True)` answers "did this raise", which is not the
@@ -1915,8 +1982,8 @@ class _CellCleanup:
         self._owned: list[tuple[str, str, bool, str]] = []
         self._notes: list[tuple[bool, str]] = []
 
-    def own(self, label: str, path: Optional[str], *, fatal: bool = True,
-            tail: Optional[str] = None) -> None:
+    def own(self, label: str, path: str | None, *, fatal: bool = True,
+            tail: str | None = None) -> None:
         """Register a directory as this cell's to remove; `None` is a no-op.
 
         `fatal` says what a failure to remove it MEANS. The credential directories fail the
@@ -1952,7 +2019,7 @@ class _CellCleanup:
         if text and (fatal, text) not in self._notes:
             self._notes.append((fatal, text))
 
-    def purge(self, path: Optional[str]) -> None:
+    def purge(self, path: str | None) -> None:
         """Remove one registered directory, keeping any failure; `None` is a no-op.
 
         Deliberately NOT a "purge everything" default: the callers pass a variable that is
@@ -2033,7 +2100,7 @@ def _all_offending_paths(root: str, secrets) -> list[str]:
     return [path for _, path in sorted(found)]
 
 
-def _first_offending_path(root: str, secrets) -> Optional[str]:
+def _first_offending_path(root: str, secrets) -> str | None:
     """The SHALLOWEST offending path, which is the one worth renaming.
 
     Shallowest rather than deepest because renaming one component fixes every path below

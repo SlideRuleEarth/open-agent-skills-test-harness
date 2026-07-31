@@ -26,7 +26,6 @@ from .spec import (
     _load_raw,
     discover_specs,
     load_scenario,
-    load_spec,
     parse_model_target,
     repo_root_for,
     skill_names,
@@ -323,6 +322,21 @@ def cmd_run(args) -> int:
         if args.skill or args.evals:
             print("error: --config can't be combined with --skill/--evals — a scenario "
                   "defines its own eval.", file=sys.stderr)
+            return 2
+        # `is not None`, not truthiness: the two say the same thing only while the parser
+        # declares `nargs="+"`, and this guard must not depend on a decision made 700 lines
+        # away. Under the previous `nargs="*"` a bare `--tag` arrived as `[]`, which is
+        # PRESENT-but-empty — the truthiness form waved it through and ran the scenario,
+        # which is exactly the bypass this refusal exists to prevent (review, third round).
+        if args.tag is not None:
+            # --tag filters DISCOVERED evals; a scenario is selected by path and there is no
+            # discovery step for it to narrow. Silently ignoring it was worse than it looks:
+            # `--config <one scenario> --tag regression` reads like a selection and runs the
+            # scenario whatever its tags say, so a mistyped tag, or a scenario that is not
+            # tagged at all, still costs a full run and reports as if it had been selected.
+            print("error: --tag filters evals found by discovery (--skill/--evals); a "
+                  "scenario is chosen by path, so --tag would change nothing here. Drop it, "
+                  "or pass the scenarios you want by path.", file=sys.stderr)
             return 2
         scenario = _load_scenario(args.config)
         try:
@@ -744,11 +758,11 @@ def cmd_list_available_agents(args) -> int:
     skip_confirm = getattr(args, "yes", False)
     if not skip_confirm:
         print("This will probe each installed CLI to verify which models are accepted.")
-        print(f"Each probe sends a trivial prompt ('say ok') to the model — this has a small cost.\n")
+        print("Each probe sends a trivial prompt ('say ok') to the model — this has a small cost.\n")
         has_list_cmd = [a.name for a in installed if a.has_model_list]
         print(f"Runners to probe: {runners_str}")
         print(f"Total probes: {total_probes} configured model(s)")
-        print(f"Runners with a model-list command (free discovery): "
+        print("Runners with a model-list command (free discovery): "
               + (", ".join(has_list_cmd) if has_list_cmd else "(none)"))
         print()
         try:
@@ -1001,7 +1015,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="skip the multi-cell confirmation (still bounded by --max-cells)")
     sp.add_argument("--dry-run", action="store_true",
                     help="print the resolved plan + cell count and exit without running")
-    sp.add_argument("--tag", nargs="*", help="only evals with one of these tags")
+    # `+`, not `*`: a bare `--tag` is meaningless in every context and used to be silently
+    # harmless in both. On the discovery path `nargs="*"` made `--skill x --tag` (a value
+    # dropped by a typo or an unexpanded shell variable) run the WHOLE skill unfiltered,
+    # reading like a narrowed selection; on the scenario path it produced `[]`, which the
+    # truthiness guard below let straight through the refusal it was supposed to hit
+    # (review, third round). Argparse rejects it here instead, before either can happen.
+    sp.add_argument("--tag", nargs="+", help="only evals with one of these tags")
     sp.add_argument("-v", "--verbose", action="store_true", help="print failing assertions")
     sp.add_argument("--reports", choices=["fail", "all", "none"], default="fail",
                     help="after the run, print paths to the per-cell report.md: "

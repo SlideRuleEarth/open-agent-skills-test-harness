@@ -14,7 +14,8 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any
+from collections.abc import Callable
 
 from .schema import RunResult
 from .workspace_view import resolve_trace_path
@@ -34,14 +35,14 @@ class AssertionContext:
     """Shared services an assertion may need (judge, schema validator)."""
 
     spec: Any  # EvalSpec (avoid import cycle)
-    judge: Optional[Callable[..., dict]] = None  # set by the runner when judging is enabled
+    judge: Callable[..., dict] | None = None  # set by the runner when judging is enabled
     skills_subdir: str = ".claude/skills"  # adapter's skill provisioning path
     # ALL the dirs this adapter can discover a provisioned skill from: the project-local
     # skills_subdir PLUS the adapter's global skills dirs. Isolation deliberately copies
     # declared skills into every global dir of the isolated HOME (isolation.py), so an agent
     # reading e.g. ~/.codex/skills/<skill>/SKILL.md has still "triggered" the skill — matching
     # only skills_subdir would false-negative that read. None → fall back to [skills_subdir].
-    skill_dirs: Optional[list[str]] = None
+    skill_dirs: list[str] | None = None
     judge_exec: Any = None  # populated by _llm_judge with the judge's ExecResult for artifact saving
 
 
@@ -131,7 +132,7 @@ def _file_exists(result, workdir, spec, cfg, ctx):
     )
 
 
-def _resolve_artifact(result, workdir: str, rel: str) -> tuple[Optional[str], Optional[str]]:
+def _resolve_artifact(result, workdir: str, rel: str) -> tuple[str | None, str | None]:
     """Locate the artifact `rel`, tolerant of an agent that wrote it to the wrong path.
 
     Order of resolution, returning (abs_path, where):
@@ -447,13 +448,13 @@ def _llm_judge(result, workdir, spec, cfg, ctx):
 
 def _read_text(path: str) -> str:
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             return fh.read()
     except OSError:
         return ""
 
 
-def _match_any(strings: list[str], cfg: dict) -> Optional[str]:
+def _match_any(strings: list[str], cfg: dict) -> str | None:
     """Return the first string satisfying EVERY criterion `cfg` supplies, else None.
 
     `contains`/`matches`/`equals` are ANDed when more than one is given — a cfg like

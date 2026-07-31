@@ -30,7 +30,7 @@ evaluations").
 Each agent CLI speaks a different dialect of "structured output":
 
 | Agent | Invocation | Output |
-|-------|-----------|--------|
+| ------- | ----------- | -------- |
 | Claude Code | `claude -p … --output-format stream-json --verbose` | JSONL: `system`/`assistant`/`user`/`result`; tool calls in `tool_use` blocks; `--json-schema` → `structured_output` on the result event |
 | Codex | `codex --ask-for-approval never --sandbox workspace-write exec --json` | JSONL: `item.started`/`item.completed` with `item.type` = `command_execution`/`file_change`/`agent_message` |
 | AntiGravity | `agy -p "<prompt>" --output-format json --add-dir <workspace> --dangerously-skip-permissions` | one JSON object (`conversation_id`/`status`/`response`/`usage`) — the tool-call trace itself is read separately off disk, keyed by `conversation_id`; parse() falls back to JSONL → single JSON → raw text for older builds |
@@ -48,10 +48,17 @@ root, prefix it with `make -C harness`):
 | Target | For | What it does |
 | --- | --- | --- |
 | `make install` | running the evals | Puts the `agentskill-evals` CLI on your PATH in an isolated env (pipx). |
-| `make dev` | editing the harness | Creates `.venv/` and editable-installs with the `[schema]` extra (adds `jsonschema`; a built-in fallback works without it). Activate with `. .venv/bin/activate`. |
+| `make dev` | editing the harness | Creates `.venv/` and editable-installs with the `[schema,dev]` extras — `jsonschema` (a built-in fallback works without it) and the **exact** Ruff `make lint` requires. Activate with `. .venv/bin/activate`. |
+| `make lint` | before pushing | Runs that pinned Ruff. The tree passes at **zero** findings, so anything it prints is a regression from your change, not existing debt. |
 
 Both pull in `pyyaml` for you. After `make install`, sanity-check with `agentskill-evals list-agents-configured-models
---skills-root ..`; `make help` lists the other targets (`selftest`, `clean`, `uninstall`).
+--skills-root ..`; `make help` lists the other targets (`selftest`, `lint`, `mutation`, `clean`, `uninstall`).
+
+> **Why Ruff is pinned to a single version.** `pyproject.toml` sets `required-version`, and a
+> different build simply refuses to run. Family selectors like `UP` gain rules between
+> releases, so an unpinned checker turns a tool upgrade into something indistinguishable from
+> a code regression — and "zero findings" is only a meaningful contract if everyone's checker
+> agrees. `make lint` deliberately uses `.venv/bin/ruff`, never one found on PATH.
 
 > **`make install` requires [pipx](https://pipx.pypa.io).** Install it with `brew install pipx`
 > (macOS) or `python3 -m pip install --user pipx && python3 -m pipx ensurepath`, then re-run
@@ -76,7 +83,7 @@ pipx install "git+https://github.com/SlideRuleEarth/open-agent-skills-test-harne
 uv tool install ./harness        # uv also manages the Python version
 
 # the hand-rolled venv that `make dev` automates:
-cd harness && python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[schema]"
+cd harness && python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[schema,dev]"
 
 # no install at all — run it as a module from inside harness/:
 python3 -m agentskill_evals selftest                                   # needs no dependencies
@@ -140,7 +147,7 @@ for AntiGravity) so the run is hermetic.
 ### Fields
 
 | field | meaning |
-|-------|---------|
+| ------- | --------- |
 | `name` | eval id (defaults to filename) |
 | `description` | what correct behavior looks like (given to the judge) |
 | `prompt` | the user message (legacy `query` also accepted) |
@@ -160,7 +167,7 @@ for AntiGravity) so the run is hermetic.
 ### Assertion types
 
 | type | checks |
-|------|--------|
+| ------ | -------- |
 | `file_exists` | `path` exists; optional `contains` / `matches` (regex) / `min_size` |
 | `file_absent` / `dir_exists` | workspace structure |
 | `ran_command` | a shell command matched `contains` / `matches` / `equals` (from the tool trace) |

@@ -102,7 +102,52 @@ COPILOT = """\
 """
 
 
+# Arms actually EXECUTED by this process, reported in the final line. The count is a floor
+# that only ever goes up, and it lived in TODO_Contained_HOME.md §4 as a hand-maintained
+# number — which was stale for two PRs running, because nothing makes forgetting it fail.
+# Counted here instead: the protocol can then say "compare against the last run" rather than
+# carry a literal, and a section that silently stopped running shows up as a DROP even
+# though every remaining arm passes. Not a constant, deliberately — a few arms are
+# conditional (PyYAML, platform), so two environments legitimately differ and only the
+# trend within one is evidence.
+_ARMS_RUN = 0
+
+
+def _arms_since(start: int) -> int:
+    """Arms run since `start` — the per-run figure, from a process-lifetime counter.
+
+    A DELTA rather than a reset, because a reset is a second step someone has to remember:
+    `_ARMS_RUN` was previously read raw, so a second `run_selftest()` in one process reported
+    491 then 982, and the banner silently stopped being the per-run measurement its own
+    documentation described (review, fifth round). Subtracting the value captured at entry
+    cannot be forgotten separately from reporting it — the arithmetic IS the reset, and it
+    is on the same line as the number it corrects.
+    """
+    return _ARMS_RUN - start
+
+
+def _banner(arms_before: int, failures: list) -> str:
+    """The final line, returned rather than printed — so its arm count can be TESTED.
+
+    Extracted from `_run_selftest_checks` because the arm guarding this used to exercise
+    `_arms_since()` in isolation while the defect lived at the call site: reverting
+    `arms = _arms_since(arms_before)` to `arms = _ARMS_RUN` restored the 492-then-984
+    double count and every arm still passed, so "2/2 instrument" pinned the helper and not
+    the wiring (review, sixth round). The assignment now lives inside the function the arm
+    calls, which is the same function the run prints — the check is ON the thing that
+    matters rather than beside it.
+    """
+    arms = _arms_since(arms_before)
+    if failures:
+        return f"SELFTEST FAILED: {len(failures)} of {arms} check(s): {', '.join(failures)}"
+    # The prefix is exact: the pre-push hook and mutate_mcp.py both read for
+    # `SELFTEST PASSED`, and the arm count is appended rather than folded into it.
+    return f"SELFTEST PASSED — {arms} arms"
+
+
 def _check(name, cond, msg, failures, verbose):
+    global _ARMS_RUN
+    _ARMS_RUN += 1
     status = "ok" if cond else "FAIL"
     if verbose or not cond:
         print(f"  [{status}] {name}: {msg}")
@@ -2014,6 +2059,91 @@ def _check_workspace_relocation(failures, verbose):
                f"escapes={seen.get('escapes')!r} archived={leaked26[:70]!r}",
                failures, verbose)
 
+        # Containment engaged for an adapter that DECLARES the environment is all it has left
+        # there, with none of those variables set — so nothing was copied in, nothing comes
+        # through the environment, and the CLI has no way to authenticate. Measured live
+        # before this check existed: the cell spent a model call to return `exited with code
+        # 1`, with the real cause ("Not logged in") buried in a truncated JSON blob inside an
+        # assertion message. All three directions are pinned, because a refusal that can only
+        # fire is as wrong as one that can never fire: the same cell with the var SET must
+        # still run, and so must an adapter that never made the declaration.
+        seen.clear()
+        run_dir27 = os.path.join(repo_root, "artifacts", "run27")
+        os.makedirs(run_dir27)
+        r.run_id, r.run_dir = "run27", run_dir27
+        os.environ["ASE_NOAUTH_MCP"] = "mcp-tok-4f2a"
+        os.environ.pop("ASE_NOAUTH_CRED", None)          # the credential route: UNSET
+
+        class _EnvOnlyAuthAdapter(_MaskingFakeAdapter):
+            # Empty surface = "mapped, copies nothing" — claude's shape, because its auth
+            # lives in the macOS keychain, which no contained home can reach. The empty
+            # surface is context, NOT the trigger: the declaration below is.
+            contained_home_subpaths: list = []
+            credential_env_vars = ["ASE_NOAUTH_CRED"]
+            contained_home_required_credential_env_vars = ["ASE_NOAUTH_CRED"]
+
+        spec27 = EvalSpec(
+            name="demo", prompt="hi", source_path=os.path.join(repo_root, "demo.yaml"),
+            mcp_servers=parse_mcp_servers(
+                {"echo": {"command": "/bin/echo", "env": {"T": "${ASE_NOAUTH_MCP}"}}},
+                where="selftest"))
+        prior_adapter27 = r.adapter
+        r.adapter = _EnvOnlyAuthAdapter()
+        try:
+            cell27 = r._run_cell(ModelTarget(), spec27)
+            ran27 = seen.get("cwd") is not None
+            # ...and the SAME cell runs once the credential is actually available.
+            os.environ["ASE_NOAUTH_CRED"] = "cred-tok-8b31"
+            seen.clear()
+            run_dir28 = os.path.join(repo_root, "artifacts", "run28")
+            os.makedirs(run_dir28)
+            r.run_id, r.run_dir = "run28", run_dir28
+            cell28 = r._run_cell(ModelTarget(), spec27)
+            # Third case, and the only shape that can see WHERE the answer comes from: an
+            # adapter in exactly the arrangement of the first — empty contained surface,
+            # credential env var declared and unset — that has simply never declared what a
+            # contained home leaves it. It must RUN. `credential_env_vars` is a forwarding
+            # and redaction assertion; a CLI may authenticate through a helper or a socket
+            # that containment does not sever, so reading a refusal out of that list (or out
+            # of the empty surface) refuses working configurations. Without this case the
+            # check cannot tell the declaration from the inference it replaced.
+            os.environ.pop("ASE_NOAUTH_CRED", None)
+            seen.clear()
+            run_dir29 = os.path.join(repo_root, "artifacts", "run29")
+            os.makedirs(run_dir29)
+            r.run_id, r.run_dir = "run29", run_dir29
+
+            class _UndeclaredAuthAdapter(_MaskingFakeAdapter):
+                contained_home_subpaths: list = []
+                credential_env_vars = ["ASE_NOAUTH_CRED"]
+                # and no contained_home_required_credential_env_vars: unanswered, not "none".
+
+            r.adapter = _UndeclaredAuthAdapter()
+            cell29 = r._run_cell(ModelTarget(), spec27)
+        finally:
+            r.adapter = prior_adapter27
+            r._secrets = r._run_secrets = ()
+            os.environ.pop("ASE_NOAUTH_MCP", None)
+            os.environ.pop("ASE_NOAUTH_CRED", None)
+        err27 = cell27.run_result.error or ""
+        _check("mcp.contained_home_without_its_credential_env_var_is_refused",
+               cell27.passed is False and ran27 is False
+               and "ASE_NOAUTH_CRED" in err27 and "contained HOME" in err27
+               and cell28.passed and cell29.passed,
+               f"a cell that needs a contained HOME must be refused when the adapter DECLARES "
+               f"the environment is all containment leaves it and none of those variables is "
+               f"set — the CLI would start with no credential at all. Refused BEFORE the "
+               f"model call, and the refusal names the variable rather than surfacing as a "
+               f"generic non-zero exit. The same cell with the variable set must still run, "
+               f"or the check is a blanket ban. And an adapter that never made the "
+               f"declaration must run too, however suggestive its other fields look: "
+               f"`credential_env_vars` and an empty surface do not establish that the "
+               f"environment is the only route. "
+               f"passed={cell27.passed} ran={ran27} refusal={err27[:140]!r} "
+               f"ran_with_cred={getattr(cell28, 'passed', None)} "
+               f"ran_when_undeclared={getattr(cell29, 'passed', None)}",
+               failures, verbose)
+
         # A credential too short to redact is still a credential. This is the arm that would
         # have caught gating on `bool(secrets)` — the redaction set is empty here.
         seen.clear()
@@ -2279,10 +2409,10 @@ def _check_mcp_hermetic_paths(failures, verbose):
                        and _try(lambda: open(os.path.join(fk, "state",
                                                           "keep.txt")).read(), "")
                        == "state content\n",
-                       f"a declared subpath naming a DIRECTORY is reproduced as a real "
-                       f"directory of real files, recursively — not linked, and not skipped "
-                       f"for being a directory rather than the auth file the field was "
-                       f"written for.", failures, verbose)
+                       "a declared subpath naming a DIRECTORY is reproduced as a real "
+                       "directory of real files, recursively — not linked, and not skipped "
+                       "for being a directory rather than the auth file the field was "
+                       "written for.", failures, verbose)
 
                 vendor = os.path.join(fk, "skills", "vendor-skill", "SKILL.md")
                 linked = os.path.join(fk, "skills", "linked-skill")
@@ -2307,10 +2437,10 @@ def _check_mcp_hermetic_paths(failures, verbose):
                        and not os.path.islink(os.path.join(p1, "plugin.json"))
                        and _try(lambda: open(os.path.join(p1, "mcp_config.json")).read(),
                                 "") == "{}",
-                       f"the plugin registry is the second site that mints its own outward "
-                       f"symlinks, two per package, and it is masked rather than skipped so "
-                       f"it is easy to assume it was already handled. Its pass-throughs copy "
-                       f"too, and its per-plugin MCP mask still lands.", failures, verbose)
+                       "the plugin registry is the second site that mints its own outward "
+                       "symlinks, two per package, and it is masked rather than skipped so "
+                       "it is easy to assume it was already handled. Its pass-throughs copy "
+                       "too, and its per-plugin MCP mask still lands.", failures, verbose)
 
                 # NB: there is deliberately no arm asserting the FIFO was skipped "without
                 # being opened". `_materialize` copies via `shutil.copyfile`, which raises
@@ -2401,10 +2531,10 @@ def _check_mcp_hermetic_paths(failures, verbose):
 
         def _probe_argv(self, model):
             return [sys.executable, "-c",
-                    "import os; home=os.environ.get('HOME',''); print('PROBEHOME='+home); "
+                    ("import os; home=os.environ.get('HOME',''); print('PROBEHOME='+home); "
                     "print('PROBECWD='+os.getcwd()); "
                     "print('PROBEMASK='+open(os.path.join(home,'.fakeprobe-mcp','mcp.json'))"
-                    ".read())"]
+                    ".read())")]
 
         def _parse_probe_cost(self, output):
             self.probe_output = output
@@ -3069,6 +3199,115 @@ def _check_cell_crash_safety(failures, verbose):
         shutil.rmtree(repo_root, ignore_errors=True)
 
 
+def _check_spec_tags_reach_artifacts(failures, verbose):
+    """`tags:` must survive into the artifacts, on both the normal and the crash path.
+
+    scenarios/README.md documents two marks for a regression scenario — the `regress_`
+    filename prefix and `tags: [regression]` — and says the second is what lets a RESULT be
+    attributed. That was untrue when written: `tags` was read only by the `--tag` discovery
+    filter, which scenarios never go through (they are selected by path), so for a scenario
+    the tag had no consumer anywhere and the documented convention rested on nothing (review,
+    second round). This is the arm that makes the claim real.
+
+    The crash path matters as much as the normal one: a cell that died is exactly when a
+    reader needs to know whether a regression broke or an experiment failed, and it builds
+    its CellResult in a different place from the success path."""
+    import json
+    import os
+    import shutil
+    import tempfile
+
+    import agentskill_evals.runner as runner_mod
+    from .exec import ExecResult
+    from .schema import RunResult
+    from .spec import EvalSpec, ModelTarget
+
+    print("spec tags reach the artifacts:")
+    repo_root = tempfile.mkdtemp(prefix="ase-repo-tags-")
+    orig_execute = runner_mod.execute
+    crashing = [False]
+
+    def _tagging_execute(adapter, prompt, opts, *, cwd, timeout, env_overrides,
+                         agent_name, eval_name):
+        if crashing[0]:
+            raise RuntimeError("simulated crash")
+        return ExecResult(result=RunResult(agent=agent_name, eval_name=eval_name,
+                                           prompt=prompt, workdir=cwd, final_text="done"),
+                          stdout="", stderr="")
+
+    runner_mod.execute = _tagging_execute
+    try:
+        run_dir = os.path.join(repo_root, "artifacts", "runtags")
+        os.makedirs(run_dir)
+        r = runner_mod.Runner.__new__(runner_mod.Runner)
+        r.agent, r.adapter, r.targets = "fake", _FakeAdapter(), [ModelTarget()]
+        r.artifacts_root = os.path.join(repo_root, "artifacts")
+        r.run_id, r.skills_root, r.judge = "runtags", repo_root, None
+        r.provision, r.command, r.auto_approve = False, "", True
+        r.reasoning_effort = None
+        r.jobs, r.isolated, r.progress = 1, False, None
+        r._repo_skill_names, r.run_dir = set(), run_dir
+        r._secrets = r._run_secrets = ()
+
+        # DISTINCT names, because `cell_dir` is keyed on the eval name: reusing one for the
+        # success and crash runs pointed both at the same artifacts dir, so the crash
+        # overwrote the success cell's assertions.json before it was read and the arm went
+        # green with the success path's assignment deleted (review, third round).
+        tagged = EvalSpec(name="tagged-ok", prompt="hi",
+                          source_path=os.path.join(repo_root, "regress_x.yaml"),
+                          tags=["regression", "mcp"])
+        untagged = EvalSpec(name="untagged", prompt="hi",
+                            source_path=os.path.join(repo_root, "plain.yaml"))
+        tagged_crash = EvalSpec(name="tagged-crash", prompt="hi",
+                                source_path=os.path.join(repo_root, "regress_y.yaml"),
+                                tags=["regression", "mcp"])
+
+        cell_ok = r._run_cell(ModelTarget(), tagged)
+        cell_plain = r._run_cell(ModelTarget(), untagged)
+        crashing[0] = True
+        cell_crash = r._run_cell(ModelTarget(), tagged_crash)
+        crashing[0] = False
+
+        def _aj(cell):
+            path = os.path.join(cell.artifacts_dir, "assertions.json")
+            return json.loads(open(path).read()) if os.path.isfile(path) else {}
+
+        aj_ok, aj_plain, aj_crash = _aj(cell_ok), _aj(cell_plain), _aj(cell_crash)
+        dirs = [cell_ok.artifacts_dir, cell_plain.artifacts_dir, cell_crash.artifacts_dir]
+        r._write_summary([cell_ok, cell_plain, cell_crash],
+                         [tagged, untagged, tagged_crash])
+        summary = json.loads(open(os.path.join(run_dir, "summary.json")).read())
+        # A LIST in the order the cells were passed, not a dict keyed by eval name: keying
+        # collapsed two cells into one entry, so the last one written decided the answer for
+        # both and half the assertion was unreachable — the same defect as the shared
+        # directory, one layer up.
+        sum_pairs = [(c["eval"], c.get("tags", "<MISSING>")) for c in summary["cells"]]
+    finally:
+        runner_mod.execute = orig_execute
+        shutil.rmtree(repo_root, ignore_errors=True)
+
+    _check("artifacts.spec_tags_are_recorded_per_cell",
+           len(set(dirs)) == 3
+           and aj_ok.get("tags") == ["regression", "mcp"]
+           and aj_crash.get("tags") == ["regression", "mcp"]
+           and aj_plain.get("tags") == []
+           and sum_pairs == [("tagged-ok", ["regression", "mcp"]),
+                             ("untagged", []),
+                             ("tagged-crash", ["regression", "mcp"])],
+           f"a scenario is selected by path and never discovered, so `tags:` has no other "
+           f"consumer: unless they reach the artifacts, `tags: [regression]` is a mark "
+           f"nothing can read and the documented two-mark convention rests on nothing. "
+           f"Recorded in assertions.json and summary.json, on the crash path too — a cell "
+           f"that died is exactly when it matters whether a regression broke or an "
+           f"experiment failed — and `[]` for an untagged eval, which is a different claim "
+           f"from an artifact that could not say. The three cells must occupy three "
+           f"DIRECTORIES and three summary entries: sharing either lets one cell answer for "
+           f"another, and the half of this assertion aimed at the overwritten one can then "
+           f"never fail. dirs={len(set(dirs))} run={aj_ok.get('tags')!r} "
+           f"crash={aj_crash.get('tags')!r} untagged={aj_plain.get('tags')!r} "
+           f"summary={sum_pairs!r}", failures, verbose)
+
+
 def _check_progress_thread_safety(failures, verbose):
     """Under --jobs>1, every worker thread shares one Progress instance. Before the fix, update()
     mutated shared state under a lock but then printed OUTSIDE it — another thread's update()
@@ -3159,6 +3398,59 @@ def _check_cli_helpers(failures, verbose):
                    "expected malformed YAML to raise", failures, verbose)
     elif verbose:
         print("  [skipped — PyYAML not installed] cli.is_yaml_error.real_yaml_error")
+
+    # `--tag` with `--config` is REJECTED rather than ignored. The filter lives in the
+    # discovery branch, so with a scenario it never ran at all: `--config x.yaml --tag
+    # regression` reads like a selection, ran the scenario whatever its tags said, and cost a
+    # full model call doing it. Driven through `main()` — the real argv path, so the arm
+    # covers the parser wiring too, not a hand-built Namespace that cannot go stale.
+    #
+    # The path deliberately does NOT exist. That pins the ORDER as well as the rejection: the
+    # refusal must come before the scenario is loaded, or this reports a file error instead.
+    from .cli import main as _cli_main
+
+    def _cli(argv):
+        """rc + stderr, with SystemExit caught. `_load_scenario` exits rather than returning,
+        so a check that MOVED below it would raise straight through this arm and abort the
+        section — reporting as a suite crash rather than as this assertion failing, which is
+        the one thing a test must never do to its own mutation."""
+        buf, out = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(out):
+                return _cli_main(argv), buf.getvalue()
+        except SystemExit as exc:
+            return exc.code, buf.getvalue()
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}\n{buf.getvalue()}"
+
+    rc_tag, err_tag = _cli(["run", "--config", "/nonexistent/scen.yaml",
+                            "--tag", "regression"])
+    # The EMPTY form, which is where this first leaked. `nargs="*"` turned a bare `--tag`
+    # into `[]` — present but falsy — so the truthiness guard passed it through and the
+    # scenario ran (review, third round). Rejected at the parser now, so the message is
+    # argparse's rather than ours; what matters is that it names --tag and never reaches the
+    # scenario. `--config` last, so a parser that accepted the empty list would go on to
+    # load the (nonexistent) path and report a FILE error — making the two outcomes tell
+    # themselves apart.
+    rc_bare, err_bare = _cli(["run", "--tag", "--config", "/nonexistent/scen.yaml"])
+    # ...and the same flag on the discovery path is untouched: it must still parse and reach
+    # the filter. A blanket rejection of --tag would be an easy way to "fix" the above.
+    rc_ok, err_ok = _cli(["run", "--agent", "claude", "--skill", "no-such-skill-xyz",
+                          "--tag", "regression", "--dry-run"])
+    _check("cli.tag_with_config_is_refused_not_ignored",
+           rc_tag == 2 and "--tag" in err_tag and "scenario" in err_tag
+           and "no such file" not in err_tag.lower()
+           and rc_bare == 2 and "--tag" in err_bare
+           and "no such file" not in err_bare.lower()
+           and rc_ok == 2 and "no evals found" in err_ok,
+           f"a scenario is chosen by path and never discovered, so --tag has no candidate "
+           f"set to narrow — passing it with --config must fail fast rather than run the "
+           f"scenario and bill a model call for a selection that never happened. Refused "
+           f"BEFORE the scenario is read (a file error here would mean the check moved), in "
+           f"the EMPTY form too — a bare `--tag` is present-but-falsy and slipped past a "
+           f"truthiness guard — and --tag on the discovery path still works. "
+           f"rc={rc_tag} err={err_tag[:150]!r} bare_rc={rc_bare} bare_err={err_bare[:90]!r} "
+           f"discovery_rc={rc_ok} discovery_err={err_ok[:80]!r}", failures, verbose)
 
     # --model + --all-models: --model wins, and a warning is printed (not silently dropped)
     cfg = ModelsConfig({"claude": ["a", "b"]}, {"claude": "a"}, {}, [])
@@ -3818,11 +4110,11 @@ def _check_version_provenance_shared(failures, verbose):
            and "the stream states no version" in unreadable_msg
            and "1.0.0" in unreadable_msg
            and "witness held" not in unreadable_msg,
-           f"an adapter with no version source warns once per process, names the REASON "
-           f"there is nothing to read (so the reader does not go hunting for a version "
-           f"that does not exist), cites the verified baseline, and — even when called "
-           f"with witnessed=True — claims no runtime evidence, because the notice is "
-           f"about an unknown build rather than about this run's hermeticity",
+           "an adapter with no version source warns once per process, names the REASON "
+           "there is nothing to read (so the reader does not go hunting for a version "
+           "that does not exist), cites the verified baseline, and — even when called "
+           "with witnessed=True — claims no runtime evidence, because the notice is "
+           "about an unknown build rather than about this run's hermeticity",
            failures, verbose)
 
 
@@ -4084,14 +4376,14 @@ def _check_claude_version_provenance(failures, verbose):
            and crashed_run_raised == ""
            and "witness held" not in unwitnessed
            and "no MCP server list at all" in unwitnessed,
-           f"a denylisted build fails the run by name and says plainly that this is "
-           f"detection after the CLI already ran; a verified build that witnessed clean "
-           f"is silent; an unverified one warns ONCE per process and names the flag the "
-           f"whole argument rests on; a run that actually loaded a server fails outright; "
-           f"a COMPLETED run that states no version fails closed through verify_post_run "
-           f"while a crashed one does not; and a run that never produced a witness says so "
-           f"rather than claiming one held — a security notice that overstates its own "
-           f"evidence is worse than none",
+           "a denylisted build fails the run by name and says plainly that this is "
+           "detection after the CLI already ran; a verified build that witnessed clean "
+           "is silent; an unverified one warns ONCE per process and names the flag the "
+           "whole argument rests on; a run that actually loaded a server fails outright; "
+           "a COMPLETED run that states no version fails closed through verify_post_run "
+           "while a crashed one does not; and a run that never produced a witness says so "
+           "rather than claiming one held — a security notice that overstates its own "
+           "evidence is worse than none",
            failures, verbose)
 
 
@@ -4625,9 +4917,9 @@ def _check_parallel_requires_isolation(failures, verbose):
            and "parallel_safe_config" in refused_isolated
            and refused_unisolated != ""
            and serial_isolated == "" and serial_unisolated == "",
-           f"--jobs>1 is refused for a runner whose config is not materialized per cell — "
-           f"ISOLATED included, since isolation does not stop the sharing — and the message "
-           f"names what would lift it. Both serial modes still run",
+           "--jobs>1 is refused for a runner whose config is not materialized per cell — "
+           "ISOLATED included, since isolation does not stop the sharing — and the message "
+           "names what would lift it. Both serial modes still run",
            failures, verbose)
 
 
@@ -4682,10 +4974,10 @@ def _check_codex_post_run_mcp_recheck(failures, verbose):
     _check("codex.post_run_reenumeration_narrows_the_launch_window",
            clean == "" and "sneaky" in appeared and "not provably MCP-hermetic" in appeared
            and "no longer is" in unenumerable,
-           f"a run whose configured server set is unchanged passes; one where a server "
-           f"appeared after argv was built fails, naming it; and an enumeration that stops "
-           f"working post-run fails closed rather than assuming the pre-launch check still "
-           f"holds", failures, verbose)
+           "a run whose configured server set is unchanged passes; one where a server "
+           "appeared after argv was built fails, naming it; and an enumeration that stops "
+           "working post-run fails closed rather than assuming the pre-launch check still "
+           "holds", failures, verbose)
 
     # --- the residual gap, asserted as a KNOWN HOLE rather than as correct behaviour ---
     # A server added after argv was built, started by codex, then removed again before this
@@ -4705,13 +4997,13 @@ def _check_codex_post_run_mcp_recheck(failures, verbose):
     idle_server_reverted = _run(_adapter([]), launched, stdout="")
     _check("codex.KNOWN_GAP_idle_server_reverted_before_recheck_is_undetectable",
            idle_server_reverted == "",
-           f"DOCUMENTED HOLE, not a passing property: a server that started during the run "
-           f"and was removed before the post-run enumeration goes unreported when the model "
-           f"never called it. Both halves are blind — no tool call means no stream evidence, "
-           f"and codex emits nothing when a server starts, so absence of evidence is not "
-           f"evidence of absence here. Closing it needs a materialized private config for "
-           f"the child (see verify_post_run, DESIGN_MCP_Support.md §1); until then a green "
-           f"codex run means 'no leak was detected', NOT 'no server ran'", failures, verbose)
+           "DOCUMENTED HOLE, not a passing property: a server that started during the run "
+           "and was removed before the post-run enumeration goes unreported when the model "
+           "never called it. Both halves are blind — no tool call means no stream evidence, "
+           "and codex emits nothing when a server starts, so absence of evidence is not "
+           "evidence of absence here. Closing it needs a materialized private config for "
+           "the child (see verify_post_run, DESIGN_MCP_Support.md §1); until then a green "
+           "codex run means 'no leak was detected', NOT 'no server ran'", failures, verbose)
 
     # --- the stream half: presence proves a leak, absence proves nothing --------------
     # Shapes taken verbatim from a live codex 0.140.0 run against a sentinel stdio server.
@@ -8192,6 +8484,34 @@ def _check_declared_contained_surfaces(failures, verbose):
            f"and contain on a value the child never got. survived={sorted(survived)} "
            f"mangled={sorted(mangled)}", failures, verbose)
 
+    # 3) ...and the SEPARATE declaration the runner refuses on. Two properties, because the
+    #    two failures are opposite. A required name outside `credential_env_vars` would reach
+    #    the child unredacted and would not trigger containment at all — the runner would
+    #    refuse for the absence of a variable it never treats as a credential. And an adapter
+    #    whose contained surface copies NOTHING has severed every HOME-side route, so leaving
+    #    the question unanswered there is a gap: the answer may legitimately be `[]` (some
+    #    route outside HOME survives), but it has to be an answer, not a default.
+    stray, unanswered = [], []
+    for name in names:
+        adapter = get_adapter(name)
+        required = getattr(adapter, "contained_home_required_credential_env_vars", None)
+        declared = list(getattr(adapter, "credential_env_vars", []) or [])
+        stray += [f"{name}:{v}" for v in (required or []) if v not in declared]
+        surface = getattr(adapter, "contained_home_subpaths", None)
+        if surface == [] and declared and required is None:
+            unanswered.append(name)
+
+    _check("contained.required_credential_env_vars_are_declared_and_answered",
+           not stray and not unanswered
+           and getattr(get_adapter("claude"), "contained_home_required_credential_env_vars",
+                       None) == ["CLAUDE_CODE_OAUTH_TOKEN"],
+           f"the refusal reads `contained_home_required_credential_env_vars`, so every name "
+           f"in it must also be in `credential_env_vars` (or the runner refuses over a "
+           f"variable it neither redacts nor contains on), and an adapter whose contained "
+           f"surface copies nothing must actually answer the question rather than inherit "
+           f"the unmapped default — `[]` is a fine answer, silence is not. "
+           f"stray={sorted(stray)} unanswered={sorted(unanswered)}", failures, verbose)
+
 
 def _check_progress_indicator(failures, verbose):
     # progress indicator
@@ -8508,6 +8828,9 @@ def run_selftest(verbose: bool = False) -> int:
 
 def _run_selftest_checks(verbose: bool = False) -> int:
     failures: list[str] = []
+    # Captured at entry, subtracted at the banner: `_ARMS_RUN` counts for the life of the
+    # PROCESS, and this function is public API an embedder can call more than once.
+    arms_before = _ARMS_RUN
 
     _section(_check_cost_formatting, failures, verbose)
     _section(_check_claude_adapter, failures, verbose)
@@ -8543,6 +8866,7 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _section(_check_mcp_hermetic_paths, failures, verbose)
     _section(_check_parallel_cell_idx, failures, verbose)
     _section(_check_cell_crash_safety, failures, verbose)
+    _section(_check_spec_tags_reach_artifacts, failures, verbose)
 
     # cli.py's pure helpers (YAML-error detection, --model/--all-models, models.yaml validation)
     _section(_check_cli_helpers, failures, verbose)
@@ -8584,12 +8908,61 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     # deprecated pre-#67 module API (models= / .models / plain-id render columns)
     _section(_check_api_compat, failures, verbose)
 
+    # LAST, because it is about everything above it: the arm count reported in the banner is
+    # the only signal that a whole section stopped running, and a counter that silently
+    # stopped counting would report zero while every arm still passed — the exact shape of
+    # failure it exists to catch. The floor is loose on purpose (real drift is a section, ~10
+    # arms at least) so this never becomes a number to bump by hand, which is the maintenance
+    # burden that made the literal in TODO_Contained_HOME.md §4 go stale in the first place.
+    _section(_check_arm_counter, failures, verbose)
+
     print()
-    if failures:
-        print(f"SELFTEST FAILED: {len(failures)} check(s): {', '.join(failures)}")
-        return 1
-    print("SELFTEST PASSED")
-    return 0
+    print(_banner(arms_before, failures))
+    return 1 if failures else 0
+
+
+def _check_arm_counter(failures, verbose):
+    """The banner's arm count must be live, and must be PER RUN rather than per process."""
+    print("arm counter:")
+    _check("selftest.arm_count_is_live",
+           _ARMS_RUN >= 400,
+           f"the run reports {_ARMS_RUN} arms, and the banner's count is what tells a "
+           f"reader that a section stopped running — a `SELFTEST PASSED` with a third of "
+           f"the suite silently skipped looks identical to a clean one otherwise. A "
+           f"counter that stopped incrementing would report a number nobody could act on, "
+           f"so the count is checked to be LIVE rather than merely printed. Floor is loose "
+           f"deliberately: it catches a dead counter or a lost section, and is not a number "
+           f"to maintain per commit", failures, verbose)
+
+    # ...and that it MEASURES ONE RUN, observed through `_banner` — the function
+    # `_run_selftest_checks` actually prints. Testing `_arms_since()` on its own passed
+    # while the call site read `_ARMS_RUN` raw, which is the whole defect: a check aimed
+    # beside the thing that matters (review, sixth round).
+    #
+    # Two consecutive runs are simulated against a counter that GROWS between them, which
+    # is what makes this a per-run claim rather than an arithmetic one. `first` started one
+    # arm ago (the liveness check above), so it must report exactly 1; `second` starts now
+    # and has done nothing, so it must report 0. A banner reading the process total reports
+    # the same large number for both — and that number is the one thing asserted absent.
+    total = _ARMS_RUN
+    first = _banner(total - 1, [])
+    second = _banner(total, [])
+    failed_form = _banner(total - 1, ["some.arm"])
+    _check("selftest.arm_count_is_per_run_not_per_process",
+           first == "SELFTEST PASSED — 1 arms"
+           and second == "SELFTEST PASSED — 0 arms"
+           and f"of {total} check(s)" not in failed_form
+           and "1 of 1 check(s)" in failed_form,
+           f"`_ARMS_RUN` counts for the life of the PROCESS, so the banner must report a "
+           f"delta against the value captured when the run began — otherwise a second "
+           f"`run_selftest()` in one interpreter reports the sum of both (492, then 984) "
+           f"while every arm still passes and the number still looks plausible. Checked "
+           f"through `_banner` rather than the helper it calls, because the regression is "
+           f"the ASSIGNMENT reverting to the raw counter, and against a counter that moved "
+           f"between the two so a process total cannot satisfy both. The FAILED form shares "
+           f"the same figure and is checked too. total={total} first={first!r} "
+           f"second={second!r} failed={failed_form!r}",
+           failures, verbose)
 
 
 def _check_mcp_declared_servers(failures, verbose):

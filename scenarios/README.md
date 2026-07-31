@@ -112,7 +112,7 @@ assertion has a `type` and type-specific fields. All types accept an optional
 ### Filesystem
 
 | Type | Required | Optional | Checks |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `file_exists` | `path` | `contains`, `matches`, `min_size` | File exists in workspace |
 | `file_absent` | `path` | | File does NOT exist |
 | `dir_exists` | `path` | | Directory exists |
@@ -120,7 +120,7 @@ assertion has a `type` and type-specific fields. All types accept an optional
 ### Tool / command trace
 
 | Type | Required | Optional | Checks |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `ran_command` | | `contains`, `matches`, `equals`, `ignore_case` | A shell command matched |
 | `used_tool` | `name` | | Tool name appeared in the trace |
 | `tool_count` | | `min`, `max` | Total tool calls within range |
@@ -131,7 +131,7 @@ These check whether the agent accessed a provisioned skill's files during the ru
 `path` is relative to the skill's `references/` or `scripts/` subdirectory.
 
 | Type | Required | Optional | Checks |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `skill_triggered` | `skill` | | Any access to files under the skill dir |
 | `skill_not_triggered` | `skill` | | No access to the skill dir |
 | `skill_reference_read` | `skill` | `path` | Read from `<skill>/references/` |
@@ -165,7 +165,7 @@ assertions:
 ### Process / output
 
 | Type | Required | Optional | Checks |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `exit_code` | | `equals` (default 0) | Process exit code |
 | `no_error` | | | Clean run: exit 0, no timeout, no harness error |
 | `final_contains` | | `contains`, `matches`, `equals`, `ignore_case` | Final answer text matches |
@@ -173,7 +173,7 @@ assertions:
 ### Schema + judge
 
 | Type | Required | Optional | Checks |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `output_matches_schema` | | `schema` | Structured output validates against JSON Schema |
 | `llm_judge` | | `rubric`, `threshold` | LLM judge grades rubric items |
 
@@ -182,6 +182,60 @@ assertions:
 Name files so a newcomer knows what each is for: **`<what>_on_<runner>-<model>.yaml`**, e.g.
 `pipeline+region-picker_on_claude-haiku.yaml`, `full-pipeline_on_codex-gpt5.5.yaml`. The target also lives
 inside the file; the filename just makes the directory self-describing at a glance.
+
+### Regression scenarios — `regress_*.yaml` + `tags: [regression]`
+
+A **regression scenario** pins behaviour that *already works*, so a later change cannot
+quietly undo it. It is not a feature demo and not a place to explore: it exists because
+something was verified once and would otherwise only be re-verified by accident.
+
+Mark them **both** ways, because the two marks do different jobs:
+
+| Mark | Who reads it |
+| --- | --- |
+| `regress_` filename prefix | a human scanning `scenarios/` — they sort together and are obvious in a diff |
+| `tags: [regression]` | anyone reading the **results** — every cell records its tags in `assertions.json` and `summary.json`, so a result can be attributed to a regression rather than an experiment without going back to the YAML (which may have changed since) |
+
+**`--tag` does not select scenarios.** Scenarios are not discovered (see the top of this
+file), so there is no candidate set for a tag to narrow: `--tag` filters evals found under
+`--skill`/`--evals`, and passing it with `--config` is an error rather than a flag that
+quietly does nothing — it would otherwise read like a selection and bill a model call for
+one that never happened. Run them by path — `for f in scenarios/regress_*.yaml; do
+agentskill-evals run --config "$f"; done` is the whole "suite", and the filename prefix is
+what makes that glob work. If regression scenarios ever need real collection, that means
+scenario-directory discovery, not a tag.
+
+Write one when a behaviour **needs a real CLI to observe**. If an offline check can see it,
+prefer that: `harness/agentskill_evals/selftest.py` for harness logic and
+`harness/tools/verify_mcp_fixtures.py` for the stdio fixtures both run in seconds and cost
+nothing, where a scenario costs a model call every time it runs. A regression scenario
+earns its cost only when the thing under test is the agent CLI's own behaviour.
+
+State in a comment at the top **what would break unnoticed without it**, and be exact about
+which part of that a live run can actually see. `regress_mcp_two_servers.yaml` is the worked
+example: every live MCP run before it declared exactly one server, so a config writer that
+emits only the last entry, or a namespacing scheme that collides on identically-named tools,
+was indistinguishable from correct. It deliberately does *not* claim the witness half of
+that — `mcp_servers_witnessed` reporting the set rather than the first name is checked
+offline in `selftest.py`, which is this convention applied to itself.
+
+The same discipline applies to the assertions, and it took two passes to get right — both
+failures worth knowing, because they are the ones that look like tests and are not.
+
+1. The first draft asserted two distinct echoed payloads and called that proof of routing.
+   It was not: the fixture echoes verbatim, so one process serving both aliases returns
+   exactly what a correctly-routed pair returns.
+2. The fix prefixed each reply with the server's **name** — and the prompt has to name the
+   servers, so the expected string was a concatenation of two things the model had already
+   been handed. A model given a bare `wolverine-11` will label it `alpha:wolverine-11`
+   unasked, so the assertion still passed with identity never reaching a tool result.
+
+The rule both violate: **ask what a broken implementation would produce, and remember the
+model is part of the implementation.** An agent will helpfully reconstruct anything it can
+infer from its prompt, so a live assertion is only evidence if its expected value is
+*unreachable* except through the mechanism under test. `ECHO_MCP_IDENTITY` takes an opaque
+marker (`kestrel-9f3a`) that appears nowhere in the prompt, which is why the third version
+holds.
 
 ## Override precedence
 

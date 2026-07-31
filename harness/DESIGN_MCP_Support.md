@@ -143,7 +143,7 @@ Validation rules (added to `validate_spec`, `spec.py:237-395`, so misconfigurati
 ## 4. Per-adapter mapping
 
 | adapter | config delivery | kill-switch (default, no `mcp_servers`) — **implemented (Phase 0)** | tool allowlist | remote transports |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | claude | `--mcp-config <scratch>/mcp.json` (keep `--strict-mcp-config`) | already hermetic | `--disallowedTools` on the *complement* of `tools:` (removes them from the advertised surface — `--allowedTools` gates nothing, measured §6-C2), plus a fail-closed post-run subset check against the init event — prevention for the **enumerated** tool set, detection for later drift (§6-C2) | http + sse (inferred) |
 | codex | `-c mcp_servers.<n>.<key>=…` argv overrides | `--disable plugins` + per-server `-c mcp_servers.<n>.enabled=false`, enumerated via `codex mcp list --json` **in the child's cwd/env** (trusted-project configs, `$CODEX_HOME` — §2); any enumeration failure fails closed (no offline fallback), then the overrides are **post-verified** against codex's own view | `-c mcp_servers.<n>.enabled_tools=[…]` | streamable HTTP; no SSE |
 | copilot | `--additional-mcp-config @<scratch>/mcp-config.json` | isolation masks (`mcp-config.json` → `{"mcpServers":{}}`, `installed-plugins/` → empty dir, `agents/` → empty dir, **both** `config.json` and `settings.json` sanitized of plugin records + `enabledMcpServers` + `customAgents.defaultLocalOnly` forced — copilot migrates user settings between those two files at startup, so masking one lets the other carry the stripped keys back in; `COPILOT_HOME` mirrored) + `--disable-mcp-server <n>` on argv for the built-in/feature-gated servers (incl. `computer-use`), the JSONC user config, and the workspace configs (a conservative superset) — fail closed on a populated (win32) ODR registry gate, when the user config is unparseable, on any discoverable custom-agent file, on settings not provably carrying `customAgents.defaultLocalOnly` in **either** file **and contradicting it in neither** — a `customAgents` key present without the opt-out (`{}` included) is a contradiction, because the migration transports the whole key — and on config-channel `extra_args` (which now also covers `--output-format`, whose override would blind the post-run audit) | per-server `tools` in config | http + sse (verified) |
@@ -217,7 +217,7 @@ Flat matches claude's flag but forces claude's naming onto codex/copilot (whose 
 **C2. Claude gating strength: advisory vs hard.** — **resolved by measurement (2026-07-22, claude 2.1.113), and the answer inverted the ranking.** All three options were run against the `fixtures/echo_mcp_server.py` stdio server (tools `echo` + `add`), allowing `echo` and instructing the model to call `add`:
 
 | option | result |
-|---|---|
+| --- | --- |
 | (a) `--dangerously-skip-permissions` + `--allowedTools mcp__echo__echo` | **No gating whatsoever.** `mcp__echo__add` stayed in the init `tools` list, was called, returned `42`. Advisory is not even advisory here — nothing carries the preference to the model. |
 | (b) `--permission-mode dontAsk` + `--allowedTools mcp__echo__echo` | **Hard, at call time.** The tool is still advertised, the model still attempts it, and the *call* is refused (`is_error: true`, "running in don't ask mode"). But the allowlist governs **every** tool: with only the MCP tool listed, `Write` and `Bash` were both denied and the file never written. Enumerating the whole built-in surface is version-brittle, and it changes the agent's capabilities — which makes a gated cell non-comparable with an ungated one, the exact axis `Runner._consistency` exists to protect. |
 | (c) `--dangerously-skip-permissions` + `--disallowedTools mcp__echo__add` | **Hard, at advertisement time** — strictly the cleanest. The denied tool is **absent from the init `tools` list**; the model never learns it exists and reports the server "only exposes an `echo` tool". Built-ins are untouched. |
@@ -378,7 +378,7 @@ Classifying by "it has no `id`" alone would be the bug this rule exists to preve
 An `id`-less **error** response is the case that makes the taxonomy earn its keep. It is schema-valid, so calling it a malformed envelope would be wrong — and would send whoever reads the audit log hunting a framing bug that does not exist, while hiding a genuine server-side error the server was trying to report. But the proxy forwards only validated client requests, so it can never correlate one, and forwarding it anyway would hand the client a reply to something the proxy cannot account for. It is therefore an anomaly of kind **uncorrelated**, not **malformed** — same verdict, different diagnosis, and the audit log records which.
 
 | message | proxy behaviour |
-|---|---|
+| --- | --- |
 | `tools/list` **response** | filter `result.tools` to the allowlist before forwarding |
 | `tools/call` **request** | if `params.name` is off-list, do **not** forward; answer the client with a JSON-RPC error and record it |
 | notification (`method`, no `id`) | forward verbatim, never answer — answering `notifications/initialized` is a protocol violation some clients treat as fatal |
@@ -498,7 +498,7 @@ Live verification against all four CLIs comes after the offline arms, and the C3
 This section is written against **MCP revision `2026-07-28`**, read on 2026-07-29 — one day after publication. That is unusually thin ice for a design to rest on, so the pages each rule came from are named here rather than left as prose. An implementer should re-read them before writing the code, not because the design is provisional, but because a revision that new can still acquire errata.
 
 | Page | What it grounds here |
-|---|---|
+| --- | --- |
 | [`basic/versioning`](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning) | The modern/legacy/dual-era model, per-request `_meta` versioning, `UnsupportedProtocolVersionError`, and the client×server compatibility matrix — §10.2 |
 | [`basic/transports/stdio`](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio) | One message per line (hence no batches); "the server **MUST NOT** write JSON-RPC *requests* to stdout"; the `server/discover` fallback probe and its timeout case; the shutdown sequence and the `SIGTERM`/`SIGKILL` escalation; unexpected termination as a **restart** trigger — §10.4, §10.5, C3-1 |
 | [`basic/patterns/mrtr`](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr) | `InputRequiredResult`, `inputRequests`/`inputResponses`, and the rule that a retry **MUST** use a different JSON-RPC `id` — §10.2 |

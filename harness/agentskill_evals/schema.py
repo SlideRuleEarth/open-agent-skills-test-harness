@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 
 class EventKind(str, Enum):
@@ -37,10 +37,10 @@ class NormalizedEvent:
 
     kind: EventKind
     raw: dict[str, Any] = field(default_factory=dict)
-    text: Optional[str] = None        # message / reasoning / result text
-    tool_name: Optional[str] = None   # e.g. "Bash", "shell", "edit", "run_command"
-    command: Optional[str] = None      # shell command string, when applicable
-    path: Optional[str] = None         # file path for file-change / file tool calls
+    text: str | None = None        # message / reasoning / result text
+    tool_name: str | None = None   # e.g. "Bash", "shell", "edit", "run_command"
+    command: str | None = None      # shell command string, when applicable
+    path: str | None = None         # file path for file-change / file tool calls
     is_error: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -54,7 +54,7 @@ class NormalizedEvent:
         }
 
 
-def witness_json(witnessed: Optional[tuple]) -> Optional[list]:
+def witness_json(witnessed: tuple | None) -> list | None:
     """``mcp_servers_witnessed`` as JSON: a list of ``[name, status]``, or null.
 
     null is "the run stated nothing" — it crashed before its init event, or this adapter
@@ -89,24 +89,24 @@ class RunResult:
     exit_code: int = -1
     events: list[NormalizedEvent] = field(default_factory=list)
     final_text: str = ""
-    structured_output: Optional[Any] = None  # parsed final JSON, when a schema was requested
-    cost_usd: Optional[float] = None
-    premium_requests: Optional[float] = None
-    duration_ms: Optional[int] = None
-    resolved_model: Optional[str] = None  # actual model used (when adapter can detect it)
+    structured_output: Any | None = None  # parsed final JSON, when a schema was requested
+    cost_usd: float | None = None
+    premium_requests: float | None = None
+    duration_ms: int | None = None
+    resolved_model: str | None = None  # actual model used (when adapter can detect it)
     # CLI build that executed (when the runner's telemetry states it; None = unknown).
     # Recorded per cell so a matrix can be checked for having run under ONE build — a
     # self-updating CLI can change mid-matrix, which silently makes cells incomparable.
-    cli_version: Optional[str] = None
+    cli_version: str | None = None
     # MCP servers this run itself reported hosting, as (name, status) pairs, when its
     # telemetry states them (claude's init event). None = the run said nothing readable,
     # which the consistency check counts as an axis it could not compare rather than as
     # agreement — see ParseOutput.mcp_servers_witnessed for why pairs rather than names.
-    mcp_servers_witnessed: Optional[tuple] = None
-    stdout_path: Optional[str] = None
-    stderr_path: Optional[str] = None
+    mcp_servers_witnessed: tuple | None = None
+    stdout_path: str | None = None
+    stderr_path: str | None = None
     timed_out: bool = False
-    error: Optional[str] = None  # harness-level error (binary missing, crash, timeout)
+    error: str | None = None  # harness-level error (binary missing, crash, timeout)
     # Non-fatal findings from the adapter's post-run verification — a declared MCP server
     # that never connected, a probe that proved nothing. These do NOT fail the run; they
     # explain results that would otherwise be inexplicable, which only works if they are

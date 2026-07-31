@@ -6,8 +6,6 @@ Adding a new agent = one Adapter subclass + one line here. Everything else
 
 from __future__ import annotations
 
-from typing import Optional
-
 from .antigravity import AntigravityAdapter
 from .base import Adapter, ParseOutput, ProbeResult, RunOptions
 from .claude import ClaudeAdapter
@@ -64,8 +62,8 @@ __all__ = [
     "ParseOutput",
     "ProbeResult",
     "RunOptions",
-    "get_adapter",
-    "all_adapters",
     "adapter_names",
+    "all_adapters",
+    "get_adapter",
     "register",
 ]

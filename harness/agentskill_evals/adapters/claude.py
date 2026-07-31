@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Optional
+from typing import Any
 
 from ..notices import warn
 from ..schema import EventKind, NormalizedEvent
@@ -86,7 +86,7 @@ _PROVENANCE = VersionProvenance(
 )
 
 
-def _stream_cli_version(stdout: str) -> Optional[str]:
+def _stream_cli_version(stdout: str) -> str | None:
     """The CLI version that actually EXECUTED, read out of the child's own stream.
 
     Claude states this directly: the ``system``/``init`` event carries
@@ -127,7 +127,7 @@ def _stream_cli_version(stdout: str) -> Optional[str]:
 
 
 def _mcp_witness(stdout: str,
-                 exit_code: int) -> tuple[Optional[str], list[str], bool, dict]:
+                 exit_code: int) -> tuple[str | None, list[str], bool, dict]:
     """Check the run's own account of its MCP host.
 
     Returns (violation, live, witnessed, statuses).
@@ -157,9 +157,9 @@ def _mcp_witness(stdout: str,
     told anything by the rest of it, so a server named anywhere counts as loaded, and a
     reshaped list anywhere is a violation.
     """
-    violation: Optional[str] = None
+    violation: str | None = None
     live: list[str] = []
-    statuses: dict[str, Optional[str]] = {}
+    statuses: dict[str, str | None] = {}
     witnessed = False
     for obj in iter_jsonl(stdout):
         if not isinstance(obj, dict):
@@ -202,7 +202,7 @@ def _mcp_witness(stdout: str,
     return (None, [], False, {})
 
 
-def _witnessed_servers(stdout: str, exit_code: int) -> Optional[tuple]:
+def _witnessed_servers(stdout: str, exit_code: int) -> tuple | None:
     """The servers this run reported hosting, as sorted ``(name, status)`` pairs.
 
     ``None`` whenever the run did not actually witness its MCP host — it crashed before
@@ -260,6 +260,14 @@ class ClaudeAdapter(Adapter):
     # contained-HOME design deliberately introduced into the child environment; leaving it out
     # of the scrub set would undo the containment the design bought.
     credential_env_vars = ["CLAUDE_CODE_OAUTH_TOKEN"]
+    # And in a CONTAINED home it is the only route, which is the measured half of the comment
+    # above rather than an inference from the empty surface: the keychain needs
+    # ~/Library/Keychains, an outward symlink a contained home cannot have, and nothing else
+    # under HOME carries a login. Confirmed from the failing direction on 2026-07-30 —
+    # scenarios/mcp_echo_cred.yaml with the variable unset spends the cell and comes back
+    # `exited with code 1` carrying "Not logged in · Please run /login"; with it set, the same
+    # cell passes. That run is what this preflight was written from.
+    contained_home_required_credential_env_vars = ["CLAUDE_CODE_OAUTH_TOKEN"]
 
     supports_output_schema = True
     # `--effort <level>` (verified 2026-07-08: choices low|medium|high|xhigh|max — the
@@ -327,7 +335,7 @@ class ClaudeAdapter(Adapter):
     def format_skill(self, skill: str) -> str:
         return f"/{skill}"
 
-    def mcp_servers_seen(self, argv: list[str]) -> Optional[list[str]]:
+    def mcp_servers_seen(self, argv: list[str]) -> list[str] | None:
         """``[]`` — this run could not have had MCP servers — or None if argv stops saying so.
 
         Unlike codex and copilot, which neutralize servers by NAME and so report the disable
@@ -522,13 +530,13 @@ class ClaudeAdapter(Adapter):
         _PROVENANCE.warn_drift(version, witnessed=witnessed)
 
     def parse(self, stdout: str, stderr: str, exit_code: int,
-               *, opts: Optional[RunOptions] = None) -> ParseOutput:
+               *, opts: RunOptions | None = None) -> ParseOutput:
         events: list[NormalizedEvent] = []
         final_text = ""
         structured: Any = None
         cost = None
         dur = None
-        resolved_model: Optional[str] = None
+        resolved_model: str | None = None
         last_assistant_text = ""
 
         for obj in iter_jsonl(stdout):

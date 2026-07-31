@@ -51,7 +51,7 @@ import os
 import re
 import subprocess
 import tempfile
-from typing import Any, Optional
+from typing import Any
 
 from ..schema import EventKind, NormalizedEvent
 from .base import (
@@ -206,7 +206,7 @@ class AntigravityAdapter(Adapter):
     # credential (then this becomes [] like copilot's), or the harness gains a
     # keychain-independent auth mode for it. Until one exists, credential-bearing agy cells
     # SHOULD stay refused, and this None is the mechanism that refuses them.
-    contained_home_subpaths: Optional[list[str]] = None
+    contained_home_subpaths: list[str] | None = None
     # agy also discovers MCP configs from the RUN WORKSPACE via --add-dir — outside the
     # HOME overlay's reach, so the runner neutralizes any *seeded* ones. It recognizes
     # FOUR customization roots (verified 1.1.1: a sentinel stdio server in each launched
@@ -239,7 +239,7 @@ class AntigravityAdapter(Adapter):
 
     has_model_list = True
 
-    def discover_models(self) -> Optional[list[str]]:
+    def discover_models(self) -> list[str] | None:
         """Return model IDs from ``agy models``.
 
         ``agy models`` prints display names like "Gemini 3.5 Flash (Medium)".
@@ -262,8 +262,8 @@ class AntigravityAdapter(Adapter):
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return None
 
-    def _probe_argv(self, model: str, *, cwd: Optional[str] = None,
-                    env: Optional[dict] = None):
+    def _probe_argv(self, model: str, *, cwd: str | None = None,
+                    env: dict | None = None):
         # --add-dir: without it a bare `agy -p` operates against the fixed, shared
         # ~/.gemini/antigravity-cli/scratch dir and leaves state there (see module
         # docstring). The anchor must be the probe's fresh PRIVATE workspace
@@ -307,7 +307,7 @@ class AntigravityAdapter(Adapter):
         _PROVENANCE.warn_drift(None)
 
     def parse(self, stdout: str, stderr: str, exit_code: int,
-               *, opts: Optional[RunOptions] = None) -> ParseOutput:
+               *, opts: RunOptions | None = None) -> ParseOutput:
         # 1) The `--output-format json` shape we now always request: one object with a
         #    conversation_id we can use to pull the real tool-call trace off disk.
         single = try_load_json(stdout)
@@ -344,7 +344,7 @@ class AntigravityAdapter(Adapter):
             structured_output=None,
         )
 
-    def _parse_json_result(self, obj: dict, opts: Optional[RunOptions]) -> ParseOutput:
+    def _parse_json_result(self, obj: dict, opts: RunOptions | None) -> ParseOutput:
         """Parse the `--output-format json` result object and enrich it with the real
         tool-call trace read from the on-disk transcript (see module docstring)."""
         warn_unknown_usage("antigravity", obj, _KNOWN_RESULT_KEYS)
@@ -510,7 +510,7 @@ def _events_from_transcript(steps: list[dict], skills_subdir: str = "") -> list[
 
 
 def _read_transcript_events(
-    conversation_id: Optional[str], opts: Optional[RunOptions], skills_subdir: str = "",
+    conversation_id: str | None, opts: RunOptions | None, skills_subdir: str = "",
 ) -> list[NormalizedEvent]:
     """Read agy's on-disk transcript for *conversation_id* and normalize its steps.
 
@@ -527,7 +527,7 @@ def _read_transcript_events(
         ".system_generated", "logs", "transcript_full.jsonl",
     )
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             text = f.read()
     except OSError:
         return []

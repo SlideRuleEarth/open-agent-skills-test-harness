@@ -26,7 +26,7 @@ import re
 import shutil
 import sys
 import tempfile
-from typing import Any, Optional
+from typing import Any
 
 from dataclasses import dataclass
 
@@ -85,7 +85,7 @@ Your FINAL response must contain a single JSON object (optionally inside a
 }"""
 
 class Judge:
-    def __init__(self, agent: str = "claude", model: Optional[str] = None, timeout: int = 240):
+    def __init__(self, agent: str = "claude", model: str | None = None, timeout: int = 240):
         self.adapter = get_adapter(agent)
         self.agent = self.adapter.name
         self.model = model
@@ -200,7 +200,7 @@ def _build_prompt(spec: Any, result: RunResult, workdir: str, rubric: list[str],
 _FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
 
 
-def _extract_json(text: str) -> Optional[dict]:
+def _extract_json(text: str) -> dict | None:
     """Try to extract a JSON verdict from text, handling markdown fences."""
     text = (text or "").strip()
     if not text:

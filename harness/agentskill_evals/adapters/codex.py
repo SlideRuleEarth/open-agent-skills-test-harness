@@ -20,11 +20,11 @@ item.completed is only counted once as a TOOL_CALL.
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import sys
-from typing import Any, Mapping, Optional
+from typing import Any
+from collections.abc import Mapping
 
 from ..schema import EventKind, NormalizedEvent
 from .base import (Adapter, MCPOffMechanism, ParseOutput, ProbeResult, RunOptions,
@@ -172,7 +172,7 @@ def _mcp_tool_calls(stdout: str) -> list[str]:
     return found
 
 
-def _config_channel_token(extra_args: list[str]) -> Optional[str]:
+def _config_channel_token(extra_args: list[str]) -> str | None:
     """The first extra_args token that opens a codex configuration channel, or None.
     A token that merely LOOKS like one (e.g. a value following some unrelated flag) is
     reported too — that false positive fails closed, the safe direction."""
@@ -246,13 +246,18 @@ class CodexAdapter(Adapter):
     # rotates", and a run that happens to straddle an access-token expiry may well rewrite
     # it. Re-check with --rotation-check rather than trusting this line.
     contained_home_subpaths: list[str] = [".codex/auth.json"]
+    # Nothing from the environment: the copy above IS the credential, and the complete
+    # contained run measured on 2026-07-27 (see --rotation-check, above) authenticated from
+    # it with no token exported. The positive `[]` rather than the default `None`, so the
+    # preflight's silence here is a recorded answer instead of an unmapped adapter.
+    contained_home_required_credential_env_vars: list[str] = []
     # No dedicated flag; the config.toml key `model_reasoning_effort` (settable per-run via
     # `-c`) reaches the API as `reasoning.effort` (verified 2026-07-08: the API echoes
     # supported values none|minimal|low|medium|high|xhigh on a bad one).
     supports_reasoning_effort = True
     has_model_list = True
 
-    def discover_models(self) -> Optional[list[str]]:
+    def discover_models(self) -> list[str] | None:
         try:
             r = subprocess.run(
                 [self.binary, "debug", "models"], capture_output=True, text=True, timeout=10,
@@ -265,8 +270,8 @@ class CodexAdapter(Adapter):
                 json.JSONDecodeError, KeyError):
             return None
 
-    def _probe_argv(self, model: str, *, cwd: Optional[str] = None,
-                    env: Optional[dict] = None):
+    def _probe_argv(self, model: str, *, cwd: str | None = None,
+                    env: dict | None = None):
         return [self.binary, "--ask-for-approval", "never", "--sandbox", "read-only",
                 "exec", "--ephemeral", "--disable", "memories",
                 "--disable", "plugins",
@@ -294,7 +299,7 @@ class CodexAdapter(Adapter):
                     return ProbeResult(accepted=True, cost_usd=None)
         return ProbeResult(accepted=True)
 
-    def mcp_servers_seen(self, argv: list[str]) -> Optional[list[str]]:
+    def mcp_servers_seen(self, argv: list[str]) -> list[str] | None:
         """The servers this run disabled by name — codex's record of what its configuration
         held at launch. Same reader the post-run re-check uses."""
         return sorted(_disabled_server_names(argv))
@@ -305,8 +310,8 @@ class CodexAdapter(Adapter):
 
     # --- MCP hermeticity ------------------------------------------------------
 
-    def _mcp_disable_args(self, cwd: Optional[str] = None,
-                          env: Optional[Mapping[str, str]] = None) -> list[str]:
+    def _mcp_disable_args(self, cwd: str | None = None,
+                          env: Mapping[str, str] | None = None) -> list[str]:
         """`-c mcp_servers.<name>.enabled=false` for every server codex would actually
         load. Verified on 0.140.0: `-c mcp_servers={}` deep-merges with config.toml
         instead of replacing it (the server stays enabled), while the per-server `enabled`
@@ -346,8 +351,8 @@ class CodexAdapter(Adapter):
             self._verify_all_mcp_disabled(args, cwd=cwd, env=env)
         return args
 
-    def _verify_all_mcp_disabled(self, disable_args: list[str], cwd: Optional[str] = None,
-                                 env: Optional[Mapping[str, str]] = None) -> None:
+    def _verify_all_mcp_disabled(self, disable_args: list[str], cwd: str | None = None,
+                                 env: Mapping[str, str] | None = None) -> None:
         """Re-run codex's own effective-config enumeration WITH the generated
         `-c ...enabled=false` overrides and `--disable plugins` applied, in the child's
         exact cwd and env, and confirm no server is still enabled. A higher-precedence
@@ -389,8 +394,8 @@ class CodexAdapter(Adapter):
                 "than running with them live."
             )
 
-    def _configured_mcp_server_names(self, cwd: Optional[str] = None,
-                                     env: Optional[Mapping[str, str]] = None) -> list[str]:
+    def _configured_mcp_server_names(self, cwd: str | None = None,
+                                     env: Mapping[str, str] | None = None) -> list[str]:
         """Server names codex will load from *configuration* (its plugin channel is closed
         separately by `--disable plugins`, and plugin-provided servers must NOT be disabled
         by name — they have no config.toml entry, so a `-c` disable would create an
@@ -415,8 +420,8 @@ class CodexAdapter(Adapter):
             )
         return names
 
-    def _mcp_names_via_cli(self, cwd: Optional[str] = None,
-                           env: Optional[Mapping[str, str]] = None) -> Optional[list[str]]:
+    def _mcp_names_via_cli(self, cwd: str | None = None,
+                           env: Mapping[str, str] | None = None) -> list[str] | None:
         """Ask codex itself which MCP servers its effective config defines — from the
         child's exact cwd and env, so trusted-project configs and $CODEX_HOME resolve the
         same way they will in the run. None (fall back) when the binary is missing,
@@ -601,7 +606,7 @@ class CodexAdapter(Adapter):
         _PROVENANCE.warn_drift(None)
 
     def parse(self, stdout: str, stderr: str, exit_code: int,
-               *, opts: Optional[RunOptions] = None) -> ParseOutput:
+               *, opts: RunOptions | None = None) -> ParseOutput:
         events: list[NormalizedEvent] = []
         final_text = ""
         structured: Any = None
@@ -728,7 +733,7 @@ class CodexAdapter(Adapter):
         return ParseOutput(events=events, final_text=final_text, structured_output=structured)
 
 
-def _validate_mcp_list_json(data: Any) -> Optional[list[str]]:
+def _validate_mcp_list_json(data: Any) -> list[str] | None:
     """Strictly validate `codex mcp list --json` output (verified 0.140.0: a JSON array
     of objects, each with a string ``name``). Any other shape — ``null``, an object like
     ``{"servers": [...]}``, an entry without a usable name — returns None so the caller
@@ -743,7 +748,7 @@ def _validate_mcp_list_json(data: Any) -> Optional[list[str]]:
     return sorted(names)
 
 
-def _enabled_mcp_names(data: Any) -> Optional[set[str]]:
+def _enabled_mcp_names(data: Any) -> set[str] | None:
     """Names of servers codex still reports as ENABLED in `mcp list --json` output — an
     entry counts as enabled unless it carries ``"enabled": false`` (a disabled server is
     either omitted from the listing or present with that flag; either way it drops out).

@@ -44,7 +44,7 @@ HOME, so their `contained_home_subpaths` will be non-empty and the credential-du
 story becomes real for them". Measured, on macOS:
 
 | adapter | credential store | surface | duplication |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | claude 2.1.113 | login keychain | `[]` + `CLAUDE_CODE_OAUTH_TOKEN` | none |
 | copilot 1.0.72 | login keychain | `[]` + `GH_TOKEN` (or `COPILOT_GITHUB_TOKEN`/`GITHUB_TOKEN`) | none |
 | antigravity 1.1.7 | login keychain | **unmapped (`None`) — no route exists** | n/a |
@@ -158,7 +158,7 @@ the writes.**
 ### The open decision (SETTLED 2026-07-23 → materialize; see §0. Kept for the reasoning.)
 
 | | Materialize | Allowlist + verify |
-|---|---|---|
+| --- | --- | --- |
 | What | Build only the adapter's declared config surface. Real directories, files **copied**, no outward symlinks at all. | Keep declared auth files as symlinks; hash them before and after the run; fail the cell if content changed. |
 | Guarantee | Prevention | Detection after the fact |
 | Cost | Per-adapter empirical work: nobody knows what each CLI actually needs from HOME. Needs live runs. | Small; lands soon. |
@@ -182,7 +182,7 @@ fails closed, which is right, but it is a slow live-run loop per adapter.
 ## 2. What already exists (do not rebuild)
 
 | Thing | Where | What it does |
-|---|---|---|
+| --- | --- | --- |
 | `home_write_escapes(home)` | `agentskill_evals/isolation.py` | Every symlink in the overlay whose `realpath` falls outside it. **This is the lifting condition** — when it returns `[]`, the refusal stops firing on its own. Do not add special cases to it; make the HOME satisfy it. |
 | `_refuse_uncontained_home(home, eval_name, refs)` | `agentskill_evals/runner.py` | The refusal. Also refuses when `home is None` (no overlay = real HOME). |
 | `interpolated_refs(servers)` | `agentskill_evals/mcp.py` | Which declared fields carry a `${VAR}`. The exposure gate. **Never** use `bool(secrets)` for this — short values are excluded from redaction on purpose and are still credentials. |
@@ -255,10 +255,26 @@ whose `env()` rewrote or stripped a declared credential var would break this —
 redact and contain on a value the child never received — so do not declare a variable the adapter
 transforms without also teaching detection about the transform.
 
+**...and it is not a statement about how the CLI authenticates.** It says these names are
+forwarded and must be redacted. It does not say they are the *only* way in, so it cannot be read
+as one: a CLI may authenticate through a credential helper, a socket, or a workload identity that
+a contained HOME leaves perfectly intact. `_refuse_uncredentialed_contained_home` — the preflight
+that refuses a contained cell with no credential route rather than spending a model call to
+rediscover "Not logged in" — therefore reads a **separate** adapter declaration,
+`contained_home_required_credential_env_vars`, whose whole content is that measured claim. Its
+default `None` means "unanswered" and fires nothing; `[]` is the positive "no env credential
+needed here"; a non-empty list is what the refusal acts on, and every name in it must also appear
+in `credential_env_vars`. Deriving the requirement from `credential_env_vars` plus an empty
+`contained_home_subpaths` was the first implementation and was wrong in the direction that costs a
+user a working run (review, PR #99) — mutation M117 is that exact inference, kept so it cannot
+come back.
+
 Locked by arms `credential_detection_reads_the_childs_effective_environment`,
 `credential_env_var_triggers_containment_without_mcp_servers`,
 `credential_env_var_run_is_refused_under_isolated_false`, `adapter_credential_env_var_is_redacted`,
-and `contained_home_that_copies_auth_is_credential_bearing_before_the_copy` (mutations M81–M85).
+and `contained_home_that_copies_auth_is_credential_bearing_before_the_copy` (mutations M81–M85),
+plus `mcp.contained_home_without_its_credential_env_var_is_refused` and
+`contained.required_credential_env_vars_are_declared_and_answered` (M115–M119).
 
 ---
 
@@ -266,23 +282,38 @@ and `contained_home_that_copies_auth_is_credential_bearing_before_the_copy` (mut
 
 Non-negotiable, in this order. `SELFTEST PASSED` alone is not evidence.
 
+Run from the REPO ROOT. `make -C`, not `cd harness &&` — a `cd` persists for the rest of the
+block, so the line after it looked for `harness/harness/.venv/bin/python` and the block could
+not be pasted as written (review, fifth round).
+
 ```sh
-harness/.venv/bin/python -m agentskill_evals.cli selftest          # 486 arms
+make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
+
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 492 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
-harness/.venv/bin/python -m pyflakes harness/agentskill_evals/*.py harness/agentskill_evals/adapters/*.py
-python3 harness/tools/mutate_mcp.py                               # 113/113 caught by the intended arm
+make -C harness lint                                          # ruff; must print "All checks passed!"
+python3 harness/tools/mutate_mcp.py                           # 125/125 production + 2/2 instrument
 git diff --check
 ```
 
-Those two counts are the floor as of the MCP witness axis, and they only ever go up: a lower
-number means arms or mutations were LOST, which is the one outcome neither command reports as
-a failure. Bump them in the same commit that adds arms. (They were previously written as
-"N on main; M after this change", which is a form that is stale the moment the change lands —
-and was, for two PRs.)
+**The arm count is now self-reported** — the selftest ends with `SELFTEST PASSED — N arms`.
+It used to live here as a hand-maintained literal and was stale for two PRs running, because
+nothing makes forgetting it fail; the number above is what one macOS run produced, kept only
+so a reader has something to compare against. Both counts are a FLOOR that only ever goes up:
+a lower one means arms or mutations were LOST, which is the single outcome neither command
+reports as a failure — and a whole section that silently stopped running now shows as a drop
+even though every remaining arm passes. A few arms are conditional (PyYAML, platform), so two
+machines legitimately differ by a couple; only the trend on ONE machine is evidence.
 
-Pre-existing pyflakes noise, leave alone: unused `load_spec` in `cli.py:22`, unused `Optional`
-in `adapters/__init__.py:9`, unused `os` in `adapters/codex.py:23`, and many "f-string is
-missing placeholders" in `selftest.py`.
+**Lint runs from `harness/.venv`, never an ambient ruff.** `pyproject.toml` pins
+`required-version = "==0.16.0"` against the `dev` extra that installs it, because a family
+selector like `UP` gains rules between releases — unpinned, a tool upgrade arrives looking
+exactly like a code regression. A mismatched build refuses to run and names both versions.
+The selected families are the ones this tree passes at **zero**, with no `ignore` list, so
+any finding is introduced by the change in front of you; what is deliberately not selected is
+listed in `pyproject.toml` with the reason. Ruff's `F` family subsumes pyflakes, which is why
+the separate pyflakes invocation (and the "pre-existing noise, leave alone" note that used to
+sit here) is gone — that noise was fixed rather than documented.
 
 **What `VersionProvenance` does and does not buy.** It is an **audit trail plus a drift
 warning**, not verification, and anything written as though it re-checks a claim per build is
@@ -301,8 +332,34 @@ procedure (`clear_hint`).
 in the same commit as the arm. An arm nothing can break is decorative, and this project has
 caught its own decorative arms four separate times.
 
+Mutations carry one of two ID prefixes and are **counted separately** in the summary. `M<n>`
+is the normal case: it perturbs production code, and it is what a coverage claim rests on.
+`I<n>` perturbs `selftest.py` itself, which is usually circular and proves nothing — it is
+legitimate only where the selftest has a feature of its own that no production edit can
+reach. Both current entries are the arm counter: `I1` stops it counting, `I2` reverts it to a
+process-lifetime total, and each leaves every arm passing while the banner reports a
+plausible wrong number. The classification is enforced, not conventional — `mutate_mcp.py`
+refuses to start if an `I*` targets anything but the selftest, or an `M*` targets it, because
+either mistake miscounts exactly what the split reporting exists to keep straight.
+
 Things that have gone wrong in the *tests*, so you can skip learning them again:
 
+- **The recurring one, five times now: a check aimed BESIDE the thing that matters.** Every
+  instance looks like coverage and is not, and the shape is always the same — the arm and its
+  mutation agree with each other while both sit one level away from where the defect lives.
+  Seen as: an arm whose two cases could not see the condition they guarded (M117); a live
+  assertion the model could satisfy from its prompt without the mechanism running at all
+  (`regress_mcp_two_servers`, twice); two cells sharing an artifacts directory so the second
+  overwrote what the first was meant to prove (M125); and an arm exercising the delta HELPER
+  while the regression was the banner's ASSIGNMENT of it (I2). Each passed review of the code
+  and was caught only by someone asking the question below.
+
+  **The test:** write out what a broken implementation would produce, and check your assertion
+  rejects it. If the answer is "it produces exactly what I asserted", the assertion is
+  measuring something else. Two corollaries this project keeps rediscovering — a defect that
+  passes THROUGH a helper is not tested by testing the helper, only by testing the site it
+  reached; and for anything with a model in the loop, the model is part of the implementation,
+  so an expected value it could reconstruct from its prompt is not evidence.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s

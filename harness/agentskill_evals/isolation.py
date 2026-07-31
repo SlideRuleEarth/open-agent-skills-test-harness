@@ -81,7 +81,8 @@ import os
 import shutil
 import stat
 import tempfile
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any
+from collections.abc import Iterable, Mapping
 
 # Sentinels marking a node in the path tree as a leaf (built specially) rather than an
 # ancestor directory to recurse into: a plain *skills directory*, or a *plugin registry*
@@ -121,7 +122,7 @@ def config_home_entries(adapter: Any) -> list[tuple]:
     return entries
 
 
-def _is_stale_repo_link(path: str, repo_root: Optional[str]) -> bool:
+def _is_stale_repo_link(path: str, repo_root: str | None) -> bool:
     """True for a skills-dir entry left behind by an install of this repo that the name-based
     mask can't catch: a symlink into ``repo_root`` under a name no longer in the skill superset
     (the skill was renamed/removed), or a broken symlink (its checkout moved or was deleted).
@@ -142,12 +143,12 @@ def build_isolated_home(
     skills_subpaths: Iterable[str],
     repo_skill_names: Iterable[str],
     declared_skill_dirs: Iterable[str],
-    real_home: Optional[str] = None,
+    real_home: str | None = None,
     plugin_registry_subpaths: Iterable[str] = (),
-    repo_root: Optional[str] = None,
-    config_file_masks: Optional[Mapping[str, Optional[str]]] = None,
-    plugin_config_masks: Optional[Mapping[str, str]] = None,
-    contained_subpaths: Optional[Iterable[str]] = None,
+    repo_root: str | None = None,
+    config_file_masks: Mapping[str, str | None] | None = None,
+    plugin_config_masks: Mapping[str, str] | None = None,
+    contained_subpaths: Iterable[str] | None = None,
 ) -> str:
     """Build a symlink overlay of ``real_home`` at ``dest_home`` with masked skills dirs.
 
@@ -217,7 +218,7 @@ def build_isolated_home(
     return dest_home
 
 
-def home_write_escapes(home: Optional[str]) -> list[str]:
+def home_write_escapes(home: str | None) -> list[str]:
     """Overlay paths a write would travel to land in the REAL home.
 
     The overlay masks what the model can READ. It was never a boundary on what the model can
@@ -329,8 +330,8 @@ def _insert_copy_leaf(tree: dict, sub: str) -> None:
 
 
 def _overlay(real_dir: str, dst_dir: str, tree: dict,
-             repo_skills: set, declared: list, repo_root: Optional[str],
-             plugin_masks: Optional[dict] = None, contained: bool = False) -> None:
+             repo_skills: set, declared: list, repo_root: str | None,
+             plugin_masks: dict | None = None, contained: bool = False) -> None:
     os.makedirs(dst_dir, mode=0o700 if contained else 0o777, exist_ok=True)
     special = set(tree)
     # 1) wholesale-symlink every real entry that isn't a special (skills/ancestor) path.
@@ -367,8 +368,8 @@ def resolve_visible_skills(
     declared_names: Iterable[str],
     repo_skill_names: Iterable[str],
     isolated: bool,
-    real_home: Optional[str] = None,
-    repo_root: Optional[str] = None,
+    real_home: str | None = None,
+    repo_root: str | None = None,
 ) -> dict:
     """What skills the model would see, computed from the filesystem (no agent run).
 
@@ -427,7 +428,7 @@ def resolve_visible_skills(
 
 
 def _build_skills_dir(real_skills: str, dst_skills: str,
-                      repo_skills: set, declared: list, repo_root: Optional[str],
+                      repo_skills: set, declared: list, repo_root: str | None,
                       contained: bool = False) -> None:
     """Rebuild one skills dir: vendor/other entries passed through, repo skills dropped
     (by name, or by symlink target for stale installs), declared skills added.
@@ -462,7 +463,7 @@ def _build_skills_dir(real_skills: str, dst_skills: str,
         placed.add(name)
 
 
-def _write_mask_file(path: str, content, real_path: Optional[str] = None) -> None:
+def _write_mask_file(path: str, content, real_path: str | None = None) -> None:
     """Materialize one config mask: a real file with the supplied content — for ``None``,
     an empty real directory; for a callable, the string it derives from the real file at
     ``real_path`` (sanitizing masks) — never a symlink to the real HOME's copy. 0600/0700
@@ -478,7 +479,7 @@ def _write_mask_file(path: str, content, real_path: Optional[str] = None) -> Non
         f.write(content)
 
 
-def _materialize(real: str, dst: str, _seen: Optional[frozenset] = None) -> None:
+def _materialize(real: str, dst: str, _seen: frozenset | None = None) -> None:
     """Reproduce ``real`` at ``dst`` by CONTENT, creating no symlinks (contained mode).
 
     ``shutil.copytree(symlinks=False)`` is nearly this, but it raises on a dangling link and
@@ -536,8 +537,8 @@ def _materialize(real: str, dst: str, _seen: Optional[frozenset] = None) -> None
 
 
 def _mask_plugin_registry_dir(real_dir: str, dst_dir: str, repo_skills: set,
-                              repo_root: Optional[str],
-                              plugin_masks: Optional[dict] = None,
+                              repo_root: str | None,
+                              plugin_masks: dict | None = None,
                               contained: bool = False) -> None:
     """Rebuild one plugin-registry dir: each child is a whole plugin package, passed through
     untouched (plugin.json, metadata, …) except its nested ``skills/``, where this repo's own
@@ -584,7 +585,7 @@ def _mask_plugin_registry_dir(real_dir: str, dst_dir: str, repo_skills: set,
                               [], repo_root, contained)
 
 
-def reroot_config_masks(masks: Mapping[str, Optional[str]], replaces: Optional[str]) -> dict:
+def reroot_config_masks(masks: Mapping[str, str | None], replaces: str | None) -> dict:
     """Re-root HOME-relative masks for a custom config home that *stands in for* one HOME
     subdir (e.g. $COPILOT_HOME replaces ``~/.copilot``): ``.copilot/mcp-config.json`` →
     ``mcp-config.json``. Masks outside ``replaces`` don't apply inside that home."""
@@ -595,7 +596,7 @@ def reroot_config_masks(masks: Mapping[str, Optional[str]], replaces: Optional[s
             if p.startswith(prefix)}
 
 
-def build_mcp_masked_home(adapter: Any, real_home: Optional[str] = None) -> tuple[Optional[str], dict]:
+def build_mcp_masked_home(adapter: Any, real_home: str | None = None) -> tuple[str | None, dict]:
     """A mask-only HOME overlay for invocations that need MCP hermeticity but not skill
     isolation — model probes and judge runs, which otherwise execute against the real HOME
     and load the user's real MCP servers. Everything passes through (auth, config, skills);

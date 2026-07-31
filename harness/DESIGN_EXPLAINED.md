@@ -52,7 +52,7 @@ tool — is slow and unreliable. This harness automates the whole loop.
 If you've used a unit-test framework, this maps cleanly onto ideas you already know:
 
 | Unit testing (pytest) | This harness |
-|---|---|
+| --- | --- |
 | A test function | An **eval** (a YAML file describing one test) |
 | The function under test | An **AI agent running a skill** |
 | `assert x == 5` | An **assertion** (`file_exists`, `ran_command`, …) |
@@ -69,7 +69,7 @@ files it shouldn't. Most of the harness's cleverness is about taming that.
 ## 3. Vocabulary (read this once, refer back as needed)
 
 | Term | Plain meaning |
-|---|---|
+| --- | --- |
 | **Skill** | A `SKILL.md` folder that teaches an agent how to do a task. |
 | **Agent CLI** | A command-line AI coding tool: `claude`, `codex`, `copilot`, `agy`. |
 | **Runner** | The harness's name for one agent CLI it can drive. "Run this on the `claude` runner." |
