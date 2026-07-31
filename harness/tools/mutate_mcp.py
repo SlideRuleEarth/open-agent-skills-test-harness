@@ -959,14 +959,14 @@ MUTATIONS = [
     # Correlation collapses to one direction, so a server->client id reads as the client's.
     ("M139-correlation-ignores-direction", PROXY,
      ("    def method_for(self, direction: str, req_id: Any) -> str | None:\n"
-      "        return self._by_direction[direction].get(self._key(req_id))"),
+      "        entry = self._by_direction[direction].get(self._key(req_id))"),
      ("    def method_for(self, direction: str, req_id: Any) -> str | None:\n"
-      '        return self._by_direction["c2s"].get(self._key(req_id))'),
+      '        entry = self._by_direction["c2s"].get(self._key(req_id))'),
      "proxy.correlation_is_direction_scoped"),
     # Retirement stops retiring, so a reused subscription id correlates against stale state.
     ("M140-retired-subscription-id-stays-resident", PROXY,
-     "        return self._by_direction[direction].pop(self._key(req_id), None)",
-     "        return self._by_direction[direction].get(self._key(req_id))",
+     "        entry = self._by_direction[direction].pop(self._key(req_id), None)",
+     "        entry = self._by_direction[direction].get(self._key(req_id))",
      "proxy.subscriptions_retire_and_their_ids_become_reusable"),
     # Graceful closure stops checking WHICH request it closes, so any empty result retires a
     # subscription that is still open.
@@ -996,9 +996,8 @@ MUTATIONS = [
     # A boolean id is accepted. `isinstance(True, int)` is true in Python, so this is the one
     # illegal id that also aliases a legal one: id `True` and id `1` become the same entry.
     ("M145-boolean-request-id-passes-as-an-integer", PROXY,
-     ("    return isinstance(value, str) or (isinstance(value, int) "
-      "and not isinstance(value, bool))"),
-     "    return isinstance(value, str) or isinstance(value, int)",
+     "    if isinstance(value, bool):\n        return False\n",
+     "",
      "proxy.envelope_shape_is_established_positively"),
     # `params` may be any JSON. The schema says it is an object, and every reader below
     # (`_meta`, `name`, `protocolVersion`) is written against that.
@@ -1035,7 +1034,7 @@ MUTATIONS = [
     # iteration walks the string KEYS, every entry fails `isinstance(req, dict)`, and a
     # conforming tool-bearing sampling result reads as clean and reaches the model.
     ("M150-input-requests-read-as-a-list", PROXY,
-     ('    if isinstance(result, dict) and "inputRequests" in result:\n'
+     ('    if modern and isinstance(result, dict) and "inputRequests" in result:\n'
       '        requests = result["inputRequests"]\n'
       "        if not isinstance(requests, dict):\n"
       "            return Anomaly(BAD_INPUT_REQUESTS,\n"
@@ -1049,7 +1048,7 @@ MUTATIONS = [
       "                return Anomaly(BAD_INPUT_REQUESTS,\n"
       '                               f"inputRequests[{key!r}] is {type(req).__name__}, "\n'
       '                               f"not a request object")\n'),
-     ("    if isinstance(result, dict):\n"
+     ("    if modern and isinstance(result, dict):\n"
       '        for req in result.get("inputRequests") or []:\n'
       "            if not isinstance(req, dict):\n"
       "                continue\n"),
@@ -1079,7 +1078,7 @@ MUTATIONS = [
     # conforming shutdown — including our own probe shim's — and fails the cell that was
     # closing cleanly.
     ("M154-closure-must-be-a-literally-empty-result", PROXY,
-     ('    if result.get("resultType", "complete") != "complete":\n'
+     ('    if result.get("resultType") != "complete":\n'
       "        return False\n"
       '    meta = result.get("_meta")\n'
       "    if not isinstance(meta, dict):\n"
@@ -1117,8 +1116,8 @@ MUTATIONS = [
     # for: with the arm calling `refusal_for` directly it was invisible, because a
     # well-worded refusal nobody ever sends is still well worded (review, PR #100).
     ("M158-off-list-call-is-forwarded", PROXY,
-     "        if name not in allowed:\n",
-     "        if False:\n",
+     "    if name is not None and name not in allowed:\n",
+     "    if False:\n",
      "proxy.off_list_call_is_refused_without_reaching_the_server"),
     # A `tools/call` with no string `params.name` is checked against the allowlist anyway, so
     # the refusal names `None` instead of the envelope being refused as malformed (§10.4).
@@ -1146,6 +1145,60 @@ MUTATIONS = [
      "_ORIGIN_OF = {C2S: S2C, S2C: C2S}",
      "_ORIGIN_OF = {C2S: C2S, S2C: S2C}",
      "proxy.tools_result_is_filtered_or_refused_never_forwarded_unfiltered"),
+    # --- the era must be ESTABLISHED, not merely unclaimed --------------------------------
+    # Absence of modern metadata is read as legacy again, so a client that simply never
+    # handshakes has every request waved through — the version gate defeated without malice
+    # and without an exotic client, since §10.6's locations are stated per version.
+    ("M163-bare-request-is-legacy-by-default", PROXY,
+     ("    if not modern and state.legacy_version is None "
+      "and method not in PRE_INITIALIZE_METHODS:\n"),
+     "    if False:\n",
+     "proxy.a_bare_request_needs_an_era_that_was_actually_established"),
+    # The sanctioned pre-initialization set loses `ping`, which the lifecycle explicitly
+    # permits before the `initialize` response — the opposite failure, a clean cell refused.
+    ("M164-pre-initialize-ping-is-refused", PROXY,
+     'PRE_INITIALIZE_METHODS = ("initialize", "ping")',
+     'PRE_INITIALIZE_METHODS = ("initialize",)',
+     "proxy.a_bare_request_needs_an_era_that_was_actually_established"),
+    # THE REVIEWED DEFECT, restored exactly: the off-list refusal is produced BEFORE the id is
+    # claimed, so an off-list call on a live id answers the request that id really belongs to
+    # — the client's outstanding `tools/list` looks answered while its real response is still
+    # in flight.
+    ("M165-refusal-jumps-the-duplicate-id-check", PROXY,
+     ('    opened = inflight.record(C2S, msg["id"], method,\n'
+      "                             version if modern else state.legacy_version)\n"
+      "    if isinstance(opened, Anomaly):\n"
+      "        return Fail(opened)\n"
+      "    if name is not None and name not in allowed:\n"),
+     ("    if name is not None and name not in allowed:\n"
+      '        return Refuse(refusal_for(msg["id"], name, server), name)\n'
+      '    opened = inflight.record(C2S, msg["id"], method,\n'
+      "                             version if modern else state.legacy_version)\n"
+      "    if isinstance(opened, Anomaly):\n"
+      "        return Fail(opened)\n"
+      "    if False:\n"),
+     "proxy.a_live_request_id_is_never_silently_reused"),
+    # Modern `InputRequiredResult` semantics applied to every era, so a legacy response
+    # carrying an `inputRequests` key of its own — `Result` is open-ended there — is refused
+    # as a bad MRTR payload. §10.6's locations are per version, not per shape.
+    ("M166-input-requests-read-in-every-era", PROXY,
+     '    if modern and isinstance(result, dict) and "inputRequests" in result:\n',
+     '    if isinstance(result, dict) and "inputRequests" in result:\n',
+     "proxy.modern_sampling_requests_are_a_keyed_map_not_a_list"),
+    # A fractional id is refused. The schema — the declared source of truth — says
+    # `string | number`, and JSON-RPC only says fractions SHOULD NOT be used, so this fails a
+    # conforming client over style rather than over conformance.
+    ("M167-fractional-request-id-refused", PROXY,
+     "    return isinstance(value, float) and math.isfinite(value)",
+     "    return False",
+     "proxy.envelope_shape_is_established_positively"),
+    # The closure defaults an absent `resultType` to complete. That rule exists for servers on
+    # EARLIER revisions, and no earlier revision has `subscriptions/listen` — so it accepts a
+    # closure that cannot exist, including the bare `{}` the prose seems to describe.
+    ("M168-closure-defaults-an-absent-result-type", PROXY,
+     '    if result.get("resultType") != "complete":\n',
+     '    if result.get("resultType", "complete") != "complete":\n',
+     "proxy.graceful_closure_is_the_conforming_shape_not_an_empty_object"),
     ("I1-arm-counter-stops-counting", SELFTEST,
      "    global _ARMS_RUN\n    _ARMS_RUN += 1\n",
      "    global _ARMS_RUN\n",

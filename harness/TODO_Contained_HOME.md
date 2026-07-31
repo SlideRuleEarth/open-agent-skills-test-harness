@@ -289,10 +289,10 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 506 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 507 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 harness/tools/mutate_mcp.py                           # 160/160 production + 2/2 instrument
+python3 harness/tools/mutate_mcp.py                           # 166/166 production + 2/2 instrument
 git diff --check
 ```
 
@@ -368,6 +368,21 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   `inputRequests` case and the `{}` subscription closure were both that: hand-written fixtures
   that encoded the same misreading as the code, where one look at the spec's own printed
   example would have shown a map and a `resultType`.
+- **A rule applied at the wrong SCOPE is its own defect family, and it cuts both ways.** Three
+  findings in one review round were all this shape: a per-version rule applied to every version
+  (`inputRequests` read on legacy responses, where `Result` is open-ended and the key means
+  whatever that server means by it); a backward-compatibility rule applied to a method that has
+  no *back* (an absent `resultType` defaulted to `complete` on `subscriptions/listen`, which
+  exists only in the revision where the field is mandatory); and prose followed over the
+  schema that is declared the source of truth (`RequestId` refused for `1.5`, which the prose
+  calls an integer and the schema calls a number).
+
+  Two of those refuse conforming traffic and one forwards non-conforming traffic, which is the
+  point — **over-strict is not the safe direction.** A proxy that fails a clean cell has broken
+  the run just as surely as one that forwards a definition, and it is harder to diagnose
+  because everything looks like it is working correctly. When writing a check, name the
+  version, the direction and the document it comes from; if the rule cannot be stated with
+  those three, it is not yet a rule.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s

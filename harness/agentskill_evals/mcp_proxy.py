@@ -49,6 +49,7 @@ WHAT IS NOT HERE, on purpose:
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -83,6 +84,13 @@ SUB_KEY = "io.modelcontextprotocol/subscriptionId"
 # listen` is 2026-07-28's replacement for legacy `resources/subscribe`.
 MODERN_ONLY_METHODS = ("server/discover", "subscriptions/listen")
 
+# The only requests a legacy client may send before its `initialize` has been answered:
+# "the client SHOULD NOT send requests other than pings before the server has responded to
+# the initialize request". Everything else needs an era that was actually established —
+# without modern `_meta` and without a negotiated version, NO implemented version governs the
+# request, which is the version gate defeated by simply never handshaking (review, PR #100).
+PRE_INITIALIZE_METHODS = ("initialize", "ping")
+
 # JSON-RPC error codes the proxy itself originates. -32601 for an off-list tool is
 # deliberate: from the client's side the tool genuinely does not exist on this connection,
 # which is what the allowlist means, and inventing a private code would tell a CLI nothing it
@@ -115,6 +123,7 @@ DUPLICATE_ID = "duplicate_request_id"            # a second live request on an i
 UNIMPLEMENTED_VERSION = "unimplemented_version"  # well-formed, modern, unread revision
 MISSING_META = "missing_meta"                    # modern request without a required key
 ERA_METHOD_MISMATCH = "era_method_mismatch"      # method belongs to the other era
+NO_ERA_ESTABLISHED = "no_era_established"        # bare request, no version governs it
 SERVER_REQUEST_IN_MODERN = "server_request_in_modern_era"
 TOOL_BEARING_SAMPLING = "tool_bearing_sampling"  # a definition outside tools/list (§10.6)
 BAD_INPUT_REQUESTS = "bad_input_requests"        # InputRequiredResult not shaped as a map
@@ -175,17 +184,30 @@ def parse_line(line: str) -> dict | Anomaly:
 
 
 def valid_request_id(value: Any) -> bool:
-    """Whether this is a legal MCP `RequestId`: a string or an integer, and nothing else.
+    """Whether this is a legal MCP `RequestId`: a string or a number, and nothing else.
 
     Not a pedantic schema check. Correlation keys on the id, so a list or an object id
     reaches `dict.__setitem__` and raises `TypeError: unhashable` — inside a pump, several
     frames from anything that knows what to do about it. Rejecting it here makes it an
     ordinary malformed envelope with an audit-log entry instead of a crash.
 
+    A STRING OR A NUMBER, not a string or an integer. The schema — declared the source of
+    truth — says `RequestId = string | number`, and JSON-RPC says fractional parts "SHOULD
+    NOT" be used, which is discouragement rather than prohibition. `1.5` is therefore a valid
+    if unfashionable id, and refusing it would fail a conforming client over style (review,
+    PR #100; the prose on the basic page says "integer" and the first version followed it).
+
     Booleans are excluded EXPLICITLY because `isinstance(True, int)` is true in Python: a
     boolean is not a legal id, and it is also the one value that would silently alias `1`.
+    Non-finite floats are excluded because `NaN` and `Infinity` are not JSON at all (RFC
+    8259) — Python's parser accepts them anyway, so they arrive here — and because a `NaN` id
+    never compares equal to itself, so it could never be retired or correlated.
     """
-    return isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool))
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, str) or isinstance(value, int):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
 
 
 def _error_object_ok(err: Any) -> bool:
@@ -443,13 +465,25 @@ def tools_result_ok(result: Any) -> bool:
     return all(isinstance(t, dict) and isinstance(t.get("name"), str) for t in tools)
 
 
-def sampling_carries_tools(msg: dict) -> bool | Anomaly:
+def sampling_carries_tools(msg: dict, *, modern: bool) -> bool | Anomaly:
     """A tool definition at a DEFINED LOCATION outside `tools/list` (§10.6).
 
     Sampling is the concrete counterexample to "`tools:` gates every route to the model": a
     server may put its own `tools` array in a `sampling/createMessage`, scoped to that request
     and not corresponding to anything registered. Legacy carries it as a server-originated
     request; modern carries it inside `InputRequiredResult.inputRequests`.
+
+    DEFINED LOCATIONS ARE PER VERSION, which is why `modern` is a parameter rather than
+    something inferred from the payload. `inputRequests` means `InputRequiredResult` only
+    under `2026-07-28`; under a legacy revision `Result` is open-ended (`[key: string]:
+    unknown`), so a server may legitimately carry a key of that name meaning something else
+    entirely, and reading it as MRTR failed a conforming legacy response (review, PR #100).
+    The caller passes the version that governs the message — for a response, the one that
+    governed the request it answers.
+
+    Deliberately NOT also gated on `resultType == "input_required"`: a modern server that put
+    `inputRequests` under the wrong label would then slip past, and a mislabelled definition
+    is still a definition.
 
     `inputRequests` IS A MAP, not a list — "keys are server-assigned string identifiers;
     values are request objects". Iterating it directly walks the KEYS, so every request is a
@@ -468,7 +502,7 @@ def sampling_carries_tools(msg: dict) -> bool | Anomaly:
         if isinstance(params, dict) and _nonempty_list(params.get("tools")):
             return True
     result = msg.get("result")
-    if isinstance(result, dict) and "inputRequests" in result:
+    if modern and isinstance(result, dict) and "inputRequests" in result:
         requests = result["inputRequests"]
         if not isinstance(requests, dict):
             return Anomaly(BAD_INPUT_REQUESTS,
@@ -508,10 +542,15 @@ class InFlight:
     possible at all (a response says only which id it answers, never which method). Pagination
     therefore needs no special case: every page's response correlates to a `tools/list` and is
     filtered on its own merits.
+
+    Each entry carries the METHOD AND THE GOVERNING VERSION, because §10.6's defined locations
+    are per version and a response carries no version of its own. Storing only the method left
+    the reader of a legacy response applying modern `InputRequiredResult` semantics to it
+    (review, PR #100).
     """
 
     def __init__(self) -> None:
-        self._by_direction: dict[str, dict[Any, str]] = {C2S: {}, S2C: {}}
+        self._by_direction: dict[str, dict[Any, tuple[str, str | None]]] = {C2S: {}, S2C: {}}
 
     def _key(self, req_id: Any) -> Any:
         # JSON-RPC ids may be a string or a number, and `1` and `"1"` are different ids. They
@@ -520,7 +559,8 @@ class InFlight:
         # numeric one. Keying on (type name, value) keeps them apart without rejecting either.
         return (type(req_id).__name__, req_id)
 
-    def record(self, direction: str, req_id: Any, method: str) -> None | Anomaly:
+    def record(self, direction: str, req_id: Any, method: str,
+               version: str | None) -> None | Anomaly:
         """Open an id, or refuse because it is already open in this direction.
 
         REUSE IS LEGAL ONLY AFTER RETIREMENT — "the request ID MUST NOT match the ID of any
@@ -529,18 +569,33 @@ class InFlight:
         on id 1, and the server's tools response correlates as a `ping` and is forwarded
         UNFILTERED. That is the guarantee this whole module exists to make, defeated by a
         peer that repeats an id, so a live duplicate is an anomaly rather than a replace.
+
+        This is the ONE place that check lives, and `decide()` claims the id here before it
+        will produce any message at all — a refusal synthesized on a live id would answer the
+        request that id actually belongs to (review, PR #100).
         """
         live = self._by_direction[direction]
         key = self._key(req_id)
         if key in live:
             return Anomaly(DUPLICATE_ID,
                            f"{direction} id {req_id!r} is already open as "
-                           f"{live[key]!r}; an id may not be reused before it is answered")
-        live[key] = method
+                           f"{live[key][0]!r}; an id may not be reused before it is answered")
+        live[key] = (method, version)
         return None
 
     def method_for(self, direction: str, req_id: Any) -> str | None:
-        return self._by_direction[direction].get(self._key(req_id))
+        entry = self._by_direction[direction].get(self._key(req_id))
+        return entry[0] if entry else None
+
+    def version_for(self, direction: str, req_id: Any) -> str | None:
+        """The protocol version that governed the request this id opened, if any.
+
+        `None` in the pre-initialization window, where a sanctioned `ping` may go out before
+        any version is in force (§10.2). A response the proxy cannot place in a version is a
+        response whose defined locations it does not know, so it reads none of them.
+        """
+        entry = self._by_direction[direction].get(self._key(req_id))
+        return entry[1] if entry else None
 
     def retire(self, direction: str, req_id: Any) -> str | None:
         """Drop an entry and return the method it held.
@@ -551,7 +606,8 @@ class InFlight:
         fresh response against stale state — or, worse, make the proxy treat a legitimate
         response as unrequested and fail a clean cell.
         """
-        return self._by_direction[direction].pop(self._key(req_id), None)
+        entry = self._by_direction[direction].pop(self._key(req_id), None)
+        return entry[0] if entry else None
 
     def open_ids(self, direction: str) -> list:
         return [key[1] for key in self._by_direction[direction]]
@@ -591,16 +647,21 @@ def is_graceful_closure(method: str | None, msg: dict) -> bool:
 
     The subscription id is checked against the response id because that is the only thing
     distinguishing a closure from a stray complete result, and a mismatch is a confusion no
-    proxy should paper over. `resultType` is accepted when ABSENT because the spec makes it a
-    client MUST to read an absent one as "complete" for servers on earlier revisions; any
-    other value is not a closure.
+    proxy should paper over.
+
+    `resultType` is REQUIRED here, not defaulted. The rule that an absent one reads as
+    "complete" exists for servers implementing earlier revisions — and no earlier revision
+    has `subscriptions/listen`, which arrived in `2026-07-28` as the replacement for
+    `resources/subscribe`. A server answering this method is by construction a modern server,
+    where `resultType` is mandatory, so defaulting it accepted a closure that cannot exist
+    (review, PR #100).
     """
     if method != "subscriptions/listen":
         return False
     result = msg.get("result")
     if not isinstance(result, dict):
         return False
-    if result.get("resultType", "complete") != "complete":
+    if result.get("resultType") != "complete":
         return False
     meta = result.get("_meta")
     if not isinstance(meta, dict):
@@ -777,6 +838,10 @@ def _decide_client_request(msg: dict, allowed: frozenset[str], state: ProtocolSt
     modern = version is not None
     if modern:
         state.observe(version)
+    # The method is judged against the era the REQUEST declared, before anything asks whether
+    # that era is in force — a bare `subscriptions/listen` is a modern-only method offered
+    # under non-modern metadata whether or not an `initialize` has happened, and that is the
+    # more specific diagnosis of the two.
     if not method_matches_era(method, modern=modern):
         # Refused rather than forwarded for the server to reject, because the two eras
         # disagree about what the connection IS. A modern `initialize` that a dual-era server
@@ -787,6 +852,17 @@ def _decide_client_request(msg: dict, allowed: frozenset[str], state: ProtocolSt
                             f"{method!r} does not belong to the era this request declared "
                             f"(modern={modern}); the method must match the request, not the "
                             f"reverse"))
+    if not modern and state.legacy_version is None and method not in PRE_INITIALIZE_METHODS:
+        # No modern `_meta` and no negotiated version: NOTHING governs this request. Reading
+        # it as legacy would be the version gate defeated by simply never handshaking — a
+        # client that sends neither would have every request waved through on the strength of
+        # an absence, and §10.6's guarantee is stated per implemented version (review, PR
+        # #100). `initialize` and `ping` are the exceptions the lifecycle names.
+        return Fail(Anomaly(NO_ERA_ESTABLISHED,
+                            f"{method!r} carries no modern `_meta` and no `initialize` has "
+                            f"been answered, so no implemented protocol version governs it; "
+                            f"only {', '.join(PRE_INITIALIZE_METHODS)} may precede one"))
+    name = None
     if method == "initialize":
         proposed = proposed_version(msg)
         if isinstance(proposed, Anomaly):
@@ -799,13 +875,21 @@ def _decide_client_request(msg: dict, allowed: frozenset[str], state: ProtocolSt
         if not isinstance(name, str) or not name:
             return Fail(Anomaly(MALFORMED,
                                 f"`tools/call` params.name is {name!r}, not a tool name"))
-        if name not in allowed:
-            # Every MRTR retry lands here too: the check keys on `params.name` per request
-            # rather than on position in the stream, and a retry carries a new id.
-            return Refuse(refusal_for(msg["id"], name, server), name)
-    opened = inflight.record(C2S, msg["id"], method)
+    # THE ID IS CLAIMED BEFORE ANY MESSAGE IS PRODUCED, refusals included. An off-list call
+    # answered on an id that is already live would send the client an error correlated to the
+    # request that id really belongs to — its outstanding `tools/list`, say, which then looks
+    # answered while the real response is still coming (review, PR #100). So the duplicate
+    # check is one step, here, ahead of every branch below it.
+    opened = inflight.record(C2S, msg["id"], method,
+                             version if modern else state.legacy_version)
     if isinstance(opened, Anomaly):
         return Fail(opened)
+    if name is not None and name not in allowed:
+        # Not forwarded, so nothing will come back to correlate: release the id the check
+        # above claimed. Every MRTR retry lands here too — the allowlist keys on `params.name`
+        # per request rather than on position in the stream, and a retry carries a new id.
+        inflight.retire(C2S, msg["id"])
+        return Refuse(refusal_for(msg["id"], name, server), name)
     return Forward(msg)
 
 
@@ -819,7 +903,9 @@ def _decide_server_request(msg: dict, state: ProtocolState, inflight: InFlight) 
                             f"server sent a {msg['method']!r} request with no legacy "
                             f"`initialize` in force; the modern revision forbids "
                             f"server-originated requests entirely"))
-    carries = sampling_carries_tools(msg)
+    # Legacy by the test above, so the legacy carrier is the one that applies: the
+    # server-originated `sampling/createMessage` request itself.
+    carries = sampling_carries_tools(msg, modern=False)
     if isinstance(carries, Anomaly):
         return Fail(carries)
     if carries:
@@ -827,7 +913,7 @@ def _decide_server_request(msg: dict, state: ProtocolState, inflight: InFlight) 
                             f"{msg['method']!r} carries its own `params.tools`: a tool "
                             f"definition at a defined location outside `tools/list`, which "
                             f"`tools:` does not gate and this proxy will not forward"))
-    opened = inflight.record(S2C, msg["id"], msg["method"])
+    opened = inflight.record(S2C, msg["id"], msg["method"], state.legacy_version)
     if isinstance(opened, Anomaly):
         return Fail(opened)
     return Forward(msg)
@@ -855,7 +941,12 @@ def _decide_response(msg: dict, shape: str, direction: str, allowed: frozenset[s
         inflight.retire(origin, req_id)
         return Forward(msg)
 
-    carries = sampling_carries_tools(msg)
+    # A response carries no version of its own, so the one that governs it is the one that
+    # governed the request it answers — which is why the correlation entry holds it. Under a
+    # legacy revision `inputRequests` is not a defined location at all (`Result` is
+    # open-ended), and reading it as MRTR failed conforming legacy traffic.
+    carries = sampling_carries_tools(
+        msg, modern=inflight.version_for(origin, req_id) in MODERN_VERSIONS)
     if isinstance(carries, Anomaly):
         return Fail(carries)
     if carries:
