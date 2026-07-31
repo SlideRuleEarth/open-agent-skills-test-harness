@@ -120,6 +120,7 @@ MALFORMED = "malformed"                          # JSON, but not a legal MCP env
 BATCH = "batch"                                  # a JSON-RPC array; illegal on MCP stdio
 UNCORRELATED = "uncorrelated"                    # response to an id never requested this way
 DUPLICATE_ID = "duplicate_request_id"            # a second live request on an id still open
+CANCELLED_ID_REUSE = "cancelled_id_reuse"        # a quarantined id reopened before it settled
 UNIMPLEMENTED_VERSION = "unimplemented_version"  # well-formed, modern, unread revision
 MISSING_META = "missing_meta"                    # modern request without a required key
 ERA_METHOD_MISMATCH = "era_method_mismatch"      # method belongs to the other era
@@ -601,10 +602,24 @@ class InFlight:
             return Anomaly(DUPLICATE_ID,
                            f"{direction} id {req_id!r} is already open as "
                            f"{live[key][0]!r}; an id may not be reused before it is answered")
-        # Reopening an id ends its cancellation grace: from here a response on it answers THIS
-        # request, and a straggler for the cancelled one is indistinguishable from it. That is
-        # inherent to id reuse in JSON-RPC, not something a proxy can recover.
-        self._cancelled[direction].discard(key)
+        if key in self._cancelled[direction]:
+            # A CANCELLED id stays quarantined, and this is a filtering boundary rather than
+            # bookkeeping. Reopening it would make a late response to the cancelled request
+            # indistinguishable from a reply to this one — so `tools/list` cancelled on id 1,
+            # then `ping` on id 1, then the server's straggling tool advertisement, and the
+            # advertisement correlates as a `ping` and is forwarded UNFILTERED. An earlier
+            # version cleared the tombstone here and called the ambiguity inherent; it is
+            # inherent, which is why the id may not be reused rather than why the bypass is
+            # acceptable (review, PR #100).
+            #
+            # The quarantine lifts when a late response consumes the tombstone. If none ever
+            # arrives — the normal case, since a server SHOULD NOT answer a cancelled request
+            # — the id stays spent for this connection, which costs nothing against the
+            # monotonic id counters every measured CLI uses (C3-2, §9).
+            return Anomaly(CANCELLED_ID_REUSE,
+                           f"{direction} id {req_id!r} was cancelled and is quarantined: a "
+                           f"late response to that request could not be told apart from a "
+                           f"reply to this one, and one of them is filtered")
         live[key] = (method, version)
         return None
 
@@ -659,6 +674,14 @@ class InFlight:
 
     def was_cancelled(self, direction: str, req_id: Any) -> bool:
         return self._key(req_id) in self._cancelled[direction]
+
+    def settle_cancelled(self, direction: str, req_id: Any) -> None:
+        """A late response arrived and was dropped, so the quarantine on its id lifts.
+
+        The straggler this id was held against has now been seen, and there cannot be a
+        second one — the request is over on both sides.
+        """
+        self._cancelled[direction].discard(self._key(req_id))
 
     def open_ids(self, direction: str) -> list:
         return [key[1] for key in self._by_direction[direction]]
@@ -781,6 +804,17 @@ class ProtocolState:
         self.legacy_capabilities = capabilities if isinstance(capabilities, dict) else {}
         return None
 
+    def abandon_initialize(self) -> None:
+        """Drop a handshake the server REFUSED, so the client may propose again.
+
+        Not a rollback of anything: an errored `initialize` negotiated nothing, so a retry is
+        a fresh first handshake rather than the renegotiation `begin_initialize` refuses.
+        Without this the connection stays pending forever — neither negotiated nor open to
+        another attempt (review, PR #100).
+        """
+        self.pending_initialize = None
+        self.legacy_capabilities = None
+
     def commit_initialize(self, negotiated: str) -> None | Anomaly:
         """Adopt the version the SERVER answered with. Only a validated result gets here."""
         if self.pending_initialize is None:
@@ -898,28 +932,42 @@ def decide(line: str, *, direction: str, allowed: frozenset[str], state: Protoco
             # Forwarded verbatim, as every notification is — but OBSERVED on the way through,
             # because this is one of the two orderly ends of a subscription and the id it
             # names becomes reusable the moment it passes.
-            _cancel_wherever_live(inflight, direction, cid)
+            _observe_cancellation(inflight, state, direction, cid)
         return Forward(msg)
     return _decide_response(msg, shape, direction, allowed, state, inflight)
 
 
-def _cancel_wherever_live(inflight: InFlight, direction: str, req_id: Any) -> None:
-    """Retire a cancelled id in the direction that actually issued the request.
+def _observe_cancellation(inflight: InFlight, state: ProtocolState, direction: str,
+                          req_id: Any) -> None:
+    """Retire a cancelled id in the map the PROTOCOL says the request lives in.
 
-    NOT the direction the notification travelled, which is the obvious reading and is wrong
-    for the one case the modern revision requires: "a server MUST send
-    `notifications/cancelled` referencing a `subscriptions/listen` request ID when it tears
-    down that subscription stream" — and that request is the CLIENT's. Retiring the sender's
-    own map there leaves the real subscription resident forever, so reusing its id later fails
-    as a duplicate and takes a clean cell with it (review, PR #100).
+    Routed by era, not by looking in both maps and taking whichever hits first. Searching
+    conflates two different rules and gets the collision wrong in both directions: an unknown
+    CLIENT cancellation would cancel a coincidentally-numbered SERVER request, and with id 1
+    live in both maps a server cancellation would retire the server's own request and leave
+    the subscription it was actually naming (review, PR #100).
 
-    Under legacy both sides issue requests and cancel their own, so the sender's own map is
-    tried first and the peer's second. An id live in neither is ignored, per "invalid
-    cancellation notifications SHOULD be ignored: unknown request IDs".
+    The rules it routes by:
+
+      * a CLIENT cancellation names a request the client issued — legacy and modern agree,
+        and "cancellation notifications MUST only reference requests that were previously
+        issued by the client";
+      * under LEGACY both sides issue requests, so a server cancels its own;
+      * under MODERN a server may send this notification for exactly one purpose — "a server
+        MUST send `notifications/cancelled` referencing a `subscriptions/listen` request ID
+        when it tears down that subscription stream ... Servers MUST NOT send
+        `notifications/cancelled` for any other purpose" — and that request is the CLIENT's.
+
+    Anything outside those is an invalid cancellation, and the spec says to ignore invalid
+    ones rather than act on a guess. Ignoring is safe here: the request stays live, so its
+    response still correlates and is still filtered.
     """
-    for where in (direction, _ORIGIN_OF[direction]):
-        if inflight.cancel(where, req_id) is not None:
-            return
+    if direction == C2S:
+        inflight.cancel(C2S, req_id)
+    elif state.legacy_version is not None:
+        inflight.cancel(S2C, req_id)
+    elif inflight.method_for(C2S, req_id) == "subscriptions/listen":
+        inflight.cancel(C2S, req_id)
 
 
 def _decide_client_request(msg: dict, allowed: frozenset[str], state: ProtocolState,
@@ -945,35 +993,31 @@ def _decide_client_request(msg: dict, allowed: frozenset[str], state: ProtocolSt
                             f"{method!r} does not belong to the era this request declared "
                             f"(modern={modern}); the method must match the request, not the "
                             f"reverse"))
-    if (not modern and state.legacy_version is None and state.pending_initialize is None
-            and method not in PRE_INITIALIZE_METHODS):
-        # No modern `_meta`, no negotiated version, AND no handshake even attempted: NOTHING
-        # governs this request and nothing is going to. Reading it as legacy would be the
-        # version gate defeated by simply never handshaking — a client that sends neither
-        # would have every request waved through on the strength of an absence, and §10.6's
-        # guarantee is stated per implemented version (review, PR #100).
+    if not modern and state.legacy_version is None and method not in PRE_INITIALIZE_METHODS:
+        # No modern `_meta` and no NEGOTIATED version: nothing governs this request. Reading
+        # it as legacy would be the version gate defeated by simply never handshaking — a
+        # client that sends neither would have every request waved through on the strength of
+        # an absence, and §10.6's guarantee is stated per implemented version.
         #
-        # A PENDING `initialize` counts, and that is what makes this rule safe to enforce.
-        # The lifecycle says a client SHOULD NOT pipeline ordinary requests behind its
-        # `initialize` — but SHOULD NOT is not MUST NOT, and a proxy reads lines serially
-        # while a server answers them, so a client that pipelines reaches this check with the
-        # response still in flight where the server it is talking to would already have
-        # negotiated. Refusing there would fail a cell that nothing else objects to, and
-        # supporting it any other way needs a defer-and-replay action — a fourth outcome for
-        # `decide`, and a materially larger contract (review, PR #100). Nothing escapes:
-        # whatever version is negotiated governs the RESPONSE, which is where tool definitions
-        # actually live, and a negotiation this proxy cannot implement fails before any
-        # response is forwarded.
+        # A PENDING `initialize` DOES NOT COUNT, and the round trip to that answer is worth
+        # keeping. Letting one through was an attempt to tolerate a client that pipelines
+        # ordinary requests behind its handshake — legal, since the lifecycle only SHOULD-NOTs
+        # it. But a pending negotiation cannot govern anything: the pipelined request's
+        # response may arrive BEFORE the `initialize` response, and it is then read under no
+        # version at all, so a modern `InputRequiredResult` carrying tool definitions is
+        # forwarded unrecognised. The gate was open exactly where §10.6 needs it shut (review,
+        # PR #100). Tolerating pipelining safely needs a defer-and-replay action — the request
+        # held until the negotiation completes — which is a materially larger contract for
+        # `decide` than forward/filter/refuse/drop/fail.
         #
-        # MEASURED (probe C3-2, §9): no shipped CLI pipelines — the three legacy ones wait,
-        # and agy sends no `initialize` at all. So this clause is defensive rather than
-        # load-bearing today, which is the reason to KEEP it: it costs one condition, and the
-        # failure it prevents is a cell failing for a reason no scenario author could see.
+        # Probe C3-2 (§9) is what makes refusing the right trade rather than a gamble: no
+        # shipped CLI pipelines. All three legacy CLIs wait for the response, and agy sends no
+        # `initialize` at all. So this refuses nothing the fleet actually does, and the day one
+        # of them starts, the answer is the defer action — not a hole here.
         return Fail(Anomaly(NO_ERA_ESTABLISHED,
                             f"{method!r} carries no modern `_meta` and no `initialize` has "
-                            f"been sent, so no implemented protocol version governs it or is "
-                            f"going to; only {', '.join(PRE_INITIALIZE_METHODS)} may precede "
-                            f"a handshake"))
+                            f"been ANSWERED, so no implemented protocol version governs it; "
+                            f"only {', '.join(PRE_INITIALIZE_METHODS)} may precede one"))
     name = None
     if method == "initialize":
         proposed = proposed_version(msg)
@@ -1053,11 +1097,19 @@ def _decide_response(msg: dict, shape: str, direction: str, allowed: frozenset[s
             # that arrives afterward". Dropping it is that instruction carried out one hop
             # earlier — and it is safer than forwarding, since the correlation this response
             # would need to be FILTERED went away with the cancellation.
+            inflight.settle_cancelled(origin, req_id)
             return Drop(msg, f"late response to cancelled {origin} id {req_id!r}")
         return Fail(Anomaly(UNCORRELATED,
                             f"response to {origin} id {req_id!r}, which was never requested "
                             f"in that direction"))
     if shape == ERROR:
+        if method == "initialize":
+            # A REFUSED handshake is not a handshake in progress. Leaving it pending would
+            # strand the connection in a state that is neither negotiated nor open to a fresh
+            # attempt — and version negotiation is exactly where an error is expected, since
+            # the lifecycle's own worked example is a server rejecting a proposed version and
+            # naming what it supports. Clearing it lets the client try again with one of them.
+            state.abandon_initialize()
         inflight.retire(origin, req_id)
         return Forward(msg)
 

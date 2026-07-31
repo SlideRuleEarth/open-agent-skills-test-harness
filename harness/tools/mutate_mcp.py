@@ -1148,17 +1148,25 @@ MUTATIONS = [
     # handshakes has every request waved through — the version gate defeated without malice
     # and without an exotic client, since §10.6's locations are stated per version.
     ("M163-bare-request-is-legacy-by-default", PROXY,
-     ("    if (not modern and state.legacy_version is None "
-      "and state.pending_initialize is None\n"),
-     "    if (False\n",
+     ("    if not modern and state.legacy_version is None "
+      "and method not in PRE_INITIALIZE_METHODS:\n"),
+     "    if False:\n",
      "proxy.a_bare_request_needs_an_era_that_was_actually_established"),
-    # The other direction: a request PIPELINED behind an unanswered `initialize` is refused.
-    # The lifecycle only SHOULD-NOTs that, and a proxy reads lines serially where the server
-    # it fronts would already have negotiated — so this fails a cell nothing else objects to,
-    # which is the false-failure half of the same rule.
-    ("M174-pipelined-request-behind-initialize-is-refused", PROXY,
-     "and state.pending_initialize is None\n",
-     "\n",
+    # A PENDING handshake satisfies the era gate — the tolerant reading, and the hole it
+    # opens is the one §10.6 needs shut: the pipelined request's response can arrive before
+    # the negotiation, and is then read under no version at all.
+    ("M174-a-pending-initialize-counts-as-an-era", PROXY,
+     ("    if not modern and state.legacy_version is None "
+      "and method not in PRE_INITIALIZE_METHODS:\n"),
+     ("    if (not modern and state.legacy_version is None\n"
+      "            and state.pending_initialize is None\n"
+      "            and method not in PRE_INITIALIZE_METHODS):\n"),
+     "proxy.a_bare_request_needs_an_era_that_was_actually_established"),
+    # A REFUSED handshake stays pending forever, so the connection is neither negotiated nor
+    # open to a fresh attempt and a legitimate retry reads as a second `initialize`.
+    ("M175-errored-initialize-stays-pending", PROXY,
+     "            state.abandon_initialize()\n",
+     "            pass\n",
      "proxy.a_bare_request_needs_an_era_that_was_actually_established"),
     # The sanctioned pre-initialization set loses `ping`, which the lifecycle explicitly
     # permits before the `initialize` response — the opposite failure, a clean cell refused.
@@ -1215,11 +1223,36 @@ MUTATIONS = [
     # case that separates them — a server tearing down a subscription cancels the CLIENT's
     # `subscriptions/listen` — so the subscription stays resident and its id later collides.
     ("M169-cancellation-retires-the-senders-own-map", PROXY,
+     ("    if direction == C2S:\n"
+      "        inflight.cancel(C2S, req_id)\n"
+      "    elif state.legacy_version is not None:\n"
+      "        inflight.cancel(S2C, req_id)\n"
+      '    elif inflight.method_for(C2S, req_id) == "subscriptions/listen":\n'
+      "        inflight.cancel(C2S, req_id)\n"),
+     "    inflight.cancel(direction, req_id)\n",
+     "proxy.cancellation_retires_the_request_it_actually_names"),
+    # Routing by SEARCH rather than by protocol: try the sender's map, then the peer's. It
+    # gets the collision wrong in both directions — an unknown client cancellation reaches
+    # into the server's map, and a modern server cancellation takes its own request instead
+    # of the subscription it named.
+    ("M176-cancellation-routed-by-searching-both-maps", PROXY,
+     ("    if direction == C2S:\n"
+      "        inflight.cancel(C2S, req_id)\n"
+      "    elif state.legacy_version is not None:\n"
+      "        inflight.cancel(S2C, req_id)\n"
+      '    elif inflight.method_for(C2S, req_id) == "subscriptions/listen":\n'
+      "        inflight.cancel(C2S, req_id)\n"),
      ("    for where in (direction, _ORIGIN_OF[direction]):\n"
       "        if inflight.cancel(where, req_id) is not None:\n"
       "            return\n"),
-     "    inflight.cancel(direction, req_id)\n",
      "proxy.cancellation_retires_the_request_it_actually_names"),
+    # THE REVIEWED DEFECT, restored exactly: reopening a cancelled id clears its quarantine,
+    # so a straggling tool advertisement correlates as the NEW request and is forwarded
+    # unfiltered — cancel `tools/list` on id 1, reuse id 1 for a `ping`, then the late result.
+    ("M177-cancelled-id-quarantine-cleared-on-reuse", PROXY,
+     "        if key in self._cancelled[direction]:\n",
+     "        if False:\n",
+     "proxy.a_late_response_to_a_cancelled_request_is_dropped_not_fatal"),
     # The nested `requestId` goes unvalidated, so `requestId: []` reaches `dict.pop` through a
     # tuple and raises `TypeError: unhashable` inside a pump — the crash `valid_request_id`
     # prevents on the envelope, arriving by a route that skipped it.

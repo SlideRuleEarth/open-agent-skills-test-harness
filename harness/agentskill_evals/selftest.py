@@ -9127,33 +9127,53 @@ def _check_mcp_proxy_decisions(failures, verbose):
                    "params": {"protocolVersion": "2025-11-25"}}, **cold)
     # ...and the SAME request is ordinary once the handshake has completed.
     warm = act({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}, **legacy_ctx())
-    # ...as it is while the handshake is still IN FLIGHT. The lifecycle only SHOULD-NOTs
-    # pipelining, and a proxy reads lines serially where the server it fronts would already
-    # have negotiated — so refusing here fails a cell nothing else objects to, and supporting
-    # it any other way costs a defer-and-replay action (review, PR #100).
+    # ...but a handshake still IN FLIGHT is NOT an era. Letting one through was an attempt to
+    # tolerate pipelining, which the lifecycle only SHOULD-NOTs — and it opened the gate
+    # exactly where §10.6 needs it shut: the pipelined request's response can arrive BEFORE
+    # the initialize response, and is then read under no version at all, so a modern
+    # `InputRequiredResult` carrying definitions goes through unrecognised (review, PR #100).
+    # C3-2 measured that no shipped CLI pipelines, which is what makes refusing the right
+    # trade rather than a gamble.
     pipelined = ctx()
     act({"jsonrpc": "2.0", "id": 1, "method": "initialize",
          "params": {"protocolVersion": "2025-11-25"}}, **pipelined)
     behind_it = act({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, **pipelined)
+    # ...and a handshake the server REFUSED leaves neither an era nor a stuck pending state:
+    # version negotiation is exactly where an error is expected, so the client may propose
+    # again. Without clearing it, bare requests stayed allowed forever behind a dead
+    # handshake, and a legitimate retry read as a second `initialize`.
+    refused_hs = ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2024-01-01"}}, **refused_hs)
+    nack = act({"jsonrpc": "2.0", "id": 1, "error": {
+        "code": -32602, "message": "Unsupported protocol version",
+        "data": {"supported": ["2025-11-25"]}}}, direction=P.S2C, **refused_hs)
+    still_shut = act({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, **refused_hs)
+    retry = act({"jsonrpc": "2.0", "id": 3, "method": "initialize",
+                 "params": {"protocolVersion": "2025-11-25"}}, **refused_hs)
     _check("proxy.a_bare_request_needs_an_era_that_was_actually_established",
            failed(ungoverned) == P.NO_ERA_ESTABLISHED
            and isinstance(sanctioned, P.Forward)
            and isinstance(opening, P.Forward)
            and isinstance(warm, P.Forward)
-           and isinstance(behind_it, P.Forward),
+           and failed(behind_it) == P.NO_ERA_ESTABLISHED
+           and isinstance(nack, P.Forward)
+           and failed(still_shut) == P.NO_ERA_ESTABLISHED
+           and isinstance(retry, P.Forward),
            f"absence of modern metadata makes a request legacy-ELIGIBLE, not legacy. Until an "
            f"`initialize` has been ANSWERED there is no negotiated version, so nothing says "
            f"which revision's rules to read the request under and §10.6's defined locations "
            f"are undefined for it — a client that simply never handshakes would otherwise "
            f"have every request waved through on the strength of an absence. `ping` and "
            f"`initialize` are the two the lifecycle sanctions before that point, and a "
-           f"handshake already IN FLIGHT counts too: pipelining is only a SHOULD NOT, and a "
-           f"proxy reads serially where the server it fronts would already have negotiated. "
-           f"Nothing escapes — the negotiated version governs the RESPONSE, which is where "
-           f"definitions live. ungoverned={failed(ungoverned)} "
-           f"ping={type(sanctioned).__name__} initialize={type(opening).__name__} "
-           f"after={type(warm).__name__} pipelined={type(behind_it).__name__}",
-           failures, verbose)
+           f"handshake merely IN FLIGHT is not an era: the pipelined request's response can "
+           f"come back BEFORE the negotiation, and is then read under no version at all. A "
+           f"REFUSED handshake clears rather than stranding the connection — negotiation is "
+           f"where an error is expected — so the client may propose again while bare requests "
+           f"stay shut. ungoverned={failed(ungoverned)} ping={type(sanctioned).__name__} "
+           f"initialize={type(opening).__name__} after={type(warm).__name__} "
+           f"pipelined={failed(behind_it)} after_nack={failed(still_shut)} "
+           f"retry={type(retry).__name__}", failures, verbose)
 
     # 3) The version gate fails CLOSED, and it is the thing that actually shuts the
     #    future-channel hole — not any payload heuristic. §10.9 flags this as the arm that
@@ -9502,7 +9522,25 @@ def _check_mcp_proxy_decisions(failures, verbose):
          "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}},
                     "notifications": {"toolsListChanged": True}}}, **torn)
     server_cancel = act(cancel, direction=P.S2C, **torn)
-    reopened = act({"jsonrpc": "2.0", "id": 1, "method": "ping"}, **torn)
+    # THE COLLISION, which is what makes routing-by-search wrong rather than merely loose:
+    # id 1 live in BOTH maps. Under legacy the server cancels its OWN request; under modern
+    # the only server cancellation the spec permits names the client's subscription. Searching
+    # the sender's map first answers the modern case backwards.
+    both = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, **both)
+    act({"jsonrpc": "2.0", "id": 1, "method": "sampling/createMessage",
+         "params": {"messages": []}}, direction=P.S2C, **both)
+    act(cancel, direction=P.S2C, **both)
+    legacy_kept_client = both["inflight"].method_for(P.C2S, 1) == "tools/list"
+    legacy_took_server = both["inflight"].method_for(P.S2C, 1) is None
+    # ...and a CLIENT cancellation for an id nobody issued must not reach into the server's
+    # map and cancel a coincidentally-numbered request there.
+    stray_cancel = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "sampling/createMessage",
+         "params": {"messages": []}}, direction=P.S2C, **stray_cancel)
+    act(cancel, **stray_cancel)
+    server_request_survived = (
+        stray_cancel["inflight"].method_for(P.S2C, 1) == "sampling/createMessage")
     # A nested id that cannot key a dict must be ignored, not crash: it reaches `dict.pop`
     # through a tuple and raises `TypeError: unhashable` inside a pump otherwise.
     poison = legacy_ctx()
@@ -9515,22 +9553,27 @@ def _check_mcp_proxy_decisions(failures, verbose):
                           "params": {"requestId": 404}}, **poison)
     _check("proxy.cancellation_retires_the_request_it_actually_names",
            isinstance(server_cancel, P.Forward)
-           and torn["inflight"].open_ids(P.C2S) == [1]  # the `ping`, not the subscription
-           and isinstance(reopened, P.Forward)
+           # the modern teardown took the CLIENT's subscription, leaving nothing open
+           and torn["inflight"].open_ids(P.C2S) == []
+           and legacy_kept_client and legacy_took_server
+           and server_request_survived
            and isinstance(unhashable_cancel, P.Forward)
            and poison["inflight"].open_ids(P.C2S) == [1]
            and isinstance(unknown_cancel, P.Forward),
-           f"a cancellation names a request the SENDER issued — except the case the modern "
-           f"revision mandates, where the server cancels the CLIENT's `subscriptions/listen` "
-           f"to tear the stream down. Retiring the notification's own direction leaves the "
-           f"real subscription resident, and reusing its id then fails a clean cell as a "
-           f"duplicate. A `requestId` that cannot key a dict is ignored rather than crashing "
-           f"the pump, and so is one nobody issued; the notification is forwarded verbatim in "
+           f"a cancellation is routed by the PROTOCOL, not by searching both maps and taking "
+           f"whichever hits first. A client cancels a request it issued; under legacy a "
+           f"server cancels its own; under modern the one server cancellation the spec "
+           f"permits names the CLIENT's `subscriptions/listen`, to tear the stream down. "
+           f"Searching gets the collision wrong in both directions — an unknown client "
+           f"cancellation would reach into the server's map, and with id 1 live in both a "
+           f"server cancellation would take its own request instead of the subscription it "
+           f"named. A `requestId` that cannot key a dict is ignored rather than crashing the "
+           f"pump, and so is one nobody issued; the notification is forwarded verbatim in "
            f"every case, because that is what notifications are: "
-           f"server_cancel={type(server_cancel).__name__} "
-           f"reopened={type(reopened).__name__} "
-           f"unhashable={type(unhashable_cancel).__name__} "
-           f"open={poison['inflight'].open_ids(P.C2S)}", failures, verbose)
+           f"modern_teardown_left={torn['inflight'].open_ids(P.C2S)} "
+           f"legacy_client_kept={legacy_kept_client} legacy_server_taken={legacy_took_server} "
+           f"stray_left_server={server_request_survived} "
+           f"unhashable={type(unhashable_cancel).__name__}", failures, verbose)
 
     # 8d) The cancellation RACE is documented, so it may not be fatal. "Cancellation
     #     notifications may arrive after request processing has completed, and potentially
@@ -9542,24 +9585,43 @@ def _check_mcp_proxy_decisions(failures, verbose):
     act({"jsonrpc": "2.0", "method": "notifications/cancelled",
          "params": {"requestId": 1}}, **race)
     late = act({"jsonrpc": "2.0", "id": 1, "result": listed}, direction=P.S2C, **race)
-    # ...and the id is still genuinely reusable, which is what the tombstone has to not break.
+    # ...and once the straggler has been seen the quarantine lifts, because there cannot be a
+    # second one: the request is over on both sides.
     reused = act({"jsonrpc": "2.0", "id": 1, "method": "ping"}, **race)
     orphan = legacy_ctx()
     never = act({"jsonrpc": "2.0", "id": 77, "result": listed}, direction=P.S2C, **orphan)
+    # THE OTHER ORDER, which is the one that bypasses filtering: reuse the id BEFORE the
+    # straggler arrives, and the late tool advertisement correlates as the new request and is
+    # forwarded unfiltered. "Reuse makes them indistinguishable" is why the id is quarantined,
+    # not why the bypass is acceptable (review, PR #100).
+    quarantine = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, **quarantine)
+    act({"jsonrpc": "2.0", "method": "notifications/cancelled",
+         "params": {"requestId": 1}}, **quarantine)
+    early_reuse = act({"jsonrpc": "2.0", "id": 1, "method": "ping"}, **quarantine)
+    # ...and the straggler that would have been laundered is still just dropped.
+    straggler = act({"jsonrpc": "2.0", "id": 1, "result": listed},
+                    direction=P.S2C, **quarantine)
     _check("proxy.a_late_response_to_a_cancelled_request_is_dropped_not_fatal",
            isinstance(late, P.Drop)
            and isinstance(reused, P.Forward)
            # a response to an id that was never requested AND never cancelled stays fatal —
            # the drop is the documented race, not a general "could not place it" escape
-           and failed(never) == P.UNCORRELATED,
+           and failed(never) == P.UNCORRELATED
+           and failed(early_reuse) == P.CANCELLED_ID_REUSE
+           and isinstance(straggler, P.Drop),
            f"the late response to a cancelled request is a race the spec describes and tells "
            f"the client to ignore, so failing the cell on it fails a conforming exchange. It "
            f"is DROPPED rather than forwarded, because the correlation that would let it be "
            f"filtered went away with the cancellation — a `tools/list` reply forwarded here "
            f"would be unfiltered. The drop is reserved for exactly this: a response on an id "
            f"never issued at all is still fatal, or the escape becomes the degradation §10.5 "
-           f"forbids. late={type(late).__name__} reused={type(reused).__name__} "
-           f"never={failed(never)}", failures, verbose)
+           f"forbids. And the id stays QUARANTINED until that straggler is seen — reopening "
+           f"it first is the same bypass by another route, since the late advertisement would "
+           f"then correlate as the new request. late={type(late).__name__} "
+           f"reused={type(reused).__name__} never={failed(never)} "
+           f"early_reuse={failed(early_reuse)} straggler={type(straggler).__name__}",
+           failures, verbose)
 
     # 8b) The closure has a CONFORMING SHAPE, and it is not `{}`. The subscriptions page calls
     #     it "an empty result" in prose and then prints what it is: `resultType: "complete"`

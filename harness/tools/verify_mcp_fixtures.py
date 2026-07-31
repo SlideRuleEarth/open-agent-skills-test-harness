@@ -747,5 +747,56 @@ check("identity works in the modern era as well",
       == "quarry-7b1c:marmot-22", r)
 
 print()
+print("E13. C3-2: the `initialize` delay window measures PIPELINING, in both directions")
+# The instrument for probe C3-2 (§9) needs its own regression, and it needs to be checked
+# BOTH ways: an instrument that reports "pipelined" for everything is as useless as one that
+# reports it for nothing, and the second failure is the plausible one — it is what a buffered
+# read path produces, since a pipelined line sits in Python's buffer while `select` reports
+# the pipe quiet. `run()` above cannot be used here: it writes every message up front, which
+# is pipelining by construction, so the timing has to be driven by hand.
+
+
+def _init_window(*, pipelined: bool, held_ms: int = 400, delay: bool = True):
+    """Drive one handshake with the response held, and return the `pipelining` record."""
+    tmp = tempfile.mkdtemp(prefix="verify-window-")
+    log = os.path.join(tmp, "probe.jsonl")
+    env = dict(os.environ, PROBE_MCP_LOG=log, PROBE_MCP_MODE="dual")
+    if delay:
+        env["PROBE_MCP_INIT_DELAY_MS"] = str(held_ms)
+    else:
+        env.pop("PROBE_MCP_INIT_DELAY_MS", None)
+    p = subprocess.Popen([sys.executable, SHIM], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    nxt = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+    try:
+        p.stdin.write((json.dumps(legacy_init(1)) + "\n").encode())
+        p.stdin.flush()
+        if not pipelined:
+            p.stdout.readline()          # WAIT for the response, as a conforming client does
+        p.stdin.write((nxt + "\n").encode())
+        p.stdin.flush()
+        p.stdin.close()
+        p.wait(timeout=DEADLINE)
+    finally:
+        if p.poll() is None:
+            p.kill()
+    recs = [json.loads(ln) for ln in open(log) if ln.strip()]
+    return next((r for r in recs if r["event"] == "pipelining"), None)
+
+
+_pipe = _init_window(pipelined=True)
+_wait = _init_window(pipelined=False)
+_off = _init_window(pipelined=True, delay=False)
+check("a client that pipelines is DETECTED", _pipe and _pipe["pipelined"] is True, _pipe)
+check("...and what it sent is named", _pipe and _pipe["methods"] == ["tools/list"], _pipe)
+check("a client that WAITS is not reported as pipelining",
+      _wait and _wait["pipelined"] is False and _wait["count"] == 0, _wait)
+check("the window names the initialize it held", _pipe and _pipe["initialize_id"] == 1, _pipe)
+check("the held duration is recorded", _pipe and _pipe["held_ms"] == 400, _pipe)
+# Off by default, or every other measurement in this file pays for it — and a shim that
+# always paused would be measuring its own delay rather than the client.
+check("the window is OFF unless asked for", _off is None, _off)
+
+print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")
 sys.exit(1 if fails else 0)

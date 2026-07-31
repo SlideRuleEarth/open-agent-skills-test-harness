@@ -139,10 +139,16 @@ def probe(cli: str, *, timeout: int, verbose: bool) -> dict:
     recs = _read_log(log)
     hit = next((r for r in recs if r["event"] == "pipelining"), None)
     era = next((r for r in recs if r["event"] == "era"), None)
+    # `connected` means AN ERA WAS OBSERVED, not "the log exists". The shim writes `start`
+    # before reading a byte, so a CLI that spawns the server and dies would otherwise count as
+    # connected — and then, having sent no `initialize`, be classified as modern with nothing
+    # to pipeline behind. A false negative reported as a clean result, which is the one
+    # outcome a probe must not produce (review, PR #100).
     result = {
         "cli": cli,
         "model": plan["model"],
-        "connected": bool(recs),
+        "connected": era is not None,
+        "spawned": bool(recs),
         "pipelining": hit,
         "era": era,
         "rc": rc,
@@ -177,11 +183,17 @@ def main() -> int:
         r = probe(cli, timeout=args.timeout, verbose=args.verbose)
         rows.append(r)
         if not r["connected"]:
-            verdict = "NO HANDSHAKE — the CLI never reached the server"
-        elif r["pipelining"] is None:
+            verdict = ("NO ERA OBSERVED — the CLI never handshook"
+                       + (" (server was spawned)" if r["spawned"] else " (server never ran)"))
+        elif r["era"]["era"] == "modern" and r["pipelining"] is None:
             # A modern client sends no `initialize` at all, so the window never opens. That
             # is an ANSWER, not a gap: there is no pre-negotiation state to pipeline behind.
+            # It is claimed only for an era actually OBSERVED as modern — "no pipelining
+            # record" on its own would say the same thing about a CLI that died first.
             verdict = "n/a — no `initialize` (modern era, per-request metadata)"
+        elif r["pipelining"] is None:
+            verdict = (f"NOT MEASURED — era {r['era']['era']} was observed but the "
+                       f"`initialize` window never ran")
         elif r["pipelining"]["pipelined"]:
             verdict = (f"PIPELINES — {r['pipelining']['count']} request(s) arrived while the "
                        f"response was held: {r['pipelining']['methods']}")
@@ -191,7 +203,11 @@ def main() -> int:
         print(f"{cli:8} {era:22} rc={str(r['rc']):5} {r['elapsed_s']:>6}s  {verdict}")
 
     print()
-    unknown = [r["cli"] for r in rows if not r["connected"]]
+    # Unmeasured means BOTH "never handshook" and "handshook in the legacy era but the
+    # window never ran". Only an observed modern era licenses "n/a".
+    unknown = [r["cli"] for r in rows
+               if not r["connected"]
+               or (r["pipelining"] is None and r["era"]["era"] != "modern")]
     pipelines = [r["cli"] for r in rows
                  if r["pipelining"] and r["pipelining"]["pipelined"]]
     if pipelines:

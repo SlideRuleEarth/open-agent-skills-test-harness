@@ -292,7 +292,7 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 509 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 harness/tools/mutate_mcp.py                           # 172/172 production + 2/2 instrument
+python3 harness/tools/mutate_mcp.py                           # 175/175 production + 2/2 instrument
 git diff --check
 ```
 
@@ -383,6 +383,12 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   because everything looks like it is working correctly. When writing a check, name the
   version, the direction and the document it comes from; if the rule cannot be stated with
   those three, it is not yet a rule.
+- **"Nothing escapes" is a claim about ORDER, and order is the thing to check.** Letting a
+  request through on a *pending* handshake looked safe because the negotiated version would
+  govern its response — true only if the negotiation lands first, and nothing makes it. The
+  pipelined request's response can arrive before the `initialize` response and be read under
+  no version at all. When an argument for safety rests on one message preceding another,
+  write down what happens in the other order; on a duplex stream both orders happen.
 - **An exception argued on safety grounds can be the banned technique wearing a hat.** Asked
   to scope MRTR detection to `resultType: "input_required"`, I scoped the *version* and
   skipped the discriminator, reasoning that "a mislabelled definition is still a definition".
@@ -495,8 +501,10 @@ ABA fix and its route to `parallel_safe_config = True`.
   Everything before the last slice cannot affect any run, which is the point: this is harness
   code in the request path of every gated cell.
   **Probe C3-2 resolved 2026-07-31** (`tools/probe_mcp_pipelining.py`): no CLI pipelines
-  requests behind `initialize`, so §10.2's allowance for a pending handshake is defensive
-  rather than load-bearing — kept, because `SHOULD NOT` is not `MUST NOT`. It needed a new
+  requests behind `initialize`, which is what licenses §10.2 REFUSING one. A pending
+  negotiation cannot govern traffic — the pipelined request's response may arrive first,
+  under no version at all — so tolerating pipelining needs a defer-and-replay action, and
+  C3-2 says the refusal costs the fleet nothing today. It needed a new
   shim mode (`PROBE_MCP_INIT_DELAY_MS`) *and* a raw-fd read path in the shim, because
   `sys.stdin.readline()` buffers a chunk rather than a line and would have hidden exactly the
   bytes being measured. claude is free to probe (`claude mcp list` health-checks stdio
