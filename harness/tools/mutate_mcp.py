@@ -888,12 +888,18 @@ MUTATIONS = [
      "    global _ARMS_RUN\n    _ARMS_RUN += 1\n",
      "    global _ARMS_RUN\n",
      "selftest.arm_count_is_live"),
-    # The delta collapses back to the raw process-lifetime counter, so a second
+    # The ASSIGNMENT in the banner reverts to the raw process-lifetime counter, so a second
     # `run_selftest()` in one interpreter reports the sum of both runs while every arm still
-    # passes and the number still looks plausible (491, then 982 — found in review).
+    # passes and the number still looks plausible (492, then 984 — found in review).
+    #
+    # Aimed at the assignment, not at `_arms_since`. The first version of this mutation
+    # perturbed the helper, which the arm exercised directly — so the helper was pinned and
+    # the wiring that actually regressed was not, and "2/2 instrument" claimed coverage it
+    # did not have (review, sixth round). `_banner` exists so this line is inside the
+    # function the arm calls and the run prints.
     ("I2-arm-count-reverts-to-process-lifetime", SELFTEST,
-     "    return _ARMS_RUN - start\n",
-     "    return _ARMS_RUN\n",
+     "    arms = _arms_since(arms_before)\n",
+     "    arms = _ARMS_RUN\n",
      "selftest.arm_count_is_per_run_not_per_process"),
     # Still rejected, but only AFTER the scenario is read — so the flag no longer fails fast,
     # and a scenario that does not parse reports a file error for a run that was never going

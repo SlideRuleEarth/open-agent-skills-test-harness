@@ -126,6 +126,25 @@ def _arms_since(start: int) -> int:
     return _ARMS_RUN - start
 
 
+def _banner(arms_before: int, failures: list) -> str:
+    """The final line, returned rather than printed — so its arm count can be TESTED.
+
+    Extracted from `_run_selftest_checks` because the arm guarding this used to exercise
+    `_arms_since()` in isolation while the defect lived at the call site: reverting
+    `arms = _arms_since(arms_before)` to `arms = _ARMS_RUN` restored the 492-then-984
+    double count and every arm still passed, so "2/2 instrument" pinned the helper and not
+    the wiring (review, sixth round). The assignment now lives inside the function the arm
+    calls, which is the same function the run prints — the check is ON the thing that
+    matters rather than beside it.
+    """
+    arms = _arms_since(arms_before)
+    if failures:
+        return f"SELFTEST FAILED: {len(failures)} of {arms} check(s): {', '.join(failures)}"
+    # The prefix is exact: the pre-push hook and mutate_mcp.py both read for
+    # `SELFTEST PASSED`, and the arm count is appended rather than folded into it.
+    return f"SELFTEST PASSED — {arms} arms"
+
+
 def _check(name, cond, msg, failures, verbose):
     global _ARMS_RUN
     _ARMS_RUN += 1
@@ -8897,15 +8916,9 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     # burden that made the literal in TODO_Contained_HOME.md §4 go stale in the first place.
     _section(_check_arm_counter, failures, verbose)
 
-    arms = _arms_since(arms_before)
     print()
-    if failures:
-        print(f"SELFTEST FAILED: {len(failures)} of {arms} check(s): {', '.join(failures)}")
-        return 1
-    # The banner keeps its exact prefix: the pre-push hook and mutate_mcp.py both read for
-    # `SELFTEST PASSED`, and the arm count is appended rather than folded into it.
-    print(f"SELFTEST PASSED — {arms} arms")
-    return 0
+    print(_banner(arms_before, failures))
+    return 1 if failures else 0
 
 
 def _check_arm_counter(failures, verbose):
@@ -8921,21 +8934,34 @@ def _check_arm_counter(failures, verbose):
            f"deliberately: it catches a dead counter or a lost section, and is not a number "
            f"to maintain per commit", failures, verbose)
 
-    # ...and that it MEASURES ONE RUN. `_ARMS_RUN` counts for the life of the process, so a
-    # banner reading it raw double-counts on the second `run_selftest()` in one interpreter
-    # — 491, then 982 — while every arm still passes and the number still looks plausible.
-    # Found in review by calling the public function twice. Checked here through the same
-    # arithmetic the banner uses, so a mutation that drops the subtraction reddens this.
-    here = _ARMS_RUN
+    # ...and that it MEASURES ONE RUN, observed through `_banner` — the function
+    # `_run_selftest_checks` actually prints. Testing `_arms_since()` on its own passed
+    # while the call site read `_ARMS_RUN` raw, which is the whole defect: a check aimed
+    # beside the thing that matters (review, sixth round).
+    #
+    # Two consecutive runs are simulated against a counter that GROWS between them, which
+    # is what makes this a per-run claim rather than an arithmetic one. `first` started one
+    # arm ago (the liveness check above), so it must report exactly 1; `second` starts now
+    # and has done nothing, so it must report 0. A banner reading the process total reports
+    # the same large number for both — and that number is the one thing asserted absent.
+    total = _ARMS_RUN
+    first = _banner(total - 1, [])
+    second = _banner(total, [])
+    failed_form = _banner(total - 1, ["some.arm"])
     _check("selftest.arm_count_is_per_run_not_per_process",
-           _arms_since(here) == 0 and _arms_since(0) == here and _arms_since(10) == here - 10,
-           f"the banner reports arms for THIS run, and `_ARMS_RUN` is a process-lifetime "
-           f"counter — so the figure must be a delta against the value captured when the "
-           f"run started, or a second call in one process reports the sum of both and the "
-           f"banner silently stops being the measurement its own documentation describes. "
-           f"A delta rather than a reset because a reset is a step that can be forgotten "
-           f"separately from the reporting: from={here} "
-           f"since_here={_arms_since(here)} since_zero={_arms_since(0)}",
+           first == "SELFTEST PASSED — 1 arms"
+           and second == "SELFTEST PASSED — 0 arms"
+           and f"of {total} check(s)" not in failed_form
+           and "1 of 1 check(s)" in failed_form,
+           f"`_ARMS_RUN` counts for the life of the PROCESS, so the banner must report a "
+           f"delta against the value captured when the run began — otherwise a second "
+           f"`run_selftest()` in one interpreter reports the sum of both (492, then 984) "
+           f"while every arm still passes and the number still looks plausible. Checked "
+           f"through `_banner` rather than the helper it calls, because the regression is "
+           f"the ASSIGNMENT reverting to the raw counter, and against a counter that moved "
+           f"between the two so a process total cannot satisfy both. The FAILED form shares "
+           f"the same figure and is checked too. total={total} first={first!r} "
+           f"second={second!r} failed={failed_form!r}",
            failures, verbose)
 
 

@@ -344,6 +344,22 @@ either mistake miscounts exactly what the split reporting exists to keep straigh
 
 Things that have gone wrong in the *tests*, so you can skip learning them again:
 
+- **The recurring one, five times now: a check aimed BESIDE the thing that matters.** Every
+  instance looks like coverage and is not, and the shape is always the same — the arm and its
+  mutation agree with each other while both sit one level away from where the defect lives.
+  Seen as: an arm whose two cases could not see the condition they guarded (M117); a live
+  assertion the model could satisfy from its prompt without the mechanism running at all
+  (`regress_mcp_two_servers`, twice); two cells sharing an artifacts directory so the second
+  overwrote what the first was meant to prove (M125); and an arm exercising the delta HELPER
+  while the regression was the banner's ASSIGNMENT of it (I2). Each passed review of the code
+  and was caught only by someone asking the question below.
+
+  **The test:** write out what a broken implementation would produce, and check your assertion
+  rejects it. If the answer is "it produces exactly what I asserted", the assertion is
+  measuring something else. Two corollaries this project keeps rediscovering — a defect that
+  passes THROUGH a helper is not tested by testing the helper, only by testing the site it
+  reached; and for anything with a model in the loop, the model is part of the implementation,
+  so an expected value it could reconstruct from its prompt is not evidence.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s
