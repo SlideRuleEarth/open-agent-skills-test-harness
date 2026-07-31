@@ -289,10 +289,10 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 507 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 509 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 harness/tools/mutate_mcp.py                           # 166/166 production + 2/2 instrument
+python3 harness/tools/mutate_mcp.py                           # 172/172 production + 2/2 instrument
 git diff --check
 ```
 
@@ -383,6 +383,21 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   because everything looks like it is working correctly. When writing a check, name the
   version, the direction and the document it comes from; if the rule cannot be stated with
   those three, it is not yet a rule.
+- **An exception argued on safety grounds can be the banned technique wearing a hat.** Asked
+  to scope MRTR detection to `resultType: "input_required"`, I scoped the *version* and
+  skipped the discriminator, reasoning that "a mislabelled definition is still a definition".
+  That argument is the structural scan restated — it says *I will look for tool-shaped things
+  regardless of what the protocol says this payload is*, which is precisely what §10.6
+  rejects — and it diagnosed a plain `ping` result as tool-bearing sampling. Deviating from a
+  rule is sometimes right, but the burden is to show the deviation is not an instance of the
+  thing the rule exists to forbid, and "it is safer" does not discharge it: unsound in the
+  strict direction is still unsound.
+- **A mutation whose defect is a CRASH needs an arm that can catch one.** An unhashable id
+  reaching `dict.pop` raises several frames from anything that could log it — which is the
+  defect — but an arm that lets it propagate turns the mutation into "failed, but NOT via",
+  which proves nothing and reads like a tooling problem. The arm calls through a helper that
+  converts an exception into a value the assertion rejects. Same principle as the rest of §4:
+  the arm has to be able to *observe* the failure it is named for.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s

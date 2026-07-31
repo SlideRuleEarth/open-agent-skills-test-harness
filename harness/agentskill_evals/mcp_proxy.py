@@ -269,7 +269,7 @@ def classify_envelope(msg: dict) -> str | Anomaly:
         if has_id:
             return (REQUEST if valid_request_id(msg["id"])
                     else Anomaly(MALFORMED, f"request `id` is {msg['id']!r}, "
-                                            f"not a string or integer"))
+                                            f"not a string or number"))
         return NOTIFICATION
 
     if has_result:
@@ -277,7 +277,7 @@ def classify_envelope(msg: dict) -> str | Anomaly:
             return Anomaly(MALFORMED, "result response with no `id`")
         if not valid_request_id(msg["id"]):
             return Anomaly(MALFORMED, f"response `id` is {msg['id']!r}, "
-                                      f"not a string or integer")
+                                      f"not a string or number")
         if not isinstance(msg["result"], dict):
             return Anomaly(MALFORMED, f"`result` is {type(msg['result']).__name__}, "
                                       f"not an object")
@@ -288,7 +288,7 @@ def classify_envelope(msg: dict) -> str | Anomaly:
                                       "and a string `message`")
         if has_id and not valid_request_id(msg["id"]):
             return Anomaly(MALFORMED, f"error `id` is {msg['id']!r}, "
-                                      f"not a string or integer")
+                                      f"not a string or number")
         return ERROR
 
     return Anomaly(MALFORMED, "none of method/result/error present")
@@ -481,9 +481,19 @@ def sampling_carries_tools(msg: dict, *, modern: bool) -> bool | Anomaly:
     The caller passes the version that governs the message — for a response, the one that
     governed the request it answers.
 
-    Deliberately NOT also gated on `resultType == "input_required"`: a modern server that put
-    `inputRequests` under the wrong label would then slip past, and a mislabelled definition
-    is still a definition.
+    THE LOCATION IS AN `input_required` RESULT, not a key that happens to be called
+    `inputRequests`. `Result` is open-ended and `resultType` is the discriminator that tells a
+    client how to parse it, so reading the key under any other type is scanning for a shape —
+    the very thing §10.6 rejects, arriving through the back door. An earlier version argued
+    that a mislabelled definition is still a definition and skipped the discriminator; that
+    argument is the heuristic scan restated, and it diagnosed a `complete` ping result
+    carrying unrelated extension data as tool-bearing sampling (review, PR #100). A conforming
+    client never acts on `inputRequests` under `complete`, and defending against one that
+    ignores the discriminator cannot be done without guessing.
+
+    An `input_required` result may legitimately carry no `inputRequests` at all — servers
+    "MUST include at least one of `inputRequests` or `requestState`" — so its absence is
+    simply no definition here.
 
     `inputRequests` IS A MAP, not a list — "keys are server-assigned string identifiers;
     values are request objects". Iterating it directly walks the KEYS, so every request is a
@@ -502,7 +512,9 @@ def sampling_carries_tools(msg: dict, *, modern: bool) -> bool | Anomaly:
         if isinstance(params, dict) and _nonempty_list(params.get("tools")):
             return True
     result = msg.get("result")
-    if modern and isinstance(result, dict) and "inputRequests" in result:
+    if (modern and isinstance(result, dict)
+            and result.get("resultType") == "input_required"
+            and "inputRequests" in result):
         requests = result["inputRequests"]
         if not isinstance(requests, dict):
             return Anomaly(BAD_INPUT_REQUESTS,
@@ -551,13 +563,22 @@ class InFlight:
 
     def __init__(self) -> None:
         self._by_direction: dict[str, dict[Any, tuple[str, str | None]]] = {C2S: {}, S2C: {}}
+        # Ids retired by a CANCELLATION rather than by an answer. See `cancel`.
+        self._cancelled: dict[str, set] = {C2S: set(), S2C: set()}
 
     def _key(self, req_id: Any) -> Any:
-        # JSON-RPC ids may be a string or a number, and `1` and `"1"` are different ids. They
-        # are also both valid dict keys, but `True == 1` in Python, so a bare id would let a
-        # boolean id (illegal, but arriving from a peer this proxy does not control) alias a
-        # numeric one. Keying on (type name, value) keeps them apart without rejecting either.
-        return (type(req_id).__name__, req_id)
+        # STRINGS AND NUMBERS ARE DIFFERENT DOMAINS; WITHIN NUMBERS THE VALUE IS THE ID.
+        # `1` and `"1"` are different ids per JSON-RPC, so the domain marker keeps them apart.
+        # But `1` and `1.0` are the same JSON number, and a peer may echo a response id in
+        # either spelling — "It MUST be the same as the value of the id member in the Request
+        # Object" is about the value. Keying on Python's type name split them, so a request on
+        # `1` answered on `1.0` read as uncorrelated and both could be live at once (review,
+        # PR #100). One numeric domain fixes it for free: `1 == 1.0` in Python and their
+        # hashes agree, and large integers keep their exact value rather than being floated.
+        #
+        # Booleans would alias `1` here, and are excluded at the envelope instead — see
+        # `valid_request_id`. That is the only place they can enter.
+        return ("s", req_id) if isinstance(req_id, str) else ("n", req_id)
 
     def record(self, direction: str, req_id: Any, method: str,
                version: str | None) -> None | Anomaly:
@@ -580,6 +601,10 @@ class InFlight:
             return Anomaly(DUPLICATE_ID,
                            f"{direction} id {req_id!r} is already open as "
                            f"{live[key][0]!r}; an id may not be reused before it is answered")
+        # Reopening an id ends its cancellation grace: from here a response on it answers THIS
+        # request, and a straggler for the cancelled one is indistinguishable from it. That is
+        # inherent to id reuse in JSON-RPC, not something a proxy can recover.
+        self._cancelled[direction].discard(key)
         live[key] = (method, version)
         return None
 
@@ -609,6 +634,32 @@ class InFlight:
         entry = self._by_direction[direction].pop(self._key(req_id), None)
         return entry[0] if entry else None
 
+    def cancel(self, direction: str, req_id: Any) -> str | None:
+        """Retire an id BECAUSE IT WAS CANCELLED, and remember that. Returns its method.
+
+        The memory is not bookkeeping — it is what keeps a documented race from failing a
+        clean cell. "Due to network latency, cancellation notifications may arrive after
+        request processing has completed, and potentially after a response has already been
+        sent", and the client "SHOULD ignore any response to the cancelled request that
+        arrives afterward". Without a record of the cancellation that late response is a reply
+        to an id nothing is waiting for — which is exactly the `UNCORRELATED` anomaly, and a
+        failed cell for a sequence the spec calls normal (review, PR #100).
+
+        Only an id that was actually live is remembered, which also bounds this: one entry per
+        request genuinely cancelled, cleared the moment the id is reused. A cancellation
+        naming an id nobody issued is ignored, per "invalid cancellation notifications SHOULD
+        be ignored: unknown request IDs".
+        """
+        key = self._key(req_id)
+        if key not in self._by_direction[direction]:
+            return None
+        method = self.retire(direction, req_id)
+        self._cancelled[direction].add(key)
+        return method
+
+    def was_cancelled(self, direction: str, req_id: Any) -> bool:
+        return self._key(req_id) in self._cancelled[direction]
+
     def open_ids(self, direction: str) -> list:
         return [key[1] for key in self._by_direction[direction]]
 
@@ -620,11 +671,19 @@ def cancelled_id(msg: dict) -> Any:
     OBSERVED on the way through, because it is one of the two orderly ends of a subscription
     (§10.4). The design's earlier claim that notifications need no special treatment is wrong
     for exactly this one.
+
+    THE NESTED ID IS VALIDATED LIKE ANY OTHER, and this is not symmetry for its own sake: it
+    goes on to key a dict, so `requestId: []` reaches `dict.pop` through a tuple and raises
+    `TypeError: unhashable` inside a pump — the same crash `valid_request_id` exists to
+    prevent on the envelope, arriving by a route that skipped it (review, PR #100). An
+    unusable id yields `_ABSENT` and the notification is simply forwarded uninterpreted, which
+    is what the spec asks for: "invalid cancellation notifications SHOULD be ignored ...
+    malformed notifications". This maintains their fire-and-forget nature.
     """
     if msg.get("method") != "notifications/cancelled":
         return _ABSENT
     params = msg.get("params")
-    if not isinstance(params, dict) or "requestId" not in params:
+    if not isinstance(params, dict) or not valid_request_id(params.get("requestId")):
         return _ABSENT
     return params["requestId"]
 
@@ -785,13 +844,27 @@ class Refuse:
 
 
 @dataclass(frozen=True)
+class Drop:
+    """Write nothing, and carry on. The one non-terminal way a message does not go through.
+
+    Reserved for a message the protocol itself says the receiver should ignore — today only
+    the late response to a cancelled request, which is a documented race rather than a fault.
+    It is NOT a general "could not handle it" escape: everything the proxy cannot account for
+    is a `Fail`, and adding cases here is how a fail-loud proxy becomes a degrading one.
+    """
+
+    msg: dict
+    reason: str
+
+
+@dataclass(frozen=True)
 class Fail:
     """Stop. Terminal by contract — the cell fails and no further traffic is forwarded."""
 
     anomaly: Anomaly
 
 
-Action = Forward | Filtered | Refuse | Fail
+Action = Forward | Filtered | Refuse | Drop | Fail
 
 
 def decide(line: str, *, direction: str, allowed: frozenset[str], state: ProtocolState,
@@ -799,11 +872,12 @@ def decide(line: str, *, direction: str, allowed: frozenset[str], state: Protoco
     """The whole decision for one wire line. The I/O layer performs the answer and nothing else.
 
     This is the function the guarantee lives in. Every check above is reachable from here, in
-    an order that matters: an envelope is validated before anything reads its fields, an era
-    is established before a method is judged, a `tools/call` is checked against the allowlist
-    BEFORE it is recorded as in-flight (a refused call never goes out, so there is nothing to
-    correlate and nothing to leave resident), and a `tools/list` response is shape-checked
-    before it is filtered.
+    an order that matters: an envelope is validated before anything reads its fields; the
+    method is judged against the era the request declared, then that era is required to be one
+    actually in force; the id is CLAIMED before any branch that can produce a message, so a
+    refusal can never be synthesized onto an id that already belongs to something else; and a
+    `tools/list` response is shape-checked before it is filtered. A refused call releases the
+    id again, since nothing goes out and nothing will come back to correlate.
 
     `state` and `inflight` are mutated — this is a stream, and the correlation that makes
     filtering possible cannot be stateless. Nothing else here is.
@@ -824,9 +898,28 @@ def decide(line: str, *, direction: str, allowed: frozenset[str], state: Protoco
             # Forwarded verbatim, as every notification is — but OBSERVED on the way through,
             # because this is one of the two orderly ends of a subscription and the id it
             # names becomes reusable the moment it passes.
-            inflight.retire(direction, cid)
+            _cancel_wherever_live(inflight, direction, cid)
         return Forward(msg)
     return _decide_response(msg, shape, direction, allowed, state, inflight)
+
+
+def _cancel_wherever_live(inflight: InFlight, direction: str, req_id: Any) -> None:
+    """Retire a cancelled id in the direction that actually issued the request.
+
+    NOT the direction the notification travelled, which is the obvious reading and is wrong
+    for the one case the modern revision requires: "a server MUST send
+    `notifications/cancelled` referencing a `subscriptions/listen` request ID when it tears
+    down that subscription stream" — and that request is the CLIENT's. Retiring the sender's
+    own map there leaves the real subscription resident forever, so reusing its id later fails
+    as a duplicate and takes a clean cell with it (review, PR #100).
+
+    Under legacy both sides issue requests and cancel their own, so the sender's own map is
+    tried first and the peer's second. An id live in neither is ignored, per "invalid
+    cancellation notifications SHOULD be ignored: unknown request IDs".
+    """
+    for where in (direction, _ORIGIN_OF[direction]):
+        if inflight.cancel(where, req_id) is not None:
+            return
 
 
 def _decide_client_request(msg: dict, allowed: frozenset[str], state: ProtocolState,
@@ -852,16 +945,30 @@ def _decide_client_request(msg: dict, allowed: frozenset[str], state: ProtocolSt
                             f"{method!r} does not belong to the era this request declared "
                             f"(modern={modern}); the method must match the request, not the "
                             f"reverse"))
-    if not modern and state.legacy_version is None and method not in PRE_INITIALIZE_METHODS:
-        # No modern `_meta` and no negotiated version: NOTHING governs this request. Reading
-        # it as legacy would be the version gate defeated by simply never handshaking — a
-        # client that sends neither would have every request waved through on the strength of
-        # an absence, and §10.6's guarantee is stated per implemented version (review, PR
-        # #100). `initialize` and `ping` are the exceptions the lifecycle names.
+    if (not modern and state.legacy_version is None and state.pending_initialize is None
+            and method not in PRE_INITIALIZE_METHODS):
+        # No modern `_meta`, no negotiated version, AND no handshake even attempted: NOTHING
+        # governs this request and nothing is going to. Reading it as legacy would be the
+        # version gate defeated by simply never handshaking — a client that sends neither
+        # would have every request waved through on the strength of an absence, and §10.6's
+        # guarantee is stated per implemented version (review, PR #100).
+        #
+        # A PENDING `initialize` counts, and that is what makes this rule safe to enforce.
+        # The lifecycle says a client SHOULD NOT pipeline ordinary requests behind its
+        # `initialize` — but SHOULD NOT is not MUST NOT, and a proxy reads lines serially
+        # while a server answers them, so a client that pipelines reaches this check with the
+        # response still in flight where the server it is talking to would already have
+        # negotiated. Refusing there would fail a cell that nothing else objects to, and
+        # supporting it any other way needs a defer-and-replay action — a fourth outcome for
+        # `decide`, and a materially larger contract (review, PR #100). Nothing escapes:
+        # whatever version is negotiated governs the RESPONSE, which is where tool definitions
+        # actually live, and a negotiation this proxy cannot implement fails before any
+        # response is forwarded.
         return Fail(Anomaly(NO_ERA_ESTABLISHED,
                             f"{method!r} carries no modern `_meta` and no `initialize` has "
-                            f"been answered, so no implemented protocol version governs it; "
-                            f"only {', '.join(PRE_INITIALIZE_METHODS)} may precede one"))
+                            f"been sent, so no implemented protocol version governs it or is "
+                            f"going to; only {', '.join(PRE_INITIALIZE_METHODS)} may precede "
+                            f"a handshake"))
     name = None
     if method == "initialize":
         proposed = proposed_version(msg)
@@ -934,6 +1041,14 @@ def _decide_response(msg: dict, shape: str, direction: str, allowed: frozenset[s
     req_id = msg["id"]
     method = inflight.method_for(origin, req_id)
     if method is None:
+        if inflight.was_cancelled(origin, req_id):
+            # The documented race, not a fault: "cancellation notifications may arrive after
+            # request processing has completed, and potentially after a response has already
+            # been sent", and the client "SHOULD ignore any response to the cancelled request
+            # that arrives afterward". Dropping it is that instruction carried out one hop
+            # earlier — and it is safer than forwarding, since the correlation this response
+            # would need to be FILTERED went away with the cancellation.
+            return Drop(msg, f"late response to cancelled {origin} id {req_id!r}")
         return Fail(Anomaly(UNCORRELATED,
                             f"response to {origin} id {req_id!r}, which was never requested "
                             f"in that direction"))

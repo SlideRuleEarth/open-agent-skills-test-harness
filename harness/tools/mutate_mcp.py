@@ -1034,8 +1034,7 @@ MUTATIONS = [
     # iteration walks the string KEYS, every entry fails `isinstance(req, dict)`, and a
     # conforming tool-bearing sampling result reads as clean and reaches the model.
     ("M150-input-requests-read-as-a-list", PROXY,
-     ('    if modern and isinstance(result, dict) and "inputRequests" in result:\n'
-      '        requests = result["inputRequests"]\n'
+     ('        requests = result["inputRequests"]\n'
       "        if not isinstance(requests, dict):\n"
       "            return Anomaly(BAD_INPUT_REQUESTS,\n"
       '                           f"InputRequiredResult.inputRequests is "\n'
@@ -1048,8 +1047,7 @@ MUTATIONS = [
       "                return Anomaly(BAD_INPUT_REQUESTS,\n"
       '                               f"inputRequests[{key!r}] is {type(req).__name__}, "\n'
       '                               f"not a request object")\n'),
-     ("    if modern and isinstance(result, dict):\n"
-      '        for req in result.get("inputRequests") or []:\n'
+     ('        for req in result.get("inputRequests") or []:\n'
       "            if not isinstance(req, dict):\n"
       "                continue\n"),
      "proxy.modern_sampling_requests_are_a_keyed_map_not_a_list"),
@@ -1150,9 +1148,17 @@ MUTATIONS = [
     # handshakes has every request waved through — the version gate defeated without malice
     # and without an exotic client, since §10.6's locations are stated per version.
     ("M163-bare-request-is-legacy-by-default", PROXY,
-     ("    if not modern and state.legacy_version is None "
-      "and method not in PRE_INITIALIZE_METHODS:\n"),
-     "    if False:\n",
+     ("    if (not modern and state.legacy_version is None "
+      "and state.pending_initialize is None\n"),
+     "    if (False\n",
+     "proxy.a_bare_request_needs_an_era_that_was_actually_established"),
+    # The other direction: a request PIPELINED behind an unanswered `initialize` is refused.
+    # The lifecycle only SHOULD-NOTs that, and a proxy reads lines serially where the server
+    # it fronts would already have negotiated — so this fails a cell nothing else objects to,
+    # which is the false-failure half of the same rule.
+    ("M174-pipelined-request-behind-initialize-is-refused", PROXY,
+     "and state.pending_initialize is None\n",
+     "\n",
      "proxy.a_bare_request_needs_an_era_that_was_actually_established"),
     # The sanctioned pre-initialization set loses `ping`, which the lifecycle explicitly
     # permits before the `initialize` response — the opposite failure, a clean cell refused.
@@ -1182,8 +1188,12 @@ MUTATIONS = [
     # carrying an `inputRequests` key of its own — `Result` is open-ended there — is refused
     # as a bad MRTR payload. §10.6's locations are per version, not per shape.
     ("M166-input-requests-read-in-every-era", PROXY,
-     '    if modern and isinstance(result, dict) and "inputRequests" in result:\n',
-     '    if isinstance(result, dict) and "inputRequests" in result:\n',
+     ('    if (modern and isinstance(result, dict)\n'
+      '            and result.get("resultType") == "input_required"\n'
+      '            and "inputRequests" in result):\n'),
+     ('    if (isinstance(result, dict)\n'
+      '            and result.get("resultType") == "input_required"\n'
+      '            and "inputRequests" in result):\n'),
      "proxy.modern_sampling_requests_are_a_keyed_map_not_a_list"),
     # A fractional id is refused. The schema — the declared source of truth — says
     # `string | number`, and JSON-RPC only says fractions SHOULD NOT be used, so this fails a
@@ -1199,6 +1209,45 @@ MUTATIONS = [
      '    if result.get("resultType") != "complete":\n',
      '    if result.get("resultType", "complete") != "complete":\n',
      "proxy.graceful_closure_is_the_conforming_shape_not_an_empty_object"),
+    # --- cancellation: the notification that is not just forwarded ------------------------
+    # THE REVIEWED DEFECT, restored exactly: the cancellation retires the direction it
+    # TRAVELLED rather than the one that issued the request. The modern revision requires the
+    # case that separates them — a server tearing down a subscription cancels the CLIENT's
+    # `subscriptions/listen` — so the subscription stays resident and its id later collides.
+    ("M169-cancellation-retires-the-senders-own-map", PROXY,
+     ("    for where in (direction, _ORIGIN_OF[direction]):\n"
+      "        if inflight.cancel(where, req_id) is not None:\n"
+      "            return\n"),
+     "    inflight.cancel(direction, req_id)\n",
+     "proxy.cancellation_retires_the_request_it_actually_names"),
+    # The nested `requestId` goes unvalidated, so `requestId: []` reaches `dict.pop` through a
+    # tuple and raises `TypeError: unhashable` inside a pump — the crash `valid_request_id`
+    # prevents on the envelope, arriving by a route that skipped it.
+    ("M170-cancelled-id-is-not-validated", PROXY,
+     '    if not isinstance(params, dict) or not valid_request_id(params.get("requestId")):\n',
+     '    if not isinstance(params, dict) or "requestId" not in params:\n',
+     "proxy.cancellation_retires_the_request_it_actually_names"),
+    # The cancellation race becomes fatal again: a response already in flight when the
+    # cancellation was sent answers an id nothing is waiting for, and the cell fails on a
+    # sequence the spec describes and tells the client to ignore.
+    ("M171-late-response-to-a-cancelled-request-is-fatal", PROXY,
+     "        if inflight.was_cancelled(origin, req_id):\n",
+     "        if False:\n",
+     "proxy.a_late_response_to_a_cancelled_request_is_dropped_not_fatal"),
+    # Numeric ids keyed by Python's type name again, so a request on `1` answered on `1.0`
+    # reads as uncorrelated — and both can be live at once.
+    ("M172-numeric-ids-keyed-by-python-type", PROXY,
+     '        return ("s", req_id) if isinstance(req_id, str) else ("n", req_id)',
+     "        return (type(req_id).__name__, req_id)",
+     "proxy.correlation_is_direction_scoped"),
+    # The `resultType` discriminator is ignored, so ANY modern result carrying a key called
+    # `inputRequests` is read as MRTR — the structural scan §10.6 rejects, by the back door.
+    ("M173-result-type-discriminator-ignored", PROXY,
+     ('    if (modern and isinstance(result, dict)\n'
+      '            and result.get("resultType") == "input_required"\n'
+      '            and "inputRequests" in result):\n'),
+     '    if modern and isinstance(result, dict) and "inputRequests" in result:\n',
+     "proxy.modern_sampling_requests_are_a_keyed_map_not_a_list"),
     ("I1-arm-counter-stops-counting", SELFTEST,
      "    global _ARMS_RUN\n    _ARMS_RUN += 1\n",
      "    global _ARMS_RUN\n",
