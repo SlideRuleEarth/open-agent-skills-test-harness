@@ -614,6 +614,23 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   sees no EOF, and the EOF arrives later for the wrong reason. Attribution needs a **sole
   holder** — each stage closes its copy as soon as it has passed it on, the driver's own close
   included, or EOF never arrives at all and the case hangs instead of passing.
+- **A NEGATIVE observation is only about the subject once every other candidate is gone.** The
+  negative control above requires "no EOF" to mean "the helper survived" — but non-EOF only
+  ever means *somebody* holds a writer, so taken too early it is satisfied by an ancestor and
+  proves nothing. Two defects then cancel: a helper that closes its writer early and survives,
+  plus a proxy that keeps its copy until exit, gives a positive case passing on the proxy's
+  exit and a control passing on the proxy's copy, with the survivor invisible to both. Fixing
+  it is ordering, not extra assertions — wait for every ancestor to exit, *then* observe.
+  **Ask what else could satisfy a negative observation, and eliminate those first**; and close
+  with the positive (kill the group, require EOF), so the control cannot pass by observing
+  nothing at all.
+- **Cleanup targets come from the thing being cleaned up, never from discovery.** The control
+  has to kill a group it deliberately left running, and the only non-guessing source for that
+  group id is the process in it — so the helper reports its own PGID in its readiness record,
+  along with a driver-supplied nonce that stops a leftover helper from answering for this run.
+  Anything else is the driver deciding for itself which processes belong to the run, which is
+  how the `rmtree(dirname(cwd))` fixture above deleted its own working tree. The driver also
+  refuses to signal its own group or an ancestor's, for the same reason.
 - **A detector is worth what its negative control is worth.** "The helper holds the descriptor
   for life" and "every ancestor closed its copy" are fixture assertions, and the previous three
   findings are all about assertions nobody made the code demonstrate. So one case **suppresses
