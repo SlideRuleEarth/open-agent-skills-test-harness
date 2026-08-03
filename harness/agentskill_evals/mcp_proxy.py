@@ -552,6 +552,31 @@ def _nonempty_list(value: Any) -> bool:
 # Correlation and protocol state (§10.2, §10.4)
 # ---------------------------------------------------------------------------------------
 
+def request_id_key(req_id: Any) -> Any:
+    """The identity of a JSON-RPC request id: STRINGS AND NUMBERS ARE DIFFERENT DOMAINS, and
+    WITHIN NUMBERS THE VALUE IS THE ID.
+
+    `1` and `"1"` are different ids per JSON-RPC, so the domain marker keeps them apart. But
+    `1` and `1.0` are the same JSON number, and a peer may echo a response id in either
+    spelling — "It MUST be the same as the value of the id member in the Request Object" is
+    about the value. Keying on Python's type name split them, so a request on `1` answered on
+    `1.0` read as uncorrelated and both could be live at once (review, PR #100). One numeric
+    domain fixes it for free: `1 == 1.0` in Python and their hashes agree, `0` and `-0.0`
+    likewise, and large integers keep their exact value rather than being floated.
+
+    Booleans would alias `1` here, and are excluded at the envelope instead — see
+    `valid_request_id`. That is the only place they can enter.
+
+    PUBLIC BECAUSE THE C3-3 PROBE MUST MEASURE THE SAME IDENTITY THIS ENFORCES. That probe
+    prices the spent-id rule by asking whether a CLI ever reuses an id; it originally
+    deduplicated on `repr`, under which `1` and `1.0` are distinct and `0` and `-0.0` are
+    distinct — so a CLI whose reuse the proxy would refuse was reported as not reusing at all
+    (review, PR #100). A measurement of a rule has to use the rule's own definition, or it
+    measures something adjacent to it.
+    """
+    return ("s", req_id) if isinstance(req_id, str) else ("n", req_id)
+
+
 class InFlight:
     """Outstanding requests, ONE MAP PER DIRECTION.
 
@@ -579,18 +604,7 @@ class InFlight:
         self._spent: dict[str, dict[Any, str]] = {C2S: {}, S2C: {}}
 
     def _key(self, req_id: Any) -> Any:
-        # STRINGS AND NUMBERS ARE DIFFERENT DOMAINS; WITHIN NUMBERS THE VALUE IS THE ID.
-        # `1` and `"1"` are different ids per JSON-RPC, so the domain marker keeps them apart.
-        # But `1` and `1.0` are the same JSON number, and a peer may echo a response id in
-        # either spelling — "It MUST be the same as the value of the id member in the Request
-        # Object" is about the value. Keying on Python's type name split them, so a request on
-        # `1` answered on `1.0` read as uncorrelated and both could be live at once (review,
-        # PR #100). One numeric domain fixes it for free: `1 == 1.0` in Python and their
-        # hashes agree, and large integers keep their exact value rather than being floated.
-        #
-        # Booleans would alias `1` here, and are excluded at the envelope instead — see
-        # `valid_request_id`. That is the only place they can enter.
-        return ("s", req_id) if isinstance(req_id, str) else ("n", req_id)
+        return request_id_key(req_id)
 
     def record(self, direction: str, req_id: Any, method: str,
                version: str | None) -> None | Anomaly:
@@ -633,15 +647,17 @@ class InFlight:
             # WHAT IS NOT SPENT is an id whose request never reached the server: an off-list
             # `tools/call` is refused here, so nothing can ever answer it. See `release`.
             #
-            # THE COST IS REAL AND NOT YET MEASURED, which the era gate's own history says to
+            # THE COST IS REAL AND NOT YET PRICED, which the era gate's own history says to
             # state plainly rather than assume. Reuse after a response is LEGAL — the rule is
             # only that an id may not match one "the sender has issued and not yet received a
             # response for" — so this refuses conforming client behaviour, and §10.5 warns that
-            # failing a clean cell is a failure just as much as forwarding a definition. Probe
-            # C3-3 (§9) is written and unrun: every SDK id allocator in reach is a monotonic
-            # counter, which is a belief about the fleet, not a measurement of it. What makes
-            # the risk bounded is that a client which does reuse ids fails LOUDLY here, with
-            # this kind named, on the first run against a real CLI — not silently.
+            # failing a clean cell is a failure just as much as forwarding a definition.
+            #
+            # Probe C3-3 (§9) reads every CLI's id sequence out of the C3-2 run for free, and
+            # reading is not pricing: a reuse would settle it, but no short run can settle the
+            # negative, because allocation is not exercised once per connection the way
+            # pipelining is. What bounds the risk is that this is a NAMED anomaly — a client
+            # that reuses ids fails loudly here on the first run against a real CLI.
             return Anomaly(CANCELLED_ID_REUSE if spent == SPENT_BY_CANCEL else SPENT_ID_REUSE,
                            f"{direction} id {req_id!r} was {spent} and is spent for this "
                            f"connection: a later response to that request could not be told "

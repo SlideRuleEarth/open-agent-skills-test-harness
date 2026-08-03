@@ -110,6 +110,23 @@ def _log(event: str, **fields) -> None:
         os.write(2, data)
 
 
+def _id_key(req_id):
+    """A request id's IDENTITY, for the C3-3 reading: domain marker plus value.
+
+    Deliberately identical to `agentskill_evals.mcp_proxy.request_id_key`, and deliberately
+    NOT imported from it: this file is a fixture that CLIs spawn directly, in a masked HOME
+    with an unrelated cwd, so it must run with nothing but the standard library on the path.
+    Duplication of a two-line rule is the lesser evil — but a duplicate that could drift is
+    not, so `verify_mcp_fixtures.py` asserts the two agree on the cases that distinguish them
+    (`1` vs `"1"`, `1` vs `1.0`, `0` vs `-0.0`).
+
+    Logged as a JSON array, which reparses to a list whose comparison and hash match the
+    proxy's tuple once the reader converts it — `("n", 1) == ("n", 1.0)` in Python, which is
+    the point of the numeric domain.
+    """
+    return ["s", req_id] if isinstance(req_id, str) else ["n", req_id]
+
+
 def _send(msg: dict) -> None:
     os.write(1, (json.dumps(msg) + "\n").encode())
 
@@ -498,6 +515,16 @@ def main() -> int:
 
         method = msg.get("method")
         req_id = msg.get("id")
+        if method is not None and req_id is not None:
+            # THE C3-3 READING, logged structurally from the PARSED message rather than left
+            # to be recovered from `raw` above. `raw` is a truncated diagnostic — 4096
+            # characters — so a longer request reparsed as JSON simply fails and its id
+            # vanishes from the measurement, and a probe that silently omits requests cannot
+            # answer "did this CLI ever reuse an id" (review, PR #100). The value is
+            # canonicalized to the same domain/value identity `mcp_proxy.request_id_key`
+            # enforces, so `1` and `1.0` — and `0` and `-0.0` — count as one id here exactly
+            # as the proxy would treat them.
+            _log("request_id", id_key=_id_key(req_id), method=method)
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
 
         if req_id is None:

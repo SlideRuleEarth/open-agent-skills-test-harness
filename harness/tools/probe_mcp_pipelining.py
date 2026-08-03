@@ -184,37 +184,45 @@ PIPELINES = "pipelines"          # requests arrived while the response was held
 WAITS = "waits"                  # nothing arrived until the response went out
 
 
+# How many requests one connection must carry before "no reuse observed" is worth anything.
+# NOT a threshold that makes C3-3 a priced trade — see `id_summary`. It only separates runs
+# that could have shown reuse from runs that structurally could not.
+ID_SAMPLE_FLOOR = 2
+
+
 def request_ids(recs: list[dict]) -> list:
-    """Every JSON-RPC request id the CLI sent, in order — the C3-3 reading.
+    """Every request id the CLI sent, in order, as the PROXY would identify them.
 
     §10.4 spends a request id for the connection once it has reached the server, which refuses
     a client behaviour the spec permits: reuse after a response. That refusal needs a price,
-    and the price is "does any shipped CLI reuse ids". The shim logs each inbound line raw, so
-    this run already contains the answer and no separate probe has to be paid for.
+    and the price is "does any shipped CLI reuse ids". The shim logs each one structurally, so
+    this run already contains the reading and no separate probe has to be paid for.
+
+    Read from the shim's `request_id` event, NOT by reparsing its `rx` record. `rx` truncates
+    at 4096 characters as a diagnostic, so reparsing it drops any longer request entirely —
+    and a measurement that silently omits requests cannot answer a question about reuse
+    (review, PR #100). The shim emits the id after parsing the full line, already canonicalized
+    to `mcp_proxy.request_id_key`'s domain/value identity.
     """
-    out = []
-    for r in recs:
-        if r.get("event") != "rx":
-            continue
-        try:
-            msg = json.loads(r["raw"])
-        except (json.JSONDecodeError, ValueError, KeyError):
-            continue
-        if isinstance(msg, dict) and "method" in msg and "id" in msg:
-            out.append(msg["id"])
-    return out
+    return [tuple(r["id_key"]) for r in recs
+            if r.get("event") == "request_id" and isinstance(r.get("id_key"), list)]
 
 
 def reuses_ids(row: dict) -> bool | None:
-    """Did this CLI reuse a request id? `None` when too few were seen to tell.
+    """Did this CLI reuse a request id? `None` when the run could not have shown it.
 
-    One request answers nothing: every allocator looks unique at n=1. The question needs a
-    session with several requests, which is what the paid rows produce.
+    `True` is a real answer — a reuse was observed, and §10.4 would refuse it. `False` means
+    only "no reuse among the requests this run happened to contain", which is why `id_summary`
+    never turns it into a fleet-wide price.
+
+    The ids are compared as the proxy identifies them, so `1` and `1.0` — and `0` and `-0.0` —
+    count as one. Deduplicating on `repr` instead reported no reuse for exactly the pairs the
+    proxy would refuse (review, PR #100).
     """
     ids = row.get("request_ids") or []
-    if len(ids) < 2:
+    if len(ids) < ID_SAMPLE_FLOOR:
         return None
-    return len(set(map(repr, ids))) != len(ids)
+    return len(set(ids)) != len(ids)
 
 
 def classify(row: dict) -> str:
@@ -297,20 +305,33 @@ def summary(rows: list[dict]) -> list[str]:
 
 
 def id_summary(rows: list[dict]) -> list[str]:
-    """C3-3's paragraph, held to the same rule as C3-2's: no fleet claim without every row."""
+    """C3-3's paragraph. A POSITIVE result is conclusive; a negative one never is.
+
+    This asymmetry is the finding, not a hedge. Pipelining is exercised exactly once per
+    connection — the `initialize` window either has traffic in it or does not — so one clean
+    run per CLI settles C3-2. ALLOCATION IS NOT LIKE THAT: a run that sends ids 0 and 1 says
+    nothing about what the fourth request will use, and a cell runs far longer than a probe
+    does. An earlier version treated any two distinct ids as a completed answer and went on to
+    claim the rule "costs the fleet nothing", which is a conclusion about sessions it never
+    observed (review, PR #100).
+
+    So the negative branch reports the SAMPLE and calls the rule unpriced, every time. Pricing
+    it needs a workload that actually stresses the allocator — many `tools/call`s on one
+    connection — which is a probe of its own, named in §9.
+    """
     reusing = [r["cli"] for r in rows if reuses_ids(r) is True]
-    untold = [r["cli"] for r in rows if reuses_ids(r) is None]
+    counts = {r["cli"]: len(r.get("request_ids") or []) for r in rows}
     if reusing:
         return [(f"C3-3 — REQUEST IDS ARE REUSED by: {', '.join(reusing)}. §10.4 spends an id "
                  f"once it reaches the server, so those cells FAIL. That rule refuses a client "
-                 f"behaviour the spec permits, and this is the fleet declining to pay for it.")]
-    if untold:
-        return [(f"C3-3 — no reuse among the CLIs that sent enough requests to tell, but "
-                 f"{', '.join(untold)} sent fewer than two, so the fleet-wide answer is "
-                 f"UNKNOWN. §10.4's spent-id rule stays an unpriced strictness until it is.")]
-    return [("C3-3 — no CLI reused a request id, across the whole fleet. §10.4's spent-id rule "
-             "therefore costs nothing today, on the same terms as the era gate: measured, not "
-             "assumed, and one CLI release from needing to be re-measured.")]
+                 f"behaviour the spec permits, and this is the fleet declining to pay for it. "
+                 f"A positive result needs no sample size: one reuse is the answer.")]
+    seen = ", ".join(f"{c}={n}" for c, n in counts.items())
+    return [(f"C3-3 — no reuse OBSERVED, over {sum(counts.values())} request(s) total "
+             f"({seen}). This does NOT price §10.4's spent-id rule and must not be read as "
+             f"doing so: allocation is not exercised once per connection the way pipelining "
+             f"is, so a short run says nothing about the id the next request will carry. The "
+             f"rule stays a deliberate strictness until a stress workload measures it (§9).")]
 
 
 def main() -> int:
@@ -331,8 +352,10 @@ def main() -> int:
         rows.append(r)
         era = f"{r['era']['era']}/{r['era']['version']}" if r["era"] else "-"
         print(f"{cli:8} {era:22} rc={str(r['rc']):5} {r['elapsed_s']:>6}s  {verdict(r)}")
-        reuse = {True: "REUSES IDS", False: "no reuse", None: "too few to tell"}[reuses_ids(r)]
-        print(f"{'':8} ids: {r['request_ids']} — {reuse}")
+        reuse = {True: "REUSES IDS", False: "no reuse in this sample",
+                 None: "too few requests to tell"}[reuses_ids(r)]
+        shown = [k[1] for k in r["request_ids"]]
+        print(f"{'':8} ids: {shown} — {reuse}")
 
     print()
     for paragraph in summary(rows):

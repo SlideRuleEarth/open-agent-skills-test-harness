@@ -1321,8 +1321,8 @@ MUTATIONS = [
     # Numeric ids keyed by Python's type name again, so a request on `1` answered on `1.0`
     # reads as uncorrelated — and both can be live at once.
     ("M172-numeric-ids-keyed-by-python-type", PROXY,
-     '        return ("s", req_id) if isinstance(req_id, str) else ("n", req_id)',
-     "        return (type(req_id).__name__, req_id)",
+     '    return ("s", req_id) if isinstance(req_id, str) else ("n", req_id)',
+     "    return (type(req_id).__name__, req_id)",
      "proxy.correlation_is_direction_scoped"),
     # The `resultType` discriminator is ignored, so ANY modern result carrying a key called
     # `inputRequests` is read as MRTR — the structural scan §10.6 rejects, by the back door.

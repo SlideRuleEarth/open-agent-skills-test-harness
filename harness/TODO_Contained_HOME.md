@@ -293,7 +293,7 @@ harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N ar
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
 python3 harness/tools/mutate_mcp.py                           # 181/181 production + 2/2 instrument
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 202 checks
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 218 checks
 git diff --check
 ```
 
@@ -400,6 +400,28 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   those stayed open. **When an argument lands, re-read what it actually quantifies over and go
   fix every case it covers** — not the one that prompted it. A reviewer should not have to
   walk you along a rule's own scope.
+- **A measurement of a rule must use the RULE'S OWN definition of its terms.** C3-3 asks "does
+  any CLI reuse a request id", to price a rule under which `1` and `1.0` are the same id and
+  `0` and `-0.0` are the same id. It deduplicated on `repr`, under which none of those pairs
+  match — so the CLI whose reuse the proxy would refuse was the one the probe reported as
+  clean. Same family as the `inputRequests` fixture written from the code: the check and the
+  thing checked have to disagree when the thing is wrong, and they cannot if the check
+  re-derives the definition instead of importing it. `request_id_key` is now exported for the
+  probe, and where importing is impossible — the shim runs with only the stdlib reachable —
+  the copy is asserted equal to the original on the cases that distinguish them.
+- **"Absence of a positive" needs a sample size argument, and it is not the same for every
+  question.** C3-2 and C3-3 ride on one run, and only one of them is settled by it: pipelining
+  happens exactly once per connection, so a clean run is an answer, while an allocator that
+  emitted 0 and 1 has said nothing about the fourth request. I gave both the same treatment
+  because they came from the same log. **Before concluding from a negative, ask how many times
+  the run gave the behaviour a chance to appear** — and if a cell exercises it more often than
+  the probe did, the probe has not priced it.
+- **A compound assertion can be unfalsifiable by operator precedence.** `"costs" not in t and
+  "unpriced" in t or "does NOT price" in t` is `(A and B) or C`, and C was true by
+  construction — a check that could not fail, written while fixing a finding about checks that
+  cannot fail. Caught by reading it back rather than by running it, because it passed.
+  **Parenthesize every mixed `and`/`or` in an assertion, and prefer several `check()` calls to
+  one clever one**: a check whose failure mode you cannot state is not a check.
 - **Refusing something legal is a cost, and it needs a price or a flag.** The same rule refuses
   a client behaviour the spec permits — id reuse after a response. §4 already knew over-strict
   is not the safe direction, and §10.5 says failing a clean cell is as much a failure as

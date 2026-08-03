@@ -862,27 +862,82 @@ check("a run where NOTHING answered claims nothing either",
       "costs the fleet nothing" not in _nothing and "2 of 2" in _nothing, _nothing)
 check("only a complete run earns the fleet-wide claim",
       "across the whole fleet" in _clean and "costs the fleet nothing" in _clean, _clean)
-# C3-3 rides on the same run and is held to the same rule: §10.4 spends a request id once it
-# reaches the server, refusing a reuse the spec permits, and that needs a price.
+# C3-3 rides on the same run: §10.4 spends a request id once it reaches the server, refusing a
+# reuse the spec permits, and that strictness needs a price. The probe must measure the
+# identity the PROXY enforces, and must not overstate what a short run establishes.
+sys.path.insert(0, os.path.dirname(HERE))
+from agentskill_evals.mcp_proxy import request_id_key  # noqa: E402
+
+sys.path.insert(0, FIXTURES)
+import probe_era_mcp_server as SHIM_MOD  # noqa: E402
+
+# The shim cannot import the proxy — CLIs spawn it with only the stdlib reachable — so it
+# carries its own copy of the rule. A copy that could drift silently is worse than the
+# duplication, so the two are checked against the cases that distinguish them.
+for _v in (1, 1.0, 0, -0.0, "1", "a", 2**70, -5):
+    check(f"the shim identifies id {_v!r} exactly as the proxy does",
+          tuple(SHIM_MOD._id_key(_v)) == request_id_key(_v),
+          (SHIM_MOD._id_key(_v), request_id_key(_v)))
+check("...so the pairs the proxy calls equal are equal in the shim too",
+      tuple(SHIM_MOD._id_key(1)) == tuple(SHIM_MOD._id_key(1.0))
+      and tuple(SHIM_MOD._id_key(0)) == tuple(SHIM_MOD._id_key(-0.0))
+      and tuple(SHIM_MOD._id_key(1)) != tuple(SHIM_MOD._id_key("1")))
 check("one request cannot answer whether a CLI reuses ids",
-      PIPE.reuses_ids({"request_ids": [0]}) is None
+      PIPE.reuses_ids({"request_ids": [("n", 0)]}) is None
       and PIPE.reuses_ids({"request_ids": []}) is None)
 check("a repeated id is reuse; a monotonic run is not",
-      PIPE.reuses_ids({"request_ids": [0, 1, 1]}) is True
-      and PIPE.reuses_ids({"request_ids": [0, 1, 2]}) is False)
-check("`1` and `\"1\"` are different ids, as JSON-RPC says",
-      PIPE.reuses_ids({"request_ids": [1, "1"]}) is False)
-check("ids come from REQUESTS only — a response echoes the id it answers",
-      PIPE.request_ids([{"event": "rx", "raw": '{"id":1,"method":"ping"}'},
-                        {"event": "rx", "raw": '{"id":1,"result":{}}'},
-                        {"event": "rx", "raw": 'not json'},
-                        {"event": "era", "era": "legacy"}]) == [1])
-check("an incomplete C3-3 does not claim the fleet either",
-      "UNKNOWN" in " ".join(PIPE.id_summary([{"cli": "a", "request_ids": [0, 1]},
-                                             {"cli": "b", "request_ids": [0]}])))
-check("...and a complete one does",
-      "across the whole fleet" in " ".join(PIPE.id_summary([{"cli": "a",
-                                                             "request_ids": [0, 1]}])))
+      PIPE.reuses_ids({"request_ids": [("n", 0), ("n", 1), ("n", 1)]}) is True
+      and PIPE.reuses_ids({"request_ids": [("n", 0), ("n", 1), ("n", 2)]}) is False)
+# THE FALSE NEGATIVE: `repr` dedup called these distinct, so a CLI whose reuse the proxy would
+# refuse was reported as not reusing at all (review, PR #100).
+check("`1` then `1.0` is REUSE, because the proxy says it is",
+      PIPE.reuses_ids({"request_ids": [request_id_key(1), request_id_key(1.0)]}) is True)
+check("`0` then `-0.0` is reuse too",
+      PIPE.reuses_ids({"request_ids": [request_id_key(0), request_id_key(-0.0)]}) is True)
+check("...but `1` and `\"1\"` stay different ids, as JSON-RPC says",
+      PIPE.reuses_ids({"request_ids": [request_id_key(1), request_id_key("1")]}) is False)
+check("ids are read from the structured event, not reparsed from the truncated `raw`",
+      PIPE.request_ids([{"event": "request_id", "id_key": ["n", 1], "method": "ping"},
+                        {"event": "rx", "raw": '{"id":9,"method":"ping"}'},
+                        {"event": "request_id", "id_key": ["s", "a"], "method": "ping"},
+                        {"event": "era", "era": "legacy"}]) == [("n", 1), ("s", "a")])
+# A NEGATIVE C3-3 IS NEVER A PRICE. Pipelining happens once per connection; allocation does
+# not, so no run length turns "no reuse seen" into "the rule costs nothing".
+_two = " ".join(PIPE.id_summary([{"cli": "a", "request_ids": [("n", 0), ("n", 1)]}]))
+check("a clean C3-3 never claims the rule costs the fleet nothing",
+      "costs the fleet nothing" not in _two and "does NOT price" in _two, _two)
+check("...and says so however long the run was",
+      all("does NOT price" in " ".join(
+          PIPE.id_summary([{"cli": "a", "request_ids": [("n", i) for i in range(n)]}]))
+          for n in (2, 5, 50)))
+check("...it reports the sample it actually saw",
+      "2 request(s)" in _two and "a=2" in _two, _two)
+check("a reuse IS conclusive, with no sample-size caveat",
+      "FAIL" in " ".join(PIPE.id_summary([{"cli": "a",
+                                           "request_ids": [("n", 0), ("n", 0)]}])))
+
+print()
+print("E15. C3-3: the shim logs a request id for EVERY request, whatever its size")
+# The reading is only as good as the record. `rx` truncates at 4096 characters as a
+# diagnostic, and the first version of this measurement reparsed that — so a request longer
+# than the cut simply vanished, and a probe that silently omits requests cannot answer a
+# question about reuse (review, PR #100). Driven live, because the defect lives in the shim's
+# logging path and a unit test of the reader would not see it.
+_big = "x" * 9000
+_recs_ids = run([legacy_init(1),
+                 {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                  "params": {"name": "echo", "arguments": {"text": _big}}},
+                 {"jsonrpc": "2.0", "id": "tail", "method": "ping"}])[2]
+_ids = PIPE.request_ids(_recs_ids)
+_raw_ids = [r for r in _recs_ids if r.get("event") == "rx" and len(r.get("raw", "")) >= 4096]
+check("a request far longer than the `raw` cut still yields its id",
+      _ids == [("n", 1), ("n", 2), ("s", "tail")], _ids)
+check("...and the `raw` record really was truncated, so the case was exercised",
+      len(_raw_ids) == 1 and len(_raw_ids[0]["raw"]) == 4096, [len(r["raw"]) for r in _raw_ids])
+check("notifications carry no id and produce no record",
+      PIPE.request_ids(run([legacy_init(1),
+                            {"jsonrpc": "2.0", "method": "notifications/initialized"}])[2])
+      == [("n", 1)])
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")

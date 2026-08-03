@@ -9501,10 +9501,10 @@ def _check_mcp_proxy_decisions(failures, verbose):
 
     # 8) Subscriptions retire at BOTH orderly ends. An entry left resident forever would
     #    correlate a fresh response against stale state, or read a legitimate reply as
-    #    unrequested. What happens to the id afterwards differs by which end it was: a
-    #    graceful closure frees it outright, while a CANCELLATION leaves a tombstone, since a
-    #    straggler may still be coming and must not be confused with a reply to whatever
-    #    reused it (§10.4, and arm 8d).
+    #    unrequested. NEITHER end returns the id: both ends are messages from the server, and
+    #    §10.4 spends an id once it has reached the server whatever ended it. They differ only
+    #    in what a LATER message on that id is called — the documented race after a
+    #    cancellation, a protocol violation after an answer (arm 8d).
     sub = P.InFlight()
     sub.record("c2s", 1, "subscriptions/listen", "2026-07-28")
     cancel = {"jsonrpc": "2.0", "method": "notifications/cancelled",
@@ -9513,7 +9513,8 @@ def _check_mcp_proxy_decisions(failures, verbose):
                "result": {"resultType": "complete", "_meta": {P.SUB_KEY: 1}}}
     cid = P.cancelled_id(cancel)
     retired = sub.cancel("c2s", cid)
-    # Through `decide`: the cancellation is forwarded AND frees the id it names.
+    # Through `decide`: the cancellation is forwarded AND retires the request it names, which
+    # is not the same as freeing its id — the id stays spent (arm 8d).
     live = ctx()
     opened_sub = act({"jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen",
                       "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}},
