@@ -27,6 +27,13 @@ reasons already live — the one function every caller reads — never as a para
 by one caller. The tell is a new boolean that only one call site checks: the other callers
 will keep publishing their old conclusion, and the exit status will disagree with the output.
 
+The dual of that mistake is one field asked to carry two independent facts. Why something
+stopped and what happened while it was cleaning up are not alternatives — both are true of the
+same ending — so a verdict over them is a conjunction over every fact, never a lookup on
+whichever arrived last. The tell is a flat enumeration of things that occur at *different
+phases* of one lifecycle: if two entries can be true at once, they belong on different axes,
+and the axes are usually asymmetric in a way that names the case you forgot.
+
 **Every assertion must be able to fail, and you must be able to say how.** Before adding a
 check, write down what a broken implementation produces and confirm your assertion rejects it.
 Three specific traps, all of which have shipped here: a mixed `and`/`or` that is true by

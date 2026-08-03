@@ -541,6 +541,27 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   which proves nothing and reads like a tooling problem. The arm calls through a helper that
   converts an exception into a value the assertion rejects. Same principle as the rest of §4:
   the arm has to be able to *observe* the failure it is named for.
+- **One field cannot carry both WHY something stopped and WHAT HAPPENED on the way out.**
+  §10.5.1 was drafted as a single closed list of "reasons an instance can end", and it read as
+  complete because every entry in it was real. It was not: `client_eof → shutdown_write_failed
+  → shutdown_child_killed` is one ending with three facts in it, and a single-slot reason has
+  to drop two. Whichever it drops is the load-bearing one — drop the trigger and a protocol
+  anomaly reads as a clean client close; drop the outcomes and a failed process-group teardown,
+  which is a surviving grandchild holding a credential, is certified clean by the record meant
+  to prove the opposite. The fix is two axes and a **monotonic conjunction** over both, not a
+  lookup on the last event. **The tell is enumerating things that can happen at different
+  phases of one lifecycle into one flat list**: ask whether two entries can be true of the same
+  ending, and if they can, they are not alternatives. The second tell is asymmetry once the
+  axes are split — `read_failed` had no shutdown-phase counterpart, and that missing
+  `shutdown_read_failed` is the §4 defect above (a swallowed `OSError` presenting as clean EOF)
+  waiting to happen in the proxy instead of the shim.
+- **Totality over an enumeration says nothing about the endings that write no record.** The
+  same section's verification plan was "drive every reason and check every reason has a
+  verdict" — which cannot reach `SIGKILL`, a crash after the start record, or a terminator
+  truncated mid-write, because in each the process that would name a reason is already gone.
+  Those need the absence rule (a start with no well-formed terminator is an anomaly) and their
+  own cases, half of them driven against the *reader* with synthetic logs rather than against
+  the program. A closed enumeration is evidence about the endings that can speak.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s
@@ -637,14 +658,18 @@ ABA fix and its route to `parallel_safe_config = True`.
   wire-level driver → the adapter integration that unlocks `tools:`.
   Everything before the last slice cannot affect any run, which is the point: this is harness
   code in the request path of every gated cell.
-  **The I/O half starts from §10.5.1, written before its code**: eleven ways an instance can
-  end, arriving from three directions, classified clean-or-anomalous by one total function
-  that every consumer reads — terminator record, per-instance verdict, `verify_post_run` —
-  with no default-clean branch, so a reason added without a verdict fails the cell instead of
-  passing it. Phase is part of the reason rather than a flag a caller applies, which dissolves
-  the "`EPIPE` is clean in exactly one place" conditional into two distinct reasons. That
-  enumeration exists up front because this is the defect shape §4 has already paid for twice
-  on #100, and eleven reasons from three directions is exactly the setup that produces it.
+  **The I/O half starts from §10.5.1, written before its code**: every way an instance can end,
+  on two axes — one latched trigger, plus the cleanup outcomes accumulated after it — with the
+  verdict a monotonic conjunction over both rather than a lookup on whatever happened last.
+  One total `is_clean` that every consumer reads (terminator record, per-instance verdict,
+  `verify_post_run`), no default-clean branch, and phase carried in the reason rather than in a
+  flag each caller applies, which dissolves the "`EPIPE` is clean in exactly one place"
+  conditional into distinct reasons. Endings that no enumeration can reach — `SIGKILL`, a crash
+  after the start record, a truncated terminator — are covered by one absence rule and are
+  tested separately, because totality over the enum cannot see them. That enumeration exists up
+  front because this is the defect shape §4 has already paid for twice on #100; the single-axis
+  first draft reproduced it *in the section written to prevent it* (review, #101), which is the
+  cheapest possible demonstration that it needed writing down.
   **Probe C3-2 resolved 2026-07-31** (`tools/probe_mcp_pipelining.py`): no CLI pipelines
   requests behind `initialize`, which is what licenses §10.2 REFUSING one. A pending
   negotiation cannot govern traffic — the pipelined request's response may arrive first,
