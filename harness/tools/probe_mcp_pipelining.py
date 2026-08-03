@@ -140,7 +140,7 @@ def probe(cli: str, *, timeout: int, verbose: bool) -> dict:
     recs = _read_log(log)
     hit = next((r for r in recs if r["event"] == "pipelining"), None)
     era = next((r for r in recs if r["event"] == "era"), None)
-    ids = request_ids(recs)
+    timeline = id_timeline(recs)
     # `connected` means AN ERA WAS OBSERVED, not "the log exists". The shim writes `start`
     # before reading a byte, so a CLI that spawns the server and dies would otherwise count as
     # connected — and then, having sent no `initialize`, be classified as modern with nothing
@@ -153,9 +153,9 @@ def probe(cli: str, *, timeout: int, verbose: bool) -> dict:
         "spawned": bool(recs),
         "pipelining": hit,
         "era": era,
-        # C3-3 rides along free: the shim already logs every inbound line, so the id sequence
-        # is a READING of this same run rather than another one. See `reuses_ids`.
-        "request_ids": ids,
+        # C3-3 rides along free: the shim already records arrivals and departures, so the id
+        # timeline is a READING of this same run rather than another one. See `id_findings`.
+        "id_timeline": timeline,
         "rc": rc,
         "timed_out": timed_out,
         "elapsed_s": round(elapsed, 1),
@@ -190,39 +190,77 @@ WAITS = "waits"                  # nothing arrived until the response went out
 ID_SAMPLE_FLOOR = 2
 
 
-def request_ids(recs: list[dict]) -> list:
-    """Every request id the CLI sent, in order, as the PROXY would identify them.
+def id_timeline(recs: list[dict]) -> list[tuple[str, tuple]]:
+    """Request arrivals and response departures, IN WIRE ORDER, as the proxy would see them.
 
     §10.4 spends a request id for the connection once it has reached the server, which refuses
     a client behaviour the spec permits: reuse after a response. That refusal needs a price,
-    and the price is "does any shipped CLI reuse ids". The shim logs each one structurally, so
-    this run already contains the reading and no separate probe has to be paid for.
+    and the price is "does any shipped CLI reuse ids". The shim records both halves, so this
+    run already contains the reading and no separate probe has to be paid for.
 
-    Read from the shim's `request_id` event, NOT by reparsing its `rx` record. `rx` truncates
-    at 4096 characters as a diagnostic, so reparsing it drops any longer request entirely —
-    and a measurement that silently omits requests cannot answer a question about reuse
-    (review, PR #100). The shim emits the id after parsing the full line, already canonicalized
-    to `mcp_proxy.request_id_key`'s domain/value identity.
+    Read from the shim's structured events, NOT by reparsing its `rx` record. `rx` truncates at
+    4096 characters as a diagnostic, so reparsing it drops any longer request entirely — and a
+    measurement that silently omits requests cannot answer a question about reuse (review, PR
+    #100). Ids arrive already canonicalized to `mcp_proxy.request_id_key`'s identity.
     """
-    return [tuple(r["id_key"]) for r in recs
-            if r.get("event") == "request_id" and isinstance(r.get("id_key"), list)]
+    kinds = {"request_id": "req", "response_id": "resp"}
+    return [(kinds[r["event"]], tuple(r["id_key"])) for r in recs
+            if r.get("event") in kinds and isinstance(r.get("id_key"), list)]
+
+
+def id_findings(timeline: list[tuple[str, tuple]]) -> dict:
+    """Separate the two ways an id can repeat. THEY ARE DIFFERENT FINDINGS.
+
+    A repeat while the first request is still UNANSWERED is a live duplicate, which JSON-RPC
+    forbids outright — "the request ID MUST NOT match the ID of any other request the sender
+    has issued and not yet received a response for" — and which the proxy refuses as
+    `duplicate_request_id`. It says nothing about the stricter rule.
+
+    A repeat AFTER the response went out is the post-response reuse the spec permits and §10.4
+    refuses. That, and only that, prices the rule.
+
+    Conflating them meant a client that pipelined `ping(1)` behind a held `initialize(1)` was
+    reported as proof that §10.4 "refuses a client behaviour the spec permits" — when the
+    proxy would have refused it anyway, for violating JSON-RPC (review, PR #100).
+    """
+    live: set = set()
+    answered: set = set()
+    duplicates: list = []
+    reuse: list = []
+    requests = 0
+    for kind, key in timeline:
+        if kind == "req":
+            requests += 1
+            if key in live:
+                duplicates.append(key)
+            elif key in answered:
+                reuse.append(key)
+            live.add(key)
+        else:
+            live.discard(key)
+            answered.add(key)
+    return {"requests": requests, "live_duplicates": duplicates,
+            "post_response_reuse": reuse}
+
+
+def request_ids(timeline: list[tuple[str, tuple]]) -> list:
+    """The arrival-ordered request ids from a timeline, for display."""
+    return [key for kind, key in timeline if kind == "req"]
 
 
 def reuses_ids(row: dict) -> bool | None:
-    """Did this CLI reuse a request id? `None` when the run could not have shown it.
+    """Did this CLI reuse an id AFTER it was answered? `None` when the run cannot say.
 
-    `True` is a real answer — a reuse was observed, and §10.4 would refuse it. `False` means
-    only "no reuse among the requests this run happened to contain", which is why `id_summary`
-    never turns it into a fleet-wide price.
-
-    The ids are compared as the proxy identifies them, so `1` and `1.0` — and `0` and `-0.0` —
-    count as one. Deduplicating on `repr` instead reported no reuse for exactly the pairs the
-    proxy would refuse (review, PR #100).
+    `True` is a real answer — the exact behaviour §10.4 refuses and the spec allows. `False`
+    means only "not among the requests this run happened to contain", which is why
+    `id_summary` never turns it into a fleet-wide price. A live duplicate is neither: it is
+    reported separately, because the proxy rejects it on grounds that have nothing to do with
+    the rule being priced.
     """
-    ids = row.get("request_ids") or []
-    if len(ids) < ID_SAMPLE_FLOOR:
+    found = id_findings(row.get("id_timeline") or [])
+    if found["requests"] < ID_SAMPLE_FLOOR:
         return None
-    return len(set(ids)) != len(ids)
+    return bool(found["post_response_reuse"])
 
 
 def classify(row: dict) -> str:
@@ -319,19 +357,33 @@ def id_summary(rows: list[dict]) -> list[str]:
     it needs a workload that actually stresses the allocator — many `tools/call`s on one
     connection — which is a probe of its own, named in §9.
     """
-    reusing = [r["cli"] for r in rows if reuses_ids(r) is True]
-    counts = {r["cli"]: len(r.get("request_ids") or []) for r in rows}
+    found = {r["cli"]: id_findings(r.get("id_timeline") or []) for r in rows}
+    reusing = [c for c, f in found.items() if f["post_response_reuse"]]
+    duplicating = [c for c, f in found.items() if f["live_duplicates"]]
+    out = []
     if reusing:
-        return [(f"C3-3 — REQUEST IDS ARE REUSED by: {', '.join(reusing)}. §10.4 spends an id "
-                 f"once it reaches the server, so those cells FAIL. That rule refuses a client "
-                 f"behaviour the spec permits, and this is the fleet declining to pay for it. "
-                 f"A positive result needs no sample size: one reuse is the answer.")]
-    seen = ", ".join(f"{c}={n}" for c, n in counts.items())
-    return [(f"C3-3 — no reuse OBSERVED, over {sum(counts.values())} request(s) total "
-             f"({seen}). This does NOT price §10.4's spent-id rule and must not be read as "
-             f"doing so: allocation is not exercised once per connection the way pipelining "
-             f"is, so a short run says nothing about the id the next request will carry. The "
-             f"rule stays a deliberate strictness until a stress workload measures it (§9).")]
+        out.append(f"C3-3 — IDS ARE REUSED AFTER BEING ANSWERED by: {', '.join(reusing)}. "
+                   f"§10.4 spends an id once it reaches the server, so those cells FAIL. That "
+                   f"is the rule refusing a client behaviour the spec permits, and it is the "
+                   f"fleet declining to pay for it. A positive result needs no sample size.")
+    else:
+        counts = ", ".join(f"{c}={f['requests']}" for c, f in found.items())
+        total = sum(f["requests"] for f in found.values())
+        out.append(f"C3-3 — no post-response reuse OBSERVED, over {total} request(s) total "
+                   f"({counts}). This does NOT price §10.4's spent-id rule and must not be "
+                   f"read as doing so: allocation is not exercised once per connection the way "
+                   f"pipelining is, so a short run says nothing about the id the next request "
+                   f"will carry. The rule stays a deliberate strictness until a stress "
+                   f"workload measures it (§9).")
+    if duplicating:
+        # Reported, but NOT as a price for the spent-id rule: this is the weaker rule, and the
+        # proxy already refuses it as `duplicate_request_id` on JSON-RPC's own terms.
+        out.append(f"C3-3, separately — LIVE DUPLICATE ids from: {', '.join(duplicating)}: an "
+                   f"id repeated while the first request was still unanswered. JSON-RPC "
+                   f"forbids that outright, so the proxy refuses it as `duplicate_request_id` "
+                   f"regardless of §10.4's stricter rule — a finding about the CLI, not a "
+                   f"price for that rule.")
+    return out
 
 
 def main() -> int:
@@ -354,7 +406,7 @@ def main() -> int:
         print(f"{cli:8} {era:22} rc={str(r['rc']):5} {r['elapsed_s']:>6}s  {verdict(r)}")
         reuse = {True: "REUSES IDS", False: "no reuse in this sample",
                  None: "too few requests to tell"}[reuses_ids(r)]
-        shown = [k[1] for k in r["request_ids"]]
+        shown = [k[1] for k in request_ids(r["id_timeline"])]
         print(f"{'':8} ids: {shown} — {reuse}")
 
     print()

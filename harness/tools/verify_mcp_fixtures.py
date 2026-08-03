@@ -882,39 +882,68 @@ check("...so the pairs the proxy calls equal are equal in the shim too",
       tuple(SHIM_MOD._id_key(1)) == tuple(SHIM_MOD._id_key(1.0))
       and tuple(SHIM_MOD._id_key(0)) == tuple(SHIM_MOD._id_key(-0.0))
       and tuple(SHIM_MOD._id_key(1)) != tuple(SHIM_MOD._id_key("1")))
+def _tl(*pairs):
+    """A timeline: ('req', v) / ('resp', v), with v canonicalized as the proxy would."""
+    return [(kind, request_id_key(v)) for kind, v in pairs]
+
+
 check("one request cannot answer whether a CLI reuses ids",
-      PIPE.reuses_ids({"request_ids": [("n", 0)]}) is None
-      and PIPE.reuses_ids({"request_ids": []}) is None)
-check("a repeated id is reuse; a monotonic run is not",
-      PIPE.reuses_ids({"request_ids": [("n", 0), ("n", 1), ("n", 1)]}) is True
-      and PIPE.reuses_ids({"request_ids": [("n", 0), ("n", 1), ("n", 2)]}) is False)
-# THE FALSE NEGATIVE: `repr` dedup called these distinct, so a CLI whose reuse the proxy would
-# refuse was reported as not reusing at all (review, PR #100).
+      PIPE.reuses_ids({"id_timeline": _tl(("req", 0))}) is None
+      and PIPE.reuses_ids({"id_timeline": []}) is None)
+check("a monotonic run is not reuse",
+      PIPE.reuses_ids({"id_timeline": _tl(("req", 0), ("resp", 0),
+                                          ("req", 1), ("resp", 1))}) is False)
+# THE DISTINCTION THAT WAS MISSING. A repeat while the first is unanswered is a live
+# duplicate, which JSON-RPC forbids and the proxy refuses as `duplicate_request_id`; only a
+# repeat AFTER the response prices §10.4's stricter rule (review, PR #100).
+check("a repeat AFTER the response is the reuse that prices the rule",
+      PIPE.reuses_ids({"id_timeline": _tl(("req", 1), ("resp", 1), ("req", 1))}) is True)
+check("a repeat BEFORE the response is a live duplicate, not that reuse",
+      PIPE.reuses_ids({"id_timeline": _tl(("req", 1), ("req", 1), ("resp", 1))}) is False)
+_dup = PIPE.id_findings(_tl(("req", 1), ("req", 1), ("resp", 1)))
+check("...and it is still reported, as its own finding",
+      _dup["live_duplicates"] == [request_id_key(1)] and _dup["post_response_reuse"] == [],
+      _dup)
+check("the two never trade places",
+      PIPE.id_findings(_tl(("req", 1), ("resp", 1), ("req", 1)))["live_duplicates"] == [])
+# THE FALSE NEGATIVE from the round before: `repr` dedup called these distinct, so a CLI whose
+# reuse the proxy would refuse was reported as not reusing at all.
 check("`1` then `1.0` is REUSE, because the proxy says it is",
-      PIPE.reuses_ids({"request_ids": [request_id_key(1), request_id_key(1.0)]}) is True)
+      PIPE.reuses_ids({"id_timeline": _tl(("req", 1), ("resp", 1), ("req", 1.0))}) is True)
 check("`0` then `-0.0` is reuse too",
-      PIPE.reuses_ids({"request_ids": [request_id_key(0), request_id_key(-0.0)]}) is True)
+      PIPE.reuses_ids({"id_timeline": _tl(("req", 0), ("resp", 0), ("req", -0.0))}) is True)
 check("...but `1` and `\"1\"` stay different ids, as JSON-RPC says",
-      PIPE.reuses_ids({"request_ids": [request_id_key(1), request_id_key("1")]}) is False)
-check("ids are read from the structured event, not reparsed from the truncated `raw`",
-      PIPE.request_ids([{"event": "request_id", "id_key": ["n", 1], "method": "ping"},
+      PIPE.reuses_ids({"id_timeline": _tl(("req", 1), ("resp", 1), ("req", "1"))}) is False)
+check("the timeline is read from structured events, not the truncated `raw`",
+      PIPE.id_timeline([{"event": "request_id", "id_key": ["n", 1], "method": "ping"},
                         {"event": "rx", "raw": '{"id":9,"method":"ping"}'},
-                        {"event": "request_id", "id_key": ["s", "a"], "method": "ping"},
-                        {"event": "era", "era": "legacy"}]) == [("n", 1), ("s", "a")])
+                        {"event": "response_id", "id_key": ["n", 1]},
+                        {"event": "era", "era": "legacy"}])
+      == [("req", ("n", 1)), ("resp", ("n", 1))])
 # A NEGATIVE C3-3 IS NEVER A PRICE. Pipelining happens once per connection; allocation does
 # not, so no run length turns "no reuse seen" into "the rule costs nothing".
-_two = " ".join(PIPE.id_summary([{"cli": "a", "request_ids": [("n", 0), ("n", 1)]}]))
+_two = " ".join(PIPE.id_summary([{"cli": "a", "id_timeline": _tl(("req", 0), ("resp", 0),
+                                                                 ("req", 1), ("resp", 1))}]))
 check("a clean C3-3 never claims the rule costs the fleet nothing",
       "costs the fleet nothing" not in _two and "does NOT price" in _two, _two)
 check("...and says so however long the run was",
-      all("does NOT price" in " ".join(
-          PIPE.id_summary([{"cli": "a", "request_ids": [("n", i) for i in range(n)]}]))
+      all("does NOT price" in " ".join(PIPE.id_summary([{"cli": "a", "id_timeline": _tl(
+          *[p for i in range(n) for p in (("req", i), ("resp", i))])}]))
           for n in (2, 5, 50)))
 check("...it reports the sample it actually saw",
       "2 request(s)" in _two and "a=2" in _two, _two)
-check("a reuse IS conclusive, with no sample-size caveat",
-      "FAIL" in " ".join(PIPE.id_summary([{"cli": "a",
-                                           "request_ids": [("n", 0), ("n", 0)]}])))
+check("a post-response reuse IS conclusive, with no sample-size caveat",
+      "FAIL" in " ".join(PIPE.id_summary(
+          [{"cli": "a", "id_timeline": _tl(("req", 0), ("resp", 0), ("req", 0))}])))
+# A LIVE DUPLICATE MUST NOT BE PRINTED AS THOUGH IT PRICED THE RULE. This is the reviewed
+# defect in its own words: the summary claimed "refuses a client behaviour the spec permits"
+# for a client whose behaviour the spec forbids.
+_livedup = " ".join(PIPE.id_summary(
+    [{"cli": "a", "id_timeline": _tl(("req", 1), ("req", 1), ("resp", 1))}]))
+check("a live duplicate does not print the spec-permits claim",
+      "the spec permits" not in _livedup and "does NOT price" in _livedup, _livedup)
+check("...but it is reported, and named as the weaker rule the proxy already refuses",
+      "LIVE DUPLICATE" in _livedup and "duplicate_request_id" in _livedup, _livedup)
 
 print()
 print("E15. C3-3: the shim logs a request id for EVERY request, whatever its size")
@@ -928,16 +957,57 @@ _recs_ids = run([legacy_init(1),
                  {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                   "params": {"name": "echo", "arguments": {"text": _big}}},
                  {"jsonrpc": "2.0", "id": "tail", "method": "ping"}])[2]
-_ids = PIPE.request_ids(_recs_ids)
+_ids = PIPE.request_ids(PIPE.id_timeline(_recs_ids))
 _raw_ids = [r for r in _recs_ids if r.get("event") == "rx" and len(r.get("raw", "")) >= 4096]
 check("a request far longer than the `raw` cut still yields its id",
       _ids == [("n", 1), ("n", 2), ("s", "tail")], _ids)
 check("...and the `raw` record really was truncated, so the case was exercised",
       len(_raw_ids) == 1 and len(_raw_ids[0]["raw"]) == 4096, [len(r["raw"]) for r in _raw_ids])
 check("notifications carry no id and produce no record",
-      PIPE.request_ids(run([legacy_init(1),
-                            {"jsonrpc": "2.0", "method": "notifications/initialized"}])[2])
-      == [("n", 1)])
+      PIPE.request_ids(PIPE.id_timeline(run(
+          [legacy_init(1),
+           {"jsonrpc": "2.0", "method": "notifications/initialized"}])[2])) == [("n", 1)])
+
+# SEQUENTIAL POST-RESPONSE REUSE, driven live. `run()` writes everything up front, so it
+# cannot produce this: the second `ping(1)` has to go out AFTER the first is answered, or the
+# shim sees a live duplicate and the two cases become indistinguishable — which was the whole
+# finding. Driven by hand, like the pipelining window above.
+def _sequenced(second_after_response: bool):
+    """Two requests on id 1; the second either waits for the answer or races it."""
+    tmp = tempfile.mkdtemp(prefix="verify-ids-")
+    log = os.path.join(tmp, "probe.jsonl")
+    env = dict(os.environ, PROBE_MCP_LOG=log, PROBE_MCP_MODE="dual")
+    if not second_after_response:
+        # The reviewer's reproduction: hold the `initialize` answer and pipeline behind it.
+        env["PROBE_MCP_INIT_DELAY_MS"] = "400"
+    p = subprocess.Popen([sys.executable, SHIM], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    try:
+        p.stdin.write((json.dumps(legacy_init(1)) + "\n").encode())
+        p.stdin.flush()
+        if second_after_response:
+            p.stdout.readline()          # WAIT for the answer, then reuse the id
+        p.stdin.write((json.dumps({"jsonrpc": "2.0", "id": 1,
+                                   "method": "ping"}) + "\n").encode())
+        p.stdin.flush()
+        p.stdin.close()
+        p.wait(timeout=DEADLINE)
+    finally:
+        if p.poll() is None:
+            p.kill()
+    return PIPE.id_findings(PIPE.id_timeline(
+        [json.loads(ln) for ln in open(log) if ln.strip()]))
+
+
+_after = _sequenced(True)
+_racing = _sequenced(False)
+check("id 1 reused AFTER its answer is post-response reuse",
+      _after["post_response_reuse"] == [("n", 1)] and _after["live_duplicates"] == [], _after)
+check("id 1 pipelined behind a HELD answer is a live duplicate, not that reuse",
+      _racing["live_duplicates"] == [("n", 1)]
+      and _racing["post_response_reuse"] == [], _racing)
+check("both runs really did send two requests, so neither verdict is an empty sample",
+      _after["requests"] == 2 and _racing["requests"] == 2, (_after, _racing))
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")

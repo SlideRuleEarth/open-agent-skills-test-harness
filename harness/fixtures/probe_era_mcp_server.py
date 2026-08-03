@@ -128,6 +128,15 @@ def _id_key(req_id):
 
 
 def _send(msg: dict) -> None:
+    # An id is ANSWERED at the instant its response goes out, and C3-3 needs that instant
+    # relative to the arrivals `_announce` records: a repeat before it is a live duplicate,
+    # which JSON-RPC already forbids and the proxy refuses as `duplicate_request_id`, while a
+    # repeat after it is the post-response reuse the spec PERMITS and §10.4 refuses. Only the
+    # second one prices that rule, and a probe that cannot tell them apart reported the first
+    # as though it did (review, PR #100). Logged before the write, so an id can never appear
+    # answered later than a request that crossed after it.
+    if msg.get("id") is not None and ("result" in msg or "error" in msg):
+        _log("response_id", id_key=_id_key(msg["id"]))
     os.write(1, (json.dumps(msg) + "\n").encode())
 
 
@@ -411,6 +420,42 @@ def _on_signal(signum, _frame):
 
 _STDIN = 0
 _rxbuf = b""
+_scanbuf = b""    # arrival scanner: appended to by _fill, never consumed by the reader
+
+
+def _announce(chunk: bytes, *, eof: bool = False) -> None:
+    """Log every request id as it ARRIVES ON THE WIRE, in wire order.
+
+    THE ORDER IS THE WHOLE POINT, and logging this from the main loop instead was wrong in the
+    one case that matters. §10.4's spent-id rule is a statement about the order messages cross
+    the stream, because that is all a proxy sitting in the stream can see. The main loop
+    observes PROCESSING order, which differs exactly where the question is interesting: a
+    request pipelined behind a held `initialize` lands in the buffer before the response is
+    written, but is not processed until after — so a client sending `initialize(1)` and then
+    `ping(1)` while the response was held looked like reuse of an ANSWERED id, when it is a
+    live duplicate that violates JSON-RPC outright. C3-3 then priced the spent-id rule against
+    a client the proxy refuses on entirely separate grounds (review, PR #100).
+
+    This scanner runs off its own append-only copy of the byte stream, so it is unaffected by
+    `_readline` consuming `_rxbuf`, and it announces a line the moment the line is complete —
+    which for a pipelined request is inside the `initialize` delay window.
+    """
+    global _scanbuf
+    _scanbuf += chunk
+    lines = _scanbuf.split(b"\n")
+    # Everything before the last newline is complete. At EOF there is no more to come, so a
+    # trailing fragment is all of the final line there will ever be and is announced too.
+    _scanbuf = b"" if eof else lines.pop()
+    for raw in lines:
+        if not raw.strip():
+            continue
+        try:
+            msg = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(msg, dict) and msg.get("method") is not None \
+                and msg.get("id") is not None:
+            _log("request_id", id_key=_id_key(msg["id"]), method=msg["method"])
 
 
 def _fill(timeout: float | None) -> bool:
@@ -428,8 +473,10 @@ def _fill(timeout: float | None) -> bool:
         return False
     chunk = os.read(_STDIN, 65536)
     if not chunk:
+        _announce(b"", eof=True)
         return False
     _rxbuf += chunk
+    _announce(chunk)
     return True
 
 
@@ -515,16 +562,9 @@ def main() -> int:
 
         method = msg.get("method")
         req_id = msg.get("id")
-        if method is not None and req_id is not None:
-            # THE C3-3 READING, logged structurally from the PARSED message rather than left
-            # to be recovered from `raw` above. `raw` is a truncated diagnostic — 4096
-            # characters — so a longer request reparsed as JSON simply fails and its id
-            # vanishes from the measurement, and a probe that silently omits requests cannot
-            # answer "did this CLI ever reuse an id" (review, PR #100). The value is
-            # canonicalized to the same domain/value identity `mcp_proxy.request_id_key`
-            # enforces, so `1` and `1.0` — and `0` and `-0.0` — count as one id here exactly
-            # as the proxy would treat them.
-            _log("request_id", id_key=_id_key(req_id), method=method)
+        # The C3-3 `request_id` record is NOT written here. It is written by `_announce` when
+        # the line arrives on the wire, because the rule it measures is about wire order and
+        # this loop runs in processing order — see `_announce`.
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
 
         if req_id is None:

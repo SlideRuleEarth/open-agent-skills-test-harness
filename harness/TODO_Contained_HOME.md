@@ -293,7 +293,7 @@ harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N ar
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
 python3 harness/tools/mutate_mcp.py                           # 181/181 production + 2/2 instrument
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 218 checks
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 227 checks
 git diff --check
 ```
 
@@ -400,6 +400,23 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   those stayed open. **When an argument lands, re-read what it actually quantifies over and go
   fix every case it covers** — not the one that prompted it. A reviewer should not have to
   walk you along a rule's own scope.
+- **An observation that matches a rule's SHAPE may still not be the behaviour it forbids.**
+  C3-3 counted any repeated request id as evidence that the spent-id rule costs the fleet. But
+  a repeat while the first request is unanswered is a live duplicate, which JSON-RPC forbids
+  and the proxy refuses on entirely separate grounds; only a repeat *after* the response is
+  the legal-but-refused behaviour being priced. The probe reported a client the proxy rejects
+  anyway as proof that the proxy is too strict. **When measuring the cost of a rule, the
+  observation has to exclude cases some other rule already covers** — otherwise the price
+  includes traffic that was never going to work.
+- **Instruments record processing order; wire order is a different measurement.** Telling those
+  two id-repeats apart is a question about the order messages crossed the stream, because that
+  is all a proxy in the stream can see — and the shim logged arrivals from its main loop,
+  which runs after buffering. The two diverge exactly where the question is interesting: a
+  pipelined request lands in the buffer before the response is written and is processed after
+  it, so a live duplicate looked like post-response reuse. This is the *third* time C3 has
+  been bitten by a buffer between the wire and the code that reports on it. **If a claim is
+  about ordering on a pipe, log at the point the bytes arrive, not the point they are
+  handled.**
 - **A measurement of a rule must use the RULE'S OWN definition of its terms.** C3-3 asks "does
   any CLI reuse a request id", to price a rule under which `1` and `1.0` are the same id and
   `0` and `-0.0` are the same id. It deduplicated on `repr`, under which none of those pairs
