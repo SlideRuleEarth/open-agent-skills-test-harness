@@ -37,17 +37,33 @@ Environment:
   PROBE_MCP_MODE           dual (default) | modern | legacy — which eras to serve, so the
                            dual-era FALLBACK path can be measured and not just the happy one
   PROBE_MCP_IGNORE_SIGTERM 1 to swallow SIGTERM, to see whether a client escalates to KILL
+  PROBE_MCP_INIT_DELAY_MS  hold the `initialize` RESPONSE this long and record what arrives
+                           meanwhile — C3-2, the pipelining measurement (0 = off)
+
+C3-2 AND WHY IT NEEDED AN INSTRUMENT CHANGE. "Does this client pipeline ordinary requests
+behind `initialize` without waiting for the response?" cannot be read off any earlier log
+from this shim, and the reason is structural rather than an oversight: a server ANSWERS
+`initialize` before it reads the next line, so by the time a pipelined request is read the
+era is established and nothing looks unusual. Arrival timestamps do not separate the two
+cases either — both show the next line being read right after the response goes out. The
+only way to see it is to hold the response and watch the pipe, which is what
+`PROBE_MCP_INIT_DELAY_MS` does. It matters because a PROXY is more exposed than the server
+it fronts: it reads lines serially without answering them, so a pipelined request reaches
+its era check with the negotiation still in flight (`DESIGN_MCP_Support.md` §10.2).
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 import signal
 import sys
+import threading
 import time
 
 MODE = os.environ.get("PROBE_MCP_MODE", "dual")
 IGNORE_SIGTERM = os.environ.get("PROBE_MCP_IGNORE_SIGTERM") == "1"
+INIT_DELAY_MS = int(os.environ.get("PROBE_MCP_INIT_DELAY_MS") or 0)
 MODERN_VERSION = "2026-07-28"
 # The legacy versions this shim actually implements. The legacy lifecycle says a server
 # returns the REQUESTED version only when it supports it, and otherwise answers with one it
@@ -78,6 +94,9 @@ _legacy = None
 _first_era = None
 _seen_eras = set()
 _subscriptions = {}       # listen-request id -> (acknowledged filter, modern flag)
+# Id keys ADMITTED to the C3-3 timeline. A response is only recorded for one of these, so a
+# reply to a refused frame cannot mark an id answered that never arrived. See `_send`.
+_admitted = set()
 
 
 def _log(event: str, **fields) -> None:
@@ -95,8 +114,112 @@ def _log(event: str, **fields) -> None:
         os.write(2, data)
 
 
+def _valid_request_id(req_id) -> bool:
+    """Whether this is a usable `RequestId`, by the PROXY's rule — see `_id_key` on drift.
+
+    C3-3's timeline may only contain ids the proxy would actually correlate on, and letting
+    anything else in broke the measurement two ways: a list id is unhashable, so the reader
+    crashed rather than reporting, and `true` followed by `1` manufactured a reuse out of
+    nothing, because Python aliases `True` to `1` while JSON-RPC does not (review, PR #100).
+    Malformed traffic is logged as its own event instead, which is a finding about the client
+    rather than an input to the price of §10.4's rule.
+    """
+    if isinstance(req_id, bool) or req_id is None:
+        return False
+    if isinstance(req_id, str):
+        return True
+    if isinstance(req_id, int):
+        return True
+    return isinstance(req_id, float) and not (req_id != req_id or req_id in (
+        float("inf"), float("-inf")))
+
+
+def _envelope_shape(msg):
+    """Which JSON-RPC shape the PROXY would call this, or `None` if it would refuse it.
+
+    Mirrors `agentskill_evals.mcp_proxy.classify_envelope` — ALL FOUR SHAPES, not just the
+    request branch — and is checked against it in `verify_mcp_fixtures.py` for the same reason
+    `_id_key` is: this file cannot import the proxy, so the copy must be pinned rather than
+    trusted.
+
+    THE POINT IS THE `None`, as much as the shapes. The proxy fails the connection on any
+    envelope it cannot classify, so every one of those is a terminal marker in the C3-3
+    timeline. Two earlier versions were narrower and each let a proxy-fatal frame read as
+    ordinary traffic: checking only the id admitted a JSON-RPC 1.0 request, and checking only
+    request-shaped frames left batches and malformed NOTIFICATIONS — which carry no id at all
+    — producing no marker, so the timeline said the conversation continued past a message the
+    proxy would have died on (review, PR #100).
+    """
+    if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
+        return None
+    has_method, has_id = "method" in msg, "id" in msg
+    has_result, has_error = "result" in msg, "error" in msg
+    if has_result and has_error:
+        return None
+    if has_method and (has_result or has_error):
+        return None
+    if has_method:
+        if not isinstance(msg["method"], str) or not msg["method"]:
+            return None
+        if "params" in msg and not isinstance(msg["params"], dict):
+            return None
+        if has_id:
+            return "request" if _valid_request_id(msg["id"]) else None
+        return "notification"
+    if has_result:
+        if not has_id or not _valid_request_id(msg["id"]):
+            return None
+        return "result" if isinstance(msg["result"], dict) else None
+    if has_error:
+        err = msg["error"]
+        if not isinstance(err, dict) or not isinstance(err.get("code"), int) \
+                or isinstance(err.get("code"), bool) or not isinstance(err.get("message"), str):
+            return None
+        if has_id and not _valid_request_id(msg["id"]):
+            return None
+        return "error"
+    return None
+
+
+def _id_key(req_id):
+    """A request id's IDENTITY, for the C3-3 reading: domain marker plus value.
+
+    Deliberately identical to `agentskill_evals.mcp_proxy.request_id_key`, and deliberately
+    NOT imported from it: this file is a fixture that CLIs spawn directly, in a masked HOME
+    with an unrelated cwd, so it must run with nothing but the standard library on the path.
+    Duplication of a two-line rule is the lesser evil — but a duplicate that could drift is
+    not, so `verify_mcp_fixtures.py` asserts the two agree on the cases that distinguish them
+    (`1` vs `"1"`, `1` vs `1.0`, `0` vs `-0.0`).
+
+    Logged as a JSON array, which reparses to a list whose comparison and hash match the
+    proxy's tuple once the reader converts it — `("n", 1) == ("n", 1.0)` in Python, which is
+    the point of the numeric domain.
+    """
+    return ["s", req_id] if isinstance(req_id, str) else ["n", req_id]
+
+
 def _send(msg: dict) -> None:
+    # An id is ANSWERED at the instant its response DEPARTS, and C3-3 needs that instant
+    # relative to the arrivals `_announce` records: a repeat before it is a live duplicate,
+    # which JSON-RPC already forbids and the proxy refuses as `duplicate_request_id`, while a
+    # repeat after it is the post-response reuse the spec PERMITS and §10.4 refuses. Only the
+    # second one prices that rule, and a probe that cannot tell them apart reported the first
+    # as though it did (review, PR #100).
+    #
+    # LOGGED AFTER THE WRITE SUCCEEDS, which is not a detail: C3-1 established that agy is
+    # gone by the time the graceful closure is written, so this call raises `BrokenPipeError`
+    # and nothing departs. Logging first recorded an answer for a response no client ever saw,
+    # and a subsequent request on that id would then read as post-response reuse against a
+    # response that does not exist (review, PR #100).
     os.write(1, (json.dumps(msg) + "\n").encode())
+    # ONLY FOR AN ID THAT ENTERED THE TIMELINE. This shim answers malformed requests, as a
+    # conformant server should — with an error — but that response must not be recorded,
+    # because the request it answers was refused admission. Recording it marked the id
+    # "answered" with no matching arrival, so a single later valid request on that id read as
+    # post-response reuse: a repeat manufactured out of one request (review, PR #100).
+    if ("result" in msg or "error" in msg) and _valid_request_id(msg.get("id")) \
+            and tuple(_id_key(msg["id"])) in _admitted:
+        _log("response_id", id_key=_id_key(msg["id"]))
 
 
 def _result(req_id, payload: dict, *, modern: bool, cacheable: bool = False,
@@ -377,20 +500,190 @@ def _on_signal(signum, _frame):
     os._exit(0)
 
 
+_STDIN = 0
+_rx_lock = threading.Lock()
+_rx_ready = threading.Condition(_rx_lock)
+_rx_lines: collections.deque = collections.deque()   # complete lines, in ARRIVAL order
+_rx_partial = b""
+_rx_eof = False
+_rx_failed = False   # the reader DIED; distinct from the client closing stdin
+
+
+def _announce(raw: bytes) -> None:
+    """Log one arrival, at the moment its bytes land. Called only from the reader thread.
+
+    THE ORDER IS THE WHOLE POINT. §10.4's spent-id rule is a statement about the order messages
+    cross the stream, because that is all a proxy sitting in the stream can see — and this shim
+    is standing where the proxy would stand.
+
+    ONLY A CONTINUOUS READER CAN OBSERVE THAT ORDER, which took two attempts to get right. The
+    first logged arrivals from the main loop, i.e. in PROCESSING order. The second moved the
+    logging into `_fill` — better, but `_fill` was still called on demand, so outside the held
+    `initialize` window the shim answered the current request before reading again: two
+    requests that both crossed the wire before the response was written were logged as
+    `req, resp, req`, which reads as post-response reuse when it is a live duplicate (review,
+    PR #100). Nothing that reads on demand can see when bytes it has not asked for arrived. So
+    input is drained continuously by `_reader`, and the main loop consumes from the queue it
+    fills.
+
+    MALFORMED TRAFFIC DOES NOT ENTER C3-3, and "malformed" means the PROXY'S whole envelope
+    taxonomy — see `_envelope_shape`. Narrower versions kept letting a proxy-fatal frame read
+    as ordinary traffic: checking only the id admitted a JSON-RPC 1.0 request, and checking
+    only request-shaped frames left batches and malformed NOTIFICATIONS unmarked. Before those,
+    a list id crashed the reader while `true` followed by `1` manufactured a reuse Python sees
+    and JSON-RPC does not (review, PR #100). Anything rejected is logged as its own event —
+    a finding about the client, and a terminal marker, since the proxy dies there.
+    """
+    if not raw.strip():
+        return
+    try:
+        msg = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        _log("request_id_malformed", why="unparseable")
+        return
+    if isinstance(msg, list):
+        # A JSON-RPC BATCH. MCP forbids it on stdio and the proxy fails on it, so it is
+        # terminal here too — it was producing no marker at all, being neither parseable-
+        # request-shaped nor unparseable (review, PR #100).
+        _log("request_id_malformed", why="batch", count=len(msg))
+        return
+    shape = _envelope_shape(msg)
+    if shape is None:
+        # ANY envelope the proxy would refuse, whatever its shape. A malformed NOTIFICATION
+        # carries no id and so slipped past a request-shaped check, while the proxy dies on it
+        # exactly as it dies on a malformed request.
+        _log("request_id_malformed", why="envelope",
+             id_repr=repr(msg.get("id")) if isinstance(msg, dict) else None,
+             method=str(msg.get("method"))[:120] if isinstance(msg, dict) else None,
+             jsonrpc=repr(msg.get("jsonrpc")) if isinstance(msg, dict) else None)
+    elif shape == "request":
+        _admitted.add(tuple(_id_key(msg["id"])))
+        _log("request_id", id_key=_id_key(msg["id"]), method=msg["method"])
+    # A well-formed notification or response is ordinary traffic with no place in an id
+    # timeline, and no finding either.
+
+
+def _reader() -> None:
+    """Drain stdin forever, announcing each line as it arrives. Daemon thread.
+
+    A thread rather than `select` in the main loop because the main loop is not always in a
+    position to select: it spends time formatting and writing responses, and any bytes that
+    arrive during that window are invisible until it next asks for them. That window is
+    exactly where a live duplicate and a post-response reuse become indistinguishable.
+    """
+    global _rx_partial, _rx_eof, _rx_failed
+    while True:
+        try:
+            chunk = os.read(_STDIN, 65536)
+        except (OSError, ValueError) as exc:
+            # A FAILED READ IS NOT A CLOSED STDIN. Swallowing it into `chunk = b""` made the
+            # main loop log `stdin_eof` and a clean terminator, so an instrument failure would
+            # have been published as "this CLI shut the server down cleanly" — the exact
+            # conclusion C3-1 exists to draw, drawn from a bug in the thing drawing it
+            # (review, PR #100).
+            _log("reader_error", error=type(exc).__name__, detail=str(exc)[:200])
+            with _rx_ready:
+                _rx_failed = True
+                _rx_eof = True
+                _rx_ready.notify_all()
+            return
+        if not chunk:
+            with _rx_ready:
+                # A trailing fragment at EOF is all of that line there will ever be.
+                if _rx_partial.strip():
+                    _announce(_rx_partial)
+                    _rx_lines.append(_rx_partial)
+                    _rx_partial = b""
+                _rx_eof = True
+                _rx_ready.notify_all()
+            return
+        with _rx_ready:
+            _rx_partial += chunk
+            parts = _rx_partial.split(b"\n")
+            _rx_partial = parts.pop()
+            for raw in parts:
+                _announce(raw)
+                _rx_lines.append(raw)
+            _rx_ready.notify_all()
+
+
+def _readline() -> str:
+    """One line from stdin, or "" at EOF.
+
+    READS FROM THE ARRIVAL QUEUE, not the fd. `sys.stdin` was wrong here for a reason worth
+    keeping: a TextIOWrapper (and the BufferedReader under it) pulls a chunk rather than a
+    line, so a pipelined request could sit in Python's buffer while `select` reported the pipe
+    quiet — which would make the C3-2 measurement report "no pipelining" for a client that
+    pipelines. The reader thread owns the only buffer, so "has anything arrived?" stays
+    answerable, and now it is answerable at the instant of arrival rather than on demand.
+    """
+    with _rx_ready:
+        while not _rx_lines and not _rx_eof:
+            _rx_ready.wait()
+        if _rx_lines:
+            return _rx_lines.popleft().decode("utf-8", "replace") + "\n"
+        return ""
+
+
+def _buffered_lines() -> list[str]:
+    """Complete lines already queued, without consuming them."""
+    with _rx_lock:
+        return [ln.decode("utf-8", "replace") for ln in _rx_lines if ln.strip()]
+
+
+def _measure_pipelining(req_id) -> None:
+    """C3-2: hold the `initialize` response and record whatever the client sends meanwhile.
+
+    A client that waits sends nothing here. A client that pipelines has already written its
+    next request, so it lands in the queue during the window. This is the only vantage point
+    from which the two differ — see the module docstring.
+
+    THE QUEUE IS READ ONCE, AT THE CLOSE, and everything still in it counts. The main loop has
+    popped exactly the `initialize` line by now, so anything else sitting there was written by
+    the client before this response was — which is the definition of pipelining. An earlier
+    version of this function snapshotted the queue length at the window's open and counted only
+    what arrived after, which is right for an on-demand reader and wrong for a continuous one:
+    a client that pipelines aggressively has its next request queued before the window even
+    opens, and that is the strongest possible evidence, not a reason to discard it.
+    """
+    deadline = time.monotonic() + INIT_DELAY_MS / 1000.0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(remaining, 0.01))
+    arrived = _buffered_lines()
+    methods = []
+    for raw in arrived:
+        try:
+            methods.append(json.loads(raw).get("method"))
+        except (json.JSONDecodeError, ValueError):
+            methods.append("<unparseable>")
+    _log("pipelining", initialize_id=req_id, held_ms=INIT_DELAY_MS,
+         pipelined=bool(arrived), count=len(arrived), methods=methods)
+
+
 def main() -> int:
-    _log("start", pid=os.getpid(), mode=MODE, ignore_sigterm=IGNORE_SIGTERM)
+    _log("start", pid=os.getpid(), mode=MODE, ignore_sigterm=IGNORE_SIGTERM,
+         init_delay_ms=INIT_DELAY_MS)
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         try:
             signal.signal(sig, _on_signal)
         except (ValueError, OSError):  # not all signals settable everywhere
             pass
+    # Daemon, so a shim that is killed or exits via os._exit() in a signal handler is never
+    # held open by it — C3-1's whole subject is how this process dies.
+    threading.Thread(target=_reader, daemon=True).start()
 
     while True:
-        # readline() rather than `for line in sys.stdin`: iteration reads ahead into a
-        # buffer, which would smear the timing this probe exists to measure.
-        line = sys.stdin.readline()
+        # Our own raw reader rather than `sys.stdin`: every layer above the fd reads ahead
+        # into a buffer this file cannot inspect, and C3-2 is precisely a question about what
+        # is in that buffer.
+        line = _readline()
         if line == "":
-            _log("stdin_eof")
+            # C3-1 reads the terminator as a verdict about the CLIENT, so an instrument failure
+            # must never wear the clean-shutdown label (review, PR #100).
+            _log("reader_failed" if _rx_failed else "stdin_eof")
             break
         line = line.strip()
         if not line:
@@ -408,6 +701,9 @@ def main() -> int:
 
         method = msg.get("method")
         req_id = msg.get("id")
+        # The C3-3 `request_id` record is NOT written here. It is written by `_announce` when
+        # the line arrives, which is as close to wire order as this process can get; this loop
+        # runs in processing order, which is further away still — see `_announce`.
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
 
         if req_id is None:
@@ -434,6 +730,10 @@ def main() -> int:
         elif method == "initialize":
             payload, selected, requested = _initialize(params)
             _observe(msg, method, version=selected, requested=requested)
+            # C3-2 runs BETWEEN deciding the answer and sending it — that window is the whole
+            # measurement, and it is the only place a client's pipelining is observable.
+            if INIT_DELAY_MS > 0:
+                _measure_pipelining(req_id)
             _result(req_id, payload, modern=False)
         elif method == "subscriptions/listen":
             _observe(msg, method)
@@ -452,9 +752,14 @@ def main() -> int:
             _log("refused", method=method, mode=MODE)
             _error(req_id, -32601, f"method not found: {method}")
 
-    _close_subscriptions("stdin_eof")
-    _log("terminator", reason="stdin_eof")
-    return 0
+    reason = "reader_failed" if _rx_failed else "stdin_eof"
+    _close_subscriptions(reason)
+    _log("terminator", reason=reason)
+    # A NON-ZERO EXIT, not just a differently-worded log line. C3-1 reads the terminator as a
+    # verdict about the client, and anything driving this shim — the verifier, a probe, a CI
+    # step — checks the exit status first. Logging the failure and then exiting 0 leaves the
+    # instrument saying "clean" in the one place most callers look (review, PR #100).
+    return 1 if _rx_failed else 0
 
 
 if __name__ == "__main__":

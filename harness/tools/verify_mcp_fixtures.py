@@ -747,5 +747,492 @@ check("identity works in the modern era as well",
       == "quarry-7b1c:marmot-22", r)
 
 print()
+print("E13. C3-2: the `initialize` delay window measures PIPELINING, in both directions")
+# The instrument for probe C3-2 (§9) needs its own regression, and it needs to be checked
+# BOTH ways: an instrument that reports "pipelined" for everything is as useless as one that
+# reports it for nothing, and the second failure is the plausible one — it is what a buffered
+# read path produces, since a pipelined line sits in Python's buffer while `select` reports
+# the pipe quiet. `run()` above cannot be used here: it writes every message up front, which
+# is pipelining by construction, so the timing has to be driven by hand.
+
+
+def _init_window(*, pipelined: bool, held_ms: int = 400, delay: bool = True):
+    """Drive one handshake with the response held, and return the `pipelining` record."""
+    tmp = tempfile.mkdtemp(prefix="verify-window-")
+    log = os.path.join(tmp, "probe.jsonl")
+    env = dict(os.environ, PROBE_MCP_LOG=log, PROBE_MCP_MODE="dual")
+    if delay:
+        env["PROBE_MCP_INIT_DELAY_MS"] = str(held_ms)
+    else:
+        env.pop("PROBE_MCP_INIT_DELAY_MS", None)
+    p = subprocess.Popen([sys.executable, SHIM], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    nxt = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+    try:
+        p.stdin.write((json.dumps(legacy_init(1)) + "\n").encode())
+        p.stdin.flush()
+        if not pipelined:
+            p.stdout.readline()          # WAIT for the response, as a conforming client does
+        p.stdin.write((nxt + "\n").encode())
+        p.stdin.flush()
+        p.stdin.close()
+        p.wait(timeout=DEADLINE)
+    finally:
+        if p.poll() is None:
+            p.kill()
+    recs = [json.loads(ln) for ln in open(log) if ln.strip()]
+    return next((r for r in recs if r["event"] == "pipelining"), None)
+
+
+_pipe = _init_window(pipelined=True)
+_wait = _init_window(pipelined=False)
+_off = _init_window(pipelined=True, delay=False)
+check("a client that pipelines is DETECTED", _pipe and _pipe["pipelined"] is True, _pipe)
+check("...and what it sent is named", _pipe and _pipe["methods"] == ["tools/list"], _pipe)
+check("a client that WAITS is not reported as pipelining",
+      _wait and _wait["pipelined"] is False and _wait["count"] == 0, _wait)
+check("the window names the initialize it held", _pipe and _pipe["initialize_id"] == 1, _pipe)
+check("the held duration is recorded", _pipe and _pipe["held_ms"] == 400, _pipe)
+# Off by default, or every other measurement in this file pays for it — and a shim that
+# always paused would be measuring its own delay rather than the client.
+check("the window is OFF unless asked for", _off is None, _off)
+
+print()
+print("E14. C3-2: the probe's own CLASSIFICATION, which is the result a decision rests on")
+# E13 above checks the shim's timing path. That is a different instrument from the probe that
+# READS it, and the probe's `elif` chain — which decides whether a CLI's answer is "n/a", an
+# unanswered question, or a measurement — had no check at all, so every one of E13's checks
+# could stay green over a probe that reported a CLI that died as "modern n/a" (review, PR
+# #100). Synthetic rows, because the point is the classification, not another live run.
+sys.path.insert(0, HERE)
+import probe_mcp_pipelining as PIPE  # noqa: E402
+
+
+def _row(cli, *, connected=True, era=None, version="2025-11-25", pipelined=None, spawned=True):
+    return {"cli": cli, "connected": connected, "spawned": spawned,
+            "era": {"event": "era", "era": era, "version": version} if era else None,
+            "pipelining": None if pipelined is None else
+            {"event": "pipelining", "pipelined": pipelined,
+             "count": 1 if pipelined else 0,
+             "methods": ["tools/list"] if pipelined else [], "initialize_id": 1}}
+
+
+_dead = _row("dead", connected=False)
+_modern = _row("agy", era="modern", version="2026-07-28")
+_gap = _row("codex", era="legacy")
+_pipes = _row("copilot", era="legacy", pipelined=True)
+_waits = _row("claude", era="legacy", pipelined=False)
+check("an observed MODERN era is `n/a` — there is no `initialize` to hide behind",
+      PIPE.classify(_modern) == PIPE.NOT_APPLICABLE, PIPE.classify(_modern))
+check("a CLI that never handshook is NOT `n/a`",
+      PIPE.classify(_dead) == PIPE.NO_ERA, PIPE.classify(_dead))
+check("a legacy era whose window never ran is UNMEASURED, not a negative result",
+      PIPE.classify(_gap) == PIPE.UNMEASURED, PIPE.classify(_gap))
+check("pipelining and waiting are both measurements",
+      (PIPE.classify(_pipes), PIPE.classify(_waits)) == (PIPE.PIPELINES, PIPE.WAITS))
+check("BOTH ways of missing an answer count as unmeasured",
+      PIPE.unmeasured([_dead, _modern, _gap, _pipes, _waits]) == ["dead", "codex"],
+      PIPE.unmeasured([_dead, _modern, _gap, _pipes, _waits]))
+check("a fully answered fleet is not reported as unmeasured",
+      PIPE.unmeasured([_modern, _pipes, _waits]) == [])
+# A BROKEN INSTRUMENT IS AN UNANSWERED ROW, and it is the one that LOOKS answered: the shim
+# can log an era and a pipelining record before its reader dies. Handling it only in the exit
+# status let the tool print the complete-fleet claim and then exit 1 — the same fleet-wide
+# conclusion from an incomplete run as before, through a door the earlier fix did not cover
+# (review, PR #100). So it is classified, not merely counted.
+_broken = _row("broken", era="legacy", pipelined=False)
+_broken["reader_failed"] = True
+check("a row whose shim broke is classified as instrument-failed, not as a measurement",
+      PIPE.classify(_broken) == PIPE.INSTRUMENT_FAILED, PIPE.classify(_broken))
+check("...even though it looks answered on every other axis",
+      _broken["connected"] and _broken["pipelining"] is not None
+      and PIPE.classify({**_broken, "reader_failed": False}) == PIPE.WAITS)
+check("...so it counts as unmeasured",
+      PIPE.unmeasured([_waits, _broken]) == ["broken"], PIPE.unmeasured([_waits, _broken]))
+_broken_sum = " ".join(PIPE.summary([_modern, _pipes, _waits, _broken]))
+check("...and the fleet-wide negative CANNOT be printed over it",
+      "across the whole fleet" not in _broken_sum
+      and "costs the fleet nothing" not in _broken_sum, _broken_sum)
+check("...with the cause named, not just the absence",
+      "reader failed" in _broken_sum and "broken" in _broken_sum, _broken_sum)
+check("...and the per-row verdict says so too",
+      "INSTRUMENT FAILED" in PIPE.verdict(_broken), PIPE.verdict(_broken))
+# The clean-run claim must still be reachable, or this check would pass on a tool that never
+# concludes anything.
+check("a fleet with no broken instrument still earns the complete claim",
+      "across the whole fleet" in " ".join(PIPE.summary([_modern, _waits])))
+# The summary is guidance a reader ACTS on, so it has to describe the design that exists:
+# §10.2 refuses a request behind an unanswered handshake, in either outcome. An earlier
+# version said pending traffic "is supported ... keep it", which was the rejected design.
+_clean = " ".join(PIPE.summary([_modern, _waits]))
+_dirty = " ".join(PIPE.summary([_pipes, _waits]))
+_partial = " ".join(PIPE.summary([_dead, _gap, _waits]))
+_nothing = " ".join(PIPE.summary([_dead, _gap]))
+check("the clean outcome prices the REFUSAL rather than blessing pending traffic",
+      "refus" in _clean and "allow" not in _clean and "supported" not in _clean, _clean)
+check("the pipelining outcome says those cells fail, and names defer-and-replay",
+      "refus" in _dirty and "FAIL" in _dirty and "defer" in _dirty, _dirty)
+check("the unmeasured line distinguishes the two reasons",
+      "never handshook" in _nothing and "window never ran" in _nothing, _nothing)
+check("...and says nothing at all when there is nothing missing",
+      "NOT MEASURED" not in _clean, _clean)
+# A NEGATIVE CONCLUSION NEEDS EVERY ROW. "No CLI pipelined ... costs the fleet nothing" was
+# printed whenever no row was positive — true of a run where every CLI failed to connect, and
+# contradicted two lines later by the list of what was not measured (review, PR #100).
+check("an incomplete run does NOT print the fleet-wide negative",
+      "costs the fleet nothing" not in _partial and "No CLI pipelined" not in _partial,
+      _partial)
+check("...it says only what it measured, and calls the fleet cost unknown",
+      "No MEASURED CLI pipelined" in _partial and "UNKNOWN" in _partial, _partial)
+check("a run where NOTHING answered claims nothing either",
+      "costs the fleet nothing" not in _nothing and "2 of 2" in _nothing, _nothing)
+check("only a complete run earns the fleet-wide claim",
+      "across the whole fleet" in _clean and "costs the fleet nothing" in _clean, _clean)
+# C3-3 rides on the same run: §10.4 spends a request id once it reaches the server, refusing a
+# reuse the spec permits, and that strictness needs a price. The probe must measure the
+# identity the PROXY enforces, and must not overstate what a short run establishes.
+sys.path.insert(0, os.path.dirname(HERE))
+from agentskill_evals.mcp_proxy import request_id_key  # noqa: E402
+from agentskill_evals.mcp_proxy import valid_request_id as P_valid  # noqa: E402
+from agentskill_evals.mcp_proxy import classify_envelope  # noqa: E402
+
+sys.path.insert(0, FIXTURES)
+import probe_era_mcp_server as SHIM_MOD  # noqa: E402
+
+# The shim cannot import the proxy — CLIs spawn it with only the stdlib reachable — so it
+# carries its own copy of the rule. A copy that could drift silently is worse than the
+# duplication, so the two are checked against the cases that distinguish them.
+for _v in (1, 1.0, 0, -0.0, "1", "a", 2**70, -5):
+    check(f"the shim identifies id {_v!r} exactly as the proxy does",
+          tuple(SHIM_MOD._id_key(_v)) == request_id_key(_v),
+          (SHIM_MOD._id_key(_v), request_id_key(_v)))
+check("...so the pairs the proxy calls equal are equal in the shim too",
+      tuple(SHIM_MOD._id_key(1)) == tuple(SHIM_MOD._id_key(1.0))
+      and tuple(SHIM_MOD._id_key(0)) == tuple(SHIM_MOD._id_key(-0.0))
+      and tuple(SHIM_MOD._id_key(1)) != tuple(SHIM_MOD._id_key("1")))
+def _tl(*pairs):
+    """A timeline: ('req', v) / ('resp', v), with v canonicalized as the proxy would."""
+    return [(kind, request_id_key(v)) for kind, v in pairs]
+
+
+check("a monotonic run has no repeats at all",
+      PIPE.id_findings(_tl(("req", 0), ("resp", 0), ("req", 1), ("resp", 1)))
+      == {"requests": 2, "live_duplicates": [], "post_response_reuse": [],
+          "truncated": False})
+# THE DISTINCTION THAT WAS MISSING. A repeat while the first is unanswered is a live
+# duplicate, which JSON-RPC forbids and the proxy refuses as `duplicate_request_id`; only a
+# repeat AFTER the response prices §10.4's stricter rule (review, PR #100).
+check("a repeat AFTER the response classifies as post-response reuse",
+      PIPE.id_findings(_tl(("req", 1), ("resp", 1),
+                           ("req", 1)))["post_response_reuse"] == [request_id_key(1)])
+check("a repeat BEFORE the response is a live duplicate, not that reuse",
+      PIPE.id_findings(_tl(("req", 1), ("req", 1),
+                           ("resp", 1)))["post_response_reuse"] == [])
+_dup = PIPE.id_findings(_tl(("req", 1), ("req", 1), ("resp", 1)))
+check("...and it is still reported, as its own finding",
+      _dup["live_duplicates"] == [request_id_key(1)] and _dup["post_response_reuse"] == [],
+      _dup)
+check("the two never trade places",
+      PIPE.id_findings(_tl(("req", 1), ("resp", 1), ("req", 1)))["live_duplicates"] == [])
+# THE PROXY STOPS AT A DUPLICATE, so the probe must too: `Fail` is terminal, the connection is
+# torn down, and nothing after it would ever reach the rule being priced (review, PR #100).
+_after_dup = PIPE.id_findings(_tl(("req", 1), ("req", 1), ("resp", 1), ("req", 1)))
+check("evidence after a live duplicate does not price the stricter rule",
+      _after_dup["post_response_reuse"] == [] and _after_dup["truncated"] is True, _after_dup)
+check("...and the run is not credited with requests it never got to make",
+      _after_dup["requests"] == 2, _after_dup)
+check("a run with no duplicate is not marked truncated",
+      PIPE.id_findings(_tl(("req", 1), ("resp", 1), ("req", 1)))["truncated"] is False)
+_dirty_sum = " ".join(PIPE.id_summary(
+    [{"cli": "a", "id_timeline": _tl(("req", 1), ("req", 1), ("resp", 1), ("req", 1))}]))
+check("...and the summary reports one repeat, not two",
+      "(1)" in _dirty_sum and "IDS ARE REUSED" not in _dirty_sum, _dirty_sum)
+# THE FALSE NEGATIVE from the round before: `repr` dedup called these distinct, so a CLI whose
+# reuse the proxy would refuse was reported as not reusing at all.
+check("`1` then `1.0` is one id, because the proxy says it is",
+      PIPE.id_findings(_tl(("req", 1), ("resp", 1),
+                           ("req", 1.0)))["post_response_reuse"] == [request_id_key(1)])
+check("`0` then `-0.0` is one id too",
+      PIPE.id_findings(_tl(("req", 0), ("resp", 0),
+                           ("req", -0.0)))["post_response_reuse"] == [request_id_key(0)])
+check("...but `1` and `\"1\"` stay different ids, as JSON-RPC says",
+      PIPE.id_findings(_tl(("req", 1), ("resp", 1),
+                           ("req", "1")))["post_response_reuse"] == [])
+check("the timeline is read from structured events, not the truncated `raw`",
+      PIPE.id_timeline([{"event": "request_id", "id_key": ["n", 1], "method": "ping"},
+                        {"event": "rx", "raw": '{"id":9,"method":"ping"}'},
+                        {"event": "response_id", "id_key": ["n", 1]},
+                        {"event": "era", "era": "legacy"}])
+      == [("req", ("n", 1)), ("resp", ("n", 1))])
+# C3-3 CONCLUDES NOTHING FROM THIS RUN, IN EITHER DIRECTION. The negative never could —
+# allocation is not exercised once per connection, so no run length bounds the next id. The
+# POSITIVE cannot either: classifying a repeat needs the order of an arrival against a
+# response, and no observer inside the server establishes that. Stopping the process, writing
+# a second request on a live id and resuming produced `req, resp, req` in 1 run of 20, which
+# is a live duplicate reported as legal reuse (review, PR #100).
+_clean_ids = " ".join(PIPE.id_summary([{"cli": "a", "id_timeline": _tl(
+    ("req", 0), ("resp", 0), ("req", 1), ("resp", 1))}]))
+_reuse_ids = " ".join(PIPE.id_summary([{"cli": "a", "id_timeline": _tl(
+    ("req", 0), ("resp", 0), ("req", 0))}]))
+_dup_ids = " ".join(PIPE.id_summary([{"cli": "a", "id_timeline": _tl(
+    ("req", 1), ("req", 1), ("resp", 1))}]))
+for _name, _text in (("a clean run", _clean_ids), ("an apparent reuse", _reuse_ids),
+                     ("a live duplicate", _dup_ids)):
+    check(f"{_name} is reported INCONCLUSIVE", "INCONCLUSIVE" in _text, _text)
+    check(f"...and {_name} never claims to price or clear the rule",
+          "costs the fleet nothing" not in _text and "the spec permits" not in _text
+          and "FAIL" not in _text, _text)
+check("the reason is named, not just the verdict",
+      "cannot be established from inside the server" in _clean_ids, _clean_ids)
+check("...and the sample it saw is still reported",
+      "2 request(s)" in _clean_ids and "a=2" in _clean_ids, _clean_ids)
+check("repeats are surfaced for a human, as UNCLASSIFIED",
+      "UNCLASSIFIED" in _reuse_ids and "UNCLASSIFIED" in _dup_ids, (_reuse_ids, _dup_ids))
+check("a clean run has nothing to surface",
+      "UNCLASSIFIED" not in _clean_ids, _clean_ids)
+# MALFORMED TRAFFIC MUST REACH THE REPORT. It was written to the raw log and dropped there:
+# `probe()` carried only the timeline, so without -v a malformed client produced no finding.
+_mal = " ".join(PIPE.id_summary([{"cli": "a", "id_timeline": _tl(("req", 1), ("resp", 1)),
+                                  "id_anomalies": [{"event": "request_id_malformed"}]}]))
+check("malformed requests are named in the summary",
+      "MALFORMED" in _mal and "terminates the connection" in _mal, _mal)
+check("...and a run without them says nothing about them",
+      "MALFORMED" not in _clean_ids, _clean_ids)
+
+print()
+print("E15. C3-3: the shim logs a request id for EVERY request, whatever its size")
+# The reading is only as good as the record. `rx` truncates at 4096 characters as a
+# diagnostic, and the first version of this measurement reparsed that — so a request longer
+# than the cut simply vanished, and a probe that silently omits requests cannot answer a
+# question about reuse (review, PR #100). Driven live, because the defect lives in the shim's
+# logging path and a unit test of the reader would not see it.
+_big = "x" * 9000
+_recs_ids = run([legacy_init(1),
+                 {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                  "params": {"name": "echo", "arguments": {"text": _big}}},
+                 {"jsonrpc": "2.0", "id": "tail", "method": "ping"}])[2]
+_ids = PIPE.request_ids(PIPE.id_timeline(_recs_ids))
+_raw_ids = [r for r in _recs_ids if r.get("event") == "rx" and len(r.get("raw", "")) >= 4096]
+check("a request far longer than the `raw` cut still yields its id",
+      _ids == [("n", 1), ("n", 2), ("s", "tail")], _ids)
+check("...and the `raw` record really was truncated, so the case was exercised",
+      len(_raw_ids) == 1 and len(_raw_ids[0]["raw"]) == 4096, [len(r["raw"]) for r in _raw_ids])
+check("notifications carry no id and produce no record",
+      PIPE.request_ids(PIPE.id_timeline(run(
+          [legacy_init(1),
+           {"jsonrpc": "2.0", "method": "notifications/initialized"}])[2])) == [("n", 1)])
+
+# SEQUENTIAL POST-RESPONSE REUSE, driven live. `run()` writes everything up front, so it
+# cannot produce this: the second `ping(1)` has to go out AFTER the first is answered, or the
+# shim sees a live duplicate and the two cases become indistinguishable — which was the whole
+# finding. Driven by hand, like the pipelining window above.
+def _sequenced(second_after_response: bool):
+    """Two requests on id 1; the second either waits for the answer or races it."""
+    tmp = tempfile.mkdtemp(prefix="verify-ids-")
+    log = os.path.join(tmp, "probe.jsonl")
+    env = dict(os.environ, PROBE_MCP_LOG=log, PROBE_MCP_MODE="dual")
+    if not second_after_response:
+        # The reviewer's reproduction: hold the `initialize` answer and pipeline behind it.
+        env["PROBE_MCP_INIT_DELAY_MS"] = "400"
+    p = subprocess.Popen([sys.executable, SHIM], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    try:
+        p.stdin.write((json.dumps(legacy_init(1)) + "\n").encode())
+        p.stdin.flush()
+        if second_after_response:
+            p.stdout.readline()          # WAIT for the answer, then reuse the id
+        p.stdin.write((json.dumps({"jsonrpc": "2.0", "id": 1,
+                                   "method": "ping"}) + "\n").encode())
+        p.stdin.flush()
+        p.stdin.close()
+        p.wait(timeout=DEADLINE)
+    finally:
+        if p.poll() is None:
+            p.kill()
+    return PIPE.id_findings(PIPE.id_timeline(
+        [json.loads(ln) for ln in open(log) if ln.strip()]))
+
+
+_after = _sequenced(True)
+_racing = _sequenced(False)
+check("id 1 reused AFTER its answer is post-response reuse",
+      _after["post_response_reuse"] == [("n", 1)] and _after["live_duplicates"] == [], _after)
+check("id 1 pipelined behind a HELD answer is a live duplicate, not that reuse",
+      _racing["live_duplicates"] == [("n", 1)]
+      and _racing["post_response_reuse"] == [], _racing)
+check("both runs really did send two requests, so neither verdict is an empty sample",
+      _after["requests"] == 2 and _racing["requests"] == 2, (_after, _racing))
+
+# THE ORDINARY CASE, which is where a reader that only fills on demand goes wrong. Two
+# requests on id 1 both crossing the wire before the server answers, with NO held window: the
+# shim must still see `req, req, resp`. It saw `req, resp, req` while `_announce` ran off
+# `_fill`, because the main loop answers the first request before asking for more input —
+# so a live duplicate was logged as post-response reuse (review, PR #100). E15 previously
+# covered only the initialize window, where `_measure_pipelining` happens to drain
+# continuously, which is exactly why this was invisible.
+_recs_dup = run([legacy_init(1), {"jsonrpc": "2.0", "id": 1, "method": "ping"}])[2]
+_found_dup = PIPE.id_findings(PIPE.id_timeline(_recs_dup))
+check("a live duplicate OUTSIDE the initialize window is still a live duplicate",
+      _found_dup["live_duplicates"] == [("n", 1)]
+      and _found_dup["post_response_reuse"] == [], _found_dup)
+
+# A RESPONSE THAT NEVER DEPARTED IS NOT AN ANSWER. C3-1 established that agy is already gone
+# when the graceful closure is written, so the write raises and nothing reaches the client;
+# logging the answer first recorded one anyway (review, PR #100).
+_gone = run([legacy_init(1),
+             {"jsonrpc": "2.0", "id": 2, "method": "subscriptions/listen",
+              "params": {**MODERN_META,
+                         "notifications": {"toolsListChanged": True}}}],
+            close_reader=True)[2]
+_answered_ids = [r for r in _gone if r.get("event") == "response_id"]
+_broken = [r for r in _gone if r.get("event") == "terminator"
+           and r.get("reason") == "broken_pipe"]
+check("a departed reader means the closure is NOT recorded as answered",
+      not _broken or all(tuple(r["id_key"]) != ("n", 2) for r in _answered_ids),
+      (_answered_ids, _broken))
+
+# MALFORMED IDS STAY OUT OF THE TIMELINE. A list id is unhashable and crashed the reader; a
+# `true` followed by `1` manufactured a reuse, because Python aliases them and JSON-RPC does
+# not (review, PR #100).
+def _raw_bytes(payload: bytes):
+    """Write these exact bytes to the shim and return its log."""
+    tmp = tempfile.mkdtemp(prefix="verify-badid-")
+    log = os.path.join(tmp, "probe.jsonl")
+    p = subprocess.Popen([sys.executable, SHIM], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         env=dict(os.environ, PROBE_MCP_LOG=log, PROBE_MCP_MODE="dual"))
+    try:
+        p.communicate(payload, timeout=DEADLINE)
+    except subprocess.TimeoutExpired:
+        p.kill()
+    return [json.loads(ln) for ln in open(log) if ln.strip()]
+
+
+def _raw_drive(msgs):
+    """Write these messages and return the log. `run()` cannot: it keys pending ids in a set,
+    so a list id raises `unhashable` in the DRIVER before the shim ever sees it."""
+    return _raw_bytes(b"".join((json.dumps(m) + "\n").encode() for m in msgs))
+
+
+_bad = _raw_drive([{"jsonrpc": "2.0", "id": [], "method": "ping"},
+                   {"jsonrpc": "2.0", "id": True, "method": "ping"},
+                   {"jsonrpc": "2.0", "id": 1, "method": "ping"}])
+_bad_tl = PIPE.id_timeline(_bad)
+check("a list id never enters the timeline",
+      PIPE.request_ids(_bad_tl) == [("n", 1)], PIPE.request_ids(_bad_tl))
+check("...so the reader does not crash on it, and `true` does not alias `1` into a reuse",
+      PIPE.id_findings(_bad_tl)["post_response_reuse"] == []
+      and PIPE.id_findings(_bad_tl)["live_duplicates"] == [], PIPE.id_findings(_bad_tl))
+check("...and the malformed traffic is still reported, as its own event",
+      len([r for r in _bad if r.get("event") == "request_id_malformed"]) == 2,
+      [r for r in _bad if r.get("event") == "request_id_malformed"])
+# A VALID ID INSIDE A MALFORMED ENVELOPE. A JSON-RPC 1.0 frame carries a perfectly good id, so
+# validating only the id let it in; the proxy terminates on that frame as MALFORMED and never
+# reaches any id rule, so a later valid request on the same id read as legal reuse. Worse, the
+# shim ANSWERS the bad frame — as a conformant server should — and recording that response
+# marked the id answered with no arrival, manufacturing a repeat out of one request (review,
+# PR #100).
+_v1 = _raw_drive([{"id": 1, "method": "ping", "params": {}},          # no "jsonrpc": "2.0"
+                  {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}}])
+_v1_tl = PIPE.id_timeline(_v1)
+check("a JSON-RPC 1.0 frame is refused admission and marks the run terminal",
+      _v1_tl[0] == ("bad", None)
+      and PIPE.id_findings(_v1_tl)["truncated"] is True, _v1_tl)
+check("...and nothing after it is classified, so no reuse is manufactured",
+      PIPE.id_findings(_v1_tl)["post_response_reuse"] == []
+      and PIPE.id_findings(_v1_tl)["requests"] == 0, PIPE.id_findings(_v1_tl))
+check("...and the response to the refused frame is not recorded as an answer",
+      [k for k, _ in PIPE.id_timeline(
+          _raw_drive([{"id": 1, "method": "ping", "params": {}}]))] == ["bad"],
+      PIPE.id_timeline(_raw_drive([{"id": 1, "method": "ping", "params": {}}])))
+# ALL FOUR SHAPES, not just the request branch. The proxy fails on any envelope it cannot
+# classify, so each of those is terminal in the timeline — and a malformed NOTIFICATION has no
+# id at all, which is how it slipped past a request-shaped check (review, PR #100).
+for _env in ({"jsonrpc": "1.0", "id": 1, "method": "ping"},
+             {"jsonrpc": "2.0", "id": 1, "method": ""},
+             {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": []},
+             {"jsonrpc": "2.0", "id": 1, "method": "ping", "result": {}},
+             {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+             {"jsonrpc": "2.0", "method": "notifications/initialized"},
+             {"jsonrpc": "1.0", "method": "notifications/initialized"},
+             {"jsonrpc": "2.0", "method": "x", "params": []},
+             {"jsonrpc": "2.0", "id": 1, "result": {}},
+             {"jsonrpc": "2.0", "id": 1, "result": []},
+             {"jsonrpc": "2.0", "id": 1, "error": {"code": 1, "message": "m"}},
+             {"jsonrpc": "2.0", "id": 1, "error": {"code": "1", "message": "m"}},
+             {"jsonrpc": "2.0", "id": 1}):
+    _proxy = classify_envelope(_env)
+    _want = None if not isinstance(_proxy, str) else _proxy
+    check(f"the shim's envelope verdict matches the proxy's for {_env}",
+          SHIM_MOD._envelope_shape(_env) == _want, (SHIM_MOD._envelope_shape(_env), _proxy))
+
+# A FAILED READ IS NOT A CLOSED STDIN. `_reader` swallowed every OSError into `chunk = b""`,
+# so the main loop logged `stdin_eof` and a clean terminator — C3-1 would have published an
+# instrument failure as "this CLI shut the server down cleanly" (review, PR #100). Driven with
+# a WRITE-only fd as stdin, so `os.read` really raises.
+_rfd, _wfd = os.pipe()
+_failtmp = tempfile.mkdtemp(prefix="verify-readerfail-")
+_faillog = os.path.join(_failtmp, "probe.jsonl")
+_fp = subprocess.Popen([sys.executable, SHIM], stdin=_wfd, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL,
+                       env=dict(os.environ, PROBE_MCP_LOG=_faillog, PROBE_MCP_MODE="dual"))
+os.close(_rfd)
+os.close(_wfd)
+_fp.wait(timeout=DEADLINE)
+_frecs = [json.loads(ln) for ln in open(_faillog) if ln.strip()]
+check("a failed read is logged as a reader error, not silence",
+      any(r["event"] == "reader_error" for r in _frecs), [r["event"] for r in _frecs])
+check("...and the terminator says so instead of claiming a clean stdin close",
+      [r.get("reason") for r in _frecs if r["event"] == "terminator"] == ["reader_failed"],
+      _frecs)
+# THE EXIT STATUS TOO. A log line the caller has to go and read is not a report: everything
+# driving this shim checks the status first, so logging the failure and exiting 0 leaves the
+# instrument saying "clean" where most callers look (review, PR #100).
+check("...and the shim exits non-zero", _fp.returncode != 0, _fp.returncode)
+check("...and a genuine stdin close still exits 0 with a clean terminator",
+      [r.get("reason") for r in run([legacy_init(1)])[2]
+       if r["event"] == "terminator"] == ["stdin_eof"])
+_okrun = subprocess.run([sys.executable, SHIM], input=b"", capture_output=True,
+                        env=dict(os.environ, PROBE_MCP_MODE="dual"), timeout=DEADLINE)
+check("...confirmed: a clean EOF is exit 0", _okrun.returncode == 0, _okrun.returncode)
+# The PROBE carries the instrument's health beside the reading, and FAILS THE RUN on it.
+_answered = {"cli": "a", "connected": True, "era": {"era": "legacy", "version": "2025-11-25"},
+             "pipelining": {"pipelined": False, "count": 0, "methods": []},
+             "id_anomalies": [], "reader_failed": False}
+check("a fully answered run exits 0", PIPE.run_failed([_answered]) is False)
+check("...a dead reader fails it",
+      PIPE.run_failed([{**_answered, "reader_failed": True}]) is True)
+check("...malformed traffic fails it",
+      PIPE.run_failed([{**_answered, "id_anomalies": [{"event": "request_id_malformed"}]}])
+      is True)
+check("...and the shim's own log is what tells the probe",
+      any(r["event"] in ("reader_error", "reader_failed") for r in _frecs), _frecs)
+
+# BATCHES AND MALFORMED NOTIFICATIONS are proxy-terminal too, and produced no marker at all —
+# a batch is neither request-shaped nor unparseable, and a malformed notification has no id.
+_batch_tl = PIPE.id_timeline(_raw_drive([[{"jsonrpc": "2.0", "id": 1, "method": "ping"}],
+                                         {"jsonrpc": "2.0", "id": 2, "method": "ping"}]))
+check("a JSON-RPC batch is a terminal marker",
+      _batch_tl and _batch_tl[0] == ("bad", None)
+      and PIPE.id_findings(_batch_tl)["truncated"] is True, _batch_tl)
+_note_tl = PIPE.id_timeline(_raw_drive([{"jsonrpc": "1.0", "method": "notifications/x"},
+                                        {"jsonrpc": "2.0", "id": 2, "method": "ping"}]))
+check("a malformed NOTIFICATION is a terminal marker, id or no id",
+      _note_tl and _note_tl[0] == ("bad", None)
+      and PIPE.id_findings(_note_tl)["truncated"] is True, _note_tl)
+check("...but a well-formed notification is neither a marker nor a finding",
+      PIPE.id_timeline(_raw_drive([{"jsonrpc": "2.0", "method": "notifications/initialized"},
+                                   {"jsonrpc": "2.0", "id": 2, "method": "ping"}]))[0]
+      == ("req", ("n", 2)))
+check("...and unparseable input is still terminal",
+      PIPE.id_timeline(_raw_bytes(b"not json\n"))[:1] == [("bad", None)])
+
+check("the shim's RequestId rule matches the proxy's",
+      all(SHIM_MOD._valid_request_id(v) == P_valid(v)
+          for v in (1, 1.0, 0, -0.0, "1", "", True, False, None, 2**70, -5, 1.5)),
+      [(v, SHIM_MOD._valid_request_id(v), P_valid(v))
+       for v in (1, 1.0, 0, -0.0, "1", "", True, False, None, 2**70, -5, 1.5)])
+
+print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")
 sys.exit(1 if fails else 0)

@@ -8908,6 +8908,9 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     # deprecated pre-#67 module API (models= / .models / plain-id render columns)
     _section(_check_api_compat, failures, verbose)
 
+    # C3 proxy — the decision layer (DESIGN_MCP_Support.md §10), wired to nothing yet
+    _section(_check_mcp_proxy_decisions, failures, verbose)
+
     # LAST, because it is about everything above it: the arm count reported in the banner is
     # the only signal that a whole section stopped running, and a counter that silently
     # stopped counting would report zero while every arm still passed — the exact shape of
@@ -8919,6 +8922,953 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     print()
     print(_banner(arms_before, failures))
     return 1 if failures else 0
+
+
+def _check_mcp_proxy_decisions(failures, verbose):
+    """C3's decision layer — DESIGN_MCP_Support.md §10, the half a mutation can reach.
+
+    `tools/mutate_mcp.py` proves arms by running THIS suite, so anything exercised only by
+    driving the proxy over real pipes would carry no mutation coverage. These arms therefore
+    call the pure functions directly; the wire-level driver covers sequencing.
+
+    Each arm pins a rule §10.9 names as one a plausible implementation gets wrong, and every
+    one of them is a way the proxy could DEGRADE — forward something it did not understand —
+    rather than fail the cell, which is the single property §10.5 exists to guarantee.
+
+    THE LOAD-BEARING ARMS GO THROUGH `decide()`, and that is a correction rather than a
+    style. An arm that calls `refusal_for()` proves a message is well worded and proves
+    nothing about whether an off-list call is ever refused; the first cut of this section did
+    exactly that, and would have passed against a proxy that forwarded every call (review, PR
+    #100). It is the same defect as M117 and M125 — a check aimed BESIDE the thing that
+    matters — so wherever the question is "does the proxy do X", the arm hands `decide()` a
+    line and inspects the ACTION.
+    """
+    import json
+
+    from . import mcp_proxy as P
+
+    print("mcp proxy decisions:")
+
+    def kind(x):
+        return x.kind if isinstance(x, P.Anomaly) else x
+
+    def ctx(allowed=("echo",), server="alpha"):
+        """A fresh proxy context: the allowlist plus the two mutable streams-worth of state."""
+        return {"allowed": frozenset(allowed), "state": P.ProtocolState(),
+                "inflight": P.InFlight(), "server": server}
+
+    def act(msg, direction=P.C2S, **c):
+        """Drive the real entry point with a real wire line, as the I/O layer will."""
+        return P.decide(json.dumps(msg), direction=direction, **c)
+
+    def legacy_ctx(version="2025-11-25", **kw):
+        """A context whose `initialize` exchange has COMPLETED, on id 0.
+
+        Most bare requests need one. Without modern `_meta` and without a negotiated version
+        no implemented version governs a request, so the proxy refuses it — see the era arm
+        below. Id 0 is used and retired here so the arms can keep numbering from 1.
+        """
+        c = ctx(**kw)
+        act({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+             "params": {"protocolVersion": version}}, **c)
+        act({"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": version}},
+            direction=P.S2C, **c)
+        return c
+
+    def failed(action):
+        return action.anomaly.kind if isinstance(action, P.Fail) else type(action).__name__
+
+    def survives(msg, direction=P.C2S, **c):
+        """`act`, but a CRASH is a value the assertion can reject rather than a lost section.
+
+        An unhashable id reaching `dict.pop` raises inside the pump, several frames from
+        anything that could log it. That is the failure under test, so it has to be catchable
+        here — otherwise the mutation for it reads as "failed, but NOT via" and proves nothing.
+        """
+        try:
+            return act(msg, direction=direction, **c)
+        except Exception as exc:
+            return exc
+
+    # 1) Envelope shape is established POSITIVELY. The naive "no `id` means notification"
+    #    reading is the defect: a malformed response that lost its id matches it and gets
+    #    forwarded down the never-answer path, unfiltered and unrecorded. The id-less ERROR
+    #    is the case that makes the taxonomy earn its keep — schema-valid (`id?: RequestId`),
+    #    so calling it malformed would send a reader hunting a framing bug that does not
+    #    exist while hiding a server-side error the server was trying to report.
+    env = {
+        "request": P.classify_envelope({"jsonrpc": "2.0", "method": "m", "id": 1}),
+        "notification": P.classify_envelope({"jsonrpc": "2.0", "method": "n"}),
+        "result": P.classify_envelope({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        "idless_error": P.classify_envelope(
+            {"jsonrpc": "2.0", "error": {"code": -1, "message": "x"}}),
+        "idless_result": P.classify_envelope({"jsonrpc": "2.0", "result": {}}),
+        "both": P.classify_envelope({"jsonrpc": "2.0", "id": 1, "result": {}, "error": {}}),
+        "null_id_request": P.classify_envelope(
+            {"jsonrpc": "2.0", "method": "m", "id": None}),
+        "wrong_version": P.classify_envelope({"jsonrpc": "1.0", "method": "m", "id": 1}),
+        # The schema says `RequestId` is a string or a number, and MCP narrows that to a
+        # string or an INTEGER. Each of these is a distinct way through: a bool passes
+        # `isinstance(x, int)` in Python and would alias id 1; a list or an object is
+        # unhashable and reaches correlation as a `TypeError` inside a pump rather than as an
+        # anomaly with a log entry.
+        "bool_id": P.classify_envelope({"jsonrpc": "2.0", "method": "m", "id": True}),
+        # A FRACTIONAL id is valid: the schema is the source of truth and says `string |
+        # number`, while JSON-RPC only SHOULD NOT it. Refusing it fails a conforming client
+        # over style (review, PR #100). `NaN` is different — not JSON at all, and an id that
+        # never equals itself could never be retired.
+        "float_id": P.classify_envelope({"jsonrpc": "2.0", "method": "m", "id": 1.5}),
+        "nan_id": P.classify_envelope({"jsonrpc": "2.0", "method": "m",
+                                       "id": float("nan")}),
+        "list_id": P.classify_envelope({"jsonrpc": "2.0", "method": "m", "id": [1]}),
+        "object_id": P.classify_envelope({"jsonrpc": "2.0", "id": {"a": 1}, "result": {}}),
+        "array_params": P.classify_envelope(
+            {"jsonrpc": "2.0", "method": "m", "id": 1, "params": [1, 2]}),
+        "scalar_result": P.classify_envelope({"jsonrpc": "2.0", "id": 1, "result": 7}),
+        "codeless_error": P.classify_envelope({"jsonrpc": "2.0", "id": 1,
+                                               "error": {"message": "x"}}),
+        "message_less_error": P.classify_envelope({"jsonrpc": "2.0", "id": 1,
+                                                   "error": {"code": -1}}),
+        "batch": P.parse_line("[{}]"),
+        "garbage": P.parse_line("{not json"),
+    }
+    # ...and the unhashable ids must be stopped BEFORE routing, which only `decide` can show.
+    unhashable = act({"jsonrpc": "2.0", "method": "ping", "id": [1]}, **ctx())
+    # The id-less error keeps its own DIAGNOSIS all the way through: same verdict as a broken
+    # frame, different kind, because the two send a reader to different places (§10.4).
+    orphan_error = act({"jsonrpc": "2.0", "error": {"code": -32603, "message": "boom"}},
+                       direction=P.S2C, **ctx())
+    _check("proxy.envelope_shape_is_established_positively",
+           env["request"] == P.REQUEST and env["notification"] == P.NOTIFICATION
+           and env["result"] == P.RESULT
+           and env["idless_error"] == P.ERROR
+           and kind(env["idless_result"]) == P.MALFORMED
+           and kind(env["both"]) == P.MALFORMED
+           and kind(env["null_id_request"]) == P.MALFORMED
+           and kind(env["wrong_version"]) == P.MALFORMED
+           and kind(env["bool_id"]) == P.MALFORMED
+           and env["float_id"] == P.REQUEST
+           and kind(env["nan_id"]) == P.MALFORMED
+           and kind(env["list_id"]) == P.MALFORMED
+           and kind(env["object_id"]) == P.MALFORMED
+           and kind(env["array_params"]) == P.MALFORMED
+           and kind(env["scalar_result"]) == P.MALFORMED
+           and kind(env["codeless_error"]) == P.MALFORMED
+           and kind(env["message_less_error"]) == P.MALFORMED
+           and kind(env["batch"]) == P.BATCH
+           and kind(env["garbage"]) == P.UNPARSEABLE
+           and failed(unhashable) == P.MALFORMED
+           and failed(orphan_error) == P.UNCORRELATED,
+           f"parseable JSON is not a valid MCP message. Each of the four shapes must be "
+           f"recognised by what it HAS, not by what it lacks: an id-less RESULT is malformed "
+           f"while an id-less ERROR is schema-valid and classifies as an error (its "
+           f"correlation is a separate question with its own anomaly kind), a null request "
+           f"id is malformed rather than a notification, and a batch array is refused as its "
+           f"own kind because MCP's stdio binding permits exactly one message per line. The "
+           f"typed fields are checked POSITIVELY too — an id is a string or a NUMBER (the "
+           f"schema is the source of truth and JSON-RPC only discourages fractions), "
+           f"`params` and `result` are objects, an `error` carries an integer code and a "
+           f"string message — because a list id is unhashable and would otherwise surface as "
+           f"a TypeError inside a pump instead of an anomaly the log can name. An id-less "
+           f"ERROR keeps its own diagnosis to the end — UNCORRELATED, not MALFORMED — so the "
+           f"log does not send a reader hunting a framing bug while hiding the server-side "
+           f"error the server was reporting. "
+           f"{ {k: kind(v) for k, v in env.items()} } routed={failed(unhashable)} "
+           f"orphan_error={failed(orphan_error)}", failures, verbose)
+
+    # 2) Era comes from METADATA, not from the method name. §10.9 names this first because a
+    #    modern client MAY skip `server/discover` — so an implementation waiting for a known
+    #    opener stalls a conforming client at its first request.
+    modern_meta = {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}}}
+    plain_modern = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": modern_meta}
+    # The opener a modern client is entitled to send must be FORWARDED, not stalled...
+    opener = act(plain_modern, **ctx())
+    # ...while a method belonging to the other era is refused through the same entry point.
+    modern_init = act({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": dict(modern_meta, protocolVersion="2025-11-25")}, **ctx())
+    bare_sub = act({"jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen"}, **ctx())
+    _check("proxy.era_comes_from_metadata_not_method",
+           P.modern_version(plain_modern) == "2026-07-28"
+           and P.has_modern_intent(plain_modern)
+           and P.modern_version({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) is None
+           # ...and the method must match the era the REQUEST established, both ways.
+           and P.method_matches_era("tools/list", modern=True)
+           and not P.method_matches_era("initialize", modern=True)
+           and not P.method_matches_era("server/discover", modern=False)
+           and not P.method_matches_era("subscriptions/listen", modern=False)
+           and P.method_matches_era("tools/list", modern=False)
+           and isinstance(opener, P.Forward)
+           and failed(modern_init) == P.ERA_METHOD_MISMATCH
+           and failed(bare_sub) == P.ERA_METHOD_MISMATCH,
+           f"a connection whose FIRST message is an ordinary `tools/list` carrying modern "
+           f"`_meta` is modern and must proceed — `server/discover` is optional for clients, "
+           f"so waiting for a known opener stalls a conforming one. And the method must "
+           f"match the request rather than the reverse: `initialize` with modern metadata is "
+           f"an unknown method, and a modern-only method with no metadata is unknown to the "
+           f"legacy semantics in force. Modern-only is a CATEGORY — naming `server/discover` "
+           f"and not `subscriptions/listen` is how the probe shim came to answer a bare "
+           f"subscription under legacy rules that have no such method. Both mismatches are "
+           f"refused rather than passed to the server to reject, because a proxy that has "
+           f"lost track of the era cannot say where tool definitions live: "
+           f"opener={type(opener).__name__} modern_init={failed(modern_init)} "
+           f"bare_sub={failed(bare_sub)}",
+           failures, verbose)
+
+    # 2b) A BARE request needs an era that was actually established. With no modern `_meta`
+    #     and no answered `initialize`, no implemented version governs the request — so
+    #     reading its absence of metadata as "legacy" is the version gate defeated by simply
+    #     never handshaking, which needs no malice and no exotic client (review, PR #100).
+    #     The lifecycle names the exceptions: "the client SHOULD NOT send requests other than
+    #     pings before the server has responded to the initialize request".
+    cold = ctx()
+    ungoverned = act({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, **cold)
+    sanctioned = act({"jsonrpc": "2.0", "id": 2, "method": "ping"}, **cold)
+    opening = act({"jsonrpc": "2.0", "id": 3, "method": "initialize",
+                   "params": {"protocolVersion": "2025-11-25"}}, **cold)
+    # ...and the SAME request is ordinary once the handshake has completed.
+    warm = act({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}, **legacy_ctx())
+    # ...but a handshake still IN FLIGHT is NOT an era. Letting one through was an attempt to
+    # tolerate pipelining, which the lifecycle only SHOULD-NOTs — and it opened the gate
+    # exactly where §10.6 needs it shut: the pipelined request's response can arrive BEFORE
+    # the initialize response, and is then read under no version at all, so a modern
+    # `InputRequiredResult` carrying definitions goes through unrecognised (review, PR #100).
+    # C3-2 measured that no shipped CLI pipelines, which is what makes refusing the right
+    # trade rather than a gamble.
+    pipelined = ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2025-11-25"}}, **pipelined)
+    behind_it = act({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, **pipelined)
+    # ...and a handshake the server REFUSED leaves neither an era nor a stuck pending state:
+    # version negotiation is exactly where an error is expected, so the client may propose
+    # again. Without clearing it, bare requests stayed allowed forever behind a dead
+    # handshake, and a legitimate retry read as a second `initialize`.
+    refused_hs = ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2024-01-01"}}, **refused_hs)
+    nack = act({"jsonrpc": "2.0", "id": 1, "error": {
+        "code": -32602, "message": "Unsupported protocol version",
+        "data": {"supported": ["2025-11-25"]}}}, direction=P.S2C, **refused_hs)
+    still_shut = act({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, **refused_hs)
+    retry = act({"jsonrpc": "2.0", "id": 3, "method": "initialize",
+                 "params": {"protocolVersion": "2025-11-25"}}, **refused_hs)
+    _check("proxy.a_bare_request_needs_an_era_that_was_actually_established",
+           failed(ungoverned) == P.NO_ERA_ESTABLISHED
+           and isinstance(sanctioned, P.Forward)
+           and isinstance(opening, P.Forward)
+           and isinstance(warm, P.Forward)
+           and failed(behind_it) == P.NO_ERA_ESTABLISHED
+           and isinstance(nack, P.Forward)
+           and failed(still_shut) == P.NO_ERA_ESTABLISHED
+           and isinstance(retry, P.Forward),
+           f"absence of modern metadata makes a request legacy-ELIGIBLE, not legacy. Until an "
+           f"`initialize` has been ANSWERED there is no negotiated version, so nothing says "
+           f"which revision's rules to read the request under and §10.6's defined locations "
+           f"are undefined for it — a client that simply never handshakes would otherwise "
+           f"have every request waved through on the strength of an absence. `ping` and "
+           f"`initialize` are the two the lifecycle sanctions before that point, and a "
+           f"handshake merely IN FLIGHT is not an era: the pipelined request's response can "
+           f"come back BEFORE the negotiation, and is then read under no version at all. A "
+           f"REFUSED handshake clears rather than stranding the connection — negotiation is "
+           f"where an error is expected — so the client may propose again while bare requests "
+           f"stay shut. ungoverned={failed(ungoverned)} ping={type(sanctioned).__name__} "
+           f"initialize={type(opening).__name__} after={type(warm).__name__} "
+           f"pipelined={failed(behind_it)} after_nack={failed(still_shut)} "
+           f"retry={type(retry).__name__}", failures, verbose)
+
+    # 3) The version gate fails CLOSED, and it is the thing that actually shuts the
+    #    future-channel hole — not any payload heuristic. §10.9 flags this as the arm that
+    #    must never be quietly relaxed to a warning.
+    future = {"params": {"_meta": {P.VER_KEY: "2099-01-01", P.CAP_KEY: {}}}}
+    future_line = act({"jsonrpc": "2.0", "id": 1, "method": "tools/list", **future}, **ctx())
+    _check("proxy.version_gate_fails_closed",
+           kind(P.modern_version(future)) == P.UNIMPLEMENTED_VERSION
+           and failed(future_line) == P.UNIMPLEMENTED_VERSION
+           and P.modern_version({"params": {"_meta": {P.VER_KEY: "2026-07-28",
+                                                      P.CAP_KEY: {}}}}) == "2026-07-28"
+           and P.negotiated_version({"protocolVersion": "2025-11-25"}) == "2025-11-25"
+           and kind(P.negotiated_version({"protocolVersion": "2024-01-01"}))
+           == P.UNIMPLEMENTED_VERSION
+           and set(P.IMPLEMENTED_VERSIONS) == {"2026-07-28", "2025-11-25", "2025-06-18"},
+           f"a request declaring a version this proxy does not implement is an anomaly even "
+           f"though it is well-formed and would parse fine. This stands in for every future "
+           f"revision: one that adds a new tool-bearing channel fails closed because nobody "
+           f"has read it, which is the honest reason — a structural scan for tool-shaped "
+           f"payloads would miss it entirely. Both eras are gated, since the fleet spans two "
+           f"legacy revisions that disagree with each other — the legacy gate sits on the "
+           f"NEGOTIATED version, which is the one the traffic is read under. "
+           f"implemented={P.IMPLEMENTED_VERSIONS} routed={failed(future_line)}",
+           failures, verbose)
+
+    # 4) Partial modern metadata is NOT legacy. EITHER reserved key establishes modern
+    #    intent, so a capabilities-only request is a broken modern request the spec obliges a
+    #    server to reject — not a bare request to read under legacy rules. The echo fixture
+    #    shipped with exactly this laundering and review caught it.
+    caps_only = {"params": {"_meta": {P.CAP_KEY: {}}}}
+    null_ver = {"params": {"_meta": {P.VER_KEY: None, P.CAP_KEY: {}}}}
+    bad_caps = {"params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: "yes"}}}
+    _check("proxy.partial_modern_metadata_is_not_legacy",
+           P.has_modern_intent(caps_only)
+           and kind(P.modern_version(caps_only)) == P.MISSING_META
+           and kind(P.modern_version(null_ver)) == P.MISSING_META
+           and kind(P.modern_version(bad_caps)) == P.MISSING_META
+           and P.modern_version({"params": {}}) is None,
+           f"absence of modern metadata is legacy-eligible; PARTIAL modern metadata is a "
+           f"broken modern request. Either reserved key establishes intent, so a "
+           f"capabilities-only request must be refused rather than quietly downgraded onto "
+           f"the bare-request path — and `null` is not absence, since a JSON null passes an "
+           f"`in` test and sails through any check written as `meta.get(KEY) or ...`. "
+           f"caps_only={kind(P.modern_version(caps_only))} "
+           f"null={kind(P.modern_version(null_ver))} bad_caps={kind(P.modern_version(bad_caps))}",
+           failures, verbose)
+
+    # 5) Capabilities are not definitions. §10.9 calls this the regression test against
+    #    reintroducing a structural scan: `"capabilities": {"tools": {}}` appears in EVERY
+    #    modern handshake, so an over-broad check takes down every gated cell.
+    discover = {"jsonrpc": "2.0", "id": 1,
+                "result": {"capabilities": {"tools": {}}, "supportedVersions": ["2026-07-28"]}}
+    legacy_sampling = {"jsonrpc": "2.0", "id": 9, "method": "sampling/createMessage",
+                       "params": {"tools": [{"name": "exfil", "inputSchema": {}}]}}
+    # `inputRequests` is a MAP keyed by server-assigned identifiers — see the arm below.
+    modern_sampling = {"jsonrpc": "2.0", "id": 9, "result": {
+        "resultType": "input_required",
+        "inputRequests": {"pick_a_tool": {
+            "method": "sampling/createMessage",
+            "params": {"tools": [{"name": "exfil", "inputSchema": {}}]}}}}}
+    empty_tools = {"jsonrpc": "2.0", "id": 9, "method": "sampling/createMessage",
+                   "params": {"tools": []}}
+    extension_shaped = {"jsonrpc": "2.0", "id": 1, "result": {
+        "capabilities": {"extensions": {"x": {"name": "not-a-tool", "inputSchema": {}}}}}}
+    _check("proxy.capabilities_are_not_tool_definitions",
+           not P.sampling_carries_tools(discover, modern=True)
+           and not P.sampling_carries_tools(extension_shaped, modern=True)
+           and not P.sampling_carries_tools(empty_tools, modern=False)
+           and P.sampling_carries_tools(legacy_sampling, modern=False) is True
+           and P.sampling_carries_tools(modern_sampling, modern=True) is True,
+           "tool definitions are checked at their DEFINED LOCATIONS per implemented "
+           "version, never by scanning for tool-shaped objects — `Result` carries an index "
+           "signature and capabilities carry an arbitrary `extensions` map, so a structural "
+           "scan fails legitimate payloads AND misses any future revision that conveys "
+           "definitions in a new shape. A `DiscoverResult` advertising `tools: {}` is a "
+           "capability FLAG and must pass clean; sampling carrying a non-empty `tools` array "
+           "is a definition outside `tools/list` and is refused, in both the legacy "
+           "(server-originated request) and modern (InputRequiredResult) carriers",
+           failures, verbose)
+
+    # 5b) `inputRequests` IS A MAP, and reading it as a list misses every entry. This arm is
+    #     separate because it is the one defect in this section that a passing suite hid: the
+    #     first version iterated the object directly, saw the string KEYS, skipped every
+    #     request — and the arm above agreed with it by building an array. Both were wrong
+    #     together, which is the recurring failure §4 of TODO_Contained_HOME.md names (review,
+    #     PR #100). The conforming shape is the one the spec prints, and it must be caught
+    #     THROUGH `decide` on a response the client actually gets back.
+    def modern_call(cid, ctxt):
+        return act({"jsonrpc": "2.0", "id": cid, "method": "tools/call",
+                    "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}},
+                               "name": "echo", "arguments": {}}}, **ctxt)
+
+    mrtr = ctx()
+    modern_call(9, mrtr)
+    conforming = act(modern_sampling, direction=P.S2C, **mrtr)
+    listed_shape = ctx()
+    modern_call(9, listed_shape)
+    as_a_list = act({"jsonrpc": "2.0", "id": 9, "result": {
+        "resultType": "input_required",
+        "inputRequests": [{"method": "sampling/createMessage",
+                           "params": {"tools": [{"name": "exfil"}]}}]}},
+        direction=P.S2C, **listed_shape)
+    # ...and the location is defined PER VERSION. Under a legacy revision `Result` is
+    # open-ended, so `inputRequests` there means whatever that server means by it — reading
+    # it as MRTR failed a conforming legacy response (review, PR #100).
+    old = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+         "params": {"name": "echo", "arguments": {}}}, **old)
+    legacy_extension = act({"jsonrpc": "2.0", "id": 9,
+                            "result": {"content": [], "inputRequests": []}},
+                           direction=P.S2C, **old)
+    # ...including a legacy payload that happens to carry both modern markers. Neither means
+    # anything there — MRTR does not exist under a legacy revision and `resultType` is just
+    # another open-ended member — so reading them is importing modern semantics into a
+    # payload no modern rule governs.
+    older = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+         "params": {"name": "echo", "arguments": {}}}, **older)
+    legacy_lookalike = act({"jsonrpc": "2.0", "id": 12, "result": {
+        "resultType": "input_required",
+        "inputRequests": {"x": {"method": "sampling/createMessage",
+                                "params": {"tools": [{"name": "exfil"}]}}}}},
+        direction=P.S2C, **older)
+    # ...and `resultType` is the DISCRIMINATOR, not decoration. `Result` is open-ended, so a
+    # `complete` result carrying a key of that name means whatever the server means by it;
+    # reading it as MRTR anyway is the structural scan §10.6 rejects, arriving by the back
+    # door — it diagnosed a plain `ping` result as tool-bearing (review, PR #100).
+    completed = ctx()
+    act({"jsonrpc": "2.0", "id": 10, "method": "ping",
+         "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}}}}, **completed)
+    complete_result = act({"jsonrpc": "2.0", "id": 10, "result": {
+        "resultType": "complete",
+        "inputRequests": {"telemetry": {"method": "sampling/createMessage",
+                                        "params": {"tools": [{"name": "audit-trail"}]}}}}},
+        direction=P.S2C, **completed)
+    # ...and the same key holding a shape MRTR could not read is equally not MRTR's business
+    # under `complete`, so it must not become a shape anomaly either.
+    complete_list = ctx()
+    act({"jsonrpc": "2.0", "id": 11, "method": "ping",
+         "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}}}}, **complete_list)
+    complete_other = act({"jsonrpc": "2.0", "id": 11, "result": {
+        "resultType": "complete", "inputRequests": ["a", "b"]}},
+        direction=P.S2C, **complete_list)
+    _check("proxy.modern_sampling_requests_are_a_keyed_map_not_a_list",
+           failed(conforming) == P.TOOL_BEARING_SAMPLING
+           and failed(as_a_list) == P.BAD_INPUT_REQUESTS
+           and isinstance(legacy_extension, P.Forward)
+           and isinstance(legacy_lookalike, P.Forward)
+           and isinstance(complete_result, P.Forward)
+           and isinstance(complete_other, P.Forward)
+           # an `input_required` result may carry only `requestState`, and an entry that is
+           # not sampling is not a definition
+           and P.sampling_carries_tools(
+               {"result": {"resultType": "input_required", "requestState": "opaque"}},
+               modern=True) is False
+           and P.sampling_carries_tools(
+               {"result": {"resultType": "input_required",
+                           "inputRequests": {"a": {"method": "elicitation/create"}}}},
+               modern=True) is False,
+           f"`InputRequiredResult.inputRequests` is a map — \"keys are server-assigned string "
+           f"identifiers; values are request objects\" — so iterating it walks the KEYS, every "
+           f"entry looks like a string rather than a request, and a conforming tool-bearing "
+           f"result reads as clean and reaches the model. A shape that is not a map is an "
+           f"ANOMALY rather than a False, because 'no tools in here' would be a guess about a "
+           f"structure this code could not read. It is read at all only where the version and "
+           f"the RESULT TYPE define it: the same key on a legacy response, or under "
+           f"`resultType: \"complete\"`, is an ordinary open-ended `Result` member and must "
+           f"pass — treating any key of that name as MRTR is the structural scan by another "
+           f"route. conforming={failed(conforming)} as_a_list={failed(as_a_list)} "
+           f"legacy={type(legacy_extension).__name__}/{type(legacy_lookalike).__name__} "
+           f"complete={type(complete_result).__name__}/{type(complete_other).__name__}",
+           failures, verbose)
+
+    # 6) A `tools/list` result is filtered or refused — never forwarded unfiltered. The shape
+    #    question is asked SEPARATELY from the filtering, because a filter that returned its
+    #    input unchanged on a shape it did not understand is the degradation §10.5 forbids.
+    listed = {"tools": [{"name": "echo"}, {"name": "add"}, {"name": "danger"}]}
+    filtered, removed = P.filter_tools_result(listed, frozenset({"echo"}))
+    # ...and the same journey through `decide`, which is what the CLI actually receives: the
+    # request is opened first, because a response the proxy cannot correlate is not filterable
+    # at all (a response says which id it answers, never which method).
+    enum = legacy_ctx()
+    enum_req = act({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}, **enum)
+    served = act({"jsonrpc": "2.0", "id": 4, "result": listed}, direction=P.S2C, **enum)
+    unshaped = legacy_ctx()
+    unshaped["inflight"].record(P.C2S, 4, "tools/list", "2025-11-25")
+    refused_shape = act({"jsonrpc": "2.0", "id": 4, "result": {"tools": [{"noname": 1}]}},
+                        direction=P.S2C, **unshaped)
+    # A response the proxy cannot place has no correlated method, so it is not recognised as
+    # a tool advertisement at all — which is the route by which an unfiltered `tools/list`
+    # reaches the model without any tools check ever running.
+    stray = act({"jsonrpc": "2.0", "id": 99, "result": listed}, direction=P.S2C,
+                **legacy_ctx())
+    _check("proxy.tools_result_is_filtered_or_refused_never_forwarded_unfiltered",
+           [t["name"] for t in filtered["tools"]] == ["echo"] and removed == ["add", "danger"]
+           and listed["tools"][0]["name"] == "echo" and len(listed["tools"]) == 3
+           and P.tools_result_ok(listed)
+           and not P.tools_result_ok({"tools": "nope"})
+           and not P.tools_result_ok({"tools": [{"noname": 1}]})
+           and not P.tools_result_ok({"tools": [{"name": 7}]})
+           and not P.tools_result_ok("nope")
+           and isinstance(enum_req, P.Forward)
+           and isinstance(served, P.Filtered)
+           and [t["name"] for t in served.msg["result"]["tools"]] == ["echo"]
+           and served.removed == ("add", "danger")
+           and failed(refused_shape) == P.BAD_TOOLS_RESULT
+           and failed(stray) == P.UNCORRELATED,
+           f"the allowlist is applied to every `tools/list` response on its own merits — "
+           f"`toolsListChanged` lets a server prompt re-enumeration whenever it likes and "
+           f"copilot issues the call twice a session, so there is no first-enumeration-wins "
+           f"shortcut. The source message is left intact so the filtered advertisement can "
+           f"still be logged as the expected event it is. A result whose entries lack string "
+           f"names cannot be certainly kept OR certainly dropped, so it is a shape anomaly "
+           f"rather than a judgement call, and the whole path is driven through `decide` "
+           f"because 'the filter works' and 'the response is filtered' are different claims: "
+           f"kept={[t['name'] for t in filtered['tools']]} removed={removed} "
+           f"served={type(served).__name__} unshaped={failed(refused_shape)} "
+           f"stray={failed(stray)}", failures, verbose)
+
+    # 7) Correlation is DIRECTION-SCOPED. Under legacy both sides originate requests and
+    #    number independently, so one shared map either collides two legitimate
+    #    conversations or reports one direction's response as uncorrelated.
+    fl = P.InFlight()
+    fl.record("c2s", 1, "tools/list", "2025-11-25")
+    fl.record("s2c", 1, "sampling/createMessage", "2025-11-25")
+    # ...and within numbers it is the VALUE that identifies, not Python's type: a response may
+    # echo `1` as `1.0` and it is the same id. Keying on the type name made that uncorrelated
+    # and let both be live at once (review, PR #100).
+    echoed = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, **echoed)
+    same_number = act({"jsonrpc": "2.0", "id": 1.0, "result": listed},
+                      direction=P.S2C, **echoed)
+    twice = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, **twice)
+    also_live = act({"jsonrpc": "2.0", "id": 1.0, "method": "ping"}, **twice)
+    _check("proxy.correlation_is_direction_scoped",
+           fl.method_for("c2s", 1) == "tools/list"
+           and fl.method_for("s2c", 1) == "sampling/createMessage"
+           and fl.method_for("c2s", 2) is None
+           and fl.method_for("c2s", "1") is None
+           and fl.method_for("c2s", 1.0) == "tools/list"
+           and isinstance(same_number, P.Filtered)
+           and failed(also_live) == P.DUPLICATE_ID,
+           f"both sides originate requests under legacy and they number independently, so an "
+           f"`id` on a server->client request is not an unrequested `id`. One shared map "
+           f"would collide id 1 in each direction. Strings and numbers are different id "
+           f"DOMAINS — `1` and `\"1\"` are different ids per JSON-RPC — but WITHIN numbers the "
+           f"value is the id: a response echoing `1` as `1.0` answers that request and must "
+           f"correlate, and a second request on `1.0` while `1` is live is a duplicate rather "
+           f"than a new conversation. c2s={fl.method_for('c2s', 1)!r} "
+           f"s2c={fl.method_for('s2c', 1)!r} str_1={fl.method_for('c2s', '1')!r} "
+           f"echoed={type(same_number).__name__} also_live={failed(also_live)}",
+           failures, verbose)
+
+    # 7b) A LIVE id is never silently reused, and this one is a filtering bypass rather than
+    #     bookkeeping: open `tools/list` on id 1, then `ping` on id 1, and an overwriting map
+    #     correlates the server's tool advertisement as a `ping` — which is forwarded
+    #     unfiltered (review, PR #100). The spec forbids the client sending it; the proxy
+    #     does not get to assume the client obeys.
+    reuse = legacy_ctx()
+    first_open = act({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, **reuse)
+    collide = act({"jsonrpc": "2.0", "id": 1, "method": "ping"}, **reuse)
+    answered = act({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}},
+                   direction=P.S2C, **reuse)
+    # ...and being answered does NOT free it. Reuse after a response is legal for the client —
+    # the rule is only that an id may not match one "the sender has issued and not yet received
+    # a response for" — but the second response that makes it unsafe comes from the SERVER, and
+    # this boundary does not control the server. `tools/list` on id 1, its filtered answer,
+    # `ping` on id 1, then a second `tools/list` result: it correlates as the `ping` and is
+    # forwarded UNFILTERED, with no cancellation anywhere in the sequence (review, PR #100).
+    after = act({"jsonrpc": "2.0", "id": 1, "method": "ping"}, **reuse)
+    second_answer = act({"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "add"}]}},
+                        direction=P.S2C, **reuse)
+    # A REFUSED call is the exception, and it has to be: nothing was forwarded, so nothing can
+    # ever answer it. Burning the id would fail the next legitimate request on it — and every
+    # MRTR retry lands here.
+    freed = legacy_ctx()
+    refused_call = act({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "danger", "arguments": {}}}, **freed)
+    reuse_after_refusal = act({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": {"name": "echo", "arguments": {}}}, **freed)
+    # The id must be claimed BEFORE any message is produced, refusals included: an off-list
+    # call answered on a live id sends the client an error correlated to the request that id
+    # really belongs to — its outstanding `tools/list` — which then looks answered while the
+    # real response is still on its way (review, PR #100).
+    shadow = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, **shadow)
+    shadowed = act({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "danger", "arguments": {}}}, **shadow)
+    # ...and the server's own numbering gets the same guard, on its own map.
+    srv = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 5, "method": "sampling/createMessage",
+         "params": {"messages": []}}, direction=P.S2C, **srv)
+    srv_collide = act({"jsonrpc": "2.0", "id": 5, "method": "roots/list"},
+                      direction=P.S2C, **srv)
+    _check("proxy.a_live_request_id_is_never_silently_reused",
+           isinstance(first_open, P.Forward)
+           and failed(collide) == P.DUPLICATE_ID
+           and isinstance(answered, P.Filtered)
+           # ANSWERED IS NOT FREE: the id is spent, and the second answer that would have
+           # exploited its reuse fails rather than correlating to whatever took it
+           and failed(after) == P.SPENT_ID_REUSE
+           and failed(second_answer) == P.RESPONSE_AFTER_COMPLETION
+           # ...but a request that never reached the server leaves its id usable
+           and isinstance(refused_call, P.Refuse)
+           and isinstance(reuse_after_refusal, P.Forward)
+           and failed(shadowed) == P.DUPLICATE_ID
+           and failed(srv_collide) == P.DUPLICATE_ID,
+           f"an id may not be reused while it is live — \"the request ID MUST NOT match the ID "
+           f"of any other request the sender has issued and not yet received a response for\" "
+           f"— and once it has REACHED THE SERVER it is spent for the connection. A map that "
+           f"overwrote would let a second request relabel the first; a map that freed the id "
+           f"on the answer leaves the same bypass one step later, since a second response "
+           f"correlates to whatever reused it and a server that sends one is exactly what this "
+           f"boundary does not control. The check runs BEFORE any message is produced, so an "
+           f"off-list call on a live id is refused as a duplicate rather than answered — that "
+           f"would hand the client an error correlated to the request the id belongs to. The "
+           f"one id that comes back is one nothing was forwarded for: a locally refused call "
+           f"can have no response, so keeping it spent would fail the next legitimate request "
+           f"and every MRTR retry. open={type(first_open).__name__} "
+           f"collide={failed(collide)} answered={type(answered).__name__} "
+           f"reuse_after_answer={failed(after)} second_answer={failed(second_answer)} "
+           f"reuse_after_refusal={type(reuse_after_refusal).__name__} "
+           f"shadowed={failed(shadowed)} server={failed(srv_collide)}", failures, verbose)
+
+    # 8) Subscriptions retire at BOTH orderly ends. An entry left resident forever would
+    #    correlate a fresh response against stale state, or read a legitimate reply as
+    #    unrequested. NEITHER end returns the id: both ends are messages from the server, and
+    #    §10.4 spends an id once it has reached the server whatever ended it. They differ only
+    #    in what a LATER message on that id is called — the documented race after a
+    #    cancellation, a protocol violation after an answer (arm 8d).
+    sub = P.InFlight()
+    sub.record("c2s", 1, "subscriptions/listen", "2026-07-28")
+    cancel = {"jsonrpc": "2.0", "method": "notifications/cancelled",
+              "params": {"requestId": 1}}
+    closure = {"jsonrpc": "2.0", "id": 1,
+               "result": {"resultType": "complete", "_meta": {P.SUB_KEY: 1}}}
+    cid = P.cancelled_id(cancel)
+    retired = sub.cancel("c2s", cid)
+    # Through `decide`: the cancellation is forwarded AND retires the request it names, which
+    # is not the same as freeing its id — the id stays spent (arm 8d).
+    live = ctx()
+    opened_sub = act({"jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen",
+                      "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}},
+                                 "notifications": {"toolsListChanged": True}}}, **live)
+    forwarded_cancel = act(cancel, **live)
+    # THE OTHER END: the server's graceful closure. It retires the subscription the same way,
+    # and it spends the id the same way — an earlier version called this the end that "genuinely
+    # frees" the id, on the reasoning that the request was over on both sides. That is the same
+    # claim the cancellation quarantine had already had to give up, and it is no better here:
+    # the closure is a message from the server, and one message from the server is no evidence
+    # about the next (review, PR #100). What differs between the two ends is the DIAGNOSIS of a
+    # later message on that id, not whether the id comes back.
+    closed = ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen",
+         "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}},
+                    "notifications": {"toolsListChanged": True}}}, **closed)
+    shut_cleanly = act(closure, direction=P.S2C, **closed)
+    reused_after_closure = act({"jsonrpc": "2.0", "id": 1, "method": "ping"}, **closed)
+    _check("proxy.subscriptions_retire_at_both_orderly_ends",
+           cid == 1 and retired == "subscriptions/listen" and sub.open_ids("c2s") == []
+           and P.cancelled_id({"jsonrpc": "2.0", "method": "notifications/other"}) is P._ABSENT
+           and P.is_graceful_closure("subscriptions/listen", closure)
+           and not P.is_graceful_closure("subscriptions/listen",
+                                         {"id": 1, "result": {"data": 1}})
+           and not P.is_graceful_closure("tools/list", closure)
+           and isinstance(opened_sub, P.Forward)
+           and isinstance(forwarded_cancel, P.Forward)
+           and live["inflight"].open_ids(P.C2S) == []
+           and isinstance(shut_cleanly, P.Forward)
+           and failed(reused_after_closure) == P.SPENT_ID_REUSE,
+           f"a long-lived `subscriptions/listen` is not a leak — agy opens one and streams "
+           f"through notifications — but it is not resident forever either. It ends on "
+           f"`notifications/cancelled` naming its id, or on the server's own graceful-closure "
+           f"response, and the subscription id IS the request id, so the live entry must go or "
+           f"the next message on that id correlates against stale state. NEITHER end returns "
+           f"the id: both are messages from the server, and the closure is no better evidence "
+           f"than the straggler was that nothing else follows. They differ only in what a "
+           f"later message on that id is CALLED (arm 8d). The cancellation is still forwarded "
+           f"verbatim; it is merely OBSERVED on the way through. cid={cid!r} "
+           f"retired={retired!r} open={live['inflight'].open_ids(P.C2S)} "
+           f"reuse_after_closure={type(reused_after_closure).__name__}",
+           failures, verbose)
+
+    # 8c) A cancellation retires the request it NAMES, in the direction that issued it — not
+    #     the direction the notification travelled. The modern revision requires the one case
+    #     that distinguishes them: "a server MUST send `notifications/cancelled` referencing a
+    #     `subscriptions/listen` request ID when it tears down that subscription stream", and
+    #     that request is the CLIENT's. Retiring the sender's own map leaves the subscription
+    #     resident forever, so its id fails as a duplicate later (review, PR #100).
+    torn = ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen",
+         "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}},
+                    "notifications": {"toolsListChanged": True}}}, **torn)
+    server_cancel = act(cancel, direction=P.S2C, **torn)
+    # THE COLLISION, which is what makes routing-by-search wrong rather than merely loose:
+    # id 1 live in BOTH maps. Under legacy the server cancels its OWN request; under modern
+    # the only server cancellation the spec permits names the client's subscription. Searching
+    # the sender's map first answers the modern case backwards.
+    both = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, **both)
+    act({"jsonrpc": "2.0", "id": 1, "method": "sampling/createMessage",
+         "params": {"messages": []}}, direction=P.S2C, **both)
+    act(cancel, direction=P.S2C, **both)
+    legacy_kept_client = both["inflight"].method_for(P.C2S, 1) == "tools/list"
+    legacy_took_server = both["inflight"].method_for(P.S2C, 1) is None
+    # ...and a CLIENT cancellation for an id nobody issued must not reach into the server's
+    # map and cancel a coincidentally-numbered request there.
+    stray_cancel = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "sampling/createMessage",
+         "params": {"messages": []}}, direction=P.S2C, **stray_cancel)
+    act(cancel, **stray_cancel)
+    server_request_survived = (
+        stray_cancel["inflight"].method_for(P.S2C, 1) == "sampling/createMessage")
+    # ...and the mirror image: under legacy a server may cancel its OWN request, so one naming
+    # a request the CLIENT issued is not a cancellation it is permitted to send. Ignored, per
+    # "invalid cancellation notifications SHOULD be ignored". Searching both maps would let a
+    # server retire the client's outstanding `tools/list` — and the reply that follows can no
+    # longer be filtered, because the correlation it needed went with it.
+    reach = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, **reach)
+    act(cancel, direction=P.S2C, **reach)
+    client_request_survived = reach["inflight"].method_for(P.C2S, 1) == "tools/list"
+    # A DUAL-ERA CONNECTION, which is why a negotiated legacy version cannot settle the
+    # question for the whole stream: modern semantics ride per REQUEST, so an initialized
+    # client may still open a modern subscription. Reading the teardown as legacy looked in the
+    # server's map, found nothing, and left the subscription open (review, PR #100).
+    dual = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen",
+         "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}},
+                    "notifications": {"toolsListChanged": True}}}, **dual)
+    dual_cancel = act(cancel, direction=P.S2C, **dual)
+    dual_torn = dual["inflight"].open_ids(P.C2S) == []
+    # ...and when BOTH meanings have live traffic there is nothing in the notification that
+    # picks one, so it fails rather than retiring a request on a guess.
+    collide = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen",
+         "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}},
+                    "notifications": {"toolsListChanged": True}}}, **collide)
+    act({"jsonrpc": "2.0", "id": 1, "method": "sampling/createMessage",
+         "params": {"messages": []}}, direction=P.S2C, **collide)
+    ambiguous = act(cancel, direction=P.S2C, **collide)
+    # A nested id that cannot key a dict must be ignored, not crash: it reaches `dict.pop`
+    # through a tuple and raises `TypeError: unhashable` inside a pump otherwise.
+    poison = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, **poison)
+    unhashable_cancel = survives({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                  "params": {"requestId": []}}, **poison)
+    # ...and a cancellation for an id nobody issued is ignored too, per "invalid cancellation
+    # notifications SHOULD be ignored: unknown request IDs".
+    unknown_cancel = act({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                          "params": {"requestId": 404}}, **poison)
+    _check("proxy.cancellation_retires_the_request_it_actually_names",
+           isinstance(server_cancel, P.Forward)
+           # the modern teardown took the CLIENT's subscription, leaving nothing open
+           and torn["inflight"].open_ids(P.C2S) == []
+           and legacy_kept_client and legacy_took_server
+           and server_request_survived
+           and client_request_survived
+           # a legacy session does not make every server cancellation legacy
+           and isinstance(dual_cancel, P.Forward) and dual_torn
+           and failed(ambiguous) == P.AMBIGUOUS_CANCELLATION
+           and isinstance(unhashable_cancel, P.Forward)
+           and poison["inflight"].open_ids(P.C2S) == [1]
+           and isinstance(unknown_cancel, P.Forward),
+           f"a cancellation is routed by the PROTOCOL and by what is actually live, not by "
+           f"searching both maps and taking whichever hits first. A client cancels a request "
+           f"it issued; under legacy a server cancels its own; under modern the one server "
+           f"cancellation the spec permits names the CLIENT's `subscriptions/listen`, to tear "
+           f"the stream down. Searching gets the collision wrong in both directions — an "
+           f"unknown client cancellation would reach into the server's map, and with id 1 live "
+           f"in both a server cancellation would take its own request instead of the "
+           f"subscription it named. Nor does a negotiated legacy version make every server "
+           f"cancellation legacy: modern semantics are per REQUEST, so a dual-era connection "
+           f"carries both and the teardown must still find the subscription. When both "
+           f"meanings really are live the message says nothing that picks one, so it fails "
+           f"loudly. A `requestId` that cannot key a dict is ignored rather than crashing the "
+           f"pump, and so is one nobody issued; the notification is forwarded verbatim in "
+           f"every other case, because that is what notifications are: "
+           f"modern_teardown_left={torn['inflight'].open_ids(P.C2S)} "
+           f"legacy_client_kept={legacy_kept_client} legacy_server_taken={legacy_took_server} "
+           f"stray_left_server={server_request_survived} "
+           f"stray_left_client={client_request_survived} dual_era_torn={dual_torn} "
+           f"ambiguous={failed(ambiguous)} "
+           f"unhashable={type(unhashable_cancel).__name__}", failures, verbose)
+
+    # 8d) The cancellation RACE is documented, so it may not be fatal. "Cancellation
+    #     notifications may arrive after request processing has completed, and potentially
+    #     after a response has already been sent" — the late response is then a reply to an id
+    #     nothing is waiting for, which is exactly the UNCORRELATED anomaly and a failed cell
+    #     for a sequence the spec calls normal.
+    race = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, **race)
+    act({"jsonrpc": "2.0", "method": "notifications/cancelled",
+         "params": {"requestId": 1}}, **race)
+    late = act({"jsonrpc": "2.0", "id": 1, "result": listed}, direction=P.S2C, **race)
+    # ...and the id is STILL spent after that straggler is seen. An earlier version released it
+    # here, reasoning that the request was now over on both sides. It is over on the client's
+    # side; the other side of this boundary is a server the scenario author does not control,
+    # and one observed response is no evidence about the next (review, PR #100).
+    reused = act({"jsonrpc": "2.0", "id": 1, "method": "ping"}, **race)
+    second = act({"jsonrpc": "2.0", "id": 1, "result": listed}, direction=P.S2C, **race)
+    orphan = legacy_ctx()
+    never = act({"jsonrpc": "2.0", "id": 77, "result": listed}, direction=P.S2C, **orphan)
+    # THE OTHER ORDER, which is the one that bypasses filtering: reuse the id BEFORE the
+    # straggler arrives, and the late tool advertisement correlates as the new request and is
+    # forwarded unfiltered. "Reuse makes them indistinguishable" is why the id is quarantined,
+    # not why the bypass is acceptable (review, PR #100).
+    quarantine = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, **quarantine)
+    act({"jsonrpc": "2.0", "method": "notifications/cancelled",
+         "params": {"requestId": 1}}, **quarantine)
+    early_reuse = act({"jsonrpc": "2.0", "id": 1, "method": "ping"}, **quarantine)
+    # ...and the straggler that would have been laundered is still just dropped.
+    straggler = act({"jsonrpc": "2.0", "id": 1, "result": listed},
+                    direction=P.S2C, **quarantine)
+    _check("proxy.a_late_response_to_a_cancelled_request_is_dropped_not_fatal",
+           isinstance(late, P.Drop)
+           # a response to an id that was never requested AND never cancelled stays fatal —
+           # the drop is the documented race, not a general "could not place it" escape
+           and failed(never) == P.UNCORRELATED
+           and failed(early_reuse) == P.CANCELLED_ID_REUSE
+           and isinstance(straggler, P.Drop)
+           # BOTH ORDERS, and the id is spent in both: after the straggler as well as before it
+           and failed(reused) == P.CANCELLED_ID_REUSE
+           and isinstance(second, P.Drop),
+           f"the late response to a cancelled request is a race the spec describes and tells "
+           f"the client to ignore, so failing the cell on it fails a conforming exchange. It "
+           f"is DROPPED rather than forwarded, because the correlation that would let it be "
+           f"filtered went away with the cancellation — a `tools/list` reply forwarded here "
+           f"would be unfiltered. The drop is reserved for exactly this: a response on an id "
+           f"never issued at all is still fatal, or the escape becomes the degradation §10.5 "
+           f"forbids. And a cancelled id is SPENT FOR THE CONNECTION, in both orders: reusing "
+           f"it before the straggler arrives is the bypass outright, and reusing it after one "
+           f"straggler has been dropped is the same bypass resting on the assumption that a "
+           f"server the scenario author does not control sends only one. "
+           f"late={type(late).__name__} never={failed(never)} "
+           f"early_reuse={failed(early_reuse)} straggler={type(straggler).__name__} "
+           f"reuse_after_straggler={failed(reused)} second={type(second).__name__}",
+           failures, verbose)
+
+    # 8b) The closure has a CONFORMING SHAPE, and it is not `{}`. The subscriptions page calls
+    #     it "an empty result" in prose and then prints what it is: `resultType: "complete"`
+    #     plus a `_meta` subscription id equal to the response id. The first version required
+    #     a literally empty object, so it rejected our own fixture — which had been asserting
+    #     the real shape in verify_mcp_fixtures.py the whole time (review, PR #100).
+    shut = ctx()
+    shut["inflight"].record(P.C2S, 1, "subscriptions/listen", "2026-07-28")
+    real_close = act(closure, direction=P.S2C, **shut)
+    empty = ctx()
+    empty["inflight"].record(P.C2S, 1, "subscriptions/listen", "2026-07-28")
+    bare_close = act({"jsonrpc": "2.0", "id": 1, "result": {}}, direction=P.S2C, **empty)
+    _check("proxy.graceful_closure_is_the_conforming_shape_not_an_empty_object",
+           isinstance(real_close, P.Forward)
+           and shut["inflight"].open_ids(P.C2S) == []
+           and failed(bare_close) == P.BAD_SUBSCRIPTION_CLOSURE
+           # a closure naming a DIFFERENT subscription is a confusion, not a closure
+           and not P.is_graceful_closure(
+               "subscriptions/listen",
+               {"id": 1, "result": {"resultType": "complete", "_meta": {P.SUB_KEY: 2}}})
+           # ...and `resultType` is REQUIRED rather than defaulted: the absent-reads-as-
+           # complete rule is for servers on earlier revisions, and no earlier revision has
+           # this method at all
+           and not P.is_graceful_closure("subscriptions/listen",
+                                         {"id": 1, "result": {"_meta": {P.SUB_KEY: 1}}}),
+           f"the graceful closure is `resultType: \"complete\"` with "
+           f"`_meta.{P.SUB_KEY}` matching the response id, not `{{}}`. Requiring an empty "
+           f"object turns every conforming shutdown into an anomaly and fails the cell that "
+           f"was closing cleanly — and since agy is the CLI that opens subscriptions at all, "
+           f"that is every agy cell. A subscription id naming a different request is not a "
+           f"closure either, and neither is a result with no `resultType`: "
+           f"`subscriptions/listen` exists only in 2026-07-28, where the field is mandatory, "
+           f"so the backward-compatibility default cannot reach it (review, PR #100). "
+           f"real={type(real_close).__name__} empty={failed(bare_close)}",
+           failures, verbose)
+
+    # 9) Protocol state holds the negotiated VERSION, and a second `initialize` is a
+    #    lifecycle violation rather than a renegotiation. The version it holds is the one the
+    #    SERVER answered with, not the one the client proposed: "if the server supports the
+    #    requested protocol version, it MUST respond with the same version. Otherwise, the
+    #    server MUST respond with another protocol version it supports" — and that answer is
+    #    what the rest of the traffic is read under (review, PR #100 — the first version
+    #    stored the proposal, and could not see a second initialize sent before the first was
+    #    answered because it recorded only an accepted version).
+    hs = ctx()
+    proposed = act({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2025-11-25",
+                               "capabilities": {"roots": {}}}}, **hs)
+    pending = hs["state"].pending_initialize
+    # A second one while the first is UNANSWERED is the same lifecycle violation — and the
+    # case a state that records only an accepted version cannot see.
+    while_pending = act({"jsonrpc": "2.0", "id": 2, "method": "initialize",
+                        "params": {"protocolVersion": "2025-11-25"}}, **hs)
+    negotiated_down = act({"jsonrpc": "2.0", "id": 1, "result": {
+        "protocolVersion": "2025-06-18", "capabilities": {}}}, direction=P.S2C, **hs)
+    after_hs = act({"jsonrpc": "2.0", "id": 3, "method": "initialize",
+                    "params": {"protocolVersion": "2025-11-25"}}, **hs)
+    # A client MAY propose a revision this proxy has not read; only the ANSWER is gated.
+    odd = ctx()
+    odd_proposal = act({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": "2024-11-05"}}, **odd)
+    odd_answer = act({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}},
+                     direction=P.S2C, **odd)
+    st = P.ProtocolState()
+    st.observe("2026-07-28")
+    st.observe("2026-07-28")
+    st.observe("2025-11-25")
+    _check("proxy.legacy_state_is_the_negotiated_version_and_initialize_happens_once",
+           isinstance(proposed, P.Forward) and pending == "2025-11-25"
+           and hs["state"].legacy_capabilities == {"roots": {}}
+           and failed(while_pending) == P.SECOND_INITIALIZE
+           and isinstance(negotiated_down, P.Forward)
+           and hs["state"].legacy_version == "2025-06-18"
+           and hs["state"].pending_initialize is None
+           and failed(after_hs) == P.SECOND_INITIALIZE
+           and isinstance(odd_proposal, P.Forward)
+           and failed(odd_answer) == P.UNIMPLEMENTED_VERSION
+           and st.observed == ["2026-07-28", "2025-11-25"],
+           f"a boolean cannot carry legacy state: later legacy messages contain no metadata "
+           f"at all, so the negotiated VERSION is the only thing that says which of the two "
+           f"legacy revisions to read them under, and the fleet speaks both. It is the "
+           f"SERVER's answer — a client proposing 2025-11-25 and served 2025-06-18 has a "
+           f"2025-06-18 connection — so the implemented-version gate belongs on the response "
+           f"and a proposal this proxy has not read is an ordinary negotiation rather than an "
+           f"anomaly. A second `initialize` is refused whether the first was answered or is "
+           f"still in flight, because accepting it would retroactively move every message "
+           f"already exchanged to a revision it was not read under. Observed versions are "
+           f"plural telemetry that gate nothing: proposed={pending!r} "
+           f"negotiated={hs['state'].legacy_version!r} pending={failed(while_pending)} "
+           f"after={failed(after_hs)} odd_answer={failed(odd_answer)} observed={st.observed}",
+           failures, verbose)
+
+    # 10) An off-list call is answered by the PROXY; the server never sees it. Driven through
+    #     `decide`, because the formatter being well worded says nothing about whether any
+    #     call is ever refused — the first version of this arm called `refusal_for` directly
+    #     and would have passed against a proxy that forwarded everything (review, PR #100).
+    gate = legacy_ctx(allowed=("echo",), server="alpha")
+    refused = act({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                   "params": {"name": "danger", "arguments": {}}}, **gate)
+    allowed_call = act({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                        "params": {"name": "echo", "arguments": {}}}, **gate)
+    nameless = act({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {}}, **gate)
+    back = refused.msg if isinstance(refused, P.Refuse) else {"error": {"message": ""}}
+    _check("proxy.off_list_call_is_refused_without_reaching_the_server",
+           isinstance(refused, P.Refuse) and refused.tool == "danger"
+           and back["id"] == 7 and back["jsonrpc"] == "2.0"
+           and back["error"]["code"] == P.ERR_METHOD_NOT_FOUND
+           and "danger" in back["error"]["message"]
+           and "alpha" in back["error"]["message"]
+           and "not contacted" in back["error"]["message"]
+           # the refused id is never opened — there is no reply coming to correlate — while
+           # the allowed one is forwarded and is
+           and isinstance(allowed_call, P.Forward)
+           and gate["inflight"].open_ids(P.C2S) == [8]
+           and failed(nameless) == P.MALFORMED,
+           f"an off-list `tools/call` is not forwarded and not silently dropped — a dropped "
+           f"request leaves the client waiting forever on an id it correlated. The proxy "
+           f"answers it, as method-not-found, because on this connection the allowlist IS "
+           f"the tool surface and that is simply true. The message names the tool, the "
+           f"server, and the fact that the server was never contacted, so nobody debugs a "
+           f"server that never saw the call. The refused id stays closed and the allowed call "
+           f"goes through: refused={type(refused).__name__} "
+           f"allowed={type(allowed_call).__name__} open={gate['inflight'].open_ids(P.C2S)} "
+           f"{back['error']['message'][:80]!r}", failures, verbose)
+
+    # 11) A server->client REQUEST is legal only where legacy semantics are actually in
+    #     force. 2026-07-28 forbids it outright — sampling, elicitation and roots ride inside
+    #     `InputRequiredResult` responses — and the test must be the legacy state, not a
+    #     "connection is modern" flag, because modern is stateless and no such flag may exist.
+    bare = ctx()
+    unheralded = act({"jsonrpc": "2.0", "id": 5, "method": "sampling/createMessage",
+                      "params": {"messages": []}}, direction=P.S2C, **bare)
+    lg = ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2025-11-25"}}, **lg)
+    act({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-11-25"}},
+        direction=P.S2C, **lg)
+    plain_sampling = act({"jsonrpc": "2.0", "id": 5, "method": "sampling/createMessage",
+                          "params": {"messages": []}}, direction=P.S2C, **lg)
+    tool_bearing = act({"jsonrpc": "2.0", "id": 6, "method": "sampling/createMessage",
+                        "params": {"tools": [{"name": "exfil"}]}}, direction=P.S2C, **lg)
+    _check("proxy.server_originated_requests_need_legacy_actually_in_force",
+           failed(unheralded) == P.SERVER_REQUEST_IN_MODERN
+           and isinstance(plain_sampling, P.Forward)
+           and lg["inflight"].method_for(P.S2C, 5) == "sampling/createMessage"
+           and failed(tool_bearing) == P.TOOL_BEARING_SAMPLING,
+           f"the modern revision says servers MUST NOT send JSON-RPC requests, so one "
+           f"arriving with no legacy `initialize` in force is an anomaly — keyed on the state "
+           f"the handshake established rather than on an era flag, since modern carries no "
+           f"state to flag. Under legacy the same request is ordinary and forwarded, and it "
+           f"is recorded in the SERVER's in-flight map so the client's answer can be "
+           f"correlated; but one carrying its own `params.tools` is a tool definition outside "
+           f"`tools/list`, which `tools:` does not gate and this proxy will not pass: "
+           f"unheralded={failed(unheralded)} plain={type(plain_sampling).__name__} "
+           f"tool_bearing={failed(tool_bearing)}", failures, verbose)
 
 
 def _check_arm_counter(failures, verbose):

@@ -289,10 +289,11 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 492 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 509 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 harness/tools/mutate_mcp.py                           # 125/125 production + 2/2 instrument
+python3 harness/tools/mutate_mcp.py                           # 181/181 production + 2/2 instrument
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 278 checks
 git diff --check
 ```
 
@@ -344,22 +345,202 @@ either mistake miscounts exactly what the split reporting exists to keep straigh
 
 Things that have gone wrong in the *tests*, so you can skip learning them again:
 
-- **The recurring one, five times now: a check aimed BESIDE the thing that matters.** Every
+- **The recurring one, eight times now: a check aimed BESIDE the thing that matters.** Every
   instance looks like coverage and is not, and the shape is always the same — the arm and its
   mutation agree with each other while both sit one level away from where the defect lives.
   Seen as: an arm whose two cases could not see the condition they guarded (M117); a live
   assertion the model could satisfy from its prompt without the mechanism running at all
   (`regress_mcp_two_servers`, twice); two cells sharing an artifacts directory so the second
-  overwrote what the first was meant to prove (M125); and an arm exercising the delta HELPER
-  while the regression was the banner's ASSIGNMENT of it (I2). Each passed review of the code
-  and was caught only by someone asking the question below.
+  overwrote what the first was meant to prove (M125); an arm exercising the delta HELPER
+  while the regression was the banner's ASSIGNMENT of it (I2); an arm calling the proxy's
+  refusal FORMATTER, which is green whether or not any call is ever refused (M158); and — the
+  purest form of it — an arm that built `inputRequests` as an array because the code read it
+  as one, so the fixture and the defect were wrong together and agreed (M150). Each passed
+  review of the code and was caught only by someone asking the question below.
 
   **The test:** write out what a broken implementation would produce, and check your assertion
   rejects it. If the answer is "it produces exactly what I asserted", the assertion is
-  measuring something else. Two corollaries this project keeps rediscovering — a defect that
+  measuring something else. Three corollaries this project keeps rediscovering — a defect that
   passes THROUGH a helper is not tested by testing the helper, only by testing the site it
-  reached; and for anything with a model in the loop, the model is part of the implementation,
-  so an expected value it could reconstruct from its prompt is not evidence.
+  reached; for anything with a model in the loop, the model is part of the implementation, so
+  an expected value it could reconstruct from its prompt is not evidence; and where the
+  subject is a *specification*, the fixture must come from the spec rather than from the code,
+  because a fixture written to match the implementation cannot disagree with it. The
+  `inputRequests` case and the `{}` subscription closure were both that: hand-written fixtures
+  that encoded the same misreading as the code, where one look at the spec's own printed
+  example would have shown a map and a `resultType`.
+- **A rule applied at the wrong SCOPE is its own defect family, and it cuts both ways.** Three
+  findings in one review round were all this shape: a per-version rule applied to every version
+  (`inputRequests` read on legacy responses, where `Result` is open-ended and the key means
+  whatever that server means by it); a backward-compatibility rule applied to a method that has
+  no *back* (an absent `resultType` defaulted to `complete` on `subscriptions/listen`, which
+  exists only in the revision where the field is mandatory); and prose followed over the
+  schema that is declared the source of truth (`RequestId` refused for `1.5`, which the prose
+  calls an integer and the schema calls a number).
+
+  Two of those refuse conforming traffic and one forwards non-conforming traffic, which is the
+  point — **over-strict is not the safe direction.** A proxy that fails a clean cell has broken
+  the run just as surely as one that forwards a definition, and it is harder to diagnose
+  because everything looks like it is working correctly. When writing a check, name the
+  version, the direction and the document it comes from; if the rule cannot be stated with
+  those three, it is not yet a rule.
+- **"Nothing escapes" is a claim about ORDER, and order is the thing to check.** Letting a
+  request through on a *pending* handshake looked safe because the negotiated version would
+  govern its response — true only if the negotiation lands first, and nothing makes it. The
+  pipelined request's response can arrive before the `initialize` response and be read under
+  no version at all. When an argument for safety rests on one message preceding another,
+  write down what happens in the other order; on a duplex stream both orders happen.
+- **A correct principle stated at too narrow a WIDTH is still a hole, and it will be found one
+  route at a time.** The spent-request-id rule took four rounds: cancelled ids remembered but
+  cleared on reuse; then held, but lifted once a straggler was seen; then held permanently —
+  for cancellation only. Each fix was right about the case in front of it. The tell was there
+  the whole time: the argument that justified the third version ("no observed response proves
+  another cannot follow, because the server is the side we do not control") **never mentioned
+  cancellation**, so it had always applied to ordinary answers and graceful closures too, and
+  those stayed open. **When an argument lands, re-read what it actually quantifies over and go
+  fix every case it covers** — not the one that prompted it. A reviewer should not have to
+  walk you along a rule's own scope.
+- **An observation that matches a rule's SHAPE may still not be the behaviour it forbids.**
+  C3-3 counted any repeated request id as evidence that the spent-id rule costs the fleet. But
+  a repeat while the first request is unanswered is a live duplicate, which JSON-RPC forbids
+  and the proxy refuses on entirely separate grounds; only a repeat *after* the response is
+  the legal-but-refused behaviour being priced. The probe reported a client the proxy rejects
+  anyway as proof that the proxy is too strict. **When measuring the cost of a rule, the
+  observation has to exclude cases some other rule already covers** — otherwise the price
+  includes traffic that was never going to work.
+- **Some measurements cannot be taken from where you are standing, and the answer is to stop
+  claiming them.** C3-3 needs to know whether an arrival preceded a response. Three rounds of
+  work went into observing that better — log at arrival, then drain continuously — and the
+  honest end point is that **no observer inside the server can establish it at all**: bytes
+  can sit unread in the kernel pipe while the main thread writes a response, so the ordering
+  is a property of scheduling, not of the client. Reducing the error rate from systematic to
+  occasional is real progress and still not a measurement. The fix was to make the probe
+  *report and not conclude*, and to name the workload that would conclude — one where the
+  driver waits for each response, so the ordering is true by construction. **When an
+  instrument keeps needing to be made more careful, check whether the quantity is observable
+  from that vantage point at all.**
+- **A new fact about a run belongs in the CLASSIFIER, not bolted onto the exit code.** When
+  the shim gained a "my reader died" signal, I threaded it into the exit status and stopped —
+  so a broken row still classified as a clean measurement, the fleet-wide conclusion was
+  printed over it, and the tool then exited 1 having already published the wrong sentence.
+  That is the same "fleet-wide claim from an incomplete run" defect fixed two rounds earlier,
+  walking in through a door the fix did not cover, because the earlier fix taught `unmeasured`
+  about two ways of being unanswered and this was a third. **When you add a reason a run might
+  be untrustworthy, put it where the existing reasons live** — one predicate that everything
+  downstream reads — rather than beside them. The tell is a new boolean on the row that only
+  one caller consults.
+- **When a claim is retracted, the retraction has to reach every place that made it.** After
+  agreeing that C3-3 concludes nothing, the committed tree still had a docstring calling a
+  positive result "conclusive", a design paragraph saying the same, and a function still
+  describing its output as "wire order" — the exact phrase the round had just established the
+  instrument cannot deliver. The behaviour was right and the authoritative text was a round
+  behind. **Grep for the retracted claim, not just the changed function**; a reviewer reading
+  the docs gets the old answer, and so does the next person to touch the code.
+- **A tool that only prints its findings has not reported them.** The malformed-request events
+  were written to a temp log, and `probe()` carried only the timeline — so without `-v` a
+  client sending malformed frames produced no finding in the summary and no effect on the exit
+  status. **Anything that changes the interpretation of a run has to reach the result object
+  and the exit code**, not just a file someone might read.
+- **An ON-DEMAND reader cannot observe arrival order, and moving the log is not enough.**
+  Telling those two id-repeats apart is a question about the order messages crossed the
+  stream. Three attempts: logging from the main loop gave *processing* order; moving the log
+  into the read helper looked like the fix and was not, because the helper is still only
+  called when the loop wants a line — so outside the artificially held window the shim
+  answered the current request before asking for more input, and two requests that both
+  crossed before the response was written were logged `req, resp, req`. **Nothing that reads
+  on demand can know when bytes it has not asked for arrived**; the only fix is to drain
+  continuously, which here means a reader thread. Fourth time C3 has been bitten by a buffer
+  between the wire and the code reporting on it, and the *first* time the buffer was the
+  program's own control flow rather than an I/O layer.
+
+  The related trap in the same change: `verify` covered only the case where the shim happens
+  to drain continuously anyway (inside the delay window), so every check passed over the
+  defect. **When a fix depends on a code path being taken, check the path where it is NOT.**
+- **Record an outbound event AFTER the write, not before.** `response_id` was logged first, so
+  a graceful closure written to a departed reader — C3-1's measured agy behaviour, where the
+  write raises and nothing leaves — was recorded as an answer that never happened. Any later
+  request on that id then read as post-response reuse against a response no client received.
+- **A terminal verdict truncates the evidence after it.** The proxy `Fail`s on a duplicate id
+  and tears the connection down, so a later reuse in the same log is traffic the rule being
+  priced would never have seen. Classification has to stop where the system stops. **When
+  reading a log to predict a component's behaviour, model its early exits too** — otherwise
+  the reading includes a future that the component's own failure prevents.
+- **A measurement of a rule must use the RULE'S OWN definition of its terms.** C3-3 asks "does
+  any CLI reuse a request id", to price a rule under which `1` and `1.0` are the same id and
+  `0` and `-0.0` are the same id. It deduplicated on `repr`, under which none of those pairs
+  match — so the CLI whose reuse the proxy would refuse was the one the probe reported as
+  clean. Same family as the `inputRequests` fixture written from the code: the check and the
+  thing checked have to disagree when the thing is wrong, and they cannot if the check
+  re-derives the definition instead of importing it. `request_id_key` is now exported for the
+  probe, and where importing is impossible — the shim runs with only the stdlib reachable —
+  the copy is asserted equal to the original on the cases that distinguish them.
+- **"Absence of a positive" needs a sample size argument, and it is not the same for every
+  question.** C3-2 and C3-3 ride on one run, and only one of them is settled by it: pipelining
+  happens exactly once per connection, so a clean run is an answer, while an allocator that
+  emitted 0 and 1 has said nothing about the fourth request. I gave both the same treatment
+  because they came from the same log. **Before concluding from a negative, ask how many times
+  the run gave the behaviour a chance to appear** — and if a cell exercises it more often than
+  the probe did, the probe has not priced it.
+- **A compound assertion can be unfalsifiable by operator precedence.** `"costs" not in t and
+  "unpriced" in t or "does NOT price" in t` is `(A and B) or C`, and C was true by
+  construction — a check that could not fail, written while fixing a finding about checks that
+  cannot fail. Caught by reading it back rather than by running it, because it passed.
+  **Parenthesize every mixed `and`/`or` in an assertion, and prefer several `check()` calls to
+  one clever one**: a check whose failure mode you cannot state is not a check.
+- **Refusing something legal is a cost, and it needs a price or a flag.** The same rule refuses
+  a client behaviour the spec permits — id reuse after a response. §4 already knew over-strict
+  is not the safe direction, and §10.5 says failing a clean cell is as much a failure as
+  forwarding a definition. The honest handling is what C3-2 did for the era gate: measure the
+  fleet, and if you cannot yet, say in the design that it is an unpriced strictness rather
+  than writing a comment that cites a measurement which does not exist. I had one of those —
+  "the monotonic counters every measured CLI uses (C3-2, §9)" — where C3-2 measured
+  *pipelining* and had never looked at ids. **A citation to the right document is not a
+  citation to the right measurement.**
+- **Absence of a positive result is not a negative result.** The C3-2 probe printed "No CLI
+  pipelined ... costs the fleet nothing" whenever no row was positive — including a run where
+  every CLI failed to connect — and then contradicted itself two lines later with the list of
+  what had not been measured. Same distinction the per-row classifier already drew, dropped at
+  the point where the rows became a conclusion. **Any fleet-wide claim needs every row
+  answered; check that the summary cannot be produced by an empty measurement.**
+- **One observed message is no evidence about the next one.** The same round, twice, in
+  different disguises. A cancelled id's quarantine was released once a late response had been
+  *seen*, reasoning that "the request is over on both sides" — over on the client's side; the
+  other side is a server the scenario author does not control, and a second straggler is no
+  more nonconforming than the first was. And a negotiated legacy version was read as settling
+  the era for the whole connection, when the modern revision carries the era **per request**,
+  so an initialized client can still open a modern subscription and a dual-era server can
+  serve both at once. Both are the same error: **summarizing a stream into a fact about the
+  connection.** Before writing state that says what the peer *is*, check whether the protocol
+  says it per message; and never lift a guard on the strength of one observation from the side
+  the boundary exists against.
+- **Ambiguity is a third answer, and it belongs in the return type.** When a server
+  cancellation could name either its own legacy request or the client's modern subscription,
+  the first fix searched both maps, the second picked by era flag, and both were *choosing*.
+  The message carries an id and nothing else; there is no fact to choose with. Failing loudly
+  is the honest outcome, and it needed the observer to be able to return an anomaly at all —
+  a function typed `-> None` cannot express "I could not tell", so it will guess.
+- **An instrument's regression is not its READER's regression.** `verify_mcp_fixtures.py` E13
+  covers the shim that measures pipelining, and all of it stayed green over a probe that would
+  have classified a CLI which died before handshaking as "modern `n/a`, exit 0" — a false
+  clean result in the tool being used to justify a design decision. The classification, not
+  the log, is the probe's actual output. Factor it out of `main()` so it can be driven on
+  synthetic rows (E14), and treat "what does this tool PRINT" as a thing under test whenever
+  the printout is the evidence for a decision.
+- **An exception argued on safety grounds can be the banned technique wearing a hat.** Asked
+  to scope MRTR detection to `resultType: "input_required"`, I scoped the *version* and
+  skipped the discriminator, reasoning that "a mislabelled definition is still a definition".
+  That argument is the structural scan restated — it says *I will look for tool-shaped things
+  regardless of what the protocol says this payload is*, which is precisely what §10.6
+  rejects — and it diagnosed a plain `ping` result as tool-bearing sampling. Deviating from a
+  rule is sometimes right, but the burden is to show the deviation is not an instance of the
+  thing the rule exists to forbid, and "it is safer" does not discharge it: unsound in the
+  strict direction is still unsound.
+- **A mutation whose defect is a CRASH needs an arm that can catch one.** An unhashable id
+  reaching `dict.pop` raises several frames from anything that could log it — which is the
+  defect — but an arm that lets it propagate turns the mutation into "failed, but NOT via",
+  which proves nothing and reads like a tooling problem. The arm calls through a helper that
+  converts an exception into a value the assertion rejects. Same principle as the rest of §4:
+  the arm has to be able to *observe* the failure it is named for.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s
@@ -448,13 +629,25 @@ ABA fix and its route to `parallel_safe_config = True`.
 - **Phase 3 antigravity** — MCP injection.
 - **C3 harness-owned filtering proxy** — required before any scenario points `tools:` at a
   server its author does not control, and required for agy tool gating regardless.
-  **Designed in `DESIGN_MCP_Support.md` §10 (2026-07-29); not built.** stdio only in the
+  **Designed in `DESIGN_MCP_Support.md` §10 (2026-07-29); being built.** stdio only in the
   first cut — remote `tools:` stays refused. Build order: ~~probe **C3-0**~~ →
-  ~~probe **C3-1**~~ → a **dual-era mode for `fixtures/echo_mcp_server.py`** → the proxy
-  module + its arms, wired to nothing → the adapter integration that unlocks `tools:`.
-  The middle slice cannot affect any run, which is the point: this is harness code in the
-  request path of every gated cell.
-  **Both probes resolved 2026-07-29** (`fixtures/probe_era_mcp_server.py`, results in
+  ~~probe **C3-1**~~ → ~~a **dual-era mode for `fixtures/echo_mcp_server.py`** (#98)~~ →
+  ~~the **decision layer** + its arms, wired to nothing (#100)~~ → the **I/O half** (spawn,
+  the two pumps, `SIGTERM`/`SIGINT` handlers, §10.5's shutdown, the audit log) plus a
+  wire-level driver → the adapter integration that unlocks `tools:`.
+  Everything before the last slice cannot affect any run, which is the point: this is harness
+  code in the request path of every gated cell.
+  **Probe C3-2 resolved 2026-07-31** (`tools/probe_mcp_pipelining.py`): no CLI pipelines
+  requests behind `initialize`, which is what licenses §10.2 REFUSING one. A pending
+  negotiation cannot govern traffic — the pipelined request's response may arrive first,
+  under no version at all — so tolerating pipelining needs a defer-and-replay action, and
+  C3-2 says the refusal costs the fleet nothing today. It needed a new
+  shim mode (`PROBE_MCP_INIT_DELAY_MS`) *and* a raw-fd read path in the shim, because
+  `sys.stdin.readline()` buffers a chunk rather than a line and would have hidden exactly the
+  bytes being measured. claude is free to probe (`claude mcp list` health-checks stdio
+  servers with a full handshake); the other three cost one cheap model call each.
+
+  **Both gating probes resolved 2026-07-29** (`fixtures/probe_era_mcp_server.py`, results in
   `DESIGN_MCP_Support.md` §9). Three findings changed the build:
   1. **The fleet is split three ways.** claude and copilot `2025-11-25`, codex
      `2025-06-18`, agy **`2026-07-28`** (modern). Dual-era is a day-one requirement, and
