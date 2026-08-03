@@ -867,6 +867,7 @@ check("only a complete run earns the fleet-wide claim",
 # identity the PROXY enforces, and must not overstate what a short run establishes.
 sys.path.insert(0, os.path.dirname(HERE))
 from agentskill_evals.mcp_proxy import request_id_key  # noqa: E402
+from agentskill_evals.mcp_proxy import valid_request_id as P_valid  # noqa: E402
 
 sys.path.insert(0, FIXTURES)
 import probe_era_mcp_server as SHIM_MOD  # noqa: E402
@@ -906,6 +907,19 @@ check("...and it is still reported, as its own finding",
       _dup)
 check("the two never trade places",
       PIPE.id_findings(_tl(("req", 1), ("resp", 1), ("req", 1)))["live_duplicates"] == [])
+# THE PROXY STOPS AT A DUPLICATE, so the probe must too: `Fail` is terminal, the connection is
+# torn down, and nothing after it would ever reach the rule being priced (review, PR #100).
+_after_dup = PIPE.id_findings(_tl(("req", 1), ("req", 1), ("resp", 1), ("req", 1)))
+check("evidence after a live duplicate does not price the stricter rule",
+      _after_dup["post_response_reuse"] == [] and _after_dup["truncated"] is True, _after_dup)
+check("...and the run is not credited with requests it never got to make",
+      _after_dup["requests"] == 2, _after_dup)
+check("a run with no duplicate is not marked truncated",
+      PIPE.id_findings(_tl(("req", 1), ("resp", 1), ("req", 1)))["truncated"] is False)
+_dirty_sum = " ".join(PIPE.id_summary(
+    [{"cli": "a", "id_timeline": _tl(("req", 1), ("req", 1), ("resp", 1), ("req", 1))}]))
+check("...and the summary does not say the spent-id rule caused the failure",
+      "IDS ARE REUSED" not in _dirty_sum and "LIVE DUPLICATE" in _dirty_sum, _dirty_sum)
 # THE FALSE NEGATIVE from the round before: `repr` dedup called these distinct, so a CLI whose
 # reuse the proxy would refuse was reported as not reusing at all.
 check("`1` then `1.0` is REUSE, because the proxy says it is",
@@ -1008,6 +1022,71 @@ check("id 1 pipelined behind a HELD answer is a live duplicate, not that reuse",
       and _racing["post_response_reuse"] == [], _racing)
 check("both runs really did send two requests, so neither verdict is an empty sample",
       _after["requests"] == 2 and _racing["requests"] == 2, (_after, _racing))
+
+# THE ORDINARY CASE, which is where a reader that only fills on demand goes wrong. Two
+# requests on id 1 both crossing the wire before the server answers, with NO held window: the
+# shim must still see `req, req, resp`. It saw `req, resp, req` while `_announce` ran off
+# `_fill`, because the main loop answers the first request before asking for more input —
+# so a live duplicate was logged as post-response reuse (review, PR #100). E15 previously
+# covered only the initialize window, where `_measure_pipelining` happens to drain
+# continuously, which is exactly why this was invisible.
+_recs_dup = run([legacy_init(1), {"jsonrpc": "2.0", "id": 1, "method": "ping"}])[2]
+_found_dup = PIPE.id_findings(PIPE.id_timeline(_recs_dup))
+check("a live duplicate OUTSIDE the initialize window is still a live duplicate",
+      _found_dup["live_duplicates"] == [("n", 1)]
+      and _found_dup["post_response_reuse"] == [], _found_dup)
+
+# A RESPONSE THAT NEVER DEPARTED IS NOT AN ANSWER. C3-1 established that agy is already gone
+# when the graceful closure is written, so the write raises and nothing reaches the client;
+# logging the answer first recorded one anyway (review, PR #100).
+_gone = run([legacy_init(1),
+             {"jsonrpc": "2.0", "id": 2, "method": "subscriptions/listen",
+              "params": {**MODERN_META,
+                         "notifications": {"toolsListChanged": True}}}],
+            close_reader=True)[2]
+_answered_ids = [r for r in _gone if r.get("event") == "response_id"]
+_broken = [r for r in _gone if r.get("event") == "terminator"
+           and r.get("reason") == "broken_pipe"]
+check("a departed reader means the closure is NOT recorded as answered",
+      not _broken or all(tuple(r["id_key"]) != ("n", 2) for r in _answered_ids),
+      (_answered_ids, _broken))
+
+# MALFORMED IDS STAY OUT OF THE TIMELINE. A list id is unhashable and crashed the reader; a
+# `true` followed by `1` manufactured a reuse, because Python aliases them and JSON-RPC does
+# not (review, PR #100).
+def _raw_drive(msgs):
+    """Write these messages and return the log. `run()` cannot: it keys pending ids in a set,
+    so a list id raises `unhashable` in the DRIVER before the shim ever sees it."""
+    tmp = tempfile.mkdtemp(prefix="verify-badid-")
+    log = os.path.join(tmp, "probe.jsonl")
+    p = subprocess.Popen([sys.executable, SHIM], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         env=dict(os.environ, PROBE_MCP_LOG=log, PROBE_MCP_MODE="dual"))
+    try:
+        p.communicate(b"".join((json.dumps(m) + "\n").encode() for m in msgs),
+                      timeout=DEADLINE)
+    except subprocess.TimeoutExpired:
+        p.kill()
+    return [json.loads(ln) for ln in open(log) if ln.strip()]
+
+
+_bad = _raw_drive([{"jsonrpc": "2.0", "id": [], "method": "ping"},
+                   {"jsonrpc": "2.0", "id": True, "method": "ping"},
+                   {"jsonrpc": "2.0", "id": 1, "method": "ping"}])
+_bad_tl = PIPE.id_timeline(_bad)
+check("a list id never enters the timeline",
+      PIPE.request_ids(_bad_tl) == [("n", 1)], PIPE.request_ids(_bad_tl))
+check("...so the reader does not crash on it, and `true` does not alias `1` into a reuse",
+      PIPE.id_findings(_bad_tl)["post_response_reuse"] == []
+      and PIPE.id_findings(_bad_tl)["live_duplicates"] == [], PIPE.id_findings(_bad_tl))
+check("...and the malformed traffic is still reported, as its own event",
+      len([r for r in _bad if r.get("event") == "request_id_malformed"]) == 2,
+      [r for r in _bad if r.get("event") == "request_id_malformed"])
+check("the shim's RequestId rule matches the proxy's",
+      all(SHIM_MOD._valid_request_id(v) == P_valid(v)
+          for v in (1, 1.0, 0, -0.0, "1", "", True, False, None, 2**70, -5, 1.5)),
+      [(v, SHIM_MOD._valid_request_id(v), P_valid(v))
+       for v in (1, 1.0, 0, -0.0, "1", "", True, False, None, 2**70, -5, 1.5)])
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")

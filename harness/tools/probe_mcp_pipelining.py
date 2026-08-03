@@ -222,6 +222,11 @@ def id_findings(timeline: list[tuple[str, tuple]]) -> dict:
     Conflating them meant a client that pipelined `ping(1)` behind a held `initialize(1)` was
     reported as proof that §10.4 "refuses a client behaviour the spec permits" — when the
     proxy would have refused it anyway, for violating JSON-RPC (review, PR #100).
+
+    CLASSIFICATION STOPS AT THE FIRST LIVE DUPLICATE, because the proxy does. A duplicate is
+    `Fail`, and `Fail` is terminal (§10.5) — the connection is torn down, so nothing after it
+    would ever have been seen by the rule being priced. Counting a later reuse anyway reported
+    that §10.4 "causes failure" using traffic that never reaches §10.4 (review, PR #100).
     """
     live: set = set()
     answered: set = set()
@@ -233,14 +238,18 @@ def id_findings(timeline: list[tuple[str, tuple]]) -> dict:
             requests += 1
             if key in live:
                 duplicates.append(key)
-            elif key in answered:
+                break            # terminal: the proxy fails the connection here
+            if key in answered:
                 reuse.append(key)
             live.add(key)
         else:
             live.discard(key)
             answered.add(key)
     return {"requests": requests, "live_duplicates": duplicates,
-            "post_response_reuse": reuse}
+            "post_response_reuse": reuse,
+            # True when the run was cut short: whatever came after is unobservable through a
+            # proxy, so this row can neither price the rule nor be counted as clean past here.
+            "truncated": bool(duplicates)}
 
 
 def request_ids(timeline: list[tuple[str, tuple]]) -> list:
@@ -377,12 +386,15 @@ def id_summary(rows: list[dict]) -> list[str]:
                    f"workload measures it (§9).")
     if duplicating:
         # Reported, but NOT as a price for the spent-id rule: this is the weaker rule, and the
-        # proxy already refuses it as `duplicate_request_id` on JSON-RPC's own terms.
+        # proxy already refuses it as `duplicate_request_id` on JSON-RPC's own terms. The run
+        # also ENDS there as far as any proxied cell is concerned, so the rest of the log is
+        # not evidence about anything.
         out.append(f"C3-3, separately — LIVE DUPLICATE ids from: {', '.join(duplicating)}: an "
                    f"id repeated while the first request was still unanswered. JSON-RPC "
                    f"forbids that outright, so the proxy refuses it as `duplicate_request_id` "
                    f"regardless of §10.4's stricter rule — a finding about the CLI, not a "
-                   f"price for that rule.")
+                   f"price for that rule. Those cells fail at that message, so nothing later "
+                   f"in the run is evidence either way and it is not counted.")
     return out
 
 

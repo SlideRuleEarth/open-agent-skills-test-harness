@@ -293,7 +293,7 @@ harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N ar
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
 python3 harness/tools/mutate_mcp.py                           # 181/181 production + 2/2 instrument
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 227 checks
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 237 checks
 git diff --check
 ```
 
@@ -408,15 +408,30 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   anyway as proof that the proxy is too strict. **When measuring the cost of a rule, the
   observation has to exclude cases some other rule already covers** — otherwise the price
   includes traffic that was never going to work.
-- **Instruments record processing order; wire order is a different measurement.** Telling those
-  two id-repeats apart is a question about the order messages crossed the stream, because that
-  is all a proxy in the stream can see — and the shim logged arrivals from its main loop,
-  which runs after buffering. The two diverge exactly where the question is interesting: a
-  pipelined request lands in the buffer before the response is written and is processed after
-  it, so a live duplicate looked like post-response reuse. This is the *third* time C3 has
-  been bitten by a buffer between the wire and the code that reports on it. **If a claim is
-  about ordering on a pipe, log at the point the bytes arrive, not the point they are
-  handled.**
+- **An ON-DEMAND reader cannot observe arrival order, and moving the log is not enough.**
+  Telling those two id-repeats apart is a question about the order messages crossed the
+  stream. Three attempts: logging from the main loop gave *processing* order; moving the log
+  into the read helper looked like the fix and was not, because the helper is still only
+  called when the loop wants a line — so outside the artificially held window the shim
+  answered the current request before asking for more input, and two requests that both
+  crossed before the response was written were logged `req, resp, req`. **Nothing that reads
+  on demand can know when bytes it has not asked for arrived**; the only fix is to drain
+  continuously, which here means a reader thread. Fourth time C3 has been bitten by a buffer
+  between the wire and the code reporting on it, and the *first* time the buffer was the
+  program's own control flow rather than an I/O layer.
+
+  The related trap in the same change: `verify` covered only the case where the shim happens
+  to drain continuously anyway (inside the delay window), so every check passed over the
+  defect. **When a fix depends on a code path being taken, check the path where it is NOT.**
+- **Record an outbound event AFTER the write, not before.** `response_id` was logged first, so
+  a graceful closure written to a departed reader — C3-1's measured agy behaviour, where the
+  write raises and nothing leaves — was recorded as an answer that never happened. Any later
+  request on that id then read as post-response reuse against a response no client received.
+- **A terminal verdict truncates the evidence after it.** The proxy `Fail`s on a duplicate id
+  and tears the connection down, so a later reuse in the same log is traffic the rule being
+  priced would never have seen. Classification has to stop where the system stops. **When
+  reading a log to predict a component's behaviour, model its early exits too** — otherwise
+  the reading includes a future that the component's own failure prevents.
 - **A measurement of a rule must use the RULE'S OWN definition of its terms.** C3-3 asks "does
   any CLI reuse a request id", to price a rule under which `1` and `1.0` are the same id and
   `0` and `-0.0` are the same id. It deduplicated on `repr`, under which none of those pairs

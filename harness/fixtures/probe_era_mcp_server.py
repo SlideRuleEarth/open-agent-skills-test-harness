@@ -53,11 +53,12 @@ its era check with the negotiation still in flight (`DESIGN_MCP_Support.md` §10
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
-import select
 import signal
 import sys
+import threading
 import time
 
 MODE = os.environ.get("PROBE_MCP_MODE", "dual")
@@ -110,6 +111,26 @@ def _log(event: str, **fields) -> None:
         os.write(2, data)
 
 
+def _valid_request_id(req_id) -> bool:
+    """Whether this is a usable `RequestId`, by the PROXY's rule — see `_id_key` on drift.
+
+    C3-3's timeline may only contain ids the proxy would actually correlate on, and letting
+    anything else in broke the measurement two ways: a list id is unhashable, so the reader
+    crashed rather than reporting, and `true` followed by `1` manufactured a reuse out of
+    nothing, because Python aliases `True` to `1` while JSON-RPC does not (review, PR #100).
+    Malformed traffic is logged as its own event instead, which is a finding about the client
+    rather than an input to the price of §10.4's rule.
+    """
+    if isinstance(req_id, bool) or req_id is None:
+        return False
+    if isinstance(req_id, str):
+        return True
+    if isinstance(req_id, int):
+        return True
+    return isinstance(req_id, float) and not (req_id != req_id or req_id in (
+        float("inf"), float("-inf")))
+
+
 def _id_key(req_id):
     """A request id's IDENTITY, for the C3-3 reading: domain marker plus value.
 
@@ -128,16 +149,21 @@ def _id_key(req_id):
 
 
 def _send(msg: dict) -> None:
-    # An id is ANSWERED at the instant its response goes out, and C3-3 needs that instant
+    # An id is ANSWERED at the instant its response DEPARTS, and C3-3 needs that instant
     # relative to the arrivals `_announce` records: a repeat before it is a live duplicate,
     # which JSON-RPC already forbids and the proxy refuses as `duplicate_request_id`, while a
     # repeat after it is the post-response reuse the spec PERMITS and §10.4 refuses. Only the
     # second one prices that rule, and a probe that cannot tell them apart reported the first
-    # as though it did (review, PR #100). Logged before the write, so an id can never appear
-    # answered later than a request that crossed after it.
-    if msg.get("id") is not None and ("result" in msg or "error" in msg):
-        _log("response_id", id_key=_id_key(msg["id"]))
+    # as though it did (review, PR #100).
+    #
+    # LOGGED AFTER THE WRITE SUCCEEDS, which is not a detail: C3-1 established that agy is
+    # gone by the time the graceful closure is written, so this call raises `BrokenPipeError`
+    # and nothing departs. Logging first recorded an answer for a response no client ever saw,
+    # and a subsequent request on that id would then read as post-response reuse against a
+    # response that does not exist (review, PR #100).
     os.write(1, (json.dumps(msg) + "\n").encode())
+    if _valid_request_id(msg.get("id")) and ("result" in msg or "error" in msg):
+        _log("response_id", id_key=_id_key(msg["id"]))
 
 
 def _result(req_id, payload: dict, *, modern: bool, cacheable: bool = False,
@@ -419,105 +445,129 @@ def _on_signal(signum, _frame):
 
 
 _STDIN = 0
-_rxbuf = b""
-_scanbuf = b""    # arrival scanner: appended to by _fill, never consumed by the reader
+_rx_lock = threading.Lock()
+_rx_ready = threading.Condition(_rx_lock)
+_rx_lines: collections.deque = collections.deque()   # complete lines, in ARRIVAL order
+_rx_partial = b""
+_rx_eof = False
 
 
-def _announce(chunk: bytes, *, eof: bool = False) -> None:
-    """Log every request id as it ARRIVES ON THE WIRE, in wire order.
+def _announce(raw: bytes) -> None:
+    """Log one arrival, at the moment its bytes land. Called only from the reader thread.
 
-    THE ORDER IS THE WHOLE POINT, and logging this from the main loop instead was wrong in the
-    one case that matters. §10.4's spent-id rule is a statement about the order messages cross
-    the stream, because that is all a proxy sitting in the stream can see. The main loop
-    observes PROCESSING order, which differs exactly where the question is interesting: a
-    request pipelined behind a held `initialize` lands in the buffer before the response is
-    written, but is not processed until after — so a client sending `initialize(1)` and then
-    `ping(1)` while the response was held looked like reuse of an ANSWERED id, when it is a
-    live duplicate that violates JSON-RPC outright. C3-3 then priced the spent-id rule against
-    a client the proxy refuses on entirely separate grounds (review, PR #100).
+    THE ORDER IS THE WHOLE POINT. §10.4's spent-id rule is a statement about the order messages
+    cross the stream, because that is all a proxy sitting in the stream can see — and this shim
+    is standing where the proxy would stand.
 
-    This scanner runs off its own append-only copy of the byte stream, so it is unaffected by
-    `_readline` consuming `_rxbuf`, and it announces a line the moment the line is complete —
-    which for a pipelined request is inside the `initialize` delay window.
+    ONLY A CONTINUOUS READER CAN OBSERVE THAT ORDER, which took two attempts to get right. The
+    first logged arrivals from the main loop, i.e. in PROCESSING order. The second moved the
+    logging into `_fill` — better, but `_fill` was still called on demand, so outside the held
+    `initialize` window the shim answered the current request before reading again: two
+    requests that both crossed the wire before the response was written were logged as
+    `req, resp, req`, which reads as post-response reuse when it is a live duplicate (review,
+    PR #100). Nothing that reads on demand can see when bytes it has not asked for arrived. So
+    input is drained continuously by `_reader`, and the main loop consumes from the queue it
+    fills.
+
+    MALFORMED TRAFFIC DOES NOT ENTER C3-3. The proxy correlates only on a valid `RequestId`,
+    so anything else is logged as its own event and kept out of the timeline — a list id is
+    unhashable and crashed the reader, and `true` followed by `1` manufactured a reuse that
+    JSON-RPC does not recognise, because Python aliases them (review, PR #100).
     """
-    global _scanbuf
-    _scanbuf += chunk
-    lines = _scanbuf.split(b"\n")
-    # Everything before the last newline is complete. At EOF there is no more to come, so a
-    # trailing fragment is all of the final line there will ever be and is announced too.
-    _scanbuf = b"" if eof else lines.pop()
-    for raw in lines:
-        if not raw.strip():
-            continue
-        try:
-            msg = json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if isinstance(msg, dict) and msg.get("method") is not None \
-                and msg.get("id") is not None:
-            _log("request_id", id_key=_id_key(msg["id"]), method=msg["method"])
-
-
-def _fill(timeout: float | None) -> bool:
-    """Wait up to `timeout` seconds for bytes on stdin. True if any arrived.
-
-    False means the deadline passed OR stdin reached EOF; the caller distinguishes those by
-    looking at what it already has, which is all either of them needs.
-    """
-    global _rxbuf
+    if not raw.strip():
+        return
     try:
-        ready, _, _ = select.select([_STDIN], [], [], timeout)
-    except (OSError, ValueError):
-        return False
-    if not ready:
-        return False
-    chunk = os.read(_STDIN, 65536)
-    if not chunk:
-        _announce(b"", eof=True)
-        return False
-    _rxbuf += chunk
-    _announce(chunk)
-    return True
+        msg = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return
+    if not isinstance(msg, dict) or msg.get("method") is None or "id" not in msg:
+        return
+    req_id = msg["id"]
+    if _valid_request_id(req_id):
+        _log("request_id", id_key=_id_key(req_id), method=msg["method"])
+    else:
+        _log("request_id_malformed", id_repr=repr(req_id), method=msg["method"])
+
+
+def _reader() -> None:
+    """Drain stdin forever, announcing each line as it arrives. Daemon thread.
+
+    A thread rather than `select` in the main loop because the main loop is not always in a
+    position to select: it spends time formatting and writing responses, and any bytes that
+    arrive during that window are invisible until it next asks for them. That window is
+    exactly where a live duplicate and a post-response reuse become indistinguishable.
+    """
+    global _rx_partial, _rx_eof
+    while True:
+        try:
+            chunk = os.read(_STDIN, 65536)
+        except (OSError, ValueError):
+            chunk = b""
+        if not chunk:
+            with _rx_ready:
+                # A trailing fragment at EOF is all of that line there will ever be.
+                if _rx_partial.strip():
+                    _announce(_rx_partial)
+                    _rx_lines.append(_rx_partial)
+                    _rx_partial = b""
+                _rx_eof = True
+                _rx_ready.notify_all()
+            return
+        with _rx_ready:
+            _rx_partial += chunk
+            parts = _rx_partial.split(b"\n")
+            _rx_partial = parts.pop()
+            for raw in parts:
+                _announce(raw)
+                _rx_lines.append(raw)
+            _rx_ready.notify_all()
 
 
 def _readline() -> str:
     """One line from stdin, or "" at EOF.
 
-    READS AT THE RAW FD, not through `sys.stdin`. A TextIOWrapper (and the BufferedReader
-    under it) pulls a chunk rather than a line, so a pipelined request can be sitting in
-    Python's buffer while `select` reports the pipe as quiet — which would make the C3-2
-    measurement below report "no pipelining" for a client that pipelines. One buffer, owned
-    here, is what makes "has anything arrived?" answerable at all.
+    READS FROM THE ARRIVAL QUEUE, not the fd. `sys.stdin` was wrong here for a reason worth
+    keeping: a TextIOWrapper (and the BufferedReader under it) pulls a chunk rather than a
+    line, so a pipelined request could sit in Python's buffer while `select` reported the pipe
+    quiet — which would make the C3-2 measurement report "no pipelining" for a client that
+    pipelines. The reader thread owns the only buffer, so "has anything arrived?" stays
+    answerable, and now it is answerable at the instant of arrival rather than on demand.
     """
-    global _rxbuf
-    while b"\n" not in _rxbuf:
-        if not _fill(None):
-            # EOF. Hand back a trailing partial line once, then nothing.
-            rest, _rxbuf = _rxbuf, b""
-            return rest.decode("utf-8", "replace")
-    line, _, _rxbuf = _rxbuf.partition(b"\n")
-    return line.decode("utf-8", "replace") + "\n"
+    with _rx_ready:
+        while not _rx_lines and not _rx_eof:
+            _rx_ready.wait()
+        if _rx_lines:
+            return _rx_lines.popleft().decode("utf-8", "replace") + "\n"
+        return ""
 
 
 def _buffered_lines() -> list[str]:
-    """Complete lines already sitting in the buffer, without consuming them."""
-    return [ln.decode("utf-8", "replace")
-            for ln in _rxbuf.split(b"\n")[:-1] if ln.strip()]
+    """Complete lines already queued, without consuming them."""
+    with _rx_lock:
+        return [ln.decode("utf-8", "replace") for ln in _rx_lines if ln.strip()]
 
 
 def _measure_pipelining(req_id) -> None:
     """C3-2: hold the `initialize` response and record whatever the client sends meanwhile.
 
     A client that waits sends nothing here. A client that pipelines has already written its
-    next request, so it lands in the buffer during the window. This is the only vantage point
+    next request, so it lands in the queue during the window. This is the only vantage point
     from which the two differ — see the module docstring.
+
+    THE QUEUE IS READ ONCE, AT THE CLOSE, and everything still in it counts. The main loop has
+    popped exactly the `initialize` line by now, so anything else sitting there was written by
+    the client before this response was — which is the definition of pipelining. An earlier
+    version of this function snapshotted the queue length at the window's open and counted only
+    what arrived after, which is right for an on-demand reader and wrong for a continuous one:
+    a client that pipelines aggressively has its next request queued before the window even
+    opens, and that is the strongest possible evidence, not a reason to discard it.
     """
     deadline = time.monotonic() + INIT_DELAY_MS / 1000.0
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        _fill(remaining)
+        time.sleep(min(remaining, 0.01))
     arrived = _buffered_lines()
     methods = []
     for raw in arrived:
@@ -537,6 +587,9 @@ def main() -> int:
             signal.signal(sig, _on_signal)
         except (ValueError, OSError):  # not all signals settable everywhere
             pass
+    # Daemon, so a shim that is killed or exits via os._exit() in a signal handler is never
+    # held open by it — C3-1's whole subject is how this process dies.
+    threading.Thread(target=_reader, daemon=True).start()
 
     while True:
         # Our own raw reader rather than `sys.stdin`: every layer above the fd reads ahead
