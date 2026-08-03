@@ -642,6 +642,14 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   rule quantifies the way its definition does. It also needs its scope pinned: the anomaly
   carries the step it escaped, and the validator requires that step to match the fact claiming
   it, or one catch-all excuses a failure anywhere in the record.
+- **A PAIRING KEY MUST BE AS FINE-GRAINED AS THE THING IT PAIRS.** The catch-all outcome was
+  keyed by step number, and step 2 owns two completion facts — so one `shutdown_anomaly(step=2)`
+  raised by closing stdin would license `drain_ended: failed` as well, or instead. The check
+  "the step matches the fact" cannot see the difference, so it passes for the wrong reason,
+  which is worse than not having it: it reads like coverage. The key is now the exact fact, and
+  the sibling case is pinned in both directions. **The tell is a key whose value set is smaller
+  than the set of things it identifies** — look for a table row that names two things, and for
+  a cross-check written against the coarser of two available identifiers.
 - **Evidence that only one actor can hold must be structurally tied to that actor's claim.**
   `child_status` is obtainable only by the process that reaped the child, so it is required
   exactly when `child_reaped` says `done` and forbidden otherwise. Left loose, a writer can
