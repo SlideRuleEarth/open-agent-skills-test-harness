@@ -597,6 +597,28 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   PID recycled under `kill(pid, 0)`. Then check the discriminating power of the fixture itself
   — a helper that exits on its own, or on stdin EOF, lets a proxy that skipped the group kill
   pass on the helper's good manners rather than on its own behaviour.
+- **The EVIDENCE CHANNEL has a premise, and it needs its own positive check.** The teardown case
+  proves "nothing survived" by reading EOF on a pipe inherited into the child's group — sound,
+  and worthless if the descriptor never arrived. A broken `pass_fds`, or a helper that closes
+  the writer at startup, produces an immediate EOF and a passing case with nothing torn down.
+  So the helper writes a **distinctive readiness token** through that same pipe and holds the
+  writer for life, and the driver requires the token, then requires **no EOF before shutdown
+  starts**, and only then treats EOF as the finding. The token must be the helper's own, or the
+  child's liveness is accepted as the helper's. Third instance of one pattern in this PR: a
+  check that passes hardest when nothing happened — first in the proxy's outcome list, then in
+  the verdict's quantifiers, then in the instrument built to catch the first two.
+- **A closed key set is closed in BOTH directions, and only one of them gets tested.** The
+  structural validator was specified as "every completion fact present, every value from its
+  closed set" — which a validator iterating the names it already knows satisfies while ignoring
+  a fact added later. Missing keys are the case everyone writes; **unrecognized keys are how the
+  next field silently stops being checked**, the same drift the "no default-clean branch" rule
+  exists to stop on the value side. Pin both, and pin them per key rather than once for the set.
+- **A count restated in prose beside the table it counts will be wrong.** Twice in one PR: the
+  section's first draft said "seven reasons" of an eleven-row table, and "three facts" of the
+  four that `spawn_failed` makes inapplicable. Both were counting rows, not entries, and both
+  read fine. The fix is not a more careful count, it is **not restating it** — "every
+  child-and-group fact" cannot drift, and re-derives itself when the table changes. Same rule as
+  the verification-block counts in §4, applied to prose.
 - **A test-only hook is a verdict input, or it is a way to pass without being tested.** The
   fault-injection point that lets the driver reach the endings with no reason was specified as
   "recorded in the start record", which sounds like it closes the hole and does not: if the

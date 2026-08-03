@@ -5,7 +5,9 @@ support — read the section you are about to change before changing it. `harnes
 §4 is the list of mistakes already made here, kept so they are not made again, and its
 verification block holds the commands and the current arm/mutation/check counts. **Do not copy
 those numbers anywhere else.** A count that lives in two places drifts, and the drift is
-silent; point at the block instead.
+silent; point at the block instead. The same holds for a count restated in prose beside the
+table it counts — write the phrase that re-derives itself ("every child-and-group fact")
+rather than the numeral, which is right until someone adds a row.
 
 **Verification is not optional.** Any change to `harness/agentskill_evals/` runs the selftest,
 the mutation suite and Ruff before it is claimed as done, per that block. A mutation suite that
@@ -46,9 +48,11 @@ records nothing. That last one needs a positive fact to check — a step that sa
 hook that reports it fired — and often a witness from outside the process under test, since
 a claim and the thing it claims about must not have the same author. Its pure form is
 `all(...)` over a collection nothing was put into: any universally quantified check needs a
-structural clause ahead of it saying what must be there. And a witness may only assert what
-it can actually observe from where it stands — narrow the claim to that, rather than
-narrowing what would have been worth claiming.
+structural clause ahead of it saying what must be there. A witness may only assert what it
+can actually observe from where it stands — narrow the claim to that, rather than narrowing
+what would have been worth claiming. And the witness itself rests on a premise: an
+observation channel that was never connected reports the same silence as a channel reporting
+success, so make it say something positive before you trust it saying nothing.
 
 **A duplicated rule must be pinned to its original.** Some files cannot import the code they
 must agree with — `harness/fixtures/` runs as a subprocess of an agent CLI with only the
