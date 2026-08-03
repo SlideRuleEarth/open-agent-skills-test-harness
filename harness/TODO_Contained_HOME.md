@@ -642,6 +642,15 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   rule quantifies the way its definition does. It also needs its scope pinned: the anomaly
   carries the step it escaped, and the validator requires that step to match the fact claiming
   it, or one catch-all excuses a failure anywhere in the record.
+- **CONFIGURED IS NOT FIRED, AND ONE FACT CANNOT BE BOTH.** The rule that a suppressed step
+  reads `failed(fault_point_configured)` let *arming* justify the claim that a step was
+  suppressed — and, read in the other direction, made a genuinely unfired hook structurally
+  invalid. Those are exactly the two states the no-op-injection case exists to tell apart, so
+  the pairing rule destroyed the test it was written alongside. Arming is a start-record fact
+  and is anomalous **on its own**; firing is per-fact evidence and is the only thing a `failed`
+  completion may pair with. **When a check needs a hook's activation, ask whether the record it
+  reads proves activation or merely intent** — and check that the isolating case can still go
+  green when the clause under test is deleted, or it is pinning something else.
 - **A PAIRING KEY MUST BE AS FINE-GRAINED AS THE THING IT PAIRS.** The catch-all outcome was
   keyed by step number, and step 2 owns two completion facts — so one `shutdown_anomaly(step=2)`
   raised by closing stdin would license `drain_ended: failed` as well, or instead. The check
