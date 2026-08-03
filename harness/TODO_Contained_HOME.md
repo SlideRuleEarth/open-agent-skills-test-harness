@@ -624,6 +624,21 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   **Ask what else could satisfy a negative observation, and eliminate those first**; and close
   with the positive (kill the group, require EOF), so the control cannot pass by observing
   nothing at all.
+- **An IDENTIFIER is not an OBSERVATION.** Having specified that the driver waits for the direct
+  child to exit, I wrote that it "takes" the child from the audit log's spawn record — which
+  supplies a pid, not a death. The driver cannot `wait()` a process it did not spawn; a
+  liveness probe on the pid is point-in-time and recycles; and the terminator's `child_reaped`
+  is the claim the case exists to test, so leaning on it is circular. The fix is the same
+  mechanism one level shallower — a second inherited pipe, scoped to the child and not passed
+  to the helper, whose EOF is external evidence of the child's exit. **When a step says "wait
+  for X", check that the driver can observe X at all**, rather than that it can name X.
+- **Two independent reports of the same identity must be cross-checked before either is acted
+  on.** The helper reports its process group; the proxy reports the child's. Believing one
+  without the other lets the control pass against the wrong group entirely — a mis-grouped
+  helper `READY`s, survives, gets cleaned up, and the child's actual group, the only thing
+  step 4 is supposed to kill, was never under test. So the two must agree, and the child must
+  satisfy `pid == pgid` under `start_new_session=True`; disagreement fails the case rather
+  than being reconciled, and only the vouched-for group is ever signalled.
 - **Cleanup targets come from the thing being cleaned up, never from discovery.** The control
   has to kill a group it deliberately left running, and the only non-guessing source for that
   group id is the process in it — so the helper reports its own PGID in its readiness record,
