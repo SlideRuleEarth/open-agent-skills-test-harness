@@ -533,9 +533,35 @@ Default signal disposition terminates a process without running any handler. A p
 
 A terminator therefore asserts something stronger than "the proxy reached its handler" — it asserts **the direct child was reaped and its process group terminated**. Nothing weaker would be worth checking.
 
-**`EPIPE` is clean in exactly one place, and the anomaly list still means what it says.** A write failure toward the client during *ordinary request forwarding* is an anomaly: it means the proxy was mid-conversation and the client vanished, and whatever it was carrying did not arrive. A write failure during *step 2 of an already-initiated shutdown* is expected — C3-1 measured it against agy — and is recorded rather than raised. The distinction is the shutdown having already begun, not the errno.
+#### 10.5.1 Every way an instance can end, in one enumeration
 
-Nor does a clean shutdown launder an earlier fault. If a forwarding `EPIPE` was recorded as an anomaly and the proxy then tore everything down perfectly, the instance is still anomalous: the terminator says the child is gone, not that the run was sound. This is the no-heal rule of §10.5 applied within a single instance rather than across restarts.
+An instance has **eleven** ways to stop, listed in nine rows below, and they arrive from three different directions — the client, the child, the proxy's own machinery — and each one has to be classified as clean or anomalous. **That classification lives in exactly one place**, a total function over a closed enumeration, and every consumer reads it: the terminator record, the per-instance verdict, and `verify_post_run`. No consumer re-derives cleanliness from a condition of its own.
+
+This is written down before the I/O half is built rather than after, because it is the shape of defect this work has already paid for twice (`TODO_Contained_HOME.md` §4). Both times a new fact about whether something could be trusted was added *beside* the existing reasons instead of *into* them, and the consumers that were not updated went on publishing their old conclusion. Eleven reasons arriving from three directions is precisely the setup that produces it.
+
+| Reason | Raised by | Verdict |
+| --- | --- | --- |
+| `client_eof` | client closed stdin | **clean** — C3-1: claude, agy |
+| `signal_term`, `signal_int` | client signalled | **clean** — C3-1: codex, copilot |
+| `shutdown_write_failed` | writing to a departed client during step 2 | **clean** — C3-1 measured it against agy; recorded, swallowed, sequence continues |
+| `shutdown_child_killed` | step 3's bounded timer expired, `SIGKILL` sent | **clean** — recorded; the terminator's promise (child reaped, group gone) still holds |
+| `spawn_failed` | the declared server would not start | anomaly — no start record exists, so nothing was forwarded either |
+| `child_exit` | the server exited while the connection was live | anomaly — the spec tells clients to *restart* an unexpectedly exited server, which is why this is the case most easily mistaken for normality |
+| `client_write_failed`, `child_write_failed` | a write during ordinary forwarding | anomaly — mid-conversation, and what it carried did not arrive |
+| `read_failed` | a read error that is **not** EOF, on either pipe | anomaly — an instrument failure must never wear the clean-shutdown label |
+| `protocol_anomaly` | any anomaly in the list above | anomaly — terminal, and no later clean shutdown launders it |
+
+**`SIGKILL` is deliberately absent.** It cannot be caught, so no terminator is written and the instance is anomalous by the absence rather than by a reason — which is exactly the property §10.5 already relies on, and it is sound only because no observed CLI destroys the process without warning (C3-1).
+
+Three rules make the enumeration load-bearing rather than decorative:
+
+- **No default-clean branch.** The predicate is total over the enumeration, and an unrecognized reason classifies as an anomaly. Adding a reason without classifying it must fail the cell, not pass it — the failure has to be the loud one, or the enumeration decays into documentation.
+- **Phase is part of the reason, not a flag a caller applies.** `client_write_failed` and `shutdown_write_failed` are two *reasons*, not one reason plus a "are we shutting down?" boolean. The paragraph this replaces stated the same rule as a condition — "the distinction is the shutdown having already begun, not the errno" — and a condition evaluated at each call site is the thing that drifts. The same holds for `child_exit` versus a child that exits during step 3, which is `shutdown_child_killed` or an ordinary reap.
+- **The reason is recorded, not just the verdict.** The terminator carries which reason ended the instance, so the audit log says *why* an instance ended cleanly and not merely *that* it did. A verdict with no reason cannot be checked against C3-1's table when a CLI changes its shutdown behaviour underneath us — which C3-1 already caught happening once.
+
+`tools/verify_mcp_proxy.py` (§10.9) drives every reason in this table against the real program, and a totality check asserts that every enumerated reason has a verdict and that every consumer handles every verdict. A reason nobody can produce on demand is a reason nobody has tested.
+
+A clean shutdown does not launder an earlier fault either. If a forwarding `EPIPE` was recorded as an anomaly and the proxy then tore everything down perfectly, the instance is still anomalous: the terminator says the child is gone, not that the run was sound. This is the no-heal rule of §10.5 applied within a single instance rather than across restarts.
 
 The handler itself must not do that work. Re-entrant buffered JSON and file I/O from a signal handler can interleave with a write already in progress and corrupt the very record the verdict depends on. The handler sets a flag or writes a byte to a self-pipe; the control path notices, runs the sequence above, and exits. Note the probe takes the shortcut this paragraph forbids — it has no child to reap and its handler writes with a single `os.write()` to an `O_APPEND` fd — so it is a witness to the shutdown *paths*, not a template for handling them.
 
@@ -568,7 +594,7 @@ Recording is *evidence, not control*: the thing that keeps an unimplemented vers
 
 ### 10.9 Testing
 
-The proxy is a program with a defined wire protocol on both sides, so it is testable without any agent CLI: drive it with a scripted client over pipes and a fixture server, and assert the filtered list, the refused call, verbatim pass-through of a non-tool method, the notification rule, and a recorded anomaly plus failing verdict for each malformed case — including the envelope cases (batch array, response with no `id`, both-`result`-and-`error`) that a "no `id` means notification" reading would wave through.
+The proxy is a program with a defined wire protocol on both sides, so it is testable without any agent CLI: **`tools/verify_mcp_proxy.py`** drives it with a scripted client over pipes and a fixture server, and asserts the filtered list, the refused call, verbatim pass-through of a non-tool method, the notification rule, and a recorded anomaly plus failing verdict for each malformed case — including the envelope cases (batch array, response with no `id`, both-`result`-and-`error`) that a "no `id` means notification" reading would wave through. It also drives **every termination reason in §10.5.1** — each one on demand, because a reason nobody can produce is a reason nobody has tested.
 
 **The module is split in two, and where the line falls is a testability decision.** `tools/mutate_mcp.py` proves arms by running the *selftest*, so anything reachable only by driving the real program over real pipes carries no mutation coverage — the gap already recorded for `fixtures/`. Everything that could be *silently* wrong therefore lives in `agentskill_evals/mcp_proxy.py` as pure functions, and the I/O half keeps only reads, writes, spawning and shutdown sequencing, which a wire-level driver can observe.
 
@@ -588,7 +614,7 @@ Live verification against all four CLIs comes after the offline arms, and the C3
 
 **A second live target, now measured: probe C3-2** (§9). §10.2's era rule REFUSES a request pipelined behind an unanswered `initialize`, and the measurement says no shipped CLI is refused by it — three legacy CLIs wait, and agy has no handshake to pipeline behind. `tools/probe_mcp_pipelining.py` re-runs it; three of the four cost one cheap model call each, and claude is free because `claude mcp list` health-checks stdio servers with a full handshake. The instrument has its own regression in `verify_mcp_fixtures.py` (E13), checked in **both** directions — an instrument that reports pipelining for everything is as useless as one that reports it for nothing, and the second is the plausible failure, being what a buffered read path produces. The probe that *reads* the instrument has its own (E14), because it is a different program: E13's checks all stayed green over a classifier that would have reported a CLI which died before handshaking as "modern `n/a`", and the classification — not the log — is what a design decision gets justified by (review, third round on PR #100). `classify`, `unmeasured` and `summary` are functions rather than an `elif` chain inside `main()` for exactly that reason.
 
-   **Every reason a run might be untrustworthy lives in `classify`**, including the shim's own health. A broken instrument is the row that *looks* answered — the reader can die after an era and a pipelining record are already logged — so when `reader_failed` was threaded into the exit status alone, the tool printed "No CLI pipelined, across the whole fleet … costs the fleet nothing" and then exited 1 (review, tenth round on PR #100). That is the fleet-wide-claim-from-an-incomplete-run defect again, arriving through the one door the earlier fix did not cover, because `unmeasured` had been taught two ways of being unanswered and this was a third. `INSTRUMENT_FAILED` is now a classification like any other, checked first, and the summary names the cause rather than only the absence.
+**Every reason a run might be untrustworthy lives in `classify`**, including the shim's own health. A broken instrument is the row that *looks* answered — the reader can die after an era and a pipelining record are already logged — so when `reader_failed` was threaded into the exit status alone, the tool printed "No CLI pipelined, across the whole fleet … costs the fleet nothing" and then exited 1 (review, tenth round on PR #100). That is the fleet-wide-claim-from-an-incomplete-run defect again, arriving through the one door the earlier fix did not cover, because `unmeasured` had been taught two ways of being unanswered and this was a third. `INSTRUMENT_FAILED` is now a classification like any other, checked first, and the summary names the cause rather than only the absence.
 
 ### 10.10 Sources
 

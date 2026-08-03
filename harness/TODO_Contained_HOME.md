@@ -637,6 +637,14 @@ ABA fix and its route to `parallel_safe_config = True`.
   wire-level driver → the adapter integration that unlocks `tools:`.
   Everything before the last slice cannot affect any run, which is the point: this is harness
   code in the request path of every gated cell.
+  **The I/O half starts from §10.5.1, written before its code**: eleven ways an instance can
+  end, arriving from three directions, classified clean-or-anomalous by one total function
+  that every consumer reads — terminator record, per-instance verdict, `verify_post_run` —
+  with no default-clean branch, so a reason added without a verdict fails the cell instead of
+  passing it. Phase is part of the reason rather than a flag a caller applies, which dissolves
+  the "`EPIPE` is clean in exactly one place" conditional into two distinct reasons. That
+  enumeration exists up front because this is the defect shape §4 has already paid for twice
+  on #100, and eleven reasons from three directions is exactly the setup that produces it.
   **Probe C3-2 resolved 2026-07-31** (`tools/probe_mcp_pipelining.py`): no CLI pipelines
   requests behind `initialize`, which is what licenses §10.2 REFUSING one. A pending
   negotiation cannot govern traffic — the pipelined request's response may arrive first,
