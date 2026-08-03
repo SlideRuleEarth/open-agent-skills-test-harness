@@ -575,6 +575,28 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   "did not happen". And since a completion fact is the implementation's own claim about itself,
   one case has to verify it from outside the process — the group really gone, checked by the
   driver, not asserted by the proxy.
+- **"EVERY recorded X is clean" is TRUE when nothing was recorded.** The fix above made the
+  verdict a conjunction over the triggers, the outcomes and the completion facts — and every
+  clause of it is universally quantified, so a terminator with an empty trigger list satisfies
+  all of them. That is not a clean instance, it is a broken writer, and the verdict said clean.
+  Any `all()` needs a **structural clause first**: the collections that must be non-empty are
+  non-empty, every required field is present, every value is from its closed set. Owned by the
+  *reader*, not the writer — a process broken enough to emit the malformed record is the wrong
+  one to ask whether it did. And the validator needs the **legal record that resembles an
+  illegal one** among its cases (here `spawn_failed`, whose facts are genuinely inapplicable),
+  or "reject everything" passes the whole suite. Same rule as the arms: state what a broken
+  implementation produces, then check the assertion rejects it — `all([])` is the purest form
+  of an assertion that cannot fail.
+- **An outside observer can only assert what it can observe — the C3-3 lesson, second
+  instance.** The external check on teardown was written as "confirms the direct child was
+  reaped", which no other process can establish: a proxy that exits without reaping leaves a
+  child that init adopts and reaps, and afterwards the two are identical. The load-bearing
+  property is narrower and *is* observable — **nothing from the instance is still alive** — so
+  that is what the case claims. Prefer **monotone evidence over a probe**: an inherited pipe
+  whose EOF proves every holder is gone cannot race the proxy's exit and cannot be fooled by a
+  PID recycled under `kill(pid, 0)`. Then check the discriminating power of the fixture itself
+  — a helper that exits on its own, or on stdin EOF, lets a proxy that skipped the group kill
+  pass on the helper's good manners rather than on its own behaviour.
 - **A test-only hook is a verdict input, or it is a way to pass without being tested.** The
   fault-injection point that lets the driver reach the endings with no reason was specified as
   "recorded in the start record", which sounds like it closes the hole and does not: if the
@@ -682,7 +704,9 @@ ABA fix and its route to `parallel_safe_config = True`.
   on two axes — the triggers, latched in order, plus the cleanup outcomes accumulated after
   them — together with a positive completion fact per teardown step, since a list of things
   that went wrong is silent about a step that never ran at all. The verdict is a monotonic
-  conjunction over all of it rather than a lookup on whatever happened last.
+  conjunction over all of it rather than a lookup on whatever happened last, behind a
+  structural clause, since every other clause is universally quantified and an empty record
+  satisfies them all.
   One total `is_clean` that every consumer reads (terminator record, per-instance verdict,
   `verify_post_run`), no default-clean branch, and phase carried in the reason rather than in a
   flag each caller applies, which dissolves the "`EPIPE` is clean in exactly one place"

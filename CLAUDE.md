@@ -44,7 +44,11 @@ appear — if a fix depends on a path being taken, test the path where it is not
 assertion that passes because nothing was recorded, when *not running the code at all* also
 records nothing. That last one needs a positive fact to check — a step that says it ran, a
 hook that reports it fired — and often a witness from outside the process under test, since
-a claim and the thing it claims about must not have the same author.
+a claim and the thing it claims about must not have the same author. Its pure form is
+`all(...)` over a collection nothing was put into: any universally quantified check needs a
+structural clause ahead of it saying what must be there. And a witness may only assert what
+it can actually observe from where it stands — narrow the claim to that, rather than
+narrowing what would have been worth claiming.
 
 **A duplicated rule must be pinned to its original.** Some files cannot import the code they
 must agree with — `harness/fixtures/` runs as a subprocess of an agent CLI with only the
