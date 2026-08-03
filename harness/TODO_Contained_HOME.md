@@ -634,6 +634,21 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   record the failure on whichever axis it prefers and stay silent on the other. **When one thing
   is described by two enumerations, enumerate the cross-product, not each list alone**; the
   missing cell is where a real state ends up unwriteable.
+- **A CATCH-ALL has to be reachable from every case it claims to cover.** `shutdown_anomaly` was
+  defined as an exception escaping *any* teardown step, and then paired with only the two facts
+  that had no typed outcome — so an exception during the drain, the reap or the group kill had
+  no legal way to be recorded, which is the same unwriteable-state defect as the round before,
+  found in the mechanism added to prevent it. A catch-all is only a catch-all if the pairing
+  rule quantifies the way its definition does. It also needs its scope pinned: the anomaly
+  carries the step it escaped, and the validator requires that step to match the fact claiming
+  it, or one catch-all excuses a failure anywhere in the record.
+- **Evidence that only one actor can hold must be structurally tied to that actor's claim.**
+  `child_status` is obtainable only by the process that reaped the child, so it is required
+  exactly when `child_reaped` says `done` and forbidden otherwise. Left loose, a writer can
+  claim the reap while lacking the one thing a reaper necessarily has, or attach a status to a
+  child it never reaped. The observation that fabricating it would be *a lie rather than an
+  omission* was already in the design as a remark — **a remark about what a liar would have to
+  do is not a check**; make the reader enforce it.
 - **A control that suppresses a step must suppress everything downstream that DEPENDS on it.**
   The control leaves the child alive on purpose, so it also has to suppress the reap — a live
   child cannot be reaped, and a control that stopped at "don't kill" would hang or crawl to the
