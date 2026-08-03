@@ -293,7 +293,7 @@ harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N ar
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
 python3 harness/tools/mutate_mcp.py                           # 181/181 production + 2/2 instrument
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 253 checks
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 271 checks
 git diff --check
 ```
 
@@ -419,6 +419,13 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   driver waits for each response, so the ordering is true by construction. **When an
   instrument keeps needing to be made more careful, check whether the quantity is observable
   from that vantage point at all.**
+- **When a claim is retracted, the retraction has to reach every place that made it.** After
+  agreeing that C3-3 concludes nothing, the committed tree still had a docstring calling a
+  positive result "conclusive", a design paragraph saying the same, and a function still
+  describing its output as "wire order" — the exact phrase the round had just established the
+  instrument cannot deliver. The behaviour was right and the authoritative text was a round
+  behind. **Grep for the retracted claim, not just the changed function**; a reviewer reading
+  the docs gets the old answer, and so does the next person to touch the code.
 - **A tool that only prints its findings has not reported them.** The malformed-request events
   were written to a temp log, and `probe()` carried only the timeline — so without `-v` a
   client sending malformed frames produced no finding in the summary and no effect on the exit

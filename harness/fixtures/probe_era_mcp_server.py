@@ -134,29 +134,51 @@ def _valid_request_id(req_id) -> bool:
         float("inf"), float("-inf")))
 
 
-def _request_envelope_ok(msg) -> bool:
-    """Whether this is a REQUEST the proxy would accept — the whole envelope, not just the id.
+def _envelope_shape(msg):
+    """Which JSON-RPC shape the PROXY would call this, or `None` if it would refuse it.
 
-    Mirrors the request branch of `agentskill_evals.mcp_proxy.classify_envelope`, and is
-    checked against it in `verify_mcp_fixtures.py` for the same reason `_id_key` is: this file
-    cannot import the proxy, so the copy must be pinned rather than trusted.
+    Mirrors `agentskill_evals.mcp_proxy.classify_envelope` — ALL FOUR SHAPES, not just the
+    request branch — and is checked against it in `verify_mcp_fixtures.py` for the same reason
+    `_id_key` is: this file cannot import the proxy, so the copy must be pinned rather than
+    trusted.
 
-    Validating only the ID was not enough. A JSON-RPC **1.0** `ping(1)` — no `"jsonrpc":
-    "2.0"` — carries a perfectly good id, so it entered the timeline; the real proxy terminates
-    the connection on that frame as `MALFORMED` and never reaches any id rule. A later `ping(1)`
-    then read as legal post-response reuse, against a first request that would have killed the
-    cell (review, PR #100). Admission here has to be the proxy's admission, or the timeline
-    describes a conversation the proxy would never have had.
+    THE POINT IS THE `None`, as much as the shapes. The proxy fails the connection on any
+    envelope it cannot classify, so every one of those is a terminal marker in the C3-3
+    timeline. Two earlier versions were narrower and each let a proxy-fatal frame read as
+    ordinary traffic: checking only the id admitted a JSON-RPC 1.0 request, and checking only
+    request-shaped frames left batches and malformed NOTIFICATIONS — which carry no id at all
+    — producing no marker, so the timeline said the conversation continued past a message the
+    proxy would have died on (review, PR #100).
     """
     if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
-        return False
-    if "method" not in msg or "result" in msg or "error" in msg:
-        return False
-    if not isinstance(msg["method"], str) or not msg["method"]:
-        return False
-    if "params" in msg and not isinstance(msg["params"], dict):
-        return False
-    return "id" in msg and _valid_request_id(msg["id"])
+        return None
+    has_method, has_id = "method" in msg, "id" in msg
+    has_result, has_error = "result" in msg, "error" in msg
+    if has_result and has_error:
+        return None
+    if has_method and (has_result or has_error):
+        return None
+    if has_method:
+        if not isinstance(msg["method"], str) or not msg["method"]:
+            return None
+        if "params" in msg and not isinstance(msg["params"], dict):
+            return None
+        if has_id:
+            return "request" if _valid_request_id(msg["id"]) else None
+        return "notification"
+    if has_result:
+        if not has_id or not _valid_request_id(msg["id"]):
+            return None
+        return "result" if isinstance(msg["result"], dict) else None
+    if has_error:
+        err = msg["error"]
+        if not isinstance(err, dict) or not isinstance(err.get("code"), int) \
+                or isinstance(err.get("code"), bool) or not isinstance(err.get("message"), str):
+            return None
+        if has_id and not _valid_request_id(msg["id"]):
+            return None
+        return "error"
+    return None
 
 
 def _id_key(req_id):
@@ -505,10 +527,12 @@ def _announce(raw: bytes) -> None:
     fills.
 
     MALFORMED TRAFFIC DOES NOT ENTER C3-3, and "malformed" means the PROXY'S whole envelope
-    rule — see `_request_envelope_ok`. Checking only the id let a JSON-RPC 1.0 frame through,
-    and before that a list id crashed the reader while `true` followed by `1` manufactured a
-    reuse Python sees and JSON-RPC does not (review, PR #100). Anything rejected is logged as
-    its own event, which is a finding about the client rather than an input to any price.
+    taxonomy — see `_envelope_shape`. Narrower versions kept letting a proxy-fatal frame read
+    as ordinary traffic: checking only the id admitted a JSON-RPC 1.0 request, and checking
+    only request-shaped frames left batches and malformed NOTIFICATIONS unmarked. Before those,
+    a list id crashed the reader while `true` followed by `1` manufactured a reuse Python sees
+    and JSON-RPC does not (review, PR #100). Anything rejected is logged as its own event —
+    a finding about the client, and a terminal marker, since the proxy dies there.
     """
     if not raw.strip():
         return
@@ -517,14 +541,26 @@ def _announce(raw: bytes) -> None:
     except (json.JSONDecodeError, ValueError):
         _log("request_id_malformed", why="unparseable")
         return
-    if _request_envelope_ok(msg):
+    if isinstance(msg, list):
+        # A JSON-RPC BATCH. MCP forbids it on stdio and the proxy fails on it, so it is
+        # terminal here too — it was producing no marker at all, being neither parseable-
+        # request-shaped nor unparseable (review, PR #100).
+        _log("request_id_malformed", why="batch", count=len(msg))
+        return
+    shape = _envelope_shape(msg)
+    if shape is None:
+        # ANY envelope the proxy would refuse, whatever its shape. A malformed NOTIFICATION
+        # carries no id and so slipped past a request-shaped check, while the proxy dies on it
+        # exactly as it dies on a malformed request.
+        _log("request_id_malformed", why="envelope",
+             id_repr=repr(msg.get("id")) if isinstance(msg, dict) else None,
+             method=str(msg.get("method"))[:120] if isinstance(msg, dict) else None,
+             jsonrpc=repr(msg.get("jsonrpc")) if isinstance(msg, dict) else None)
+    elif shape == "request":
         _admitted.add(tuple(_id_key(msg["id"])))
         _log("request_id", id_key=_id_key(msg["id"]), method=msg["method"])
-    elif isinstance(msg, dict) and msg.get("method") is not None and "id" in msg:
-        # Shaped like a request and refused like one. A notification (no `id`) is not a
-        # finding — it is ordinary traffic that simply has no place in an id timeline.
-        _log("request_id_malformed", id_repr=repr(msg.get("id")),
-             method=str(msg.get("method"))[:120], jsonrpc=repr(msg.get("jsonrpc")))
+    # A well-formed notification or response is ordinary traffic with no place in an id
+    # timeline, and no finding either.
 
 
 def _reader() -> None:
@@ -666,8 +702,8 @@ def main() -> int:
         method = msg.get("method")
         req_id = msg.get("id")
         # The C3-3 `request_id` record is NOT written here. It is written by `_announce` when
-        # the line arrives on the wire, because the rule it measures is about wire order and
-        # this loop runs in processing order — see `_announce`.
+        # the line arrives, which is as close to wire order as this process can get; this loop
+        # runs in processing order, which is further away still — see `_announce`.
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
 
         if req_id is None:
@@ -719,7 +755,11 @@ def main() -> int:
     reason = "reader_failed" if _rx_failed else "stdin_eof"
     _close_subscriptions(reason)
     _log("terminator", reason=reason)
-    return 0
+    # A NON-ZERO EXIT, not just a differently-worded log line. C3-1 reads the terminator as a
+    # verdict about the client, and anything driving this shim — the verifier, a probe, a CI
+    # step — checks the exit status first. Logging the failure and then exiting 0 leaves the
+    # instrument saying "clean" in the one place most callers look (review, PR #100).
+    return 1 if _rx_failed else 0
 
 
 if __name__ == "__main__":

@@ -1068,20 +1068,24 @@ check("a departed reader means the closure is NOT recorded as answered",
 # MALFORMED IDS STAY OUT OF THE TIMELINE. A list id is unhashable and crashed the reader; a
 # `true` followed by `1` manufactured a reuse, because Python aliases them and JSON-RPC does
 # not (review, PR #100).
-def _raw_drive(msgs):
-    """Write these messages and return the log. `run()` cannot: it keys pending ids in a set,
-    so a list id raises `unhashable` in the DRIVER before the shim ever sees it."""
+def _raw_bytes(payload: bytes):
+    """Write these exact bytes to the shim and return its log."""
     tmp = tempfile.mkdtemp(prefix="verify-badid-")
     log = os.path.join(tmp, "probe.jsonl")
     p = subprocess.Popen([sys.executable, SHIM], stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          env=dict(os.environ, PROBE_MCP_LOG=log, PROBE_MCP_MODE="dual"))
     try:
-        p.communicate(b"".join((json.dumps(m) + "\n").encode() for m in msgs),
-                      timeout=DEADLINE)
+        p.communicate(payload, timeout=DEADLINE)
     except subprocess.TimeoutExpired:
         p.kill()
     return [json.loads(ln) for ln in open(log) if ln.strip()]
+
+
+def _raw_drive(msgs):
+    """Write these messages and return the log. `run()` cannot: it keys pending ids in a set,
+    so a list id raises `unhashable` in the DRIVER before the shim ever sees it."""
+    return _raw_bytes(b"".join((json.dumps(m) + "\n").encode() for m in msgs))
 
 
 _bad = _raw_drive([{"jsonrpc": "2.0", "id": [], "method": "ping"},
@@ -1115,16 +1119,26 @@ check("...and the response to the refused frame is not recorded as an answer",
       [k for k, _ in PIPE.id_timeline(
           _raw_drive([{"id": 1, "method": "ping", "params": {}}]))] == ["bad"],
       PIPE.id_timeline(_raw_drive([{"id": 1, "method": "ping", "params": {}}])))
-for _bad_env in ({"jsonrpc": "1.0", "id": 1, "method": "ping"},
-                 {"jsonrpc": "2.0", "id": 1, "method": ""},
-                 {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": []},
-                 {"jsonrpc": "2.0", "id": 1, "method": "ping", "result": {}}):
-    check(f"the shim's envelope rule matches the proxy's for {_bad_env}",
-          SHIM_MOD._request_envelope_ok(_bad_env)
-          is (classify_envelope(_bad_env) == "request"), _bad_env)
-check("...and it admits the envelope the proxy calls a request",
-      SHIM_MOD._request_envelope_ok({"jsonrpc": "2.0", "id": 1, "method": "ping"})
-      and classify_envelope({"jsonrpc": "2.0", "id": 1, "method": "ping"}) == "request")
+# ALL FOUR SHAPES, not just the request branch. The proxy fails on any envelope it cannot
+# classify, so each of those is terminal in the timeline — and a malformed NOTIFICATION has no
+# id at all, which is how it slipped past a request-shaped check (review, PR #100).
+for _env in ({"jsonrpc": "1.0", "id": 1, "method": "ping"},
+             {"jsonrpc": "2.0", "id": 1, "method": ""},
+             {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": []},
+             {"jsonrpc": "2.0", "id": 1, "method": "ping", "result": {}},
+             {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+             {"jsonrpc": "2.0", "method": "notifications/initialized"},
+             {"jsonrpc": "1.0", "method": "notifications/initialized"},
+             {"jsonrpc": "2.0", "method": "x", "params": []},
+             {"jsonrpc": "2.0", "id": 1, "result": {}},
+             {"jsonrpc": "2.0", "id": 1, "result": []},
+             {"jsonrpc": "2.0", "id": 1, "error": {"code": 1, "message": "m"}},
+             {"jsonrpc": "2.0", "id": 1, "error": {"code": "1", "message": "m"}},
+             {"jsonrpc": "2.0", "id": 1}):
+    _proxy = classify_envelope(_env)
+    _want = None if not isinstance(_proxy, str) else _proxy
+    check(f"the shim's envelope verdict matches the proxy's for {_env}",
+          SHIM_MOD._envelope_shape(_env) == _want, (SHIM_MOD._envelope_shape(_env), _proxy))
 
 # A FAILED READ IS NOT A CLOSED STDIN. `_reader` swallowed every OSError into `chunk = b""`,
 # so the main loop logged `stdin_eof` and a clean terminator — C3-1 would have published an
@@ -1145,9 +1159,47 @@ check("a failed read is logged as a reader error, not silence",
 check("...and the terminator says so instead of claiming a clean stdin close",
       [r.get("reason") for r in _frecs if r["event"] == "terminator"] == ["reader_failed"],
       _frecs)
-check("...and a genuine stdin close still reads as a clean terminator",
+# THE EXIT STATUS TOO. A log line the caller has to go and read is not a report: everything
+# driving this shim checks the status first, so logging the failure and exiting 0 leaves the
+# instrument saying "clean" where most callers look (review, PR #100).
+check("...and the shim exits non-zero", _fp.returncode != 0, _fp.returncode)
+check("...and a genuine stdin close still exits 0 with a clean terminator",
       [r.get("reason") for r in run([legacy_init(1)])[2]
        if r["event"] == "terminator"] == ["stdin_eof"])
+_okrun = subprocess.run([sys.executable, SHIM], input=b"", capture_output=True,
+                        env=dict(os.environ, PROBE_MCP_MODE="dual"), timeout=DEADLINE)
+check("...confirmed: a clean EOF is exit 0", _okrun.returncode == 0, _okrun.returncode)
+# The PROBE carries the instrument's health beside the reading, and FAILS THE RUN on it.
+_answered = {"cli": "a", "connected": True, "era": {"era": "legacy", "version": "2025-11-25"},
+             "pipelining": {"pipelined": False, "count": 0, "methods": []},
+             "id_anomalies": [], "reader_failed": False}
+check("a fully answered run exits 0", PIPE.run_failed([_answered]) is False)
+check("...a dead reader fails it",
+      PIPE.run_failed([{**_answered, "reader_failed": True}]) is True)
+check("...malformed traffic fails it",
+      PIPE.run_failed([{**_answered, "id_anomalies": [{"event": "request_id_malformed"}]}])
+      is True)
+check("...and the shim's own log is what tells the probe",
+      any(r["event"] in ("reader_error", "reader_failed") for r in _frecs), _frecs)
+
+# BATCHES AND MALFORMED NOTIFICATIONS are proxy-terminal too, and produced no marker at all —
+# a batch is neither request-shaped nor unparseable, and a malformed notification has no id.
+_batch_tl = PIPE.id_timeline(_raw_drive([[{"jsonrpc": "2.0", "id": 1, "method": "ping"}],
+                                         {"jsonrpc": "2.0", "id": 2, "method": "ping"}]))
+check("a JSON-RPC batch is a terminal marker",
+      _batch_tl and _batch_tl[0] == ("bad", None)
+      and PIPE.id_findings(_batch_tl)["truncated"] is True, _batch_tl)
+_note_tl = PIPE.id_timeline(_raw_drive([{"jsonrpc": "1.0", "method": "notifications/x"},
+                                        {"jsonrpc": "2.0", "id": 2, "method": "ping"}]))
+check("a malformed NOTIFICATION is a terminal marker, id or no id",
+      _note_tl and _note_tl[0] == ("bad", None)
+      and PIPE.id_findings(_note_tl)["truncated"] is True, _note_tl)
+check("...but a well-formed notification is neither a marker nor a finding",
+      PIPE.id_timeline(_raw_drive([{"jsonrpc": "2.0", "method": "notifications/initialized"},
+                                   {"jsonrpc": "2.0", "id": 2, "method": "ping"}]))[0]
+      == ("req", ("n", 2)))
+check("...and unparseable input is still terminal",
+      PIPE.id_timeline(_raw_bytes(b"not json\n"))[:1] == [("bad", None)])
 
 check("the shim's RequestId rule matches the proxy's",
       all(SHIM_MOD._valid_request_id(v) == P_valid(v)

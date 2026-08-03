@@ -142,6 +142,10 @@ def probe(cli: str, *, timeout: int, verbose: bool) -> dict:
     era = next((r for r in recs if r["event"] == "era"), None)
     timeline = id_timeline(recs)
     anomalies = id_anomalies(recs)
+    # THE INSTRUMENT'S OWN HEALTH, carried beside the reading. A shim whose reader died
+    # produced a log that looks like a short clean session; nothing downstream could tell that
+    # from a CLI that connected and left (review, PR #100).
+    reader_failed = any(r.get("event") in ("reader_error", "reader_failed") for r in recs)
     # `connected` means AN ERA WAS OBSERVED, not "the log exists". The shim writes `start`
     # before reading a byte, so a CLI that spawns the server and dies would otherwise count as
     # connected — and then, having sent no `initialize`, be classified as modern with nothing
@@ -161,6 +165,7 @@ def probe(cli: str, *, timeout: int, verbose: bool) -> dict:
         # is a finding the proxy would terminate on, and it reached neither the summary nor
         # the exit status while it lived only in the raw file (review, PR #100).
         "id_anomalies": anomalies,
+        "reader_failed": reader_failed,
         "rc": rc,
         "timed_out": timed_out,
         "elapsed_s": round(elapsed, 1),
@@ -190,7 +195,13 @@ WAITS = "waits"                  # nothing arrived until the response went out
 
 
 def id_timeline(recs: list[dict]) -> list[tuple[str, tuple]]:
-    """Request arrivals and response departures, IN WIRE ORDER, as the proxy would see them.
+    """Request arrivals and response departures, in the order THE SHIM OBSERVED THEM.
+
+    NOT "wire order", which is what this said and could not deliver. The shim logs an arrival
+    when its reader thread gets the bytes and a departure when its main thread completes the
+    write; nothing synchronises those, and a request can sit unread in the kernel pipe while
+    the response goes out. So this is a good-faith approximation of wire order, and
+    `id_summary` is careful never to conclude from it (review, PR #100).
 
     §10.4 spends a request id for the connection once it has reached the server, which refuses
     a client behaviour the spec permits: reuse after a response. That refusal needs a price,
@@ -384,20 +395,36 @@ ORDERING_UNPROVEN = ("the order of an arrival against a response cannot be estab
                      "inside the server, so a repeat cannot be classified")
 
 
+def run_failed(rows: list[dict]) -> bool:
+    """Whether this run answered nothing and should exit non-zero.
+
+    Three ways, and the last two were reported only in prose until review asked for them here.
+    A CLI whose question went unanswered; malformed traffic, because the proxy terminates on
+    the first such frame so nothing after it is evidence; and a shim whose READER DIED, which
+    measured nothing at all whatever its log looks like. A finding that changes how a run
+    should be read has to reach the exit status, not just a paragraph (review, PR #100).
+    """
+    return bool(unmeasured(rows)
+                or any(r.get("id_anomalies") or r.get("reader_failed") for r in rows))
+
+
 def id_summary(rows: list[dict]) -> list[str]:
-    """C3-3's paragraph. A POSITIVE result is conclusive; a negative one never is.
+    """C3-3's paragraph. NEITHER DIRECTION CONCLUDES, and that is the finding.
 
-    This asymmetry is the finding, not a hedge. Pipelining is exercised exactly once per
-    connection — the `initialize` window either has traffic in it or does not — so one clean
-    run per CLI settles C3-2. ALLOCATION IS NOT LIKE THAT: a run that sends ids 0 and 1 says
-    nothing about what the fourth request will use, and a cell runs far longer than a probe
-    does. An earlier version treated any two distinct ids as a completed answer and went on to
-    claim the rule "costs the fleet nothing", which is a conclusion about sessions it never
-    observed (review, PR #100).
+    The negative cannot: pipelining is exercised exactly once per connection — the `initialize`
+    window either has traffic in it or does not — so one clean run per CLI settles C3-2, while
+    a run that sends ids 0 and 1 says nothing about what the fourth request will use, and a
+    cell runs far longer than a probe does.
 
-    So the negative branch reports the SAMPLE and calls the rule unpriced, every time. Pricing
-    it needs a workload that actually stresses the allocator — many `tools/call`s on one
-    connection — which is a probe of its own, named in §9.
+    The positive cannot either, which took a further round to accept: classifying a repeat
+    needs the order of an arrival against a response, and no observer inside the server
+    establishes that — see `id_timeline`. An earlier version of this docstring called a
+    positive conclusive, which was true of nothing (review, PR #100).
+
+    So this reports the SAMPLE, surfaces repeats as unclassified, and calls the rule unpriced,
+    every time. Pricing it needs a workload that stresses the allocator AND establishes the
+    ordering by construction — a driver that waits for each response before sending the next —
+    which is a probe of its own, named in §9.
     """
     found = {r["cli"]: id_findings(r.get("id_timeline") or []) for r in rows}
     counts = ", ".join(f"{c}={f['requests']}" for c, f in found.items())
@@ -456,10 +483,7 @@ def main() -> int:
     print()
     for paragraph in summary(rows):
         print(paragraph)
-    # Malformed traffic joins the unmeasured CLIs in the exit status: the proxy terminates the
-    # connection on the first such frame, so that run answered nothing and saying so quietly
-    # in a paragraph is not enough (review, PR #100).
-    return 1 if unmeasured(rows) or any(r["id_anomalies"] for r in rows) else 0
+    return 1 if run_failed(rows) else 0
 
 
 if __name__ == "__main__":
