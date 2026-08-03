@@ -9438,7 +9438,23 @@ def _check_mcp_proxy_decisions(failures, verbose):
     collide = act({"jsonrpc": "2.0", "id": 1, "method": "ping"}, **reuse)
     answered = act({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}},
                    direction=P.S2C, **reuse)
+    # ...and being answered does NOT free it. Reuse after a response is legal for the client —
+    # the rule is only that an id may not match one "the sender has issued and not yet received
+    # a response for" — but the second response that makes it unsafe comes from the SERVER, and
+    # this boundary does not control the server. `tools/list` on id 1, its filtered answer,
+    # `ping` on id 1, then a second `tools/list` result: it correlates as the `ping` and is
+    # forwarded UNFILTERED, with no cancellation anywhere in the sequence (review, PR #100).
     after = act({"jsonrpc": "2.0", "id": 1, "method": "ping"}, **reuse)
+    second_answer = act({"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "add"}]}},
+                        direction=P.S2C, **reuse)
+    # A REFUSED call is the exception, and it has to be: nothing was forwarded, so nothing can
+    # ever answer it. Burning the id would fail the next legitimate request on it — and every
+    # MRTR retry lands here.
+    freed = legacy_ctx()
+    refused_call = act({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "danger", "arguments": {}}}, **freed)
+    reuse_after_refusal = act({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": {"name": "echo", "arguments": {}}}, **freed)
     # The id must be claimed BEFORE any message is produced, refusals included: an off-list
     # call answered on a live id sends the client an error correlated to the request that id
     # really belongs to — its outstanding `tools/list` — which then looks answered while the
@@ -9456,24 +9472,32 @@ def _check_mcp_proxy_decisions(failures, verbose):
     _check("proxy.a_live_request_id_is_never_silently_reused",
            isinstance(first_open, P.Forward)
            and failed(collide) == P.DUPLICATE_ID
-           # ...and once the id is answered it is genuinely free again, or a long session
-           # would run out of ids and a clean cell would fail.
            and isinstance(answered, P.Filtered)
-           and isinstance(after, P.Forward)
+           # ANSWERED IS NOT FREE: the id is spent, and the second answer that would have
+           # exploited its reuse fails rather than correlating to whatever took it
+           and failed(after) == P.SPENT_ID_REUSE
+           and failed(second_answer) == P.RESPONSE_AFTER_COMPLETION
+           # ...but a request that never reached the server leaves its id usable
+           and isinstance(refused_call, P.Refuse)
+           and isinstance(reuse_after_refusal, P.Forward)
            and failed(shadowed) == P.DUPLICATE_ID
            and failed(srv_collide) == P.DUPLICATE_ID,
-           f"an id may be reused only after it is retired — \"the request ID MUST NOT match "
-           f"the ID of any other request the sender has issued and not yet received a "
-           f"response for\". A map that overwrote instead would let a second request on a "
-           f"live id relabel the first: `tools/list` then `ping` on id 1 makes the tool "
-           f"advertisement correlate as a `ping` and leave unfiltered. The check runs BEFORE "
-           f"any message is produced, so an off-list call on a live id is refused as a "
-           f"duplicate rather than answered — answering it would hand the client an error "
-           f"correlated to the request that id belongs to. Retirement must still free the id, "
-           f"since the alternative fails clean cells: open={type(first_open).__name__} "
+           f"an id may not be reused while it is live — \"the request ID MUST NOT match the ID "
+           f"of any other request the sender has issued and not yet received a response for\" "
+           f"— and once it has REACHED THE SERVER it is spent for the connection. A map that "
+           f"overwrote would let a second request relabel the first; a map that freed the id "
+           f"on the answer leaves the same bypass one step later, since a second response "
+           f"correlates to whatever reused it and a server that sends one is exactly what this "
+           f"boundary does not control. The check runs BEFORE any message is produced, so an "
+           f"off-list call on a live id is refused as a duplicate rather than answered — that "
+           f"would hand the client an error correlated to the request the id belongs to. The "
+           f"one id that comes back is one nothing was forwarded for: a locally refused call "
+           f"can have no response, so keeping it spent would fail the next legitimate request "
+           f"and every MRTR retry. open={type(first_open).__name__} "
            f"collide={failed(collide)} answered={type(answered).__name__} "
-           f"reused={type(after).__name__} shadowed={failed(shadowed)} "
-           f"server={failed(srv_collide)}", failures, verbose)
+           f"reuse_after_answer={failed(after)} second_answer={failed(second_answer)} "
+           f"reuse_after_refusal={type(reuse_after_refusal).__name__} "
+           f"shadowed={failed(shadowed)} server={failed(srv_collide)}", failures, verbose)
 
     # 8) Subscriptions retire at BOTH orderly ends. An entry left resident forever would
     #    correlate a fresh response against stale state, or read a legitimate reply as
@@ -9488,17 +9512,20 @@ def _check_mcp_proxy_decisions(failures, verbose):
     closure = {"jsonrpc": "2.0", "id": 1,
                "result": {"resultType": "complete", "_meta": {P.SUB_KEY: 1}}}
     cid = P.cancelled_id(cancel)
-    retired = sub.retire("c2s", cid)
+    retired = sub.cancel("c2s", cid)
     # Through `decide`: the cancellation is forwarded AND frees the id it names.
     live = ctx()
     opened_sub = act({"jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen",
                       "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}},
                                  "notifications": {"toolsListChanged": True}}}, **live)
     forwarded_cancel = act(cancel, **live)
-    # THE OTHER END, and the one that genuinely frees the id: a graceful closure ends the
-    # request on both sides at once, so nothing can straggle in behind it and the id is
-    # reusable immediately. That is what distinguishes it from the cancellation above, where
-    # the same reuse is refused — the difference is whether a late response is still possible.
+    # THE OTHER END: the server's graceful closure. It retires the subscription the same way,
+    # and it spends the id the same way — an earlier version called this the end that "genuinely
+    # frees" the id, on the reasoning that the request was over on both sides. That is the same
+    # claim the cancellation quarantine had already had to give up, and it is no better here:
+    # the closure is a message from the server, and one message from the server is no evidence
+    # about the next (review, PR #100). What differs between the two ends is the DIAGNOSIS of a
+    # later message on that id, not whether the id comes back.
     closed = ctx()
     act({"jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen",
          "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}},
@@ -9516,15 +9543,16 @@ def _check_mcp_proxy_decisions(failures, verbose):
            and isinstance(forwarded_cancel, P.Forward)
            and live["inflight"].open_ids(P.C2S) == []
            and isinstance(shut_cleanly, P.Forward)
-           and isinstance(reused_after_closure, P.Forward),
+           and failed(reused_after_closure) == P.SPENT_ID_REUSE,
            f"a long-lived `subscriptions/listen` is not a leak — agy opens one and streams "
            f"through notifications — but it is not resident forever either. It ends on "
            f"`notifications/cancelled` naming its id, or on the server's own graceful-closure "
-           f"response, and the subscription id IS the request id, so the entry must go or the "
-           f"next `ping` on that id correlates against stale state. Only the CLOSURE frees the "
-           f"id outright: it ends the request on both sides, while a cancellation leaves a "
-           f"straggler possible and so leaves a tombstone (arm 8d). The cancellation is still "
-           f"forwarded verbatim; it is merely OBSERVED on the way through. cid={cid!r} "
+           f"response, and the subscription id IS the request id, so the live entry must go or "
+           f"the next message on that id correlates against stale state. NEITHER end returns "
+           f"the id: both are messages from the server, and the closure is no better evidence "
+           f"than the straggler was that nothing else follows. They differ only in what a "
+           f"later message on that id is CALLED (arm 8d). The cancellation is still forwarded "
+           f"verbatim; it is merely OBSERVED on the way through. cid={cid!r} "
            f"retired={retired!r} open={live['inflight'].open_ids(P.C2S)} "
            f"reuse_after_closure={type(reused_after_closure).__name__}",
            failures, verbose)

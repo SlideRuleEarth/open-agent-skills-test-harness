@@ -140,6 +140,7 @@ def probe(cli: str, *, timeout: int, verbose: bool) -> dict:
     recs = _read_log(log)
     hit = next((r for r in recs if r["event"] == "pipelining"), None)
     era = next((r for r in recs if r["event"] == "era"), None)
+    ids = request_ids(recs)
     # `connected` means AN ERA WAS OBSERVED, not "the log exists". The shim writes `start`
     # before reading a byte, so a CLI that spawns the server and dies would otherwise count as
     # connected — and then, having sent no `initialize`, be classified as modern with nothing
@@ -152,6 +153,9 @@ def probe(cli: str, *, timeout: int, verbose: bool) -> dict:
         "spawned": bool(recs),
         "pipelining": hit,
         "era": era,
+        # C3-3 rides along free: the shim already logs every inbound line, so the id sequence
+        # is a READING of this same run rather than another one. See `reuses_ids`.
+        "request_ids": ids,
         "rc": rc,
         "timed_out": timed_out,
         "elapsed_s": round(elapsed, 1),
@@ -178,6 +182,39 @@ NOT_APPLICABLE = "n/a"           # modern era OBSERVED, so there is no `initiali
 UNMEASURED = "unmeasured"        # an era was observed, but the delay window never ran
 PIPELINES = "pipelines"          # requests arrived while the response was held
 WAITS = "waits"                  # nothing arrived until the response went out
+
+
+def request_ids(recs: list[dict]) -> list:
+    """Every JSON-RPC request id the CLI sent, in order — the C3-3 reading.
+
+    §10.4 spends a request id for the connection once it has reached the server, which refuses
+    a client behaviour the spec permits: reuse after a response. That refusal needs a price,
+    and the price is "does any shipped CLI reuse ids". The shim logs each inbound line raw, so
+    this run already contains the answer and no separate probe has to be paid for.
+    """
+    out = []
+    for r in recs:
+        if r.get("event") != "rx":
+            continue
+        try:
+            msg = json.loads(r["raw"])
+        except (json.JSONDecodeError, ValueError, KeyError):
+            continue
+        if isinstance(msg, dict) and "method" in msg and "id" in msg:
+            out.append(msg["id"])
+    return out
+
+
+def reuses_ids(row: dict) -> bool | None:
+    """Did this CLI reuse a request id? `None` when too few were seen to tell.
+
+    One request answers nothing: every allocator looks unique at n=1. The question needs a
+    session with several requests, which is what the paid rows produce.
+    """
+    ids = row.get("request_ids") or []
+    if len(ids) < 2:
+        return None
+    return len(set(map(repr, ids))) != len(ids)
 
 
 def classify(row: dict) -> str:
@@ -218,28 +255,62 @@ def unmeasured(rows: list[dict]) -> list[str]:
 
 def summary(rows: list[dict]) -> list[str]:
     """The closing paragraphs. This is what a reader acts on, so it states the design as it
-    IS: §10.2 refuses a request behind an unanswered `initialize`, in either outcome."""
+    IS — §10.2 refuses a request behind an unanswered `initialize` — and it never states a
+    FLEET-WIDE conclusion that the rows do not support.
+
+    A negative claim needs every row answered. An earlier version printed "No CLI pipelined ...
+    costs the fleet nothing" whenever no row was positive, which is true of a run where every
+    single CLI failed to connect; it then contradicted itself two lines later with the list of
+    what had not been measured (review, PR #100). Absence of a positive result is not a
+    negative result, which is the same distinction `classify` draws per row, applied to the
+    fleet.
+    """
     out = []
     pipelines = [r["cli"] for r in rows if classify(r) == PIPELINES]
+    missing = unmeasured(rows)
     if pipelines:
         out.append(f"AT LEAST ONE CLI PIPELINES: {', '.join(pipelines)}. §10.2 refuses a "
                    f"request sent behind an unanswered `initialize`, so those cells FAIL "
                    f"today. The answer is the defer-and-replay action §10.2 names — hold the "
                    f"pipelined request until the negotiation completes — not reopening the "
                    f"gate: a pending negotiation cannot govern the traffic it would admit.")
+    elif missing:
+        out.append(f"No MEASURED CLI pipelined, and that is all this run says: "
+                   f"{len(missing)} of {len(rows)} did not answer the question. Whether "
+                   f"§10.2's refusal of a request behind a pending handshake costs the fleet "
+                   f"anything is UNKNOWN until they do — an unmeasured CLI is exactly where a "
+                   f"'correct by the specification, broken in practice' failure hides (§10.5).")
     else:
-        out.append("No CLI pipelined. §10.2's refusal of a request behind a pending handshake "
-                   "therefore costs the fleet nothing — which is what makes it a priced trade "
-                   "rather than a gamble, not what makes it safe. SHOULD NOT is not MUST NOT, "
-                   "and one CLI release turns this into the defer-and-replay action.")
-    missing = unmeasured(rows)
+        out.append("No CLI pipelined, across the whole fleet. §10.2's refusal of a request "
+                   "behind a pending handshake therefore costs the fleet nothing — which is "
+                   "what makes it a priced trade rather than a gamble, not what makes it safe. "
+                   "SHOULD NOT is not MUST NOT, and one CLI release turns this into the "
+                   "defer-and-replay action.")
     if missing:
         why = {r["cli"]: ("never handshook" if classify(r) == NO_ERA
                           else f"{r['era']['era']} era observed, but the window never ran")
                for r in rows if r["cli"] in missing}
         out.append("NOT MEASURED: " + ", ".join(f"{c} ({why[c]})" for c in missing)
                    + " — an unanswered question, not a negative result.")
+    out.extend(id_summary(rows))
     return out
+
+
+def id_summary(rows: list[dict]) -> list[str]:
+    """C3-3's paragraph, held to the same rule as C3-2's: no fleet claim without every row."""
+    reusing = [r["cli"] for r in rows if reuses_ids(r) is True]
+    untold = [r["cli"] for r in rows if reuses_ids(r) is None]
+    if reusing:
+        return [(f"C3-3 — REQUEST IDS ARE REUSED by: {', '.join(reusing)}. §10.4 spends an id "
+                 f"once it reaches the server, so those cells FAIL. That rule refuses a client "
+                 f"behaviour the spec permits, and this is the fleet declining to pay for it.")]
+    if untold:
+        return [(f"C3-3 — no reuse among the CLIs that sent enough requests to tell, but "
+                 f"{', '.join(untold)} sent fewer than two, so the fleet-wide answer is "
+                 f"UNKNOWN. §10.4's spent-id rule stays an unpriced strictness until it is.")]
+    return [("C3-3 — no CLI reused a request id, across the whole fleet. §10.4's spent-id rule "
+             "therefore costs nothing today, on the same terms as the era gate: measured, not "
+             "assumed, and one CLI release from needing to be re-measured.")]
 
 
 def main() -> int:
@@ -260,6 +331,8 @@ def main() -> int:
         rows.append(r)
         era = f"{r['era']['era']}/{r['era']['version']}" if r["era"] else "-"
         print(f"{cli:8} {era:22} rc={str(r['rc']):5} {r['elapsed_s']:>6}s  {verdict(r)}")
+        reuse = {True: "REUSES IDS", False: "no reuse", None: "too few to tell"}[reuses_ids(r)]
+        print(f"{'':8} ids: {r['request_ids']} — {reuse}")
 
     print()
     for paragraph in summary(rows):

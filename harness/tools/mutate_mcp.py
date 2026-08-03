@@ -1261,8 +1261,10 @@ MUTATIONS = [
     # so a straggling tool advertisement correlates as the NEW request and is forwarded
     # unfiltered — cancel `tools/list` on id 1, reuse id 1 for a `ping`, then the late result.
     ("M177-cancelled-id-quarantine-cleared-on-reuse", PROXY,
-     "        if key in self._cancelled[direction]:\n",
-     "        if False:\n",
+     ("        spent = self._spent[direction].get(key)\n"
+      "        if spent is not None:\n"),
+     ("        spent = self._spent[direction].get(key)\n"
+      "        if spent == SPENT_BY_ANSWER:\n"),
      "proxy.a_late_response_to_a_cancelled_request_is_dropped_not_fatal"),
     # The SECOND reviewed defect on the same tombstone: the id is released once a straggler has
     # been dropped, on the reasoning that the request is then over on both sides. The server is
@@ -1270,7 +1272,7 @@ MUTATIONS = [
     # next — so cancel, one straggler, reuse, second straggler, forwarded unfiltered.
     ("M178-quarantine-lifts-once-a-straggler-is-seen", PROXY,
      '            return Drop(msg, f"late response to cancelled {origin} id {req_id!r}")\n',
-     ("            inflight._cancelled[origin].discard(inflight._key(req_id))\n"
+     ("            inflight._spent[origin].pop(inflight._key(req_id), None)\n"
       '            return Drop(msg, f"late response to cancelled {origin} id {req_id!r}")\n'),
      "proxy.a_late_response_to_a_cancelled_request_is_dropped_not_fatal"),
     # The nested `requestId` goes unvalidated, so `requestId: []` reaches `dict.pop` through a
@@ -1284,9 +1286,38 @@ MUTATIONS = [
     # cancellation was sent answers an id nothing is waiting for, and the cell fails on a
     # sequence the spec describes and tells the client to ignore.
     ("M171-late-response-to-a-cancelled-request-is-fatal", PROXY,
-     "        if inflight.was_cancelled(origin, req_id):\n",
+     "        if spent == SPENT_BY_CANCEL:\n",
      "        if False:\n",
      "proxy.a_late_response_to_a_cancelled_request_is_dropped_not_fatal"),
+    # THE REVIEWED DEFECT: an id is freed once the server answers it, so the bypass the
+    # cancellation quarantine closes is reachable with no cancellation at all — `tools/list` on
+    # id 1, its filtered answer, `ping` on id 1, second `tools/list` result forwarded
+    # unfiltered. Aimed at `settle` rather than a call site: all five response paths run
+    # through it, and mutating one would leave the other four to disagree.
+    ("M181-an-answered-id-is-freed-not-spent", PROXY,
+     ("        method = self._drop(direction, req_id)\n"
+      "        if method is not None:\n"
+      "            self._spent[direction][self._key(req_id)] = SPENT_BY_ANSWER\n"),
+     "        method = self._drop(direction, req_id)\n",
+     "proxy.a_live_request_id_is_never_silently_reused"),
+    # The same rule applied where it does NOT belong, which is the over-strict direction §10.5
+    # warns about: a locally refused call burns its id even though nothing was forwarded and
+    # nothing can ever answer it. The client's next request on that id — and every MRTR retry —
+    # is then refused for a reason it cannot act on.
+    ("M182-a-refused-call-spends-an-id-nothing-was-sent-on", PROXY,
+     "        return self._drop(direction, req_id)\n",
+     ("        method = self._drop(direction, req_id)\n"
+      "        self._spent[direction][self._key(req_id)] = SPENT_BY_ANSWER\n"
+      "        return method\n"),
+     "proxy.a_live_request_id_is_never_silently_reused"),
+    # A second response to an already-answered request is silently DROPPED, by widening the
+    # documented-race branch to cover every spent id. The race is documented for cancellation
+    # and nothing else, so this discards a server protocol violation without a word — the
+    # degradation §10.5 forbids, wearing the clothes of a sanctioned drop.
+    ("M183-a-second-response-is-dropped-like-a-cancellation-race", PROXY,
+     "        if spent == SPENT_BY_CANCEL:\n",
+     "        if spent is not None:\n",
+     "proxy.a_live_request_id_is_never_silently_reused"),
     # Numeric ids keyed by Python's type name again, so a request on `1` answered on `1.0`
     # reads as uncorrelated — and both can be live at once.
     ("M172-numeric-ids-keyed-by-python-type", PROXY,

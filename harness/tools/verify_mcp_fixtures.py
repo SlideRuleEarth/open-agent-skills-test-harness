@@ -840,16 +840,49 @@ check("a fully answered fleet is not reported as unmeasured",
 # version said pending traffic "is supported ... keep it", which was the rejected design.
 _clean = " ".join(PIPE.summary([_modern, _waits]))
 _dirty = " ".join(PIPE.summary([_pipes, _waits]))
+_partial = " ".join(PIPE.summary([_dead, _gap, _waits]))
+_nothing = " ".join(PIPE.summary([_dead, _gap]))
 check("the clean outcome prices the REFUSAL rather than blessing pending traffic",
       "refus" in _clean and "allow" not in _clean and "supported" not in _clean, _clean)
 check("the pipelining outcome says those cells fail, and names defer-and-replay",
       "refus" in _dirty and "FAIL" in _dirty and "defer" in _dirty, _dirty)
 check("the unmeasured line distinguishes the two reasons",
-      "never handshook" in " ".join(PIPE.summary([_dead, _gap]))
-      and "window never ran" in " ".join(PIPE.summary([_dead, _gap])),
-      PIPE.summary([_dead, _gap]))
+      "never handshook" in _nothing and "window never ran" in _nothing, _nothing)
 check("...and says nothing at all when there is nothing missing",
-      len(PIPE.summary([_modern, _waits])) == 1, PIPE.summary([_modern, _waits]))
+      "NOT MEASURED" not in _clean, _clean)
+# A NEGATIVE CONCLUSION NEEDS EVERY ROW. "No CLI pipelined ... costs the fleet nothing" was
+# printed whenever no row was positive — true of a run where every CLI failed to connect, and
+# contradicted two lines later by the list of what was not measured (review, PR #100).
+check("an incomplete run does NOT print the fleet-wide negative",
+      "costs the fleet nothing" not in _partial and "No CLI pipelined" not in _partial,
+      _partial)
+check("...it says only what it measured, and calls the fleet cost unknown",
+      "No MEASURED CLI pipelined" in _partial and "UNKNOWN" in _partial, _partial)
+check("a run where NOTHING answered claims nothing either",
+      "costs the fleet nothing" not in _nothing and "2 of 2" in _nothing, _nothing)
+check("only a complete run earns the fleet-wide claim",
+      "across the whole fleet" in _clean and "costs the fleet nothing" in _clean, _clean)
+# C3-3 rides on the same run and is held to the same rule: §10.4 spends a request id once it
+# reaches the server, refusing a reuse the spec permits, and that needs a price.
+check("one request cannot answer whether a CLI reuses ids",
+      PIPE.reuses_ids({"request_ids": [0]}) is None
+      and PIPE.reuses_ids({"request_ids": []}) is None)
+check("a repeated id is reuse; a monotonic run is not",
+      PIPE.reuses_ids({"request_ids": [0, 1, 1]}) is True
+      and PIPE.reuses_ids({"request_ids": [0, 1, 2]}) is False)
+check("`1` and `\"1\"` are different ids, as JSON-RPC says",
+      PIPE.reuses_ids({"request_ids": [1, "1"]}) is False)
+check("ids come from REQUESTS only — a response echoes the id it answers",
+      PIPE.request_ids([{"event": "rx", "raw": '{"id":1,"method":"ping"}'},
+                        {"event": "rx", "raw": '{"id":1,"result":{}}'},
+                        {"event": "rx", "raw": 'not json'},
+                        {"event": "era", "era": "legacy"}]) == [1])
+check("an incomplete C3-3 does not claim the fleet either",
+      "UNKNOWN" in " ".join(PIPE.id_summary([{"cli": "a", "request_ids": [0, 1]},
+                                             {"cli": "b", "request_ids": [0]}])))
+check("...and a complete one does",
+      "across the whole fleet" in " ".join(PIPE.id_summary([{"cli": "a",
+                                                             "request_ids": [0, 1]}])))
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")

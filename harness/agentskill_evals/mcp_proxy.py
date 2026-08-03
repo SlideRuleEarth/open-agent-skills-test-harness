@@ -121,6 +121,8 @@ BATCH = "batch"                                  # a JSON-RPC array; illegal on 
 UNCORRELATED = "uncorrelated"                    # response to an id never requested this way
 DUPLICATE_ID = "duplicate_request_id"            # a second live request on an id still open
 CANCELLED_ID_REUSE = "cancelled_id_reuse"        # a cancelled id reopened; it stays spent
+SPENT_ID_REUSE = "spent_id_reuse"                # an ANSWERED id reopened; it stays spent too
+RESPONSE_AFTER_COMPLETION = "response_after_completion"  # a second answer to one request
 AMBIGUOUS_CANCELLATION = "ambiguous_cancellation"  # one id, two eras, two live requests
 UNIMPLEMENTED_VERSION = "unimplemented_version"  # well-formed, modern, unread revision
 MISSING_META = "missing_meta"                    # modern request without a required key
@@ -132,6 +134,12 @@ BAD_INPUT_REQUESTS = "bad_input_requests"        # InputRequiredResult not shape
 BAD_TOOLS_RESULT = "bad_tools_result"            # tools/list result not shaped as expected
 BAD_SUBSCRIPTION_CLOSURE = "bad_subscription_closure"
 SECOND_INITIALIZE = "second_initialize"          # lifecycle violation, not renegotiation
+
+# Why a request id is spent. Both spend it permanently; they differ in what a LATER response
+# on that id means — a documented race after a cancellation, a protocol violation after an
+# answer (§10.4).
+SPENT_BY_CANCEL = "cancelled"
+SPENT_BY_ANSWER = "answered"
 
 
 @dataclass(frozen=True)
@@ -565,8 +573,10 @@ class InFlight:
 
     def __init__(self) -> None:
         self._by_direction: dict[str, dict[Any, tuple[str, str | None]]] = {C2S: {}, S2C: {}}
-        # Ids retired by a CANCELLATION rather than by an answer. See `cancel`.
-        self._cancelled: dict[str, set] = {C2S: set(), S2C: set()}
+        # SPENT IDS, and why each was spent. An id that reached the server is spent for the
+        # rest of the connection; the reason is kept because the two spellings get different
+        # verdicts on a later response — see `settle`, `cancel` and `spent_reason`.
+        self._spent: dict[str, dict[Any, str]] = {C2S: {}, S2C: {}}
 
     def _key(self, req_id: Any) -> Any:
         # STRINGS AND NUMBERS ARE DIFFERENT DOMAINS; WITHIN NUMBERS THE VALUE IS THE ID.
@@ -603,29 +613,38 @@ class InFlight:
             return Anomaly(DUPLICATE_ID,
                            f"{direction} id {req_id!r} is already open as "
                            f"{live[key][0]!r}; an id may not be reused before it is answered")
-        if key in self._cancelled[direction]:
-            # A CANCELLED id is SPENT FOR THE CONNECTION, and this is a filtering boundary
-            # rather than bookkeeping. Reopening it would make a late response to the cancelled
-            # request indistinguishable from a reply to this one — so `tools/list` cancelled on
-            # id 1, then `ping` on id 1, then the server's straggling tool advertisement, and
-            # the advertisement correlates as a `ping` and is forwarded UNFILTERED. An earlier
-            # version cleared the tombstone here and called the ambiguity inherent; it is
-            # inherent, which is why the id may not be reused rather than why the bypass is
-            # acceptable (review, PR #100).
+        spent = self._spent[direction].get(key)
+        if spent is not None:
+            # AN ID THAT REACHED THE SERVER IS SPENT FOR THE CONNECTION, however it ended. This
+            # is a filtering boundary rather than bookkeeping: reopening it makes a second
+            # response on that id indistinguishable from a reply to whatever reopened it — so
+            # `tools/list` on id 1, its filtered answer, `ping` on id 1, then a second
+            # `tools/list` result, which correlates as the `ping` and is forwarded UNFILTERED.
             #
-            # A LATER VERSION LIFTED IT AFTER ONE LATE RESPONSE, on the reasoning that the
-            # request was then over on both sides. It is not: the proxy's boundary is against a
-            # server the scenario author does not control (§10.1), and no observed response
-            # proves another cannot arrive. A second straggler is nonconforming, but so was the
-            # first, and only the second one lands on a reopened id — `tools/list` cancelled,
-            # one straggler dropped, `ping` on the same id, second straggler forwarded
-            # unfiltered. So nothing lifts it (review, PR #100).
+            # THE RULE GREW TWICE, both times because the reasoning was applied too narrowly.
+            # First it covered only cancellation, and cleared even that on reuse. Then it held
+            # for cancellation but lifted once a straggler had been seen. Both were answered
+            # with: no observed response proves another cannot follow, because the server is
+            # the side of this boundary the scenario author does not control (§10.1). That
+            # argument never mentioned cancellation — it is about servers — so it applies just
+            # as much to an ordinary answer and to a graceful closure, and leaving those free
+            # left the same bypass reachable without a cancellation at all (review, PR #100).
             #
-            # The cost is one id per genuinely cancelled request, which is nothing against the
-            # monotonic counters every measured CLI uses (C3-2, §9).
-            return Anomaly(CANCELLED_ID_REUSE,
-                           f"{direction} id {req_id!r} was cancelled and is spent for this "
-                           f"connection: a late response to that request could not be told "
+            # WHAT IS NOT SPENT is an id whose request never reached the server: an off-list
+            # `tools/call` is refused here, so nothing can ever answer it. See `release`.
+            #
+            # THE COST IS REAL AND NOT YET MEASURED, which the era gate's own history says to
+            # state plainly rather than assume. Reuse after a response is LEGAL — the rule is
+            # only that an id may not match one "the sender has issued and not yet received a
+            # response for" — so this refuses conforming client behaviour, and §10.5 warns that
+            # failing a clean cell is a failure just as much as forwarding a definition. Probe
+            # C3-3 (§9) is written and unrun: every SDK id allocator in reach is a monotonic
+            # counter, which is a belief about the fleet, not a measurement of it. What makes
+            # the risk bounded is that a client which does reuse ids fails LOUDLY here, with
+            # this kind named, on the first run against a real CLI — not silently.
+            return Anomaly(CANCELLED_ID_REUSE if spent == SPENT_BY_CANCEL else SPENT_ID_REUSE,
+                           f"{direction} id {req_id!r} was {spent} and is spent for this "
+                           f"connection: a later response to that request could not be told "
                            f"apart from a reply to this one, and one of them is filtered")
         live[key] = (method, version)
         return None
@@ -644,44 +663,63 @@ class InFlight:
         entry = self._by_direction[direction].get(self._key(req_id))
         return entry[1] if entry else None
 
-    def retire(self, direction: str, req_id: Any) -> str | None:
-        """Drop an entry and return the method it held.
-
-        Retirement makes the id REUSABLE, which is not a nicety: the subscription id IS the
-        JSON-RPC request id, and a client that cancels a subscription on id 1 may legitimately
-        use id 1 for the next `ping`. An entry left resident forever would then correlate a
-        fresh response against stale state — or, worse, make the proxy treat a legitimate
-        response as unrequested and fail a clean cell.
-        """
+    def _drop(self, direction: str, req_id: Any) -> str | None:
+        """Remove the live entry and return the method it held. Says nothing about the id."""
         entry = self._by_direction[direction].pop(self._key(req_id), None)
         return entry[0] if entry else None
 
+    def release(self, direction: str, req_id: Any) -> str | None:
+        """Close an id whose request NEVER REACHED THE SERVER, leaving it reusable.
+
+        The only such case is a locally refused request — an off-list `tools/call`, answered by
+        the proxy itself. Nothing was forwarded, so nothing can ever come back on that id and
+        there is no second response to be confused by; the ambiguity `settle` exists to prevent
+        cannot arise.
+
+        Releasing here is not merely safe but required. Every MRTR retry of a refused call
+        would otherwise burn an id, and a client that numbers monotonically is fine while one
+        that reuses would find its next request refused for a reason it could not act on.
+        """
+        return self._drop(direction, req_id)
+
+    def settle(self, direction: str, req_id: Any) -> str | None:
+        """Close an id the SERVER ANSWERED, spending it for the connection.
+
+        Every response the proxy forwards or filters ends here, and so does a subscription's
+        graceful closure. The id does not come back, for the reason spelled out in `record`:
+        one response is no evidence that a second will not follow, and the second would
+        correlate to whatever reused the id.
+        """
+        method = self._drop(direction, req_id)
+        if method is not None:
+            self._spent[direction][self._key(req_id)] = SPENT_BY_ANSWER
+        return method
+
     def cancel(self, direction: str, req_id: Any) -> str | None:
-        """Retire an id BECAUSE IT WAS CANCELLED, and remember that. Returns its method.
+        """Close an id BECAUSE IT WAS CANCELLED, and remember which. Returns its method.
 
-        The memory is not bookkeeping — it is what keeps a documented race from failing a
-        clean cell. "Due to network latency, cancellation notifications may arrive after
-        request processing has completed, and potentially after a response has already been
-        sent", and the client "SHOULD ignore any response to the cancelled request that
-        arrives afterward". Without a record of the cancellation that late response is a reply
-        to an id nothing is waiting for — which is exactly the `UNCORRELATED` anomaly, and a
-        failed cell for a sequence the spec calls normal (review, PR #100).
+        The reason is kept because it changes the verdict on a later response. A response after
+        a cancellation is a race the spec DOCUMENTS — "cancellation notifications may arrive
+        after request processing has completed, and potentially after a response has already
+        been sent", with the client told to "ignore any response to the cancelled request that
+        arrives afterward" — so it is dropped rather than treated as a fault. A second response
+        after an ordinary answer has no such licence and is a server-side protocol violation.
+        Same tombstone, different diagnosis, which is what §10.4's taxonomy is for.
 
-        THE RECORD IS PERMANENT for the connection: it is both what makes the late response a
-        drop instead of an anomaly, and what keeps the id from being reopened underneath one.
-        Only an id that was actually live is remembered, which bounds it to one entry per
-        request genuinely cancelled. A cancellation naming an id nobody issued is ignored, per
-        "invalid cancellation notifications SHOULD be ignored: unknown request IDs".
+        Only an id that was actually live is remembered, so a cancellation naming an id nobody
+        issued is ignored, per "invalid cancellation notifications SHOULD be ignored: unknown
+        request IDs".
         """
         key = self._key(req_id)
         if key not in self._by_direction[direction]:
             return None
-        method = self.retire(direction, req_id)
-        self._cancelled[direction].add(key)
+        method = self._drop(direction, req_id)
+        self._spent[direction][key] = SPENT_BY_CANCEL
         return method
 
-    def was_cancelled(self, direction: str, req_id: Any) -> bool:
-        return self._key(req_id) in self._cancelled[direction]
+    def spent_reason(self, direction: str, req_id: Any) -> str | None:
+        """Why this id is spent, or `None` if it was never issued in this direction."""
+        return self._spent[direction].get(self._key(req_id))
 
     def open_ids(self, direction: str) -> list:
         return [key[1] for key in self._by_direction[direction]]
@@ -1073,10 +1111,13 @@ def _decide_client_request(msg: dict, allowed: frozenset[str], state: ProtocolSt
     if isinstance(opened, Anomaly):
         return Fail(opened)
     if name is not None and name not in allowed:
-        # Not forwarded, so nothing will come back to correlate: release the id the check
-        # above claimed. Every MRTR retry lands here too — the allowlist keys on `params.name`
-        # per request rather than on position in the stream, and a retry carries a new id.
-        inflight.retire(C2S, msg["id"])
+        # NOT FORWARDED, so nothing can ever come back on this id: it is released rather than
+        # spent, the one exception to the rule in `record`. The ambiguity that spends an id
+        # needs a second response to exist, and here there is no first one — the proxy answered
+        # this itself. Keeping it would fail the client's next request on that id for a reason
+        # it could not act on. (The allowlist keys on `params.name` per request rather than on
+        # position in the stream, so every MRTR retry lands here too and is judged afresh.)
+        inflight.release(C2S, msg["id"])
         return Refuse(refusal_for(msg["id"], name, server), name)
     return Forward(msg)
 
@@ -1122,7 +1163,8 @@ def _decide_response(msg: dict, shape: str, direction: str, allowed: frozenset[s
     req_id = msg["id"]
     method = inflight.method_for(origin, req_id)
     if method is None:
-        if inflight.was_cancelled(origin, req_id):
+        spent = inflight.spent_reason(origin, req_id)
+        if spent == SPENT_BY_CANCEL:
             # The documented race, not a fault: "cancellation notifications may arrive after
             # request processing has completed, and potentially after a response has already
             # been sent", and the client "SHOULD ignore any response to the cancelled request
@@ -1135,6 +1177,17 @@ def _decide_response(msg: dict, shape: str, direction: str, allowed: frozenset[s
             # an id released on the first would let the second correlate to whatever reopened
             # it (review, PR #100). So every response on a cancelled id drops, forever.
             return Drop(msg, f"late response to cancelled {origin} id {req_id!r}")
+        if spent == SPENT_BY_ANSWER:
+            # A SECOND response to a request that was already answered. Nothing licenses this:
+            # the cancellation race is documented and so is dropped, but "the server sent two
+            # replies to one request" is a protocol violation with no sanctioned reading, and a
+            # proxy that quietly discarded it would be deciding on its own that the extra
+            # message did not matter. Since the id is spent, it correlates to nothing and
+            # cannot be filtered — which is the whole reason it is spent (§10.4, §10.5).
+            return Fail(Anomaly(RESPONSE_AFTER_COMPLETION,
+                                f"a second response arrived on {origin} id {req_id!r}, which "
+                                f"was already answered; one request has one response, and this "
+                                f"one correlates to nothing that could be filtered"))
         return Fail(Anomaly(UNCORRELATED,
                             f"response to {origin} id {req_id!r}, which was never requested "
                             f"in that direction"))
@@ -1146,7 +1199,7 @@ def _decide_response(msg: dict, shape: str, direction: str, allowed: frozenset[s
             # the lifecycle's own worked example is a server rejecting a proposed version and
             # naming what it supports. Clearing it lets the client try again with one of them.
             state.abandon_initialize()
-        inflight.retire(origin, req_id)
+        inflight.settle(origin, req_id)
         return Forward(msg)
 
     # A response carries no version of its own, so the one that governs it is the one that
@@ -1171,7 +1224,7 @@ def _decide_response(msg: dict, shape: str, direction: str, allowed: frozenset[s
                                 f"response on subscription id {req_id!r} is not the "
                                 f"conforming closure (resultType `complete` and a matching "
                                 f"{SUB_KEY})"))
-        inflight.retire(origin, req_id)
+        inflight.settle(origin, req_id)
         return Forward(msg)
 
     if method == "initialize":
@@ -1181,7 +1234,7 @@ def _decide_response(msg: dict, shape: str, direction: str, allowed: frozenset[s
         committed = state.commit_initialize(negotiated)
         if isinstance(committed, Anomaly):
             return Fail(committed)
-        inflight.retire(origin, req_id)
+        inflight.settle(origin, req_id)
         return Forward(msg)
 
     if method == "tools/list":
@@ -1193,8 +1246,8 @@ def _decide_response(msg: dict, shape: str, direction: str, allowed: frozenset[s
         kept, removed = filter_tools_result(result, allowed)
         out = dict(msg)
         out["result"] = kept
-        inflight.retire(origin, req_id)
+        inflight.settle(origin, req_id)
         return Filtered(out, tuple(removed))
 
-    inflight.retire(origin, req_id)
+    inflight.settle(origin, req_id)
     return Forward(msg)

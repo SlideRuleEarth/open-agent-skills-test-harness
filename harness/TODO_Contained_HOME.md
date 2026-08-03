@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 509 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 harness/tools/mutate_mcp.py                           # 178/178 production + 2/2 instrument
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2 probe; 192 checks
+python3 harness/tools/mutate_mcp.py                           # 181/181 production + 2/2 instrument
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 202 checks
 git diff --check
 ```
 
@@ -390,6 +390,31 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   pipelined request's response can arrive before the `initialize` response and be read under
   no version at all. When an argument for safety rests on one message preceding another,
   write down what happens in the other order; on a duplex stream both orders happen.
+- **A correct principle stated at too narrow a WIDTH is still a hole, and it will be found one
+  route at a time.** The spent-request-id rule took four rounds: cancelled ids remembered but
+  cleared on reuse; then held, but lifted once a straggler was seen; then held permanently —
+  for cancellation only. Each fix was right about the case in front of it. The tell was there
+  the whole time: the argument that justified the third version ("no observed response proves
+  another cannot follow, because the server is the side we do not control") **never mentioned
+  cancellation**, so it had always applied to ordinary answers and graceful closures too, and
+  those stayed open. **When an argument lands, re-read what it actually quantifies over and go
+  fix every case it covers** — not the one that prompted it. A reviewer should not have to
+  walk you along a rule's own scope.
+- **Refusing something legal is a cost, and it needs a price or a flag.** The same rule refuses
+  a client behaviour the spec permits — id reuse after a response. §4 already knew over-strict
+  is not the safe direction, and §10.5 says failing a clean cell is as much a failure as
+  forwarding a definition. The honest handling is what C3-2 did for the era gate: measure the
+  fleet, and if you cannot yet, say in the design that it is an unpriced strictness rather
+  than writing a comment that cites a measurement which does not exist. I had one of those —
+  "the monotonic counters every measured CLI uses (C3-2, §9)" — where C3-2 measured
+  *pipelining* and had never looked at ids. **A citation to the right document is not a
+  citation to the right measurement.**
+- **Absence of a positive result is not a negative result.** The C3-2 probe printed "No CLI
+  pipelined ... costs the fleet nothing" whenever no row was positive — including a run where
+  every CLI failed to connect — and then contradicted itself two lines later with the list of
+  what had not been measured. Same distinction the per-row classifier already drew, dropped at
+  the point where the rows became a conclusion. **Any fleet-wide claim needs every row
+  answered; check that the summary cannot be produced by an empty measurement.**
 - **One observed message is no evidence about the next one.** The same round, twice, in
   different disguises. A cancelled id's quarantine was released once a late response had been
   *seen*, reasoning that "the request is over on both sides" — over on the client's side; the
