@@ -562,6 +562,26 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   Those need the absence rule (a start with no well-formed terminator is an anomaly) and their
   own cases, half of them driven against the *reader* with synthetic logs rather than against
   the program. A closed enumeration is evidence about the endings that can speak.
+- **A LIST OF EXCEPTIONS IS NOT EVIDENCE THAT ANYTHING RAN.** The two-axis fix defined an empty
+  cleanup-outcome list as "every step did what it promised" — but every outcome in it records
+  something going *wrong*, so a teardown that skipped its process-group kill outright raises
+  nothing, records nothing, and satisfies a verdict computed from the reasons alone. The thing
+  being certified clean is a surviving credential-bearing grandchild: the exact failure the
+  step exists to prevent, passed by the record that was supposed to prove it did not happen.
+  The fix is **positive completion facts** — each step records `done` or `not_applicable` with
+  its justification, and *missing* is an anomaly, because a step that reported nothing cannot
+  be told apart from a step that never ran. **Whenever absence is given a meaning, check
+  whether two different situations produce it**; here a blank meant both "did not apply" and
+  "did not happen". And since a completion fact is the implementation's own claim about itself,
+  one case has to verify it from outside the process — the group really gone, checked by the
+  driver, not asserted by the proxy.
+- **A test-only hook is a verdict input, or it is a way to pass without being tested.** The
+  fault-injection point that lets the driver reach the endings with no reason was specified as
+  "recorded in the start record", which sounds like it closes the hole and does not: if the
+  fault is armed and never fires, the trigger is clean, the outcomes are clean, and the stated
+  verdict formula passes a run whose whole purpose was to fail. The **configuration** is the
+  anomalous fact, not the firing — and there is a case for the no-op injection specifically,
+  because the failure mode is a hook that quietly does nothing.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s
@@ -659,8 +679,10 @@ ABA fix and its route to `parallel_safe_config = True`.
   Everything before the last slice cannot affect any run, which is the point: this is harness
   code in the request path of every gated cell.
   **The I/O half starts from §10.5.1, written before its code**: every way an instance can end,
-  on two axes — one latched trigger, plus the cleanup outcomes accumulated after it — with the
-  verdict a monotonic conjunction over both rather than a lookup on whatever happened last.
+  on two axes — the triggers, latched in order, plus the cleanup outcomes accumulated after
+  them — together with a positive completion fact per teardown step, since a list of things
+  that went wrong is silent about a step that never ran at all. The verdict is a monotonic
+  conjunction over all of it rather than a lookup on whatever happened last.
   One total `is_clean` that every consumer reads (terminator record, per-instance verdict,
   `verify_post_run`), no default-clean branch, and phase carried in the reason rather than in a
   flag each caller applies, which dissolves the "`EPIPE` is clean in exactly one place"

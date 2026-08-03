@@ -36,11 +36,15 @@ and the axes are usually asymmetric in a way that names the case you forgot.
 
 **Every assertion must be able to fail, and you must be able to say how.** Before adding a
 check, write down what a broken implementation produces and confirm your assertion rejects it.
-Three specific traps, all of which have shipped here: a mixed `and`/`or` that is true by
+Four specific traps, all of which have shipped here: a mixed `and`/`or` that is true by
 precedence regardless of the interesting term — parenthesize, or split into several checks; a
 placeholder expression standing in for something not easily reachable — extract the predicate
-into a function instead; and a check that only exercises the code path where the bug cannot
-appear. If a fix depends on a path being taken, test the path where it is not taken.
+into a function instead; a check that only exercises the code path where the bug cannot
+appear — if a fix depends on a path being taken, test the path where it is not taken; and an
+assertion that passes because nothing was recorded, when *not running the code at all* also
+records nothing. That last one needs a positive fact to check — a step that says it ran, a
+hook that reports it fired — and often a witness from outside the process under test, since
+a claim and the thing it claims about must not have the same author.
 
 **A duplicated rule must be pinned to its original.** Some files cannot import the code they
 must agree with — `harness/fixtures/` runs as a subprocess of an agent CLI with only the
