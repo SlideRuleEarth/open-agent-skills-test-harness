@@ -967,13 +967,13 @@ MUTATIONS = [
     ("M140-retired-subscription-id-stays-resident", PROXY,
      "        entry = self._by_direction[direction].pop(self._key(req_id), None)",
      "        entry = self._by_direction[direction].get(self._key(req_id))",
-     "proxy.subscriptions_retire_and_their_ids_become_reusable"),
+     "proxy.subscriptions_retire_at_both_orderly_ends"),
     # Graceful closure stops checking WHICH request it closes, so any empty result retires a
     # subscription that is still open.
     ("M141-graceful-closure-ignores-the-method", PROXY,
      '    if method != "subscriptions/listen":\n        return False\n',
      "",
-     "proxy.subscriptions_retire_and_their_ids_become_reusable"),
+     "proxy.subscriptions_retire_at_both_orderly_ends"),
     # A second `initialize` is accepted as a renegotiation, retroactively moving every
     # message already exchanged to a revision it was not read under.
     ("M142-second-initialize-accepted-as-renegotiation", PROXY,
@@ -1223,28 +1223,39 @@ MUTATIONS = [
     # case that separates them — a server tearing down a subscription cancels the CLIENT's
     # `subscriptions/listen` — so the subscription stays resident and its id later collides.
     ("M169-cancellation-retires-the-senders-own-map", PROXY,
-     ("    if direction == C2S:\n"
-      "        inflight.cancel(C2S, req_id)\n"
-      "    elif state.legacy_version is not None:\n"
+     ("    if legacy:\n"
       "        inflight.cancel(S2C, req_id)\n"
-      '    elif inflight.method_for(C2S, req_id) == "subscriptions/listen":\n'
+      "    elif modern:\n"
       "        inflight.cancel(C2S, req_id)\n"),
      "    inflight.cancel(direction, req_id)\n",
      "proxy.cancellation_retires_the_request_it_actually_names"),
-    # Routing by SEARCH rather than by protocol: try the sender's map, then the peer's. It
-    # gets the collision wrong in both directions — an unknown client cancellation reaches
-    # into the server's map, and a modern server cancellation takes its own request instead
-    # of the subscription it named.
+    # Routing by SEARCH rather than by protocol: try the sender's map, then the peer's. A
+    # server can then retire the CLIENT's outstanding `tools/list` by naming its id — a
+    # cancellation it is not permitted to send, and the reply that follows has lost the
+    # correlation that would have filtered it.
     ("M176-cancellation-routed-by-searching-both-maps", PROXY,
-     ("    if direction == C2S:\n"
-      "        inflight.cancel(C2S, req_id)\n"
-      "    elif state.legacy_version is not None:\n"
+     ("    if legacy:\n"
       "        inflight.cancel(S2C, req_id)\n"
-      '    elif inflight.method_for(C2S, req_id) == "subscriptions/listen":\n'
+      "    elif modern:\n"
       "        inflight.cancel(C2S, req_id)\n"),
      ("    for where in (direction, _ORIGIN_OF[direction]):\n"
       "        if inflight.cancel(where, req_id) is not None:\n"
-      "            return\n"),
+      "            break\n"),
+     "proxy.cancellation_retires_the_request_it_actually_names"),
+    # A negotiated legacy version is taken to settle the era for the whole connection, so every
+    # server cancellation reads as legacy. Modern semantics are per REQUEST: an initialized
+    # client may still open a modern subscription, and its teardown then finds nothing in the
+    # server's map and leaves the stream open (reviewed defect, restored).
+    ("M179-a-legacy-session-makes-every-server-cancellation-legacy", PROXY,
+     ("    legacy = (state.legacy_version is not None\n"
+      "              and inflight.method_for(S2C, req_id) is not None)\n"),
+     "    legacy = state.legacy_version is not None\n",
+     "proxy.cancellation_retires_the_request_it_actually_names"),
+    # The genuine collision is resolved by guessing instead of failing: id live under both
+    # eras, and the legacy branch wins because it is written first.
+    ("M180-ambiguous-cancellation-guesses-instead-of-failing", PROXY,
+     "    if legacy and modern:\n",
+     "    if False:\n",
      "proxy.cancellation_retires_the_request_it_actually_names"),
     # THE REVIEWED DEFECT, restored exactly: reopening a cancelled id clears its quarantine,
     # so a straggling tool advertisement correlates as the NEW request and is forwarded
@@ -1252,6 +1263,15 @@ MUTATIONS = [
     ("M177-cancelled-id-quarantine-cleared-on-reuse", PROXY,
      "        if key in self._cancelled[direction]:\n",
      "        if False:\n",
+     "proxy.a_late_response_to_a_cancelled_request_is_dropped_not_fatal"),
+    # The SECOND reviewed defect on the same tombstone: the id is released once a straggler has
+    # been dropped, on the reasoning that the request is then over on both sides. The server is
+    # the side this boundary does not trust, and one observed response says nothing about the
+    # next — so cancel, one straggler, reuse, second straggler, forwarded unfiltered.
+    ("M178-quarantine-lifts-once-a-straggler-is-seen", PROXY,
+     '            return Drop(msg, f"late response to cancelled {origin} id {req_id!r}")\n',
+     ("            inflight._cancelled[origin].discard(inflight._key(req_id))\n"
+      '            return Drop(msg, f"late response to cancelled {origin} id {req_id!r}")\n'),
      "proxy.a_late_response_to_a_cancelled_request_is_dropped_not_fatal"),
     # The nested `requestId` goes unvalidated, so `requestId: []` reaches `dict.pop` through a
     # tuple and raises `TypeError: unhashable` inside a pump — the crash `valid_request_id`

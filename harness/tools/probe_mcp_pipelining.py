@@ -3,13 +3,14 @@
 
     python3 harness/tools/probe_mcp_pipelining.py [claude|codex|copilot|agy] ...
 
-THE QUESTION, and why it is worth a live run. `DESIGN_MCP_Support.md` §10.2 gates a bare
-request on an era actually being established. A proxy is structurally more exposed to
-pipelining than the server it fronts: the server ANSWERS `initialize` before reading the
-next line, so by then its state is settled, while a proxy only forwards and therefore meets
-a pipelined request with the negotiation still in flight. If a CLI pipelines and the proxy
-refuses, that cell fails and nothing else in the fleet objects — the worst failure shape
-§10.5 names, correct by the specification and broken in practice.
+THE QUESTION, and why it is worth a live run. `DESIGN_MCP_Support.md` §10.2 REFUSES a bare
+request until an era is actually established, and a pending `initialize` does not establish
+one. A proxy is structurally more exposed to pipelining than the server it fronts: the server
+ANSWERS `initialize` before reading the next line, so by then its state is settled, while a
+proxy only forwards and therefore meets a pipelined request with the negotiation still in
+flight. If a CLI pipelines, that cell fails and nothing else in the fleet objects — the worst
+failure shape §10.5 names, correct by the specification and broken in practice. This probe is
+what prices that refusal: it is the measurement, not the argument.
 
 WHY NO EARLIER LOG COULD ANSWER IT. Every C3-0/C3-1 run used the same shim, and the shim
 answers `initialize` immediately, so a pipelined request is read after the era exists and
@@ -166,6 +167,81 @@ def probe(cli: str, *, timeout: int, verbose: bool) -> dict:
     return result
 
 
+# The five outcomes one CLI can have. They are NAMED and derived by a function rather than
+# decided inline while printing, because the classification is the probe's actual result — the
+# reading a design decision gets justified by — and an inline `elif` chain in `main()` cannot be
+# checked by anything. `verify_mcp_fixtures.py` E14 drives these on synthetic rows; E13 checks
+# the shim's timing path, which is a different instrument and was the only one covered (review,
+# PR #100).
+NO_ERA = "no_era"                # never handshook: the question was not put
+NOT_APPLICABLE = "n/a"           # modern era OBSERVED, so there is no `initialize` to hide behind
+UNMEASURED = "unmeasured"        # an era was observed, but the delay window never ran
+PIPELINES = "pipelines"          # requests arrived while the response was held
+WAITS = "waits"                  # nothing arrived until the response went out
+
+
+def classify(row: dict) -> str:
+    if not row["connected"]:
+        return NO_ERA
+    if row["pipelining"] is None:
+        # "No pipelining record" alone would say the same thing about a CLI that died before
+        # handshaking, so `n/a` is claimed only for an era actually observed as MODERN — a
+        # modern client sends no `initialize`, so the window cannot open and that is an ANSWER.
+        return NOT_APPLICABLE if row["era"]["era"] == "modern" else UNMEASURED
+    return PIPELINES if row["pipelining"]["pipelined"] else WAITS
+
+
+def verdict(row: dict) -> str:
+    kind = classify(row)
+    if kind == NO_ERA:
+        return ("NO ERA OBSERVED — the CLI never handshook"
+                + (" (server was spawned)" if row["spawned"] else " (server never ran)"))
+    if kind == NOT_APPLICABLE:
+        return "n/a — no `initialize` (modern era, per-request metadata)"
+    if kind == UNMEASURED:
+        return (f"NOT MEASURED — era {row['era']['era']} was observed but the "
+                f"`initialize` window never ran")
+    if kind == PIPELINES:
+        return (f"PIPELINES — {row['pipelining']['count']} request(s) arrived while the "
+                f"response was held: {row['pipelining']['methods']}")
+    return "waits for the response before sending anything else"
+
+
+def unmeasured(rows: list[dict]) -> list[str]:
+    """The CLIs whose answer is missing — BOTH ways of missing it.
+
+    A CLI that never handshook, and one that handshook in a legacy era where the window never
+    ran, are equally unanswered. Only an observed modern era licenses `n/a`.
+    """
+    return [r["cli"] for r in rows if classify(r) in (NO_ERA, UNMEASURED)]
+
+
+def summary(rows: list[dict]) -> list[str]:
+    """The closing paragraphs. This is what a reader acts on, so it states the design as it
+    IS: §10.2 refuses a request behind an unanswered `initialize`, in either outcome."""
+    out = []
+    pipelines = [r["cli"] for r in rows if classify(r) == PIPELINES]
+    if pipelines:
+        out.append(f"AT LEAST ONE CLI PIPELINES: {', '.join(pipelines)}. §10.2 refuses a "
+                   f"request sent behind an unanswered `initialize`, so those cells FAIL "
+                   f"today. The answer is the defer-and-replay action §10.2 names — hold the "
+                   f"pipelined request until the negotiation completes — not reopening the "
+                   f"gate: a pending negotiation cannot govern the traffic it would admit.")
+    else:
+        out.append("No CLI pipelined. §10.2's refusal of a request behind a pending handshake "
+                   "therefore costs the fleet nothing — which is what makes it a priced trade "
+                   "rather than a gamble, not what makes it safe. SHOULD NOT is not MUST NOT, "
+                   "and one CLI release turns this into the defer-and-replay action.")
+    missing = unmeasured(rows)
+    if missing:
+        why = {r["cli"]: ("never handshook" if classify(r) == NO_ERA
+                          else f"{r['era']['era']} era observed, but the window never ran")
+               for r in rows if r["cli"] in missing}
+        out.append("NOT MEASURED: " + ", ".join(f"{c} ({why[c]})" for c in missing)
+                   + " — an unanswered question, not a negative result.")
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("clis", nargs="*", default=["claude", "codex", "copilot", "agy"],
@@ -182,46 +258,13 @@ def main() -> int:
     for cli in args.clis:
         r = probe(cli, timeout=args.timeout, verbose=args.verbose)
         rows.append(r)
-        if not r["connected"]:
-            verdict = ("NO ERA OBSERVED — the CLI never handshook"
-                       + (" (server was spawned)" if r["spawned"] else " (server never ran)"))
-        elif r["era"]["era"] == "modern" and r["pipelining"] is None:
-            # A modern client sends no `initialize` at all, so the window never opens. That
-            # is an ANSWER, not a gap: there is no pre-negotiation state to pipeline behind.
-            # It is claimed only for an era actually OBSERVED as modern — "no pipelining
-            # record" on its own would say the same thing about a CLI that died first.
-            verdict = "n/a — no `initialize` (modern era, per-request metadata)"
-        elif r["pipelining"] is None:
-            verdict = (f"NOT MEASURED — era {r['era']['era']} was observed but the "
-                       f"`initialize` window never ran")
-        elif r["pipelining"]["pipelined"]:
-            verdict = (f"PIPELINES — {r['pipelining']['count']} request(s) arrived while the "
-                       f"response was held: {r['pipelining']['methods']}")
-        else:
-            verdict = "waits for the response before sending anything else"
         era = f"{r['era']['era']}/{r['era']['version']}" if r["era"] else "-"
-        print(f"{cli:8} {era:22} rc={str(r['rc']):5} {r['elapsed_s']:>6}s  {verdict}")
+        print(f"{cli:8} {era:22} rc={str(r['rc']):5} {r['elapsed_s']:>6}s  {verdict(r)}")
 
     print()
-    # Unmeasured means BOTH "never handshook" and "handshook in the legacy era but the
-    # window never ran". Only an observed modern era licenses "n/a".
-    unknown = [r["cli"] for r in rows
-               if not r["connected"]
-               or (r["pipelining"] is None and r["era"]["era"] != "modern")]
-    pipelines = [r["cli"] for r in rows
-                 if r["pipelining"] and r["pipelining"]["pipelined"]]
-    if pipelines:
-        print(f"AT LEAST ONE CLI PIPELINES: {', '.join(pipelines)}. §10.2's rule lets a "
-              f"request behind an unanswered `initialize` through, so this is supported — "
-              f"but it is now load-bearing rather than defensive, and must stay that way.")
-    else:
-        print("No CLI pipelined. §10.2's allowance for a pending handshake is therefore "
-              "defensive rather than load-bearing — keep it: SHOULD NOT is not MUST NOT, "
-              "and this is one CLI release away from changing.")
-    if unknown:
-        print(f"NOT MEASURED (no handshake): {', '.join(unknown)} — an unanswered question, "
-              f"not a negative result.")
-    return 0 if not unknown else 1
+    for paragraph in summary(rows):
+        print(paragraph)
+    return 1 if unmeasured(rows) else 0
 
 
 if __name__ == "__main__":

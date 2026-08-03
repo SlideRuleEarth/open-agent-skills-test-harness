@@ -9475,9 +9475,12 @@ def _check_mcp_proxy_decisions(failures, verbose):
            f"reused={type(after).__name__} shadowed={failed(shadowed)} "
            f"server={failed(srv_collide)}", failures, verbose)
 
-    # 8) Subscriptions retire, and their ids become reusable. An entry left resident forever
-    #    would correlate a fresh response against stale state — the verifier pins exactly
-    #    this by reusing id 1 for a `ping` after cancelling a subscription on it.
+    # 8) Subscriptions retire at BOTH orderly ends. An entry left resident forever would
+    #    correlate a fresh response against stale state, or read a legitimate reply as
+    #    unrequested. What happens to the id afterwards differs by which end it was: a
+    #    graceful closure frees it outright, while a CANCELLATION leaves a tombstone, since a
+    #    straggler may still be coming and must not be confused with a reply to whatever
+    #    reused it (§10.4, and arm 8d).
     sub = P.InFlight()
     sub.record("c2s", 1, "subscriptions/listen", "2026-07-28")
     cancel = {"jsonrpc": "2.0", "method": "notifications/cancelled",
@@ -9492,7 +9495,17 @@ def _check_mcp_proxy_decisions(failures, verbose):
                       "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}},
                                  "notifications": {"toolsListChanged": True}}}, **live)
     forwarded_cancel = act(cancel, **live)
-    _check("proxy.subscriptions_retire_and_their_ids_become_reusable",
+    # THE OTHER END, and the one that genuinely frees the id: a graceful closure ends the
+    # request on both sides at once, so nothing can straggle in behind it and the id is
+    # reusable immediately. That is what distinguishes it from the cancellation above, where
+    # the same reuse is refused — the difference is whether a late response is still possible.
+    closed = ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen",
+         "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}},
+                    "notifications": {"toolsListChanged": True}}}, **closed)
+    shut_cleanly = act(closure, direction=P.S2C, **closed)
+    reused_after_closure = act({"jsonrpc": "2.0", "id": 1, "method": "ping"}, **closed)
+    _check("proxy.subscriptions_retire_at_both_orderly_ends",
            cid == 1 and retired == "subscriptions/listen" and sub.open_ids("c2s") == []
            and P.cancelled_id({"jsonrpc": "2.0", "method": "notifications/other"}) is P._ABSENT
            and P.is_graceful_closure("subscriptions/listen", closure)
@@ -9501,14 +9514,19 @@ def _check_mcp_proxy_decisions(failures, verbose):
            and not P.is_graceful_closure("tools/list", closure)
            and isinstance(opened_sub, P.Forward)
            and isinstance(forwarded_cancel, P.Forward)
-           and live["inflight"].open_ids(P.C2S) == [],
+           and live["inflight"].open_ids(P.C2S) == []
+           and isinstance(shut_cleanly, P.Forward)
+           and isinstance(reused_after_closure, P.Forward),
            f"a long-lived `subscriptions/listen` is not a leak — agy opens one and streams "
            f"through notifications — but it is not resident forever either. It ends on "
            f"`notifications/cancelled` naming its id, or on the server's own graceful-closure "
-           f"response, and the subscription id IS the request id, so a retired id must become "
-           f"reusable or the next `ping` on it correlates against stale state. The "
-           f"cancellation is still forwarded verbatim; it is merely OBSERVED on the way "
-           f"through. cid={cid!r} retired={retired!r} open={live['inflight'].open_ids(P.C2S)}",
+           f"response, and the subscription id IS the request id, so the entry must go or the "
+           f"next `ping` on that id correlates against stale state. Only the CLOSURE frees the "
+           f"id outright: it ends the request on both sides, while a cancellation leaves a "
+           f"straggler possible and so leaves a tombstone (arm 8d). The cancellation is still "
+           f"forwarded verbatim; it is merely OBSERVED on the way through. cid={cid!r} "
+           f"retired={retired!r} open={live['inflight'].open_ids(P.C2S)} "
+           f"reuse_after_closure={type(reused_after_closure).__name__}",
            failures, verbose)
 
     # 8c) A cancellation retires the request it NAMES, in the direction that issued it — not
@@ -9541,6 +9559,34 @@ def _check_mcp_proxy_decisions(failures, verbose):
     act(cancel, **stray_cancel)
     server_request_survived = (
         stray_cancel["inflight"].method_for(P.S2C, 1) == "sampling/createMessage")
+    # ...and the mirror image: under legacy a server may cancel its OWN request, so one naming
+    # a request the CLIENT issued is not a cancellation it is permitted to send. Ignored, per
+    # "invalid cancellation notifications SHOULD be ignored". Searching both maps would let a
+    # server retire the client's outstanding `tools/list` — and the reply that follows can no
+    # longer be filtered, because the correlation it needed went with it.
+    reach = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, **reach)
+    act(cancel, direction=P.S2C, **reach)
+    client_request_survived = reach["inflight"].method_for(P.C2S, 1) == "tools/list"
+    # A DUAL-ERA CONNECTION, which is why a negotiated legacy version cannot settle the
+    # question for the whole stream: modern semantics ride per REQUEST, so an initialized
+    # client may still open a modern subscription. Reading the teardown as legacy looked in the
+    # server's map, found nothing, and left the subscription open (review, PR #100).
+    dual = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen",
+         "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}},
+                    "notifications": {"toolsListChanged": True}}}, **dual)
+    dual_cancel = act(cancel, direction=P.S2C, **dual)
+    dual_torn = dual["inflight"].open_ids(P.C2S) == []
+    # ...and when BOTH meanings have live traffic there is nothing in the notification that
+    # picks one, so it fails rather than retiring a request on a guess.
+    collide = legacy_ctx()
+    act({"jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen",
+         "params": {"_meta": {P.VER_KEY: "2026-07-28", P.CAP_KEY: {}},
+                    "notifications": {"toolsListChanged": True}}}, **collide)
+    act({"jsonrpc": "2.0", "id": 1, "method": "sampling/createMessage",
+         "params": {"messages": []}}, direction=P.S2C, **collide)
+    ambiguous = act(cancel, direction=P.S2C, **collide)
     # A nested id that cannot key a dict must be ignored, not crash: it reaches `dict.pop`
     # through a tuple and raises `TypeError: unhashable` inside a pump otherwise.
     poison = legacy_ctx()
@@ -9557,22 +9603,32 @@ def _check_mcp_proxy_decisions(failures, verbose):
            and torn["inflight"].open_ids(P.C2S) == []
            and legacy_kept_client and legacy_took_server
            and server_request_survived
+           and client_request_survived
+           # a legacy session does not make every server cancellation legacy
+           and isinstance(dual_cancel, P.Forward) and dual_torn
+           and failed(ambiguous) == P.AMBIGUOUS_CANCELLATION
            and isinstance(unhashable_cancel, P.Forward)
            and poison["inflight"].open_ids(P.C2S) == [1]
            and isinstance(unknown_cancel, P.Forward),
-           f"a cancellation is routed by the PROTOCOL, not by searching both maps and taking "
-           f"whichever hits first. A client cancels a request it issued; under legacy a "
-           f"server cancels its own; under modern the one server cancellation the spec "
-           f"permits names the CLIENT's `subscriptions/listen`, to tear the stream down. "
-           f"Searching gets the collision wrong in both directions — an unknown client "
-           f"cancellation would reach into the server's map, and with id 1 live in both a "
-           f"server cancellation would take its own request instead of the subscription it "
-           f"named. A `requestId` that cannot key a dict is ignored rather than crashing the "
+           f"a cancellation is routed by the PROTOCOL and by what is actually live, not by "
+           f"searching both maps and taking whichever hits first. A client cancels a request "
+           f"it issued; under legacy a server cancels its own; under modern the one server "
+           f"cancellation the spec permits names the CLIENT's `subscriptions/listen`, to tear "
+           f"the stream down. Searching gets the collision wrong in both directions — an "
+           f"unknown client cancellation would reach into the server's map, and with id 1 live "
+           f"in both a server cancellation would take its own request instead of the "
+           f"subscription it named. Nor does a negotiated legacy version make every server "
+           f"cancellation legacy: modern semantics are per REQUEST, so a dual-era connection "
+           f"carries both and the teardown must still find the subscription. When both "
+           f"meanings really are live the message says nothing that picks one, so it fails "
+           f"loudly. A `requestId` that cannot key a dict is ignored rather than crashing the "
            f"pump, and so is one nobody issued; the notification is forwarded verbatim in "
-           f"every case, because that is what notifications are: "
+           f"every other case, because that is what notifications are: "
            f"modern_teardown_left={torn['inflight'].open_ids(P.C2S)} "
            f"legacy_client_kept={legacy_kept_client} legacy_server_taken={legacy_took_server} "
            f"stray_left_server={server_request_survived} "
+           f"stray_left_client={client_request_survived} dual_era_torn={dual_torn} "
+           f"ambiguous={failed(ambiguous)} "
            f"unhashable={type(unhashable_cancel).__name__}", failures, verbose)
 
     # 8d) The cancellation RACE is documented, so it may not be fatal. "Cancellation
@@ -9585,9 +9641,12 @@ def _check_mcp_proxy_decisions(failures, verbose):
     act({"jsonrpc": "2.0", "method": "notifications/cancelled",
          "params": {"requestId": 1}}, **race)
     late = act({"jsonrpc": "2.0", "id": 1, "result": listed}, direction=P.S2C, **race)
-    # ...and once the straggler has been seen the quarantine lifts, because there cannot be a
-    # second one: the request is over on both sides.
+    # ...and the id is STILL spent after that straggler is seen. An earlier version released it
+    # here, reasoning that the request was now over on both sides. It is over on the client's
+    # side; the other side of this boundary is a server the scenario author does not control,
+    # and one observed response is no evidence about the next (review, PR #100).
     reused = act({"jsonrpc": "2.0", "id": 1, "method": "ping"}, **race)
+    second = act({"jsonrpc": "2.0", "id": 1, "result": listed}, direction=P.S2C, **race)
     orphan = legacy_ctx()
     never = act({"jsonrpc": "2.0", "id": 77, "result": listed}, direction=P.S2C, **orphan)
     # THE OTHER ORDER, which is the one that bypasses filtering: reuse the id BEFORE the
@@ -9604,23 +9663,27 @@ def _check_mcp_proxy_decisions(failures, verbose):
                     direction=P.S2C, **quarantine)
     _check("proxy.a_late_response_to_a_cancelled_request_is_dropped_not_fatal",
            isinstance(late, P.Drop)
-           and isinstance(reused, P.Forward)
            # a response to an id that was never requested AND never cancelled stays fatal —
            # the drop is the documented race, not a general "could not place it" escape
            and failed(never) == P.UNCORRELATED
            and failed(early_reuse) == P.CANCELLED_ID_REUSE
-           and isinstance(straggler, P.Drop),
+           and isinstance(straggler, P.Drop)
+           # BOTH ORDERS, and the id is spent in both: after the straggler as well as before it
+           and failed(reused) == P.CANCELLED_ID_REUSE
+           and isinstance(second, P.Drop),
            f"the late response to a cancelled request is a race the spec describes and tells "
            f"the client to ignore, so failing the cell on it fails a conforming exchange. It "
            f"is DROPPED rather than forwarded, because the correlation that would let it be "
            f"filtered went away with the cancellation — a `tools/list` reply forwarded here "
            f"would be unfiltered. The drop is reserved for exactly this: a response on an id "
            f"never issued at all is still fatal, or the escape becomes the degradation §10.5 "
-           f"forbids. And the id stays QUARANTINED until that straggler is seen — reopening "
-           f"it first is the same bypass by another route, since the late advertisement would "
-           f"then correlate as the new request. late={type(late).__name__} "
-           f"reused={type(reused).__name__} never={failed(never)} "
-           f"early_reuse={failed(early_reuse)} straggler={type(straggler).__name__}",
+           f"forbids. And a cancelled id is SPENT FOR THE CONNECTION, in both orders: reusing "
+           f"it before the straggler arrives is the bypass outright, and reusing it after one "
+           f"straggler has been dropped is the same bypass resting on the assumption that a "
+           f"server the scenario author does not control sends only one. "
+           f"late={type(late).__name__} never={failed(never)} "
+           f"early_reuse={failed(early_reuse)} straggler={type(straggler).__name__} "
+           f"reuse_after_straggler={failed(reused)} second={type(second).__name__}",
            failures, verbose)
 
     # 8b) The closure has a CONFORMING SHAPE, and it is not `{}`. The subscriptions page calls

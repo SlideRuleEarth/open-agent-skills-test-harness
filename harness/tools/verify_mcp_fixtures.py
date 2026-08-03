@@ -798,5 +798,59 @@ check("the held duration is recorded", _pipe and _pipe["held_ms"] == 400, _pipe)
 check("the window is OFF unless asked for", _off is None, _off)
 
 print()
+print("E14. C3-2: the probe's own CLASSIFICATION, which is the result a decision rests on")
+# E13 above checks the shim's timing path. That is a different instrument from the probe that
+# READS it, and the probe's `elif` chain — which decides whether a CLI's answer is "n/a", an
+# unanswered question, or a measurement — had no check at all, so every one of E13's checks
+# could stay green over a probe that reported a CLI that died as "modern n/a" (review, PR
+# #100). Synthetic rows, because the point is the classification, not another live run.
+sys.path.insert(0, HERE)
+import probe_mcp_pipelining as PIPE  # noqa: E402
+
+
+def _row(cli, *, connected=True, era=None, version="2025-11-25", pipelined=None, spawned=True):
+    return {"cli": cli, "connected": connected, "spawned": spawned,
+            "era": {"event": "era", "era": era, "version": version} if era else None,
+            "pipelining": None if pipelined is None else
+            {"event": "pipelining", "pipelined": pipelined,
+             "count": 1 if pipelined else 0,
+             "methods": ["tools/list"] if pipelined else [], "initialize_id": 1}}
+
+
+_dead = _row("dead", connected=False)
+_modern = _row("agy", era="modern", version="2026-07-28")
+_gap = _row("codex", era="legacy")
+_pipes = _row("copilot", era="legacy", pipelined=True)
+_waits = _row("claude", era="legacy", pipelined=False)
+check("an observed MODERN era is `n/a` — there is no `initialize` to hide behind",
+      PIPE.classify(_modern) == PIPE.NOT_APPLICABLE, PIPE.classify(_modern))
+check("a CLI that never handshook is NOT `n/a`",
+      PIPE.classify(_dead) == PIPE.NO_ERA, PIPE.classify(_dead))
+check("a legacy era whose window never ran is UNMEASURED, not a negative result",
+      PIPE.classify(_gap) == PIPE.UNMEASURED, PIPE.classify(_gap))
+check("pipelining and waiting are both measurements",
+      (PIPE.classify(_pipes), PIPE.classify(_waits)) == (PIPE.PIPELINES, PIPE.WAITS))
+check("BOTH ways of missing an answer count as unmeasured",
+      PIPE.unmeasured([_dead, _modern, _gap, _pipes, _waits]) == ["dead", "codex"],
+      PIPE.unmeasured([_dead, _modern, _gap, _pipes, _waits]))
+check("a fully answered fleet is not reported as unmeasured",
+      PIPE.unmeasured([_modern, _pipes, _waits]) == [])
+# The summary is guidance a reader ACTS on, so it has to describe the design that exists:
+# §10.2 refuses a request behind an unanswered handshake, in either outcome. An earlier
+# version said pending traffic "is supported ... keep it", which was the rejected design.
+_clean = " ".join(PIPE.summary([_modern, _waits]))
+_dirty = " ".join(PIPE.summary([_pipes, _waits]))
+check("the clean outcome prices the REFUSAL rather than blessing pending traffic",
+      "refus" in _clean and "allow" not in _clean and "supported" not in _clean, _clean)
+check("the pipelining outcome says those cells fail, and names defer-and-replay",
+      "refus" in _dirty and "FAIL" in _dirty and "defer" in _dirty, _dirty)
+check("the unmeasured line distinguishes the two reasons",
+      "never handshook" in " ".join(PIPE.summary([_dead, _gap]))
+      and "window never ran" in " ".join(PIPE.summary([_dead, _gap])),
+      PIPE.summary([_dead, _gap]))
+check("...and says nothing at all when there is nothing missing",
+      len(PIPE.summary([_modern, _waits])) == 1, PIPE.summary([_modern, _waits]))
+
+print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")
 sys.exit(1 if fails else 0)

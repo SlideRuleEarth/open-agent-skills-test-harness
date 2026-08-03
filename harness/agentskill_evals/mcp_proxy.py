@@ -120,7 +120,8 @@ MALFORMED = "malformed"                          # JSON, but not a legal MCP env
 BATCH = "batch"                                  # a JSON-RPC array; illegal on MCP stdio
 UNCORRELATED = "uncorrelated"                    # response to an id never requested this way
 DUPLICATE_ID = "duplicate_request_id"            # a second live request on an id still open
-CANCELLED_ID_REUSE = "cancelled_id_reuse"        # a quarantined id reopened before it settled
+CANCELLED_ID_REUSE = "cancelled_id_reuse"        # a cancelled id reopened; it stays spent
+AMBIGUOUS_CANCELLATION = "ambiguous_cancellation"  # one id, two eras, two live requests
 UNIMPLEMENTED_VERSION = "unimplemented_version"  # well-formed, modern, unread revision
 MISSING_META = "missing_meta"                    # modern request without a required key
 ERA_METHOD_MISMATCH = "era_method_mismatch"      # method belongs to the other era
@@ -603,23 +604,29 @@ class InFlight:
                            f"{direction} id {req_id!r} is already open as "
                            f"{live[key][0]!r}; an id may not be reused before it is answered")
         if key in self._cancelled[direction]:
-            # A CANCELLED id stays quarantined, and this is a filtering boundary rather than
-            # bookkeeping. Reopening it would make a late response to the cancelled request
-            # indistinguishable from a reply to this one — so `tools/list` cancelled on id 1,
-            # then `ping` on id 1, then the server's straggling tool advertisement, and the
-            # advertisement correlates as a `ping` and is forwarded UNFILTERED. An earlier
+            # A CANCELLED id is SPENT FOR THE CONNECTION, and this is a filtering boundary
+            # rather than bookkeeping. Reopening it would make a late response to the cancelled
+            # request indistinguishable from a reply to this one — so `tools/list` cancelled on
+            # id 1, then `ping` on id 1, then the server's straggling tool advertisement, and
+            # the advertisement correlates as a `ping` and is forwarded UNFILTERED. An earlier
             # version cleared the tombstone here and called the ambiguity inherent; it is
             # inherent, which is why the id may not be reused rather than why the bypass is
             # acceptable (review, PR #100).
             #
-            # The quarantine lifts when a late response consumes the tombstone. If none ever
-            # arrives — the normal case, since a server SHOULD NOT answer a cancelled request
-            # — the id stays spent for this connection, which costs nothing against the
-            # monotonic id counters every measured CLI uses (C3-2, §9).
+            # A LATER VERSION LIFTED IT AFTER ONE LATE RESPONSE, on the reasoning that the
+            # request was then over on both sides. It is not: the proxy's boundary is against a
+            # server the scenario author does not control (§10.1), and no observed response
+            # proves another cannot arrive. A second straggler is nonconforming, but so was the
+            # first, and only the second one lands on a reopened id — `tools/list` cancelled,
+            # one straggler dropped, `ping` on the same id, second straggler forwarded
+            # unfiltered. So nothing lifts it (review, PR #100).
+            #
+            # The cost is one id per genuinely cancelled request, which is nothing against the
+            # monotonic counters every measured CLI uses (C3-2, §9).
             return Anomaly(CANCELLED_ID_REUSE,
-                           f"{direction} id {req_id!r} was cancelled and is quarantined: a "
-                           f"late response to that request could not be told apart from a "
-                           f"reply to this one, and one of them is filtered")
+                           f"{direction} id {req_id!r} was cancelled and is spent for this "
+                           f"connection: a late response to that request could not be told "
+                           f"apart from a reply to this one, and one of them is filtered")
         live[key] = (method, version)
         return None
 
@@ -660,10 +667,11 @@ class InFlight:
         to an id nothing is waiting for — which is exactly the `UNCORRELATED` anomaly, and a
         failed cell for a sequence the spec calls normal (review, PR #100).
 
-        Only an id that was actually live is remembered, which also bounds this: one entry per
-        request genuinely cancelled, cleared the moment the id is reused. A cancellation
-        naming an id nobody issued is ignored, per "invalid cancellation notifications SHOULD
-        be ignored: unknown request IDs".
+        THE RECORD IS PERMANENT for the connection: it is both what makes the late response a
+        drop instead of an anomaly, and what keeps the id from being reopened underneath one.
+        Only an id that was actually live is remembered, which bounds it to one entry per
+        request genuinely cancelled. A cancellation naming an id nobody issued is ignored, per
+        "invalid cancellation notifications SHOULD be ignored: unknown request IDs".
         """
         key = self._key(req_id)
         if key not in self._by_direction[direction]:
@@ -674,14 +682,6 @@ class InFlight:
 
     def was_cancelled(self, direction: str, req_id: Any) -> bool:
         return self._key(req_id) in self._cancelled[direction]
-
-    def settle_cancelled(self, direction: str, req_id: Any) -> None:
-        """A late response arrived and was dropped, so the quarantine on its id lifts.
-
-        The straggler this id was held against has now been seen, and there cannot be a
-        second one — the request is over on both sides.
-        """
-        self._cancelled[direction].discard(self._key(req_id))
 
     def open_ids(self, direction: str) -> list:
         return [key[1] for key in self._by_direction[direction]]
@@ -930,44 +930,76 @@ def decide(line: str, *, direction: str, allowed: frozenset[str], state: Protoco
         cid = cancelled_id(msg)
         if cid is not _ABSENT:
             # Forwarded verbatim, as every notification is — but OBSERVED on the way through,
-            # because this is one of the two orderly ends of a subscription and the id it
-            # names becomes reusable the moment it passes.
-            _observe_cancellation(inflight, state, direction, cid)
+            # because this is one of the two orderly ends of a subscription and the request it
+            # names stops being live the moment it passes. Observing can fail: an id that names
+            # a live request under both eras at once cannot be routed by anything in the
+            # message, and is the one cancellation not forwarded (see `_observe_cancellation`).
+            failure = _observe_cancellation(inflight, state, direction, cid)
+            if failure is not None:
+                return Fail(failure)
         return Forward(msg)
     return _decide_response(msg, shape, direction, allowed, state, inflight)
 
 
 def _observe_cancellation(inflight: InFlight, state: ProtocolState, direction: str,
-                          req_id: Any) -> None:
+                          req_id: Any) -> None | Anomaly:
     """Retire a cancelled id in the map the PROTOCOL says the request lives in.
 
-    Routed by era, not by looking in both maps and taking whichever hits first. Searching
-    conflates two different rules and gets the collision wrong in both directions: an unknown
-    CLIENT cancellation would cancel a coincidentally-numbered SERVER request, and with id 1
-    live in both maps a server cancellation would retire the server's own request and leave
-    the subscription it was actually naming (review, PR #100).
+    Routed by the rules plus WHAT IS ACTUALLY LIVE, not by looking in both maps and taking
+    whichever hits first. Searching conflates two different rules and gets the collision wrong
+    in both directions: an unknown CLIENT cancellation would cancel a coincidentally-numbered
+    SERVER request, and with id 1 live in both maps a server cancellation would retire the
+    server's own request and leave the subscription it was actually naming (review, PR #100).
 
     The rules it routes by:
 
       * a CLIENT cancellation names a request the client issued — legacy and modern agree,
         and "cancellation notifications MUST only reference requests that were previously
-        issued by the client";
-      * under LEGACY both sides issue requests, so a server cancels its own;
+        issued by the client". One rule, no branch;
+      * under LEGACY both sides issue requests, so a server may cancel its OWN;
       * under MODERN a server may send this notification for exactly one purpose — "a server
         MUST send `notifications/cancelled` referencing a `subscriptions/listen` request ID
         when it tears down that subscription stream ... Servers MUST NOT send
         `notifications/cancelled` for any other purpose" — and that request is the CLIENT's.
 
-    Anything outside those is an invalid cancellation, and the spec says to ignore invalid
-    ones rather than act on a guess. Ignoring is safe here: the request stays live, so its
-    response still correlates and is still filtered.
+    THE TWO SERVER MEANINGS ARE NOT MUTUALLY EXCLUSIVE, and an earlier version treated them as
+    though a negotiated legacy version settled the question for the whole connection. It does
+    not: modern semantics are per REQUEST, carried in each request's `_meta`, so a client that
+    has initialized may still open a modern `subscriptions/listen` and a dual-era server may
+    serve both at once. Reading every server cancellation as legacy left exactly that
+    subscription open, because nothing of that id was in the server's map to retire (review,
+    PR #100). So each meaning is tested against the traffic that would have to exist for it —
+    a live server-originated request, or a live client `subscriptions/listen` (a modern-only
+    method, so its presence is itself the era test) — and only one of them normally does.
+
+    A cancellation matching NEITHER is invalid, and the spec says to ignore invalid ones rather
+    than act on a guess. Ignoring is safe: the request, if any, stays live, so its response
+    still correlates and is still filtered.
+
+    A cancellation matching BOTH is the collision, and there is no evidence in the message that
+    picks between them — the notification carries an id and nothing else. Guessing retires a
+    live request, and a later response to it then reads as uncorrelated or, worse, correlates
+    to whatever the surviving entry says. So it fails loudly instead (§10.5: a proxy that
+    cannot say what happened does not continue).
     """
     if direction == C2S:
         inflight.cancel(C2S, req_id)
-    elif state.legacy_version is not None:
+        return None
+    legacy = (state.legacy_version is not None
+              and inflight.method_for(S2C, req_id) is not None)
+    modern = inflight.method_for(C2S, req_id) == "subscriptions/listen"
+    if legacy and modern:
+        return Anomaly(AMBIGUOUS_CANCELLATION,
+                       f"server cancellation names id {req_id!r}, which is live BOTH as its "
+                       f"own {inflight.method_for(S2C, req_id)!r} request under legacy and as "
+                       f"the client's modern `subscriptions/listen`; the notification carries "
+                       f"nothing that says which, and retiring the wrong one loses a "
+                       f"correlation that filtering depends on")
+    if legacy:
         inflight.cancel(S2C, req_id)
-    elif inflight.method_for(C2S, req_id) == "subscriptions/listen":
+    elif modern:
         inflight.cancel(C2S, req_id)
+    return None
 
 
 def _decide_client_request(msg: dict, allowed: frozenset[str], state: ProtocolState,
@@ -1097,7 +1129,11 @@ def _decide_response(msg: dict, shape: str, direction: str, allowed: frozenset[s
             # that arrives afterward". Dropping it is that instruction carried out one hop
             # earlier — and it is safer than forwarding, since the correlation this response
             # would need to be FILTERED went away with the cancellation.
-            inflight.settle_cancelled(origin, req_id)
+            #
+            # The tombstone is NOT consumed here. Dropping this straggler says nothing about
+            # whether another follows — the server is the untrusted side of this boundary — and
+            # an id released on the first would let the second correlate to whatever reopened
+            # it (review, PR #100). So every response on a cancelled id drops, forever.
             return Drop(msg, f"late response to cancelled {origin} id {req_id!r}")
         return Fail(Anomaly(UNCORRELATED,
                             f"response to {origin} id {req_id!r}, which was never requested "

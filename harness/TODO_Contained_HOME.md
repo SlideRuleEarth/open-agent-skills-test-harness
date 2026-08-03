@@ -292,7 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 509 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 harness/tools/mutate_mcp.py                           # 175/175 production + 2/2 instrument
+python3 harness/tools/mutate_mcp.py                           # 178/178 production + 2/2 instrument
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2 probe; 192 checks
 git diff --check
 ```
 
@@ -389,6 +390,30 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   pipelined request's response can arrive before the `initialize` response and be read under
   no version at all. When an argument for safety rests on one message preceding another,
   write down what happens in the other order; on a duplex stream both orders happen.
+- **One observed message is no evidence about the next one.** The same round, twice, in
+  different disguises. A cancelled id's quarantine was released once a late response had been
+  *seen*, reasoning that "the request is over on both sides" — over on the client's side; the
+  other side is a server the scenario author does not control, and a second straggler is no
+  more nonconforming than the first was. And a negotiated legacy version was read as settling
+  the era for the whole connection, when the modern revision carries the era **per request**,
+  so an initialized client can still open a modern subscription and a dual-era server can
+  serve both at once. Both are the same error: **summarizing a stream into a fact about the
+  connection.** Before writing state that says what the peer *is*, check whether the protocol
+  says it per message; and never lift a guard on the strength of one observation from the side
+  the boundary exists against.
+- **Ambiguity is a third answer, and it belongs in the return type.** When a server
+  cancellation could name either its own legacy request or the client's modern subscription,
+  the first fix searched both maps, the second picked by era flag, and both were *choosing*.
+  The message carries an id and nothing else; there is no fact to choose with. Failing loudly
+  is the honest outcome, and it needed the observer to be able to return an anomaly at all —
+  a function typed `-> None` cannot express "I could not tell", so it will guess.
+- **An instrument's regression is not its READER's regression.** `verify_mcp_fixtures.py` E13
+  covers the shim that measures pipelining, and all of it stayed green over a probe that would
+  have classified a CLI which died before handshaking as "modern `n/a`, exit 0" — a false
+  clean result in the tool being used to justify a design decision. The classification, not
+  the log, is the probe's actual output. Factor it out of `main()` so it can be driven on
+  synthetic rows (E14), and treat "what does this tool PRINT" as a thing under test whenever
+  the printout is the evidence for a decision.
 - **An exception argued on safety grounds can be the banned technique wearing a hat.** Asked
   to scope MRTR detection to `resultType: "input_required"`, I scoped the *version* and
   skipped the discriminator, reasoning that "a mislabelled definition is still a definition".
