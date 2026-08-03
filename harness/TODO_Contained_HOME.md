@@ -607,6 +607,22 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   child's liveness is accepted as the helper's. Third instance of one pattern in this PR: a
   check that passes hardest when nothing happened — first in the proxy's outcome list, then in
   the verdict's quantifiers, then in the instrument built to catch the first two.
+- **A liveness signal is about WHOEVER holds it, not about who you meant.** The readiness token
+  above proves the helper *once* held the pipe; it says nothing about who holds it now, because
+  every process on the inheritance path got a copy. A helper that writes its token and closes
+  its writer then survives undetected: the ancestors keep the pipe open, the pre-shutdown check
+  sees no EOF, and the EOF arrives later for the wrong reason. Attribution needs a **sole
+  holder** — each stage closes its copy as soon as it has passed it on, the driver's own close
+  included, or EOF never arrives at all and the case hangs instead of passing.
+- **A detector is worth what its negative control is worth.** "The helper holds the descriptor
+  for life" and "every ancestor closed its copy" are fixture assertions, and the previous three
+  findings are all about assertions nobody made the code demonstrate. So one case **suppresses
+  the group kill on purpose** and requires that the survivor be reported — the only arrangement
+  that tells a channel attributing survival to the helper apart from one reporting on whatever
+  ancestor still holds a copy. This is `mutate_mcp.py`'s argument applied to a fixture: an
+  instrument that has never been shown failing is an instrument nobody has tested. Whatever the
+  control leaves running, the driver must then clean up — a test for leaked credential-bearing
+  processes that leaks one has picked the wrong side of its own point.
 - **A closed key set is closed in BOTH directions, and only one of them gets tested.** The
   structural validator was specified as "every completion fact present, every value from its
   closed set" — which a validator iterating the names it already knows satisfies while ignoring

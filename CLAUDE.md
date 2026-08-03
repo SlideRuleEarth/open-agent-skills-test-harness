@@ -52,7 +52,9 @@ structural clause ahead of it saying what must be there. A witness may only asse
 can actually observe from where it stands — narrow the claim to that, rather than narrowing
 what would have been worth claiming. And the witness itself rests on a premise: an
 observation channel that was never connected reports the same silence as a channel reporting
-success, so make it say something positive before you trust it saying nothing.
+success, so make it say something positive before you trust it saying nothing — and prove it
+can still report the failure by causing that failure on purpose, which is what the mutation
+suite does for the arms and what a negative control does for a fixture.
 
 **A duplicated rule must be pinned to its original.** Some files cannot import the code they
 must agree with — `harness/fixtures/` runs as a subprocess of an agent CLI with only the
