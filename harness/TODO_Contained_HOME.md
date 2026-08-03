@@ -624,6 +624,15 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   **Ask what else could satisfy a negative observation, and eliminate those first**; and close
   with the positive (kill the group, require EOF), so the control cannot pass by observing
   nothing at all.
+- **A FIX APPLIED TO ONE INSTRUMENT MUST BE STATED AS A RULE, OR THE NEXT ONE ARRIVES WITHOUT
+  IT.** The helper channel was given a two-sided proof — announce, then no-premature-EOF, then
+  a control that keeps the holder alive — and the very next round added a *second* channel for
+  the child carrying the identical unverified premise: never passed to the child, EOF at once,
+  accepted as proof the child had exited. The defect and its fix were on the same page. What
+  stopped it recurring was writing the requirement as a quantified rule over **every** liveness
+  channel instead of as two repairs, and then noticing the rule now also demands a control for
+  the child. This is `CLAUDE.md`'s first rule, and the tell is exactly as advertised: the
+  justification for the helper channel's fix never mentioned helpers.
 - **An IDENTIFIER is not an OBSERVATION.** Having specified that the driver waits for the direct
   child to exit, I wrote that it "takes" the child from the audit log's spawn record — which
   supplies a pid, not a death. The driver cannot `wait()` a process it did not spawn; a
