@@ -293,7 +293,7 @@ harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N ar
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
 python3 harness/tools/mutate_mcp.py                           # 181/181 production + 2/2 instrument
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 271 checks
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 278 checks
 git diff --check
 ```
 
@@ -419,6 +419,16 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   driver waits for each response, so the ordering is true by construction. **When an
   instrument keeps needing to be made more careful, check whether the quantity is observable
   from that vantage point at all.**
+- **A new fact about a run belongs in the CLASSIFIER, not bolted onto the exit code.** When
+  the shim gained a "my reader died" signal, I threaded it into the exit status and stopped —
+  so a broken row still classified as a clean measurement, the fleet-wide conclusion was
+  printed over it, and the tool then exited 1 having already published the wrong sentence.
+  That is the same "fleet-wide claim from an incomplete run" defect fixed two rounds earlier,
+  walking in through a door the fix did not cover, because the earlier fix taught `unmeasured`
+  about two ways of being unanswered and this was a third. **When you add a reason a run might
+  be untrustworthy, put it where the existing reasons live** — one predicate that everything
+  downstream reads — rather than beside them. The tell is a new boolean on the row that only
+  one caller consults.
 - **When a claim is retracted, the retraction has to reach every place that made it.** After
   agreeing that C3-3 concludes nothing, the committed tree still had a docstring calling a
   positive result "conclusive", a design paragraph saying the same, and a function still

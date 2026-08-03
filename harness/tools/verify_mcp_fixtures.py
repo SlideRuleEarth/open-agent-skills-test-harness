@@ -835,6 +835,32 @@ check("BOTH ways of missing an answer count as unmeasured",
       PIPE.unmeasured([_dead, _modern, _gap, _pipes, _waits]))
 check("a fully answered fleet is not reported as unmeasured",
       PIPE.unmeasured([_modern, _pipes, _waits]) == [])
+# A BROKEN INSTRUMENT IS AN UNANSWERED ROW, and it is the one that LOOKS answered: the shim
+# can log an era and a pipelining record before its reader dies. Handling it only in the exit
+# status let the tool print the complete-fleet claim and then exit 1 — the same fleet-wide
+# conclusion from an incomplete run as before, through a door the earlier fix did not cover
+# (review, PR #100). So it is classified, not merely counted.
+_broken = _row("broken", era="legacy", pipelined=False)
+_broken["reader_failed"] = True
+check("a row whose shim broke is classified as instrument-failed, not as a measurement",
+      PIPE.classify(_broken) == PIPE.INSTRUMENT_FAILED, PIPE.classify(_broken))
+check("...even though it looks answered on every other axis",
+      _broken["connected"] and _broken["pipelining"] is not None
+      and PIPE.classify({**_broken, "reader_failed": False}) == PIPE.WAITS)
+check("...so it counts as unmeasured",
+      PIPE.unmeasured([_waits, _broken]) == ["broken"], PIPE.unmeasured([_waits, _broken]))
+_broken_sum = " ".join(PIPE.summary([_modern, _pipes, _waits, _broken]))
+check("...and the fleet-wide negative CANNOT be printed over it",
+      "across the whole fleet" not in _broken_sum
+      and "costs the fleet nothing" not in _broken_sum, _broken_sum)
+check("...with the cause named, not just the absence",
+      "reader failed" in _broken_sum and "broken" in _broken_sum, _broken_sum)
+check("...and the per-row verdict says so too",
+      "INSTRUMENT FAILED" in PIPE.verdict(_broken), PIPE.verdict(_broken))
+# The clean-run claim must still be reachable, or this check would pass on a tool that never
+# concludes anything.
+check("a fleet with no broken instrument still earns the complete claim",
+      "across the whole fleet" in " ".join(PIPE.summary([_modern, _waits])))
 # The summary is guidance a reader ACTS on, so it has to describe the design that exists:
 # §10.2 refuses a request behind an unanswered handshake, in either outcome. An earlier
 # version said pending traffic "is supported ... keep it", which was the rejected design.

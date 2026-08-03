@@ -192,6 +192,7 @@ NOT_APPLICABLE = "n/a"           # modern era OBSERVED, so there is no `initiali
 UNMEASURED = "unmeasured"        # an era was observed, but the delay window never ran
 PIPELINES = "pipelines"          # requests arrived while the response was held
 WAITS = "waits"                  # nothing arrived until the response went out
+INSTRUMENT_FAILED = "instrument_failed"   # the SHIM broke; whatever it logged is not evidence
 
 
 def id_timeline(recs: list[dict]) -> list[tuple[str, tuple]]:
@@ -295,6 +296,16 @@ def request_ids(timeline: list[tuple[str, tuple]]) -> list:
 
 
 def classify(row: dict) -> str:
+    # FIRST, AND BEFORE `connected`. A shim whose reader died may well have logged an era
+    # before dying, so the row looks answered and its C3-2 verdict looks like a measurement —
+    # it is not one, because the instrument stopped seeing input at an unknown point. Handling
+    # this only in the exit status let the tool print "No CLI pipelined, across the whole
+    # fleet ... costs the fleet nothing" and then exit 1, which is the fleet-wide claim from
+    # an incomplete run all over again, arriving through a door the earlier fix did not cover
+    # (review, PR #100). A row's TRUSTWORTHINESS belongs in the classifier, with everything
+    # else that decides whether the run answered its question.
+    if row.get("reader_failed"):
+        return INSTRUMENT_FAILED
     if not row["connected"]:
         return NO_ERA
     if row["pipelining"] is None:
@@ -307,6 +318,9 @@ def classify(row: dict) -> str:
 
 def verdict(row: dict) -> str:
     kind = classify(row)
+    if kind == INSTRUMENT_FAILED:
+        return ("INSTRUMENT FAILED — the shim's reader died mid-run, so this row measures "
+                "nothing about the CLI")
     if kind == NO_ERA:
         return ("NO ERA OBSERVED — the CLI never handshook"
                 + (" (server was spawned)" if row["spawned"] else " (server never ran)"))
@@ -324,10 +338,22 @@ def verdict(row: dict) -> str:
 def unmeasured(rows: list[dict]) -> list[str]:
     """The CLIs whose answer is missing — BOTH ways of missing it.
 
-    A CLI that never handshook, and one that handshook in a legacy era where the window never
-    ran, are equally unanswered. Only an observed modern era licenses `n/a`.
+    A CLI that never handshook, one that handshook in a legacy era where the window never ran,
+    and one whose SHIM BROKE are all equally unanswered — the last of those looks answered,
+    which is why it has to be excluded here rather than only in the exit status. Only an
+    observed modern era licenses `n/a`.
     """
-    return [r["cli"] for r in rows if classify(r) in (NO_ERA, UNMEASURED)]
+    return [r["cli"] for r in rows
+            if classify(r) in (NO_ERA, UNMEASURED, INSTRUMENT_FAILED)]
+
+
+def _why_unmeasured(row: dict) -> str:
+    kind = classify(row)
+    if kind == INSTRUMENT_FAILED:
+        return "the shim's reader failed; nothing it logged is evidence"
+    if kind == NO_ERA:
+        return "never handshook"
+    return f"{row['era']['era']} era observed, but the window never ran"
 
 
 def summary(rows: list[dict]) -> list[str]:
@@ -364,9 +390,7 @@ def summary(rows: list[dict]) -> list[str]:
                    "SHOULD NOT is not MUST NOT, and one CLI release turns this into the "
                    "defer-and-replay action.")
     if missing:
-        why = {r["cli"]: ("never handshook" if classify(r) == NO_ERA
-                          else f"{r['era']['era']} era observed, but the window never ran")
-               for r in rows if r["cli"] in missing}
+        why = {r["cli"]: _why_unmeasured(r) for r in rows if r["cli"] in missing}
         out.append("NOT MEASURED: " + ", ".join(f"{c} ({why[c]})" for c in missing)
                    + " — an unanswered question, not a negative result.")
     out.extend(id_summary(rows))
