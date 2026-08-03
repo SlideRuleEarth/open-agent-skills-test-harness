@@ -94,6 +94,9 @@ _legacy = None
 _first_era = None
 _seen_eras = set()
 _subscriptions = {}       # listen-request id -> (acknowledged filter, modern flag)
+# Id keys ADMITTED to the C3-3 timeline. A response is only recorded for one of these, so a
+# reply to a refused frame cannot mark an id answered that never arrived. See `_send`.
+_admitted = set()
 
 
 def _log(event: str, **fields) -> None:
@@ -131,6 +134,31 @@ def _valid_request_id(req_id) -> bool:
         float("inf"), float("-inf")))
 
 
+def _request_envelope_ok(msg) -> bool:
+    """Whether this is a REQUEST the proxy would accept — the whole envelope, not just the id.
+
+    Mirrors the request branch of `agentskill_evals.mcp_proxy.classify_envelope`, and is
+    checked against it in `verify_mcp_fixtures.py` for the same reason `_id_key` is: this file
+    cannot import the proxy, so the copy must be pinned rather than trusted.
+
+    Validating only the ID was not enough. A JSON-RPC **1.0** `ping(1)` — no `"jsonrpc":
+    "2.0"` — carries a perfectly good id, so it entered the timeline; the real proxy terminates
+    the connection on that frame as `MALFORMED` and never reaches any id rule. A later `ping(1)`
+    then read as legal post-response reuse, against a first request that would have killed the
+    cell (review, PR #100). Admission here has to be the proxy's admission, or the timeline
+    describes a conversation the proxy would never have had.
+    """
+    if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
+        return False
+    if "method" not in msg or "result" in msg or "error" in msg:
+        return False
+    if not isinstance(msg["method"], str) or not msg["method"]:
+        return False
+    if "params" in msg and not isinstance(msg["params"], dict):
+        return False
+    return "id" in msg and _valid_request_id(msg["id"])
+
+
 def _id_key(req_id):
     """A request id's IDENTITY, for the C3-3 reading: domain marker plus value.
 
@@ -162,7 +190,13 @@ def _send(msg: dict) -> None:
     # and a subsequent request on that id would then read as post-response reuse against a
     # response that does not exist (review, PR #100).
     os.write(1, (json.dumps(msg) + "\n").encode())
-    if _valid_request_id(msg.get("id")) and ("result" in msg or "error" in msg):
+    # ONLY FOR AN ID THAT ENTERED THE TIMELINE. This shim answers malformed requests, as a
+    # conformant server should — with an error — but that response must not be recorded,
+    # because the request it answers was refused admission. Recording it marked the id
+    # "answered" with no matching arrival, so a single later valid request on that id read as
+    # post-response reuse: a repeat manufactured out of one request (review, PR #100).
+    if ("result" in msg or "error" in msg) and _valid_request_id(msg.get("id")) \
+            and tuple(_id_key(msg["id"])) in _admitted:
         _log("response_id", id_key=_id_key(msg["id"]))
 
 
@@ -450,6 +484,7 @@ _rx_ready = threading.Condition(_rx_lock)
 _rx_lines: collections.deque = collections.deque()   # complete lines, in ARRIVAL order
 _rx_partial = b""
 _rx_eof = False
+_rx_failed = False   # the reader DIED; distinct from the client closing stdin
 
 
 def _announce(raw: bytes) -> None:
@@ -469,24 +504,27 @@ def _announce(raw: bytes) -> None:
     input is drained continuously by `_reader`, and the main loop consumes from the queue it
     fills.
 
-    MALFORMED TRAFFIC DOES NOT ENTER C3-3. The proxy correlates only on a valid `RequestId`,
-    so anything else is logged as its own event and kept out of the timeline — a list id is
-    unhashable and crashed the reader, and `true` followed by `1` manufactured a reuse that
-    JSON-RPC does not recognise, because Python aliases them (review, PR #100).
+    MALFORMED TRAFFIC DOES NOT ENTER C3-3, and "malformed" means the PROXY'S whole envelope
+    rule — see `_request_envelope_ok`. Checking only the id let a JSON-RPC 1.0 frame through,
+    and before that a list id crashed the reader while `true` followed by `1` manufactured a
+    reuse Python sees and JSON-RPC does not (review, PR #100). Anything rejected is logged as
+    its own event, which is a finding about the client rather than an input to any price.
     """
     if not raw.strip():
         return
     try:
         msg = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
+        _log("request_id_malformed", why="unparseable")
         return
-    if not isinstance(msg, dict) or msg.get("method") is None or "id" not in msg:
-        return
-    req_id = msg["id"]
-    if _valid_request_id(req_id):
-        _log("request_id", id_key=_id_key(req_id), method=msg["method"])
-    else:
-        _log("request_id_malformed", id_repr=repr(req_id), method=msg["method"])
+    if _request_envelope_ok(msg):
+        _admitted.add(tuple(_id_key(msg["id"])))
+        _log("request_id", id_key=_id_key(msg["id"]), method=msg["method"])
+    elif isinstance(msg, dict) and msg.get("method") is not None and "id" in msg:
+        # Shaped like a request and refused like one. A notification (no `id`) is not a
+        # finding — it is ordinary traffic that simply has no place in an id timeline.
+        _log("request_id_malformed", id_repr=repr(msg.get("id")),
+             method=str(msg.get("method"))[:120], jsonrpc=repr(msg.get("jsonrpc")))
 
 
 def _reader() -> None:
@@ -497,12 +535,22 @@ def _reader() -> None:
     arrive during that window are invisible until it next asks for them. That window is
     exactly where a live duplicate and a post-response reuse become indistinguishable.
     """
-    global _rx_partial, _rx_eof
+    global _rx_partial, _rx_eof, _rx_failed
     while True:
         try:
             chunk = os.read(_STDIN, 65536)
-        except (OSError, ValueError):
-            chunk = b""
+        except (OSError, ValueError) as exc:
+            # A FAILED READ IS NOT A CLOSED STDIN. Swallowing it into `chunk = b""` made the
+            # main loop log `stdin_eof` and a clean terminator, so an instrument failure would
+            # have been published as "this CLI shut the server down cleanly" — the exact
+            # conclusion C3-1 exists to draw, drawn from a bug in the thing drawing it
+            # (review, PR #100).
+            _log("reader_error", error=type(exc).__name__, detail=str(exc)[:200])
+            with _rx_ready:
+                _rx_failed = True
+                _rx_eof = True
+                _rx_ready.notify_all()
+            return
         if not chunk:
             with _rx_ready:
                 # A trailing fragment at EOF is all of that line there will ever be.
@@ -597,7 +645,9 @@ def main() -> int:
         # is in that buffer.
         line = _readline()
         if line == "":
-            _log("stdin_eof")
+            # C3-1 reads the terminator as a verdict about the CLIENT, so an instrument failure
+            # must never wear the clean-shutdown label (review, PR #100).
+            _log("reader_failed" if _rx_failed else "stdin_eof")
             break
         line = line.strip()
         if not line:
@@ -666,8 +716,9 @@ def main() -> int:
             _log("refused", method=method, mode=MODE)
             _error(req_id, -32601, f"method not found: {method}")
 
-    _close_subscriptions("stdin_eof")
-    _log("terminator", reason="stdin_eof")
+    reason = "reader_failed" if _rx_failed else "stdin_eof"
+    _close_subscriptions(reason)
+    _log("terminator", reason=reason)
     return 0
 
 

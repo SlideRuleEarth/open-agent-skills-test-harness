@@ -141,6 +141,7 @@ def probe(cli: str, *, timeout: int, verbose: bool) -> dict:
     hit = next((r for r in recs if r["event"] == "pipelining"), None)
     era = next((r for r in recs if r["event"] == "era"), None)
     timeline = id_timeline(recs)
+    anomalies = id_anomalies(recs)
     # `connected` means AN ERA WAS OBSERVED, not "the log exists". The shim writes `start`
     # before reading a byte, so a CLI that spawns the server and dies would otherwise count as
     # connected — and then, having sent no `initialize`, be classified as modern with nothing
@@ -156,6 +157,10 @@ def probe(cli: str, *, timeout: int, verbose: bool) -> dict:
         # C3-3 rides along free: the shim already records arrivals and departures, so the id
         # timeline is a READING of this same run rather than another one. See `id_findings`.
         "id_timeline": timeline,
+        # Carried into the RESULT, not left in a temp log nobody reads: a malformed request
+        # is a finding the proxy would terminate on, and it reached neither the summary nor
+        # the exit status while it lived only in the raw file (review, PR #100).
+        "id_anomalies": anomalies,
         "rc": rc,
         "timed_out": timed_out,
         "elapsed_s": round(elapsed, 1),
@@ -184,12 +189,6 @@ PIPELINES = "pipelines"          # requests arrived while the response was held
 WAITS = "waits"                  # nothing arrived until the response went out
 
 
-# How many requests one connection must carry before "no reuse observed" is worth anything.
-# NOT a threshold that makes C3-3 a priced trade — see `id_summary`. It only separates runs
-# that could have shown reuse from runs that structurally could not.
-ID_SAMPLE_FLOOR = 2
-
-
 def id_timeline(recs: list[dict]) -> list[tuple[str, tuple]]:
     """Request arrivals and response departures, IN WIRE ORDER, as the proxy would see them.
 
@@ -202,10 +201,31 @@ def id_timeline(recs: list[dict]) -> list[tuple[str, tuple]]:
     4096 characters as a diagnostic, so reparsing it drops any longer request entirely — and a
     measurement that silently omits requests cannot answer a question about reuse (review, PR
     #100). Ids arrive already canonicalized to `mcp_proxy.request_id_key`'s identity.
+
+    A malformed frame enters as `("bad", None)` — IN POSITION, because the proxy terminates the
+    connection there and everything after it is traffic no proxied cell would reach. Leaving it
+    out entirely would have the reader class the messages either side of it as consecutive.
     """
     kinds = {"request_id": "req", "response_id": "resp"}
-    return [(kinds[r["event"]], tuple(r["id_key"])) for r in recs
-            if r.get("event") in kinds and isinstance(r.get("id_key"), list)]
+    out: list[tuple[str, tuple | None]] = []
+    for r in recs:
+        event = r.get("event")
+        if event == "request_id_malformed":
+            out.append(("bad", None))
+        elif event in kinds and isinstance(r.get("id_key"), list):
+            out.append((kinds[event], tuple(r["id_key"])))
+    return out
+
+
+def id_anomalies(recs: list[dict]) -> list[dict]:
+    """Requests the shim refused to admit to the timeline — the proxy would terminate on them.
+
+    Surfaced as part of the RESULT rather than left in a temp log. They were being written and
+    then dropped: `probe()` carried only the timeline, and neither the summary nor the exit
+    status looked at them, so without `-v` a client sending malformed frames produced no
+    reported finding at all (review, PR #100).
+    """
+    return [r for r in recs if r.get("event") == "request_id_malformed"]
 
 
 def id_findings(timeline: list[tuple[str, tuple]]) -> dict:
@@ -233,7 +253,13 @@ def id_findings(timeline: list[tuple[str, tuple]]) -> dict:
     duplicates: list = []
     reuse: list = []
     requests = 0
+    malformed = False
     for kind, key in timeline:
+        if kind == "bad":
+            # Also terminal, and for the same reason: the proxy fails on a malformed envelope
+            # before any id rule runs, so nothing past here would have happened.
+            malformed = True
+            break
         if kind == "req":
             requests += 1
             if key in live:
@@ -249,27 +275,12 @@ def id_findings(timeline: list[tuple[str, tuple]]) -> dict:
             "post_response_reuse": reuse,
             # True when the run was cut short: whatever came after is unobservable through a
             # proxy, so this row can neither price the rule nor be counted as clean past here.
-            "truncated": bool(duplicates)}
+            "truncated": bool(duplicates) or malformed}
 
 
 def request_ids(timeline: list[tuple[str, tuple]]) -> list:
     """The arrival-ordered request ids from a timeline, for display."""
     return [key for kind, key in timeline if kind == "req"]
-
-
-def reuses_ids(row: dict) -> bool | None:
-    """Did this CLI reuse an id AFTER it was answered? `None` when the run cannot say.
-
-    `True` is a real answer — the exact behaviour §10.4 refuses and the spec allows. `False`
-    means only "not among the requests this run happened to contain", which is why
-    `id_summary` never turns it into a fleet-wide price. A live duplicate is neither: it is
-    reported separately, because the proxy rejects it on grounds that have nothing to do with
-    the rule being priced.
-    """
-    found = id_findings(row.get("id_timeline") or [])
-    if found["requests"] < ID_SAMPLE_FLOOR:
-        return None
-    return bool(found["post_response_reuse"])
 
 
 def classify(row: dict) -> str:
@@ -351,6 +362,28 @@ def summary(rows: list[dict]) -> list[str]:
     return out
 
 
+# WHY C3-3 CANNOT CONCLUDE FROM THIS RUN, AT ALL.
+#
+# The negative was already unusable: allocation is not exercised once per connection, so no
+# short run bounds what the next request will carry. The POSITIVE turns out to be unusable
+# too, and for a deeper reason — the classification depends on whether an arrival preceded a
+# response, and no observer inside the server can establish that. The reader thread and the
+# main thread log independently; bytes can sit in the kernel pipe, unscheduled, while the main
+# thread writes a response. Continuous draining makes the favourable interleaving likely, not
+# certain: stopping the process, writing a second request on a live id, and resuming produced
+# `req, resp, req` in 1 run of 20 — a live duplicate reported as legal post-response reuse
+# (review, PR #100).
+#
+# Draining continuously is still right — it removed a systematic error, and E15 pins it — but
+# "usually correct" is not what a price is made of. So this run REPORTS and does not conclude,
+# in either direction. What would conclude is a workload that establishes the ordering by
+# CONSTRUCTION: a driver that waits for each response before sending the next request, so the
+# order is a property of the client's behaviour rather than of the server's scheduling. That
+# is the stress probe named in §9, and it is what C3-3 is waiting for.
+ORDERING_UNPROVEN = ("the order of an arrival against a response cannot be established from "
+                     "inside the server, so a repeat cannot be classified")
+
+
 def id_summary(rows: list[dict]) -> list[str]:
     """C3-3's paragraph. A POSITIVE result is conclusive; a negative one never is.
 
@@ -367,34 +400,30 @@ def id_summary(rows: list[dict]) -> list[str]:
     connection — which is a probe of its own, named in §9.
     """
     found = {r["cli"]: id_findings(r.get("id_timeline") or []) for r in rows}
-    reusing = [c for c, f in found.items() if f["post_response_reuse"]]
-    duplicating = [c for c, f in found.items() if f["live_duplicates"]]
-    out = []
-    if reusing:
-        out.append(f"C3-3 — IDS ARE REUSED AFTER BEING ANSWERED by: {', '.join(reusing)}. "
-                   f"§10.4 spends an id once it reaches the server, so those cells FAIL. That "
-                   f"is the rule refusing a client behaviour the spec permits, and it is the "
-                   f"fleet declining to pay for it. A positive result needs no sample size.")
-    else:
-        counts = ", ".join(f"{c}={f['requests']}" for c, f in found.items())
-        total = sum(f["requests"] for f in found.values())
-        out.append(f"C3-3 — no post-response reuse OBSERVED, over {total} request(s) total "
-                   f"({counts}). This does NOT price §10.4's spent-id rule and must not be "
-                   f"read as doing so: allocation is not exercised once per connection the way "
-                   f"pipelining is, so a short run says nothing about the id the next request "
-                   f"will carry. The rule stays a deliberate strictness until a stress "
-                   f"workload measures it (§9).")
-    if duplicating:
-        # Reported, but NOT as a price for the spent-id rule: this is the weaker rule, and the
-        # proxy already refuses it as `duplicate_request_id` on JSON-RPC's own terms. The run
-        # also ENDS there as far as any proxied cell is concerned, so the rest of the log is
-        # not evidence about anything.
-        out.append(f"C3-3, separately — LIVE DUPLICATE ids from: {', '.join(duplicating)}: an "
-                   f"id repeated while the first request was still unanswered. JSON-RPC "
-                   f"forbids that outright, so the proxy refuses it as `duplicate_request_id` "
-                   f"regardless of §10.4's stricter rule — a finding about the CLI, not a "
-                   f"price for that rule. Those cells fail at that message, so nothing later "
-                   f"in the run is evidence either way and it is not counted.")
+    counts = ", ".join(f"{c}={f['requests']}" for c, f in found.items())
+    total = sum(f["requests"] for f in found.values())
+    repeats = {c: f["live_duplicates"] + f["post_response_reuse"] for c, f in found.items()}
+    malformed = {r["cli"]: len(r.get("id_anomalies") or []) for r in rows}
+    out = [(f"C3-3 — INCONCLUSIVE, and this run cannot be otherwise. {total} request(s) "
+            f"observed ({counts}); {ORDERING_UNPROVEN}. It therefore neither prices §10.4's "
+            f"spent-id rule nor clears it: a negative says nothing because allocation is not "
+            f"exercised once per connection, and a positive says nothing because the ordering "
+            f"that distinguishes a live duplicate from post-response reuse is not established "
+            f"from here. Pricing needs the sequential stress workload in §9, where the driver "
+            f"waits for each response and the order is true by construction.")]
+    seen = {c: v for c, v in repeats.items() if v}
+    if seen:
+        out.append("C3-3, observed but UNCLASSIFIED — repeated ids from: "
+                   + ", ".join(f"{c} ({len(v)})" for c, v in seen.items())
+                   + ". Worth looking at by hand; not evidence for or against the rule, for "
+                     "the reason above.")
+    bad = {c: n for c, n in malformed.items() if n}
+    if bad:
+        out.append("C3-3, separately — MALFORMED requests from: "
+                   + ", ".join(f"{c} ({n})" for c, n in bad.items())
+                   + ". The proxy terminates the connection on the first of these, so those "
+                     "cells fail before any id rule is reached — a finding about the CLI, and "
+                     "one that makes the rest of its run unusable as evidence.")
     return out
 
 
@@ -416,15 +445,21 @@ def main() -> int:
         rows.append(r)
         era = f"{r['era']['era']}/{r['era']['version']}" if r["era"] else "-"
         print(f"{cli:8} {era:22} rc={str(r['rc']):5} {r['elapsed_s']:>6}s  {verdict(r)}")
-        reuse = {True: "REUSES IDS", False: "no reuse in this sample",
-                 None: "too few requests to tell"}[reuses_ids(r)]
+        found = id_findings(r["id_timeline"])
+        repeats = found["live_duplicates"] + found["post_response_reuse"]
+        note = (f"{len(repeats)} repeat(s), UNCLASSIFIED" if repeats
+                else "no repeats in this sample")
         shown = [k[1] for k in request_ids(r["id_timeline"])]
-        print(f"{'':8} ids: {shown} — {reuse}")
+        print(f"{'':8} ids: {shown} — {note}"
+              + (f"; {len(r['id_anomalies'])} MALFORMED" if r["id_anomalies"] else ""))
 
     print()
     for paragraph in summary(rows):
         print(paragraph)
-    return 1 if unmeasured(rows) else 0
+    # Malformed traffic joins the unmeasured CLIs in the exit status: the proxy terminates the
+    # connection on the first such frame, so that run answered nothing and saying so quietly
+    # in a paragraph is not enough (review, PR #100).
+    return 1 if unmeasured(rows) or any(r["id_anomalies"] for r in rows) else 0
 
 
 if __name__ == "__main__":

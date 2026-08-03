@@ -293,7 +293,7 @@ harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N ar
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
 python3 harness/tools/mutate_mcp.py                           # 181/181 production + 2/2 instrument
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 237 checks
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 253 checks
 git diff --check
 ```
 
@@ -408,6 +408,22 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   anyway as proof that the proxy is too strict. **When measuring the cost of a rule, the
   observation has to exclude cases some other rule already covers** — otherwise the price
   includes traffic that was never going to work.
+- **Some measurements cannot be taken from where you are standing, and the answer is to stop
+  claiming them.** C3-3 needs to know whether an arrival preceded a response. Three rounds of
+  work went into observing that better — log at arrival, then drain continuously — and the
+  honest end point is that **no observer inside the server can establish it at all**: bytes
+  can sit unread in the kernel pipe while the main thread writes a response, so the ordering
+  is a property of scheduling, not of the client. Reducing the error rate from systematic to
+  occasional is real progress and still not a measurement. The fix was to make the probe
+  *report and not conclude*, and to name the workload that would conclude — one where the
+  driver waits for each response, so the ordering is true by construction. **When an
+  instrument keeps needing to be made more careful, check whether the quantity is observable
+  from that vantage point at all.**
+- **A tool that only prints its findings has not reported them.** The malformed-request events
+  were written to a temp log, and `probe()` carried only the timeline — so without `-v` a
+  client sending malformed frames produced no finding in the summary and no effect on the exit
+  status. **Anything that changes the interpretation of a run has to reach the result object
+  and the exit code**, not just a file someone might read.
 - **An ON-DEMAND reader cannot observe arrival order, and moving the log is not enough.**
   Telling those two id-repeats apart is a question about the order messages crossed the
   stream. Three attempts: logging from the main loop gave *processing* order; moving the log
