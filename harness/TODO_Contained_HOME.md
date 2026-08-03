@@ -624,6 +624,21 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   **Ask what else could satisfy a negative observation, and eliminate those first**; and close
   with the positive (kill the group, require EOF), so the control cannot pass by observing
   nothing at all.
+- **TWO ENUMERATIONS DESCRIBING THE SAME EVENT MUST BE ABLE TO AGREE.** The completion facts
+  could say `done`, `not_applicable`, or nothing — and nothing was defined as malformed. But the
+  outcome axis already had `shutdown_reap_failed` and `shutdown_group_kill_failed`, which are
+  those same steps running and failing, and there was **no legal way to say so on the fact
+  side**. A record of a failed teardown could not be written at all. The fix is a `failed` state
+  paired to its outcome, closed in **both** directions — a `failed` fact requires its outcome
+  and the outcome requires the fact — because a validator checking one direction lets the writer
+  record the failure on whichever axis it prefers and stay silent on the other. **When one thing
+  is described by two enumerations, enumerate the cross-product, not each list alone**; the
+  missing cell is where a real state ends up unwriteable.
+- **A control that suppresses a step must suppress everything downstream that DEPENDS on it.**
+  The control leaves the child alive on purpose, so it also has to suppress the reap — a live
+  child cannot be reaped, and a control that stopped at "don't kill" would hang or crawl to the
+  terminator through a give-up path, reporting a reap failure for a reap never attempted. Ask
+  what the suppressed step was supposed to *produce*, then follow the consumers.
 - **A FIX APPLIED TO ONE INSTRUMENT MUST BE STATED AS A RULE, OR THE NEXT ONE ARRIVES WITHOUT
   IT.** The helper channel was given a two-sided proof — announce, then no-premature-EOF, then
   a control that keeps the holder alive — and the very next round added a *second* channel for
