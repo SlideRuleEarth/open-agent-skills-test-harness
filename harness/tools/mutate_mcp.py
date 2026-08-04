@@ -1308,9 +1308,9 @@ MUTATIONS = [
     # the side this boundary does not trust, and one observed response says nothing about the
     # next — so cancel, one straggler, reuse, second straggler, forwarded unfiltered.
     ("M178-quarantine-lifts-once-a-straggler-is-seen", PROXY,
-     '            return Drop(msg, f"late response to cancelled {origin} id {req_id!r}")\n',
+     "            return Drop(msg, DROP_LATE_CANCELLED,\n",
      ("            inflight._spent[origin].pop(inflight._key(req_id), None)\n"
-      '            return Drop(msg, f"late response to cancelled {origin} id {req_id!r}")\n'),
+      "            return Drop(msg, DROP_LATE_CANCELLED,\n"),
      "proxy.a_late_response_to_a_cancelled_request_is_dropped_not_fatal"),
     # The nested `requestId` goes unvalidated, so `requestId: []` reaches `dict.pop` through a
     # tuple and raises `TypeError: unhashable` inside a pump — the crash `valid_request_id`
@@ -1768,10 +1768,17 @@ MUTATIONS = [
      "        elif entry[kind] is not None:",
      "        elif False:",
      "audit_log.a_second_record_never_overwrites_the_first"),
-    ("M242-records-may-precede-the-start-record", AUDIT,
-     "        if LINE_START in kinds and kinds[0] != LINE_START:",
+    ("M242-the-per-instance-grammar-is-not-checked", AUDIT,
+     "        if ranks != sorted(ranks):",
      "        if False:",
-     "audit_log.nothing_may_be_written_ahead_of_the_start_record"),
+     "audit_log.the_terminator_is_last_and_the_start_is_first"),
+    # The half that WAS checked before, so this one pins the half that was not: a start-first
+    # test accepts a terminator with a spawn, an event, or anything else recorded after it —
+    # a terminator that does not terminate.
+    ("M280-only-the-start-record-has-to-be-first", AUDIT,
+     "        if ranks != sorted(ranks):",
+     "        if kinds and kinds[0] != LINE_START:",
+     "audit_log.the_terminator_is_last_and_the_start_is_first"),
 
     # ---- §10.6's guarantee, read back off the log -----------------------------------------
     ("M243-an-off-list-tool-may-be-advertised", AUDIT,
@@ -2023,6 +2030,108 @@ MUTATIONS = [
       "            self.fired.append(fact)\n"
       "            typed = audit.typed_outcome(fact)"),
      "shutdown_read_failed: recorded, paired to drain_ended, and anomalous"),
+
+    # ---- framing: every way a line can fail to BE a line (review, PR #103) --------------
+    ("M281-an-empty-line-is-skipped-rather-than-refused", PROXY_IO,
+     "            try:\n                text = line.decode(\"utf-8\")",
+     ("            if not line.strip():\n                continue\n"
+      "            try:\n                text = line.decode(\"utf-8\")"),
+     "a blank line is not a message, and is terminal"),
+    # `errors="replace"` on a trust boundary is a REWRITE, not a tolerance: it forwards bytes
+    # the peer never sent, and the cell passes.
+    ("M282-undecodable-bytes-are-rewritten-and-forwarded", PROXY_IO,
+     '                text = line.decode("utf-8")',
+     '                text = line.decode("utf-8", "replace")',
+     "bytes that are not UTF-8 are not a message, and are terminal"),
+    # The residue discarded at EOF, so a stream that ended mid-message reads as one that ended.
+    ("M283-a-half-written-line-at-EOF-is-discarded", PROXY_IO,
+     "            self._flush_residue(direction)",
+     "            self._buffers[direction] = b\"\"",
+     "a partial line at EOF is not a message, and is terminal"),
+    # The drain's terminality test back to a truthiness check on an accumulator that the
+    # teardown guarantees is already non-empty, so a malformed frame is recorded and then
+    # followed by more forwarding.
+    ("M284-a-drain-anomaly-does-not-stop-the-drain", PROXY_IO,
+     "            if len(self.triggers) > before:",
+     "            if self.triggers and not shutting_down:",
+     "a malformed frame during the drain stops it, and what followed is not forwarded"),
+    ("M285-NaN-and-Infinity-reach-the-decision-layer", PROXY,
+     "        msg = json.loads(line, parse_constant=_refuse_constant)",
+     "        msg = json.loads(line)",
+     "proxy.a_json_extension_constant_is_not_a_legal_message"),
+
+    # ---- the group's verdict is positive evidence, not an errno ------------------------
+    # THE REVIEWED DEFECT ITSELF: `EPERM` read as an empty group. It is drivable because a
+    # zombie-only group answers the probe with exactly that errno on macOS — which is how the
+    # original inference came to look measured — and the `child_reaped=fail` case leaves our own
+    # unreaped child in the group on purpose. A mutant that reads it as confirmation records one
+    # outcome where two are true, and would certify a live member a sandbox had made
+    # unsignallable (review, PR #103).
+    ("M286-an-unsignallable-group-is-confirmed-gone", PROXY_IO,
+     ("            except OSError:\n"
+      "                pass                     # present but unsignallable; still present"),
+     ("            except OSError:\n"
+      "                self._done(audit.GROUP_TERMINATED)\n"
+      "                return"),
+     "shutdown_reap_failed: recorded, paired to child_reaped, and anomalous"),
+    ("M287-the-group-is-never-confirmed-empty", PROXY_IO,
+     "            self._guard(audit.GROUP_TERMINATED, self._confirm_group_gone)",
+     "            self._done(audit.GROUP_TERMINATED)",
+     "shutdown_reap_failed: recorded, paired to child_reaped, and anomalous"),
+    # ...and the false-failure direction, which §10.5 weighs the same: `ESRCH` — the group is
+    # gone, which is the goal — no longer read as confirmation, so every clean cell fails.
+    ("M294-ESRCH-is-not-read-as-confirmation", PROXY_IO,
+     ("            except ProcessLookupError:\n"
+      "                self._done(audit.GROUP_TERMINATED)\n"
+      "                return\n"
+      "            except OSError:"),
+     ("            except ProcessLookupError:\n"
+      "                pass\n"
+      "            except OSError:"),
+     "...and the whole exchange still ends clean"),
+
+    # ---- the guardian ------------------------------------------------------------------
+    # No guardian at all: a proxy SIGKILLed before its teardown leaves a credential-bearing
+    # server with nothing that will ever terminate it. The audit still fails the cell, which is
+    # exactly why this needs a case that looks at the PROCESS rather than at the record.
+    ("M288-no-guardian-is-started", PROXY_IO,
+     "        self._start_guardian()",
+     "        pass",
+     "a proxy SIGKILLed before its teardown: nothing from the instance is left alive"),
+    # The guardian recorded but never started, so the spawn record's claim is the only thing
+    # that would notice — which is why the liveness check above is NOT nested inside the
+    # record check.
+    ("M295-the-guardian-is-recorded-but-not-watched", PROXY_IO,
+     "        return run_guardian(int(args[1]), int(args[2]))",
+     "        return 0",
+     "a proxy SIGKILLed before its teardown: nothing from the instance is left alive"),
+    # The guardian stands down on the proxy's EXIT rather than on a byte, so the ending it
+    # exists for — a proxy that never ran its teardown — silences it too.
+    ("M289-the-guardian-stands-down-on-any-EOF", PROXY_IO,
+     "                if os.read(lifeline, 1) != b\"\":",
+     "                if True:",
+     "a proxy SIGKILLed before its teardown: nothing from the instance is left alive"),
+    # ...and the other direction: standing down never happens, so the guardian sweeps up the
+    # survivors §10.9's control deliberately leaves alive and the evidence goes with them.
+    ("M290-the-guardian-is-never-stood-down", PROXY_IO,
+     "            _write_all(self._lifeline, GUARDIAN_STAND_DOWN)",
+     "            pass",
+     "with steps 3-5 suppressed, BOTH channels are still open after the proxy exits"),
+    # NO MUTATION for the guardian's ask-before-signal guard, and that is a statement rather
+    # than an omission: its whole purpose is a pid recycled between the child being reaped by
+    # init and the guardian waking, which nothing can stage on demand. Removing it changes no
+    # observable behaviour in any case here, so a mutation would report MISSED for a check that
+    # cannot exist — the same limit as the three cleanup outcomes driven through injection.
+
+    # ---- the archived log carries codes, not prose --------------------------------------
+    ("M292-the-drop-event-carries-the-peers-own-text", PROXY_IO,
+     "self.sink.write(audit.LINE_EVENT, event=audit.MESSAGE_DROPPED, reason=action.code)",
+     "self.sink.write(audit.LINE_EVENT, event=audit.MESSAGE_DROPPED, reason=action.detail)",
+     "a late response to a cancelled request is dropped, and recorded as a CODE"),
+    ("M293-a-drop-reason-may-be-any-string", AUDIT,
+     "            if not isinstance(reason, str) or reason not in DROP_REASONS:",
+     "            if not isinstance(reason, str) or not reason:",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
 
     # ---- F: instruments, proven by tools/verify_mcp_fixtures.py -------------------------
     # Everything above asks whether the selftest notices a defect in production code. These

@@ -289,12 +289,12 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 557 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 558 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py                        # 277/277 production + 2/2 instrument + 8/8 fixture
+python3 -u harness/tools/mutate_mcp.py                        # 293/293 production + 2/2 instrument + 8/8 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 278 checks
-harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 47 here
+harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 58 here
 git diff --check
 ```
 
@@ -865,6 +865,58 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   `fail` mode. That drives the **record** and not the code that would produce it in the wild.
   The driver says so in its own header, and §10.9 says so too, because "every outcome driven"
   is otherwise a claim about coverage the file does not have.
+- **AN ERRNO WITH MORE THAN ONE CAUSE IS NOT EVIDENCE — the `EPERM` lesson, corrected.** §4
+  already said "produce it on purpose and look", and I did: macOS returns `EPERM` from `killpg`
+  for an all-zombie group where Linux returns 0. What that establishes is ONE cause, not an
+  equivalence, and `kill(2)` defines the errno as the inability to signal group members — which
+  a sandbox restriction or a differently credentialed descendant also produces, either of them
+  leaving a live member while the branch certified success. **A measurement licenses the
+  direction it measured, never the converse.** The fix is not a better errno reading but
+  positive evidence: deliver the signal while the group is provably ours, then confirm
+  emptiness after the reap with a signal-0 probe, whose worst outcome is a false failure.
+- **DETECTION IS NOT CLEANUP.** The absence rule catches a proxy killed before its teardown and
+  fails the cell — and the credential-bearing server it was fronting is still running, because
+  `start_new_session=True` put it out of reach of every ancestor's group kill. Recording an
+  ending is not ending it. The fix is a **guardian**: a third process in its own session
+  holding a lifeline, which kills the child's group when the proxy dies. **It stands down on a
+  BYTE rather than on the proxy's exit**, so a teardown that ran and *failed* still silences
+  it — otherwise the guardian would sweep up exactly the survivors §10.9's liveness cases exist
+  to observe, and the mechanism for one failure would erase the evidence for another.
+- **A GUARANTEE MUST BE STATED AT THE WIDTH OF ITS MECHANISM.** "Nothing from this instance is
+  still alive" was the claim; a process group was the mechanism; and a descendant that calls
+  `setsid()` leaves the group and survives a clean run unreported. There is no portable
+  containment stronger than a process group on both supported platforms, so the claim was the
+  thing that had to move. The limit is now driven as a case that asserts what actually happens
+  — clean verdict, `group_terminated: done`, helper alive — because **a documented boundary
+  nothing checks outdates itself quietly**, and this one fails loudly if containment is widened.
+- **A RULE ENFORCED AT ONE FIELD IS A RULE ABOUT THAT FIELD.** `NaN`/`Infinity` were "refused"
+  only because `valid_request_id` rejects a NaN id; nothing looked anywhere else in a message,
+  because Python's JSON decoder accepts all three as a documented extension. The check belongs
+  at the decoder (`parse_constant`), which is the one place that quantifies over the message.
+  Same shape in the framing: an empty line, undecodable bytes and a partial line at EOF were
+  each skipped by a different guard written for a different purpose — `strip()`,
+  `errors="replace"`, and an EOF path that discarded its buffer — and each produced a clean
+  verdict for a stream that had gone wrong. **`errors="replace"` on a boundary is a rewrite,
+  not a tolerance**: it forwards bytes the peer never sent.
+- **"HAS SOMETHING GONE WRONG" IS NOT "DID THIS GO WRONG HERE".** The drain stopped on
+  `if self.triggers`, which is always true during a teardown — there is already the trigger
+  that started it — so a malformed frame arriving on the way out was recorded as an anomaly and
+  then followed by more forwarding. The terminality test has to be a **count compared across
+  the call**, not a truthiness test on an accumulator. The tell is a guard that reads state
+  which the surrounding phase guarantees is already set.
+- **A GRAMMAR IS AN ORDERING, SO CHECK IT AS ONE.** The log reader checked that the start record
+  came first and nothing else, which accepted `start → terminator → spawn` and
+  `start → spawn → terminator → event` as clean — a terminator that does not terminate, with
+  work recorded after the record on which the absence rule, the no-heal rule and every
+  completion fact rest. One rank per line kind and "the sequence is sorted" cannot disagree with
+  itself about a case, where a hand-written first-record test only ever covers the end someone
+  thought about.
+- **AN ARCHIVED ARTIFACT MUST CARRY ENUMERATED REASONS, NOT PROSE.** The dropped-message event
+  logged the decision layer's human-readable reason, which quotes the request id — an arbitrary
+  wire value of any length and content the peer chose. `Drop` now carries a **code** from a
+  closed set for the log and its prose for stderr, and the reader validates the code against
+  that set. The tell is a field the writer formats and the reader accepts as any non-empty
+  string.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s

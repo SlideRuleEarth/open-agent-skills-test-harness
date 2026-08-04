@@ -9040,6 +9040,29 @@ def _check_mcp_proxy_decisions(failures, verbose):
     # frame, different kind, because the two send a reader to different places (§10.4).
     orphan_error = act({"jsonrpc": "2.0", "error": {"code": -32603, "message": "boom"}},
                        direction=P.S2C, **ctx())
+    # A JSON EXTENSION IS NOT JSON, and the rule has to live at the decoder rather than at
+    # whichever field happens to look. Python's decoder accepts `NaN`, `Infinity` and
+    # `-Infinity` by default, so §10.4's refusal held only where something checked: a NaN ID is
+    # rejected because NaN is never equal to itself and so could never be retired, and nothing
+    # at all looked anywhere else in a message (review, PR #103).
+    _extensions = {name: P.parse_line(line) for name, line in (
+        ("nan_id", '{"jsonrpc":"2.0","id":NaN,"method":"ping"}'),
+        ("nan_param", '{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":NaN}}'),
+        ("infinity", '{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":Infinity}}'),
+        ("neg_infinity", '{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":-Infinity}}'),
+        ("nested", '{"jsonrpc":"2.0","id":1,"method":"ping","params":{"a":[1,{"b":NaN}]}}'))}
+    _check("proxy.a_json_extension_constant_is_not_a_legal_message",
+           all(isinstance(v, P.Anomaly) and v.kind == P.UNPARSEABLE
+               for v in _extensions.values())
+           and isinstance(P.parse_line('{"jsonrpc":"2.0","id":1.5,"method":"ping"}'), dict),
+           f"a rule enforced at one field is a rule about that field: the id check caught a "
+           f"NaN id and nothing caught one in `params`, nested in an array, or an `Infinity` "
+           f"anywhere. The last clause is the negative control — a FRACTIONAL id is valid "
+           f"(§10.4), so a decoder made strict enough to reject `1.5` would satisfy every "
+           f"clause above while failing conforming clients: "
+           f"{ {k: v for k, v in _extensions.items() if not isinstance(v, P.Anomaly)} }",
+           failures, verbose)
+
     _check("proxy.envelope_shape_is_established_positively",
            env["request"] == P.REQUEST and env["notification"] == P.NOTIFICATION
            and env["result"] == P.RESULT
@@ -10384,6 +10407,7 @@ def _check_mcp_audit_log(failures, verbose):
     import json
 
     from . import mcp_audit as A
+    from . import mcp_proxy as P
 
     print("mcp audit log:")
 
@@ -10437,7 +10461,7 @@ def _check_mcp_audit_log(failures, verbose):
                    event(A.TOOLS_ADVERTISED, forwarded=["alpha"], removed=["beta"]),
                    event(A.CALL_FORWARDED, tool="alpha"),
                    event(A.CALL_REFUSED, tool="beta"),
-                   event(A.MESSAGE_DROPPED, reason="late response to cancelled c2s id 1"),
+                   event(A.MESSAGE_DROPPED, reason=P.DROP_LATE_CANCELLED),
                    term())
     _check("audit_log.an_ordinary_gated_run_reads_clean",
            read(ordinary).clean,
@@ -10534,15 +10558,27 @@ def _check_mcp_audit_log(failures, verbose):
            f"id across restarts produces, where the SECOND run's clean terminator would be "
            f"read as the first run's: {codes(doubled)}", failures, verbose)
 
-    reordered = log(spawn(), start(), term())
-    _check("audit_log.nothing_may_be_written_ahead_of_the_start_record",
-           "records_precede_start" in codes(reordered)
-           and read(log(start(), spawn(), term())).clean,
-           f"the start record is written BEFORE the child is spawned and therefore before a "
-           f"single byte is forwarded (§10.5), which is what makes `logged a start` and "
-           f"`spawned nothing` a clean partition. A line ahead of it in an append-only file is "
-           f"a writer that buffered or reordered, and the partition no longer holds: "
-           f"{codes(reordered)}", failures, verbose)
+    ordering = {
+        "spawn,start,terminator": log(spawn(), start(), term()),
+        "start,terminator,spawn": log(start(), term(), spawn()),
+        "start,spawn,terminator,event":
+            log(start(), spawn(), term(), event(A.CALL_FORWARDED, tool="alpha")),
+        "start,event,spawn,terminator":
+            log(start(), event(A.CALL_FORWARDED, tool="alpha"), spawn(), term()),
+    }
+    misordered = {seq: codes(text) for seq, text in ordering.items()
+                  if f"records_out_of_order:{seq}" not in codes(text)}
+    _check("audit_log.the_terminator_is_last_and_the_start_is_first",
+           not misordered and read(log(start(), spawn(), term())).clean
+           and read(log(start(), spawn(), event(A.CALL_FORWARDED, tool="alpha"),
+                        term())).clean,
+           f"checking only that the start came first accepted a TERMINATOR THAT DOES NOT "
+           f"TERMINATE — work recorded after the record on which the absence rule, the no-heal "
+           f"rule and every completion fact rest. The grammar is one ordering, so it is checked "
+           f"as one: `start`, an optional `spawn`, the events, and the terminator last. Both "
+           f"legal sequences are in the arm because a reader that rejected every order would "
+           f"satisfy all four cases above: {misordered or 'all four caught'}",
+           failures, verbose)
 
     # ---- §10.6's guarantee, read back off the log --------------------------------------
     both_ways = {
@@ -10588,6 +10624,12 @@ def _check_mcp_audit_log(failures, verbose):
             log(start(), spawn(), event(A.CALL_FORWARDED, tool="alpha", reason="why"), term()),
         "event_name:0:forwarded:0":
             log(start(), spawn(), event(A.TOOLS_ADVERTISED, forwarded=[7], removed=[]), term()),
+        # Free prose where a closed code belongs. The drop reason's SOURCE quotes the request
+        # id, which is an arbitrary value the peer chose, and this file is archived.
+        "event_reason:0:'late response to cancelled c2s id 1'":
+            log(start(), spawn(),
+                event(A.MESSAGE_DROPPED, reason="late response to cancelled c2s id 1"),
+                term()),
     }
     caught = {}
     for code, text in hostile.items():

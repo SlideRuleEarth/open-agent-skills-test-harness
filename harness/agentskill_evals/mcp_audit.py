@@ -66,7 +66,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from .mcp_proxy import ANOMALY_KINDS, IMPLEMENTED_VERSIONS
+from .mcp_proxy import ANOMALY_KINDS, DROP_REASONS, IMPLEMENTED_VERSIONS
 
 # ---------------------------------------------------------------------------------------
 # Axis 1 — the triggers (§10.5.1)
@@ -672,6 +672,15 @@ LINE_EVENT = "event"
 LINE_TERMINATOR = "terminator"
 LINE_KINDS = frozenset({LINE_START, LINE_SPAWN, LINE_EVENT, LINE_TERMINATOR})
 
+# THE PER-INSTANCE GRAMMAR, as a rank per kind: `start`, then an optional `spawn`, then the
+# events, and the terminator LAST. Checking only that the start came first accepted `start ->
+# terminator -> spawn` and `start -> spawn -> terminator -> event` as clean, which is a
+# terminator that does not terminate — the record on which the absence rule, the no-heal rule
+# and every completion fact rest, with work recorded after it (review, PR #103). A rank
+# comparison rather than a hand-written state machine because the grammar IS an ordering, and
+# "the sequence is sorted" cannot disagree with itself about a case.
+_LINE_ORDER = {LINE_START: 0, LINE_SPAWN: 1, LINE_EVENT: 2, LINE_TERMINATOR: 3}
+
 # On every line, whatever its kind. `ts` is here because §10.7's whole claim for this log is
 # that it is wire-level evidence "per call, with the server, the tool, whether it was allowed
 # or refused, and WHEN" — a record with no time is not that.
@@ -708,7 +717,7 @@ _EVENT_PAYLOAD_KEYS = frozenset(k for keys in _EVENT_FIELDS.values() for k in ke
 # report the keys the record layer is reading.
 _LINE_FIELDS = {
     LINE_START: (("server", "pid"), ("fault_point",)),
-    LINE_SPAWN: (("child_pid", "child_pgid"), ()),
+    LINE_SPAWN: (("child_pid", "child_pgid"), ("guardian_pid",)),
     LINE_TERMINATOR: (("observed",),
                       ("triggers", "outcomes", "facts", "fired", "child_status")),
 }
@@ -803,12 +812,15 @@ def parse_log(text: str) -> tuple[tuple[Instance, ...], tuple[str, ...]]:
     for instance_id in order:
         entry = grouped[instance_id]
         kinds = entry["kinds"]
-        if LINE_START in kinds and kinds[0] != LINE_START:
+        ranks = [_LINE_ORDER[k] for k in kinds]
+        if ranks != sorted(ranks):
             # The start record is written BEFORE the child is spawned and therefore before a
-            # single byte is forwarded (§10.5), so anything ahead of it in an append-only file
-            # is a writer that buffered or reordered — and the boundary that partitions "logged
-            # a start" from "spawned nothing" no longer holds.
-            entry["problems"].append("records_precede_start")
+            # single byte is forwarded (§10.5), and the terminator is written LAST, after every
+            # step of the teardown. An append-only file that disagrees is a writer that buffered
+            # or reordered — and then neither boundary holds: the partition between "logged a
+            # start" and "spawned nothing" at one end, and at the other a terminator whose
+            # completion facts describe steps that had not happened when it was written.
+            entry["problems"].append(f"records_out_of_order:{','.join(kinds)}")
         instances.append(Instance(instance_id, entry[LINE_START], entry[LINE_SPAWN],
                                   entry[LINE_TERMINATOR], tuple(entry["events"]),
                                   tuple(entry["problems"])))
@@ -914,8 +926,11 @@ def _event_problems(events: tuple[dict, ...], allowed: frozenset[str]) -> list[s
             elif kind == CALL_REFUSED and tool in allowed:
                 problems.append(f"on_list_call_refused:{tool}")
         else:
+            # A CLOSED SET, imported rather than re-derived. Free prose here is how an id or a
+            # method name the peer chose ends up in an archived artifact, and a reader that
+            # accepted any non-empty string would never say so.
             reason = event.get("reason")
-            if not isinstance(reason, str) or not reason:
+            if not isinstance(reason, str) or reason not in DROP_REASONS:
                 problems.append(f"event_reason:{i}:{reason!r}")
     return problems
 

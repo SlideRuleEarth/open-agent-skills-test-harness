@@ -80,6 +80,29 @@ driven_triggers: set[str] = set()
 driven_outcomes: set[str] = set()
 
 
+def reap_group(record, nonce) -> None:
+    """Kill a group a case deliberately left alive, from the identity IT reported.
+
+    Nonce-bound and never discovered: the process announces its own pgid, the driver checks the
+    nonce it supplied is echoed back, and only then signals. Anything else is the driver
+    deciding for itself which processes belonged to the run, which is how a cleanup ends up
+    reaching further than what it created (§4). It also refuses its own group and its parent's.
+
+    Called from `finally` on EVERY path, because the exact failure or mutation a case is
+    testing is the one most likely to skip a cleanup written inline — and a test for leaked
+    credential-bearing processes that leaks one has picked the wrong side of its own point.
+    """
+    if not isinstance(record, dict) or record.get("nonce") != nonce:
+        return
+    pgid = record.get("pgid")
+    if not isinstance(pgid, int) or pgid in (os.getpgid(0), os.getpgid(os.getppid())):
+        return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
 def check(label, cond, detail="") -> bool:
     global ran
     ran += 1
@@ -279,13 +302,26 @@ def run(*, command=None, args=None, tools=("echo",), env=None, fault=None, send=
             # A case that supplied its own `stdin_fd` has no pipe to write down, and reaching
             # `None.write` there would report an AttributeError from the driver in place of
             # whatever the case was about.
-            for msg in (send if proc.stdin is not None else ()):
-                payload = msg if isinstance(msg, (str, bytes)) else json.dumps(msg)
-                if isinstance(payload, str):
-                    payload = payload.encode("utf-8")
-                proc.stdin.write(payload + b"\n")
+            # `reply_per_send` is a COUNT as well as a switch: `True` reads one reply per
+            # send, `False` reads none, and an integer reads for the first N — which is what a
+            # case needs when it has to complete a handshake and then get a second request onto
+            # the wire WITHOUT waiting for its answer, because the answer is the thing under
+            # test and is never coming.
+            _await = len(send) if reply_per_send is True else int(reply_per_send or 0)
+            for _i, msg in enumerate(send if proc.stdin is not None else ()):
+                # BYTES GO VERBATIM; anything else is framed. A helper that appended a
+                # newline to raw bytes turned the partial-line case into a COMPLETE malformed
+                # line, so the check passed on `decide()` refusing the JSON rather than on the
+                # residue path it was written for — the arm and the defect agreeing with each
+                # other one level away from where the defect lives (review, PR #103).
+                if isinstance(msg, bytes):
+                    payload = msg
+                else:
+                    text = msg if isinstance(msg, str) else json.dumps(msg)
+                    payload = text.encode("utf-8") + b"\n"
+                proc.stdin.write(payload)
                 proc.stdin.flush()
-                if not close_stdout and reply_per_send:
+                if not close_stdout and _i < _await:
                     # BOUNDED. A bare `readline()` blocks forever against a proxy that neither
                     # answers nor exits, and `proc.wait(timeout=...)` below is no help because
                     # it has not been reached yet — so the file's claim to run everything behind
@@ -347,6 +383,12 @@ def reply_to(replies, req_id):
         if isinstance(msg, dict) and msg.get("id") == req_id:
             return msg
     return None
+
+
+def proxy_drop_code() -> str:
+    """Imported rather than restated: a copy of a closed set can disagree with it silently."""
+    from agentskill_evals.mcp_proxy import DROP_LATE_CANCELLED
+    return DROP_LATE_CANCELLED
 
 
 def req(mid, method, **params):
@@ -414,6 +456,72 @@ for label, line in (("a JSON-RPC batch array", '[{"jsonrpc":"2.0","id":1,"method
     check(f"{label} is an anomaly, not traffic",
           bad.triggers[:1] == [A.PROTOCOL_ANOMALY] and not bad.verdict.clean
           and bad.returncode == 1, bad)
+
+
+# FRAMING IS PART OF VALIDATION, and each of these was once waved through by a different guard
+# written for a different purpose. All three produced a clean verdict for a stream that had gone
+# wrong, and the third forwarded bytes the peer never sent (review, PR #103).
+_ping = json.dumps(req(1, "ping")).encode()
+_framing = {
+    "a blank line is not a message, and is terminal": b"\n" + _ping + b"\n",
+    "bytes that are not UTF-8 are not a message, and are terminal":
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":'
+        b'{"name":"echo","arguments":{"text":"\xff\xfe"}}}\n',
+    "a partial line at EOF is not a message, and is terminal": _ping + b'\n{"jsonrpc":',
+    "a JSON extension constant is not a message, and is terminal":
+        b'{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":Infinity}}\n',
+}
+for _label, _bytes in _framing.items():
+    _framed = run(send=[_bytes], reply_per_send=False)
+    check(_label,
+          A.PROTOCOL_ANOMALY in _framed.triggers
+          and _framed.terminator["triggers"][_framed.triggers.index(A.PROTOCOL_ANOMALY)]
+              .get("anomaly") == "unparseable"
+          and not _framed.verdict.clean, _framed)
+
+# ...and the drain is held to the same rules, which is what "the shutdown is not a licence to
+# pump bytes unfiltered" has to mean in practice. Two lines arrive after stdin closes: a
+# malformed one and a perfectly good notification behind it.
+_late = ("import sys\n"
+         "for _ in sys.stdin: pass\n"
+         "sys.stdout.write('not json at all\\n')\n"
+         "sys.stdout.write('{\"jsonrpc\":\"2.0\",\"method\":\"notifications/late\"}\\n')\n"
+         "sys.stdout.flush()\n")
+_drained = run(args=["-c", _late])
+check("a malformed frame during the drain stops it, and what followed is not forwarded",
+      _drained.triggers == [A.CLIENT_EOF, A.PROTOCOL_ANOMALY]
+      and not any("notifications/late" in r for r in _drained.replies)
+      and not _drained.verdict.clean,
+      f"during a teardown there is ALREADY a trigger, so `if self.triggers` stops nothing: "
+      f"{_drained} replies={_drained.replies}")
+
+
+# THE DOCUMENTED RACE, driven end to end. A cancellation may arrive after the server has already
+# answered, and the client is told to ignore the response — so the proxy drops it one hop
+# earlier. This is the only path that writes a `message_dropped` event, and without a case for
+# it the rule that the event carries a CLOSED CODE rather than the decision layer's prose was
+# checked against synthetic records only (review, PR #103).
+_slow = ("import json, sys, time\n"
+         "def out(m):\n"
+         "    sys.stdout.write(json.dumps(m) + '\\n'); sys.stdout.flush()\n"
+         "for line in sys.stdin:\n"
+         "    msg = json.loads(line)\n"
+         "    if msg.get('method') == 'initialize':\n"
+         "        out({'jsonrpc': '2.0', 'id': msg['id'], 'result': {\n"
+         "            'protocolVersion': '2025-11-25', 'capabilities': {},\n"
+         "            'serverInfo': {'name': 'slow', 'version': '1'}}})\n"
+         "    elif msg.get('method') == 'tools/list':\n"
+         "        time.sleep(0.6)\n"
+         "        out({'jsonrpc': '2.0', 'id': msg['id'], 'result': {'tools': []}})\n")
+_raced = run(args=["-c", _slow], reply_per_send=1, settle=1.5,
+             send=[INIT, req(2, "tools/list"),
+                   {"jsonrpc": "2.0", "method": "notifications/cancelled",
+                    "params": {"requestId": 2}}])
+check("a late response to a cancelled request is dropped, and recorded as a CODE",
+      [e.get("reason") for e in _raced.events(A.MESSAGE_DROPPED)]
+      == [proxy_drop_code()] and _raced.verdict.clean,
+      f"the reason's source quotes the request id, which is an arbitrary wire value, and this "
+      f"file is archived: {_raced.events(A.MESSAGE_DROPPED)} {_raced}")
 
 
 # ---------------------------------------------------------------------------------------
@@ -546,12 +654,17 @@ check(f"{A.SHUTDOWN_CHILD_KILLED}: forced termination is the standard escalation
 # A helper OUTSIDE the child's process group, holding the child's stdout. The group signal
 # cannot reach it, so the drain never sees EOF — an unaccounted-for process holding a pipe from
 # a credential-bearing server, which is exactly what a clean verdict must not certify.
+_stuck_nonce = uuid.uuid4().hex
 stuck_channel = Channel("stuck")
 try:
     stuck = run(args=[TARGET], tools=("alpha",), server="target", channels=(stuck_channel,),
-                env={"PT_HELPER_FD": str(stuck_channel.writer), "PT_NONCE": "stuck",
+                env={"PT_HELPER_FD": str(stuck_channel.writer), "PT_NONCE": _stuck_nonce,
                      "PT_HELPER_ESCAPE": "1", "PT_HELPER_STDOUT": "1"})
 finally:
+    # This helper called `setsid`, so NOTHING the proxy did could reach it and it would
+    # otherwise run to its own ceiling — the verifier leaking exactly the kind of process it
+    # exists to detect (review, PR #103).
+    reap_group(stuck_channel.record(GRACE), _stuck_nonce)
     stuck_channel.close()
 _stuck_anomaly = [o for o in stuck.terminator.get("outcomes", [])
                   if o.get("kind") == A.SHUTDOWN_ANOMALY]
@@ -573,12 +686,21 @@ check("...and the escalation that ran alongside it is recorded on its own axis e
 # exists at all (§10.9). `fact=fail` records the step's OWN typed outcome and no firing,
 # because a record carrying both would say the step was attempted and failed AND that it never
 # ran, and §10.5.1 rejects exactly that.
-for fact, outcome in ((A.DRAIN_ENDED, A.SHUTDOWN_READ_FAILED),
-                      (A.CHILD_REAPED, A.SHUTDOWN_REAP_FAILED),
-                      (A.GROUP_TERMINATED, A.SHUTDOWN_GROUP_KILL_FAILED)):
+# The expected outcome LIST, not just membership. A child that could not be reaped is still in
+# its own process group, so step 4's confirmation cannot answer "is the group empty?" and says
+# so — a real consequence rather than noise, and one worth pinning: it is the case where two
+# facts fail for one cause, and a record naming only one of them would be describing less than
+# happened.
+_injections = {
+    A.DRAIN_ENDED: [A.SHUTDOWN_READ_FAILED],
+    A.CHILD_REAPED: [A.SHUTDOWN_REAP_FAILED, A.SHUTDOWN_GROUP_KILL_FAILED],
+    A.GROUP_TERMINATED: [A.SHUTDOWN_GROUP_KILL_FAILED],
+}
+for fact, expected in _injections.items():
+    outcome = expected[0]
     injected = run(send=[INIT], fault=f"{fact}={IO.FAIL}")
     check(f"{outcome}: recorded, paired to {fact}, and anomalous",
-          injected.outcomes == [outcome]
+          injected.outcomes == expected
           and injected.state(fact) == A.FAILED
           and (injected.facts[fact] or {}).get("cause") == outcome
           and not injected.only.terminator.get("fired")
@@ -814,8 +936,81 @@ try:
               f"a non-EOF that never becomes EOF is a reader that never observed anything: "
               f"{swept}")
 finally:
+    # UNCONDITIONALLY, and not inside the branch above. The group is left alive on purpose here,
+    # so a case that fails its cross-check — or a mutation that makes it fail — must not be the
+    # one path where nothing cleans it up.
+    reap_group(child_rec, nonce)
+    reap_group(helper_rec, nonce)
     child_chan.close()
     helper_chan.close()
+
+# ---------------------------------------------------------------------------------------
+# 8. What the guardian covers, and what a process group cannot (§10.5, §10.6)
+# ---------------------------------------------------------------------------------------
+section("the guardian, and the limit of a process group (§10.5):")
+
+
+def orphan_case(*, kill: bool):
+    """Start an instance whose server outlives its stdin, then end the proxy two ways.
+
+    The child is deliberately un-killable by the ordinary escalation — it ignores SIGTERM and
+    lingers — so its process group is still there when the proxy goes away. What happens next
+    is the whole case: a proxy that ran its teardown terminated the group itself, and one that
+    was SIGKILLed never got to, which is what the guardian is for.
+    """
+    nonce = uuid.uuid4().hex
+    channel = Channel("orphan")
+    found = run(args=[TARGET], tools=("alpha",), server="target", channels=(channel,),
+                env={"PT_NONCE": nonce, "PT_CHILD_FD": str(channel.writer),
+                     "PT_IGNORE_TERM": "1", "PT_LINGER": "30"},
+                kill_after=0.0 if kill else None, settle=0.6)
+    return nonce, channel, found
+
+
+for _label, _kill in (("a proxy SIGKILLed before its teardown", True),
+                      ("a proxy that ran its teardown", False)):
+    _nonce, _chan, _orphaned = orphan_case(kill=_kill)
+    try:
+        _rec = _chan.record(DEADLINE)
+        _spawn = (_orphaned.only.spawn or {}) if _orphaned.only else {}
+        check(f"{_label}: the child announced itself and a guardian was recorded",
+              isinstance(_rec, dict) and _rec.get("nonce") == _nonce
+              and A.is_json_int(_spawn.get("guardian_pid")), (_rec, _spawn))
+        # NOT GATED behind the check above, deliberately. The two say different things — one
+        # that the mechanism was set up, one that it worked — and nesting the second inside the
+        # first means removing the guardian entirely reddens only the weaker claim. THE SAME
+        # MONOTONE EVIDENCE the teardown cases use, pointed at the one ending that has no
+        # teardown to observe: `start_new_session=True` gives step 4 a group to signal and is
+        # also what puts that group out of reach of every ancestor's group kill, so without a
+        # guardian this channel stays open and a credential-bearing server outlives the run.
+        check(f"{_label}: nothing from the instance is left alive",
+              _chan.at_eof(DEADLINE),
+              f"child group {_spawn.get('child_pgid')} still holds the channel; "
+              f"detection is not cleanup")
+    finally:
+        reap_group(_rec if isinstance(_rec, dict) else None, _nonce)
+        _chan.close()
+
+# THE LIMIT, MEASURED RATHER THAN ASSUMED. A descendant that calls `setsid()` leaves the child's
+# process group, and no group signal can reach it afterwards — nor can the guardian, which
+# signals that same group. This case exists so the boundary of the guarantee is a checked fact
+# and not a sentence in a design document: if containment is ever widened, it fails and has to
+# be rewritten, which is the only way a documented limit stays honest (review, PR #103).
+_escape_nonce = uuid.uuid4().hex
+_escape_chan = Channel("escaped")
+try:
+    _escaped = run(args=[TARGET], tools=("alpha",), server="target", channels=(_escape_chan,),
+                   env={"PT_NONCE": _escape_nonce, "PT_HELPER_FD": str(_escape_chan.writer),
+                        "PT_HELPER_ESCAPE": "1"})
+    _escape_rec = _escape_chan.record(DEADLINE)
+    check("a descendant that leaves the process group survives a clean run, and is not reported",
+          _escaped.verdict.clean and _escaped.state(A.GROUP_TERMINATED) == A.DONE
+          and isinstance(_escape_rec, dict) and _escape_rec.get("nonce") == _escape_nonce
+          and not _escape_chan.at_eof(GRACE),
+          f"§10.6 claims a process GROUP, and this is exactly where that stops: {_escaped}")
+finally:
+    reap_group(_escape_rec if isinstance(_escape_rec, dict) else None, _escape_nonce)
+    _escape_chan.close()
 
 print()
 # SELF-REPORTED, for the reason the selftest's arm count is: a total kept by hand in

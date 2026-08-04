@@ -151,6 +151,12 @@ ANOMALY_KINDS = frozenset({
 # Why a request id is spent. Both spend it permanently; they differ in what a LATER response
 # on that id means — a documented race after a cancellation, a protocol violation after an
 # answer (§10.4).
+# The closed set of reasons a message may be DROPPED. The audit log records the code and never
+# the prose: the prose names ids and methods, which are arbitrary values the peer chose, and
+# §10.7's contract for that file is enumerated reasons rather than message detail.
+DROP_LATE_CANCELLED = "late_response_to_cancelled"
+DROP_REASONS = frozenset({DROP_LATE_CANCELLED})
+
 SPENT_BY_CANCEL = "cancelled"
 SPENT_BY_ANSWER = "answered"
 
@@ -186,6 +192,18 @@ RESULT = "result"
 ERROR = "error"
 
 
+def _refuse_constant(name: str):
+    """`NaN`, `Infinity` and `-Infinity` are not JSON, so they do not reach the decision layer.
+
+    Python's decoder accepts all three by default, as a documented EXTENSION — and §10.4
+    already says they stay refused, so without this the rule held only where something happened
+    to look: `valid_request_id` rejects a NaN id because NaN is never equal to itself and so
+    could never be retired, and nothing at all checked a NaN anywhere else in a message. A rule
+    enforced at one field is a rule about that field (review, PR #103).
+    """
+    raise ValueError(f"{name} is a Python extension, not JSON, and is not a legal MCP value")
+
+
 def parse_line(line: str) -> dict | Anomaly:
     """One wire line to a JSON object, or an anomaly.
 
@@ -196,7 +214,7 @@ def parse_line(line: str) -> dict | Anomaly:
     malformed.
     """
     try:
-        msg = json.loads(line)
+        msg = json.loads(line, parse_constant=_refuse_constant)
     except (json.JSONDecodeError, ValueError) as exc:
         return Anomaly(UNPARSEABLE, f"line is not JSON: {exc}")
     if isinstance(msg, list):
@@ -955,7 +973,8 @@ class Drop:
     """
 
     msg: dict
-    reason: str
+    code: str                        # from DROP_REASONS — what the audit log records
+    detail: str                      # for stderr only; it quotes ids the peer chose
 
 
 @dataclass(frozen=True)
@@ -1205,7 +1224,8 @@ def _decide_response(msg: dict, shape: str, direction: str, allowed: frozenset[s
             # whether another follows — the server is the untrusted side of this boundary — and
             # an id released on the first would let the second correlate to whatever reopened
             # it (review, PR #100). So every response on a cancelled id drops, forever.
-            return Drop(msg, f"late response to cancelled {origin} id {req_id!r}")
+            return Drop(msg, DROP_LATE_CANCELLED,
+                        f"late response to cancelled {origin} id {req_id!r}")
         if spent == SPENT_BY_ANSWER:
             # A SECOND response to a request that was already answered. Nothing licenses this:
             # the cancellation race is documented and so is dropped, but "the server sent two
