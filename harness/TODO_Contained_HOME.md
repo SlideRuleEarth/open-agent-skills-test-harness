@@ -289,13 +289,20 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 509 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 531 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 harness/tools/mutate_mcp.py                           # 181/181 production + 2/2 instrument
+python3 harness/tools/mutate_mcp.py                           # 211/211 production + 2/2 instrument + 8/8 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 278 checks
 git diff --check
 ```
+
+**The mutation suite now runs TWO suites, chosen by the file each mutation perturbs.**
+`agentskill_evals/` is proven by the selftest; `fixtures/` and `tools/` are proven by
+`verify_mcp_fixtures.py`, and those are the `F*` ids, counted apart from production for the
+same reason `I*` is — they perturb an instrument rather than the code under test. Running
+`mutate_mcp.py` therefore covers the third line above as well, and its three totals are three
+different claims. Do not add them together.
 
 **The arm count is now self-reported** — the selftest ends with `SELFTEST PASSED — N arms`.
 It used to live here as a hand-maintained literal and was stale for two PRs running, because
@@ -535,6 +542,16 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   rule is sometimes right, but the burden is to show the deviation is not an instance of the
   thing the rule exists to forbid, and "it is safer" does not discharge it: unsound in the
   strict direction is still unsound.
+- **A TOTALITY assertion over a membership test is a tautology.** The first cut of the audit
+  arms tried to pin "every enumerated reason has a verdict" as `all(is_clean(r) or r not in
+  CLEAN_REASONS for r in EVERY_REASON)` — which is `P or not P` once you notice `is_clean(r)`
+  IS `r in CLEAN_REASONS`, so it passes against any set whatsoever, including an empty one.
+  Not the precedence trap above; the disjunction simply restates the function's definition.
+  Where a classification is a set lookup, totality is free and therefore not worth asserting —
+  what is worth asserting is the **exact set**, because the failure that matters is a sixth
+  member appearing, and that is the direction nothing announces: a cell that now passes where
+  it used to fail. Two arms, because the two failures are different: the set stated exactly,
+  and an unenumerated reason classifying as an anomaly.
 - **A mutation whose defect is a CRASH needs an arm that can catch one.** An unhashable id
   reaching `dict.pop` raises several frames from anything that could log it — which is the
   defect — but an arm that lets it propagate turns the mutation into "failed, but NOT via",
@@ -821,9 +838,11 @@ ABA fix and its route to `parallel_safe_config = True`.
   **Designed in `DESIGN_MCP_Support.md` §10 (2026-07-29); being built.** stdio only in the
   first cut — remote `tools:` stays refused. Build order: ~~probe **C3-0**~~ →
   ~~probe **C3-1**~~ → ~~a **dual-era mode for `fixtures/echo_mcp_server.py`** (#98)~~ →
-  ~~the **decision layer** + its arms, wired to nothing (#100)~~ → the **I/O half** (spawn,
-  the two pumps, `SIGTERM`/`SIGINT` handlers, §10.5's shutdown, the audit log) plus a
-  wire-level driver → the adapter integration that unlocks `tools:`.
+  ~~the **decision layer** + its arms, wired to nothing (#100)~~ →
+  ~~the **audit record types**, the structural validator and `verdict()`
+  (`agentskill_evals/mcp_audit.py`), written before the code that produces them~~ → the
+  **I/O half** (spawn, the two pumps, `SIGTERM`/`SIGINT` handlers, §10.5's shutdown, writing
+  the audit log) plus a wire-level driver → the adapter integration that unlocks `tools:`.
   Everything before the last slice cannot affect any run, which is the point: this is harness
   code in the request path of every gated cell.
   **The I/O half starts from §10.5.1, written before its code**: every way an instance can end,

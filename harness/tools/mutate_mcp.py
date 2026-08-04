@@ -6,8 +6,16 @@ named arm MUST go red. An arm that stays green while its defect is present is de
 
 Run it: `python3 harness/tools/mutate_mcp.py` (needs `harness/.venv`). It copies the tree to
 a tempdir, checks the baseline passes, then applies one mutation at a time and re-runs the
-selftest. Exit 0 only when every mutation is caught BY ITS NAMED ARM — "some arm failed" is
-not the same claim.
+suite that owns the mutated file. Exit 0 only when every mutation is caught BY ITS NAMED ARM
+— "some arm failed" is not the same claim.
+
+TWO SUITES, chosen by the file the mutation perturbs rather than declared per entry.
+`agentskill_evals/` is proven by the selftest; `fixtures/` and `tools/` are proven by
+`tools/verify_mcp_fixtures.py`, which is the only thing that drives them. Deriving the suite
+from the target rather than adding a sixth field is the same argument `_classify` already
+makes about the id prefix: a fact that can be stated independently will eventually be stated
+wrongly, and here the wrong suite means a mutation reported as uncaught because the program
+that would have caught it never ran.
 
 Three failure modes it reports, all of which have happened and none of which mean the code
 is fine:
@@ -27,10 +35,18 @@ Adding a mutation: keep it to the smallest edit that reintroduces the real defec
 it at the one arm that should notice. If you cannot name that arm, the arm does not exist yet
 and writing it is the actual work.
 
-TWO ID PREFIXES, and they are counted and reported separately.
+THREE ID PREFIXES, and they are counted and reported separately.
 
   M<n>   a PRODUCTION mutation — the normal case, and what "N/N caught" is a claim about.
          It perturbs the code under test and asks whether the instrument notices.
+  F<n>   a FIXTURE-or-TOOL mutation, proven by `verify_mcp_fixtures.py`. These perturb an
+         instrument and ask whether that instrument's own verifier notices — the same
+         epistemics as `I*` rather than `M*`, so they are counted apart from production for
+         the same reason. What makes them worth having, where mutating the selftest is not,
+         is that the verifier is a SEPARATE program from what it checks: `verify_mcp_fixtures`
+         does not import the shim, it drives it over pipes. Nothing here is circular, and the
+         gap they close is real — until now the fixtures and probes carried no mutation
+         coverage at all, so every assertion in that verifier was named but unproven.
   I<n>   an INSTRUMENT mutation — it perturbs `selftest.py` itself. Almost always the wrong
          thing to write, because mutating the test to prove the test fails is circular and
          establishes nothing about the code. It is legitimate only where the selftest has a
@@ -42,15 +58,17 @@ TWO ID PREFIXES, and they are counted and reported separately.
          the test — the separate heading in the summary exists so this decision is made in
          the open rather than by quietly appending to the list.
 
-The prefix is NOT taken on trust: `_classify` refuses to start if an `I*` targets anything
-but SELFTEST, or an `M*` targets it. A convention relating two independent facts holds only
-until someone types the wrong letter, and either direction miscounts exactly what the split
-reporting exists to keep straight.
+The prefix is NOT taken on trust: `_classify` derives the class from the target file and
+refuses to start unless the id agrees. A convention relating two independent facts holds only
+until someone types the wrong letter, and every direction miscounts exactly what the split
+reporting exists to keep straight. It also refuses a mutation aimed at this file: mutating the
+mutation runner to see whether the mutation runner notices is the circularity the `I*` heading
+exists to keep rare, with none of the justification.
 
-Every result line carries the wall time of the selftest run that produced it, and the summary
-names the slowest. Read those against the `baseline:` line: a mutation taking several times
-the baseline is a defect that costs runtime rather than one that reddens an arm, and it is
-the only notice anyone gets before it grows past `_SELFTEST_TIMEOUT` and reports as a hang.
+Every result line carries the wall time of the suite run that produced it, and the summary
+names the slowest. Read those against the `baseline:` lines: a mutation taking several times
+its suite's baseline is a defect that costs runtime rather than one that reddens an arm, and
+it is the only notice anyone gets before it grows past `_SUITE_TIMEOUT` and reports as a hang.
 """
 import re
 import shutil
@@ -75,12 +93,23 @@ AGY = "agentskill_evals/adapters/antigravity.py"
 SCHEMA = "agentskill_evals/schema.py"
 CLI = "agentskill_evals/cli.py"
 PROXY = "agentskill_evals/mcp_proxy.py"
+AUDIT = "agentskill_evals/mcp_audit.py"
 # The suite mutates PRODUCTION code and asks whether the selftest notices. This one target
 # is the exception, and only for the arm counter: that counter is a feature of the selftest
 # whose failure mode (it stops counting, every arm still passes, the banner still says
 # PASSED) cannot be reached from anywhere else. Adding other mutations here would be testing
 # the test rather than the code, which is not what this tool is for.
 SELFTEST = "agentskill_evals/selftest.py"
+# Instruments, proven by `verify_mcp_fixtures.py` rather than by the selftest — nothing in
+# `agentskill_evals` imports them, so no arm can reach them and every `F*` below would report
+# MISSED if it were routed to the selftest. See `_suite_for`.
+SHIM = "fixtures/probe_era_mcp_server.py"
+ECHO = "fixtures/echo_mcp_server.py"
+PIPEPROBE = "tools/probe_mcp_pipelining.py"
+# Not a target, the second suite itself. A mutation aimed here would be asking the verifier
+# whether it notices being broken.
+VERIFIER = "tools/verify_mcp_fixtures.py"
+SELF = "tools/mutate_mcp.py"
 
 MUTATIONS = [
     ("M1-witness-fails-any-server", CLAUDE,
@@ -1364,6 +1393,240 @@ MUTATIONS = [
        "            print('error: --tag does not select a scenario', file=sys.stderr)\n"
        "            return 2\n")),
      "cli.tag_with_config_is_refused_not_ignored"),
+
+    # ---- C3's audit record and its verdict (§10.5.1) -------------------------------------
+    # Every one of these reintroduces a defect that survived a round of review on the design
+    # itself, where prose held it without complaining. They are shape defects, and the point of
+    # writing the types before the I/O half is that a shape defect reddens an arm in seconds.
+    ("M184-is-clean-defaults-to-clean", AUDIT,
+     "    return reason in CLEAN_REASONS",
+     "    return True",
+     "audit.an_unenumerated_reason_is_an_anomaly_not_a_pass"),
+    # A reason that is clean without being a reason at all. Nothing else notices: it forgives
+    # nothing until the day something is spelled that way, and then it forgives silently.
+    ("M212-a-clean-reason-that-is-not-an-enumerated-reason", AUDIT,
+     "    CLIENT_EOF, SIGNAL_TERM, SIGNAL_INT,\n",
+     '    CLIENT_EOF, SIGNAL_TERM, SIGNAL_INT, "client_hung_up",\n',
+     "audit.an_unenumerated_reason_is_an_anomaly_not_a_pass"),
+    # A sixth reason forgiven, and this one IS enumerated — so the arm above stays green and
+    # only the exact-set arm notices. The direction that never announces itself: a cell that
+    # now passes where it used to fail.
+    ("M213-a-sixth-reason-quietly-becomes-clean", AUDIT,
+     "    SHUTDOWN_CHILD_KILLED,\n})",
+     "    SHUTDOWN_CHILD_KILLED,\n    SHUTDOWN_READ_FAILED,\n})",
+     "audit.is_clean_is_total_and_has_no_default_clean_branch"),
+    ("M185-empty-record-passes-vacuously", AUDIT,
+     "    if not triggers:",
+     "    if False:",
+     "audit.an_empty_trigger_list_is_malformed_not_vacuously_clean"),
+    ("M186-missing-completion-facts-are-not-checked", AUDIT,
+     ('        if key not in facts:\n'
+      '            problems.append(f"fact_missing:{key}")'),
+     ('        if False:\n'
+      '            problems.append(f"fact_missing:{key}")'),
+     "audit.every_missing_completion_fact_is_caught_individually"),
+    # The spot-check defect in its exact form: four of the five facts are checked, and the
+    # fifth is the one whose step silently never ran.
+    ("M187-completion-facts-checked-all-but-one", AUDIT,
+     ('    for key in FACTS:\n'
+      '        if key not in facts:'),
+     ('    for key in FACTS[:4]:\n'
+      '        if key not in facts:'),
+     "audit.every_missing_completion_fact_is_caught_individually"),
+    ("M188-unknown-fact-names-are-ignored", AUDIT,
+     ('        if key not in FACTS:\n'
+      '            problems.append(f"fact_unknown:{key}")'),
+     ('        if False:\n'
+      '            problems.append(f"fact_unknown:{key}")'),
+     "audit.an_unrecognized_completion_fact_name_is_malformed"),
+    ("M189-unknown-completion-state-accepted", AUDIT,
+     "        if state is None or state not in STATES:",
+     "        if state is None:",
+     "audit.an_unrecognized_completion_state_is_malformed"),
+    ("M190-not-applicable-needs-no-licence", AUDIT,
+     "        if state == NOT_APPLICABLE and latch not in _NOT_APPLICABLE_LICENSED_BY[key]:",
+     "        if False:",
+     "audit.not_applicable_needs_the_trigger_that_licenses_it"),
+    # Step 1 always runs, so a blank here is never justified — not even under `spawn_failed`,
+    # where the other four legitimately are.
+    ("M191-spawn-failure-excuses-the-intake-close", AUDIT,
+     "    INTAKE_CLOSED: frozenset(),",
+     "    INTAKE_CLOSED: frozenset({SPAWN_FAILED}),",
+     "audit.not_applicable_needs_the_trigger_that_licenses_it"),
+    # ...and the same rule from the other side: the `spawn_failed` record is LEGAL, and a
+    # validator that rejects it scores full marks against every other case here.
+    ("M192-legal-spawn-failed-record-rejected", AUDIT,
+     "    CHILD_STDIN_CLOSED: frozenset({SPAWN_FAILED}),",
+     "    CHILD_STDIN_CLOSED: frozenset(),",
+     "audit.spawn_failed_is_structurally_valid_and_anomalous"),
+    ("M193-failed-fact-needs-no-outcome", AUDIT,
+     "        if state == FAILED and not paired:",
+     "        if False:",
+     "audit.failed_and_its_outcome_require_each_other"),
+    ("M194-outcome-needs-no-failed-fact", AUDIT,
+     "        if key is not None and _fact_state(facts, key) != FAILED:",
+     "        if False:",
+     "audit.failed_and_its_outcome_require_each_other"),
+    # `failed` deleted from the state set: a teardown that ran and did not work then has no
+    # legal spelling at all, and the only remaining one — omitting the fact — is malformed.
+    ("M195-a-failed-step-has-no-writeable-state", AUDIT,
+     "STATES = frozenset({DONE, NOT_APPLICABLE, FAILED})",
+     "STATES = frozenset({DONE, NOT_APPLICABLE})",
+     "audit.a_failed_teardown_is_recordable_and_anomalous"),
+    # The coarse key. Any anomaly anywhere licenses `failed` anywhere — which is what a
+    # step-keyed catch-all did, since step 2 owns two facts.
+    ("M196-any-anomaly-licenses-any-failed-fact", AUDIT,
+     "                  or key in anomaly_facts",
+     "                  or bool(anomaly_facts)",
+     "audit.a_shutdown_anomaly_licenses_only_the_fact_it_names"),
+    ("M197-catch-all-need-not-name-its-fact", AUDIT,
+     ('            if entry.get("fact") not in FACTS:\n'
+      '                problems.append'),
+     ('            if False:\n'
+      '                problems.append'),
+     "audit.the_catch_all_reaches_the_facts_with_no_typed_outcome"),
+    # The catch-all narrowed to the facts that already have a typed outcome — which is where
+    # it started, and leaves an exception escaping steps 1 or 2 unrecordable.
+    ("M198-catch-all-does-not-reach-the-untyped-facts", AUDIT,
+     "                  or key in anomaly_facts",
+     "                  or (typed is not None and key in anomaly_facts)",
+     "audit.the_catch_all_reaches_the_facts_with_no_typed_outcome"),
+    ("M199-anomaly-may-name-a-fact-that-did-not-fail", AUDIT,
+     "        if state != FAILED and key in anomaly_facts:",
+     "        if False:",
+     "audit.a_shutdown_anomaly_whose_fact_is_not_failed_is_malformed"),
+    ("M200-reap-claimed-without-its-exit-status", AUDIT,
+     "    if _fact_state(facts, CHILD_REAPED) == DONE and not has_status:",
+     "    if False:",
+     "audit.child_status_travels_with_the_reap_and_only_with_it"),
+    ("M201-exit-status-for-a-child-never-reaped", AUDIT,
+     "    if _fact_state(facts, CHILD_REAPED) != DONE and has_status:",
+     "    if False:",
+     "audit.child_status_travels_with_the_reap_and_only_with_it"),
+    ("M202-fault-firing-need-not-be-configured", AUDIT,
+     "        if key not in configured:",
+     "        if False:",
+     "audit.only_a_fired_fault_point_pairs_with_a_failed_fact"),
+    ("M203-fault-firing-need-not-have-suppressed-anything", AUDIT,
+     "        if _fact_state(facts, key) != FAILED:",
+     "        if False:",
+     "audit.only_a_fired_fault_point_pairs_with_a_failed_fact"),
+    # Arming stops being a verdict input, which is the state the no-op-injection case exists
+    # to reject: a hook armed and silently never fired then produces a passing run.
+    ("M204-arming-a-fault-point-is-forgiven", AUDIT,
+     ("    if _configured(instance):\n"
+      "        out.append(FAULT_POINT_CONFIGURED)"),
+     ("    if False:\n"
+      "        out.append(FAULT_POINT_CONFIGURED)"),
+     "audit.arming_a_fault_point_fails_the_instance_on_its_own"),
+    # ...and the collapse in the other direction: firing counted as a verdict input too, so
+    # the suppressed-step control can no longer say what made it anomalous.
+    ("M205-firing-is-counted-as-well-as-arming", AUDIT,
+     ("    if _configured(instance):\n"
+      "        out.append(FAULT_POINT_CONFIGURED)"),
+     ("    if _configured(instance):\n"
+      "        out.append(FAULT_POINT_CONFIGURED)\n"
+      '    out += [FAULT_POINT_CONFIGURED for _e in instance.get("fired") or []]'),
+     "audit.a_suppressed_step_is_recorded_without_being_excused"),
+    # The verdict as a lookup on the latch rather than a conjunction over everything.
+    ("M206-verdict-reads-only-the-first-reason", AUDIT,
+     "    anomalous = tuple(r for r in reasons(instance) if not is_clean(r))",
+     "    anomalous = tuple(r for r in reasons(instance)[:1] if not is_clean(r))",
+     "audit.each_axis_can_fail_the_instance_on_its_own"),
+    # The cleanup axis dropped from the verdict entirely — a perfect teardown laundering the
+    # fault that happened during it.
+    ("M207-cleanup-outcomes-do-not-reach-the-verdict", AUDIT,
+     ('    out += [e["kind"] for e in instance.get("outcomes") or []\n'
+      '            if isinstance(e, dict) and "kind" in e]'),
+     "    out += []",
+     "audit.a_clean_teardown_never_launders_an_anomalous_one"),
+    # A runner-up trigger treated as a teardown fault, so EOF followed by signal escalation —
+    # ordinary behaviour on half the fleet — fails the cell.
+    ("M208-a-second-clean-trigger-is-treated-as-an-anomaly", AUDIT,
+     ('    out = [e["reason"] for e in instance.get("triggers") or []\n'
+      '           if isinstance(e, dict) and "reason" in e]'),
+     ('    out = [e["reason"] for e in (instance.get("triggers") or [])[:1]\n'
+      '           if isinstance(e, dict) and "reason" in e]\n'
+      '    out += [SHUTDOWN_ANOMALY for _e in (instance.get("triggers") or [])[1:]]'),
+     "audit.two_clean_triggers_do_not_compose_into_a_failure"),
+    # C3-1 measured both of these against conforming CLIs, so failing on either fails a clean
+    # cell — which §10.5 counts as the same defect as forwarding a definition.
+    ("M209-a-measured-clean-outcome-fails-the-cell", AUDIT,
+     "    SHUTDOWN_WRITE_FAILED,\n",
+     "",
+     "audit.the_two_measured_cleanup_outcomes_stay_clean"),
+    ("M210-forced-termination-fails-the-cell", AUDIT,
+     "    SHUTDOWN_CHILD_KILLED,\n",
+     "",
+     "audit.the_two_measured_cleanup_outcomes_stay_clean"),
+    # And the validator that scores full marks by rejecting everything.
+    ("M211-validator-rejects-every-record", AUDIT,
+     "    if not triggers:",
+     "    if True:",
+     "audit.a_clean_instance_is_clean"),
+
+    # ---- F: instruments, proven by tools/verify_mcp_fixtures.py -------------------------
+    # Everything above asks whether the selftest notices a defect in production code. These
+    # ask whether the fixture verifier notices a defect in a fixture or probe — the gap named
+    # in that file's own header ("fixtures carry no selftest arms and are not mutation
+    # targets"), which left 278 named checks with nothing proving any of them can fail. Each
+    # one below reintroduces a defect this repo actually shipped, most of them from #100's
+    # instrument rounds.
+    ("F1-shim-decides-era-by-method", SHIM,
+     '        return "modern", v, "_meta"',
+     '        return "modern", v, "method"',
+     "decided by _meta not method"),
+    # C3-0's load-bearing column is what the two parties SPOKE, not what one of them asked
+    # for. Recording the claim puts `2099-01-01` in the results table for a session that
+    # actually ran on 2025-11-25.
+    ("F2-shim-records-the-clients-guess-as-the-era", SHIM,
+     "    version = claimed if version is None else version",
+     "    version = claimed",
+     "era.version is not the client's guess"),
+    # The §4 lesson in its original form: a failed read swallowed into an empty chunk makes
+    # the main loop log `stdin_eof`, so an instrument failure is published as "this CLI shut
+    # the server down cleanly" — the exact conclusion C3-1 exists to draw.
+    ("F3-shim-reports-a-failed-read-as-clean-eof", SHIM,
+     ("                _rx_failed = True\n"
+      "                _rx_eof = True\n"),
+     ("                _rx_failed = False\n"
+      "                _rx_eof = True\n"),
+     "...and the terminator says so instead of claiming a clean stdin close"),
+    # The identity marker exists because a model can reconstruct a plausible-looking reply
+    # from the server name alone. A constant marker is reconstructible, which is the whole
+    # defect — and it looks correct in every transcript.
+    ("F4-echo-identity-marker-is-a-constant", ECHO,
+     '        return _text(f"{IDENTITY}:{text}" if IDENTITY else text)',
+     '        return _text(f"echo:{text}" if IDENTITY else text)',
+     "...and it is the instance's OWN marker, not a constant"),
+    # Modern envelope shape leaking into legacy replies. A legacy client is entitled to a
+    # result with none of this in it, and the proxy's own era rules are written against a
+    # fixture that keeps them apart.
+    ("F5-echo-sends-modern-shape-to-legacy-clients", ECHO,
+     "    if modern:\n        out = {\"resultType\": \"complete\"}",
+     "    if True:\n        out = {\"resultType\": \"complete\"}",
+     "no resultType leaked into legacy"),
+    # The row's TRUSTWORTHINESS back out of the classifier and into the exit status alone —
+    # the defect that let the probe print the fleet-wide negative over a broken instrument
+    # and then exit 1, having already published the wrong sentence (review, PR #100).
+    ("F6-probe-classifier-ignores-a-dead-reader", PIPEPROBE,
+     '    if row.get("reader_failed"):\n        return INSTRUMENT_FAILED',
+     '    if False:\n        return INSTRUMENT_FAILED',
+     "a row whose shim broke is classified as instrument-failed, not as a measurement"),
+    # Classified correctly and then dropped from the one predicate every caller reads. This
+    # is the same defect one layer downstream, and it is why the two are separate mutations:
+    # F6 alone would leave this path uncovered.
+    ("F7-probe-unmeasured-forgets-instrument-failure", PIPEPROBE,
+     "            if classify(r) in (NO_ERA, UNMEASURED, INSTRUMENT_FAILED)]",
+     "            if classify(r) in (NO_ERA, UNMEASURED)]",
+     "...so it counts as unmeasured"),
+    # A live duplicate counted as post-response reuse: the false positive that reported a
+    # client pipelining `ping(1)` behind a held `initialize(1)` as proof that §10.4 refuses
+    # something the spec permits, when JSON-RPC forbids it outright (review, PR #100).
+    ("F8-probe-counts-a-live-duplicate-as-reuse", PIPEPROBE,
+     "            if key in live:\n                duplicates.append(key)",
+     "            if key in live:\n                reuse.append(key)",
+     "a repeat BEFORE the response is a live duplicate, not that reuse"),
 ]
 
 
@@ -1373,44 +1636,82 @@ MUTATIONS = [
 # helper fed it a real-home overlay), and without a bound it wedges the ENTIRE suite with no
 # output. Bounded, such a mutation is reported as TIMEOUT and the suite carries on — a
 # hanging mutation is a finding, not a reason to lose the other 78.
-_SELFTEST_TIMEOUT = 300
+_SUITE_TIMEOUT = 300
+
+# Each suite says how to run it and how to read a failed check out of its output. The parser
+# is per suite because the two report differently — the selftest prints `[FAIL] name: msg`,
+# the fixture verifier prints `FAIL label  <- detail` — and a runner that guessed one format
+# for both would read every failure of the other as "failed, but NOT via", which reports a
+# working arm as a broken one.
+_SUITES = {
+    "selftest": (("-m", "agentskill_evals", "selftest"), r"\[FAIL\]\s+([^:]+):"),
+    "fixtures": ((VERIFIER,), r"^\s*FAIL\s+(.+?)\s\s<- "),
+}
 
 
-def run(cwd):
-    """Run the selftest in `cwd`. Returns (returncode, output, elapsed_seconds).
+def _suite_for(rel):
+    """Which suite proves a mutation of `rel` — derived from the path, never declared.
+
+    `agentskill_evals/` is reachable from the selftest and nothing else drives it;
+    `fixtures/` and `tools/` are driven only by `verify_mcp_fixtures.py`, which does not
+    import them. Routing by hand would put a sixth field on 180-odd entries whose value is
+    already implied by the second, and a wrong one reports MISSED for a defect whose checker
+    never ran — indistinguishable, in the output, from a decorative check.
+    """
+    return "fixtures" if rel.startswith(("fixtures/", "tools/")) else "selftest"
+
+
+def run(cwd, suite):
+    """Run one suite in `cwd`. Returns (returncode, output, elapsed_seconds).
 
     Elapsed is measured with a monotonic clock so a wall-clock adjustment mid-suite (a run
     this long can straddle one) cannot produce a negative or wildly inflated duration.
     """
+    argv, _ = _SUITES[suite]
     t0 = time.monotonic()
     try:
-        p = subprocess.run(
-            [str(cwd / ".venv/bin/python"), "-m", "agentskill_evals", "selftest"],
-            cwd=cwd, capture_output=True, text=True, timeout=_SELFTEST_TIMEOUT)
+        p = subprocess.run([str(cwd / ".venv/bin/python"), *argv],
+                           cwd=cwd, capture_output=True, text=True, timeout=_SUITE_TIMEOUT)
     except subprocess.TimeoutExpired:
         return 124, "__TIMEOUT__", time.monotonic() - t0
     return p.returncode, p.stdout + p.stderr, time.monotonic() - t0
 
 
+def failed_checks(suite, out):
+    """The named checks that went red, read with the parser belonging to `suite`.
+
+    Extracted rather than inlined so it can be driven on captured output: a parser that
+    silently matches nothing turns every catch into "failed, but NOT via", which looks like
+    a coverage problem and is a tooling one.
+    """
+    return re.findall(_SUITES[suite][1], out, re.MULTILINE)
+
+
 def _classify(mid, rel):
-    """`M` or `I` for one mutation, refusing any entry where the two disagree.
+    """`M`, `I` or `F` for one mutation, refusing any entry where id and target disagree.
 
     The prefix and the target are independent facts, so a convention relating them holds
     only until someone types the wrong letter — at which point an `M` aimed at the selftest
     is counted as production coverage, or an `I` aimed at production is excused from it.
-    Both directions are exactly the miscount the split reporting exists to prevent, so the
-    ID is checked against the file rather than trusted (review, fifth round).
+    Every such direction is exactly the miscount the split reporting exists to prevent, so
+    the ID is checked against the file rather than trusted (review, fifth round).
 
     Raises rather than warns: a suite that reports a wrong total is worse than one that
-    refuses to start, and this runs before the 12-minute baseline so the cost is a second.
+    refuses to start, and this runs before any baseline so the cost is a second.
     """
-    kind = "I" if mid.startswith("I") else "M"
-    if (rel == SELFTEST) != (kind == "I"):
+    if rel in (SELF, VERIFIER):
         raise SystemExit(
-            f"mutation {mid!r} is misclassified: an `I*` id means it perturbs the INSTRUMENT "
-            f"and must target {SELFTEST}, and an `M*` id means it perturbs production and "
-            f"must not. This one is {mid[0]}* against {rel}. Rename it, or retarget it — "
-            f"the two totals are only meaningful while the id and the file agree.")
+            f"mutation {mid!r} targets {rel}, which is a suite rather than something a suite "
+            f"checks. Asking the mutation runner whether it notices being mutated, or the "
+            f"fixture verifier whether it notices, establishes nothing about either.")
+    expected = "I" if rel == SELFTEST else "F" if _suite_for(rel) == "fixtures" else "M"
+    kind = mid[0] if mid[0] in "MIF" else "?"
+    if kind != expected:
+        raise SystemExit(
+            f"mutation {mid!r} is misclassified: {rel} is a {expected}* target — `M*` perturbs "
+            f"production, `I*` perturbs {SELFTEST}, `F*` perturbs a fixture or tool proven by "
+            f"{VERIFIER}. This one is {mid[0]}*. Rename it, or retarget it — the three totals "
+            f"are only meaningful while the id and the file agree.")
     return kind
 
 
@@ -1419,22 +1720,31 @@ def main():
     # Before the baseline, which costs a selftest run: a misclassified entry makes every
     # number below it wrong, so it is worth nothing to discover that at the end.
     kinds = {mid: _classify(mid, rel) for mid, rel, _f, _r, _a in MUTATIONS}
+    suites = {mid: _suite_for(rel) for mid, rel, _f, _r, _a in MUTATIONS}
     tmp = Path(tempfile.mkdtemp(prefix="mutate-mcp-"))
     work = tmp / "harness"
     shutil.copytree(HARNESS, work, symlinks=True,
                     ignore=shutil.ignore_patterns("__pycache__", "artifacts", "build"))
-    rc, out, baseline_s = run(work)
-    if out == "__TIMEOUT__":
-        print(f"BASELINE TIMED OUT after {_SELFTEST_TIMEOUT}s — the unmutated selftest hung, "
-              f"so nothing below would prove anything.")
-        return 1
-    if rc != 0:
-        print("BASELINE FAILED — mutations prove nothing:")
-        print(out[-3000:])
-        return 1
-    # The reference every per-mutation time below is read against; without it those numbers
-    # describe the machine, not the mutation.
-    print(f"baseline: SELFTEST PASSED in {baseline_s:.1f}s\n")
+    # One baseline per suite actually used. Only the suites in play: paying for a green run
+    # of a suite nothing below mutates would be measuring the machine, and a suite whose
+    # baseline is never checked can be broken while its mutations all report CAUGHT for the
+    # wrong reason.
+    baseline = {}
+    for suite in sorted(set(suites.values())):
+        rc, out, secs = run(work, suite)
+        if out == "__TIMEOUT__":
+            print(f"BASELINE TIMED OUT after {_SUITE_TIMEOUT}s — the unmutated {suite} suite "
+                  f"hung, so nothing below would prove anything.")
+            return 1
+        if rc != 0:
+            print(f"BASELINE FAILED ({suite}) — mutations prove nothing:")
+            print(out[-3000:])
+            return 1
+        # The reference every per-mutation time below is read against; without it those
+        # numbers describe the machine, not the mutation.
+        baseline[suite] = secs
+        print(f"baseline: {suite} PASSED in {secs:.1f}s")
+    print()
 
     # Counted apart, and reported apart. An `I*` mutation perturbs the INSTRUMENT (the
     # selftest itself) rather than the code under test, so folding it into one total would
@@ -1442,11 +1752,12 @@ def main():
     # keeps the exception visible at the point anyone reads the result, instead of only to
     # someone who opens this file — and makes adding a second one a deliberate act that shows
     # up in the output rather than a quiet edit to the list.
-    caught = {"M": 0, "I": 0}
-    totals = {"M": 0, "I": 0}
+    caught = {"M": 0, "I": 0, "F": 0}
+    totals = {"M": 0, "I": 0, "F": 0}
     slowest = (0.0, None)
     for mid, rel, find, repl, arm in MUTATIONS:
         kind = kinds[mid]                    # validated against `rel` before the baseline
+        suite = suites[mid]
         totals[kind] += 1
         path = work / rel
         original = path.read_text()
@@ -1457,24 +1768,24 @@ def main():
             # No time to report, and "(0.0s)" would read as a suite that ran instantly rather
             # than one that never started — the same lie the None/[] distinction exists to
             # prevent elsewhere. Say which it is.
-            print(f"{mid}: STALE ANCHOR — text not found in {rel} (selftest not run)")
+            print(f"{mid}: STALE ANCHOR — text not found in {rel} ({suite} not run)")
             continue
         mutated = original
         for f, r in edits:
             mutated = mutated.replace(f, r, 1)
         path.write_text(mutated)
-        rc, out, elapsed = run(work)
+        rc, out, elapsed = run(work, suite)
         path.write_text(original)
         took = f"({elapsed:.1f}s)"
         if elapsed > slowest[0]:
             slowest = (elapsed, mid)
-        failed = re.findall(r"\[FAIL\]\s+([^:]+):", out)
+        failed = failed_checks(suite, out)
         if out == "__TIMEOUT__":
-            # Not a clean catch: the arm never got to report because the selftest hung. A
+            # Not a clean catch: the arm never got to report because the suite hung. A
             # mutation whose defect is an infinite loop must be caught by an arm that BOUNDS
             # the work (a thread + join), not by the suite's own timeout — so this counts as
             # uncaught and fails the run, forcing a real fix rather than masking the hang.
-            print(f"{mid}: *** TIMEOUT *** selftest exceeded {_SELFTEST_TIMEOUT}s — the "
+            print(f"{mid}: *** TIMEOUT *** {suite} exceeded {_SUITE_TIMEOUT}s — the "
                   f"defect hangs rather than reddening {arm} {took}")
         elif rc != 0 and arm in failed:
             print(f"{mid}: CAUGHT by {arm} {took}")
@@ -1482,15 +1793,20 @@ def main():
         elif rc != 0:
             print(f"{mid}: failed, but NOT via {arm} -> {failed} {took}")
         else:
-            print(f"{mid}: *** MISSED *** selftest still passes with the defect present {took}")
+            print(f"{mid}: *** MISSED *** {suite} still passes with the defect present {took}")
     print(f"\n{caught['M']}/{totals['M']} production mutations caught by the intended arm")
     if totals["I"]:
         print(f"{caught['I']}/{totals['I']} instrument mutation(s) caught — these perturb "
               f"the selftest itself (see SELFTEST in the target list), and are NOT evidence "
               f"of production coverage")
+    if totals["F"]:
+        print(f"{caught['F']}/{totals['F']} fixture/tool mutation(s) caught by "
+              f"{VERIFIER} — these perturb instruments rather than production code, so they "
+              f"are NOT part of the production total either")
     total = time.monotonic() - started
     slow = f"slowest {slowest[1]} at {slowest[0]:.1f}s" if slowest[1] else "no mutation ran"
-    print(f"elapsed: {total / 60:.1f} min total, baseline {baseline_s:.1f}s, {slow}")
+    bases = ", ".join(f"{s} baseline {v:.1f}s" for s, v in sorted(baseline.items()))
+    print(f"elapsed: {total / 60:.1f} min total, {bases}, {slow}")
     shutil.rmtree(tmp, ignore_errors=True)
     # Both must be clean: an instrument mutation surviving means the arm guarding the
     # selftest's own reporting is decorative, which is the same failure as any other MISSED.

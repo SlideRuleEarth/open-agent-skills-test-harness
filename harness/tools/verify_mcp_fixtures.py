@@ -11,8 +11,13 @@ instrument that produced it: if the shim misreads an era, every row is wrong and
 downstream would notice. This is that instrument's own check, kept in the repo so the
 measurement is reproducible rather than resting on a scratch file that no longer exists.
 
-Fixtures carry no selftest arms and are not mutation targets, so this lives in tools/
-alongside the other runnable verifiers rather than in the arm count.
+Fixtures carry no selftest arms, so this lives in tools/ alongside the other runnable
+verifiers rather than in the arm count. They ARE mutation targets now, though — `mutate_mcp.py`
+routes any mutation of `fixtures/` or `tools/` to this file as the suite that must catch it,
+under the `F*` heading. Until that existed, everything below was named and unproven: an
+assertion nothing has ever been seen to break is a claim about the author's intent, not about
+the fixture. Adding a check here is therefore only half the work; the other half is a mutation
+that reddens it.
 
 Drives the shim over pipes — no agent CLI, no network, a few seconds. Everything runs
 behind a DEADLINE and the child is always reaped: a shim that stops answering must fail a
