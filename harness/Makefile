@@ -10,7 +10,7 @@ VENV   ?= .venv
 # Distribution / CLI name used with pipx — MUST match [project].name in pyproject.toml.
 DIST   ?= agentskill-evals
 
-.PHONY: help install dev selftest lint mutation clean uninstall
+.PHONY: help install dev selftest lint verify mutation clean uninstall
 
 help: ## That's me!
 	@printf "\033[37m%-30s\033[0m %s\n" "#-----------------------------------------------------------------------------------------"
@@ -58,11 +58,25 @@ lint: ## Lint with the pinned Ruff (run `make dev` first)
 	  exit 1; }
 	$(VENV)/bin/ruff check .
 
+# The two wire-level drivers. They are not arms and are not in the selftest's count: the
+# fixtures and the proxy's I/O half are only reachable by running the real programs over real
+# pipes, which is also why `mutate_mcp.py` routes their mutations to these files as the suites
+# that must catch them. Each self-reports what it ran, for the reason the selftest's arm count
+# does — a total that DROPS means checks were lost, which neither a pass nor a failure reports.
+verify: ## Drive the MCP fixtures and the C3 proxy over real pipes (seconds; run `make dev` first)
+	@test -x $(VENV)/bin/python || { \
+	  echo "verify: $(VENV) is missing — run 'make dev' first."; \
+	  exit 1; }
+	$(VENV)/bin/python tools/verify_mcp_fixtures.py
+	$(VENV)/bin/python tools/verify_mcp_proxy.py
+
 # Unlike `selftest`, this one NEEDS $(VENV): mutate_mcp copies the tree per mutation and runs
 # `$(VENV)/bin/python -m agentskill_evals selftest` inside each copy. Checked up front because
 # the alternative is discovering it as a FileNotFoundError once per mutation, which reads as
-# 80-odd broken mutations rather than one missing venv.
-mutation: ## Re-prove the self-test's arms by mutation (SLOW, ~10 min; run `make dev` first)
+# 80-odd broken mutations rather than one missing venv. It now drives THREE suites — the
+# selftest, `verify_mcp_fixtures.py` and `verify_mcp_proxy.py` — so `make verify` above is
+# covered by this target too, and its three totals are three different claims.
+mutation: ## Re-prove every suite's checks by mutation (SLOW; see TODO_Contained_HOME.md §4)
 	@test -x $(VENV)/bin/python || { \
 	  echo "mutation: $(VENV) is missing — run 'make dev' first (mutate_mcp runs the"; \
 	  echo "          self-test from $(VENV) inside each mutated copy of the tree)."; \

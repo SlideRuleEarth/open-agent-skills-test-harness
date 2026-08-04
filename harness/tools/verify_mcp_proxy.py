@@ -742,6 +742,14 @@ nonce, child_chan, helper_chan, control = group_case(
 try:
     child_rec, helper_rec = child_chan.record(), helper_chan.record()
     group = cross_checked_group(nonce, child_rec, helper_rec, control)
+    # WHY THE RECORDS ARE READ AFTER THE RUN AND NOT BEFORE IT. §10.9 specifies the order as
+    # "both records -> no premature EOF -> run the shutdown -> require both still open", and a
+    # pipe keeps its data after its writer is gone, so reading the announcements here is not
+    # the same observation as reading them earlier — it proves the descriptor once arrived, and
+    # nothing about who holds it now. The separate no-premature-EOF step is not missing so much
+    # as SUBSUMED: a holder that closed its writer early would leave its channel at EOF by the
+    # time the still-open check runs, and that check happens at the strictly later moment, once
+    # the proxy and every other ancestor is gone. Non-EOF then has exactly one explanation.
     if check("the control's three reports agree too, and it is a group of our own",
              group is not None and group not in (os.getpgid(0), os.getpgid(os.getppid())),
              (nonce, child_rec, helper_rec)):
