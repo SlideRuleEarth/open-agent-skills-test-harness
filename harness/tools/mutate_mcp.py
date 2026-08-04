@@ -1557,7 +1557,7 @@ MUTATIONS = [
      "        elif False:",
      "audit.a_tagged_entry_must_carry_the_payload_its_tag_promises"),
     ("M209-shutdown-anomaly-need-not-carry-its-exception", AUDIT,
-     ('            if entry.exception is None:\n'
+     ('            if not entry.exception:\n'
       '                problems.append("anomaly_no_exception")'),
      ('            if False:\n'
       '                problems.append("anomaly_no_exception")'),
@@ -1584,6 +1584,39 @@ MUTATIONS = [
      "    return isinstance(value, int) and not isinstance(value, bool)",
      "    return isinstance(value, int)",
      "audit.child_status_is_an_exit_status_and_not_merely_present"),
+    # The erasure. Every non-conforming value for an OPTIONAL field becomes the same `None`
+    # that means "not there", so `cause: null` under `done` is indistinguishable from a fact
+    # with no cause and the rule forbidding one never sees it.
+    # Anchored past `value = entry[key]` because `_str_or` has a byte-identical body, and an
+    # anchor matching the first occurrence would mutate the REQUIRED-field helper instead —
+    # a different defect, caught by a different arm, reported as this one.
+    ("M229-a-present-optional-field-is-erased-into-absence", AUDIT,
+     ('    value = entry[key]\n'
+      '    if isinstance(value, str):\n'
+      '        return value\n'
+      '    problems.append(code)\n'
+      '    return None'),
+     ('    value = entry[key]\n'
+      '    if isinstance(value, str):\n'
+      '        return value\n'
+      '    return None'),
+     "audit.a_present_optional_field_is_never_erased_into_absence"),
+    # A payload carried outside the tag that reads it — never consulted, and therefore never
+    # reported, which is the defect `cause_forbidden` exists for.
+    ("M230-a-stray-anomaly-kind-is-tolerated", AUDIT,
+     "        elif entry.reason != PROTOCOL_ANOMALY and entry.anomaly is not None:",
+     "        elif False:",
+     "audit.a_payload_is_legal_only_under_the_tag_that_reads_it"),
+    ("M231-a-stray-outcome-payload-is-tolerated", AUDIT,
+     "        elif entry.fact is not None or entry.exception is not None:",
+     "        elif False:",
+     "audit.a_payload_is_legal_only_under_the_tag_that_reads_it"),
+    # An empty exception string: the field is there and says nothing, which the `is None`
+    # spelling of this check waves through.
+    ("M232-an-empty-exception-counts-as-carried", AUDIT,
+     "            if not entry.exception:",
+     "            if entry.exception is None:",
+     "audit.a_tagged_entry_must_carry_the_payload_its_tag_promises"),
     # A fault point armed on a name that is not a completion fact. The instance is anomalous
     # from the arming either way, which is precisely what makes the malformed configuration
     # invisible without its own check.

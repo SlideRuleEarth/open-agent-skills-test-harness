@@ -289,10 +289,10 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 539 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 541 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 harness/tools/mutate_mcp.py                           # 226/226 production + 2/2 instrument + 8/8 fixture
+python3 harness/tools/mutate_mcp.py                           # 230/230 production + 2/2 instrument + 8/8 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 278 checks
 git diff --check
 ```
@@ -567,6 +567,21 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   absence-not-emptiness one level down, and it arrives the same way: a flag substituted for a
   value nobody looked at. **Preserve the value, then check it**; a sentinel distinguishes
   absent from every value JSON can carry, and a `present` boolean cannot.
+- **ERASING A BAD VALUE INTO `None` HIDES IT WHEREVER ABSENCE IS LEGAL.**
+  `x if isinstance(x, str) else None` turns every non-conforming value into the same `None`
+  the parser uses for "not there" — so a `cause: null` under a `done` step was
+  indistinguishable from a step with no cause, and the rule forbidding a cause under `done`,
+  added one round earlier, never saw one. Three sibling fields used the identical idiom and
+  survived only because their tags make them REQUIRED, so a different check caught the
+  erasure: **coverage by accident, from the same defect.** Preserve or report; never
+  substitute the absence marker for a value that was present. And the arm has to feed it
+  `null`, because a valid string cannot catch a parser erasing the field before validation.
+- **A payload is legal only under the tag that READS it, and that rule quantifies over every
+  tagged union in the file.** `cause_forbidden` was written for completion facts and stopped
+  there, leaving `anomaly` legal on any trigger and `fact`/`exception` legal on any outcome —
+  fields nothing consults, which is precisely what that rule exists to reject. One rule
+  widened one route at a time, again, and the tell was as advertised: the justification
+  ("nothing reports what nothing looks at") never mentioned completion facts.
 - **A closed set that is only checked on the way OUT is not checked.** The fault point's
   suppression targets are completion facts, but the parser accepted any string — so
   `{"suppresses": ["not_a_fact"]}` had no structural problem. It was easy to miss because the

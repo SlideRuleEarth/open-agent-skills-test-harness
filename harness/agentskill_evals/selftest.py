@@ -10144,19 +10144,23 @@ def _check_mcp_audit_verdict(failures, verbose):
     real_kind = rec(triggers=({"reason": A.PROTOCOL_ANOMALY, "anomaly": P_UNCORRELATED},))
     no_exception = rec(outcomes=({"kind": A.SHUTDOWN_ANOMALY, "fact": A.INTAKE_CLOSED},),
                        fact_map=facts(**{A.INTAKE_CLOSED: failed(A.SHUTDOWN_ANOMALY)}))
+    empty_exception = rec(outcomes=(anomaly(A.INTAKE_CLOSED, ""),),
+                          fact_map=facts(**{A.INTAKE_CLOSED: failed(A.SHUTDOWN_ANOMALY)}))
     _check("audit.a_tagged_entry_must_carry_the_payload_its_tag_promises",
            "protocol_anomaly_kind:None" in probs(bare_anomaly)
            and "protocol_anomaly_kind:gremlins" in probs(invented_kind)
            and not probs(real_kind)
-           and "anomaly_no_exception" in probs(no_exception),
+           and "anomaly_no_exception" in probs(no_exception)
+           and "anomaly_no_exception" in probs(empty_exception),
            f"`protocol_anomaly` and `shutdown_anomaly` are discriminated unions whose tag "
            f"promises a `why`, and a record that tears the connection down for a protocol "
            f"reason while declining to say which has withheld the one thing the audit log "
            f"exists to carry. The kind is checked against `mcp_proxy.ANOMALY_KINDS` rather "
            f"than a copy: a re-derived set can disagree with the original silently, and "
-           f"importing is possible here: bare={probs(bare_anomaly)} "
-           f"invented={probs(invented_kind)} real={probs(real_kind)} "
-           f"no_exc={probs(no_exception)}", failures, verbose)
+           f"importing is possible here. The empty exception is the boundary: a field that is "
+           f"THERE and says nothing is not a payload, and `is None` waves it through: "
+           f"bare={probs(bare_anomaly)} invented={probs(invented_kind)} real={probs(real_kind)} "
+           f"no_exc={probs(no_exception)} empty={probs(empty_exception)}", failures, verbose)
 
     # ---- structural: evidence only a reaper can hold ---------------------------------
     no_status = rec()
@@ -10197,6 +10201,37 @@ def _check_mcp_audit_verdict(failures, verbose):
            f"carrying the cause of its own failure is a record disagreeing with itself, and "
            f"reading `cause` only under `failed` does not tolerate that so much as leave it "
            f"unread — which is worse, because nothing reports it: {probs(cause_on_done)}",
+           failures, verbose)
+
+    erased = {repr(v): probs(rec(fact_map=facts(**{A.GROUP_TERMINATED:
+                                                   {"state": A.DONE, "cause": v}})))
+              for v in (None, True, 7, [1], {"a": 1})}
+    _check("audit.a_present_optional_field_is_never_erased_into_absence",
+           all(f"fact_cause_not_a_string:{A.GROUP_TERMINATED}" in v for v in erased.values())
+           and f"cause_forbidden:{A.GROUP_TERMINATED}:" in probs(
+               rec(fact_map=facts(**{A.GROUP_TERMINATED: {"state": A.DONE, "cause": ""}}))),
+           f"`x if isinstance(x, str) else None` turns every non-conforming value into the "
+           f"same `None` this parser uses for `not there` — and absence is LEGAL for a cause, "
+           f"so `cause: null` under `done` was indistinguishable from a fact with no cause and "
+           f"the rule forbidding one never saw it. `null` is the case to test, not a valid "
+           f"string: a valid string cannot catch a parser erasing the field before the "
+           f"validator runs (review, PR #102). The empty string is the boundary — it IS a "
+           f"string, so it survives parsing and the union rule rejects it: {erased}",
+           failures, verbose)
+
+    stray_anomaly = rec(triggers=({"reason": A.CLIENT_EOF, "anomaly": P_UNCORRELATED},))
+    stray_payload = rec(outcomes=({"kind": A.SHUTDOWN_REAP_FAILED,
+                                   "fact": A.CHILD_REAPED},),
+                        fact_map=facts(**{A.CHILD_REAPED: failed(A.SHUTDOWN_REAP_FAILED)}))
+    _check("audit.a_payload_is_legal_only_under_the_tag_that_reads_it",
+           f"trigger_anomaly_forbidden:{A.CLIENT_EOF}" in probs(stray_anomaly)
+           and f"outcome_payload_forbidden:{A.SHUTDOWN_REAP_FAILED}" in probs(stray_payload),
+           f"the same union rule as `cause_forbidden`, reaching the two tagged unions it did "
+           f"not name when it was written one round ago. `_evidence_for` consults `fact` only "
+           f"on a `shutdown_anomaly` and the kind only on a `protocol_anomaly`, so either one "
+           f"carried elsewhere is never consulted — and an unread field is exactly what the "
+           f"cause rule was added for: nothing reports what nothing looks at: "
+           f"stray_anomaly={probs(stray_anomaly)} stray_payload={probs(stray_payload)}",
            failures, verbose)
 
     junk_target = rec(fault_point={"suppresses": ["not_a_fact"]})

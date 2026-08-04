@@ -271,6 +271,25 @@ def _str_or(value: Any, problems: list[str], code: str) -> str | None:
     return None
 
 
+def _opt_str(entry: dict, key: str, problems: list[str], code: str) -> str | None:
+    """An OPTIONAL string field: absent, a string, or a reported problem — never erased.
+
+    `entry.get(k) if isinstance(..., str) else None` turns every non-conforming value into
+    `None`, which is the same thing this parser uses for "not there" — so a `cause: null` on a
+    `done` fact was indistinguishable from a fact with no cause, and the rule forbidding a
+    cause under `done` never saw one (review, PR #102). The other three fields here survived
+    only because their tags make them REQUIRED, so a different check caught the erasure; that
+    is coverage by accident, and it is the same idiom.
+    """
+    if key not in entry:
+        return None
+    value = entry[key]
+    if isinstance(value, str):
+        return value
+    problems.append(code)
+    return None
+
+
 def _as_list(raw: Any, key: str, problems: list[str], *, required: bool) -> list:
     """A list, or a reported problem — never an exception, and never a silent empty.
 
@@ -310,8 +329,9 @@ def parse(raw: Any) -> tuple[Record, tuple[str, ...]]:
             continue
         reason = _str_or(entry.get("reason"), problems, f"trigger_reason_not_a_string:{i}")
         if reason is not None:
-            anomaly = entry.get("anomaly")
-            triggers.append(Trigger(reason, anomaly if isinstance(anomaly, str) else None))
+            anomaly = _opt_str(entry, "anomaly", problems,
+                               f"trigger_anomaly_not_a_string:{i}")
+            triggers.append(Trigger(reason, anomaly))
 
     outcomes = []
     for i, entry in enumerate(_as_list(raw, "outcomes", problems, required=True)):
@@ -320,9 +340,10 @@ def parse(raw: Any) -> tuple[Record, tuple[str, ...]]:
             continue
         kind = _str_or(entry.get("kind"), problems, f"outcome_kind_not_a_string:{i}")
         if kind is not None:
-            fact, exc = entry.get("fact"), entry.get("exception")
-            outcomes.append(Outcome(kind, fact if isinstance(fact, str) else None,
-                                    exc if isinstance(exc, str) and exc else None))
+            fact = _opt_str(entry, "fact", problems, f"outcome_fact_not_a_string:{i}")
+            exc = _opt_str(entry, "exception", problems,
+                           f"outcome_exception_not_a_string:{i}")
+            outcomes.append(Outcome(kind, fact, exc))
 
     facts: dict[str, Fact] = {}
     fact_keys: tuple[str, ...] = ()
@@ -341,8 +362,9 @@ def parse(raw: Any) -> tuple[Record, tuple[str, ...]]:
                 continue
             state = _str_or(entry.get("state"), problems, f"fact_state_not_a_string:{key}")
             if state is not None:
-                cause = entry.get("cause")
-                facts[key] = Fact(state, cause if isinstance(cause, str) else None)
+                cause = _opt_str(entry, "cause", problems,
+                                 f"fact_cause_not_a_string:{key}")
+                facts[key] = Fact(state, cause)
 
     fired = []
     for i, entry in enumerate(_as_list(raw, "fired", problems, required=False)):
@@ -408,6 +430,12 @@ def validate(record: Record) -> tuple[str, ...]:
         # declines to say which, which is precisely what the audit log exists to record.
         elif entry.reason == PROTOCOL_ANOMALY and entry.anomaly not in ANOMALY_KINDS:
             problems.append(f"protocol_anomaly_kind:{entry.anomaly}")
+        # ...and the same union closed the other way: a payload is legal only under the tag
+        # that READS it. An `anomaly` on a `client_eof` trigger is never consulted, and an
+        # unread field is the defect `cause_forbidden` was added for one round ago — this is
+        # that rule reaching the two tagged unions it did not name.
+        elif entry.reason != PROTOCOL_ANOMALY and entry.anomaly is not None:
+            problems.append(f"trigger_anomaly_forbidden:{entry.reason}")
 
     for entry in record.outcomes:
         if entry.kind not in OUTCOMES:
@@ -415,8 +443,12 @@ def validate(record: Record) -> tuple[str, ...]:
         elif entry.kind == SHUTDOWN_ANOMALY:
             if entry.fact not in FACTS:
                 problems.append(f"anomaly_unkeyed:{entry.fact}")
-            if entry.exception is None:
+            # `not` rather than `is None`: an empty string is a record that carries the field
+            # and says nothing in it, which is the presence-not-content defect again.
+            if not entry.exception:
                 problems.append("anomaly_no_exception")
+        elif entry.fact is not None or entry.exception is not None:
+            problems.append(f"outcome_payload_forbidden:{entry.kind}")
 
     for key in FACTS:
         if key not in record.facts:
