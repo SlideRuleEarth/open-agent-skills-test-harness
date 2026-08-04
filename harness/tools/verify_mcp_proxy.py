@@ -158,6 +158,15 @@ class Channel:
 # ---------------------------------------------------------------------------------------
 
 
+def _readable(fd: int, timeout: float) -> bool:
+    sel = selectors.DefaultSelector()
+    sel.register(fd, selectors.EVENT_READ)
+    try:
+        return bool(sel.select(timeout))
+    finally:
+        sel.close()
+
+
 class Result:
     def __init__(self, returncode, replies, log, allowed, server, stderr="") -> None:
         self.returncode = returncode
@@ -261,14 +270,25 @@ def run(*, command=None, args=None, tools=("echo",), env=None, fault=None, send=
 
         replies = []
         try:
-            for msg in send:
+            # A case that supplied its own `stdin_fd` has no pipe to write down, and reaching
+            # `None.write` there would report an AttributeError from the driver in place of
+            # whatever the case was about.
+            for msg in (send if proc.stdin is not None else ()):
                 payload = msg if isinstance(msg, (str, bytes)) else json.dumps(msg)
                 if isinstance(payload, str):
                     payload = payload.encode("utf-8")
                 proc.stdin.write(payload + b"\n")
                 proc.stdin.flush()
                 if not close_stdout and reply_per_send:
-                    line = proc.stdout.readline()
+                    # BOUNDED. A bare `readline()` blocks forever against a proxy that neither
+                    # answers nor exits, and `proc.wait(timeout=...)` below is no help because
+                    # it has not been reached yet — so the file's claim to run everything behind
+                    # a deadline would be false exactly where a broken shutdown puts it to the
+                    # test. A reply that never comes is a case failing on its assertions, which
+                    # is a result; a driver that hangs is not.
+                    line = b""
+                    if _readable(proc.stdout.fileno(), DEADLINE):
+                        line = proc.stdout.readline()
                     if line:
                         replies.append(line.decode("utf-8", "replace").strip())
         except OSError:
