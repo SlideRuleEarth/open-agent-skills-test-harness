@@ -8910,6 +8910,7 @@ def _run_selftest_checks(verbose: bool = False) -> int:
 
     # C3 proxy — the decision layer (DESIGN_MCP_Support.md §10), wired to nothing yet
     _section(_check_mcp_proxy_decisions, failures, verbose)
+    _section(_check_mcp_audit_verdict, failures, verbose)
 
     # LAST, because it is about everything above it: the arm count reported in the banner is
     # the only signal that a whole section stopped running, and a counter that silently
@@ -9869,6 +9870,498 @@ def _check_mcp_proxy_decisions(failures, verbose):
            f"`tools/list`, which `tools:` does not gate and this proxy will not pass: "
            f"unheralded={failed(unheralded)} plain={type(plain_sampling).__name__} "
            f"tool_bearing={failed(tool_bearing)}", failures, verbose)
+
+def _check_mcp_audit_verdict(failures, verbose):
+    """C3's audit record and its verdict — DESIGN_MCP_Support.md §10.5.1.
+
+    Written before the I/O half, and these arms are why: twelve rounds of review on that
+    section found defects that prose held without complaining — a step that failed had no legal
+    value to record, a catch-all that could not be named for most steps, a pairing key coarser
+    than the thing it keyed, arming a fault standing in for firing it. Each is a SHAPE, and a
+    shape is what an arm can drive.
+
+    THE INPUT IS ARBITRARY DECODED JSON. The reader owns this module precisely because the
+    writer is the thing under suspicion, so half the arms below feed it records no conforming
+    proxy would produce. A validator that assumed its input was well shaped crashed on six of
+    them and quietly passed two more (review, PR #102); a traceback out of `verify_post_run` is
+    a worse outcome than the malformed record that caused it, because a failed cell is a
+    result and a crash is not.
+    """
+    from . import mcp_audit as A
+    from .mcp_proxy import UNCORRELATED as P_UNCORRELATED
+
+    print("mcp audit verdict:")
+
+    def facts(**over):
+        """Every completion fact `done`, minus whatever the case overrides."""
+        out = {k: {"state": A.DONE} for k in A.FACTS}
+        out.update(dict(over))
+        return out
+
+    def failed(cause):
+        return {"state": A.FAILED, "cause": cause}
+
+    def anomaly(fact, exc="OSError"):
+        return {"kind": A.SHUTDOWN_ANOMALY, "fact": fact, "exception": exc}
+
+    def rec(triggers=({"reason": A.CLIENT_EOF},), outcomes=(), fact_map=None, **extra):
+        """A record that is clean unless the case makes it otherwise.
+
+        `child_status` rides along with a `done` reap, because the two travel together — a
+        builder that omitted it would make every case below malformed for a reason the case
+        was not about, which is the surest way to write arms that pass for the wrong reason.
+        """
+        fm = facts() if fact_map is None else fact_map
+        out = {"triggers": [dict(t) for t in triggers],
+               "outcomes": [dict(o) for o in outcomes],
+               "facts": fm}
+        if fm.get(A.CHILD_REAPED, {}).get("state") == A.DONE:
+            out["child_status"] = 0
+        out.update(extra)
+        return out
+
+    probs = A.problems
+
+    # ---- the clean path, and the legal record that LOOKS malformed --------------------
+    clean = rec()
+    _check("audit.a_clean_instance_is_clean",
+           A.verdict(clean).clean and not probs(clean),
+           f"the ordinary ending — the client closed stdin, nothing went wrong during "
+           f"teardown, and every step recorded that it ran — has to come out clean, or every "
+           f"gated cell fails. This is the arm that stops the validator from earning full "
+           f"marks by rejecting everything: {A.verdict(clean)}", failures, verbose)
+
+    spawn = rec(triggers=({"reason": A.SPAWN_FAILED},),
+                fact_map={A.INTAKE_CLOSED: {"state": A.DONE},
+                          **{k: {"state": A.NOT_APPLICABLE} for k in A.FACTS[1:]}})
+    _check("audit.spawn_failed_is_structurally_valid_and_anomalous",
+           not probs(spawn) and not A.verdict(spawn).clean
+           and A.verdict(spawn).anomalous == (A.SPAWN_FAILED,),
+           f"a declared server that would not start is an ordinary ending with a record like "
+           f"any other — the instance boundary sits BEFORE the spawn attempt precisely so it "
+           f"has one (§10.5). Its four `not_applicable` facts are exactly what a lazily "
+           f"written validator rejects along with the malformed ones, so this case is what "
+           f"keeps the structural half honest, while the verdict still fails the cell: "
+           f"problems={probs(spawn)} verdict={A.verdict(spawn)}", failures, verbose)
+
+    # ---- the parse layer: arbitrary JSON in, stable codes out, never an exception -----
+    shapes = {
+        "not_a_map:record": 42,
+        "not_a_list:triggers": {"triggers": {}, "outcomes": [], "facts": facts()},
+        "trigger_not_a_map:0": {"triggers": ["client_eof"], "outcomes": [], "facts": facts()},
+        "trigger_reason_not_a_string:0": {"triggers": [{"reason": ["client_eof"]}],
+                                          "outcomes": [], "facts": facts()},
+        "outcome_kind_not_a_string:0": rec(outcomes=({"kind": [1]},)),
+        "fact_state_not_a_string:intake_closed":
+            rec(fact_map=facts(**{A.INTAKE_CLOSED: {"state": [1]}})),
+        "not_a_map:facts": {"triggers": [{"reason": A.CLIENT_EOF}], "outcomes": [],
+                            "facts": ["intake_closed"]},
+        "not_a_list:fired": rec(fired=3),
+        "not_a_map:fault_point": rec(fault_point=7),
+        "not_a_list:suppresses": rec(fault_point={"suppresses": 3}),
+        "suppresses_not_a_string:0": rec(fault_point={"suppresses": [3]}),
+        "fired_fact_not_a_string:0": rec(fault_point={"suppresses": []}, fired=[{"fact": 3}]),
+    }
+    caught = {}
+    for code, raw in shapes.items():
+        try:
+            caught[code] = code in probs(raw) and not A.verdict(raw).clean
+        except Exception as exc:                              # noqa: BLE001 — that IS the arm
+            caught[code] = f"raised {type(exc).__name__}"
+    _check("audit.every_malformed_shape_is_a_problem_code_not_an_exception",
+           all(v is True for v in caught.values()),
+           f"the reader's input is whatever `json.loads` returned, because the writer is the "
+           f"thing under suspicion — so every one of these has to become a stable code rather "
+           f"than a traceback out of `verify_post_run`, where a crash is not a failed cell but "
+           f"an absent verdict. The `except` here is the assertion, not defensive style: an "
+           f"arm that let the exception propagate would report a tooling problem instead of a "
+           f"finding: { {k: v for k, v in caught.items() if v is not True} or 'all caught'}",
+           failures, verbose)
+
+    absent = rec()
+    del absent["outcomes"]
+    nulled = rec()
+    nulled["outcomes"] = None
+    _check("audit.missing_null_and_empty_are_three_different_records",
+           "missing:outcomes" in probs(absent) and "null:outcomes" in probs(nulled)
+           and not probs(rec()) and A.verdict(rec()).clean,
+           f"`raw.get(k) or []` collapses all three into `no outcomes`, and an empty outcome "
+           f"list is LEGAL — so a writer that forgot the axis entirely validated clean. "
+           f"Absence is not emptiness anywhere in this module; distinguishing them is the "
+           f"whole subject of §10.5.1's second half, and this is that rule applied to the "
+           f"record's own keys: absent={probs(absent)} nulled={probs(nulled)}",
+           failures, verbose)
+
+    # ---- structural: the vacuity guard ------------------------------------------------
+    empty = {"triggers": [], "outcomes": [], "facts": facts()}
+    _check("audit.an_empty_trigger_list_is_malformed_not_vacuously_clean",
+           "triggers_empty" in probs(empty) and not A.verdict(empty).clean,
+           f"`every recorded reason is clean` is TRUE of a record with no reasons in it, and "
+           f"so is `every fact is present` of an empty fact map — `all()` over a collection "
+           f"nothing was put into is the purest unfalsifiable assertion there is. An instance "
+           f"is DEFINED as having a latched first trigger, so a record without one is evidence "
+           f"about the writer rather than about the run: {probs(empty)}", failures, verbose)
+
+    # ---- structural: the fact key set, closed in BOTH directions ----------------------
+    missing = {}
+    for k in A.FACTS:
+        fm = facts()
+        del fm[k]
+        missing[k] = probs(rec(fact_map=fm))
+    _check("audit.every_missing_completion_fact_is_caught_individually",
+           all(f"fact_missing:{k}" in missing[k] for k in A.FACTS),
+           f"one case per fact rather than one for the set: a validator that checks four of "
+           f"five passes a single spot-check, and the fact it forgot is the one whose step "
+           f"silently never ran. Missing is malformed rather than clean because a step that "
+           f"recorded nothing cannot be told apart from a step that never happened: "
+           f"{dict(missing)}", failures, verbose)
+
+    extra_key = rec(fact_map=facts() | {"group_reaped": {"state": A.DONE}})
+    _check("audit.an_unrecognized_completion_fact_name_is_malformed",
+           "fact_unknown:group_reaped" in probs(extra_key),
+           f"the key set is closed in BOTH directions and only one of them is obvious. A "
+           f"missing fact is the case everyone writes; an unrecognized one is how a fact added "
+           f"LATER stops being checked, because a validator iterating the names it already "
+           f"knows accepts a record carrying one it has never heard of: {probs(extra_key)}",
+           failures, verbose)
+
+    bad_state = rec(fact_map=facts(**{A.DRAIN_ENDED: {"state": "skipped"}}))
+    _check("audit.an_unrecognized_completion_state_is_malformed",
+           f"state_unknown:{A.DRAIN_ENDED}:skipped" in probs(bad_state),
+           f"the value set is closed too, and `skipped` is the exact word an implementer "
+           f"reaches for when a step did not run — which is the state the enumeration refuses "
+           f"to let anyone spell, because `done`, `not_applicable` and `failed` are the three "
+           f"a reader can act on: {probs(bad_state)}", failures, verbose)
+
+    # ---- structural: `not_applicable` is licensed by the LATCH ------------------------
+    na_unlicensed = rec(fact_map=facts(**{A.GROUP_TERMINATED: {"state": A.NOT_APPLICABLE}}))
+    na_intake = rec(triggers=({"reason": A.SPAWN_FAILED},),
+                    fact_map={A.INTAKE_CLOSED: {"state": A.NOT_APPLICABLE},
+                              **{k: {"state": A.NOT_APPLICABLE} for k in A.FACTS[1:]}})
+    _check("audit.not_applicable_needs_the_trigger_that_licenses_it",
+           f"not_applicable_unlicensed:{A.GROUP_TERMINATED}" in probs(na_unlicensed)
+           and f"not_applicable_unlicensed:{A.INTAKE_CLOSED}" in probs(na_intake),
+           f"a blank would mean three different things — did not apply, tried and failed, did "
+           f"not happen — so the licence is explicit and checked against the trigger. Both "
+           f"directions matter: `client_eof` never licenses one, and even under `spawn_failed` "
+           f"step 1 always ran, because there is no ending in which the proxy had no intake to "
+           f"close: unlicensed={probs(na_unlicensed)} intake={probs(na_intake)}",
+           failures, verbose)
+
+    # ---- structural: `failed` names ONE cause, and the record must bear it ------------
+    unpaired = rec(fact_map=facts(**{A.CHILD_REAPED: failed(A.SHUTDOWN_REAP_FAILED)}))
+    orphan_outcome = rec(outcomes=({"kind": A.SHUTDOWN_REAP_FAILED},))
+    _check("audit.failed_and_its_outcome_require_each_other",
+           f"cause_unsupported:{A.CHILD_REAPED}:{A.SHUTDOWN_REAP_FAILED}" in probs(unpaired)
+           and f"outcome_unpaired:{A.SHUTDOWN_REAP_FAILED}" in probs(orphan_outcome),
+           f"the two axes describe the same events and must be able to AGREE — that is why "
+           f"`failed` exists at all, since without it a teardown that ran and did not work had "
+           f"no structurally valid record. Checking one direction only lets the writer record "
+           f"the failure on whichever axis it finds convenient and stay silent on the other: "
+           f"fact_only={probs(unpaired)} outcome_only={probs(orphan_outcome)}",
+           failures, verbose)
+
+    paired = rec(outcomes=({"kind": A.SHUTDOWN_REAP_FAILED},),
+                 fact_map=facts(**{A.CHILD_REAPED: failed(A.SHUTDOWN_REAP_FAILED)}))
+    _check("audit.a_failed_teardown_is_recordable_and_anomalous",
+           not probs(paired) and not A.verdict(paired).clean
+           and A.verdict(paired).anomalous == (A.SHUTDOWN_REAP_FAILED,),
+           f"the positive half of the rule above, and the one that would have been missed by "
+           f"testing only rejections: a reap that failed must be WRITEABLE — present, "
+           f"structurally valid, and anomalous — or the only way to record it is to omit the "
+           f"fact, which the validator calls malformed: {probs(paired)} {A.verdict(paired)}",
+           failures, verbose)
+
+    nameless = rec(outcomes=({"kind": A.SHUTDOWN_REAP_FAILED},),
+                   fact_map=facts(**{A.CHILD_REAPED: {"state": A.FAILED}}))
+    wrong_cause = rec(outcomes=({"kind": A.SHUTDOWN_REAP_FAILED},),
+                      fact_map=facts(**{A.CHILD_REAPED: failed("gremlins")}))
+    _check("audit.a_failed_fact_declares_its_cause_rather_than_having_one_inferred",
+           f"cause_unknown:{A.CHILD_REAPED}:None" in probs(nameless)
+           and f"cause_unknown:{A.CHILD_REAPED}:gremlins" in probs(wrong_cause),
+           f"inferring the cause from whatever evidence happens to be lying around is what "
+           f"let one record carry two incompatible accounts of the same step. Declared, it is "
+           f"checkable against the evidence; inferred, `some pairing exists` was the whole "
+           f"test: nameless={probs(nameless)} wrong={probs(wrong_cause)}", failures, verbose)
+
+    contradicted = rec(outcomes=({"kind": A.SHUTDOWN_GROUP_KILL_FAILED},),
+                       fact_map=facts(**{A.GROUP_TERMINATED:
+                                         failed(A.SHUTDOWN_GROUP_KILL_FAILED)}),
+                       fault_point={"suppresses": [A.GROUP_TERMINATED]},
+                       fired=[{"fact": A.GROUP_TERMINATED}])
+    _check("audit.a_failed_fact_cannot_carry_two_incompatible_causes",
+           any(p.startswith(f"cause_contradicted:{A.GROUP_TERMINATED}:")
+               for p in probs(contradicted)),
+           f"a group kill the fault point stopped from running cannot ALSO have been attempted "
+           f"and failed, and a record saying both is not one with extra detail — it is two "
+           f"accounts of one step, with nothing to say which happened. The `or` this replaces "
+           f"reported no problem at all, because it asked whether SOME cause was supported "
+           f"rather than whether exactly one was (review, PR #102): {probs(contradicted)}",
+           failures, verbose)
+
+    # ---- structural: the catch-all is keyed by fact, not by step ----------------------
+    sibling = rec(outcomes=(anomaly(A.CHILD_STDIN_CLOSED),),
+                  fact_map=facts(**{A.DRAIN_ENDED: failed(A.SHUTDOWN_ANOMALY),
+                                    A.CHILD_STDIN_CLOSED: {"state": A.DONE}}))
+    reverse = rec(outcomes=(anomaly(A.DRAIN_ENDED),),
+                  fact_map=facts(**{A.CHILD_STDIN_CLOSED: failed(A.SHUTDOWN_ANOMALY),
+                                    A.DRAIN_ENDED: {"state": A.DONE}}))
+    _check("audit.a_shutdown_anomaly_licenses_only_the_fact_it_names",
+           f"cause_unsupported:{A.DRAIN_ENDED}:{A.SHUTDOWN_ANOMALY}" in probs(sibling)
+           and f"cause_unsupported:{A.CHILD_STDIN_CLOSED}:{A.SHUTDOWN_ANOMALY}"
+           in probs(reverse),
+           f"step 2 owns BOTH of these facts, so a catch-all keyed by step number would "
+           f"license `failed` on either of them — or on both — having arisen from one "
+           f"operation, and a `step matches fact` check could not see the difference. A "
+           f"pairing key coarser than what it pairs is not a weaker check, it is one that "
+           f"passes for the wrong reason while reading like coverage: sibling={probs(sibling)} "
+           f"reverse={probs(reverse)}", failures, verbose)
+
+    keyed = rec(outcomes=(anomaly(A.INTAKE_CLOSED, "RuntimeError"),),
+                fact_map=facts(**{A.INTAKE_CLOSED: failed(A.SHUTDOWN_ANOMALY)}))
+    unkeyed = rec(outcomes=({"kind": A.SHUTDOWN_ANOMALY, "exception": "RuntimeError"},),
+                  fact_map=facts(**{A.INTAKE_CLOSED: failed(A.SHUTDOWN_ANOMALY)}))
+    _check("audit.the_catch_all_reaches_the_facts_with_no_typed_outcome",
+           not probs(keyed) and not A.verdict(keyed).clean
+           and "anomaly_unkeyed:None" in probs(unkeyed),
+           f"`intake_closed` and `child_stdin_closed` have no typed failure, so without the "
+           f"catch-all an exception escaping either step could not be recorded at all — the "
+           f"same unwriteable state the `failed` value was added to fix, surviving in the "
+           f"mechanism meant to prevent it. It carries the exact fact it escaped or it is "
+           f"malformed: keyed={probs(keyed)} unkeyed={probs(unkeyed)}", failures, verbose)
+
+    orphan_anomaly = rec(outcomes=(anomaly(A.CHILD_REAPED, "RuntimeError"),))
+    _check("audit.a_shutdown_anomaly_whose_fact_is_not_failed_is_malformed",
+           f"anomaly_orphan:{A.CHILD_REAPED}" in probs(orphan_anomaly),
+           f"the reverse direction for the catch-all: an exception escaped the reap and the "
+           f"reap says it went fine. One of the two records is a lie, and a reader that "
+           f"accepted the pair would have to pick which — so it accepts neither: "
+           f"{probs(orphan_anomaly)}", failures, verbose)
+
+    # ---- structural: a tag promises a payload ----------------------------------------
+    bare_anomaly = rec(triggers=({"reason": A.PROTOCOL_ANOMALY},))
+    invented_kind = rec(triggers=({"reason": A.PROTOCOL_ANOMALY, "anomaly": "gremlins"},))
+    real_kind = rec(triggers=({"reason": A.PROTOCOL_ANOMALY, "anomaly": P_UNCORRELATED},))
+    no_exception = rec(outcomes=({"kind": A.SHUTDOWN_ANOMALY, "fact": A.INTAKE_CLOSED},),
+                       fact_map=facts(**{A.INTAKE_CLOSED: failed(A.SHUTDOWN_ANOMALY)}))
+    empty_exception = rec(outcomes=(anomaly(A.INTAKE_CLOSED, ""),),
+                          fact_map=facts(**{A.INTAKE_CLOSED: failed(A.SHUTDOWN_ANOMALY)}))
+    _check("audit.a_tagged_entry_must_carry_the_payload_its_tag_promises",
+           "protocol_anomaly_kind:None" in probs(bare_anomaly)
+           and "protocol_anomaly_kind:gremlins" in probs(invented_kind)
+           and not probs(real_kind)
+           and "anomaly_no_exception" in probs(no_exception)
+           and "anomaly_no_exception" in probs(empty_exception),
+           f"`protocol_anomaly` and `shutdown_anomaly` are discriminated unions whose tag "
+           f"promises a `why`, and a record that tears the connection down for a protocol "
+           f"reason while declining to say which has withheld the one thing the audit log "
+           f"exists to carry. The kind is checked against `mcp_proxy.ANOMALY_KINDS` rather "
+           f"than a copy: a re-derived set can disagree with the original silently, and "
+           f"importing is possible here. The empty exception is the boundary: a field that is "
+           f"THERE and says nothing is not a payload, and `is None` waves it through: "
+           f"bare={probs(bare_anomaly)} invented={probs(invented_kind)} real={probs(real_kind)} "
+           f"no_exc={probs(no_exception)} empty={probs(empty_exception)}", failures, verbose)
+
+    # ---- structural: evidence only a reaper can hold ---------------------------------
+    no_status = rec()
+    del no_status["child_status"]
+    invented_status = rec(outcomes=({"kind": A.SHUTDOWN_REAP_FAILED},),
+                          fact_map=facts(**{A.CHILD_REAPED: failed(A.SHUTDOWN_REAP_FAILED)}),
+                          child_status=0)
+    _check("audit.child_status_travels_with_the_reap_and_only_with_it",
+           "child_status_missing" in probs(no_status)
+           and "child_status_forbidden" in probs(invented_status),
+           f"only a process that reaped a child can hold its exit status, so `done` without "
+           f"one claims the reap while lacking the single piece of evidence a reaper "
+           f"necessarily has, and a status under `failed` was invented — there was nowhere to "
+           f"get it. The design already REMARKED that fabricating it would be a lie rather "
+           f"than an omission, and a remark about what a liar would have to do is not a check: "
+           f"missing={probs(no_status)} invented={probs(invented_status)}", failures, verbose)
+
+    statuses = {repr(v): probs(rec(child_status=v))
+                for v in (None, "fabricated", True, 1.0, [0])}
+    _check("audit.child_status_is_an_exit_status_and_not_merely_present",
+           all(any(p.startswith("child_status_not_an_integer") for p in v)
+               for v in statuses.values())
+           and not probs(rec(child_status=-9)) and not probs(rec(child_status=0)),
+           f"presence was never the claim being made. `null` is the sharpest of these — the "
+           f"record says the evidence exists and carries none of it — but `true` is the one a "
+           f"type check misses, because `isinstance(True, int)` holds in Python and a boolean "
+           f"here is a status nobody has. A `present` flag cannot tell any of them from a real "
+           f"exit code, which is the presence-not-content defect this whole rule is about, one "
+           f"type down: {statuses}", failures, verbose)
+
+    cause_on_done = rec(fact_map=facts(**{A.GROUP_TERMINATED:
+                                          {"state": A.DONE,
+                                           "cause": A.SHUTDOWN_GROUP_KILL_FAILED}}))
+    _check("audit.a_cause_is_forbidden_wherever_the_state_is_not_failed",
+           f"cause_forbidden:{A.GROUP_TERMINATED}:{A.SHUTDOWN_GROUP_KILL_FAILED}"
+           in probs(cause_on_done),
+           f"the union is closed in BOTH directions. A step that says it completed while "
+           f"carrying the cause of its own failure is a record disagreeing with itself, and "
+           f"reading `cause` only under `failed` does not tolerate that so much as leave it "
+           f"unread — which is worse, because nothing reports it: {probs(cause_on_done)}",
+           failures, verbose)
+
+    erased = {repr(v): probs(rec(fact_map=facts(**{A.GROUP_TERMINATED:
+                                                   {"state": A.DONE, "cause": v}})))
+              for v in (None, True, 7, [1], {"a": 1})}
+    _check("audit.a_present_optional_field_is_never_erased_into_absence",
+           all(f"fact_cause_not_a_string:{A.GROUP_TERMINATED}" in v for v in erased.values())
+           and f"cause_forbidden:{A.GROUP_TERMINATED}:" in probs(
+               rec(fact_map=facts(**{A.GROUP_TERMINATED: {"state": A.DONE, "cause": ""}}))),
+           f"`x if isinstance(x, str) else None` turns every non-conforming value into the "
+           f"same `None` this parser uses for `not there` — and absence is LEGAL for a cause, "
+           f"so `cause: null` under `done` was indistinguishable from a fact with no cause and "
+           f"the rule forbidding one never saw it. `null` is the case to test, not a valid "
+           f"string: a valid string cannot catch a parser erasing the field before the "
+           f"validator runs (review, PR #102). The empty string is the boundary — it IS a "
+           f"string, so it survives parsing and the union rule rejects it: {erased}",
+           failures, verbose)
+
+    stray_anomaly = rec(triggers=({"reason": A.CLIENT_EOF, "anomaly": P_UNCORRELATED},))
+    stray_payload = rec(outcomes=({"kind": A.SHUTDOWN_REAP_FAILED,
+                                   "fact": A.CHILD_REAPED},),
+                        fact_map=facts(**{A.CHILD_REAPED: failed(A.SHUTDOWN_REAP_FAILED)}))
+    _check("audit.a_payload_is_legal_only_under_the_tag_that_reads_it",
+           f"trigger_anomaly_forbidden:{A.CLIENT_EOF}" in probs(stray_anomaly)
+           and f"outcome_payload_forbidden:{A.SHUTDOWN_REAP_FAILED}" in probs(stray_payload),
+           f"the same union rule as `cause_forbidden`, reaching the two tagged unions it did "
+           f"not name when it was written one round ago. `_evidence_for` consults `fact` only "
+           f"on a `shutdown_anomaly` and the kind only on a `protocol_anomaly`, so either one "
+           f"carried elsewhere is never consulted — and an unread field is exactly what the "
+           f"cause rule was added for: nothing reports what nothing looks at: "
+           f"stray_anomaly={probs(stray_anomaly)} stray_payload={probs(stray_payload)}",
+           failures, verbose)
+
+    junk_target = rec(fault_point={"suppresses": ["not_a_fact"]})
+    _check("audit.every_suppression_target_is_a_known_completion_fact",
+           "suppresses_unknown:not_a_fact" in probs(junk_target),
+           f"the instance is anomalous either way, because the hook was armed — and that is "
+           f"exactly why this needs its own check: `anomalous for an unrelated reason` reads "
+           f"identically to `checked`, so a malformed fault configuration would be accepted as "
+           f"valid and only the arming would ever be reported. The targets are completion "
+           f"facts, so a name outside the closed set is a writer bug: {probs(junk_target)}",
+           failures, verbose)
+
+    # ---- the reasons: two axes, and they stay independent ----------------------------
+    escalated = rec(triggers=({"reason": A.CLIENT_EOF}, {"reason": A.SIGNAL_TERM}))
+    _check("audit.two_clean_triggers_do_not_compose_into_a_failure",
+           A.verdict(escalated).clean,
+           f"EOF followed by signal escalation is ordinary CLI behaviour — C3-1 measured "
+           f"claude and agy closing stdin and codex and copilot signalling, and a client may "
+           f"do both. The latch decides which trigger stopped forwarding, not which triggers "
+           f"COUNT, so runners-up are appended to the same list and classified the same way: "
+           f"{A.verdict(escalated)}", failures, verbose)
+
+    dirty_trigger = rec(triggers=({"reason": A.PROTOCOL_ANOMALY,
+                                   "anomaly": P_UNCORRELATED},))
+    dirty_cleanup = rec(outcomes=({"kind": A.SHUTDOWN_GROUP_KILL_FAILED},),
+                        fact_map=facts(**{A.GROUP_TERMINATED:
+                                          failed(A.SHUTDOWN_GROUP_KILL_FAILED)}))
+    _check("audit.each_axis_can_fail_the_instance_on_its_own",
+           not A.verdict(dirty_trigger).clean and not A.verdict(dirty_cleanup).clean
+           and A.verdict(dirty_trigger).anomalous == (A.PROTOCOL_ANOMALY,)
+           and A.verdict(dirty_cleanup).anomalous == (A.SHUTDOWN_GROUP_KILL_FAILED,),
+           f"the pair a single-slot reason cannot tell apart: one anomalous trigger through a "
+           f"CLEAN teardown, and one clean trigger through an anomalous one. Drop the trigger "
+           f"and a protocol anomaly reads as a clean client close; drop the outcomes and a "
+           f"failed group teardown — a surviving grandchild holding an interpolated credential "
+           f"— is certified clean by the record meant to prove the opposite: "
+           f"{A.verdict(dirty_trigger)} {A.verdict(dirty_cleanup)}", failures, verbose)
+
+    tolerated = rec(outcomes=({"kind": A.SHUTDOWN_WRITE_FAILED},
+                              {"kind": A.SHUTDOWN_CHILD_KILLED},))
+    _check("audit.the_two_measured_cleanup_outcomes_stay_clean",
+           A.verdict(tolerated).clean,
+           f"C3-1 measured agy closing stdin and ceasing to read at once, so the spec's "
+           f"graceful-closure write fails EPIPE against a CONFORMING peer — failing on it "
+           f"would fail a clean cell, which §10.5 counts as the same defect as forwarding a "
+           f"definition. Forced termination is likewise the spec's own escalation and only a "
+           f"SHOULD is attached to a prompt exit. Neither pairs with a completion fact, "
+           f"because neither stops its step: {A.verdict(tolerated)}", failures, verbose)
+
+    unknown_reason = rec(triggers=({"reason": "client_hung_up"},))
+    enumerated = A.TRIGGERS | A.OUTCOMES | {A.FAULT_POINT_CONFIGURED}
+    _check("audit.is_clean_is_total_and_has_no_default_clean_branch",
+           A.CLEAN_REASONS == {A.CLIENT_EOF, A.SIGNAL_TERM, A.SIGNAL_INT,
+                               A.SHUTDOWN_WRITE_FAILED, A.SHUTDOWN_CHILD_KILLED},
+           f"the clean set stated exactly, because the obvious phrasing of this arm — every "
+           f"enumerated reason is clean OR not in the clean set — is true by construction for "
+           f"a membership test and would pass against any set whatsoever. Five reasons leave "
+           f"an instance clean and the other {len(enumerated) - 5} do not; a sixth appearing "
+           f"here is a cell that now passes where it used to fail, which is the direction that "
+           f"never announces itself: {sorted(A.CLEAN_REASONS)}", failures, verbose)
+
+    _check("audit.an_unenumerated_reason_is_an_anomaly_not_a_pass",
+           not A.is_clean("client_hung_up")
+           and not A.verdict(unknown_reason).clean
+           and A.CLEAN_REASONS <= enumerated,
+           f"there is no default-clean branch: an unrecognized reason classifies as an anomaly, "
+           f"so adding one without classifying it fails the cell rather than passing it. The "
+           f"last conjunct is the same rule pointed the other way — a clean reason that is not "
+           f"an enumerated reason at all is a typo nothing else would catch, and it would sit "
+           f"in the set forgiving nothing until the day it forgave something: "
+           f"{A.verdict(unknown_reason)}", failures, verbose)
+
+    # ---- the fault point: arming is not firing ---------------------------------------
+    armed = rec(fault_point={"suppresses": [A.GROUP_TERMINATED]})
+    disarmed = {k: v for k, v in armed.items() if k != "fault_point"}
+    arm_only = rec(fault_point={"suppresses": []})
+    _check("audit.arming_a_fault_point_fails_the_instance_on_its_own",
+           not A.verdict(armed).clean
+           and A.verdict(armed).anomalous == (A.FAULT_POINT_CONFIGURED,)
+           and not probs(armed)
+           and A.verdict(disarmed).clean
+           and not A.verdict(arm_only).clean,
+           f"the isolating case, and the second half of it is what makes it one: this record "
+           f"is otherwise ordinary — clean trigger, empty outcome list, every fact `done`, no "
+           f"firing anywhere — so removing the configuration makes it CLEAN, which proves the "
+           f"arm pins that clause and nothing else is covering for it. The last conjunct is "
+           f"the arm-only hook that suppresses NOTHING: PRESENCE is the anomalous fact, and "
+           f"reading an empty list as `no fault point` passed exactly the run this case "
+           f"exists to reject (review, PR #102): armed={A.verdict(armed)} "
+           f"disarmed={A.verdict(disarmed)} arm_only={A.verdict(arm_only)}", failures, verbose)
+
+    fired_ok = rec(fault_point={"suppresses": [A.GROUP_TERMINATED]},
+                   fired=[{"fact": A.GROUP_TERMINATED}],
+                   fact_map=facts(**{A.GROUP_TERMINATED: failed(A.FAULT_POINT_FIRED)}))
+    fired_unconf = rec(fault_point={"suppresses": [A.CHILD_REAPED]},
+                       fired=[{"fact": A.GROUP_TERMINATED}],
+                       fact_map=facts(**{A.GROUP_TERMINATED: failed(A.FAULT_POINT_FIRED)}))
+    fired_unpaired = rec(fault_point={"suppresses": [A.GROUP_TERMINATED]},
+                         fired=[{"fact": A.GROUP_TERMINATED}])
+    _check("audit.only_a_fired_fault_point_pairs_with_a_failed_fact",
+           not probs(fired_ok)
+           and f"fired_unconfigured:{A.GROUP_TERMINATED}" in probs(fired_unconf)
+           and f"fired_unpaired:{A.GROUP_TERMINATED}" in probs(fired_unpaired),
+           f"arming and firing are two facts and one cannot stand in for the other: the "
+           f"pairing that licenses a `failed` completion is the FIRING, it is legal only for a "
+           f"fact the configuration listed, and a firing whose fact did not fail is a record "
+           f"of a suppression that did not happen. Collapsing the two destroys the arm-only "
+           f"case above, which is the whole reason both exist: ok={probs(fired_ok)} "
+           f"unconf={probs(fired_unconf)} unpaired={probs(fired_unpaired)}", failures, verbose)
+
+    _check("audit.a_suppressed_step_is_recorded_without_being_excused",
+           not A.verdict(fired_ok).clean
+           and A.verdict(fired_ok).anomalous == (A.FAULT_POINT_CONFIGURED,),
+           f"the combined teardown control of §10.9 lands here: steps 3-5 suppressed, "
+           f"`group_terminated` reading `failed`, the firing recorded, and the verdict "
+           f"anomalous — through the CONFIGURATION, since firing is evidence rather than a "
+           f"verdict input. The instance was already anomalous from the arming, so what the "
+           f"fired record adds is to the record and not to the judgement: "
+           f"{A.verdict(fired_ok)}", failures, verbose)
+
+    # ---- monotonicity ----------------------------------------------------------------
+    worse = rec(outcomes=({"kind": A.SHUTDOWN_READ_FAILED},),
+                fact_map=facts(**{A.DRAIN_ENDED: failed(A.SHUTDOWN_READ_FAILED)}))
+    _check("audit.a_clean_teardown_never_launders_an_anomalous_one",
+           A.verdict(clean).clean and not A.verdict(worse).clean,
+           f"the verdict is a monotonic conjunction over everything recorded, never a lookup "
+           f"on the last thing that happened: the same clean `client_eof` trigger, and adding "
+           f"one anomalous cleanup outcome can only move the verdict toward anomalous. This is "
+           f"§10.5's no-heal rule stated as an algebraic property and applied WITHIN one "
+           f"instance rather than across restarts: {A.verdict(worse)}", failures, verbose)
 
 
 def _check_arm_counter(failures, verbose):

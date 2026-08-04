@@ -289,13 +289,20 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 509 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 541 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 harness/tools/mutate_mcp.py                           # 181/181 production + 2/2 instrument
+python3 harness/tools/mutate_mcp.py                           # 230/230 production + 2/2 instrument + 8/8 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 278 checks
 git diff --check
 ```
+
+**The mutation suite now runs TWO suites, chosen by the file each mutation perturbs.**
+`agentskill_evals/` is proven by the selftest; `fixtures/` and `tools/` are proven by
+`verify_mcp_fixtures.py`, and those are the `F*` ids, counted apart from production for the
+same reason `I*` is — they perturb an instrument rather than the code under test. Running
+`mutate_mcp.py` therefore covers the third line above as well, and its three totals are three
+different claims. Do not add them together.
 
 **The arm count is now self-reported** — the selftest ends with `SELFTEST PASSED — N arms`.
 It used to live here as a hand-maintained literal and was stale for two PRs running, because
@@ -535,6 +542,69 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   rule is sometimes right, but the burden is to show the deviation is not an instance of the
   thing the rule exists to forbid, and "it is safer" does not discharge it: unsound in the
   strict direction is still unsound.
+- **A READER'S INPUT IS THE FORMAT, NOT THE WRITER'S PROMISE.** `mcp_audit.validate` was
+  written against the record the proxy intends to write, so `{"triggers": {}}` raised
+  `KeyError`, an array `state` raised `TypeError`, and a scalar `fired` raised on iteration —
+  six shapes crashed and two more passed clean. The module exists BECAUSE the writer is under
+  suspicion, which makes "the writer would never emit that" the one justification unavailable
+  to it. **A crash is worse than the malformed input that caused it**: a failed cell is a
+  result, and a traceback out of `verify_post_run` is an absent verdict — the outcome the
+  whole section exists to make impossible, arriving through the code written to guarantee it.
+  Parse first, into types, reporting every shape it cannot use; judge afterwards.
+- **`x.get(k) or []` erases the difference between MISSING, NULL and EMPTY.** All three become
+  "nothing on that axis", and nothing on an axis is legal — so a writer that forgot the axis
+  entirely validated clean. The same idiom hid a second one: a fault point whose suppression
+  list was empty read as no fault point at all, which passed exactly the arm-only run that
+  case exists to reject. **Wherever absence has a meaning, check what else produces the same
+  value** — this is the completion-facts lesson (§10.5.1) applied to the record's own keys,
+  which is where it should have been applied first.
+- **A BOOLEAN `present` FLAG THROWS AWAY THE THING BEING CHECKED.** `child_status` was parsed
+  as `"child_status" in raw`, so `null`, `"fabricated"` and `true` were all a clean verdict on
+  a record claiming to hold a child's exit status. `null` is the sharpest — the record asserts
+  the evidence exists and carries none of it — but `true` is the one a type check still misses,
+  because **`isinstance(True, int)` holds in Python**, so the obvious repair accepts a boolean
+  standing in for an exit code. Presence-not-content is the same defect as
+  absence-not-emptiness one level down, and it arrives the same way: a flag substituted for a
+  value nobody looked at. **Preserve the value, then check it**; a sentinel distinguishes
+  absent from every value JSON can carry, and a `present` boolean cannot.
+- **ERASING A BAD VALUE INTO `None` HIDES IT WHEREVER ABSENCE IS LEGAL.**
+  `x if isinstance(x, str) else None` turns every non-conforming value into the same `None`
+  the parser uses for "not there" — so a `cause: null` under a `done` step was
+  indistinguishable from a step with no cause, and the rule forbidding a cause under `done`,
+  added one round earlier, never saw one. Three sibling fields used the identical idiom and
+  survived only because their tags make them REQUIRED, so a different check caught the
+  erasure: **coverage by accident, from the same defect.** Preserve or report; never
+  substitute the absence marker for a value that was present. And the arm has to feed it
+  `null`, because a valid string cannot catch a parser erasing the field before validation.
+- **A payload is legal only under the tag that READS it, and that rule quantifies over every
+  tagged union in the file.** `cause_forbidden` was written for completion facts and stopped
+  there, leaving `anomaly` legal on any trigger and `fact`/`exception` legal on any outcome —
+  fields nothing consults, which is precisely what that rule exists to reject. One rule
+  widened one route at a time, again, and the tell was as advertised: the justification
+  ("nothing reports what nothing looks at") never mentioned completion facts.
+- **A closed set that is only checked on the way OUT is not checked.** The fault point's
+  suppression targets are completion facts, but the parser accepted any string — so
+  `{"suppresses": ["not_a_fact"]}` had no structural problem. It was easy to miss because the
+  instance is anomalous regardless (the hook was armed), and **"anomalous for an unrelated
+  reason" reads exactly like "checked"** in the output. Whenever a field's legality is implied
+  by another rule already failing the run, that is the moment it needs its own check.
+- **Inferring a cause from available evidence accepts contradictory records.** A `failed`
+  completion fact used to be legal if SOME pairing existed, so one record could carry both a
+  real group-kill failure and a fault-point suppression of that same step — two incompatible
+  accounts of one operation, no problem reported. The fix is that the fact DECLARES its cause
+  and the reader checks the record bears exactly that one. **"Is there evidence for this?" is
+  a weaker question than "is this the evidence?"**, and the gap between them is where two
+  truths sit side by side.
+- **A TOTALITY assertion over a membership test is a tautology.** The first cut of the audit
+  arms tried to pin "every enumerated reason has a verdict" as `all(is_clean(r) or r not in
+  CLEAN_REASONS for r in EVERY_REASON)` — which is `P or not P` once you notice `is_clean(r)`
+  IS `r in CLEAN_REASONS`, so it passes against any set whatsoever, including an empty one.
+  Not the precedence trap above; the disjunction simply restates the function's definition.
+  Where a classification is a set lookup, totality is free and therefore not worth asserting —
+  what is worth asserting is the **exact set**, because the failure that matters is a sixth
+  member appearing, and that is the direction nothing announces: a cell that now passes where
+  it used to fail. Two arms, because the two failures are different: the set stated exactly,
+  and an unenumerated reason classifying as an anomaly.
 - **A mutation whose defect is a CRASH needs an arm that can catch one.** An unhashable id
   reaching `dict.pop` raises several frames from anything that could log it — which is the
   defect — but an arm that lets it propagate turns the mutation into "failed, but NOT via",
@@ -821,9 +891,11 @@ ABA fix and its route to `parallel_safe_config = True`.
   **Designed in `DESIGN_MCP_Support.md` §10 (2026-07-29); being built.** stdio only in the
   first cut — remote `tools:` stays refused. Build order: ~~probe **C3-0**~~ →
   ~~probe **C3-1**~~ → ~~a **dual-era mode for `fixtures/echo_mcp_server.py`** (#98)~~ →
-  ~~the **decision layer** + its arms, wired to nothing (#100)~~ → the **I/O half** (spawn,
-  the two pumps, `SIGTERM`/`SIGINT` handlers, §10.5's shutdown, the audit log) plus a
-  wire-level driver → the adapter integration that unlocks `tools:`.
+  ~~the **decision layer** + its arms, wired to nothing (#100)~~ →
+  ~~the **audit record types**, the structural validator and `verdict()`
+  (`agentskill_evals/mcp_audit.py`), written before the code that produces them~~ → the
+  **I/O half** (spawn, the two pumps, `SIGTERM`/`SIGINT` handlers, §10.5's shutdown, writing
+  the audit log) plus a wire-level driver → the adapter integration that unlocks `tools:`.
   Everything before the last slice cannot affect any run, which is the point: this is harness
   code in the request path of every gated cell.
   **The I/O half starts from §10.5.1, written before its code**: every way an instance can end,

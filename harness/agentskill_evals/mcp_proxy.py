@@ -135,6 +135,19 @@ BAD_TOOLS_RESULT = "bad_tools_result"            # tools/list result not shaped 
 BAD_SUBSCRIPTION_CLOSURE = "bad_subscription_closure"
 SECOND_INITIALIZE = "second_initialize"          # lifecycle violation, not renegotiation
 
+# The same set, closed and named, because `mcp_audit` has to check that a `protocol_anomaly`
+# trigger carries one of THESE and not free text. A closed set that exists only as a column of
+# module constants is a set nobody can check against: the audit half would have to re-derive it
+# and could then disagree with it silently, which is the drift `verify_mcp_fixtures.py` already
+# pins for `_id_key` and friends. Where import is possible, import.
+ANOMALY_KINDS = frozenset({
+    UNPARSEABLE, MALFORMED, BATCH, UNCORRELATED, DUPLICATE_ID, CANCELLED_ID_REUSE,
+    SPENT_ID_REUSE, RESPONSE_AFTER_COMPLETION, AMBIGUOUS_CANCELLATION, UNIMPLEMENTED_VERSION,
+    MISSING_META, ERA_METHOD_MISMATCH, NO_ERA_ESTABLISHED, SERVER_REQUEST_IN_MODERN,
+    TOOL_BEARING_SAMPLING, BAD_INPUT_REQUESTS, BAD_TOOLS_RESULT, BAD_SUBSCRIPTION_CLOSURE,
+    SECOND_INITIALIZE,
+})
+
 # Why a request id is spent. Both spend it permanently; they differ in what a LATER response
 # on that id means — a documented race after a cancellation, a protocol violation after an
 # answer (§10.4).
