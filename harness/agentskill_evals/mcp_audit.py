@@ -226,6 +226,22 @@ class Fact:
     cause: str | None = None         # required when `state` is `failed`
 
 
+# Absent, distinguishable from every value JSON can carry — including `null`. A boolean
+# `present` flag cannot make that distinction, and `child_status: null` is a record claiming
+# the evidence exists while carrying none of it (review, PR #102).
+_MISSING = object()
+
+
+def is_exit_status(value: Any) -> bool:
+    """A JSON integer, and `True` is not one.
+
+    `isinstance(True, int)` holds in Python, so the obvious check accepts a boolean — and a
+    boolean here is a record claiming an exit status it does not have, which is the same
+    fabrication the presence rule exists to catch, one type down.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 @dataclass(frozen=True)
 class Record:
     """One instance's assembled records, after shape checking and before judgement.
@@ -241,7 +257,7 @@ class Record:
     fired: tuple[str, ...] = ()
     fault_point: bool = False                # PRESENT, which is the anomalous fact
     suppresses: frozenset[str] = frozenset()
-    child_status: bool = False               # present, not its value
+    child_status: Any = _MISSING             # the VALUE, or `_MISSING`; never a flag
 
     @property
     def latch(self) -> str | None:
@@ -356,7 +372,7 @@ def parse(raw: Any) -> tuple[Record, tuple[str, ...]]:
                     problems.append(f"suppresses_not_a_string:{i}")
 
     return (Record(tuple(triggers), tuple(outcomes), facts, fact_keys, tuple(fired),
-                   fault_point, frozenset(suppresses), "child_status" in raw),
+                   fault_point, frozenset(suppresses), raw.get("child_status", _MISSING)),
             tuple(problems))
 
 
@@ -427,10 +443,23 @@ def validate(record: Record) -> tuple[str, ...]:
     # invented, because there was nowhere to get it.
     reaped = record.facts.get(CHILD_REAPED)
     reaped_done = reaped is not None and reaped.state == DONE
-    if reaped_done and not record.child_status:
+    present = record.child_status is not _MISSING
+    if reaped_done and not present:
         problems.append("child_status_missing")
-    if not reaped_done and record.child_status:
+    if not reaped_done and present:
         problems.append("child_status_forbidden")
+    # Presence was never the claim being made. `null`, `"fabricated"` and `true` are all a
+    # record asserting it holds a child's exit status while holding something else, and a
+    # `present` boolean cannot tell any of them from the real thing.
+    if present and not is_exit_status(record.child_status):
+        problems.append(f"child_status_not_an_integer:{record.child_status!r}")
+
+    # The fault point's targets are completion facts, so a name outside the closed set is a
+    # malformed configuration. The instance is anomalous either way — the hook was armed — but
+    # "anomalous for an unrelated reason" is not the same as "checked", and the arming is the
+    # only thing that would have been reported.
+    for name in sorted(record.suppresses - set(FACTS)):
+        problems.append(f"suppresses_unknown:{name}")
 
     return tuple(problems)
 
@@ -475,8 +504,15 @@ def _cause_problems(record: Record) -> list[str]:
             # — it is two incompatible accounts of one step.
             if len(evidence) > 1:
                 problems.append(f"cause_contradicted:{key}:{','.join(sorted(evidence))}")
-        elif SHUTDOWN_ANOMALY in evidence:
-            problems.append(f"anomaly_orphan:{key}")
+        else:
+            # The union is closed in BOTH directions. A `done` step carrying the cause of its
+            # own failure is a record disagreeing with itself, and reading `cause` only under
+            # `failed` means the contradiction is not so much tolerated as unread.
+            cause = entry.cause if entry is not None else None
+            if cause is not None:
+                problems.append(f"cause_forbidden:{key}:{cause}")
+            if SHUTDOWN_ANOMALY in evidence:
+                problems.append(f"anomaly_orphan:{key}")
 
     for kind in {o.kind for o in record.outcomes}:
         key = _OUTCOME_PAIRING.get(kind)

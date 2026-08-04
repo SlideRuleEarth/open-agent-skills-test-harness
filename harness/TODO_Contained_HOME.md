@@ -289,10 +289,10 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 536 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 539 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 harness/tools/mutate_mcp.py                           # 222/222 production + 2/2 instrument + 8/8 fixture
+python3 harness/tools/mutate_mcp.py                           # 226/226 production + 2/2 instrument + 8/8 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 278 checks
 git diff --check
 ```
@@ -558,6 +558,21 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   case exists to reject. **Wherever absence has a meaning, check what else produces the same
   value** — this is the completion-facts lesson (§10.5.1) applied to the record's own keys,
   which is where it should have been applied first.
+- **A BOOLEAN `present` FLAG THROWS AWAY THE THING BEING CHECKED.** `child_status` was parsed
+  as `"child_status" in raw`, so `null`, `"fabricated"` and `true` were all a clean verdict on
+  a record claiming to hold a child's exit status. `null` is the sharpest — the record asserts
+  the evidence exists and carries none of it — but `true` is the one a type check still misses,
+  because **`isinstance(True, int)` holds in Python**, so the obvious repair accepts a boolean
+  standing in for an exit code. Presence-not-content is the same defect as
+  absence-not-emptiness one level down, and it arrives the same way: a flag substituted for a
+  value nobody looked at. **Preserve the value, then check it**; a sentinel distinguishes
+  absent from every value JSON can carry, and a `present` boolean cannot.
+- **A closed set that is only checked on the way OUT is not checked.** The fault point's
+  suppression targets are completion facts, but the parser accepted any string — so
+  `{"suppresses": ["not_a_fact"]}` had no structural problem. It was easy to miss because the
+  instance is anomalous regardless (the hook was armed), and **"anomalous for an unrelated
+  reason" reads exactly like "checked"** in the output. Whenever a field's legality is implied
+  by another rule already failing the run, that is the moment it needs its own check.
 - **Inferring a cause from available evidence accepts contradictory records.** A `failed`
   completion fact used to be legal if SOME pairing existed, so one record could carry both a
   real group-kill failure and a fault-point suppression of that same step — two incompatible

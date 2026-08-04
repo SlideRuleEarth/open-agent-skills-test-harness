@@ -1535,9 +1535,20 @@ MUTATIONS = [
      "    base = {FAULT_POINT_FIRED} if typed is None else {SHUTDOWN_ANOMALY, FAULT_POINT_FIRED}",
      "audit.the_catch_all_reaches_the_facts_with_no_typed_outcome"),
     ("M207-anomaly-may-name-a-fact-that-did-not-fail", AUDIT,
-     "        elif SHUTDOWN_ANOMALY in evidence:",
-     "        elif False:",
+     ('            if SHUTDOWN_ANOMALY in evidence:\n'
+      '                problems.append(f"anomaly_orphan:{key}")'),
+     ('            if False:\n'
+      '                problems.append(f"anomaly_orphan:{key}")'),
      "audit.a_shutdown_anomaly_whose_fact_is_not_failed_is_malformed"),
+    # The tagged union read in one direction only: `cause` is examined under `failed` and
+    # ignored everywhere else, so a step that completed while carrying the cause of its own
+    # failure is not tolerated so much as unread.
+    ("M225-a-cause-under-done-is-never-read", AUDIT,
+     ('            if cause is not None:\n'
+      '                problems.append(f"cause_forbidden:{key}:{cause}")'),
+     ('            if False:\n'
+      '                problems.append(f"cause_forbidden:{key}:{cause}")'),
+     "audit.a_cause_is_forbidden_wherever_the_state_is_not_failed"),
     # The two discriminated unions, each losing the payload its tag promises. A
     # `protocol_anomaly` that declines to say WHICH anomaly withholds the one thing the audit
     # log exists to carry, and it looks structurally fine.
@@ -1554,13 +1565,32 @@ MUTATIONS = [
 
     # ---- evidence only a reaper can hold -------------------------------------------------
     ("M210-reap-claimed-without-its-exit-status", AUDIT,
-     "    if reaped_done and not record.child_status:",
+     "    if reaped_done and not present:",
      "    if False:",
      "audit.child_status_travels_with_the_reap_and_only_with_it"),
     ("M211-exit-status-for-a-child-never-reaped", AUDIT,
-     "    if not reaped_done and record.child_status:",
+     "    if not reaped_done and present:",
      "    if False:",
      "audit.child_status_travels_with_the_reap_and_only_with_it"),
+    # Presence back in place of the value: `null`, `"fabricated"` and `true` are then all a
+    # clean verdict, and the record claims evidence it does not carry.
+    ("M226-child-status-is-checked-for-presence-not-content", AUDIT,
+     "    if present and not is_exit_status(record.child_status):",
+     "    if False:",
+     "audit.child_status_is_an_exit_status_and_not_merely_present"),
+    # ...and the type check that a boolean walks straight through, because `isinstance(True,
+    # int)` holds. The failure this catches looks like a real exit code in every dump.
+    ("M227-a-boolean-passes-for-an-exit-status", AUDIT,
+     "    return isinstance(value, int) and not isinstance(value, bool)",
+     "    return isinstance(value, int)",
+     "audit.child_status_is_an_exit_status_and_not_merely_present"),
+    # A fault point armed on a name that is not a completion fact. The instance is anomalous
+    # from the arming either way, which is precisely what makes the malformed configuration
+    # invisible without its own check.
+    ("M228-suppression-targets-are-not-checked", AUDIT,
+     "    for name in sorted(record.suppresses - set(FACTS)):",
+     "    for name in ():",
+     "audit.every_suppression_target_is_a_known_completion_fact"),
 
     # ---- arming is not firing -------------------------------------------------------------
     ("M212-fault-firing-need-not-be-configured", AUDIT,

@@ -10174,6 +10174,41 @@ def _check_mcp_audit_verdict(failures, verbose):
            f"than an omission, and a remark about what a liar would have to do is not a check: "
            f"missing={probs(no_status)} invented={probs(invented_status)}", failures, verbose)
 
+    statuses = {repr(v): probs(rec(child_status=v))
+                for v in (None, "fabricated", True, 1.0, [0])}
+    _check("audit.child_status_is_an_exit_status_and_not_merely_present",
+           all(any(p.startswith("child_status_not_an_integer") for p in v)
+               for v in statuses.values())
+           and not probs(rec(child_status=-9)) and not probs(rec(child_status=0)),
+           f"presence was never the claim being made. `null` is the sharpest of these — the "
+           f"record says the evidence exists and carries none of it — but `true` is the one a "
+           f"type check misses, because `isinstance(True, int)` holds in Python and a boolean "
+           f"here is a status nobody has. A `present` flag cannot tell any of them from a real "
+           f"exit code, which is the presence-not-content defect this whole rule is about, one "
+           f"type down: {statuses}", failures, verbose)
+
+    cause_on_done = rec(fact_map=facts(**{A.GROUP_TERMINATED:
+                                          {"state": A.DONE,
+                                           "cause": A.SHUTDOWN_GROUP_KILL_FAILED}}))
+    _check("audit.a_cause_is_forbidden_wherever_the_state_is_not_failed",
+           f"cause_forbidden:{A.GROUP_TERMINATED}:{A.SHUTDOWN_GROUP_KILL_FAILED}"
+           in probs(cause_on_done),
+           f"the union is closed in BOTH directions. A step that says it completed while "
+           f"carrying the cause of its own failure is a record disagreeing with itself, and "
+           f"reading `cause` only under `failed` does not tolerate that so much as leave it "
+           f"unread — which is worse, because nothing reports it: {probs(cause_on_done)}",
+           failures, verbose)
+
+    junk_target = rec(fault_point={"suppresses": ["not_a_fact"]})
+    _check("audit.every_suppression_target_is_a_known_completion_fact",
+           "suppresses_unknown:not_a_fact" in probs(junk_target),
+           f"the instance is anomalous either way, because the hook was armed — and that is "
+           f"exactly why this needs its own check: `anomalous for an unrelated reason` reads "
+           f"identically to `checked`, so a malformed fault configuration would be accepted as "
+           f"valid and only the arming would ever be reported. The targets are completion "
+           f"facts, so a name outside the closed set is a writer bug: {probs(junk_target)}",
+           failures, verbose)
+
     # ---- the reasons: two axes, and they stay independent ----------------------------
     escalated = rec(triggers=({"reason": A.CLIENT_EOF}, {"reason": A.SIGNAL_TERM}))
     _check("audit.two_clean_triggers_do_not_compose_into_a_failure",
