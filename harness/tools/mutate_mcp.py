@@ -1955,9 +1955,16 @@ MUTATIONS = [
      "a client that closes stdin and THEN signals records both, and stays clean"),
     # A buffered log, which makes a killed proxy indistinguishable from one that never ran —
     # and "never ran" is the half of §10.5's partition that is NOT a failure.
+    # DEFENDED IN TWO PLACES, so reintroducing the defect has to remove both (cf. M53): the
+    # handle is opened LINE-BUFFERED and every write is flushed besides, which means neither
+    # edit alone changes the bytes on disk. A block-buffered log is the actual failure — the
+    # start record sits in userspace when the SIGKILL lands, and a killed proxy becomes
+    # indistinguishable from one that never ran.
     ("M270-the-audit-log-is-not-flushed-per-record", PROXY_IO,
-     "        self._handle.flush()",
-     "        pass",
+     ('            self._handle = open(path, "a", buffering=1, encoding="utf-8")',
+      "        self._handle.flush()"),
+     ('            self._handle = open(path, "a", encoding="utf-8")',
+      "        pass"),
      "...and the start record was flushed before the child was spawned"),
     # Truncation instead of append, so the anomalous first instance vanishes rather than fails.
     ("M271-a-restart-truncates-the-log", PROXY_IO,

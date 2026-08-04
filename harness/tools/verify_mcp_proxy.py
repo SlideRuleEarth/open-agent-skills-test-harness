@@ -63,6 +63,12 @@ TARGET = os.path.join(HARNESS, "fixtures", "proxy_target_server.py")
 # loaded machine does not turn a pass into a flake.
 GRACE = 0.5
 DEADLINE = 30.0
+# Separate from DEADLINE, and much shorter, because it bounds a different thing: a reply the
+# proxy is going to send arrives in milliseconds, so a wait here is only ever spent on a case
+# that is about to fail its assertions. Sharing the 30s bound made one mutation — an anomaly
+# that stops being terminal — spend two minutes waiting for four replies that were never
+# coming, which is a suite timeout rather than a finding.
+REPLY_DEADLINE = 5.0
 
 fails: list[str] = []
 ran = 0
@@ -287,7 +293,7 @@ def run(*, command=None, args=None, tools=("echo",), env=None, fault=None, send=
                     # test. A reply that never comes is a case failing on its assertions, which
                     # is a result; a driver that hangs is not.
                     line = b""
-                    if _readable(proc.stdout.fileno(), DEADLINE):
+                    if _readable(proc.stdout.fileno(), REPLY_DEADLINE):
                         line = proc.stdout.readline()
                     if line:
                         replies.append(line.decode("utf-8", "replace").strip())
@@ -620,9 +626,15 @@ for label, kwargs in (("an uncatchable SIGKILL to the proxy", {"kill_after": 0.0
           and "terminator_absent" in gone.verdict.instances[0].problems
           and not gone.verdict.clean, gone)
 
+# THE STRUCTURAL CLAUSE FIRST, and here it is load-bearing rather than style: a block-buffered
+# log loses the start record entirely, so there is no instance to ask about and
+# `.only.start` would raise from the driver instead of reporting the defect.
+_flushed = run(send=[INIT], kill_after=0.0)
 check("...and the start record was flushed before the child was spawned",
-      run(send=[INIT], kill_after=0.0).only.start is not None,
-      "a buffered log makes a killed proxy indistinguishable from one that never ran")
+      _flushed.only is not None and _flushed.only.start is not None,
+      f"a buffered log makes a killed proxy indistinguishable from one that never ran, and "
+      f"'never ran' is the half of §10.5's partition that is NOT a failure: "
+      f"{_flushed.verdict.problems}")
 
 
 def restart_case():
