@@ -189,6 +189,17 @@ _TYPED_PAIRING = {
 _OUTCOME_PAIRING = {v: k for k, v in _TYPED_PAIRING.items() if v is not None}
 
 
+def typed_outcome(fact: str) -> str | None:
+    """The cleanup outcome that names this fact's own way of failing, where one exists.
+
+    Two facts have none — `intake_closed` and `child_stdin_closed` — and that is what
+    `shutdown_anomaly` is for. Exported so the writer names the same outcome the reader pairs
+    against, rather than restating the table: a check that re-derives a definition cannot
+    disagree with it, and a copy of one silently can.
+    """
+    return _TYPED_PAIRING.get(fact)
+
+
 def causes_for(fact: str) -> frozenset[str]:
     """The causes a `failed` fact may name — its typed outcome, the catch-all, or suppression.
 
@@ -830,9 +841,23 @@ def _field_problems(record: dict, kind: str) -> list[str]:
     known = _ENVELOPE_KEYS.union(required, optional)
     for key in sorted(set(record) - known):
         problems.append(f"{kind}_key_unknown:{key}")
-    ts = record.get("ts")
-    if not is_json_int(ts) and not isinstance(ts, float):
-        problems.append(f"{kind}_ts:{ts!r}")
+    return problems
+
+
+def _ts_problems(inst: Instance) -> list[str]:
+    """Every line carries a time, EVENTS INCLUDED — and they are the ones that matter most.
+
+    §10.7's claim for this log is that it is wire-level evidence "per call, with the server, the
+    tool, whether it was allowed or refused, and WHEN". The event records are the per-call half
+    of that, so a rule applied only to the three lifecycle records would leave the half the
+    claim is actually about unchecked. One loop over every record rather than a clause inside
+    the per-kind checks, because a rule with one owner cannot be applied to some of its cases.
+    """
+    problems = []
+    for record in inst.records:
+        ts = record.get("ts")
+        if not is_json_int(ts) and not isinstance(ts, float):
+            problems.append(f"{record.get('kind')}_ts:{ts!r}")
     return problems
 
 
@@ -909,6 +934,7 @@ def instance_verdict(inst: Instance, *, server: str,
                      allowed: frozenset[str]) -> InstanceVerdict:
     """One instance, judged: the log's own rules, then §10.5.1's over the assembled record."""
     problems = list(inst.problems)
+    problems.extend(_ts_problems(inst))
 
     if inst.start is None:
         # The partition of §10.5 has two halves and this is neither: an instance that logged a

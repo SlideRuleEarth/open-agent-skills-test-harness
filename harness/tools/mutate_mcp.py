@@ -106,9 +106,17 @@ SELFTEST = "agentskill_evals/selftest.py"
 SHIM = "fixtures/probe_era_mcp_server.py"
 ECHO = "fixtures/echo_mcp_server.py"
 PIPEPROBE = "tools/probe_mcp_pipelining.py"
-# Not a target, the second suite itself. A mutation aimed here would be asking the verifier
-# whether it notices being broken.
+# The proxy's I/O half and the awkward server it is driven against. PRODUCTION code that no
+# selftest arm can reach — it is only executed by running the real program over real pipes —
+# so it is `M*` like any other production target, proven by a THIRD suite. The classification
+# and the suite are different questions, and conflating them is what the split below fixes:
+# `M`/`I`/`F` says what a mutation perturbs, `_suite_for` says who would notice.
+PROXY_IO = "agentskill_evals/mcp_proxy_io.py"
+TARGET = "fixtures/proxy_target_server.py"
+# Not targets, the suites themselves. A mutation aimed here would be asking a verifier whether
+# it notices being broken.
 VERIFIER = "tools/verify_mcp_fixtures.py"
+PROXY_VERIFIER = "tools/verify_mcp_proxy.py"
 SELF = "tools/mutate_mcp.py"
 
 MUTATIONS = [
@@ -1806,8 +1814,14 @@ MUTATIONS = [
      "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
     # §10.7's claim for this log is that it is wire-level evidence "per call ... and WHEN".
     ("M250-a-record-need-not-say-when", AUDIT,
-     "    if not is_json_int(ts) and not isinstance(ts, float):",
-     "    if False:",
+     "        if not is_json_int(ts) and not isinstance(ts, float):",
+     "        if False:",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
+    # ...and the half of §10.7's claim that is actually about calls: the rule applied to the
+    # three lifecycle records and not to the event records it exists for.
+    ("M279-only-the-lifecycle-records-need-a-time", AUDIT,
+     "    for record in inst.records:",
+     "    for record in (inst.start or {}, inst.spawn or {}, inst.terminator or {}):",
      "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
 
     # ---- the start and spawn records' own claims -------------------------------------------
@@ -1852,6 +1866,156 @@ MUTATIONS = [
      "        elif version not in IMPLEMENTED_VERSIONS:",
      "        elif False:",
      "audit_log.an_observed_version_the_proxy_cannot_implement_is_a_leak"),
+
+    # ---- the proxy's I/O half, proven by tools/verify_mcp_proxy.py ----------------------
+    # Production code the selftest cannot reach: it is only executed by running the real
+    # program over real pipes, which is why the third suite exists. Every entry below is a
+    # defect that would produce a plausible-looking run — the whole failure mode §10.5 names,
+    # where a bug is a silently wrong eval rather than a loud failure.
+
+    # The audit log's evidence about the one thing it exists to record. The client still sees a
+    # filtered list, so nothing on the wire looks wrong; only the log is lying.
+    ("M259-the-log-understates-what-was-forwarded", PROXY_IO,
+     "                            forwarded=[n for n in kept if isinstance(n, str)],",
+     "                            forwarded=[],",
+     "...and the audit log records the filtering as the expected event it is"),
+    # The filtered list sent back to the SERVER instead of on to the client, so the client is
+    # answered by nothing and the server is told what its own tools are.
+    ("M260-a-filtered-result-goes-back-the-way-it-came", PROXY_IO,
+     ("                            removed=list(action.removed))\n"
+      "            self._send(direction, action.msg, back=False, shutting_down=shutting_down)"),
+     ("                            removed=list(action.removed))\n"
+      "            self._send(direction, action.msg, back=True, shutting_down=shutting_down)"),
+     "an off-list tool is stripped from the advertisement the client sees"),
+    # ...and the mirror image: the refusal forwarded to the server, which is the whole boundary
+    # inverted — the off-list call reaches the server and the client is never answered.
+    ("M261-a-refusal-is-forwarded-instead-of-answered", PROXY_IO,
+     ("            self.sink.write(audit.LINE_EVENT, event=audit.CALL_REFUSED, "
+      "tool=action.tool)\n"
+      "            self._send(direction, action.msg, back=True, shutting_down=shutting_down)"),
+     ("            self.sink.write(audit.LINE_EVENT, event=audit.CALL_REFUSED, "
+      "tool=action.tool)\n"
+      "            self._send(direction, action.msg, back=False, shutting_down=shutting_down)"),
+     "an off-list `tools/call` is answered by the proxy and never reaches the server"),
+    # `Fail` stops being terminal, which is the one thing §10.5 says it must be. The connection
+    # carries on and the cell passes with an unaccounted-for message in it.
+    ("M262-an-anomaly-does-not-stop-the-connection", PROXY_IO,
+     "            self._trigger(audit.PROTOCOL_ANOMALY, anomaly=action.anomaly.kind)",
+     "            pass",
+     "a JSON-RPC batch array is an anomaly, not traffic"),
+    # The tag without its payload: torn down for a protocol reason, declining to say which.
+    ("M263-the-anomaly-kind-is-not-recorded", PROXY_IO,
+     "            self._trigger(audit.PROTOCOL_ANOMALY, anomaly=action.anomaly.kind)",
+     "            self._trigger(audit.PROTOCOL_ANOMALY, anomaly=None)",
+     "protocol_anomaly: it carries WHICH anomaly, not just that there was one"),
+
+    # ---- the three ways an ending gets the wrong name -------------------------------------
+    # A server that died mid-request read as the client hanging up. The spec tells clients to
+    # RESTART an unexpectedly exited server, so this is the case most easily mistaken for
+    # normality — and it is the difference between a failed cell and a clean one.
+    ("M264-a-dead-child-reads-as-a-departing-client", PROXY_IO,
+     "                self._trigger(audit.CHILD_EXIT)",
+     "                self._trigger(audit.CLIENT_EOF)",
+     "child_exit: a server that exits while the connection is live"),
+    # §4's canonical defect, in the proxy this time: a swallowed read error presenting as a
+    # clean end of stream, so an instrument failure wears the clean-shutdown label.
+    ("M265-a-read-error-wears-the-clean-shutdown-label", PROXY_IO,
+     ("            print(f\"mcp-proxy: read failed on {direction}: {exc}\", file=sys.stderr)\n"
+      "            self._trigger(audit.READ_FAILED)"),
+     ("            print(f\"mcp-proxy: read failed on {direction}: {exc}\", file=sys.stderr)\n"
+      "            self._trigger(audit.CLIENT_EOF)"),
+     "read_failed: a read error is not an end of stream"),
+    # PHASE IS PART OF THE REASON, and these are the two directions of getting it wrong. First:
+    # the shutdown-phase write failure recorded as a live one, which fails every clean agy cell
+    # — C3-1 measured agy closing stdin and ceasing to read at once.
+    ("M266-the-shutdown-drain-fails-the-cell-on-EPIPE", PROXY_IO,
+     "            if shutting_down:",
+     "            if False:",
+     "shutdown_write_failed: measured against agy — recorded, swallowed, and CLEAN"),
+    # ...and the reverse: a write that failed MID-CONVERSATION, with what it carried never
+    # arriving, recorded as the clean teardown outcome and the cell passing.
+    ("M267-a-live-write-failure-is-forgiven-as-a-teardown-one", PROXY_IO,
+     "            if shutting_down:",
+     "            if True:",
+     "client_write_failed: a write to a departed client DURING forwarding"),
+
+    # ---- the shutdown sequence -------------------------------------------------------------
+    # No handlers, so default disposition terminates without running one and no terminator is
+    # written — on HALF THE SHIPPED FLEET, since C3-1 measured codex and copilot signalling
+    # rather than closing stdin. A false failure indistinguishable from the real one.
+    ("M268-the-signal-handlers-are-never-installed", PROXY_IO,
+     "            signal.signal(sig, lambda _sig, _frame: None)",
+     "            pass",
+     "signal_term: the client signals, and the handler still writes a terminator"),
+    # The runners-up sweep dropped, so a signal arriving during the teardown goes unrecorded and
+    # the log cannot say a CLI closed stdin and then signalled.
+    ("M269-a-signal-during-the-teardown-is-lost", PROXY_IO,
+     "            self._on_signal(wake_r)",
+     "            pass",
+     "a client that closes stdin and THEN signals records both, and stays clean"),
+    # A buffered log, which makes a killed proxy indistinguishable from one that never ran —
+    # and "never ran" is the half of §10.5's partition that is NOT a failure.
+    ("M270-the-audit-log-is-not-flushed-per-record", PROXY_IO,
+     "        self._handle.flush()",
+     "        pass",
+     "...and the start record was flushed before the child was spawned"),
+    # Truncation instead of append, so the anomalous first instance vanishes rather than fails.
+    ("M271-a-restart-truncates-the-log", PROXY_IO,
+     '            self._handle = open(path, "a", buffering=1, encoding="utf-8")',
+     '            self._handle = open(path, "w", buffering=1, encoding="utf-8")',
+     "a restarted proxy APPENDS, so the killed instance is still in the file"),
+    # STEP 4 AS A NO-OP, claiming success. This is the mutation the two liveness channels exist
+    # for: every other check in that file passes against it, the record says `group_terminated:
+    # done`, and a credential-bearing grandchild outlives the run.
+    ("M272-the-process-group-is-never-terminated", PROXY_IO,
+     "        self._step(audit.GROUP_TERMINATED, self._terminate_group)            # step 4",
+     "        self._done(audit.GROUP_TERMINATED)                                   # step 4",
+     "an ordinary clean shutdown leaves NOTHING from the instance alive"),
+    # Forced termination made a failure, so a server that merely needed SIGKILL fails the cell —
+    # which §10.5.1 classifies CLEAN because the spec only SHOULDs a prompt exit.
+    ("M273-a-killed-child-fails-the-cell", PROXY_IO,
+     "                self._outcome(audit.SHUTDOWN_CHILD_KILLED)",
+     "                self._outcome(audit.SHUTDOWN_READ_FAILED)",
+     "shutdown_child_killed: forced termination is the standard escalation, so CLEAN"),
+    # The drain given its own deadline again, so the escalation never runs and a server that
+    # needed SIGKILL is reported as a `shutdown_anomaly` instead of ending cleanly.
+    ("M274-the-drain-gives-up-before-the-escalation", PROXY_IO,
+     "        for escalation in (signal.SIGTERM, signal.SIGKILL):\n            self._signal_group(escalation)",
+     "        for escalation in ():\n            self._signal_group(escalation)",
+     "shutdown_child_killed: forced termination is the standard escalation, so CLEAN"),
+    # An unbounded drain instead of an anomaly: something outside the child's group holds its
+    # stdout and the proxy waits for it, which is a hang rather than a verdict.
+    ("M275-a-drain-that-never-ends-is-not-reported", PROXY_IO,
+     '        raise TimeoutError(\n            f"the child\'s stdout was still open after a group SIGKILL',
+     '        self._done(audit.DRAIN_ENDED)\n        return\n        raise TimeoutError(\n            f"the child\'s stdout was still open after a group SIGKILL',
+     "shutdown_anomaly: a bounded drain that never reaches EOF says so"),
+
+    # ---- the fault point, which is itself under test ---------------------------------------
+    # Arming not recorded, so a hook that silently never fires produces a PASSING run — the
+    # exact case §10.9 spends a dedicated arm-only run on.
+    ("M276-arming-is-not-recorded-in-the-start-record", PROXY_IO,
+     '            started["fault_point"] = {"suppresses": sorted(self.fault.targets)}',
+     "            pass",
+     "armed and wired to suppress nothing STILL fails the instance"),
+    # Suppression that relabels the fact instead of skipping the step, so the control's steps
+    # 3-5 run after all and the processes it needs alive are killed.
+    ("M277-a-suppressed-step-runs-anyway", PROXY_IO,
+     ("        self.fired.append(fact)\n"
+      "        self._failed(fact, audit.FAULT_POINT_FIRED)\n"
+      "        return True"),
+     ("        self.fired.append(fact)\n"
+      "        self._failed(fact, audit.FAULT_POINT_FIRED)\n"
+      "        return False"),
+     "with steps 3-5 suppressed, BOTH channels are still open after the proxy exits"),
+    # Two incompatible accounts of one step: the typed outcome AND a firing, which says the step
+    # was attempted and failed and also that it never ran.
+    ("M278-an-injected-failure-also-claims-suppression", PROXY_IO,
+     ("        if mode == FAIL:\n"
+      "            typed = audit.typed_outcome(fact)"),
+     ("        if mode == FAIL:\n"
+      "            self.fired.append(fact)\n"
+      "            typed = audit.typed_outcome(fact)"),
+     "shutdown_read_failed: recorded, paired to drain_ended, and anomalous"),
 
     # ---- F: instruments, proven by tools/verify_mcp_fixtures.py -------------------------
     # Everything above asks whether the selftest notices a defect in production code. These
@@ -1934,7 +2098,15 @@ _SUITE_TIMEOUT = 300
 _SUITES = {
     "selftest": (("-m", "agentskill_evals", "selftest"), r"\[FAIL\]\s+([^:]+):"),
     "fixtures": ((VERIFIER,), r"^\s*FAIL\s+(.+?)\s\s<- "),
+    "proxy": ((PROXY_VERIFIER,), r"^\s*FAIL\s+(.+?)\s\s<- "),
 }
+
+# The two files the third suite proves, named rather than derived: `mcp_proxy_io.py` sits in
+# `agentskill_evals/` where the selftest would otherwise be asked to catch it and would report
+# MISSED for every entry, and `proxy_target_server.py` sits in `fixtures/` where
+# `verify_mcp_fixtures.py` would. A path prefix cannot express either, because both directories
+# hold files belonging to the other suites.
+_PROXY_SUITE = (PROXY_IO, TARGET)
 
 
 def _suite_for(rel):
@@ -1945,7 +2117,13 @@ def _suite_for(rel):
     import them. Routing by hand would put a sixth field on 180-odd entries whose value is
     already implied by the second, and a wrong one reports MISSED for a defect whose checker
     never ran — indistinguishable, in the output, from a decorative check.
+
+    The proxy's I/O half is the exception the path cannot express, so it is named: it lives in
+    `agentskill_evals/` but no arm can reach it, and its fixture lives in `fixtures/` but the
+    other verifier does not drive it.
     """
+    if rel in _PROXY_SUITE:
+        return "proxy"
     return "fixtures" if rel.startswith(("fixtures/", "tools/")) else "selftest"
 
 
@@ -1987,12 +2165,17 @@ def _classify(mid, rel):
     Raises rather than warns: a suite that reports a wrong total is worse than one that
     refuses to start, and this runs before any baseline so the cost is a second.
     """
-    if rel in (SELF, VERIFIER):
+    if rel in (SELF, VERIFIER, PROXY_VERIFIER):
         raise SystemExit(
             f"mutation {mid!r} targets {rel}, which is a suite rather than something a suite "
-            f"checks. Asking the mutation runner whether it notices being mutated, or the "
-            f"fixture verifier whether it notices, establishes nothing about either.")
-    expected = "I" if rel == SELFTEST else "F" if _suite_for(rel) == "fixtures" else "M"
+            f"checks. Asking the mutation runner whether it notices being mutated, or either "
+            f"verifier whether it notices, establishes nothing about any of them.")
+    # BY THE FILE'S ROLE, not by which suite proves it. Reading the class off `_suite_for` was
+    # right while there were two suites and wrong the moment a third arrived: `mcp_proxy_io.py`
+    # is production proven by a driver, and `proxy_target_server.py` is an instrument proven by
+    # the same one, so the suite says nothing about which total either belongs in.
+    expected = ("I" if rel == SELFTEST
+                else "F" if rel.startswith(("fixtures/", "tools/")) else "M")
     kind = mid[0] if mid[0] in "MIF" else "?"
     if kind != expected:
         raise SystemExit(
@@ -2088,9 +2271,9 @@ def main():
               f"the selftest itself (see SELFTEST in the target list), and are NOT evidence "
               f"of production coverage")
     if totals["F"]:
-        print(f"{caught['F']}/{totals['F']} fixture/tool mutation(s) caught by "
-              f"{VERIFIER} — these perturb instruments rather than production code, so they "
-              f"are NOT part of the production total either")
+        print(f"{caught['F']}/{totals['F']} fixture/tool mutation(s) caught — these perturb "
+              f"instruments rather than production code, so they are NOT part of the "
+              f"production total either")
     total = time.monotonic() - started
     slow = f"slowest {slowest[1]} at {slowest[0]:.1f}s" if slowest[1] else "no mutation ran"
     bases = ", ".join(f"{s} baseline {v:.1f}s" for s, v in sorted(baseline.items()))

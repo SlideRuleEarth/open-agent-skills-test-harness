@@ -10578,6 +10578,9 @@ def _check_mcp_audit_log(failures, verbose):
         "start_key_unknown:secret": log(start(secret="t0ken"), spawn(), term()),
         "start_ts:None": log(json.dumps({"instance": "i1", "kind": A.LINE_START,
                                          "server": "echo", "pid": 1}), spawn(), term()),
+        "event_ts:None": log(start(), spawn(),
+                             json.dumps({"instance": "i1", "kind": A.LINE_EVENT,
+                                         "event": A.CALL_FORWARDED, "tool": "alpha"}), term()),
         "event_unknown:0:'exfiltrated'": log(start(), spawn(), event("exfiltrated"), term()),
         "event_key_missing:0:call_forwarded:tool":
             log(start(), spawn(), event(A.CALL_FORWARDED), term()),

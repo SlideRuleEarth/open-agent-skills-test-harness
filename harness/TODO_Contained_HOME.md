@@ -292,17 +292,21 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 541 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 harness/tools/mutate_mcp.py                           # 230/230 production + 2/2 instrument + 8/8 fixture
+python3 harness/tools/mutate_mcp.py                           # 250/250 production + 2/2 instrument + 8/8 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 278 checks
+harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 47 here
 git diff --check
 ```
 
-**The mutation suite now runs TWO suites, chosen by the file each mutation perturbs.**
-`agentskill_evals/` is proven by the selftest; `fixtures/` and `tools/` are proven by
-`verify_mcp_fixtures.py`, and those are the `F*` ids, counted apart from production for the
-same reason `I*` is — they perturb an instrument rather than the code under test. Running
-`mutate_mcp.py` therefore covers the third line above as well, and its three totals are three
-different claims. Do not add them together.
+**The mutation suite now runs THREE suites, and which one runs is a different question from
+which total a mutation counts in.** The suite is chosen by the file: `agentskill_evals/` is
+proven by the selftest, `fixtures/` and `tools/` by `verify_mcp_fixtures.py`, and the proxy's
+I/O half plus its awkward server by `verify_mcp_proxy.py` — the two files named explicitly,
+because both sit in a directory another suite owns. The **class** is chosen by the file's role:
+`M*` perturbs production, `I*` the selftest itself, `F*` an instrument. Those agreed while
+there were two suites and stopped agreeing the moment `mcp_proxy_io.py` arrived — production
+code no arm can reach. Running `mutate_mcp.py` therefore covers the last two lines above as
+well, and its three totals are three different claims. Do not add them together.
 
 **The arm count is now self-reported** — the selftest ends with `SELFTEST PASSED — N arms`.
 It used to live here as a hand-maintained literal and was stale for two PRs running, because
@@ -800,6 +804,67 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   verdict formula passes a run whose whole purpose was to fail. The **configuration** is the
   anomalous fact, not the firing — and there is a case for the no-op injection specifically,
   because the failure mode is a hook that quietly does nothing.
+- **A STEP ORDER CAN ENCODE A CORRECTNESS PROPERTY, AND THE OBVIOUS IMPLEMENTATION BREAKS IT
+  SILENTLY.** §10.5 says terminate the group (step 4) *before* reaping the child (step 5), which
+  reads like tidiness and is not: the group is named by the child's pid, and that pid stops
+  being unique the instant it is reaped, so `killpg` after `wait()` names a group the kernel may
+  have reassigned. Holding the child as an unreaped **zombie** through step 4 is the whole
+  mechanism. Then the constraint propagates upward in a way nothing warned about — step 3 may
+  not call `wait()` either, and `os.waitid(..., WNOWAIT)`, the POSIX way to wait without
+  consuming, **is not available on macOS**. **When a design fixes an order, ask what property
+  the order buys and then check every call that could violate it**, because the violating
+  version passes every test and differs only in which processes it signals.
+- **AN ERRNO IS A MEASUREMENT, NOT A MEANING.** `killpg` returns `EPERM` on macOS for a group
+  whose members are all zombies, where Linux returns 0 — and this proxy deliberately keeps a
+  zombie in that group, so reading `EPERM` as failure reports `shutdown_group_kill_failed` on
+  **every clean shutdown on one of the two supported platforms**. That is the false-failure half
+  of §10.5's rule, and it is the half that is easy to write while feeling careful. The check is
+  the same one the C3 probes exist for: before treating a return value as evidence, produce it
+  on purpose and look.
+- **A BOUND BELONGS TO THE STEP THAT OWNS THE WAIT, NOT TO EACH STEP THAT TOUCHES IT.** The
+  drain (step 2) and the escalation (step 3) were bounded separately, so a server that merely
+  needed `SIGKILL` — an outcome §10.5.1 classifies **clean** — had its drain time out first and
+  came out as a teardown anomaly. Two timers over one wait always disagree about something. The
+  tell is two steps asking the same question of the same descriptor.
+- **NON-BLOCKING ON ONE END OF A PIPE IS NOT NON-BLOCKING.** `signal.set_wakeup_fd` requires the
+  *write* end to be non-blocking and says nothing about the read end, so the sweep that collects
+  signals arriving during the teardown blocked forever on an empty pipe — after every clean
+  shutdown. No terminator was written, so the absence rule reported an anomaly for a run that
+  had done everything right. The failure only shows on the path that reads an *empty* channel,
+  which is the ordinary path; every case with something to read passed.
+- **AN INSTRUMENT MUST NOT BE COUPLED TO THE THING IT OBSERVES.** The credential-bearing helper
+  inherited the proxy's stderr, which is a descriptor the *driver* holds — so the driver's read
+  of it blocked until the helper exited, and the helper is precisely the process the case needs
+  to still be running. A liveness test that deadlocks on its subject surviving proves nothing.
+  Fixed on both sides: the helper gets `DEVNULL`, and the driver gives the proxy a stderr
+  **file** rather than a pipe, because anything in the group can hold a pipe open.
+- **A CONTROL CAN PASS ON THE FIXTURE'S MANNERS — SECOND INSTANCE, ONE LEVEL DOWN.** The rule
+  was already written for the helper ("must survive everything except a group signal"), and the
+  control then failed because the *child* exited on stdin close and EOF'd its own channel. The
+  suppressed steps were never under test. The fixture now closes stdout while staying alive, so
+  the drain settles cleanly and the only anomalies in the record are the injected ones. Same
+  quantifier lesson as the liveness channels: the rule was about one participant when it was
+  about every participant.
+- **THE INSTRUMENT FOR "A READ ERROR THAT IS NOT EOF" HAS TO PRODUCE AN OBSERVABLE ERROR.** Two
+  obvious arrangements do not: a directory as stdin makes CPython refuse to start (`<stdin> is
+  a directory, cannot continue`), so the proxy never reaches its own boundary and there is no
+  log at all; a pty whose master is closed reads as **plain EOF** on macOS, which is the very
+  thing the case must distinguish itself from. A loopback socket with `SO_LINGER {1, 0}` turns
+  the driver's close into an RST and the read into `ECONNRESET`. **Check that the failure you
+  are injecting arrives at the layer you are testing**, rather than upstream of it.
+- **CLASSIFYING BY THE WRONG AXIS SURVIVES UNTIL THE THIRD CASE.** `mutate_mcp.py` derived a
+  mutation's class (`M` production / `I` selftest / `F` instrument) from *which suite proves
+  it*, which agreed with the file's role for as long as there were two suites. The third suite
+  broke it in both directions at once: `mcp_proxy_io.py` is production proven by a driver, and
+  `proxy_target_server.py` is an instrument proven by the same driver. "What does this perturb?"
+  and "who would notice?" are two questions, and only the first determines which total a
+  mutation belongs in. A derivation that has never been wrong is not the same as a correct one.
+- **AN UNTESTED PATH THAT NOBODY SAYS IS UNTESTED READS AS TESTED.** Three cleanup outcomes —
+  `shutdown_read_failed`, `shutdown_reap_failed`, `shutdown_group_kill_failed` — cannot be
+  arranged from outside the proxy at all, so the driver reaches them through the fault point's
+  `fail` mode. That drives the **record** and not the code that would produce it in the wild.
+  The driver says so in its own header, and §10.9 says so too, because "every outcome driven"
+  is otherwise a claim about coverage the file does not have.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s

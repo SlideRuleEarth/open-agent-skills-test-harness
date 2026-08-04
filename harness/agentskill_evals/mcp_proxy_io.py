@@ -38,7 +38,7 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 if __package__:
     from . import mcp_audit as audit
@@ -66,6 +66,23 @@ GRACE_ENV = "ASE_MCP_GRACE"              # seconds; scales every bound below
 DEFAULT_GRACE = 5.0
 
 _READ_CHUNK = 65536
+
+# The client's own descriptors, by number rather than through `sys.stdin`/`sys.stdout`. Those
+# are buffered wrappers this program must not use — a line left in a userspace buffer is a line
+# the peer never saw — and `sys.stdin` is not even guaranteed to exist: CPython sets it to None
+# for a descriptor it cannot wrap for reading, so `sys.stdin.fileno()` turns an unusual stdin
+# into an `AttributeError` before the start record is written.
+CLIENT_IN = 0
+CLIENT_OUT = 1
+
+
+class _DrainFailed(Exception):
+    """The drain hit a read error and already recorded it. Unwind without re-diagnosing.
+
+    Without this the `shutdown_anomaly` catch-all would fire on top of the `shutdown_read_failed`
+    the drain just recorded, and the fact would carry two causes — which §10.5.1 rejects as two
+    incompatible accounts of one step, correctly.
+    """
 
 
 class ConfigError(Exception):
@@ -170,6 +187,12 @@ class AuditSink:
             pass
 
 
+SUPPRESS = "suppress"                    # skip the step; the fact reads `fault_point_fired`
+FAIL = "fail"                            # skip it and record the step's OWN typed outcome
+ABORT = "abort"                          # vanish before step 6, so no terminator is written
+FAULT_MODES = (SUPPRESS, FAIL, ABORT)
+
+
 @dataclass(frozen=True)
 class Fault:
     """The fault point of §10.9, read once at startup and recorded in the start record.
@@ -179,10 +202,32 @@ class Fault:
     and silently never fired from producing a passing run. Firing is evidence: it says which
     step was actually suppressed, and it is the only thing a suppressed step's `failed` may name
     as its cause.
+
+    THREE MODES, because "a reason nobody can produce on demand is a reason nobody has tested"
+    (§10.9) and three cleanup outcomes cannot be produced any other way. A read error on a pipe
+    this process created, a child that survives a group `SIGKILL`, and a `killpg` that fails for
+    a reason other than the group being gone are not arrangeable from outside the proxy at all.
+
+      `fact`        SUPPRESS — the step does not run and the record says exactly that:
+                    `fault_point_fired` for the fact, and `failed(fault_point_fired)` on it.
+      `fact=fail`   FAIL — the step does not run and the record carries the step's OWN typed
+                    outcome, with NO firing. That is not a cosmetic difference: §10.5.1 requires
+                    exactly one cause, and a record holding both would say the step was
+                    attempted and failed AND that it never ran.
+      `fact=abort`  ABORT — the process exits at that point, writing no terminator. §10.9's
+                    "teardown that died before reaching step 6", made deterministic instead of
+                    raced against a signal.
+
+    None of the three can make a run pass: the instance is anomalous from the ARMING, before
+    any of them does anything.
     """
 
     armed: bool = False
-    targets: frozenset[str] = frozenset()
+    modes: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def targets(self) -> frozenset[str]:
+        return frozenset(self.modes)
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> Fault:
@@ -192,11 +237,26 @@ class Fault:
         # PRESENT and empty is arm-only mode: configured, recorded, wired to suppress nothing,
         # which is its entire purpose. Reading an empty value as "no fault point" would pass
         # exactly the case §10.9 arms it for.
-        named = [part for part in env[FAULT_ENV].split(",") if part]
-        return cls(armed=True, targets=frozenset(named))
+        modes: dict[str, str] = {}
+        for part in env[FAULT_ENV].split(","):
+            if not part:
+                continue
+            fact, _, mode = part.partition("=")
+            mode = mode or SUPPRESS
+            if fact not in audit.FACTS or mode not in FAULT_MODES:
+                raise ConfigError(f"{FAULT_ENV} entry {part!r} names no completion fact "
+                                  f"and mode from {FAULT_MODES}")
+            if mode == FAIL and audit.typed_outcome(fact) is None:
+                # Two facts have no typed outcome, so there is nothing for this mode to record
+                # — and inventing `shutdown_anomaly` here would fabricate an exception that
+                # never happened, in a record whose whole purpose is to be believed.
+                raise ConfigError(f"{FAULT_ENV}: {fact!r} has no typed cleanup outcome, so "
+                                  f"{FAIL!r} has nothing to record; use {SUPPRESS!r}")
+            modes[fact] = mode
+        return cls(armed=True, modes=modes)
 
-    def suppresses(self, fact: str) -> bool:
-        return self.armed and fact in self.targets
+    def mode_for(self, fact: str) -> str | None:
+        return self.modes.get(fact) if self.armed else None
 
 
 def _grace(environ: dict[str, str] | None = None) -> float:
@@ -267,18 +327,30 @@ class Instance:
     def _outcome(self, kind: str, **payload) -> None:
         self.outcomes.append({"kind": kind, **payload})
 
-    def _suppressed(self, fact: str) -> bool:
-        """Whether the fault point stops this step from running, recording the firing if so.
+    def _injected(self, fact: str) -> bool:
+        """Whether the fault point stops this step from running, recording what it did.
 
         The step is SKIPPED, not relabelled. §10.9's control leaves the child and its group
         alive on purpose, which is only a demonstration if nothing killed them — and the record
         then says so, because the fact reads `failed(fault_point_fired)` and the pairing rule
         requires the matching fired record in both directions.
         """
-        if not self.fault.suppresses(fact):
+        mode = self.fault.mode_for(fact)
+        if mode is None:
             return False
+        if mode == ABORT:
+            # No terminator, on purpose. The absence rule is what has to catch this, and it is
+            # the one ending that cannot be made to describe itself.
+            print(f"mcp-proxy: fault point aborting before {fact}", file=sys.stderr)
+            sys.stderr.flush()
+            os._exit(70)
+        if mode == FAIL:
+            typed = audit.typed_outcome(fact)
+            self._outcome(typed)
+            self._failed(fact, typed)
+            return True
         self.fired.append(fact)
-        self.facts[fact] = {"state": audit.FAILED, "cause": audit.FAULT_POINT_FIRED}
+        self._failed(fact, audit.FAULT_POINT_FIRED)
         return True
 
     def _done(self, fact: str) -> None:
@@ -401,7 +473,7 @@ class Instance:
         """Both directions and the signal channel, until something latches a trigger."""
         sel = selectors.DefaultSelector()
         try:
-            sel.register(sys.stdin.fileno(), selectors.EVENT_READ, proxy.C2S)
+            sel.register(CLIENT_IN, selectors.EVENT_READ, proxy.C2S)
             sel.register(self.child.stdout.fileno(), selectors.EVENT_READ, proxy.S2C)
             sel.register(wake_r, selectors.EVENT_READ, "signal")
             while not self.triggers:
@@ -425,7 +497,7 @@ class Instance:
             self._trigger(audit.SIGNAL_INT if number == signal.SIGINT else audit.SIGNAL_TERM)
 
     def _on_readable(self, direction: str, sel: selectors.BaseSelector) -> None:
-        source = sys.stdin.fileno() if direction == proxy.C2S else self.child.stdout.fileno()
+        source = CLIENT_IN if direction == proxy.C2S else self.child.stdout.fileno()
         try:
             chunk = os.read(source, _READ_CHUNK)
         except OSError as exc:
@@ -484,7 +556,12 @@ class Instance:
             self._send(direction, action.msg, back=True, shutting_down=shutting_down)
             return
         if isinstance(action, proxy.Filtered):
-            kept = [t.get("name") for t in action.msg["result"]["tools"]]
+            # `.get` rather than `[...]`, even though `tools_result_ok` ran before the filter:
+            # a `KeyError` here would escape the pump and be recorded as `read_failed`, which
+            # is a misdiagnosis rather than a crash — the worst of the three outcomes, since
+            # the log would name a pipe fault for a bug in this function.
+            result = action.msg.get("result") if isinstance(action.msg.get("result"), dict) else {}
+            kept = [t.get("name") for t in (result.get("tools") or []) if isinstance(t, dict)]
             self.sink.write(audit.LINE_EVENT, event=audit.TOOLS_ADVERTISED,
                             forwarded=[n for n in kept if isinstance(n, str)],
                             removed=list(action.removed))
@@ -514,7 +591,7 @@ class Instance:
         to_client = (direction == proxy.S2C) != back
         payload = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
         try:
-            _write_all(sys.stdout.fileno() if to_client else self.child.stdin.fileno(),
+            _write_all(CLIENT_OUT if to_client else self.child.stdin.fileno(),
                        payload)
         except OSError as exc:
             if shutting_down:
@@ -549,28 +626,21 @@ class Instance:
         guarantee about every live member rather than an inference about one, and step 5's
         bounded reap is what reports a child that outlived even that.
         """
-        self._step(audit.INTAKE_CLOSED, self._close_intake)
+        self._step(audit.INTAKE_CLOSED, self._close_intake)                  # step 1
         if self.child is None:
             # `spawn_failed`: there is no child, so four facts are legitimately inapplicable —
             # the one shape a lazily written validator rejects along with the malformed ones.
             for fact in audit.FACTS[1:]:
                 self._not_applicable(fact)
             return
-        self._step(audit.CHILD_STDIN_CLOSED, self._close_child_stdin)
-        self._step(audit.DRAIN_ENDED, self._drain)
-        # Steps 3 and 5 produce ONE fact between them, which is why the fault point is keyed on
-        # facts rather than on step numbers: a step-keyed fault could not say which of them it
-        # was suppressing (§10.9). One suppression check therefore covers both.
-        reaping = not self._suppressed(audit.CHILD_REAPED)
-        if reaping:
-            self._guard(audit.CHILD_REAPED, self._await_child_exit)          # step 3
+        self._step(audit.CHILD_STDIN_CLOSED, self._close_child_stdin)        # step 2a
+        self._step(audit.DRAIN_ENDED, self._drain)                           # steps 2b and 3
         self._step(audit.GROUP_TERMINATED, self._terminate_group)            # step 4
-        if reaping and audit.CHILD_REAPED not in self.facts:
-            self._guard(audit.CHILD_REAPED, self._reap_child)                # step 5
+        self._step(audit.CHILD_REAPED, self._reap_child)                     # step 5
 
     def _step(self, fact: str, run) -> bool:
-        """One step, skipped if the fault point suppresses it and guarded either way."""
-        if self._suppressed(fact):
+        """One step, skipped if the fault point claims it and guarded either way."""
+        if self._injected(fact):
             return False
         return self._guard(fact, run)
 
@@ -585,6 +655,8 @@ class Instance:
         """
         try:
             run()
+        except _DrainFailed:
+            return False
         except BaseException as exc:                          # noqa: BLE001 — that is the point
             print(f"mcp-proxy: teardown step {fact} raised: {exc!r}", file=sys.stderr)
             self._outcome(audit.SHUTDOWN_ANOMALY, fact=fact, exception=repr(exc))
@@ -605,7 +677,7 @@ class Instance:
         self._done(audit.CHILD_STDIN_CLOSED)
 
     def _drain(self) -> None:
-        """Step 2, continued — keep draining the child's stdout, forwarding what it says.
+        """Steps 2b and 3 — drain the child's stdout, escalating on the bounded timer.
 
         THE PROXY NEVER SYNTHESIZES A CLOSURE. The graceful-closure result for an open
         `subscriptions/listen` is the SERVER's statement about the server's subscription, so the
@@ -613,67 +685,69 @@ class Instance:
         subscription closed cleanly is a thing the proxy cannot know, and is the same
         fabrication §10.4 refuses everywhere else.
 
-        BOUNDED, because the child's stdout can be held open by something other than the child
-        — a helper that inherited it. A drain that never reaches EOF within its bound is
-        therefore recorded as a `shutdown_anomaly`, not waved through: an unaccounted-for
-        process holding a pipe from a credential-bearing server is exactly what a clean verdict
-        must not certify.
+        THE DRAIN AND THE ESCALATION ARE ONE WAIT, not two bounded independently. They are the
+        same question — has the child finished? — asked of the same descriptor, and a drain with
+        its own separate deadline reports a server that merely needed `SIGKILL` as a
+        `shutdown_anomaly`, when §10.5.1 classifies forced termination as CLEAN. That would fail
+        a conforming cell, which §10.5 weighs exactly as heavily as forwarding a definition.
+
+        AND IT IS STILL BOUNDED, because the child's stdout can be held open by something the
+        group signal does not reach — a helper the server put in a different process group. A
+        drain that never reaches EOF is a `shutdown_anomaly` rather than a hang: an
+        unaccounted-for process holding a pipe from a credential-bearing server is exactly what
+        a clean verdict must not certify.
         """
-        deadline = time.monotonic() + self.grace * 2
+        if self._drain_until(time.monotonic() + self.grace):
+            self._done(audit.DRAIN_ENDED)
+            return
+        if self.fault.mode_for(audit.CHILD_REAPED) is not None:
+            # §10.9's control leaves the child and its group alive ON PURPOSE, and step 3's
+            # escalation would kill exactly what the case exists to observe. Gating on the
+            # arming rather than on the fixture's manners is the point: "a proxy that skipped
+            # step 4 would pass on the helper's good manners" is the failure mode being avoided.
+            raise TimeoutError("step 3 is suppressed, and the child has not finished")
+        for escalation in (signal.SIGTERM, signal.SIGKILL):
+            self._signal_group(escalation)
+            if escalation == signal.SIGKILL:
+                # The spec makes forced termination the standard escalation and only SHOULDs a
+                # prompt exit, so this is worth recording and not worth failing on. The
+                # terminator's promise — child reaped, group gone — still holds.
+                self._outcome(audit.SHUTDOWN_CHILD_KILLED)
+            if self._drain_until(time.monotonic() + self.grace):
+                self._done(audit.DRAIN_ENDED)
+                return
+        raise TimeoutError(
+            f"the child's stdout was still open after a group SIGKILL, so something outside "
+            f"the child's process group is holding it {self.grace:.1f}s later")
+
+    def _drain_until(self, deadline: float) -> bool:
+        """Pump the child's stdout until EOF or the deadline. True iff EOF was reached."""
+        if self._child_eof:
+            return True
         sel = selectors.DefaultSelector()
         try:
-            if not self._child_eof:
-                sel.register(self.child.stdout.fileno(), selectors.EVENT_READ)
-            while not self._child_eof:
+            sel.register(self.child.stdout.fileno(), selectors.EVENT_READ)
+            while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(
-                        f"the child's stdout was still open {self.grace * 2:.1f}s after its "
-                        f"stdin was closed; something outside the child is holding it")
-                if not sel.select(min(remaining, 0.25)):
+                    return False
+                if not sel.select(min(remaining, 0.05)):
                     continue
                 try:
                     chunk = os.read(self.child.stdout.fileno(), _READ_CHUNK)
                 except OSError as exc:
                     # Same argument as `read_failed`, and the one §4 has already caught in the
-                    # wild: a swallowed OSError that presents as a clean end of stream.
+                    # wild: a swallowed `OSError` that presents as a clean end of stream.
                     print(f"mcp-proxy: drain read failed: {exc}", file=sys.stderr)
                     self._outcome(audit.SHUTDOWN_READ_FAILED)
                     self._failed(audit.DRAIN_ENDED, audit.SHUTDOWN_READ_FAILED)
-                    return
+                    raise _DrainFailed from exc
                 if not chunk:
                     self._child_eof = True
-                    break
+                    return True
                 self._consume(proxy.S2C, chunk, shutting_down=True)
         finally:
             sel.close()
-        self._done(audit.DRAIN_ENDED)
-
-    def _await_child_exit(self) -> None:
-        """Step 3 — the child's bounded chance to exit, escalating, WITHOUT reaping it.
-
-        The child's stdout reaching EOF is the reading that it has finished, and step 2's drain
-        has usually already established it, so the ordinary shutdown spends no time here and
-        sends no signals. What this step owes the sequence is only a BOUND: correctness comes
-        from step 4's unconditional group `SIGKILL` and step 5's bounded reap, neither of which
-        depends on this reading being right.
-        """
-        deadline = time.monotonic() + self.grace
-        while not self._child_eof and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if self._child_eof:
-            return
-        self._signal_group(signal.SIGTERM)
-        deadline = time.monotonic() + self.grace
-        while not self._child_eof and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if self._child_eof:
-            return
-        self._signal_group(signal.SIGKILL)
-        # The spec makes forced termination the standard escalation and only SHOULDs a prompt
-        # exit, so this is worth recording and not worth failing on. The terminator's promise —
-        # child reaped, group gone — still holds.
-        self._outcome(audit.SHUTDOWN_CHILD_KILLED)
 
     def _terminate_group(self) -> None:
         """Step 4 — the GROUP, not just the child, and while the child is still unreaped.
@@ -795,6 +869,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         cfg = load_config(args[0])
+        fault = Fault.from_env()
         sink = AuditSink(cfg.audit_path, uuid.uuid4().hex)
     except ConfigError as exc:
         # OUTSIDE the instance boundary, so nothing was logged and nothing was spawned. Closed
@@ -803,7 +878,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"mcp-proxy: {exc}", file=sys.stderr)
         return 2
     try:
-        return Instance(cfg, sink, Fault.from_env(), grace=_grace()).run()
+        return Instance(cfg, sink, fault, grace=_grace()).run()
     finally:
         sink.close()
 
