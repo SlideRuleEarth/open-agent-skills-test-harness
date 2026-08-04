@@ -1982,8 +1982,9 @@ MUTATIONS = [
     # for: every other check in that file passes against it, the record says `group_terminated:
     # done`, and a credential-bearing grandchild outlives the run.
     ("M272-the-process-group-is-never-terminated", PROXY_IO,
-     "        self._step(audit.GROUP_TERMINATED, self._terminate_group)            # step 4",
-     "        self._done(audit.GROUP_TERMINATED)                                   # step 4",
+     "        delivered = self._step(audit.GROUP_TERMINATED, self._terminate_group)   # step 4",
+     ("        delivered = True\n"
+      "        self._done(audit.GROUP_TERMINATED)                                   # step 4"),
      "an ordinary clean shutdown leaves NOTHING from the instance alive"),
     # Forced termination made a failure, so a server that merely needed SIGKILL fails the cell —
     # which §10.5.1 classifies CLEAN because the spec only SHOULDs a prompt exit.
