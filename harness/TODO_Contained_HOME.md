@@ -541,6 +541,195 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   which proves nothing and reads like a tooling problem. The arm calls through a helper that
   converts an exception into a value the assertion rejects. Same principle as the rest of §4:
   the arm has to be able to *observe* the failure it is named for.
+- **One field cannot carry both WHY something stopped and WHAT HAPPENED on the way out.**
+  §10.5.1 was drafted as a single closed list of "reasons an instance can end", and it read as
+  complete because every entry in it was real. It was not: `client_eof → shutdown_write_failed
+  → shutdown_child_killed` is one ending with three facts in it, and a single-slot reason has
+  to drop two. Whichever it drops is the load-bearing one — drop the trigger and a protocol
+  anomaly reads as a clean client close; drop the outcomes and a failed process-group teardown,
+  which is a surviving grandchild holding a credential, is certified clean by the record meant
+  to prove the opposite. The fix is two axes and a **monotonic conjunction** over both, not a
+  lookup on the last event. **The tell is enumerating things that can happen at different
+  phases of one lifecycle into one flat list**: ask whether two entries can be true of the same
+  ending, and if they can, they are not alternatives. The second tell is asymmetry once the
+  axes are split — `read_failed` had no shutdown-phase counterpart, and that missing
+  `shutdown_read_failed` is the §4 defect above (a swallowed `OSError` presenting as clean EOF)
+  waiting to happen in the proxy instead of the shim.
+- **Totality over an enumeration says nothing about the endings that write no record.** The
+  same section's verification plan was "drive every reason and check every reason has a
+  verdict" — which cannot reach `SIGKILL`, a crash after the start record, or a terminator
+  truncated mid-write, because in each the process that would name a reason is already gone.
+  Those need the absence rule (a start with no well-formed terminator is an anomaly) and their
+  own cases, half of them driven against the *reader* with synthetic logs rather than against
+  the program. A closed enumeration is evidence about the endings that can speak.
+- **A LIST OF EXCEPTIONS IS NOT EVIDENCE THAT ANYTHING RAN.** The two-axis fix defined an empty
+  cleanup-outcome list as "every step did what it promised" — but every outcome in it records
+  something going *wrong*, so a teardown that skipped its process-group kill outright raises
+  nothing, records nothing, and satisfies a verdict computed from the reasons alone. The thing
+  being certified clean is a surviving credential-bearing grandchild: the exact failure the
+  step exists to prevent, passed by the record that was supposed to prove it did not happen.
+  The fix is **positive completion facts** — each step records `done` or `not_applicable` with
+  its justification, and *missing* is an anomaly, because a step that reported nothing cannot
+  be told apart from a step that never ran. **Whenever absence is given a meaning, check
+  whether two different situations produce it**; here a blank meant both "did not apply" and
+  "did not happen". And since a completion fact is the implementation's own claim about itself,
+  one case has to verify it from outside the process — the group really gone, checked by the
+  driver, not asserted by the proxy.
+- **"EVERY recorded X is clean" is TRUE when nothing was recorded.** The fix above made the
+  verdict a conjunction over the triggers, the outcomes and the completion facts — and every
+  clause of it is universally quantified, so a terminator with an empty trigger list satisfies
+  all of them. That is not a clean instance, it is a broken writer, and the verdict said clean.
+  Any `all()` needs a **structural clause first**: the collections that must be non-empty are
+  non-empty, every required field is present, every value is from its closed set. Owned by the
+  *reader*, not the writer — a process broken enough to emit the malformed record is the wrong
+  one to ask whether it did. And the validator needs the **legal record that resembles an
+  illegal one** among its cases (here `spawn_failed`, whose facts are genuinely inapplicable),
+  or "reject everything" passes the whole suite. Same rule as the arms: state what a broken
+  implementation produces, then check the assertion rejects it — `all([])` is the purest form
+  of an assertion that cannot fail.
+- **An outside observer can only assert what it can observe — the C3-3 lesson, second
+  instance.** The external check on teardown was written as "confirms the direct child was
+  reaped", which no other process can establish: a proxy that exits without reaping leaves a
+  child that init adopts and reaps, and afterwards the two are identical. The load-bearing
+  property is narrower and *is* observable — **nothing from the instance is still alive** — so
+  that is what the case claims. Prefer **monotone evidence over a probe**: an inherited pipe
+  whose EOF proves every holder is gone cannot race the proxy's exit and cannot be fooled by a
+  PID recycled under `kill(pid, 0)`. Then check the discriminating power of the fixture itself
+  — a helper that exits on its own, or on stdin EOF, lets a proxy that skipped the group kill
+  pass on the helper's good manners rather than on its own behaviour.
+- **The EVIDENCE CHANNEL has a premise, and it needs its own positive check.** The teardown case
+  proves "nothing survived" by reading EOF on a pipe inherited into the child's group — sound,
+  and worthless if the descriptor never arrived. A broken `pass_fds`, or a helper that closes
+  the writer at startup, produces an immediate EOF and a passing case with nothing torn down.
+  So the helper writes a **distinctive readiness token** through that same pipe and holds the
+  writer for life, and the driver requires the token, then requires **no EOF before shutdown
+  starts**, and only then treats EOF as the finding. The token must be the helper's own, or the
+  child's liveness is accepted as the helper's. Third instance of one pattern in this PR: a
+  check that passes hardest when nothing happened — first in the proxy's outcome list, then in
+  the verdict's quantifiers, then in the instrument built to catch the first two.
+- **A liveness signal is about WHOEVER holds it, not about who you meant.** The readiness token
+  above proves the helper *once* held the pipe; it says nothing about who holds it now, because
+  every process on the inheritance path got a copy. A helper that writes its token and closes
+  its writer then survives undetected: the ancestors keep the pipe open, the pre-shutdown check
+  sees no EOF, and the EOF arrives later for the wrong reason. Attribution needs a **sole
+  holder** — each stage closes its copy as soon as it has passed it on, the driver's own close
+  included, or EOF never arrives at all and the case hangs instead of passing.
+- **A NEGATIVE observation is only about the subject once every other candidate is gone.** The
+  negative control above requires "no EOF" to mean "the helper survived" — but non-EOF only
+  ever means *somebody* holds a writer, so taken too early it is satisfied by an ancestor and
+  proves nothing. Two defects then cancel: a helper that closes its writer early and survives,
+  plus a proxy that keeps its copy until exit, gives a positive case passing on the proxy's
+  exit and a control passing on the proxy's copy, with the survivor invisible to both. Fixing
+  it is ordering, not extra assertions — wait for every ancestor to exit, *then* observe.
+  **Ask what else could satisfy a negative observation, and eliminate those first**; and close
+  with the positive (kill the group, require EOF), so the control cannot pass by observing
+  nothing at all.
+- **TWO ENUMERATIONS DESCRIBING THE SAME EVENT MUST BE ABLE TO AGREE.** The completion facts
+  could say `done`, `not_applicable`, or nothing — and nothing was defined as malformed. But the
+  outcome axis already had `shutdown_reap_failed` and `shutdown_group_kill_failed`, which are
+  those same steps running and failing, and there was **no legal way to say so on the fact
+  side**. A record of a failed teardown could not be written at all. The fix is a `failed` state
+  paired to its outcome, closed in **both** directions — a `failed` fact requires its outcome
+  and the outcome requires the fact — because a validator checking one direction lets the writer
+  record the failure on whichever axis it prefers and stay silent on the other. **When one thing
+  is described by two enumerations, enumerate the cross-product, not each list alone**; the
+  missing cell is where a real state ends up unwriteable.
+- **A CATCH-ALL has to be reachable from every case it claims to cover.** `shutdown_anomaly` was
+  defined as an exception escaping *any* teardown step, and then paired with only the two facts
+  that had no typed outcome — so an exception during the drain, the reap or the group kill had
+  no legal way to be recorded, which is the same unwriteable-state defect as the round before,
+  found in the mechanism added to prevent it. A catch-all is only a catch-all if the pairing
+  rule quantifies the way its definition does. It also needs its scope pinned: the anomaly
+  carries the step it escaped, and the validator requires that step to match the fact claiming
+  it, or one catch-all excuses a failure anywhere in the record.
+- **CONFIGURED IS NOT FIRED, AND ONE FACT CANNOT BE BOTH.** The rule that a suppressed step
+  reads `failed(fault_point_configured)` let *arming* justify the claim that a step was
+  suppressed — and, read in the other direction, made a genuinely unfired hook structurally
+  invalid. Those are exactly the two states the no-op-injection case exists to tell apart, so
+  the pairing rule destroyed the test it was written alongside. Arming is a start-record fact
+  and is anomalous **on its own**; firing is per-fact evidence and is the only thing a `failed`
+  completion may pair with. **When a check needs a hook's activation, ask whether the record it
+  reads proves activation or merely intent** — and check that the isolating case can still go
+  green when the clause under test is deleted, or it is pinning something else.
+- **A PAIRING KEY MUST BE AS FINE-GRAINED AS THE THING IT PAIRS.** The catch-all outcome was
+  keyed by step number, and step 2 owns two completion facts — so one `shutdown_anomaly(step=2)`
+  raised by closing stdin would license `drain_ended: failed` as well, or instead. The check
+  "the step matches the fact" cannot see the difference, so it passes for the wrong reason,
+  which is worse than not having it: it reads like coverage. The key is now the exact fact, and
+  the sibling case is pinned in both directions. **The tell is a key whose value set is smaller
+  than the set of things it identifies** — look for a table row that names two things, and for
+  a cross-check written against the coarser of two available identifiers.
+- **Evidence that only one actor can hold must be structurally tied to that actor's claim.**
+  `child_status` is obtainable only by the process that reaped the child, so it is required
+  exactly when `child_reaped` says `done` and forbidden otherwise. Left loose, a writer can
+  claim the reap while lacking the one thing a reaper necessarily has, or attach a status to a
+  child it never reaped. The observation that fabricating it would be *a lie rather than an
+  omission* was already in the design as a remark — **a remark about what a liar would have to
+  do is not a check**; make the reader enforce it.
+- **A control that suppresses a step must suppress everything downstream that DEPENDS on it.**
+  The control leaves the child alive on purpose, so it also has to suppress the reap — a live
+  child cannot be reaped, and a control that stopped at "don't kill" would hang or crawl to the
+  terminator through a give-up path, reporting a reap failure for a reap never attempted. Ask
+  what the suppressed step was supposed to *produce*, then follow the consumers.
+- **A FIX APPLIED TO ONE INSTRUMENT MUST BE STATED AS A RULE, OR THE NEXT ONE ARRIVES WITHOUT
+  IT.** The helper channel was given a two-sided proof — announce, then no-premature-EOF, then
+  a control that keeps the holder alive — and the very next round added a *second* channel for
+  the child carrying the identical unverified premise: never passed to the child, EOF at once,
+  accepted as proof the child had exited. The defect and its fix were on the same page. What
+  stopped it recurring was writing the requirement as a quantified rule over **every** liveness
+  channel instead of as two repairs, and then noticing the rule now also demands a control for
+  the child. This is `CLAUDE.md`'s first rule, and the tell is exactly as advertised: the
+  justification for the helper channel's fix never mentioned helpers.
+- **An IDENTIFIER is not an OBSERVATION.** Having specified that the driver waits for the direct
+  child to exit, I wrote that it "takes" the child from the audit log's spawn record — which
+  supplies a pid, not a death. The driver cannot `wait()` a process it did not spawn; a
+  liveness probe on the pid is point-in-time and recycles; and the terminator's `child_reaped`
+  is the claim the case exists to test, so leaning on it is circular. The fix is the same
+  mechanism one level shallower — a second inherited pipe, scoped to the child and not passed
+  to the helper, whose EOF is external evidence of the child's exit. **When a step says "wait
+  for X", check that the driver can observe X at all**, rather than that it can name X.
+- **Two independent reports of the same identity must be cross-checked before either is acted
+  on.** The helper reports its process group; the proxy reports the child's. Believing one
+  without the other lets the control pass against the wrong group entirely — a mis-grouped
+  helper `READY`s, survives, gets cleaned up, and the child's actual group, the only thing
+  step 4 is supposed to kill, was never under test. So the two must agree, and the child must
+  satisfy `pid == pgid` under `start_new_session=True`; disagreement fails the case rather
+  than being reconciled, and only the vouched-for group is ever signalled.
+- **Cleanup targets come from the thing being cleaned up, never from discovery.** The control
+  has to kill a group it deliberately left running, and the only non-guessing source for that
+  group id is the process in it — so the helper reports its own PGID in its readiness record,
+  along with a driver-supplied nonce that stops a leftover helper from answering for this run.
+  Anything else is the driver deciding for itself which processes belong to the run, which is
+  how the `rmtree(dirname(cwd))` fixture above deleted its own working tree. The driver also
+  refuses to signal its own group or an ancestor's, for the same reason.
+- **A detector is worth what its negative control is worth.** "The helper holds the descriptor
+  for life" and "every ancestor closed its copy" are fixture assertions, and the previous three
+  findings are all about assertions nobody made the code demonstrate. So one case **suppresses
+  the group kill on purpose** and requires that the survivor be reported — the only arrangement
+  that tells a channel attributing survival to the helper apart from one reporting on whatever
+  ancestor still holds a copy. This is `mutate_mcp.py`'s argument applied to a fixture: an
+  instrument that has never been shown failing is an instrument nobody has tested. Whatever the
+  control leaves running, the driver must then clean up — a test for leaked credential-bearing
+  processes that leaks one has picked the wrong side of its own point.
+- **A closed key set is closed in BOTH directions, and only one of them gets tested.** The
+  structural validator was specified as "every completion fact present, every value from its
+  closed set" — which a validator iterating the names it already knows satisfies while ignoring
+  a fact added later. Missing keys are the case everyone writes; **unrecognized keys are how the
+  next field silently stops being checked**, the same drift the "no default-clean branch" rule
+  exists to stop on the value side. Pin both, and pin them per key rather than once for the set.
+- **A count restated in prose beside the table it counts will be wrong.** Twice in one PR: the
+  section's first draft said "seven reasons" of an eleven-row table, and "three facts" of the
+  four that `spawn_failed` makes inapplicable. Both were counting rows, not entries, and both
+  read fine. The fix is not a more careful count, it is **not restating it** — "every
+  child-and-group fact" cannot drift, and re-derives itself when the table changes. Same rule as
+  the verification-block counts in §4, applied to prose.
+- **A test-only hook is a verdict input, or it is a way to pass without being tested.** The
+  fault-injection point that lets the driver reach the endings with no reason was specified as
+  "recorded in the start record", which sounds like it closes the hole and does not: if the
+  fault is armed and never fires, the trigger is clean, the outcomes are clean, and the stated
+  verdict formula passes a run whose whole purpose was to fail. The **configuration** is the
+  anomalous fact, not the firing — and there is a case for the no-op injection specifically,
+  because the failure mode is a hook that quietly does nothing.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s
@@ -637,6 +826,22 @@ ABA fix and its route to `parallel_safe_config = True`.
   wire-level driver → the adapter integration that unlocks `tools:`.
   Everything before the last slice cannot affect any run, which is the point: this is harness
   code in the request path of every gated cell.
+  **The I/O half starts from §10.5.1, written before its code**: every way an instance can end,
+  on two axes — the triggers, latched in order, plus the cleanup outcomes accumulated after
+  them — together with a positive completion fact per teardown step, since a list of things
+  that went wrong is silent about a step that never ran at all. The verdict is a monotonic
+  conjunction over all of it rather than a lookup on whatever happened last, behind a
+  structural clause, since every other clause is universally quantified and an empty record
+  satisfies them all.
+  One total `is_clean` that every consumer reads (terminator record, per-instance verdict,
+  `verify_post_run`), no default-clean branch, and phase carried in the reason rather than in a
+  flag each caller applies, which dissolves the "`EPIPE` is clean in exactly one place"
+  conditional into distinct reasons. Endings that no enumeration can reach — `SIGKILL`, a crash
+  after the start record, a truncated terminator — are covered by one absence rule and are
+  tested separately, because totality over the enum cannot see them. That enumeration exists up
+  front because this is the defect shape §4 has already paid for twice on #100; the single-axis
+  first draft reproduced it *in the section written to prevent it* (review, #101), which is the
+  cheapest possible demonstration that it needed writing down.
   **Probe C3-2 resolved 2026-07-31** (`tools/probe_mcp_pipelining.py`): no CLI pipelines
   requests behind `initialize`, which is what licenses §10.2 REFUSING one. A pending
   negotiation cannot govern traffic — the pipelined request's response may arrive first,
