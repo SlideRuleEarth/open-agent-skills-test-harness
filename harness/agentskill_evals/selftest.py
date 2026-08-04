@@ -8911,6 +8911,7 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     # C3 proxy — the decision layer (DESIGN_MCP_Support.md §10), wired to nothing yet
     _section(_check_mcp_proxy_decisions, failures, verbose)
     _section(_check_mcp_audit_verdict, failures, verbose)
+    _section(_check_mcp_audit_log, failures, verbose)
 
     # LAST, because it is about everything above it: the arm count reported in the banner is
     # the only signal that a whole section stopped running, and a counter that silently
@@ -10362,6 +10363,315 @@ def _check_mcp_audit_verdict(failures, verbose):
            f"one anomalous cleanup outcome can only move the verdict toward anomalous. This is "
            f"§10.5's no-heal rule stated as an algebraic property and applied WITHIN one "
            f"instance rather than across restarts: {A.verdict(worse)}", failures, verbose)
+
+
+def _check_mcp_audit_log(failures, verbose):
+    """C3's audit LOG — DESIGN_MCP_Support.md §10.5, §10.7 and §10.9.
+
+    The section above judges one instance from a map somebody assembled. This one is about
+    where that map comes from, and it exists because the rules that live at the FILE level are
+    the ones with nothing to enumerate: an instance that stopped writing, a final line cut in
+    half, a clean restart standing in for the anomalous instance before it. Every one of them is
+    a statement about a string, so every one of them is drivable — which is the whole reason the
+    reader parses text rather than taking a file path.
+
+    HALF OF THESE ARMS ARE NEGATIVE CONTROLS, deliberately. A reader that rejected every log
+    would satisfy the absence rule, the allowlist rule and the no-heal rule simultaneously, and
+    would fail every gated cell — the false failure §10.5 says is exactly as bad as the false
+    pass. So each rule below is driven with its own clean counterpart, and where the rule is
+    about one instance among several, the arm asserts which one came out clean.
+    """
+    import json
+
+    from . import mcp_audit as A
+
+    print("mcp audit log:")
+
+    allow = frozenset({"alpha"})             # and `beta` is the off-list tool throughout
+
+    def line(**fields):
+        fields.setdefault("ts", 1)
+        return json.dumps(fields)
+
+    def start(instance="i1", **over):
+        return line(**{"instance": instance, "kind": A.LINE_START, "server": "echo",
+                       "pid": 4001, **over})
+
+    def spawn(instance="i1", **over):
+        return line(**{"instance": instance, "kind": A.LINE_SPAWN, "child_pid": 4002,
+                       "child_pgid": 4002, **over})
+
+    def event(kind, instance="i1", **payload):
+        return line(instance=instance, kind=A.LINE_EVENT, event=kind, **payload)
+
+    def term(instance="i1", facts=None, **over):
+        """A terminator that is clean unless the case makes it otherwise.
+
+        `child_status` rides along with a `done` reap because the two travel together, exactly
+        as the record-layer builder does it: a terminator that carried one regardless would
+        make every `spawn_failed` case below malformed for a reason the case was not about.
+        """
+        settled = {k: {"state": A.DONE} for k in A.FACTS} if facts is None else facts
+        fields = {"instance": instance, "kind": A.LINE_TERMINATOR, "observed": ["2025-11-25"],
+                  "triggers": [{"reason": A.CLIENT_EOF}], "outcomes": [], "facts": settled}
+        if settled.get(A.CHILD_REAPED, {}).get("state") == A.DONE:
+            fields["child_status"] = 0
+        fields.update(over)
+        return line(**fields)
+
+    def log(*lines):
+        return "".join(f"{one}\n" for one in lines)
+
+    def read(text, *, server="echo", allowed=allow):
+        return A.log_verdict(text, server=server, allowed=allowed)
+
+    def codes(text, **kw):
+        found = read(text, **kw)
+        return tuple(found.problems) + tuple(p for v in found.instances for p in v.problems)
+
+    def by_id(text, **kw):
+        return {v.instance_id: v for v in read(text, **kw).instances}
+
+    # ---- the positive control, which every rule below is measured against ---------------
+    ordinary = log(start(), spawn(),
+                   event(A.TOOLS_ADVERTISED, forwarded=["alpha"], removed=["beta"]),
+                   event(A.CALL_FORWARDED, tool="alpha"),
+                   event(A.CALL_REFUSED, tool="beta"),
+                   event(A.MESSAGE_DROPPED, reason="late response to cancelled c2s id 1"),
+                   term())
+    _check("audit_log.an_ordinary_gated_run_reads_clean",
+           read(ordinary).clean,
+           f"one instance that started, spawned, advertised a filtered tool list, forwarded an "
+           f"on-list call, refused an off-list one and ended on `client_eof`. If this is not "
+           f"clean then every gated cell fails, which §10.5 weighs exactly as heavily as "
+           f"forwarding a definition — and it is the arm that stops each rule below from being "
+           f"satisfied by a reader that rejects everything: {read(ordinary)}", failures, verbose)
+
+    leaked_advert = log(start(), spawn(),
+                        event(A.TOOLS_ADVERTISED, forwarded=["alpha", "beta"], removed=[]),
+                        term())
+    _check("audit_log.a_filtered_advertisement_is_an_expected_event",
+           read(ordinary).clean and "off_list_advertised:beta" in codes(leaked_advert),
+           f"the invariant is about what was FORWARDED, not what was seen. A proper-subset "
+           f"allowlist normally MEANS the server advertises off-list tools and the proxy strips "
+           f"them, so a reader phrased as `the log records no off-list tool` would reject "
+           f"exactly the case where filtering worked — `beta` names a stripped tool in one of "
+           f"these logs and a forwarded one in the other, and only the second is a failure: "
+           f"filtered={read(ordinary).clean} forwarded={codes(leaked_advert)}",
+           failures, verbose)
+
+    # ---- the absence rule, and the endings that have no reason to record ----------------
+    unterminated = log(start(), spawn())
+    _check("audit_log.a_start_with_no_terminator_is_an_anomaly",
+           not read(unterminated).clean and "terminator_absent" in codes(unterminated)
+           and read(log(start(), spawn(), term())).clean,
+           f"the one rule covering the four endings no enumeration can reach — an uncatchable "
+           f"`SIGKILL` to the proxy, a crash after the start record, a teardown that died "
+           f"before step 6, and a truncated final line — because in each the process that would "
+           f"have named a reason is already gone. The instance boundary sits before the spawn "
+           f"attempt precisely so this partition is exact: a start with no terminator is a "
+           f"failure, and no start at all is an instance that forwarded nothing: "
+           f"{codes(unterminated)}", failures, verbose)
+
+    whole = term()
+    truncated = log(start(), spawn()) + whole[:len(whole) // 2]
+    _check("audit_log.a_truncated_final_line_is_absent_rather_than_repaired",
+           "unparseable_line:2" in codes(truncated)
+           and "terminator_absent" in codes(truncated)
+           and read(log(start(), spawn(), whole)).clean,
+           f"the same log with the last record whole is clean, so the half-written line is what "
+           f"made the difference — without that control this arm would pass against a reader "
+           f"that failed the log for any reason at all. A partial line is treated as ABSENT and "
+           f"never repaired into a terminator: repairing it, or waving it through as `just a "
+           f"partial write`, turns a proxy killed mid-record into one that ended cleanly, which "
+           f"is the exact inversion the absence rule exists to prevent: {codes(truncated)}",
+           failures, verbose)
+
+    _check("audit_log.an_empty_log_is_not_a_clean_log",
+           not read("").clean and "no_instances" in read("").problems
+           and not read("\n\n").clean,
+           f"the conjunction over instances is universally quantified, so it is vacuously true "
+           f"of a file with nothing in it — and a gated server whose proxy never wrote a start "
+           f"record means the gating never happened, so a pass would certify an UNGATED run. "
+           f"The structural clause has to come first here for the same reason `triggers_empty` "
+           f"does one level down: empty={read('').problems} blank={codes(chr(10) * 2)}",
+           failures, verbose)
+
+    # ---- the no-heal rule, which is why the verdict is per instance ---------------------
+    restarted = log(start("i1"), spawn("i1"),
+                    start("i2"), spawn("i2"), term("i2"))
+    seen = by_id(restarted)
+    _check("audit_log.a_clean_restart_never_heals_the_instance_before_it",
+           not read(restarted).clean
+           and seen["i2"].clean and not seen["i1"].clean,
+           f"unexpected exit is a spec-sanctioned RESTART trigger, so one log holds many "
+           f"instances and the cell verdict is the conjunction over all of them. `find the "
+           f"latest verdict for this server`, or a dedupe keyed on the server name, would each "
+           f"let the clean second instance paper over the first — and the arm asserts i2 came "
+           f"out clean as well as that the log did not, because a reader that failed both would "
+           f"satisfy a check written only on the log: i1={seen['i1'].problems} "
+           f"i2={seen['i2'].problems}", failures, verbose)
+
+    orphan = log(start("i1"), spawn("i1"), term("i2"))
+    _check("audit_log.a_terminator_answers_only_for_its_own_instance",
+           set(by_id(orphan)) == {"i1", "i2"}
+           and "terminator_absent" in by_id(orphan)["i1"].problems
+           and "start_absent" in by_id(orphan)["i2"].problems,
+           f"a terminator carrying a different instance id is not this instance's terminator, "
+           f"however clean it reads and however close to the start record it sits. Matching on "
+           f"position, or on `the last terminator in the file`, would satisfy i1 with a record "
+           f"written by a process that had already restarted — and the orphan is itself a "
+           f"failure, since a terminator with no start closes a boundary nothing recorded: "
+           f"{codes(orphan)}", failures, verbose)
+
+    doubled = log(start(), start(), spawn(), term(), term())
+    _check("audit_log.a_second_record_never_overwrites_the_first",
+           f"{A.LINE_START}_duplicate" in codes(doubled)
+           and f"{A.LINE_TERMINATOR}_duplicate" in codes(doubled),
+           f"one instance writes one start and one terminator. A grouping that overwrote would "
+           f"let the second answer for the first, which is the same substitution the no-heal "
+           f"rule refuses one level up — and it is the shape a writer that reuses an instance "
+           f"id across restarts produces, where the SECOND run's clean terminator would be "
+           f"read as the first run's: {codes(doubled)}", failures, verbose)
+
+    reordered = log(spawn(), start(), term())
+    _check("audit_log.nothing_may_be_written_ahead_of_the_start_record",
+           "records_precede_start" in codes(reordered)
+           and read(log(start(), spawn(), term())).clean,
+           f"the start record is written BEFORE the child is spawned and therefore before a "
+           f"single byte is forwarded (§10.5), which is what makes `logged a start` and "
+           f"`spawned nothing` a clean partition. A line ahead of it in an append-only file is "
+           f"a writer that buffered or reordered, and the partition no longer holds: "
+           f"{codes(reordered)}", failures, verbose)
+
+    # ---- §10.6's guarantee, read back off the log --------------------------------------
+    both_ways = {
+        "off_list_advertised:beta":
+            log(start(), spawn(), event(A.TOOLS_ADVERTISED, forwarded=["beta"], removed=[]),
+                term()),
+        "on_list_removed:alpha":
+            log(start(), spawn(), event(A.TOOLS_ADVERTISED, forwarded=[], removed=["alpha"]),
+                term()),
+        "off_list_call_forwarded:beta":
+            log(start(), spawn(), event(A.CALL_FORWARDED, tool="beta"), term()),
+        "on_list_call_refused:alpha":
+            log(start(), spawn(), event(A.CALL_REFUSED, tool="alpha"), term()),
+    }
+    missed = {code: codes(text) for code, text in both_ways.items() if code not in codes(text)}
+    _check("audit_log.the_allowlist_is_checked_in_both_directions",
+           not missed and read(ordinary).clean,
+           f"the two obvious checks — no off-list tool advertised, no off-list call forwarded — "
+           f"are satisfied in full by a proxy that stripped every tool and refused every call. "
+           f"That is `rejects everything scores full marks` landing where it does the most "
+           f"damage, because a silently reduced tool surface is a WRONG eval rather than a "
+           f"failed one, and the scenario author sees a model that would not use the tool it "
+           f"was given. So an allowed tool that was removed, and an allowed tool that was "
+           f"refused, are failures too: {missed or 'all four caught'}", failures, verbose)
+
+    # ---- the line and event envelopes, closed in both directions -----------------------
+    hostile = {
+        "line_kind:0:['start']": json.dumps({"instance": "i1", "kind": ["start"], "ts": 1}),
+        "line_instance:0:None": json.dumps({"kind": A.LINE_START, "ts": 1}),
+        "line_not_a_map:0": "[1, 2]",
+        "unparseable_line:0": "{not json",
+        "blank_line:1": log(start(), "   ", spawn(), term()),
+        "start_key_unknown:secret": log(start(secret="t0ken"), spawn(), term()),
+        "start_ts:None": log(json.dumps({"instance": "i1", "kind": A.LINE_START,
+                                         "server": "echo", "pid": 1}), spawn(), term()),
+        "event_unknown:0:'exfiltrated'": log(start(), spawn(), event("exfiltrated"), term()),
+        "event_key_missing:0:call_forwarded:tool":
+            log(start(), spawn(), event(A.CALL_FORWARDED), term()),
+        "event_payload_forbidden:0:call_forwarded:reason":
+            log(start(), spawn(), event(A.CALL_FORWARDED, tool="alpha", reason="why"), term()),
+        "event_name:0:forwarded:0":
+            log(start(), spawn(), event(A.TOOLS_ADVERTISED, forwarded=[7], removed=[]), term()),
+    }
+    caught = {}
+    for code, text in hostile.items():
+        try:
+            caught[code] = code in codes(text) and not read(text).clean
+        except Exception as exc:                              # noqa: BLE001 — that IS the arm
+            caught[code] = f"raised {type(exc).__name__}"
+    _check("audit_log.every_malformed_line_is_a_code_rather_than_an_exception",
+           all(v is True for v in caught.values()),
+           f"the reader's input is a file the proxy may have been killed halfway through "
+           f"writing, so `['start'] in LINE_KINDS` raises `TypeError: unhashable type` — the "
+           f"envelope crash of §10.4 arriving inside the one component whose contract is that "
+           f"it does not raise. A traceback out of `verify_post_run` is not a failed cell but "
+           f"an ABSENT verdict. The `event_payload_forbidden` case is the same rule the record "
+           f"layer applies to its tagged unions: a field nothing consults can say anything at "
+           f"all, and no check will ever disagree with it: "
+           f"{ {k: v for k, v in caught.items() if v is not True} or 'all caught'}",
+           failures, verbose)
+
+    # ---- the start record's own claims --------------------------------------------------
+    _check("audit_log.the_log_belongs_to_the_server_it_gates",
+           "server_mismatch:'echo'" in codes(ordinary, server="other")
+           and read(ordinary).clean,
+           f"the verdict is per gated server, so a log written by a proxy fronting a different "
+           f"server answers for nothing here — and a misrouted config that wrote to the wrong "
+           f"file would otherwise produce a clean verdict for a server whose proxy never ran: "
+           f"{codes(ordinary, server='other')}", failures, verbose)
+
+    unspawned = {A.INTAKE_CLOSED: {"state": A.DONE},
+                 **{k: {"state": A.NOT_APPLICABLE} for k in A.FACTS[1:]}}
+    spawn_failed = term(triggers=[{"reason": A.SPAWN_FAILED}], facts=unspawned)
+    partition = {
+        "spawn_record_missing": log(start(), term()),
+        "spawn_record_after_spawn_failed": log(start(), spawn(), spawn_failed),
+    }
+    legal_spawn_failed = log(start(), spawn_failed)
+    _check("audit_log.a_spawn_record_and_spawn_failed_are_exact_complements",
+           all(code in codes(text) for code, text in partition.items())
+           and by_id(legal_spawn_failed)["i1"].anomalous == (A.SPAWN_FAILED,)
+           and codes(legal_spawn_failed) == (),
+           f"a signal handler sets a flag and the CONTROL PATH acts on it (§10.5), so a signal "
+           f"arriving between the start record and the spawn does not skip the spawn — which is "
+           f"what makes this a partition rather than a tendency. The legal `spawn_failed` log "
+           f"is in the arm because its four `not_applicable` facts and its missing spawn record "
+           f"are exactly what a reader written to reject the two malformed cases rejects along "
+           f"with them: missing={codes(partition['spawn_record_missing'])} "
+           f"legal={codes(legal_spawn_failed)}", failures, verbose)
+
+    not_leader = log(start(), spawn(child_pgid=4003), term())
+    _check("audit_log.the_spawn_record_must_name_a_group_leader",
+           "spawn_not_group_leader:4002:4003" in codes(not_leader)
+           and "spawn_ids:'4002':4002" in codes(log(start(), spawn(child_pid="4002"), term())),
+           f"`start_new_session=True` makes the child a session and process-group leader, so "
+           f"its pgid IS its pid — a launch decision that exists only so step 4 has a group to "
+           f"signal (§10.5). A spawn record disagreeing with it says the group the teardown "
+           f"went on to kill was not the group the child was in, which is a surviving "
+           f"credential-bearing grandchild reported as a successful cleanup: {codes(not_leader)}",
+           failures, verbose)
+
+    # ---- the fault point rides on the start record, and only there ----------------------
+    armed = log(start(fault_point={"suppresses": []}), spawn(), term())
+    on_term = log(start(), spawn(), term(fault_point={"suppresses": []}))
+    _check("audit_log.arming_is_read_from_the_start_record_and_nowhere_else",
+           A.FAULT_POINT_CONFIGURED in read(armed).instances[0].anomalous
+           and A.FAULT_POINT_CONFIGURED not in read(on_term).instances[0].anomalous
+           and "terminator_key_unknown:fault_point" in codes(on_term),
+           f"arming is anomalous BY BEING PRESENT, and the arm-only case of §10.9 is the one "
+           f"that pins it: nothing else in `armed` is anomalous, so no other clause can be "
+           f"covering for the verdict. Reading `fault_point` from wherever it appears would let "
+           f"a terminator declare an arming that never happened; not reading it from the start "
+           f"would let one hide an arming that did — and this arm requires the terminator's "
+           f"copy to be both ignored AND reported, since silently dropping it is how a field "
+           f"stops being checked: armed={read(armed).instances[0].anomalous} "
+           f"on_term={codes(on_term)}", failures, verbose)
+
+    # ---- §10.7's telemetry, cross-checked against the gate that produced it -------------
+    leaked = log(start(), spawn(), term(observed=["2025-11-25", "2099-01-01"]))
+    _check("audit_log.an_observed_version_the_proxy_cannot_implement_is_a_leak",
+           "observed_unimplemented:2099-01-01" in codes(leaked)
+           and read(log(start(), spawn(), term(observed=[]))).clean,
+           f"recording is evidence, not control — what keeps an unimplemented version from "
+           f"being forwarded is §10.2's gate, applied to every request including the first. "
+           f"Which is exactly why this is worth checking: every version that reaches `observed` "
+           f"passed that gate, so one outside the implemented set is the GATE having leaked, "
+           f"reported by the telemetry that was only supposed to describe it. An empty list is "
+           f"clean because a connection can end before any version is established: "
+           f"{codes(leaked)}", failures, verbose)
 
 
 def _check_arm_counter(failures, verbose):

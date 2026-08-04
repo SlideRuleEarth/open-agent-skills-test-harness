@@ -1575,7 +1575,7 @@ MUTATIONS = [
     # Presence back in place of the value: `null`, `"fabricated"` and `true` are then all a
     # clean verdict, and the record claims evidence it does not carry.
     ("M226-child-status-is-checked-for-presence-not-content", AUDIT,
-     "    if present and not is_exit_status(record.child_status):",
+     "    if present and not is_json_int(record.child_status):",
      "    if False:",
      "audit.child_status_is_an_exit_status_and_not_merely_present"),
     # ...and the type check that a boolean walks straight through, because `isinstance(True,
@@ -1699,6 +1699,159 @@ MUTATIONS = [
      "    SHUTDOWN_CHILD_KILLED,\n})",
      "    SHUTDOWN_CHILD_KILLED,\n    SHUTDOWN_READ_FAILED,\n})",
      "audit.is_clean_is_total_and_has_no_default_clean_branch"),
+
+    # ---- the audit LOG: instances, the absence rule, and the cell verdict ---------------
+    # Everything above judges one instance from a map. These perturb the layer that decides
+    # WHICH records make up an instance and whether the file as a whole clears the cell —
+    # where the failures have nothing to enumerate, because the process that would have named
+    # a reason is already gone.
+
+    # The false-failure direction, which §10.5 weighs exactly as heavily as the false pass.
+    # Every line then reports its own required keys as unrecognized, so the reader refuses
+    # every log ever written and the arms that assert a rule fires stay green throughout.
+    ("M233-the-reader-rejects-every-log", AUDIT,
+     "    known = _ENVELOPE_KEYS.union(required, optional)",
+     "    known = _ENVELOPE_KEYS",
+     "audit_log.an_ordinary_gated_run_reads_clean"),
+    # The refinement §10.5 spells out: a proper-subset allowlist normally MEANS the server
+    # advertises off-list tools and the proxy strips them, so a rule read off `removed` the
+    # same way as `forwarded` fails precisely the cell where filtering worked.
+    ("M234-a-stripped-tool-is-read-as-a-leaked-one", AUDIT,
+     "                if name in allowed:",
+     "                if name not in allowed:",
+     "audit_log.a_filtered_advertisement_is_an_expected_event"),
+
+    # ---- the endings with no reason to record --------------------------------------------
+    ("M235-a-start-with-no-terminator-passes", AUDIT,
+     '        problems.append("terminator_absent")',
+     "        pass",
+     "audit_log.a_start_with_no_terminator_is_an_anomaly"),
+    # The partial final line waved through as "just a partial write", which turns a proxy
+    # killed mid-record into one that ended cleanly — and leaves nothing in the file saying so.
+    ("M236-a-truncated-line-is-silently-skipped", AUDIT,
+     '            problems.append(f"unparseable_line:{i}")',
+     "            pass",
+     "audit_log.a_truncated_final_line_is_absent_rather_than_repaired"),
+    # The vacuity guard removed: `all()` over no instances is True, so a gated server whose
+    # proxy never wrote a start record certifies an UNGATED run.
+    ("M237-an-empty-log-is-vacuously-clean", AUDIT,
+     '        problems = problems + ("no_instances",)',
+     "        pass",
+     "audit_log.an_empty_log_is_not_a_clean_log"),
+    ("M238-a-blank-line-is-not-worth-reporting", AUDIT,
+     '            problems.append(f"blank_line:{i}")',
+     "            pass",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
+
+    # ---- the no-heal rule ------------------------------------------------------------------
+    # "Find the latest verdict for this server", written exactly as anyone would write it.
+    # Every clean restart then papers over the anomalous instance ahead of it.
+    ("M239-the-last-instance-answers-for-the-file", AUDIT,
+     "    return LogVerdict(clean=not problems and all(v.clean for v in verdicts),",
+     "    return LogVerdict(clean=not problems and all(v.clean for v in verdicts[-1:]),",
+     "audit_log.a_clean_restart_never_heals_the_instance_before_it"),
+    ("M240-a-terminator-with-no-start-is-forgiven", AUDIT,
+     '        problems.append("start_absent")',
+     "        pass",
+     "audit_log.a_terminator_answers_only_for_its_own_instance"),
+    # The second record wins, which is what a writer reusing an instance id across restarts
+    # produces: the later run's clean terminator read as the earlier run's.
+    ("M241-a-second-record-overwrites-the-first", AUDIT,
+     "        elif entry[kind] is not None:",
+     "        elif False:",
+     "audit_log.a_second_record_never_overwrites_the_first"),
+    ("M242-records-may-precede-the-start-record", AUDIT,
+     "        if LINE_START in kinds and kinds[0] != LINE_START:",
+     "        if False:",
+     "audit_log.nothing_may_be_written_ahead_of_the_start_record"),
+
+    # ---- §10.6's guarantee, read back off the log -----------------------------------------
+    ("M243-an-off-list-tool-may-be-advertised", AUDIT,
+     "                if name not in allowed:",
+     "                if False:",
+     "audit_log.the_allowlist_is_checked_in_both_directions"),
+    ("M244-an-off-list-call-may-be-forwarded", AUDIT,
+     "            elif kind == CALL_FORWARDED and tool not in allowed:",
+     "            elif False:",
+     "audit_log.the_allowlist_is_checked_in_both_directions"),
+    # The direction a "reject everything" proxy passes: refusing a tool the scenario allowed
+    # is a silently reduced tool surface, which is a WRONG eval rather than a failed one.
+    ("M245-an-allowed-tool-may-be-refused", AUDIT,
+     "            elif kind == CALL_REFUSED and tool in allowed:",
+     "            elif False:",
+     "audit_log.the_allowlist_is_checked_in_both_directions"),
+
+    # ---- the line and event envelopes ------------------------------------------------------
+    # `["start"] in LINE_KINDS` raises `TypeError: unhashable type` — §10.4's envelope crash
+    # arriving inside the one component whose contract is that it does not raise.
+    ("M246-a-line-kind-is-looked-up-before-it-is-typed", AUDIT,
+     "        if not isinstance(kind, str) or kind not in LINE_KINDS:",
+     "        if kind not in LINE_KINDS:",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
+    # An unrecognized key on a record, unreported — which is how an interpolated credential
+    # ends up in an artifact nobody is checking the shape of.
+    ("M247-an-unrecognized-key-on-a-record-is-ignored", AUDIT,
+     "    for key in sorted(set(record) - known):",
+     "    for key in ():",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
+    ("M248-an-event-need-not-carry-its-payload", AUDIT,
+     "        for key in _EVENT_FIELDS[kind]:",
+     "        for key in ():",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
+    # The tagged-union rule the record layer already applies, one level up: a payload on the
+    # wrong event kind is read by nobody, so it can say anything and nothing disagrees.
+    ("M249-a-payload-on-the-wrong-event-kind-is-tolerated", AUDIT,
+     "        for key in sorted(_EVENT_PAYLOAD_KEYS - set(_EVENT_FIELDS[kind])):",
+     "        for key in ():",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
+    # §10.7's claim for this log is that it is wire-level evidence "per call ... and WHEN".
+    ("M250-a-record-need-not-say-when", AUDIT,
+     "    if not is_json_int(ts) and not isinstance(ts, float):",
+     "    if False:",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
+
+    # ---- the start and spawn records' own claims -------------------------------------------
+    ("M251-the-log-need-not-name-the-server-it-gates", AUDIT,
+     "        if not isinstance(name, str) or name != server:",
+     "        if False:",
+     "audit_log.the_log_belongs_to_the_server_it_gates"),
+    ("M252-a-spawn-record-may-survive-spawn-failed", AUDIT,
+     "    if record.latch == SPAWN_FAILED and inst.spawn is not None:",
+     "    if False:",
+     "audit_log.a_spawn_record_and_spawn_failed_are_exact_complements"),
+    ("M253-a-child-may-be-forwarded-to-without-a-spawn-record", AUDIT,
+     "    if record.latch != SPAWN_FAILED and inst.spawn is None:",
+     "    if False:",
+     "audit_log.a_spawn_record_and_spawn_failed_are_exact_complements"),
+    # `start_new_session=True` makes the child its own group leader, so a spawn record where
+    # pid and pgid disagree says the group step 4 killed was not the group the child was in —
+    # a surviving credential-bearing grandchild, reported as a successful cleanup.
+    ("M254-the-child-need-not-lead-its-own-group", AUDIT,
+     "        elif pid != pgid:",
+     "        elif False:",
+     "audit_log.the_spawn_record_must_name_a_group_leader"),
+    ("M255-a-pid-is-taken-on-trust", AUDIT,
+     "        if not is_json_int(pid) or not is_json_int(pgid):",
+     "        if False:",
+     "audit_log.the_spawn_record_must_name_a_group_leader"),
+
+    # ---- arming rides on the start record --------------------------------------------------
+    # A terminator allowed to declare an arming that never happened...
+    ("M256-a-terminator-may-declare-its-own-arming", AUDIT,
+     '    raw = {k: v for k, v in (inst.terminator or {}).items() if k != "fault_point"}',
+     "    raw = dict(inst.terminator or {})",
+     "audit_log.arming_is_read_from_the_start_record_and_nowhere_else"),
+    # ...and the direction that matters more: one allowed to hide an arming that did.
+    ("M257-arming-recorded-at-the-start-is-not-read", AUDIT,
+     '    if inst.start is not None and "fault_point" in inst.start:',
+     "    if False:",
+     "audit_log.arming_is_read_from_the_start_record_and_nowhere_else"),
+
+    # ---- §10.7's telemetry as evidence about the gate --------------------------------------
+    ("M258-an-unimplemented-version-may-be-observed", AUDIT,
+     "        elif version not in IMPLEMENTED_VERSIONS:",
+     "        elif False:",
+     "audit_log.an_observed_version_the_proxy_cannot_implement_is_a_leak"),
 
     # ---- F: instruments, proven by tools/verify_mcp_fixtures.py -------------------------
     # Everything above asks whether the selftest notices a defect in production code. These

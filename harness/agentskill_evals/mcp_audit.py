@@ -1,9 +1,19 @@
-"""C3 — the harness-owned filtering proxy: the AUDIT RECORD and its VERDICT.
+"""C3 — the harness-owned filtering proxy: the AUDIT RECORD, the LOG, and their VERDICTS.
 
 `DESIGN_MCP_Support.md` §10.5 and §10.5.1 are the specification; this module is their whole
 implementation, and like `mcp_proxy.py` it does no I/O. The proxy writes these records and the
 post-run check reads them, but the question they both ask — *did this instance end cleanly?* —
 is answered here, once, by `verdict()`.
+
+TWO LAYERS, and the second is the reason the first is worth having. `verdict()` judges one
+instance from an assembled map. `log_verdict()` judges a whole append-only file: it groups the
+lines by instance id, applies the ABSENCE RULE — a start record with no well-formed terminator
+is an anomaly — and conjoins, so a clean restart can never heal the instance before it. Both
+halves are pure over their input, the file's text included, because every rule that could be
+silently wrong here is a statement about a string: a truncated final line, a terminator matched
+to the wrong start, an off-list tool in a list of what was forwarded. The caller keeps `open()`
+and one rule that only it can apply — for a gated server, a log that does not exist fails the
+cell, since a gated server whose proxy never ran means the gating never happened.
 
 WHY THIS EXISTS AS A MODULE AND NOT AS A FEW CHECKS AT THE CALL SITES. §10.5's rule is that a
 cell fails unless the log PROVES the instance ended cleanly, so the classification is consumed
@@ -52,10 +62,11 @@ success, and only one of the two earns a clean verdict.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from .mcp_proxy import ANOMALY_KINDS
+from .mcp_proxy import ANOMALY_KINDS, IMPLEMENTED_VERSIONS
 
 # ---------------------------------------------------------------------------------------
 # Axis 1 — the triggers (§10.5.1)
@@ -232,12 +243,16 @@ class Fact:
 _MISSING = object()
 
 
-def is_exit_status(value: Any) -> bool:
+def is_json_int(value: Any) -> bool:
     """A JSON integer, and `True` is not one.
 
     `isinstance(True, int)` holds in Python, so the obvious check accepts a boolean — and a
     boolean here is a record claiming an exit status it does not have, which is the same
     fabrication the presence rule exists to catch, one type down.
+
+    ONE predicate, not one per field. An exit status and a pid are the same shape and the same
+    trap, so the log layer below reuses this rather than restating it — a rule written twice is
+    a rule that can be fixed once.
     """
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -483,7 +498,7 @@ def validate(record: Record) -> tuple[str, ...]:
     # Presence was never the claim being made. `null`, `"fabricated"` and `true` are all a
     # record asserting it holds a child's exit status while holding something else, and a
     # `present` boolean cannot tell any of them from the real thing.
-    if present and not is_exit_status(record.child_status):
+    if present and not is_json_int(record.child_status):
         problems.append(f"child_status_not_an_integer:{record.child_status!r}")
 
     # The fault point's targets are completion facts, so a name outside the closed set is a
@@ -619,3 +634,393 @@ def verdict(raw: Any) -> Verdict:
     found = shape + validate(record)
     anomalous = tuple(r for r in reasons(record) if not is_clean(r))
     return Verdict(clean=not found and not anomalous, problems=found, anomalous=anomalous)
+
+
+# ---------------------------------------------------------------------------------------
+# The audit LOG (§10.5) — one file, many instances, and the CELL verdict
+# ---------------------------------------------------------------------------------------
+# Everything above judges ONE instance from a map somebody already assembled. This half is
+# where that map comes from, and it is pure over the file's TEXT rather than over a file: the
+# rules that matter here — a start with no terminator, a truncated final line, one clean
+# restart standing in for the anomalous instance before it — are all statements about a string,
+# so an arm can drive them and a mutation can break them. What is left for the caller is
+# `open()`, and the one rule that lives there is stated from the other side: for a gated
+# server, an audit log that does NOT exist fails the cell, because a gated server whose proxy
+# never ran means the gating never happened.
+#
+# THE CLIENT MAY RESTART THE PROXY, so the file is append-only across instances and the verdict
+# is PER INSTANCE. A later instance never heals an earlier one: the cell verdict is the
+# conjunction over every instance, and one anomalous or unterminated instance fails the cell no
+# matter how many clean instances follow it. "Find the latest verdict for this server", or a
+# dedupe keyed on the server name, would each let a clean restart paper over exactly the
+# failure this file exists to catch (§10.5).
+
+LINE_START = "start"
+LINE_SPAWN = "spawn"
+LINE_EVENT = "event"
+LINE_TERMINATOR = "terminator"
+LINE_KINDS = frozenset({LINE_START, LINE_SPAWN, LINE_EVENT, LINE_TERMINATOR})
+
+# On every line, whatever its kind. `ts` is here because §10.7's whole claim for this log is
+# that it is wire-level evidence "per call, with the server, the tool, whether it was allowed
+# or refused, and WHEN" — a record with no time is not that.
+_ENVELOPE_KEYS = frozenset({"instance", "kind", "ts"})
+
+# The events (§10.5, §10.7). These are the ORDINARY things the proxy did, recorded so the
+# invariant can be checked against what was FORWARDED rather than against what was seen: a
+# proper-subset allowlist normally MEANS the server advertises off-list tools and the proxy
+# strips them, so "the log records no off-list advertisement" would reject exactly the case
+# where filtering worked.
+TOOLS_ADVERTISED = "tools_advertised"    # a `tools/list` response, after filtering
+CALL_FORWARDED = "call_forwarded"        # an on-list `tools/call` that reached the server
+CALL_REFUSED = "call_refused"            # an off-list `tools/call` the proxy answered itself
+MESSAGE_DROPPED = "message_dropped"      # the documented late-response race (§10.4)
+
+# Each event kind and the payload it must carry — which is also the payload it MAY carry. A
+# field nothing consults is the thing being rejected: a `tool` on an advertisement is read by
+# nobody, so it can say anything at all and no check will ever disagree with it.
+_EVENT_FIELDS = {
+    TOOLS_ADVERTISED: ("forwarded", "removed"),
+    CALL_FORWARDED: ("tool",),
+    CALL_REFUSED: ("tool",),
+    MESSAGE_DROPPED: ("reason",),
+}
+EVENT_KINDS = frozenset(_EVENT_FIELDS)
+# Every payload key any event kind uses. The unknown-key sweep subtracts this and the
+# per-kind sweep intersects it, so the two partition the record between them: a key here but
+# on the wrong kind is `event_payload_forbidden`, and a key nowhere here is `event_key_unknown`.
+_EVENT_PAYLOAD_KEYS = frozenset(k for keys in _EVENT_FIELDS.values() for k in keys)
+
+# Per line kind: what it must carry, and what it may. The three axes are deliberately NOT in
+# the required column — `parse()` above owns their presence, and a rule with two owners is a
+# rule that gets half-fixed. They appear as optional only so the unknown-key sweep does not
+# report the keys the record layer is reading.
+_LINE_FIELDS = {
+    LINE_START: (("server", "pid"), ("fault_point",)),
+    LINE_SPAWN: (("child_pid", "child_pgid"), ()),
+    LINE_TERMINATOR: (("observed",),
+                      ("triggers", "outcomes", "facts", "fired", "child_status")),
+}
+
+
+@dataclass(frozen=True)
+class Instance:
+    """Every line one proxy instance wrote, grouped and nothing more.
+
+    Deliberately not judged yet. Grouping is the step that can lose evidence — a dedupe, a
+    "latest wins", a terminator matched to the wrong start — so it happens once, here, and
+    every rule below reads the result rather than the file.
+    """
+
+    instance_id: str
+    start: dict | None = None
+    spawn: dict | None = None
+    terminator: dict | None = None
+    events: tuple[dict, ...] = ()
+    problems: tuple[str, ...] = ()       # from GROUPING: duplicates and out-of-order lines
+
+    @property
+    def records(self) -> tuple[dict, ...]:
+        found = [r for r in (self.start, self.spawn, self.terminator) if r is not None]
+        return tuple(found) + self.events
+
+
+def parse_log(text: str) -> tuple[tuple[Instance, ...], tuple[str, ...]]:
+    """The log's TEXT in; instances in first-appearance order and every unusable line out.
+
+    Never raises, for the reason `parse()` never raises: the writer is the thing under
+    suspicion, and a traceback out of `verify_post_run` is not a failed cell but an ABSENT
+    verdict — the one outcome §10.5 exists to make impossible, arriving through the code
+    written to guarantee it.
+
+    A TRUNCATED FINAL LINE IS NOT REPAIRED. It is reported as unparseable and contributes no
+    record, so the instance it belonged to has no terminator and the absence rule below fires.
+    Repairing it — or ignoring it as "just a partial write" — would turn a proxy killed
+    mid-record into one that ended cleanly, which is the precise inversion the absence rule
+    exists to prevent (§10.9).
+    """
+    problems: list[str] = []
+    order: list[str] = []
+    grouped: dict[str, dict] = {}
+
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()          # the newline that terminated the last record, not a line
+
+    for i, line in enumerate(lines):
+        if not line.strip():
+            problems.append(f"blank_line:{i}")
+            continue
+        try:
+            raw = json.loads(line)
+        except ValueError:
+            problems.append(f"unparseable_line:{i}")
+            continue
+        if not isinstance(raw, dict):
+            problems.append(f"line_not_a_map:{i}")
+            continue
+        instance_id = raw.get("instance")
+        if not isinstance(instance_id, str) or not instance_id:
+            problems.append(f"line_instance:{i}:{instance_id!r}")
+            continue
+        kind = raw.get("kind")
+        # `isinstance` FIRST. `["start"] in LINE_KINDS` raises `TypeError: unhashable type`,
+        # which is the envelope crash of §10.4 arriving by a route that skipped envelope
+        # validation — inside the reader whose entire contract is that it does not raise.
+        if not isinstance(kind, str) or kind not in LINE_KINDS:
+            problems.append(f"line_kind:{i}:{kind!r}")
+            continue
+
+        entry = grouped.get(instance_id)
+        if entry is None:
+            entry = grouped[instance_id] = {LINE_START: None, LINE_SPAWN: None,
+                                            LINE_TERMINATOR: None, "events": [], "kinds": [],
+                                            "problems": []}
+            order.append(instance_id)
+        entry["kinds"].append(kind)
+        if kind == LINE_EVENT:
+            entry["events"].append(raw)
+        elif entry[kind] is not None:
+            # Two starts, or two terminators, for one instance id. Overwriting would let the
+            # second answer for the first, which is the same substitution the per-instance
+            # verdict exists to refuse one level up.
+            entry["problems"].append(f"{kind}_duplicate")
+        else:
+            entry[kind] = raw
+
+    instances = []
+    for instance_id in order:
+        entry = grouped[instance_id]
+        kinds = entry["kinds"]
+        if LINE_START in kinds and kinds[0] != LINE_START:
+            # The start record is written BEFORE the child is spawned and therefore before a
+            # single byte is forwarded (§10.5), so anything ahead of it in an append-only file
+            # is a writer that buffered or reordered — and the boundary that partitions "logged
+            # a start" from "spawned nothing" no longer holds.
+            entry["problems"].append("records_precede_start")
+        instances.append(Instance(instance_id, entry[LINE_START], entry[LINE_SPAWN],
+                                  entry[LINE_TERMINATOR], tuple(entry["events"]),
+                                  tuple(entry["problems"])))
+    return tuple(instances), tuple(problems)
+
+
+def assemble(inst: Instance) -> dict:
+    """The one map `verdict()` reads: the terminator's axes plus the START record's fault point.
+
+    The fault point comes from the start and only from the start, in both directions. Taking it
+    from wherever it appears would let a terminator declare an arming that never happened; not
+    taking it from the start would let a terminator hide one that did — and hiding it is the
+    case that matters, since `fault_point_configured` is the clause that stops an armed-but-
+    silent hook from producing a passing run (§10.5.1). A `fault_point` on the terminator is
+    dropped here and reported by the unknown-key sweep, so it can neither add nor subtract.
+    """
+    raw = {k: v for k, v in (inst.terminator or {}).items() if k != "fault_point"}
+    if inst.start is not None and "fault_point" in inst.start:
+        raw["fault_point"] = inst.start["fault_point"]
+    return raw
+
+
+def _field_problems(record: dict, kind: str) -> list[str]:
+    """The keys a line must carry and the keys it may — closed in both directions."""
+    problems: list[str] = []
+    required, optional = _LINE_FIELDS[kind]
+    for key in required:
+        if key not in record:
+            problems.append(f"{kind}_key_missing:{key}")
+    known = _ENVELOPE_KEYS.union(required, optional)
+    for key in sorted(set(record) - known):
+        problems.append(f"{kind}_key_unknown:{key}")
+    ts = record.get("ts")
+    if not is_json_int(ts) and not isinstance(ts, float):
+        problems.append(f"{kind}_ts:{ts!r}")
+    return problems
+
+
+def _names(entry: dict, key: str, index: int, problems: list[str]) -> list[str]:
+    """A list of tool names on an event, with every non-name reported rather than skipped."""
+    out = []
+    for j, item in enumerate(_as_list(entry, key, problems, required=True)):
+        if isinstance(item, str):
+            out.append(item)
+        else:
+            problems.append(f"event_name:{index}:{key}:{j}")
+    return out
+
+
+def _event_problems(events: tuple[dict, ...], allowed: frozenset[str]) -> list[str]:
+    """The guarantee of §10.6, checked against what the proxy says it actually forwarded.
+
+    BOTH DIRECTIONS, and the second one is the one a lazy implementation passes. That an
+    off-list tool was never advertised and never called is satisfied in full by a proxy that
+    stripped everything and refused everything — "rejects everything scores full marks" is the
+    same defect §10.9 spends a case on for the structural validator, and the allowlist is where
+    it would do the most damage, because a silently reduced tool surface is a wrong eval rather
+    than a failed one.
+    """
+    problems: list[str] = []
+    for i, event in enumerate(events):
+        problems.extend(f"event_key_unknown:{i}:{key}"
+                        for key in sorted(set(event) - _ENVELOPE_KEYS - {"event"}
+                                          - _EVENT_PAYLOAD_KEYS))
+        kind = event.get("event")
+        if not isinstance(kind, str) or kind not in EVENT_KINDS:
+            problems.append(f"event_unknown:{i}:{kind!r}")
+            continue
+        for key in _EVENT_FIELDS[kind]:
+            if key not in event:
+                problems.append(f"event_key_missing:{i}:{kind}:{key}")
+        for key in sorted(_EVENT_PAYLOAD_KEYS - set(_EVENT_FIELDS[kind])):
+            if key in event:
+                problems.append(f"event_payload_forbidden:{i}:{kind}:{key}")
+
+        if kind == TOOLS_ADVERTISED:
+            for name in _names(event, "forwarded", i, problems):
+                if name not in allowed:
+                    problems.append(f"off_list_advertised:{name}")
+            for name in _names(event, "removed", i, problems):
+                if name in allowed:
+                    problems.append(f"on_list_removed:{name}")
+        elif kind in (CALL_FORWARDED, CALL_REFUSED):
+            tool = event.get("tool")
+            if not isinstance(tool, str) or not tool:
+                problems.append(f"event_tool:{i}:{tool!r}")
+            elif kind == CALL_FORWARDED and tool not in allowed:
+                problems.append(f"off_list_call_forwarded:{tool}")
+            elif kind == CALL_REFUSED and tool in allowed:
+                problems.append(f"on_list_call_refused:{tool}")
+        else:
+            reason = event.get("reason")
+            if not isinstance(reason, str) or not reason:
+                problems.append(f"event_reason:{i}:{reason!r}")
+    return problems
+
+
+@dataclass(frozen=True)
+class InstanceVerdict:
+    """One instance's ending, named. Never a bare boolean, for §10.5.1's fourth rule."""
+
+    instance_id: str
+    clean: bool
+    problems: tuple[str, ...]
+    anomalous: tuple[str, ...]
+
+
+def instance_verdict(inst: Instance, *, server: str,
+                     allowed: frozenset[str]) -> InstanceVerdict:
+    """One instance, judged: the log's own rules, then §10.5.1's over the assembled record."""
+    problems = list(inst.problems)
+
+    if inst.start is None:
+        # The partition of §10.5 has two halves and this is neither: an instance that logged a
+        # start must also log a terminator, and an instance that logged nothing spawned nothing.
+        # A terminator with no start is a third thing, and what it says cannot be trusted —
+        # there is no record of the boundary it claims to close.
+        problems.append("start_absent")
+    else:
+        problems.extend(_field_problems(inst.start, LINE_START))
+        name = inst.start.get("server")
+        if not isinstance(name, str) or name != server:
+            problems.append(f"server_mismatch:{name!r}")
+        if not is_json_int(inst.start.get("pid")):
+            problems.append(f"start_pid:{inst.start.get('pid')!r}")
+
+    if inst.spawn is not None:
+        problems.extend(_field_problems(inst.spawn, LINE_SPAWN))
+        pid, pgid = inst.spawn.get("child_pid"), inst.spawn.get("child_pgid")
+        if not is_json_int(pid) or not is_json_int(pgid):
+            problems.append(f"spawn_ids:{pid!r}:{pgid!r}")
+        elif pid != pgid:
+            # `start_new_session=True` makes the child a session and process-group leader, so
+            # its pgid IS its pid. That launch decision exists only so step 4 has a group to
+            # signal (§10.5), and a spawn record disagreeing with it means the group the
+            # teardown went on to kill was not the one the child was in.
+            problems.append(f"spawn_not_group_leader:{pid}:{pgid}")
+
+    problems.extend(_event_problems(inst.events, allowed))
+
+    anomalous: tuple[str, ...] = ()
+    if inst.terminator is None:
+        # THE ABSENCE RULE (§10.5). It covers the four endings no enumeration can reach — an
+        # uncatchable SIGKILL to the proxy, a crash after the start record, a teardown that
+        # died before step 6, and a truncated final line — because in each the process that
+        # would have named a reason is already gone. The record layer is deliberately NOT run
+        # here: it would report a dozen missing axes and describe a broken writer, when what
+        # happened is that the writer stopped.
+        problems.append("terminator_absent")
+    else:
+        problems.extend(_field_problems(inst.terminator, LINE_TERMINATOR))
+        problems.extend(_observed_problems(inst.terminator))
+        record, shape = parse(assemble(inst))
+        problems.extend(shape)
+        problems.extend(validate(record))
+        anomalous = tuple(r for r in reasons(record) if not is_clean(r))
+        problems.extend(_spawn_partition(record, inst))
+
+    return InstanceVerdict(inst.instance_id, not problems and not anomalous,
+                           tuple(problems), anomalous)
+
+
+def _observed_problems(terminator: dict) -> list[str]:
+    """§10.7's version telemetry, cross-checked against the gate that produced it.
+
+    Recording is evidence, not control — the thing that keeps an unimplemented version from
+    being forwarded is §10.2's gate. Which is exactly why this check is worth having: every
+    version that reaches `observed` passed that gate, so one outside the implemented set is the
+    gate having leaked, reported by the telemetry that was supposed to merely describe it.
+    """
+    problems: list[str] = []
+    for j, version in enumerate(_as_list(terminator, "observed", problems, required=False)):
+        if not isinstance(version, str):
+            problems.append(f"observed_not_a_string:{j}")
+        elif version not in IMPLEMENTED_VERSIONS:
+            problems.append(f"observed_unimplemented:{version}")
+    return problems
+
+
+def _spawn_partition(record: Record, inst: Instance) -> list[str]:
+    """`spawn_failed` and a spawn record are exact complements, and both directions matter.
+
+    The signal handlers are why this is exact rather than approximate: a handler sets a flag and
+    the control path acts on it (§10.5), so a signal arriving between the start record and the
+    spawn does not skip the spawn. There is therefore no ending in which a terminator exists,
+    the spawn did not happen, and the latch says anything but `spawn_failed` — and a record
+    claiming one is claiming four `not_applicable` facts it has no licence for.
+    """
+    if record.latch is None:
+        return []                       # `triggers_empty` already says what is wrong here
+    if record.latch == SPAWN_FAILED and inst.spawn is not None:
+        return ["spawn_record_after_spawn_failed"]
+    if record.latch != SPAWN_FAILED and inst.spawn is None:
+        return ["spawn_record_missing"]
+    return []
+
+
+@dataclass(frozen=True)
+class LogVerdict:
+    """The CELL's verdict for one gated server: the conjunction over every instance."""
+
+    clean: bool
+    problems: tuple[str, ...]                    # of the file, not of any one instance
+    instances: tuple[InstanceVerdict, ...]
+
+    @property
+    def unclean(self) -> tuple[InstanceVerdict, ...]:
+        return tuple(v for v in self.instances if not v.clean)
+
+
+def log_verdict(text: str, *, server: str, allowed: frozenset[str]) -> LogVerdict:
+    """The whole file, judged. Never raises.
+
+    THE STRUCTURAL CLAUSE IS FIRST, and here it is `no_instances`. The conjunction below is
+    universally quantified, so it is vacuously true of a log with nothing in it — and a log with
+    nothing in it is a gated server whose proxy never wrote a start record, which means the
+    gating never happened and a pass would certify an ungated run. Same rule as §10.5.1's
+    `triggers_empty`, one level up, and reported as a code rather than as a silent `False` so
+    the verdict still says why.
+    """
+    instances, problems = parse_log(text)
+    verdicts = tuple(instance_verdict(i, server=server, allowed=allowed) for i in instances)
+    if not verdicts:
+        problems = problems + ("no_instances",)
+    return LogVerdict(clean=not problems and all(v.clean for v in verdicts),
+                      problems=problems, instances=verdicts)
