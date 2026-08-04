@@ -13,11 +13,18 @@ defect this design has already paid for twice (`TODO_Contained_HOME.md` §4), an
 particular way — the consumers that were not updated keep publishing their old conclusion, so
 the exit status disagrees with the output.
 
-WHY IT IS WRITTEN BEFORE THE I/O HALF. Everything below is a shape, not a behaviour, and
-shapes are where twelve rounds of review on the design found their defects: a step that failed
-had no legal value to record, a catch-all that could not be named for most steps, a pairing key
-coarser than the thing it keyed, arming a fault standing in for firing it. Prose held every one
-of those without complaining. A dataclass and a validator do not.
+THE INPUT IS ARBITRARY DECODED JSON, NOT A RECORD THE PROXY PROMISED TO WRITE. That is the
+whole reason the reader owns this: the writer is the thing under suspicion. A validator that
+assumes `triggers` is a list of maps crashes on `{"triggers": {}}`, and a crash inside
+`verify_post_run` is not a failed cell — it is a harness traceback, which is a worse outcome
+than the malformed record it was reading. So `parse()` accepts anything `json.loads` can
+produce, never raises, and turns every shape it cannot use into a stable problem code
+(review, PR #102).
+
+MISSING, NULL AND EMPTY ARE THREE DIFFERENT THINGS. `raw.get("outcomes") or []` collapses all
+three into "no outcomes", so a terminator with no `outcomes` key at all — a writer that forgot
+the axis entirely — validated clean. Absence is not emptiness anywhere in this module; it is
+the whole subject of §10.5.1's second half.
 
 THE VERDICT, and the order of its three clauses matters:
 
@@ -45,7 +52,10 @@ success, and only one of the two earns a clean verdict.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
+
+from .mcp_proxy import ANOMALY_KINDS
 
 # ---------------------------------------------------------------------------------------
 # Axis 1 — the triggers (§10.5.1)
@@ -95,6 +105,10 @@ OUTCOMES = frozenset({
 # fired would otherwise leave a clean trigger and clean outcomes satisfying the formula
 # exactly — and the run would pass while pretending to have been tested.
 FAULT_POINT_CONFIGURED = "fault_point_configured"
+# Written when the hook actually suppresses a fact. EVIDENCE, not a verdict input: the arming
+# already made the instance anomalous, so firing adds nothing to the verdict and everything to
+# the record. It is the only thing a suppressed step's `failed` may name as its cause.
+FAULT_POINT_FIRED = "fault_point_fired"
 
 # Every reason, on either axis, that leaves an instance clean. Everything else is an anomaly,
 # INCLUDING an unrecognized one — see `is_clean`.
@@ -145,11 +159,11 @@ _NOT_APPLICABLE_LICENSED_BY = {
     GROUP_TERMINATED: frozenset({SPAWN_FAILED}),
 }
 
-# The typed outcome a `failed` fact pairs with, where one exists. `failed` exists because the
-# two axes describe the same events and must be able to agree: without it, a teardown that ran
-# and did not work has NO structurally valid record at all, since `shutdown_reap_failed` could
-# not be said of `child_reaped` and the only remaining spelling — omitting the fact — is what
-# the validator calls malformed.
+# The typed outcome a `failed` fact may name as its cause, where one exists. `failed` exists
+# because the two axes describe the same events and must be able to agree: without it, a
+# teardown that ran and did not work has NO structurally valid record at all, since
+# `shutdown_reap_failed` could not be said of `child_reaped` and the only remaining spelling —
+# omitting the fact — is what the validator calls malformed.
 _TYPED_PAIRING = {
     INTAKE_CLOSED: None,
     CHILD_STDIN_CLOSED: None,
@@ -164,6 +178,20 @@ _TYPED_PAIRING = {
 _OUTCOME_PAIRING = {v: k for k, v in _TYPED_PAIRING.items() if v is not None}
 
 
+def causes_for(fact: str) -> frozenset[str]:
+    """The causes a `failed` fact may name — its typed outcome, the catch-all, or suppression.
+
+    EXACTLY ONE, declared rather than inferred. Accepting a fact that merely has *some*
+    pairing available lets contradictory evidence sit in one record: a `group_terminated`
+    carrying both `shutdown_group_kill_failed` and a fault-point firing says the kill was
+    attempted and failed AND that it never ran, and an inferring validator reports no problem
+    at all (review, PR #102).
+    """
+    typed = _TYPED_PAIRING.get(fact)
+    base = {SHUTDOWN_ANOMALY, FAULT_POINT_FIRED}
+    return frozenset(base | ({typed} if typed else set()))
+
+
 def is_clean(reason: str) -> bool:
     """Total over both axes and the start reason. Anything unrecognized is an ANOMALY.
 
@@ -175,6 +203,164 @@ def is_clean(reason: str) -> bool:
 
 
 # ---------------------------------------------------------------------------------------
+# The parsed record
+# ---------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Trigger:
+    reason: str
+    anomaly: str | None = None       # required when `reason` is `protocol_anomaly`
+
+
+@dataclass(frozen=True)
+class Outcome:
+    kind: str
+    fact: str | None = None          # required when `kind` is `shutdown_anomaly`
+    exception: str | None = None     # ...and so is this
+
+
+@dataclass(frozen=True)
+class Fact:
+    state: str
+    cause: str | None = None         # required when `state` is `failed`
+
+
+@dataclass(frozen=True)
+class Record:
+    """One instance's assembled records, after shape checking and before judgement.
+
+    Assembly from the log is I/O and lives with the reader; everything from here down is a
+    pure function of what it assembled.
+    """
+
+    triggers: tuple[Trigger, ...] = ()
+    outcomes: tuple[Outcome, ...] = ()
+    facts: dict[str, Fact] = field(default_factory=dict)
+    fact_keys: tuple[str, ...] = ()          # as written, so an unknown NAME can be reported
+    fired: tuple[str, ...] = ()
+    fault_point: bool = False                # PRESENT, which is the anomalous fact
+    suppresses: frozenset[str] = frozenset()
+    child_status: bool = False               # present, not its value
+
+    @property
+    def latch(self) -> str | None:
+        return self.triggers[0].reason if self.triggers else None
+
+
+def _str_or(value: Any, problems: list[str], code: str) -> str | None:
+    if isinstance(value, str):
+        return value
+    problems.append(code)
+    return None
+
+
+def _as_list(raw: Any, key: str, problems: list[str], *, required: bool) -> list:
+    """A list, or a reported problem — never an exception, and never a silent empty.
+
+    `missing`, `null` and "not a list" are three different codes because they are three
+    different writer bugs, and the one that used to be invisible is `missing`: `raw.get(k) or
+    []` turns a forgotten axis into an empty one, and an empty one is legal.
+    """
+    if key not in raw:
+        if required:
+            problems.append(f"missing:{key}")
+        return []
+    value = raw[key]
+    if value is None:
+        problems.append(f"null:{key}")
+        return []
+    if not isinstance(value, list):
+        problems.append(f"not_a_list:{key}")
+        return []
+    return value
+
+
+def parse(raw: Any) -> tuple[Record, tuple[str, ...]]:
+    """Arbitrary decoded JSON in; a best-effort `Record` and every shape problem out.
+
+    Best-effort rather than all-or-nothing so one read reports everything wrong with a record
+    instead of one problem per re-run — and every normalization it performs is REPORTED, so
+    the verdict is anomalous regardless of what the rest of the pass makes of the remains.
+    """
+    problems: list[str] = []
+    if not isinstance(raw, dict):
+        return Record(), ("not_a_map:record",)
+
+    triggers = []
+    for i, entry in enumerate(_as_list(raw, "triggers", problems, required=True)):
+        if not isinstance(entry, dict):
+            problems.append(f"trigger_not_a_map:{i}")
+            continue
+        reason = _str_or(entry.get("reason"), problems, f"trigger_reason_not_a_string:{i}")
+        if reason is not None:
+            anomaly = entry.get("anomaly")
+            triggers.append(Trigger(reason, anomaly if isinstance(anomaly, str) else None))
+
+    outcomes = []
+    for i, entry in enumerate(_as_list(raw, "outcomes", problems, required=True)):
+        if not isinstance(entry, dict):
+            problems.append(f"outcome_not_a_map:{i}")
+            continue
+        kind = _str_or(entry.get("kind"), problems, f"outcome_kind_not_a_string:{i}")
+        if kind is not None:
+            fact, exc = entry.get("fact"), entry.get("exception")
+            outcomes.append(Outcome(kind, fact if isinstance(fact, str) else None,
+                                    exc if isinstance(exc, str) and exc else None))
+
+    facts: dict[str, Fact] = {}
+    fact_keys: tuple[str, ...] = ()
+    if "facts" not in raw:
+        problems.append("missing:facts")
+    elif raw["facts"] is None:
+        problems.append("null:facts")
+    elif not isinstance(raw["facts"], dict):
+        problems.append("not_a_map:facts")
+    else:
+        fact_keys = tuple(str(k) for k in raw["facts"])
+        for key, entry in raw["facts"].items():
+            key = str(key)
+            if not isinstance(entry, dict):
+                problems.append(f"fact_not_a_map:{key}")
+                continue
+            state = _str_or(entry.get("state"), problems, f"fact_state_not_a_string:{key}")
+            if state is not None:
+                cause = entry.get("cause")
+                facts[key] = Fact(state, cause if isinstance(cause, str) else None)
+
+    fired = []
+    for i, entry in enumerate(_as_list(raw, "fired", problems, required=False)):
+        if not isinstance(entry, dict):
+            problems.append(f"fired_not_a_map:{i}")
+            continue
+        fact = _str_or(entry.get("fact"), problems, f"fired_fact_not_a_string:{i}")
+        if fact is not None:
+            fired.append(fact)
+
+    # PRESENCE is the anomalous fact, not a non-empty suppression list. An arm-only hook
+    # suppresses nothing by design, and reading emptiness as "no fault point" gave exactly the
+    # passing verdict the arm-only case exists to reject.
+    fault_point = "fault_point" in raw and raw["fault_point"] is not None
+    suppresses: set[str] = set()
+    if "fault_point" in raw and raw["fault_point"] is None:
+        problems.append("null:fault_point")
+    elif fault_point:
+        if not isinstance(raw["fault_point"], dict):
+            problems.append("not_a_map:fault_point")
+        else:
+            for i, item in enumerate(_as_list(raw["fault_point"], "suppresses", problems,
+                                              required=True)):
+                if isinstance(item, str):
+                    suppresses.add(item)
+                else:
+                    problems.append(f"suppresses_not_a_string:{i}")
+
+    return (Record(tuple(triggers), tuple(outcomes), facts, fact_keys, tuple(fired),
+                   fault_point, frozenset(suppresses), "child_status" in raw),
+            tuple(problems))
+
+
+# ---------------------------------------------------------------------------------------
 # The structural validator (§10.5.1)
 # ---------------------------------------------------------------------------------------
 # Owned by the READER. The proxy may assert the same shape before writing, but that assertion
@@ -183,13 +369,8 @@ def is_clean(reason: str) -> bool:
 # same author.
 
 
-def _fact_state(facts: dict, key: str) -> str | None:
-    entry = facts.get(key)
-    return entry.get("state") if isinstance(entry, dict) else None
-
-
-def validate(instance: dict) -> tuple[str, ...]:
-    """Every way this record is malformed, as stable problem codes, in a fixed order.
+def validate(record: Record) -> tuple[str, ...]:
+    """Every way a parsed record is malformed, as stable problem codes, in a fixed order.
 
     A record that fails is `malformed_record` — an anomaly whose subject is the PROXY rather
     than the run. Codes rather than prose so an arm can assert which rule fired: "the validator
@@ -199,121 +380,124 @@ def validate(instance: dict) -> tuple[str, ...]:
     """
     problems: list[str] = []
 
-    triggers = instance.get("triggers") or []
-    if not triggers:
+    if not record.triggers:
         # The vacuity guard. Both clauses below quantify over collections, and an empty one
         # satisfies them while contradicting the definition of an instance, which HAS a latch.
         problems.append("triggers_empty")
-    for entry in triggers:
-        reason = entry.get("reason") if isinstance(entry, dict) else None
-        if reason not in TRIGGERS:
-            problems.append(f"trigger_unknown:{reason}")
-    latch = triggers[0].get("reason") if triggers and isinstance(triggers[0], dict) else None
+    for entry in record.triggers:
+        if entry.reason not in TRIGGERS:
+            problems.append(f"trigger_unknown:{entry.reason}")
+        # A discriminated union: the tag promises a payload, so the payload is required. A
+        # bare `protocol_anomaly` says the connection was torn down for a protocol reason and
+        # declines to say which, which is precisely what the audit log exists to record.
+        elif entry.reason == PROTOCOL_ANOMALY and entry.anomaly not in ANOMALY_KINDS:
+            problems.append(f"protocol_anomaly_kind:{entry.anomaly}")
 
-    outcomes = instance.get("outcomes") or []
-    for entry in outcomes:
-        kind = entry.get("kind") if isinstance(entry, dict) else None
-        if kind not in OUTCOMES:
-            problems.append(f"outcome_unknown:{kind}")
+    for entry in record.outcomes:
+        if entry.kind not in OUTCOMES:
+            problems.append(f"outcome_unknown:{entry.kind}")
+        elif entry.kind == SHUTDOWN_ANOMALY:
+            if entry.fact not in FACTS:
+                problems.append(f"anomaly_unkeyed:{entry.fact}")
+            if entry.exception is None:
+                problems.append("anomaly_no_exception")
 
-    facts = instance.get("facts")
-    facts = facts if isinstance(facts, dict) else {}
     for key in FACTS:
-        if key not in facts:
+        if key not in record.facts:
             problems.append(f"fact_missing:{key}")
-    for key in sorted(facts):
-        if key not in FACTS:
-            problems.append(f"fact_unknown:{key}")
+    for key in sorted(set(record.fact_keys) - set(FACTS)):
+        problems.append(f"fact_unknown:{key}")
 
     for key in FACTS:
-        state = _fact_state(facts, key)
-        if state is None or state not in STATES:
-            if key in facts:
-                problems.append(f"state_unknown:{key}:{state}")
+        entry = record.facts.get(key)
+        if entry is None:
             continue
-        if state == NOT_APPLICABLE and latch not in _NOT_APPLICABLE_LICENSED_BY[key]:
+        if entry.state not in STATES:
+            problems.append(f"state_unknown:{key}:{entry.state}")
+            continue
+        if (entry.state == NOT_APPLICABLE
+                and record.latch not in _NOT_APPLICABLE_LICENSED_BY[key]):
             problems.append(f"not_applicable_unlicensed:{key}")
 
-    problems.extend(_pairing_problems(facts, outcomes, instance))
+    problems.extend(_cause_problems(record))
 
     # Only a process that reaped a child can hold its exit status, so `done` without one claims
     # a reap while lacking the single piece of evidence a reaper necessarily has, and a status
     # attached to `failed` or `not_applicable` is a status for a child that was never reaped —
     # invented, because there was nowhere to get it.
-    has_status = "child_status" in instance
-    if _fact_state(facts, CHILD_REAPED) == DONE and not has_status:
+    reaped = record.facts.get(CHILD_REAPED)
+    reaped_done = reaped is not None and reaped.state == DONE
+    if reaped_done and not record.child_status:
         problems.append("child_status_missing")
-    if _fact_state(facts, CHILD_REAPED) != DONE and has_status:
+    if not reaped_done and record.child_status:
         problems.append("child_status_forbidden")
 
     return tuple(problems)
 
 
-def _pairing_problems(facts: dict, outcomes: list, instance: dict) -> list[str]:
-    """The `failed` pairings, both directions, keyed by the EXACT FACT and never by the step.
+def _evidence_for(record: Record, key: str) -> frozenset[str]:
+    """Every cause this record carries evidence for, on one fact.
 
-    A step number is coarser than the thing it identifies — step 2 owns both
-    `child_stdin_closed` and `drain_ended` — so a `shutdown_anomaly(step=2)` would license
-    `failed` on either of them, or on both, having arisen from one operation. A pairing key one
-    level coarser than what it pairs is not a weaker check; it is a check that passes for the
-    wrong reason while reading like coverage.
+    Keyed by the EXACT FACT and never by the step. A step number is coarser than the thing it
+    identifies — step 2 owns both `child_stdin_closed` and `drain_ended` — so a
+    `shutdown_anomaly(step=2)` would license `failed` on either of them, or on both, having
+    arisen from one operation. A pairing key one level coarser than what it pairs is not a
+    weaker check; it is a check that passes for the wrong reason while reading like coverage.
     """
-    problems: list[str] = []
-    kinds = [e.get("kind") for e in outcomes if isinstance(e, dict)]
-    anomaly_facts = {e.get("fact") for e in outcomes
-                     if isinstance(e, dict) and e.get("kind") == SHUTDOWN_ANOMALY}
-    configured = _configured(instance)
-    # A malformed entry becomes `None` rather than being skipped, so it lands in the
-    # `fired_unconfigured` check below instead of vanishing. Dropping what a loop does not
-    # recognize is how a record ends up validating clean because part of it was unreadable —
-    # the same shape as every other silent-absence defect this section has been through.
-    fired = {e.get("fact") if isinstance(e, dict) else None
-             for e in instance.get("fired") or []}
+    found = set()
+    typed = _TYPED_PAIRING.get(key)
+    kinds = {o.kind for o in record.outcomes}
+    if typed is not None and typed in kinds:
+        found.add(typed)
+    if any(o.kind == SHUTDOWN_ANOMALY and o.fact == key for o in record.outcomes):
+        found.add(SHUTDOWN_ANOMALY)
+    if key in record.fired:
+        found.add(FAULT_POINT_FIRED)
+    return frozenset(found)
 
-    for entry in outcomes:
-        if isinstance(entry, dict) and entry.get("kind") == SHUTDOWN_ANOMALY:
-            if entry.get("fact") not in FACTS:
-                problems.append(f"anomaly_unkeyed:{entry.get('fact')}")
+
+def _cause_problems(record: Record) -> list[str]:
+    """The declared cause of each `failed` fact, and the evidence it must exactly match."""
+    problems: list[str] = []
 
     for key in FACTS:
-        state = _fact_state(facts, key)
-        typed = _TYPED_PAIRING[key]
-        paired = ((typed is not None and typed in kinds)
-                  or key in anomaly_facts
-                  or key in fired)
-        if state == FAILED and not paired:
-            problems.append(f"failed_unpaired:{key}")
-        if state != FAILED and key in anomaly_facts:
+        entry = record.facts.get(key)
+        state = entry.state if entry is not None else None
+        evidence = _evidence_for(record, key)
+        if state == FAILED:
+            cause = entry.cause if entry is not None else None
+            if cause not in causes_for(key):
+                problems.append(f"cause_unknown:{key}:{cause}")
+            elif cause not in evidence:
+                problems.append(f"cause_unsupported:{key}:{cause}")
+            # Exactly one. A step the fault point stopped from running cannot ALSO have been
+            # attempted and failed, and a record saying both is not a record with extra detail
+            # — it is two incompatible accounts of one step.
+            if len(evidence) > 1:
+                problems.append(f"cause_contradicted:{key}:{','.join(sorted(evidence))}")
+        elif SHUTDOWN_ANOMALY in evidence:
             problems.append(f"anomaly_orphan:{key}")
 
-    for kind in kinds:
+    for kind in {o.kind for o in record.outcomes}:
         key = _OUTCOME_PAIRING.get(kind)
-        if key is not None and _fact_state(facts, key) != FAILED:
+        if key is None:
+            continue
+        entry = record.facts.get(key)
+        if entry is None or entry.state != FAILED:
             problems.append(f"outcome_unpaired:{kind}")
 
     # Firing is EVIDENCE, not a verdict input — the arming already made the instance anomalous,
     # so a fired record adds nothing to the verdict and everything to the record. What it must
-    # do is line up: only a fired record may pair with a completion fact, and only for a fact
-    # the configuration listed.
-    for key in sorted(fired, key=str):
-        if key not in configured:
+    # do is line up: it is legal only for a fact the configuration listed, and only where that
+    # fact actually reads `failed`.
+    for key in sorted(set(record.fired)):
+        if key not in record.suppresses:
             problems.append(f"fired_unconfigured:{key}")
-        if _fact_state(facts, key) != FAILED:
+        entry = record.facts.get(key)
+        if entry is None or entry.state != FAILED:
             problems.append(f"fired_unpaired:{key}")
 
     return problems
-
-
-def _configured(instance: dict) -> frozenset[str]:
-    """The completion facts the fault point is armed on, if any.
-
-    Named facts rather than step numbers, for the same reason the anomaly is: steps 3 and 5
-    produce ONE fact between them, so a step-keyed fault configuration could not say which.
-    """
-    fault = instance.get("fault_point")
-    if not isinstance(fault, dict):
-        return frozenset()
-    return frozenset(f for f in fault.get("suppresses") or [] if isinstance(f, str))
 
 
 # ---------------------------------------------------------------------------------------
@@ -335,31 +519,35 @@ class Verdict:
     anomalous: tuple[str, ...]
 
 
-def reasons(instance: dict) -> tuple[str, ...]:
+def reasons(record: Record) -> tuple[str, ...]:
     """Every reason the instance recorded, in the start record as much as the terminator.
 
     `fault_point_configured` is here, and that is the point of it: a fault armed and never
     fired leaves a clean trigger and clean outcomes, so a verdict reading only the two axes
     would pass a run whose whole purpose was to fail.
     """
-    out = [e["reason"] for e in instance.get("triggers") or []
-           if isinstance(e, dict) and "reason" in e]
-    out += [e["kind"] for e in instance.get("outcomes") or []
-            if isinstance(e, dict) and "kind" in e]
-    if _configured(instance):
+    out = [t.reason for t in record.triggers]
+    out += [o.kind for o in record.outcomes]
+    if record.fault_point:
         out.append(FAULT_POINT_CONFIGURED)
     return tuple(out)
 
 
-def verdict(instance: dict) -> Verdict:
-    """The one classification every consumer reads (§10.5.1).
+def problems(raw: Any) -> tuple[str, ...]:
+    """Shape problems and semantic problems together, for one piece of decoded JSON."""
+    record, shape = parse(raw)
+    return shape + validate(record)
+
+
+def verdict(raw: Any) -> Verdict:
+    """The one classification every consumer reads (§10.5.1). Never raises.
 
     A monotonic conjunction over everything recorded, never a lookup on the last thing that
     happened. Monotonic means evidence only ever moves the verdict toward anomalous — the
     no-heal rule of §10.5 stated as an algebraic property rather than as a warning, and applied
     within one instance rather than across restarts.
     """
-    problems = validate(instance)
-    anomalous = tuple(r for r in reasons(instance) if not is_clean(r))
-    return Verdict(clean=not problems and not anomalous,
-                   problems=problems, anomalous=anomalous)
+    record, shape = parse(raw)
+    found = shape + validate(record)
+    anomalous = tuple(r for r in reasons(record) if not is_clean(r))
+    return Verdict(clean=not found and not anomalous, problems=found, anomalous=anomalous)

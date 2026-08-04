@@ -1398,172 +1398,244 @@ MUTATIONS = [
     # Every one of these reintroduces a defect that survived a round of review on the design
     # itself, where prose held it without complaining. They are shape defects, and the point of
     # writing the types before the I/O half is that a shape defect reddens an arm in seconds.
-    ("M184-is-clean-defaults-to-clean", AUDIT,
-     "    return reason in CLEAN_REASONS",
-     "    return True",
-     "audit.an_unenumerated_reason_is_an_anomaly_not_a_pass"),
-    # A reason that is clean without being a reason at all. Nothing else notices: it forgives
-    # nothing until the day something is spelled that way, and then it forgives silently.
-    ("M212-a-clean-reason-that-is-not-an-enumerated-reason", AUDIT,
-     "    CLIENT_EOF, SIGNAL_TERM, SIGNAL_INT,\n",
-     '    CLIENT_EOF, SIGNAL_TERM, SIGNAL_INT, "client_hung_up",\n',
-     "audit.an_unenumerated_reason_is_an_anomaly_not_a_pass"),
-    # A sixth reason forgiven, and this one IS enumerated — so the arm above stays green and
-    # only the exact-set arm notices. The direction that never announces itself: a cell that
-    # now passes where it used to fail.
-    ("M213-a-sixth-reason-quietly-becomes-clean", AUDIT,
-     "    SHUTDOWN_CHILD_KILLED,\n})",
-     "    SHUTDOWN_CHILD_KILLED,\n    SHUTDOWN_READ_FAILED,\n})",
-     "audit.is_clean_is_total_and_has_no_default_clean_branch"),
-    ("M185-empty-record-passes-vacuously", AUDIT,
-     "    if not triggers:",
+    #
+    # The first group is the PARSE layer, which exists because the reader's input is whatever
+    # `json.loads` returned and the writer is the thing under suspicion. Each of these makes
+    # the validator assume a shape instead of checking it, and the arm they redden catches the
+    # resulting exception — a traceback out of `verify_post_run` is not a failed cell, it is an
+    # absent verdict, which is the outcome §10.5 exists to make impossible.
+    ("M184-reader-assumes-its-input-is-a-map", AUDIT,
+     "    if not isinstance(raw, dict):",
+     "    if False:",
+     "audit.every_malformed_shape_is_a_problem_code_not_an_exception"),
+    ("M185-reader-assumes-a-list-where-json-allows-anything", AUDIT,
+     "    if not isinstance(value, list):",
+     "    if False:",
+     "audit.every_malformed_shape_is_a_problem_code_not_an_exception"),
+    ("M186-reader-assumes-list-entries-are-maps", AUDIT,
+     ('        if not isinstance(entry, dict):\n'
+      '            problems.append(f"trigger_not_a_map:{i}")'),
+     ('        if False:\n'
+      '            problems.append(f"trigger_not_a_map:{i}")'),
+     "audit.every_malformed_shape_is_a_problem_code_not_an_exception"),
+    ("M187-reader-assumes-a-scalar-is-a-string", AUDIT,
+     "    if isinstance(value, str):",
+     "    if True:",
+     "audit.every_malformed_shape_is_a_problem_code_not_an_exception"),
+    # `raw.get(k) or []` in its original form: a writer that forgot an axis entirely then
+    # validates as one that recorded nothing on it, and recording nothing is legal.
+    ("M188-a-missing-axis-reads-as-an-empty-one", AUDIT,
+     ('        if required:\n'
+      '            problems.append(f"missing:{key}")'),
+     ('        if False:\n'
+      '            problems.append(f"missing:{key}")'),
+     "audit.missing_null_and_empty_are_three_different_records"),
+    ("M189-null-is-not-distinguished-from-a-bad-type", AUDIT,
+     ('    if value is None:\n'
+      '        problems.append(f"null:{key}")'),
+     ('    if False:\n'
+      '        problems.append(f"null:{key}")'),
+     "audit.missing_null_and_empty_are_three_different_records"),
+
+    # ---- the vacuity guard and the fact key set -----------------------------------------
+    ("M190-empty-record-passes-vacuously", AUDIT,
+     "    if not record.triggers:",
      "    if False:",
      "audit.an_empty_trigger_list_is_malformed_not_vacuously_clean"),
-    ("M186-missing-completion-facts-are-not-checked", AUDIT,
-     ('        if key not in facts:\n'
+    ("M191-validator-rejects-every-record", AUDIT,
+     "    if not record.triggers:",
+     "    if True:",
+     "audit.a_clean_instance_is_clean"),
+    ("M192-missing-completion-facts-are-not-checked", AUDIT,
+     ('        if key not in record.facts:\n'
       '            problems.append(f"fact_missing:{key}")'),
      ('        if False:\n'
       '            problems.append(f"fact_missing:{key}")'),
      "audit.every_missing_completion_fact_is_caught_individually"),
     # The spot-check defect in its exact form: four of the five facts are checked, and the
     # fifth is the one whose step silently never ran.
-    ("M187-completion-facts-checked-all-but-one", AUDIT,
+    ("M193-completion-facts-checked-all-but-one", AUDIT,
      ('    for key in FACTS:\n'
-      '        if key not in facts:'),
+      '        if key not in record.facts:'),
      ('    for key in FACTS[:4]:\n'
-      '        if key not in facts:'),
+      '        if key not in record.facts:'),
      "audit.every_missing_completion_fact_is_caught_individually"),
-    ("M188-unknown-fact-names-are-ignored", AUDIT,
-     ('        if key not in FACTS:\n'
-      '            problems.append(f"fact_unknown:{key}")'),
-     ('        if False:\n'
-      '            problems.append(f"fact_unknown:{key}")'),
+    ("M194-unknown-fact-names-are-ignored", AUDIT,
+     "    for key in sorted(set(record.fact_keys) - set(FACTS)):",
+     "    for key in ():",
      "audit.an_unrecognized_completion_fact_name_is_malformed"),
-    ("M189-unknown-completion-state-accepted", AUDIT,
-     "        if state is None or state not in STATES:",
-     "        if state is None:",
-     "audit.an_unrecognized_completion_state_is_malformed"),
-    ("M190-not-applicable-needs-no-licence", AUDIT,
-     "        if state == NOT_APPLICABLE and latch not in _NOT_APPLICABLE_LICENSED_BY[key]:",
+    ("M195-unknown-completion-state-accepted", AUDIT,
+     "        if entry.state not in STATES:",
      "        if False:",
+     "audit.an_unrecognized_completion_state_is_malformed"),
+    ("M196-not-applicable-needs-no-licence", AUDIT,
+     ("        if (entry.state == NOT_APPLICABLE\n"
+      "                and record.latch not in _NOT_APPLICABLE_LICENSED_BY[key]):"),
+     ("        if (False\n"
+      "                and record.latch not in _NOT_APPLICABLE_LICENSED_BY[key]):"),
      "audit.not_applicable_needs_the_trigger_that_licenses_it"),
     # Step 1 always runs, so a blank here is never justified — not even under `spawn_failed`,
     # where the other four legitimately are.
-    ("M191-spawn-failure-excuses-the-intake-close", AUDIT,
+    ("M197-spawn-failure-excuses-the-intake-close", AUDIT,
      "    INTAKE_CLOSED: frozenset(),",
      "    INTAKE_CLOSED: frozenset({SPAWN_FAILED}),",
      "audit.not_applicable_needs_the_trigger_that_licenses_it"),
     # ...and the same rule from the other side: the `spawn_failed` record is LEGAL, and a
     # validator that rejects it scores full marks against every other case here.
-    ("M192-legal-spawn-failed-record-rejected", AUDIT,
+    ("M198-legal-spawn-failed-record-rejected", AUDIT,
      "    CHILD_STDIN_CLOSED: frozenset({SPAWN_FAILED}),",
      "    CHILD_STDIN_CLOSED: frozenset(),",
      "audit.spawn_failed_is_structurally_valid_and_anomalous"),
-    ("M193-failed-fact-needs-no-outcome", AUDIT,
-     "        if state == FAILED and not paired:",
-     "        if False:",
+
+    # ---- the declared cause, and the evidence that must match it exactly -----------------
+    ("M199-a-failed-fact-need-not-name-its-cause", AUDIT,
+     "            if cause not in causes_for(key):",
+     "            if False:",
+     "audit.a_failed_fact_declares_its_cause_rather_than_having_one_inferred"),
+    ("M200-a-declared-cause-need-not-be-supported", AUDIT,
+     "            elif cause not in evidence:",
+     "            elif False:",
      "audit.failed_and_its_outcome_require_each_other"),
-    ("M194-outcome-needs-no-failed-fact", AUDIT,
-     "        if key is not None and _fact_state(facts, key) != FAILED:",
-     "        if False:",
+    # The `or` this replaced: one record carrying both a real group-kill failure and a fault
+    # suppression of the same step, which are two incompatible accounts of one operation.
+    ("M201-contradictory-causes-are-tolerated", AUDIT,
+     "            if len(evidence) > 1:",
+     "            if False:",
+     "audit.a_failed_fact_cannot_carry_two_incompatible_causes"),
+    ("M202-outcome-needs-no-failed-fact", AUDIT,
+     ('        if entry is None or entry.state != FAILED:\n'
+      '            problems.append(f"outcome_unpaired:{kind}")'),
+     ('        if False:\n'
+      '            problems.append(f"outcome_unpaired:{kind}")'),
      "audit.failed_and_its_outcome_require_each_other"),
     # `failed` deleted from the state set: a teardown that ran and did not work then has no
     # legal spelling at all, and the only remaining one — omitting the fact — is malformed.
-    ("M195-a-failed-step-has-no-writeable-state", AUDIT,
+    ("M203-a-failed-step-has-no-writeable-state", AUDIT,
      "STATES = frozenset({DONE, NOT_APPLICABLE, FAILED})",
      "STATES = frozenset({DONE, NOT_APPLICABLE})",
      "audit.a_failed_teardown_is_recordable_and_anomalous"),
+
+    # ---- the catch-all, keyed by fact and carrying its payload ---------------------------
     # The coarse key. Any anomaly anywhere licenses `failed` anywhere — which is what a
     # step-keyed catch-all did, since step 2 owns two facts.
-    ("M196-any-anomaly-licenses-any-failed-fact", AUDIT,
-     "                  or key in anomaly_facts",
-     "                  or bool(anomaly_facts)",
+    ("M204-any-anomaly-licenses-any-failed-fact", AUDIT,
+     "    if any(o.kind == SHUTDOWN_ANOMALY and o.fact == key for o in record.outcomes):",
+     "    if any(o.kind == SHUTDOWN_ANOMALY for o in record.outcomes):",
      "audit.a_shutdown_anomaly_licenses_only_the_fact_it_names"),
-    ("M197-catch-all-need-not-name-its-fact", AUDIT,
-     ('            if entry.get("fact") not in FACTS:\n'
-      '                problems.append'),
+    ("M205-catch-all-need-not-name-its-fact", AUDIT,
+     ('            if entry.fact not in FACTS:\n'
+      '                problems.append(f"anomaly_unkeyed:{entry.fact}")'),
      ('            if False:\n'
-      '                problems.append'),
+      '                problems.append(f"anomaly_unkeyed:{entry.fact}")'),
      "audit.the_catch_all_reaches_the_facts_with_no_typed_outcome"),
     # The catch-all narrowed to the facts that already have a typed outcome — which is where
     # it started, and leaves an exception escaping steps 1 or 2 unrecordable.
-    ("M198-catch-all-does-not-reach-the-untyped-facts", AUDIT,
-     "                  or key in anomaly_facts",
-     "                  or (typed is not None and key in anomaly_facts)",
+    ("M206-catch-all-does-not-reach-the-untyped-facts", AUDIT,
+     "    base = {SHUTDOWN_ANOMALY, FAULT_POINT_FIRED}",
+     "    base = {FAULT_POINT_FIRED} if typed is None else {SHUTDOWN_ANOMALY, FAULT_POINT_FIRED}",
      "audit.the_catch_all_reaches_the_facts_with_no_typed_outcome"),
-    ("M199-anomaly-may-name-a-fact-that-did-not-fail", AUDIT,
-     "        if state != FAILED and key in anomaly_facts:",
-     "        if False:",
+    ("M207-anomaly-may-name-a-fact-that-did-not-fail", AUDIT,
+     "        elif SHUTDOWN_ANOMALY in evidence:",
+     "        elif False:",
      "audit.a_shutdown_anomaly_whose_fact_is_not_failed_is_malformed"),
-    ("M200-reap-claimed-without-its-exit-status", AUDIT,
-     "    if _fact_state(facts, CHILD_REAPED) == DONE and not has_status:",
+    # The two discriminated unions, each losing the payload its tag promises. A
+    # `protocol_anomaly` that declines to say WHICH anomaly withholds the one thing the audit
+    # log exists to carry, and it looks structurally fine.
+    ("M208-protocol-anomaly-need-not-say-which", AUDIT,
+     "        elif entry.reason == PROTOCOL_ANOMALY and entry.anomaly not in ANOMALY_KINDS:",
+     "        elif False:",
+     "audit.a_tagged_entry_must_carry_the_payload_its_tag_promises"),
+    ("M209-shutdown-anomaly-need-not-carry-its-exception", AUDIT,
+     ('            if entry.exception is None:\n'
+      '                problems.append("anomaly_no_exception")'),
+     ('            if False:\n'
+      '                problems.append("anomaly_no_exception")'),
+     "audit.a_tagged_entry_must_carry_the_payload_its_tag_promises"),
+
+    # ---- evidence only a reaper can hold -------------------------------------------------
+    ("M210-reap-claimed-without-its-exit-status", AUDIT,
+     "    if reaped_done and not record.child_status:",
      "    if False:",
      "audit.child_status_travels_with_the_reap_and_only_with_it"),
-    ("M201-exit-status-for-a-child-never-reaped", AUDIT,
-     "    if _fact_state(facts, CHILD_REAPED) != DONE and has_status:",
+    ("M211-exit-status-for-a-child-never-reaped", AUDIT,
+     "    if not reaped_done and record.child_status:",
      "    if False:",
      "audit.child_status_travels_with_the_reap_and_only_with_it"),
-    ("M202-fault-firing-need-not-be-configured", AUDIT,
-     "        if key not in configured:",
+
+    # ---- arming is not firing -------------------------------------------------------------
+    ("M212-fault-firing-need-not-be-configured", AUDIT,
+     "        if key not in record.suppresses:",
      "        if False:",
      "audit.only_a_fired_fault_point_pairs_with_a_failed_fact"),
-    ("M203-fault-firing-need-not-have-suppressed-anything", AUDIT,
-     "        if _fact_state(facts, key) != FAILED:",
-     "        if False:",
+    ("M213-fault-firing-need-not-have-suppressed-anything", AUDIT,
+     ('        if entry is None or entry.state != FAILED:\n'
+      '            problems.append(f"fired_unpaired:{key}")'),
+     ('        if False:\n'
+      '            problems.append(f"fired_unpaired:{key}")'),
      "audit.only_a_fired_fault_point_pairs_with_a_failed_fact"),
     # Arming stops being a verdict input, which is the state the no-op-injection case exists
     # to reject: a hook armed and silently never fired then produces a passing run.
-    ("M204-arming-a-fault-point-is-forgiven", AUDIT,
-     ("    if _configured(instance):\n"
-      "        out.append(FAULT_POINT_CONFIGURED)"),
-     ("    if False:\n"
-      "        out.append(FAULT_POINT_CONFIGURED)"),
+    ("M214-arming-a-fault-point-is-forgiven", AUDIT,
+     "    if record.fault_point:",
+     "    if False:",
+     "audit.arming_a_fault_point_fails_the_instance_on_its_own"),
+    # An arm-only hook suppresses nothing by design, so reading emptiness as "no fault point"
+    # passes exactly the run that case exists to reject.
+    ("M215-an-empty-suppression-list-reads-as-no-fault-point", AUDIT,
+     "    if record.fault_point:",
+     "    if record.suppresses:",
      "audit.arming_a_fault_point_fails_the_instance_on_its_own"),
     # ...and the collapse in the other direction: firing counted as a verdict input too, so
     # the suppressed-step control can no longer say what made it anomalous.
-    ("M205-firing-is-counted-as-well-as-arming", AUDIT,
-     ("    if _configured(instance):\n"
-      "        out.append(FAULT_POINT_CONFIGURED)"),
-     ("    if _configured(instance):\n"
-      "        out.append(FAULT_POINT_CONFIGURED)\n"
-      '    out += [FAULT_POINT_CONFIGURED for _e in instance.get("fired") or []]'),
+    ("M216-firing-is-counted-as-well-as-arming", AUDIT,
+     "        out.append(FAULT_POINT_CONFIGURED)",
+     ("        out.append(FAULT_POINT_CONFIGURED)\n"
+      "    out += [FAULT_POINT_CONFIGURED for _f in record.fired]"),
      "audit.a_suppressed_step_is_recorded_without_being_excused"),
-    # The verdict as a lookup on the latch rather than a conjunction over everything.
-    ("M206-verdict-reads-only-the-first-reason", AUDIT,
-     "    anomalous = tuple(r for r in reasons(instance) if not is_clean(r))",
-     "    anomalous = tuple(r for r in reasons(instance)[:1] if not is_clean(r))",
+
+    # ---- the verdict as a conjunction over everything -------------------------------------
+    ("M217-verdict-reads-only-the-first-reason", AUDIT,
+     "    anomalous = tuple(r for r in reasons(record) if not is_clean(r))",
+     "    anomalous = tuple(r for r in reasons(record)[:1] if not is_clean(r))",
      "audit.each_axis_can_fail_the_instance_on_its_own"),
-    # The cleanup axis dropped from the verdict entirely — a perfect teardown laundering the
-    # fault that happened during it.
-    ("M207-cleanup-outcomes-do-not-reach-the-verdict", AUDIT,
-     ('    out += [e["kind"] for e in instance.get("outcomes") or []\n'
-      '            if isinstance(e, dict) and "kind" in e]'),
+    ("M218-cleanup-outcomes-do-not-reach-the-verdict", AUDIT,
+     "    out += [o.kind for o in record.outcomes]",
      "    out += []",
      "audit.a_clean_teardown_never_launders_an_anomalous_one"),
     # A runner-up trigger treated as a teardown fault, so EOF followed by signal escalation —
     # ordinary behaviour on half the fleet — fails the cell.
-    ("M208-a-second-clean-trigger-is-treated-as-an-anomaly", AUDIT,
-     ('    out = [e["reason"] for e in instance.get("triggers") or []\n'
-      '           if isinstance(e, dict) and "reason" in e]'),
-     ('    out = [e["reason"] for e in (instance.get("triggers") or [])[:1]\n'
-      '           if isinstance(e, dict) and "reason" in e]\n'
-      '    out += [SHUTDOWN_ANOMALY for _e in (instance.get("triggers") or [])[1:]]'),
+    ("M219-a-second-clean-trigger-is-treated-as-an-anomaly", AUDIT,
+     "    out = [t.reason for t in record.triggers]",
+     ("    out = [t.reason for t in record.triggers[:1]]\n"
+      "    out += [SHUTDOWN_ANOMALY for _t in record.triggers[1:]]"),
      "audit.two_clean_triggers_do_not_compose_into_a_failure"),
     # C3-1 measured both of these against conforming CLIs, so failing on either fails a clean
     # cell — which §10.5 counts as the same defect as forwarding a definition.
-    ("M209-a-measured-clean-outcome-fails-the-cell", AUDIT,
+    ("M220-a-measured-clean-outcome-fails-the-cell", AUDIT,
      "    SHUTDOWN_WRITE_FAILED,\n",
      "",
      "audit.the_two_measured_cleanup_outcomes_stay_clean"),
-    ("M210-forced-termination-fails-the-cell", AUDIT,
+    ("M221-forced-termination-fails-the-cell", AUDIT,
      "    SHUTDOWN_CHILD_KILLED,\n",
      "",
      "audit.the_two_measured_cleanup_outcomes_stay_clean"),
-    # And the validator that scores full marks by rejecting everything.
-    ("M211-validator-rejects-every-record", AUDIT,
-     "    if not triggers:",
-     "    if True:",
-     "audit.a_clean_instance_is_clean"),
+    ("M222-is-clean-defaults-to-clean", AUDIT,
+     "    return reason in CLEAN_REASONS",
+     "    return True",
+     "audit.an_unenumerated_reason_is_an_anomaly_not_a_pass"),
+    # A reason that is clean without being a reason at all. Nothing else notices: it forgives
+    # nothing until the day something is spelled that way, and then it forgives silently.
+    ("M223-a-clean-reason-that-is-not-an-enumerated-reason", AUDIT,
+     "    CLIENT_EOF, SIGNAL_TERM, SIGNAL_INT,\n",
+     '    CLIENT_EOF, SIGNAL_TERM, SIGNAL_INT, "client_hung_up",\n',
+     "audit.an_unenumerated_reason_is_an_anomaly_not_a_pass"),
+    # A sixth reason forgiven, and this one IS enumerated — so the arm above stays green and
+    # only the exact-set arm notices. The direction that never announces itself: a cell that
+    # now passes where it used to fail.
+    ("M224-a-sixth-reason-quietly-becomes-clean", AUDIT,
+     "    SHUTDOWN_CHILD_KILLED,\n})",
+     "    SHUTDOWN_CHILD_KILLED,\n    SHUTDOWN_READ_FAILED,\n})",
+     "audit.is_clean_is_total_and_has_no_default_clean_branch"),
 
     # ---- F: instruments, proven by tools/verify_mcp_fixtures.py -------------------------
     # Everything above asks whether the selftest notices a defect in production code. These

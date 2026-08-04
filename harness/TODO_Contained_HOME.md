@@ -289,10 +289,10 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 531 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 536 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 harness/tools/mutate_mcp.py                           # 211/211 production + 2/2 instrument + 8/8 fixture
+python3 harness/tools/mutate_mcp.py                           # 222/222 production + 2/2 instrument + 8/8 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 278 checks
 git diff --check
 ```
@@ -542,6 +542,29 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   rule is sometimes right, but the burden is to show the deviation is not an instance of the
   thing the rule exists to forbid, and "it is safer" does not discharge it: unsound in the
   strict direction is still unsound.
+- **A READER'S INPUT IS THE FORMAT, NOT THE WRITER'S PROMISE.** `mcp_audit.validate` was
+  written against the record the proxy intends to write, so `{"triggers": {}}` raised
+  `KeyError`, an array `state` raised `TypeError`, and a scalar `fired` raised on iteration —
+  six shapes crashed and two more passed clean. The module exists BECAUSE the writer is under
+  suspicion, which makes "the writer would never emit that" the one justification unavailable
+  to it. **A crash is worse than the malformed input that caused it**: a failed cell is a
+  result, and a traceback out of `verify_post_run` is an absent verdict — the outcome the
+  whole section exists to make impossible, arriving through the code written to guarantee it.
+  Parse first, into types, reporting every shape it cannot use; judge afterwards.
+- **`x.get(k) or []` erases the difference between MISSING, NULL and EMPTY.** All three become
+  "nothing on that axis", and nothing on an axis is legal — so a writer that forgot the axis
+  entirely validated clean. The same idiom hid a second one: a fault point whose suppression
+  list was empty read as no fault point at all, which passed exactly the arm-only run that
+  case exists to reject. **Wherever absence has a meaning, check what else produces the same
+  value** — this is the completion-facts lesson (§10.5.1) applied to the record's own keys,
+  which is where it should have been applied first.
+- **Inferring a cause from available evidence accepts contradictory records.** A `failed`
+  completion fact used to be legal if SOME pairing existed, so one record could carry both a
+  real group-kill failure and a fault-point suppression of that same step — two incompatible
+  accounts of one operation, no problem reported. The fix is that the fact DECLARES its cause
+  and the reader checks the record bears exactly that one. **"Is there evidence for this?" is
+  a weaker question than "is this the evidence?"**, and the gap between them is where two
+  truths sit side by side.
 - **A TOTALITY assertion over a membership test is a tautology.** The first cut of the audit
   arms tried to pin "every enumerated reason has a verdict" as `all(is_clean(r) or r not in
   CLEAN_REASONS for r in EVERY_REASON)` — which is `P or not P` once you notice `is_clean(r)`
