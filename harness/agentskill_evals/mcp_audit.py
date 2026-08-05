@@ -63,10 +63,12 @@ success, and only one of the two earns a clean verdict.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
-from .mcp_proxy import ANOMALY_KINDS, DROP_REASONS, IMPLEMENTED_VERSIONS
+from .mcp_proxy import (ANOMALY_KINDS, DROP_REASONS, IMPLEMENTED_VERSIONS,
+                        refuse_json_extension)
 
 # ---------------------------------------------------------------------------------------
 # Axis 1 — the triggers (§10.5.1)
@@ -86,10 +88,14 @@ CLIENT_WRITE_FAILED = "client_write_failed"
 CHILD_WRITE_FAILED = "child_write_failed"
 READ_FAILED = "read_failed"
 PROTOCOL_ANOMALY = "protocol_anomaly"
+# The guardian died while the connection was live. It is the child's PARENT (§10.5), so its
+# death leaves a credential-bearing server whose exit nobody will observe and whose process
+# group nothing can prove the identity of — which is terminal, not degraded.
+GUARDIAN_LOST = "guardian_lost"
 
 TRIGGERS = frozenset({
     CLIENT_EOF, SIGNAL_TERM, SIGNAL_INT, SPAWN_FAILED, CHILD_EXIT,
-    CLIENT_WRITE_FAILED, CHILD_WRITE_FAILED, READ_FAILED, PROTOCOL_ANOMALY,
+    CLIENT_WRITE_FAILED, CHILD_WRITE_FAILED, READ_FAILED, PROTOCOL_ANOMALY, GUARDIAN_LOST,
 })
 
 # ---------------------------------------------------------------------------------------
@@ -717,7 +723,12 @@ _EVENT_PAYLOAD_KEYS = frozenset(k for keys in _EVENT_FIELDS.values() for k in ke
 # report the keys the record layer is reading.
 _LINE_FIELDS = {
     LINE_START: (("server", "pid"), ("fault_point",)),
-    LINE_SPAWN: (("child_pid", "child_pgid"), ("guardian_pid",)),
+    # `guardian_pid` IS REQUIRED, because the guardian is. It was optional while the guardian
+    # was a best effort, and an optional field whose value nothing validated meant a synthetic
+    # log stayed clean with it missing, `false`, or `"alive"` (review, PR #103). The spawn
+    # record now exists only after the guardian has reported ready about itself, so its
+    # presence, its type and its distinctness from the child are the readiness evidence.
+    LINE_SPAWN: (("child_pid", "child_pgid", "guardian_pid"), ()),
     LINE_TERMINATOR: (("observed",),
                       ("triggers", "outcomes", "facts", "fired", "child_status")),
 }
@@ -772,7 +783,11 @@ def parse_log(text: str) -> tuple[tuple[Instance, ...], tuple[str, ...]]:
             problems.append(f"blank_line:{i}")
             continue
         try:
-            raw = json.loads(line)
+            # THE SAME DECODER RULE THE PROXY USES, imported rather than restated: `NaN` and
+            # `Infinity` are a Python extension and not JSON, so a line carrying one is
+            # unparseable here exactly as it is on the wire. A copy of that rule could disagree
+            # with the original silently, and this reader is what judges the writer.
+            raw = json.loads(line, parse_constant=refuse_json_extension)
         except ValueError:
             problems.append(f"unparseable_line:{i}")
             continue
@@ -864,11 +879,20 @@ def _ts_problems(inst: Instance) -> list[str]:
     of that, so a rule applied only to the three lifecycle records would leave the half the
     claim is actually about unchecked. One loop over every record rather than a clause inside
     the per-kind checks, because a rule with one owner cannot be applied to some of its cases.
+
+    A `float` IS NOT ENOUGH, and the gap was `NaN` and `Infinity` — both of which
+    `isinstance(x, float)` accepts and neither of which is a time (review, PR #103). They are
+    the same defect as `isinstance(True, int)` one type over: a value that passes the obvious
+    check while carrying nothing the field is for. `json.loads` produces them from bare
+    `NaN`/`Infinity` tokens unless told not to, which is why the refusal is ALSO at the decoder
+    below — one rule about what JSON is, one about what a timestamp is, and this half stays
+    reachable because `instance_verdict` is a public entry point over synthetic instances.
     """
     problems = []
     for record in inst.records:
         ts = record.get("ts")
-        if not is_json_int(ts) and not isinstance(ts, float):
+        usable = is_json_int(ts) or (isinstance(ts, float) and math.isfinite(ts))
+        if not usable:
             problems.append(f"{record.get('kind')}_ts:{ts!r}")
     return problems
 
@@ -968,6 +992,16 @@ def instance_verdict(inst: Instance, *, server: str,
     if inst.spawn is not None:
         problems.extend(_field_problems(inst.spawn, LINE_SPAWN))
         pid, pgid = inst.spawn.get("child_pid"), inst.spawn.get("child_pgid")
+        guardian = inst.spawn.get("guardian_pid")
+        # A POSITIVE READINESS FACT, checked as one. The guardian is the child's parent and is
+        # established before it exists (§10.5), so a spawn record naming no guardian, or naming
+        # something that is not a pid, or naming the child itself, describes a topology this
+        # proxy cannot produce — and each of those read clean while the field was merely
+        # optional (review, PR #103).
+        if not is_json_int(guardian) or guardian <= 0:
+            problems.append(f"spawn_guardian:{guardian!r}")
+        elif guardian == pid:
+            problems.append(f"spawn_guardian_is_the_child:{guardian}")
         if not is_json_int(pid) or not is_json_int(pgid):
             problems.append(f"spawn_ids:{pid!r}:{pgid!r}")
         elif pid != pgid:

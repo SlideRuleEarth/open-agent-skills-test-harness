@@ -21,6 +21,16 @@ certifies that the instance ended cleanly: a false clean verdict produced by the
 meant to prevent one. §10.5's six steps are therefore in a fixed order, and each of them
 records whether it kept its promise, because a step that ran no code raises nothing to notice.
 
+THE PROXY IS NOT THE SERVER'S PARENT — THE GUARDIAN IS, and that inversion is what makes the
+containment claim structural rather than careful. The guardian is established BEFORE the
+credential-bearing child exists, it is the thing that starts it, and a guardian that cannot be
+established is `spawn_failed` with no server ever running. Because it is the parent it can keep
+the child unreaped, which is the only way any process here can show that a process-group id
+still names the group it created rather than one the kernel has since handed to a stranger. So
+every real signal to that group is sent by the guardian, on the proxy's order, and the proxy's
+own fallback exists for exactly one ending — the guardian dying mid-run — and says out loud
+that it is the weaker claim (review, PR #103).
+
 WHAT IS DELIBERATELY NOT WRITTEN TO THE AUDIT LOG: argv, the environment, the config, and the
 detail text of any anomaly. The config carries interpolated credentials (§10.3) and an anomaly
 detail can quote a wire message the server chose the contents of. The log carries tool names,
@@ -62,18 +72,39 @@ else:
 FAULT_ENV = "ASE_MCP_FAULT_SUPPRESS"     # PRESENCE arms it; the value names the facts
 INHERIT_ENV = "ASE_MCP_INHERIT_FDS"      # fds to hand the child and then close (§10.9)
 GRACE_ENV = "ASE_MCP_GRACE"              # seconds; scales every bound below
+GUARDIAN_ENV = "ASE_MCP_GUARDIAN"        # how to break the guardian, for §10.9's cases
 
 DEFAULT_GRACE = 5.0
 
-# The guardian's own bound. Its wait normally ends when the proxy dies, by any means, so this
-# exists only so a guardian whose lifeline somehow never closes cannot become permanent. A
-# ceiling reached is NOT a reason to signal: the proxy is evidently still alive and still in
-# charge of its own child.
-GUARDIAN_CEILING = 3600.0
 GUARDIAN_FLAG = "--guardian"
-# One byte, meaning "I ran my teardown; do not act". Anything at all stands the guardian down;
-# only an EOF with nothing before it fires it.
-GUARDIAN_STAND_DOWN = b"."
+# How long the guard loop waits before re-asking whether the proxy is still its parent. There is
+# deliberately NO ceiling on the loop itself. An earlier version gave up after an hour and
+# exited, which recreates the orphan it exists to prevent — a long-lived session outlives the
+# ceiling and the credential-bearing child is then unguarded (review, PR #103). The wait ends on
+# facts instead: an order, the lifeline's EOF, or a reparented `getppid()`.
+GUARDIAN_POLL = 0.2
+
+# §10.9's three ways to break the guardian, since it is now MANDATORY and "fail closed" is a
+# claim about paths that have to be producible on demand.
+GUARDIAN_MISSING = "missing"             # its program is not there, so `Popen` raises
+GUARDIAN_SILENT = "silent"               # it exits BEFORE reporting ready — no child is started
+GUARDIAN_LATE = "late"                   # it exits AFTER, so a live child loses its pin
+GUARDIAN_IMPOSTER = "imposter"           # it reports a pid that is not its own
+
+# The orders, one byte each, written down the lifeline. Every order is answered by exactly one
+# report line, so the proxy's account of what happened to the group is the guardian's, not its
+# own guess. EOF is not an order: it is the proxy having died.
+ORDER_TERM = b"T"                        # deliver SIGTERM to the child's group
+ORDER_KILL = b"K"                        # deliver SIGKILL to the child's group
+ORDER_RELEASE = b"R"                     # reap the child, release the pin, confirm the group
+ORDER_STAND_DOWN = b"."                  # leave the group alone and exit — §10.9's control only
+
+# What the guardian says about the group after the reap, and what `group_identity` says about it
+# before a signal. `gone` is the only one that settles `group_terminated` as `done`.
+GROUP_GONE = "gone"
+GROUP_PRESENT = "present"
+GROUP_SAME = "same"
+GROUP_UNKNOWN = "unknown"
 
 _READ_CHUNK = 65536
 
@@ -295,63 +326,338 @@ def _inherit_fds(environ: dict[str, str] | None = None) -> tuple[int, ...]:
     return tuple(found)
 
 
-def run_guardian(pgid: int, lifeline: int) -> int:
-    """Kill the child's process group if the PROXY dies without running its teardown (§10.5).
-
-    WHY A SEPARATE PROCESS AT ALL. The child is started with `start_new_session=True` precisely
-    so step 4 has a group to signal — and that same decision puts it out of reach of every
-    ancestor's group kill, so a `SIGKILL` to the proxy leaves a credential-bearing server with
-    nothing left that will ever terminate it. The absence rule catches that in the audit and
-    fails the cell, but detection is not cleanup: the process is still running (review, PR
-    #103). This is the piece that cleans up.
-
-    IT STANDS DOWN ON A BYTE, NOT ON THE PROXY'S EXIT. The proxy writes one immediately before
-    its terminator, so a teardown that RAN — even one that ran and failed — silences the
-    guardian, and only a proxy that never got there leaves an EOF with nothing before it. That
-    distinction is what keeps this from erasing evidence: a group kill the proxy attempted and
-    could not complete is recorded as `shutdown_group_kill_failed` and the survivors are left
-    for §10.9's liveness cases to observe, rather than being quietly swept up by the mechanism
-    that exists for a different failure.
-
-    AND IT ASKS BEFORE IT SIGNALS. `killpg(pgid, 0)` sends nothing, so a pgid recycled between
-    the child being reaped by init and this wakeup produces a no-op rather than a signal to a
-    stranger — the same reasoning as `_confirm_group_gone`, in the one place where the process
-    holding the group open is no longer around to keep the pid unique.
-    """
-    sel = selectors.DefaultSelector()
-    sel.register(lifeline, selectors.EVENT_READ)
-    deadline = time.monotonic() + GUARDIAN_CEILING
-    try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not sel.select(remaining):
-                return 0                 # the ceiling: the proxy is alive and still in charge
-            try:
-                if os.read(lifeline, 1) != b"":
-                    return 0             # stood down
-            except OSError:
-                pass
-            break                        # EOF: the proxy is gone and never stood down
-    finally:
-        sel.close()
-        os.close(lifeline)
-    try:
-        os.killpg(pgid, 0)
-    except OSError:
-        return 0                         # nothing there; never signal on a guess
-    print(f"mcp-proxy guardian: proxy gone without a teardown; killing group {pgid}",
-          file=sys.stderr)
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except OSError as exc:
-        print(f"mcp-proxy guardian: {exc}", file=sys.stderr)
-    return 0
-
-
 def _write_all(fd: int, payload: bytes) -> None:
     """Every byte, or an `OSError`. A partial write on a pipe is a truncated JSON-RPC line."""
     while payload:
         payload = payload[os.write(fd, payload):]
+
+
+def _close(fd: int | None) -> None:
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _readable(fd: int, timeout: float) -> bool:
+    sel = selectors.DefaultSelector()
+    try:
+        sel.register(fd, selectors.EVENT_READ)
+        return bool(sel.select(timeout))
+    finally:
+        sel.close()
+
+
+def _is_own_group(pgid: int) -> bool:
+    """Signalling this would reach the caller, whatever spawned it, and every sibling.
+
+    Which means `start_new_session=True` did not take effect. A cleanup must not reach further
+    than what it created (§4), so both signalling sites — the guardian and the proxy's fallback
+    — ask this before they deliver anything, and both refuse rather than guess.
+    """
+    return pgid == os.getpgid(0)
+
+
+def group_identity(pid: int, pgid: int) -> str:
+    """Whether `pgid` still names the group that `pid` is in — asked before signalling it.
+
+    A PROCESS GROUP ID IS A PID, and it stops being unique the moment the last member is reaped:
+    `killpg` on a bare number can therefore reach a group the kernel handed to somebody else
+    (review, PR #103). The strong answer to that is a PIN — an unreaped member keeps the id from
+    being recycled — and while the guardian is alive it holds one, so it never needs this. This
+    is the weaker answer, for the one path where the pin holder has died: ask the kernel which
+    group the process is in and signal only if it is still the recorded one.
+
+    Weaker, and worth saying how. If the child has itself been reaped, `pid` may already name a
+    stranger; when the child was its own group leader — which it is, by `start_new_session=True`
+    — `getpgid(pid) == pid` degenerates to "some group leader has this pid". It is nonetheless
+    strictly better than not asking, and the alternative on this path is to leave a
+    credential-bearing process running. `gone` is not a failure: nothing to signal is the goal.
+    """
+    try:
+        found = os.getpgid(pid)
+    except ProcessLookupError:
+        return GROUP_GONE
+    except OSError:
+        return GROUP_UNKNOWN            # cannot be established, so it cannot be signalled
+    return GROUP_SAME if found == pgid else GROUP_UNKNOWN
+
+
+def probe_group_empty(pgid: int, grace: float) -> bool:
+    """Whether the group is EMPTY, asked with a signal that delivers nothing.
+
+    `killpg(pgid, 0)` answering `ESRCH` is direct evidence, where an errno from a real delivery
+    is an inference: `EPERM` means the members present could not be signalled, which a sandbox
+    restriction and a differently credentialed descendant produce as readily as the all-zombie
+    group that was measured (review, PR #103). Anything but `ESRCH` therefore means something is
+    still there, and the bounded retry is for the one benign case — a helper that has died and
+    is briefly a zombie of its own until init reaps it.
+
+    Because it sends NOTHING, this is the one group operation that needs no pin: the worst a
+    recycled pgid can produce here is a false `shutdown_group_kill_failed`, which is a failed
+    cell rather than a signal to a stranger.
+    """
+    deadline = time.monotonic() + grace
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            pass                         # present but unsignallable; still present
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+
+
+class Guardian:
+    """The child's PARENT: established before the child exists, and the holder of its pin.
+
+    WHY IT IS THE PARENT AND NOT A BYSTANDER. Three separate properties fall out of that one
+    decision, and none of them is reachable by a process that merely knows a number:
+
+      * IT CANNOT BE LATE. The credential-bearing server is started BY the guardian, so there is
+        no window in which the child exists and nothing is watching it. A guardian spawned after
+        the child leaves exactly that window, and a `SIGKILL` inside it orphans the server no
+        matter how careful the code on either side is (review, PR #103).
+      * IT CANNOT BE ABSENT. No guardian means no spawn: `_establish_guardian` failing is
+        `spawn_failed`, an ordinary anomalous ending with a record like any other, and the
+        server never runs. "Best effort" was the wrong shape for a containment mechanism.
+      * IT HOLDS THE IDENTITY. The group is named by the child's pid, and the kernel may reuse
+        that number once the last member is reaped. Keeping the child unreaped is what makes
+        every signal this process sends provably reach the group it created rather than a
+        stranger's, and the argument needs nothing about how pids are allocated: a pgid names at
+        most one EXISTING group, a group exists while it has a member, and an unreaped child is
+        one. It is also why the guardian NEVER signals after it has reaped — releasing the pin
+        ends its licence to act, so `release()` is the last thing it does.
+
+    THE READY REPORT IS A HANDSHAKE, not a return value. `Popen` returning tells the proxy a
+    fork succeeded; the report tells it this code ran, in that process, and got as far as
+    starting the child. Its `guardian_pid` is read by the proxy against the pid it spawned, so a
+    report from anything else fails the run closed.
+
+    IT ONLY EVER STANDS DOWN ON PURPOSE. The default at every ending — an order, an EOF, a
+    reparented `getppid()` — is to terminate the group; the single exception is §10.9's
+    retention control, which is armed by a fault point and therefore cannot occur in a run that
+    could have passed. An earlier version stood down whenever the proxy's teardown had merely
+    RUN, so a teardown that ran and FAILED left the survivors it had just failed to kill
+    (review, PR #103). The record preserves the evidence either way; cleanup does not erase it.
+    """
+
+    def __init__(self, order: dict) -> None:
+        self.command = order["command"]
+        self.args = list(order["args"])
+        self.env = dict(order["env"])
+        self.cwd = order["cwd"]
+        self.inherit = tuple(order["inherit"])
+        self.stdin_fd = int(order["stdin_fd"])
+        self.stdout_fd = int(order["stdout_fd"])
+        self.lifeline = int(order["lifeline_fd"])
+        self.report_fd = int(order["report_fd"])
+        self.grace = float(order["grace"])
+        self.child: subprocess.Popen | None = None
+        self.child_pgid: int | None = None
+
+    # -- talking to the proxy -----------------------------------------------------------------
+
+    def report(self, **fields) -> None:
+        """One line per order, and never anything else. A failed write means the proxy is gone,
+        which the guard loop is about to discover for itself."""
+        try:
+            _write_all(self.report_fd, (json.dumps(fields) + "\n").encode("utf-8"))
+        except OSError:
+            pass
+
+    # -- the child ----------------------------------------------------------------------------
+
+    def spawn(self, knob: str = "") -> bool:
+        """Start the declared server, in its own session, and report what was started."""
+        try:
+            self.child = subprocess.Popen(      # noqa: S603 — the declared server (§10.3)
+                [self.command, *self.args],
+                stdin=self.stdin_fd, stdout=self.stdout_fd,
+                env=self.env, cwd=self.cwd, close_fds=True, pass_fds=self.inherit,
+                # ITS OWN PROCESS GROUP, which is what gives step 4 something to signal: a stdio
+                # server may spawn helpers, they inherit the interpolated environment, and a
+                # surviving grandchild is a live credential the run no longer accounts for.
+                start_new_session=True)
+        except OSError as exc:
+            self.report(error=f"cannot start {self.command!r}: {exc}")
+            return False
+        finally:
+            # EVERY DESCRIPTOR HANDED ON IS CLOSED HERE. The proxy holds the other end of both
+            # stdio pipes and reads the child's stdout to EOF, so a copy left open in this
+            # process is an EOF that never arrives — a proxy that hangs in its own drain. The
+            # same discipline gives each §10.9 liveness channel a SOLE writer.
+            for fd in (self.stdin_fd, self.stdout_fd, *self.inherit):
+                _close(fd)
+        try:
+            self.child_pgid = os.getpgid(self.child.pid)
+        except OSError:
+            self.child_pgid = self.child.pid
+        # §10.9's `imposter`: a ready report that did not come from the process the proxy
+        # started. The child exists by now, so this is also the case that shows failing closed
+        # AFTER the spawn still cleans up — the proxy repudiates the report and closes the
+        # lifeline, and the guardian sweeps the group it is still holding.
+        mine = os.getpid() + 1 if knob == GUARDIAN_IMPOSTER else os.getpid()
+        self.report(guardian_pid=mine, child_pid=self.child.pid, child_pgid=self.child_pgid)
+        return True
+
+    # -- the group ----------------------------------------------------------------------------
+
+    def _signal(self, sig: int) -> str | None:
+        """Deliver one signal to the child's group. An error string, or None.
+
+        `ESRCH` and `EPERM` are both None, and neither of them is a verdict: the group being
+        gone is the goal, and an `EPERM` says only that what is there could not be signalled by
+        this process. What the group actually contains is settled by `probe_group_empty`, which
+        sends nothing and can therefore be believed.
+        """
+        if _is_own_group(self.child_pgid):
+            return f"group {self.child_pgid} is this process's own, not the child's"
+        try:
+            os.killpg(self.child_pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            return None
+        except OSError as exc:
+            return str(exc)
+        return None
+
+    def deliver(self, sig: int) -> None:
+        error = self._signal(sig)
+        self.report(signalled=error is None, error=error)
+
+    def release(self) -> bool:
+        """Reap the child, release the pin, and say what became of the group. True iff reaped.
+
+        THE SWEEP COMES FIRST, unconditionally. Reaping is what ends this process's licence to
+        signal, so anything still in the group has to be dealt with while the pin is still held
+        — including the case where the proxy's own step 4 never delivered, which is exactly the
+        failure the guardian exists to survive. On a shutdown that already worked it is a
+        `killpg` against a group holding nothing but our own zombie, which costs one syscall.
+
+        A REAP THAT TIMES OUT KEEPS THE PIN, so this returns False and the guard loop carries on
+        watching. There is no state in which this process has released the pin and is still
+        pretending to guard something.
+        """
+        self._signal(signal.SIGKILL)
+        try:
+            self.child.wait(timeout=self.grace)
+        except subprocess.TimeoutExpired:
+            self.report(reaped=False, error="the child outlived a group SIGKILL")
+            return False
+        self.report(reaped=True, status=self.child.returncode,
+                    group=(GROUP_GONE if probe_group_empty(self.child_pgid, self.grace)
+                           else GROUP_PRESENT))
+        return True
+
+    def sweep(self) -> None:
+        """The proxy died without releasing the pin. Terminate the group and reap."""
+        print(f"mcp-proxy guardian: the proxy is gone and its teardown did not finish; "
+              f"terminating group {self.child_pgid}", file=sys.stderr)
+        self._signal(signal.SIGTERM)
+        time.sleep(min(self.grace, 0.2))
+        self._signal(signal.SIGKILL)
+        try:
+            self.child.wait(timeout=self.grace)
+        except subprocess.TimeoutExpired:
+            print(f"mcp-proxy guardian: child {self.child.pid} outlived a group SIGKILL",
+                  file=sys.stderr)
+
+    # -- the loop -----------------------------------------------------------------------------
+
+    def obey(self, order: bytes) -> bool:
+        """Carry out one order. True iff the pin is now released and there is nothing to guard."""
+        if order == ORDER_TERM:
+            self.deliver(signal.SIGTERM)
+        elif order == ORDER_KILL:
+            self.deliver(signal.SIGKILL)
+        elif order == ORDER_RELEASE:
+            return self.release()
+        else:
+            self.report(signalled=False, error=f"unknown order {order!r}")
+        return False
+
+    def guard(self) -> None:
+        """Wait for orders until the pin is released, the proxy stands us down, or it dies.
+
+        THE LIFELINE'S EOF IS THE WHOLE DEATH DETECTOR, and it is the kernel's own statement
+        rather than a poll: the proxy holds the only write end — it is not in the guardian's
+        `pass_fds`, so `close_fds` closes it here, and the child is spawned from this process
+        with an explicit `pass_fds` that does not carry it either — so an EOF means no writer is
+        left anywhere. A second channel was tried, `getppid()` no longer being the proxy, and
+        removing it changed the outcome of nothing: its mutation reported MISSED because every
+        ending that reparents this process also closes that descriptor. A redundant check whose
+        failure is unobservable is not defence in depth, it is a line nothing proves — so what
+        guards the premise instead is the sole-writer discipline above, which is a property of
+        two `pass_fds` lists that a reader can check.
+
+        AND THERE IS NO CEILING. An earlier version gave up after an hour and exited, which
+        recreates the orphan for any session that runs longer than one (review, PR #103). The
+        wait ends on facts: an order, or the EOF.
+        """
+        while True:
+            if not _readable(self.lifeline, GUARDIAN_POLL):
+                continue
+            try:
+                order = os.read(self.lifeline, 1)
+            except OSError:
+                order = b""
+            if not order:
+                break                    # EOF: the proxy is gone and never released the pin
+            if order == ORDER_STAND_DOWN:
+                return                   # §10.9's retention control, and nothing else
+            if self.obey(order):
+                return                   # released: this process may no longer signal anything
+        self.sweep()
+
+    def run(self, knob: str = "") -> int:
+        if not self.spawn(knob):
+            return 3
+        if knob == GUARDIAN_LATE:
+            # §10.9: a guardian that dies once the child exists. The proxy sees the report pipe
+            # reach EOF, latches `guardian_lost`, and falls back to its own identity-checked
+            # cleanup — the path this knob exists to make reachable.
+            return 4
+        self.guard()
+        return 0
+
+
+def run_guardian(order_fd: int) -> int:
+    """Read the launch order off the inherited descriptor, then be the guardian.
+
+    THE ORDER COMES DOWN A PIPE, not on the command line and not through the environment,
+    because it carries the interpolated `env` (§10.3). `argv` is world-readable through `ps` and
+    is recorded in `result.json`, which is the reason mutation M10 exists.
+    """
+    chunks = []
+    try:
+        while True:
+            chunk = os.read(order_fd, _READ_CHUNK)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except OSError:
+        return 2
+    finally:
+        _close(order_fd)
+    try:
+        order = json.loads(b"".join(chunks).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return 2
+    if not isinstance(order, dict):
+        return 2
+    knob = os.environ.get(GUARDIAN_ENV, "")
+    if knob == GUARDIAN_SILENT:
+        # §10.9: a guardian that dies before reporting ready. No child has been started, so the
+        # proxy's handshake times out and the run fails closed with nothing spawned.
+        return 3
+    try:
+        return Guardian(order).run(knob=knob)
+    except (KeyError, TypeError, ValueError) as exc:
+        print(f"mcp-proxy guardian: malformed launch order: {exc!r}", file=sys.stderr)
+        return 2
 
 
 class Instance:
@@ -369,10 +675,18 @@ class Instance:
         self.fired: list[str] = []
         self.state = proxy.ProtocolState()
         self.inflight = proxy.InFlight()
-        self.child: subprocess.Popen | None = None
+        # The child is the GUARDIAN's process, not this one's: what the proxy holds of it is two
+        # descriptors and two numbers, and everything else about it is asked for by order.
+        self.child_pid: int | None = None
         self.child_pgid: int | None = None
+        self.child_in: int | None = None       # write end of the child's stdin
+        self.child_out: int | None = None      # read end of the child's stdout
         self.guardian: subprocess.Popen | None = None
-        self._lifeline: int | None = None      # the guardian's; the proxy only ever closes it
+        self.guardian_pid: int | None = None   # as the GUARDIAN reported it, then cross-checked
+        self._lifeline: int | None = None      # orders out; its EOF is what fires the guardian
+        self._report: int | None = None        # reports in; its EOF is the guardian's death
+        self._report_buf = b""
+        self._release_report: dict | None = None
         self.child_status: int | None = None
         self._buffers = {proxy.C2S: b"", proxy.S2C: b""}
         self._client_eof = False
@@ -484,118 +798,222 @@ class Instance:
         return self._finish()
 
     def _spawn(self) -> bool:
-        """§10.5 step 0. A failure here is an ordinary ending with a record like any other."""
+        """§10.5 step 0 — establish the guardian, which is what starts the server.
+
+        THE ORDER IS THE WHOLE OF IT. The credential-bearing child is the guardian's own child,
+        so containment cannot be late, cannot be absent, and cannot be a best effort: a guardian
+        that will not start means no server starts, which is `spawn_failed` — an ordinary
+        anomalous ending with a record like any other, because the instance boundary sits before
+        the spawn attempt (§10.5). Both halves of "the guardian must be ready before the server
+        can receive credentials, and inability to establish it must fail closed" are then
+        properties of the structure rather than of the care taken at one call site.
+        """
+        ready = self._establish_guardian()
+        if ready is None:
+            self._trigger(audit.SPAWN_FAILED)
+            return False
+        self.guardian_pid = ready["guardian_pid"]
+        self.child_pid, self.child_pgid = ready["child_pid"], ready["child_pgid"]
+        # Facts the start record cannot hold, since it precedes the spawn. They are what lets
+        # §10.9's teardown case check the proxy's account of the group against the group a
+        # surviving process reports for itself, rather than discovering processes from outside
+        # and deciding for itself which belonged to the run. `guardian_pid` is REQUIRED, and its
+        # presence is what the reader takes as the readiness evidence: it was reported by the
+        # guardian about itself and cross-checked below, so it cannot be written by a proxy that
+        # never got one (review, PR #103).
+        self.sink.write(audit.LINE_SPAWN, child_pid=self.child_pid,
+                        child_pgid=self.child_pgid, guardian_pid=self.guardian_pid)
+        return True
+
+    def _establish_guardian(self) -> dict | None:
+        """Start the guardian, hand it the launch order, and WAIT for it to report ready.
+
+        NOTHING ABOUT THE CHILD EXISTS UNTIL THIS RETURNS. The report is a handshake rather than
+        a return value: `Popen` succeeding says a fork happened, and what has to be established
+        is that our code ran in that process and got as far as starting the server. So the
+        guardian reports its OWN pid and the proxy checks it against the one it spawned — a
+        readiness fact with a witness, instead of an inference from a call that returned.
+        """
         env = dict(os.environ)
         env.update(self.cfg.env)
         # The proxy's own control vars are not the child's business, and one of them names
         # descriptors the child is about to be handed by inheritance rather than by name.
-        for key in (FAULT_ENV, INHERIT_ENV, GRACE_ENV):
+        for key in (FAULT_ENV, INHERIT_ENV, GRACE_ENV, GUARDIAN_ENV):
             env.pop(key, None)
         inherit = _inherit_fds()
-        try:
-            self.child = subprocess.Popen(          # noqa: S603 — the declared server (§10.3)
-                [self.cfg.command, *self.cfg.args],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                env=env, cwd=self.cfg.cwd, close_fds=True, pass_fds=inherit,
-                # ITS OWN PROCESS GROUP, and this is a launch decision that exists only to make
-                # step 4 possible: a stdio server may spawn helpers, they inherit the
-                # interpolated environment, and a surviving grandchild is a live credential the
-                # run no longer accounts for. Terminating the child alone would leave it.
-                start_new_session=True)
-        except OSError as exc:
-            print(f"mcp-proxy: cannot start {self.cfg.command!r}: {exc}", file=sys.stderr)
-            self._trigger(audit.SPAWN_FAILED)
-            return False
-        finally:
-            # The driver's writers, closed the moment they have been handed on. Holding one
-            # would mean its EOF could never arrive, and §10.9's positive case would hang
-            # rather than pass — the proxy is on the inheritance path of both channels.
-            for fd in inherit:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-        try:
-            self.child_pgid = os.getpgid(self.child.pid)
-        except OSError:
-            # The child is gone already. Not a spawn failure — it started — so this is the
-            # `child_exit` ending, reached before the first byte rather than mid-request.
-            self.child_pgid = self.child.pid
-            self._trigger(audit.CHILD_EXIT)
-            self.sink.write(audit.LINE_SPAWN, child_pid=self.child.pid,
-                            child_pgid=self.child_pgid)
-            return False
-        self._start_guardian()
-        # Facts the start record cannot hold, since it precedes the spawn. They are what lets
-        # §10.9's teardown case check the proxy's account of the group against the group a
-        # surviving process reports for itself, rather than discovering processes from outside
-        # and deciding for itself which belonged to the run.
-        spawned = {"child_pid": self.child.pid, "child_pgid": self.child_pgid}
-        if self.guardian is not None:
-            spawned["guardian_pid"] = self.guardian.pid
-        self.sink.write(audit.LINE_SPAWN, **spawned)
-        return True
-
-    def _start_guardian(self) -> None:
-        """The lifeline, and the process that watches it. Best effort by design.
-
-        A guardian that will not start is not a reason to refuse the run: the proxy's own
-        teardown is the primary mechanism and this is the backstop for the case where the proxy
-        never reaches it. It is recorded in the spawn record either way, so a run without one is
-        visible rather than assumed.
-        """
-        reader, writer = os.pipe()
+        child_in_r, child_in_w = os.pipe()
+        child_out_r, child_out_w = os.pipe()
+        lifeline_r, lifeline_w = os.pipe()
+        report_r, report_w = os.pipe()
+        order_r, order_w = os.pipe()
+        handed = (child_in_r, child_out_w, lifeline_r, report_w, order_r)
+        ours = (child_in_w, child_out_r, lifeline_w, report_r, order_w)
+        # §10.9's `missing`: a program that is not there, so this is a real `OSError` out of the
+        # real call rather than an exception a test asked the code to raise.
+        program = (os.path.join(os.path.dirname(sys.executable), "no-such-interpreter")
+                   if os.environ.get(GUARDIAN_ENV) == GUARDIAN_MISSING else sys.executable)
         try:
             self.guardian = subprocess.Popen(   # noqa: S603 — this module, by absolute path
-                [sys.executable, os.path.abspath(__file__), GUARDIAN_FLAG,
-                 str(self.child_pgid), str(reader)],
+                [program, os.path.abspath(__file__), GUARDIAN_FLAG, str(order_r)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, close_fds=True, pass_fds=(reader,),
+                close_fds=True, pass_fds=handed + inherit,
                 # ITS OWN SESSION, so a group signal aimed at the proxy — which is what half the
                 # fleet sends (C3-1) — does not take out the thing whose whole job is to outlive
-                # the proxy's death.
+                # the proxy's death. Its stderr is the proxy's, inherited and passed on to the
+                # child, so a server's diagnostics still land where they did before.
                 start_new_session=True)
         except OSError as exc:
-            print(f"mcp-proxy: no guardian: {exc}", file=sys.stderr)
-            os.close(writer)
+            print(f"mcp-proxy: no guardian, so no server: {exc}", file=sys.stderr)
             self.guardian = None
-        else:
-            self._lifeline = writer
-        os.close(reader)
+            # OUR ends only. The `finally` below closes the handed ones on every path, and
+            # closing a descriptor twice is not free: between the two closes the number can have
+            # been handed to something else, and the second close would take that with it.
+            for fd in ours:
+                _close(fd)
+            return None
+        finally:
+            # Every descriptor the guardian now owns, and the driver's writers with them. Each
+            # channel has a SOLE writer one level down, which is what makes an observation about
+            # a channel an observation about a process rather than about the inheritance path.
+            for fd in handed + inherit:
+                _close(fd)
+        self.child_in, self.child_out = child_in_w, child_out_r
+        self._lifeline, self._report = lifeline_w, report_r
+        launch = {"command": self.cfg.command, "args": list(self.cfg.args), "env": env,
+                  "cwd": self.cfg.cwd, "inherit": list(inherit), "stdin_fd": child_in_r,
+                  "stdout_fd": child_out_w, "lifeline_fd": lifeline_r, "report_fd": report_w,
+                  "grace": self.grace}
+        try:
+            _write_all(order_w, json.dumps(launch).encode("utf-8"))
+        except OSError as exc:
+            print(f"mcp-proxy: cannot brief the guardian: {exc}", file=sys.stderr)
+            _close(order_w)
+            return None
+        _close(order_w)
 
-    def _stand_down_guardian(self) -> None:
-        """One byte, written immediately before the terminator. See `run_guardian`."""
-        if self._lifeline is None:
-            return
+        ready = self._read_report(time.monotonic() + self.grace)
+        if ready is None or "error" in ready:
+            print(f"mcp-proxy: the guardian did not start the server: "
+                  f"{(ready or {}).get('error', 'no ready report')}", file=sys.stderr)
+            return None
+        # `is_json_int` rather than `isinstance(..., int)`, because `True` passes the latter —
+        # the reader's own predicate, imported so the writer cannot check something narrower
+        # than what the log is checked against.
+        if (ready.get("guardian_pid") != self.guardian.pid
+                or not audit.is_json_int(ready.get("child_pid"))
+                or not audit.is_json_int(ready.get("child_pgid"))):
+            print(f"mcp-proxy: unusable ready report {ready!r}", file=sys.stderr)
+            return None
+        return ready
+
+    def _read_report(self, deadline: float) -> dict | None:
+        """One report line, or None — which is the guardian having died or gone quiet.
+
+        A report that never comes is NOT distinguished here from one that arrives malformed:
+        both mean the proxy has no account of what happened to the group, and every caller
+        records the same typed failure for the step it was asking about.
+        """
+        while b"\n" not in self._report_buf:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or self._report is None:
+                return None
+            if not _readable(self._report, remaining):
+                return None
+            try:
+                chunk = os.read(self._report, _READ_CHUNK)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                return None              # EOF: the guardian is gone
+            self._report_buf += chunk
+        line, self._report_buf = self._report_buf.split(b"\n", 1)
         try:
-            _write_all(self._lifeline, GUARDIAN_STAND_DOWN)
-        except OSError:
-            pass                         # the guardian is already gone; nothing to stand down
+            found = json.loads(line)
+        except ValueError:
+            return None
+        return found if isinstance(found, dict) else None
+
+    def _ask(self, order: bytes) -> dict | None:
+        """One order down the lifeline, one report back. None if the guardian did not answer."""
+        if self._lifeline is None or self.guardian is None:
+            return None
         try:
-            os.close(self._lifeline)
+            _write_all(self._lifeline, order)
         except OSError:
-            pass
+            return None                  # the guardian is gone; the caller records the failure
+        return self._read_report(time.monotonic() + self.grace)
+
+    def _guardian_lost(self) -> bool:
+        """Whether the guardian is gone — which is what ends the proxy's licence to be sure."""
+        return self.guardian is None or self.guardian.poll() is not None
+
+    def _release_guardian(self) -> None:
+        """Close the lifeline, having first told the guardian if it is to do NOTHING.
+
+        THE STAND-DOWN IS THE EXCEPTION AND THE DEFAULT IS CLEANUP. It is sent only when a fault
+        point actually fired on one of the two facts whose suppression leaves the group alive on
+        purpose (§10.9's retention control) — and firing implies arming, which is anomalous on
+        its own, so no run that could have passed ever sends one. Every other ending, including
+        a teardown that ran and failed, leaves the guardian to find the EOF and terminate the
+        group: the audit record already holds the evidence of the failure, and cleaning up after
+        it does not erase that (review, PR #103).
+        """
+        retained = [f for f in (audit.GROUP_TERMINATED, audit.CHILD_REAPED) if f in self.fired]
+        if retained and self._lifeline is not None:
+            print(f"mcp-proxy: standing the guardian down; {', '.join(retained)} suppressed",
+                  file=sys.stderr)
+            try:
+                _write_all(self._lifeline, ORDER_STAND_DOWN)
+            except OSError:
+                pass                     # already gone, and it acts on nothing when it is
+        _close(self._lifeline)
         self._lifeline = None
 
     # -- the pumps --------------------------------------------------------------------------
 
     def _pump(self, wake_r: int) -> None:
-        """Both directions and the signal channel, until something latches a trigger."""
+        """Both directions, the signal channel and the guardian, until a trigger latches.
+
+        THE GUARDIAN IS WATCHED FROM HERE, and that is not symmetry for its own sake. It is the
+        child's parent, so a guardian that dies mid-run leaves a live credential-bearing server
+        with no process holding its identity — the reap will not be ours to make and the group's
+        pin is gone. That is a terminal condition rather than a degraded mode: the report pipe
+        reaching EOF latches `guardian_lost`, forwarding stops, and the teardown falls back to
+        the weaker identity check `group_identity` describes.
+        """
         sel = selectors.DefaultSelector()
         try:
             sel.register(CLIENT_IN, selectors.EVENT_READ, proxy.C2S)
-            sel.register(self.child.stdout.fileno(), selectors.EVENT_READ, proxy.S2C)
+            sel.register(self.child_out, selectors.EVENT_READ, proxy.S2C)
             sel.register(wake_r, selectors.EVENT_READ, "signal")
+            sel.register(self._report, selectors.EVENT_READ, "guardian")
             while not self.triggers:
                 for key, _events in sel.select():
                     if key.data == "signal":
                         self._on_signal(wake_r)
+                    elif key.data == "guardian":
+                        self._on_guardian(sel)
                     else:
                         self._on_readable(key.data, sel)
                     if self.triggers:
                         break
         finally:
             sel.close()
+
+    def _on_guardian(self, sel: selectors.BaseSelector) -> None:
+        """The guardian says nothing unprompted, so anything here is its death or a bug."""
+        try:
+            chunk = os.read(self._report, _READ_CHUNK)
+        except OSError:
+            chunk = b""
+        if chunk:
+            # Unsolicited, which no order-and-report exchange produces. Keep it for whichever
+            # step asks next rather than discarding a line the teardown is about to need.
+            self._report_buf += chunk
+            return
+        sel.unregister(self._report)
+        print("mcp-proxy: the guardian is gone; the child has no pin", file=sys.stderr)
+        self._trigger(audit.GUARDIAN_LOST)
 
     def _on_signal(self, wake_r: int) -> None:
         """`set_wakeup_fd` writes the signal NUMBER, so the trigger says which arrived."""
@@ -607,7 +1025,7 @@ class Instance:
             self._trigger(audit.SIGNAL_INT if number == signal.SIGINT else audit.SIGNAL_TERM)
 
     def _on_readable(self, direction: str, sel: selectors.BaseSelector) -> None:
-        source = CLIENT_IN if direction == proxy.C2S else self.child.stdout.fileno()
+        source = CLIENT_IN if direction == proxy.C2S else self.child_out
         try:
             chunk = os.read(source, _READ_CHUNK)
         except OSError as exc:
@@ -737,8 +1155,13 @@ class Instance:
         to_client = (direction == proxy.S2C) != back
         payload = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
         try:
-            _write_all(CLIENT_OUT if to_client else self.child.stdin.fileno(),
-                       payload)
+            target = CLIENT_OUT if to_client else self.child_in
+            if target is None:
+                # Step 2a has already closed it, and the NUMBER is not kept: an fd the kernel
+                # has since handed to something else would take this line silently. A write to a
+                # descriptor that is gone is a write failure like any other.
+                raise BrokenPipeError("the child's stdin is closed")
+            _write_all(target, payload)
         except OSError as exc:
             if shutting_down:
                 # C3-1 measured this against agy: the client closes stdin and stops reading at
@@ -771,23 +1194,33 @@ class Instance:
         that reading: step 4 delivers `SIGKILL` to the group unconditionally, which is a kernel
         guarantee about every live member rather than an inference about one, and step 5's
         bounded reap is what reports a child that outlived even that.
+
+        WHO ACTUALLY DOES STEPS 4 AND 5 IS THE GUARDIAN, on order. It is the child's parent, so
+        it is the only process here that holds the pin the paragraph above is about — the proxy
+        asking the kernel to signal a number it merely remembers is the thing that has no such
+        guarantee (review, PR #103). What the proxy keeps is the sequence, the bounds and the
+        record; what it delegates is every real signal, plus the reap that ends the pin.
         """
         self._step(audit.INTAKE_CLOSED, self._close_intake)                  # step 1
-        if self.child is None:
+        if self.child_pid is None:
             # `spawn_failed`: there is no child, so four facts are legitimately inapplicable —
             # the one shape a lazily written validator rejects along with the malformed ones.
             for fact in audit.FACTS[1:]:
                 self._not_applicable(fact)
+            self._release_guardian()
             return
         self._step(audit.CHILD_STDIN_CLOSED, self._close_child_stdin)        # step 2a
         self._step(audit.DRAIN_ENDED, self._drain)                           # steps 2b and 3
         delivered = self._step(audit.GROUP_TERMINATED, self._terminate_group)   # step 4
         self._step(audit.CHILD_REAPED, self._reap_child)                        # step 5
-        # Step 4's fact is settled here, once the reap has removed the one member this proxy
+        # Step 4's fact is settled here, once the reap has removed the one member the guardian
         # was deliberately keeping alive. `delivered` is false when the fault point claimed the
         # step or when delivery itself errored, and in both cases the fact is already written.
         if delivered and audit.GROUP_TERMINATED not in self.facts:
             self._guard(audit.GROUP_TERMINATED, self._confirm_group_gone)
+        # LAST, and outside every step: the guardian is released once the record of what the
+        # teardown managed is complete, so nothing above can be reordered ahead of it.
+        self._release_guardian()
 
     def _step(self, fact: str, run) -> bool:
         """One step, skipped if the fault point claims it and guarded either way."""
@@ -821,10 +1254,8 @@ class Instance:
 
     def _close_child_stdin(self) -> None:
         """Step 2 — the portable graceful signal (§10.2)."""
-        try:
-            self.child.stdin.close()
-        except OSError:
-            pass                     # already gone; the promise the fact makes is still kept
+        _close(self.child_in)
+        self.child_in = None
         self._done(audit.CHILD_STDIN_CLOSED)
 
     def _drain(self) -> None:
@@ -857,8 +1288,8 @@ class Instance:
             # arming rather than on the fixture's manners is the point: "a proxy that skipped
             # step 4 would pass on the helper's good manners" is the failure mode being avoided.
             raise TimeoutError("step 3 is suppressed, and the child has not finished")
-        for escalation in (signal.SIGTERM, signal.SIGKILL):
-            self._signal_group(escalation)
+        for order, escalation in ((ORDER_TERM, signal.SIGTERM), (ORDER_KILL, signal.SIGKILL)):
+            self._deliver(order, escalation)
             if escalation == signal.SIGKILL:
                 # The spec makes forced termination the standard escalation and only SHOULDs a
                 # prompt exit, so this is worth recording and not worth failing on. The
@@ -877,7 +1308,7 @@ class Instance:
             return True
         sel = selectors.DefaultSelector()
         try:
-            sel.register(self.child.stdout.fileno(), selectors.EVENT_READ)
+            sel.register(self.child_out, selectors.EVENT_READ)
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -885,7 +1316,7 @@ class Instance:
                 if not sel.select(min(remaining, 0.05)):
                     continue
                 try:
-                    chunk = os.read(self.child.stdout.fileno(), _READ_CHUNK)
+                    chunk = os.read(self.child_out, _READ_CHUNK)
                 except OSError as exc:
                     # Same argument as `read_failed`, and the one §4 has already caught in the
                     # wild: a swallowed `OSError` that presents as a clean end of stream.
@@ -900,6 +1331,47 @@ class Instance:
         finally:
             sel.close()
 
+    def _deliver(self, order: bytes, sig: int) -> str | None:
+        """One signal to the child's group. An error string, or None if nothing went wrong.
+
+        TWO ROUTES AND ONE RULE: a real signal is sent only by a process that can show the group
+        id has not been recycled. Normally that is the guardian, which holds the child unreaped
+        and therefore holds the id itself; this method just carries the order and the answer.
+        The fallback exists for the one ending where the pin holder has died mid-run — see
+        `group_identity`, which is a weaker claim and is documented as one.
+
+        THE ERRNO IS NOT THE EVIDENCE, on either route. `EPERM` was once read as success on the
+        strength of a measurement — macOS returns it for a group whose members are all zombies,
+        where Linux returns 0 — but that establishes ONE cause of `EPERM`, not an equivalence.
+        `kill(2)` defines it as the inability to signal group members, which a sandbox
+        restriction or a differently credentialed descendant also produces, and either would
+        leave a live member while the branch certified success (review, PR #103). So neither
+        `EPERM` nor `ESRCH` decides anything: emptiness is checked positively, by a probe.
+        """
+        if not self._guardian_lost():
+            report = self._ask(order)
+            if report is not None:
+                return None if report.get("signalled") else str(report.get("error"))
+            # NO ANSWER FALLS THROUGH to the fallback rather than returning an error. The
+            # guardian has died between the check above and now — a race that check cannot
+            # close, since `poll()` is a question about a moment — and reporting a failure the
+            # proxy could still act on would leave a live group for the sake of a tidier record.
+        if _is_own_group(self.child_pgid):
+            return f"group {self.child_pgid} is the proxy's own, not the child's"
+        identity = group_identity(self.child_pid, self.child_pgid)
+        if identity == GROUP_GONE:
+            return None                  # nothing to signal is the goal, not a failure
+        if identity != GROUP_SAME:
+            return (f"the guardian is gone and process {self.child_pid} can no longer be shown "
+                    f"to be in group {self.child_pgid}")
+        try:
+            os.killpg(self.child_pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            return None
+        except OSError as exc:
+            return str(exc)
+        return None
+
     def _terminate_group(self) -> None:
         """Step 4 — the GROUP, not just the child, and while the child is still unreaped.
 
@@ -907,103 +1379,77 @@ class Instance:
         surviving grandchild is a live credential the run no longer accounts for.
 
         DELIVERY HAPPENS HERE; THE VERDICT IS SETTLED AFTER THE REAP. Signalling while the child
-        is an unreaped zombie is what makes the pgid provably still ours — a zombie is a member,
-        so the group cannot be recycled out from under it — but it is also what makes the group
-        impossible to observe as empty, since our own zombie is in it. So this step delivers
-        `SIGTERM` then `SIGKILL` and records only errors it can attribute; `_confirm_group_gone`
-        runs after step 5 and is what actually decides the fact.
-
-        THE ERRNO IS NOT THE EVIDENCE, and an earlier version of this made it so. `EPERM` was
-        read as success on the strength of a measurement — macOS returns it for a group whose
-        members are all zombies, where Linux returns 0 — but that establishes ONE cause of
-        `EPERM`, not an equivalence. `kill(2)` defines it as the inability to signal group
-        members, which a sandbox restriction or a differently credentialed descendant also
-        produces, and either would have left a live member while this branch certified success
-        (review, PR #103). Neither `EPERM` nor `ESRCH` decides anything now: they are recorded
-        as attempted, and emptiness is checked positively below.
+        is unreaped is what makes the pgid provably still ours — an unreaped member holds the id
+        against reuse — but it is also what makes the group impossible to observe as empty,
+        since that member is in it. So this step delivers `SIGTERM` then `SIGKILL` and records
+        only errors it can attribute; `_confirm_group_gone` runs after step 5 and decides.
         """
-        if self.child_pgid == os.getpgid(0):
-            # `start_new_session=True` did not take effect, so this group is the proxy's own and
-            # signalling it would reach the proxy, whatever spawned it, and every sibling in the
-            # session. A cleanup must not reach further than what it created (§4), so it
-            # refuses rather than guessing.
-            print(f"mcp-proxy: refusing to signal group {self.child_pgid}, which is not the "
-                  f"child's own", file=sys.stderr)
-            self._outcome(audit.SHUTDOWN_GROUP_KILL_FAILED)
-            self._failed(audit.GROUP_TERMINATED, audit.SHUTDOWN_GROUP_KILL_FAILED)
-            return
-        for escalation in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.killpg(self.child_pgid, escalation)
-            except ProcessLookupError:
-                break                    # ESRCH: nothing left to signal; confirm it below
-            except PermissionError:
-                break                    # EPERM: nothing this process could signal — likewise
-            except OSError as exc:
-                print(f"mcp-proxy: group kill failed: {exc}", file=sys.stderr)
+        for order, escalation in ((ORDER_TERM, signal.SIGTERM), (ORDER_KILL, signal.SIGKILL)):
+            error = self._deliver(order, escalation)
+            if error is not None:
+                print(f"mcp-proxy: group kill failed: {error}", file=sys.stderr)
                 self._outcome(audit.SHUTDOWN_GROUP_KILL_FAILED)
                 self._failed(audit.GROUP_TERMINATED, audit.SHUTDOWN_GROUP_KILL_FAILED)
                 return
             if escalation == signal.SIGTERM:
                 time.sleep(min(self.grace, 0.2))
 
-    def _confirm_group_gone(self) -> None:
-        """The positive half of step 4, run AFTER step 5's reap. `ESRCH` is the whole finding.
-
-        Once our zombie has been reaped the group is empty if and only if it no longer exists,
-        so `killpg(pgid, 0)` answering `ESRCH` is direct evidence rather than an inference from
-        an errno that has more than one cause. Anything else — a delivery that succeeded, or an
-        `EPERM` saying the members present could not be signalled — means something is still in
-        the group, and the bounded retry is for the one benign case: a helper that has died and
-        is briefly a zombie of its own until init reaps it.
-
-        The probe sends NO SIGNAL, which is what makes the residual pid-reuse window safe rather
-        than merely unlikely. Between the reap and this call the pgid could in principle name a
-        recycled group; because signal 0 delivers nothing, the worst outcome is a false
-        `shutdown_group_kill_failed` — a failed cell rather than a signal to a stranger.
-        """
-        deadline = time.monotonic() + self.grace
-        while True:
-            try:
-                os.killpg(self.child_pgid, 0)
-            except ProcessLookupError:
-                self._done(audit.GROUP_TERMINATED)
-                return
-            except OSError:
-                pass                     # present but unsignallable; still present
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(0.02)
-        print(f"mcp-proxy: process group {self.child_pgid} still exists after SIGKILL",
-              file=sys.stderr)
-        self._outcome(audit.SHUTDOWN_GROUP_KILL_FAILED)
-        self._failed(audit.GROUP_TERMINATED, audit.SHUTDOWN_GROUP_KILL_FAILED)
-
-    def _signal_group(self, sig: int) -> None:
-        try:
-            os.killpg(self.child_pgid, sig)
-        except OSError:
-            pass                     # step 4 is where a failing group signal is reported
-
     def _reap_child(self) -> None:
-        """Step 5 — reap, and record the exit status alongside the fact.
+        """Step 5 — the guardian reaps, releases the pin, and reports; this records what it said.
 
-        The status is DATA and deliberately not a verdict input: MCP specifies no exit code for
-        a server that saw its stdin close, so failing on a non-zero one would fail conforming
-        servers. What the terminator promises is that the child was reaped, not that it was
-        happy about it — and a status is something only a reaper can hold, so recording one
-        without having reaped would be a lie rather than an omission.
+        THE REAPER IS THE GUARDIAN, so `child_status` is the guardian's statement rather than
+        this process's. The rule it was written for survives the move — only a process that
+        reaped a child can hold its exit status, so a `done` without one claims a reap while
+        lacking the one piece of evidence a reaper necessarily has — because the proxy has
+        nowhere else to obtain a status either, and the fact and the number arrive together in
+        the same report or not at all.
+
+        THE ORDER IS ALSO WHAT MAKES THE SWEEP HAPPEN. `Guardian.release` terminates the group
+        before it reaps, unconditionally, because reaping is what ends its licence to signal —
+        so the one ordering the proxy must never get wrong is asking for the reap before it has
+        finished with the group, and it cannot: there is nothing left it could ask for after.
         """
-        try:
-            self.child.wait(timeout=self.grace)
-        except subprocess.TimeoutExpired:
-            # Unreapable even after a group-wide `SIGKILL`. The terminator's central promise is
-            # exactly this, so it cannot be the part that is allowed to fail quietly.
+        self._release_report = report = self._ask(ORDER_RELEASE)
+        if report is None or not report.get("reaped"):
+            # Unreapable even after a group-wide `SIGKILL`, or nobody left to do the reaping.
+            # The terminator's central promise is exactly this, so it cannot be the part that is
+            # allowed to fail quietly.
+            print(f"mcp-proxy: the child was not reaped: "
+                  f"{(report or {}).get('error', 'the guardian did not answer')}",
+                  file=sys.stderr)
             self._outcome(audit.SHUTDOWN_REAP_FAILED)
             self._failed(audit.CHILD_REAPED, audit.SHUTDOWN_REAP_FAILED)
             return
         self._done(audit.CHILD_REAPED)
-        self.child_status = self.child.returncode
+        status = report.get("status")
+        # The status is DATA and deliberately not a verdict input: MCP specifies no exit code
+        # for a server that saw its stdin close, so failing on a non-zero one would fail
+        # conforming servers. A non-integer is dropped rather than written, since the reader
+        # requires an integer beside a `done` and a record it rejects says less than one that
+        # says the reap failed.
+        if audit.is_json_int(status):
+            self.child_status = status
+
+    def _confirm_group_gone(self) -> None:
+        """The positive half of step 4, settled AFTER step 5's reap. Emptiness is the finding.
+
+        Once the pinning member has been reaped the group is empty if and only if it no longer
+        exists, and the guardian answers that in the same breath as the reap — the tightest
+        window available, since it is the process the reap happened in. `probe_group_empty` is
+        what it uses and what this falls back to when there is no report to read, which is the
+        `guardian_lost` ending: a probe that sends nothing is the one group operation that
+        stays sound without a pin.
+        """
+        report = self._release_report
+        empty = (report.get("group") == GROUP_GONE if report is not None
+                 else probe_group_empty(self.child_pgid, self.grace))
+        if empty:
+            self._done(audit.GROUP_TERMINATED)
+            return
+        print(f"mcp-proxy: process group {self.child_pgid} still exists after SIGKILL",
+              file=sys.stderr)
+        self._outcome(audit.SHUTDOWN_GROUP_KILL_FAILED)
+        self._failed(audit.GROUP_TERMINATED, audit.SHUTDOWN_GROUP_KILL_FAILED)
 
     # -- step 6 -----------------------------------------------------------------------------
 
@@ -1016,11 +1462,6 @@ class Instance:
         that a claim and the thing it claims about must not have the same author applies here
         first. `verify_post_run` re-reads the file.
         """
-        # BEFORE the terminator, so the two facts stay in the order they describe: the teardown
-        # ran, and only then is the guardian told it has nothing to do. A proxy that dies
-        # between these two points leaves no terminator AND no stand-down, which is exactly the
-        # pair the absence rule and the guardian are each meant to catch.
-        self._stand_down_guardian()
         terminator = {
             "observed": list(self.state.observed),
             "triggers": self.triggers,
@@ -1046,11 +1487,10 @@ class Instance:
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if args[:1] == [GUARDIAN_FLAG]:
-        if len(args) != 3 or not all(a.lstrip("-").isdigit() for a in args[1:]):
-            print(f"usage: mcp_proxy_io.py {GUARDIAN_FLAG} <pgid> <lifeline-fd>",
-                  file=sys.stderr)
+        if len(args) != 2 or not args[1].isdigit():
+            print(f"usage: mcp_proxy_io.py {GUARDIAN_FLAG} <launch-order-fd>", file=sys.stderr)
             return 2
-        return run_guardian(int(args[1]), int(args[2]))
+        return run_guardian(int(args[1]))
     if len(args) != 1:
         print("usage: mcp_proxy_io.py <config.json>", file=sys.stderr)
         return 2

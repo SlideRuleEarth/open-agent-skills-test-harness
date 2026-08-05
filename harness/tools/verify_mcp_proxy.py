@@ -25,6 +25,12 @@ WHAT IT DRIVES, and each group is a clause of §10.9:
      whose step 4 is a no-op.
   6. The fault point itself: armed and wired to suppress nothing must STILL fail the instance,
      because otherwise a hook that silently never fires produces a passing run.
+  7. The guardian: that it is MANDATORY — every way of breaking it before the child exists ends
+     with no server having run, against a positive control saying this wiring does start one
+     when the guardian works — that losing it mid-run is terminal, and that a teardown which ran
+     and FAILED still gets its survivors swept, which is the ending an earlier version stood the
+     guardian down for.
+  8. Totality over both enumerations, LAST, because that is what it quantifies over.
 
 WHAT IT DELIBERATELY DOES NOT DRIVE. The structural validator is pinned on synthetic RECORDS,
 not on runs, and those live in the selftest (`audit.*` and `audit_log.*` arms) where a mutation
@@ -80,6 +86,9 @@ driven_triggers: set[str] = set()
 driven_outcomes: set[str] = set()
 
 
+reaped_groups: set[int] = set()
+
+
 def reap_group(record, nonce) -> None:
     """Kill a group a case deliberately left alive, from the identity IT reported.
 
@@ -88,15 +97,30 @@ def reap_group(record, nonce) -> None:
     deciding for itself which processes belonged to the run, which is how a cleanup ends up
     reaching further than what it created (§4). It also refuses its own group and its parent's.
 
-    Called from `finally` on EVERY path, because the exact failure or mutation a case is
-    testing is the one most likely to skip a cleanup written inline — and a test for leaked
-    credential-bearing processes that leaks one has picked the wrong side of its own point.
+    AN ANNOUNCEMENT IS A PAST FACT, so it is re-anchored before it is acted on. By the time this
+    runs the proxy and its guardian are gone, and nothing holds the pgid against reuse — a bare
+    `killpg` on the recorded number can reach a group the kernel has since handed to somebody
+    else (review, PR #103). `group_identity` is imported from the program rather than restated
+    here so the driver's rule cannot drift from the one the proxy applies, and the announced PID
+    is what carries the weight: the helper's pgid is not its own pid, so "that process is still
+    in that group" is a real identity rather than "some group leader has this number".
+
+    IDEMPOTENT, because a case that leaves survivors reports two announcements for one group and
+    the cleanup runs from `finally` on every path — and it is called from `finally` on every
+    path because the exact failure or mutation a case is testing is the one most likely to skip
+    a cleanup written inline. A test for leaked credential-bearing processes that leaks one has
+    picked the wrong side of its own point.
     """
     if not isinstance(record, dict) or record.get("nonce") != nonce:
         return
-    pgid = record.get("pgid")
-    if not isinstance(pgid, int) or pgid in (os.getpgid(0), os.getpgid(os.getppid())):
+    pid, pgid = record.get("pid"), record.get("pgid")
+    if not isinstance(pid, int) or not isinstance(pgid, int):
         return
+    if pgid in (os.getpgid(0), os.getpgid(os.getppid())) or pgid in reaped_groups:
+        return
+    if IO.group_identity(pid, pgid) != IO.GROUP_SAME:
+        return                       # gone, or no longer showable as ours: never signal a guess
+    reaped_groups.add(pgid)
     try:
         os.killpg(pgid, signal.SIGKILL)
     except OSError:
@@ -244,8 +268,8 @@ class Result:
                 f" stderr={self.stderr.strip()[-200:]!r}")
 
 
-def run(*, command=None, args=None, tools=("echo",), env=None, fault=None, send=(),
-        signal_after=None, kill_after=None, close_stdout=False, stdin_fd=None,
+def run(*, command=None, args=None, tools=("echo",), env=None, fault=None, guardian=None,
+        send=(), signal_after=None, kill_after=None, close_stdout=False, stdin_fd=None,
         channels=(), server="echo", settle=0.3, grace=GRACE, warmup=0.0, reply_per_send=True,
         after_send=None):
     """One proxy instance, driven to completion, with its audit log read back.
@@ -267,8 +291,11 @@ def run(*, command=None, args=None, tools=("echo",), env=None, fault=None, send=
         child_env = dict(os.environ)
         child_env[IO.GRACE_ENV] = str(grace)
         child_env.pop(IO.FAULT_ENV, None)
+        child_env.pop(IO.GUARDIAN_ENV, None)
         if fault is not None:
             child_env[IO.FAULT_ENV] = fault
+        if guardian is not None:
+            child_env[IO.GUARDIAN_ENV] = guardian
         writers = [c.writer for c in channels]
         if writers:
             child_env[IO.INHERIT_ENV] = ",".join(str(w) for w in writers)
@@ -568,31 +595,31 @@ check(f"{A.CHILD_WRITE_FAILED}: the server stopped reading and what we sent did 
 def read_failed_case():
     """A read error on the client's stdin that is NOT an end of stream.
 
-    A LOOPBACK SOCKET RESET, because the obvious candidates do not work. A directory descriptor
-    makes CPython refuse to start at all (`<stdin> is a directory, cannot continue`), so the
-    proxy never reaches its own boundary; a pty whose master is closed reads as plain EOF on
-    macOS, which is the very thing this case has to be distinguishable from. `SO_LINGER {1, 0}`
-    turns the driver's close into an RST, and the proxy's next read gets `ECONNRESET`.
+    THE WRITE END OF A PIPE, HANDED OVER AS STDIN, so the proxy's first `os.read(0, ...)` gets
+    `EBADF`. The obvious candidates do not work: a directory descriptor makes CPython refuse to
+    start at all (`<stdin> is a directory, cannot continue`), so the proxy never reaches its own
+    boundary, and a pty whose master is closed reads as plain EOF on macOS — the very thing this
+    case has to be distinguishable from.
 
-    The distinction is the whole case: an instrument failure must never wear the clean-shutdown
-    label, and a swallowed `OSError` presenting as a quiet end of stream is the defect §4 has
-    already caught in the wild.
+    IT USED TO BE A LOOPBACK SOCKET RESET, and that worked everywhere except where it mattered:
+    `bind()` gets `EPERM` under a sandbox that denies networking, so a reviewer could not run
+    this file at all (review, PR #103). A wrong-mode descriptor needs no network, no privileges
+    and no timing — the error is on the first read rather than after a close the case has to
+    schedule — and it exercises the same branch, which is the point of the case rather than the
+    errno: an instrument failure must never wear the clean-shutdown label, and a swallowed
+    `OSError` presenting as a quiet end of stream is the defect §4 has already caught in the
+    wild.
     """
-    import socket
-    import struct
-
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(1)
-    near = socket.create_connection(listener.getsockname())
-    far, _ = listener.accept()
-    listener.close()
-    near.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    reader, writer = os.pipe()
+    # THE READER GOES FIRST, and that is not tidiness. A write end whose pipe still has a reader
+    # is simply never ready to read, so the proxy would block in `select` and the case would
+    # time out instead of driving anything. With no reader, the descriptor reports ready and the
+    # read that follows is the one that fails.
+    os.close(reader)
     try:
-        return run(stdin_fd=far.fileno(), settle=0.0, after_send=lambda _proc: near.close())
+        return run(stdin_fd=writer, settle=0.0)
     finally:
-        far.close()
-        near.close()
+        os.close(writer)
 
 
 read_failed = read_failed_case()
@@ -626,12 +653,6 @@ anomaly = run(send=['{"jsonrpc":"2.0","id":1,"method":"tools/list"}'])
 check(f"{A.PROTOCOL_ANOMALY}: it carries WHICH anomaly, not just that there was one",
       anomaly.triggers == [A.PROTOCOL_ANOMALY]
       and anomaly.terminator["triggers"][0].get("anomaly") == "no_era_established", anomaly)
-
-check("every trigger in the enumeration was actually produced by a run above",
-      driven_triggers == set(A.TRIGGERS),
-      f"missing={sorted(set(A.TRIGGERS) - driven_triggers)} "
-      f"unenumerated={sorted(driven_triggers - set(A.TRIGGERS))}")
-
 
 # ---------------------------------------------------------------------------------------
 # 3. Every cleanup outcome, on demand (§10.5.1 axis 2)
@@ -705,12 +726,6 @@ for fact, expected in _injections.items():
           and (injected.facts[fact] or {}).get("cause") == outcome
           and not injected.only.terminator.get("fired")
           and not injected.verdict.clean, injected)
-
-check("every cleanup outcome in the enumeration was actually produced by a run above",
-      driven_outcomes == set(A.OUTCOMES),
-      f"missing={sorted(set(A.OUTCOMES) - driven_outcomes)} "
-      f"unenumerated={sorted(driven_outcomes - set(A.OUTCOMES))}")
-
 
 # ---------------------------------------------------------------------------------------
 # 4. The two axes are independent
@@ -870,7 +885,11 @@ try:
     check("the child, the helper and the spawn record agree on one process group",
           group is not None, (nonce, child_rec, helper_rec,
                               positive.only.spawn if positive.only else None))
-    check("an ordinary clean shutdown leaves NOTHING from the instance alive",
+    # "NOTHING FROM THE INSTANCE" WOULD BE A CLAIM THIS CANNOT MAKE. What the mechanism is is a
+    # process group (§10.6), so what the check says is a process group — the escaped-descendant
+    # case below is the same boundary from the other side, and a label claiming more than its
+    # mechanism delivers is how a documented limit stops matching the code (review, PR #103).
+    check("an ordinary clean shutdown leaves nothing in the child's process group alive",
           positive.verdict.clean
           and child_chan.at_eof(DEADLINE) and helper_chan.at_eof(DEADLINE),
           positive)
@@ -983,13 +1002,157 @@ for _label, _kill in (("a proxy SIGKILLed before its teardown", True),
         # teardown to observe: `start_new_session=True` gives step 4 a group to signal and is
         # also what puts that group out of reach of every ancestor's group kill, so without a
         # guardian this channel stays open and a credential-bearing server outlives the run.
-        check(f"{_label}: nothing from the instance is left alive",
+        check(f"{_label}: nothing in the child's process group is left alive",
               _chan.at_eof(DEADLINE),
               f"child group {_spawn.get('child_pgid')} still holds the channel; "
               f"detection is not cleanup")
     finally:
         reap_group(_rec if isinstance(_rec, dict) else None, _nonce)
         _chan.close()
+
+# ---------------------------------------------------------------------------------------
+# The guardian is MANDATORY, so its absence has to fail CLOSED (§10.5)
+# ---------------------------------------------------------------------------------------
+# Two ways it can fail to be established, and both must end with no server having run at all.
+# The channel carries that: the fixture announces the moment it starts, so an announcement is
+# the credential-bearing child having existed. The positive control is the point — "no
+# announcement arrived" is exactly what a channel that was never wired reports, so the same
+# wiring is driven with a working guardian first and the case asserts it DOES announce there.
+
+
+def unguarded_case(knob):
+    nonce = uuid.uuid4().hex
+    channel = Channel("unguarded")
+    found = run(args=[TARGET], tools=("alpha",), server="target", channels=(channel,),
+                env={"PT_NONCE": nonce, "PT_CHILD_FD": str(channel.writer)},
+                guardian=knob, send=[req(1, "ping")], reply_per_send=False)
+    return nonce, channel, found
+
+
+_wired_nonce, _wired_chan, _wired = unguarded_case(None)
+try:
+    _wired_rec = _wired_chan.record(DEADLINE)
+    check("the control: with a working guardian, this wiring DOES start a server that announces",
+          isinstance(_wired_rec, dict) and _wired_rec.get("nonce") == _wired_nonce
+          and _wired.only is not None and _wired.only.spawn is not None,
+          _wired)
+finally:
+    reap_group(_wired_rec if isinstance(_wired_rec, dict) else None, _wired_nonce)
+    _wired_chan.close()
+
+for _knob, _how in ((IO.GUARDIAN_MISSING, "the guardian's program is not there"),
+                    (IO.GUARDIAN_SILENT, "the guardian dies before reporting ready")):
+    _un_nonce, _un_chan, _unguarded = unguarded_case(_knob)
+    try:
+        check(f"{_how}: no server runs, and the instance ends `spawn_failed`",
+              _unguarded.triggers[:1] == [A.SPAWN_FAILED]
+              and (_unguarded.only.spawn if _unguarded.only else "no instance") is None
+              and not _unguarded.verdict.clean
+              and _un_chan.record(GRACE) is None,
+              f"containment that cannot be established must stop the run rather than be skipped "
+              f"— the child is the guardian's own process, so this is structural: {_unguarded}")
+    finally:
+        _un_chan.close()
+
+# THE READY REPORT IS CHECKED AGAINST THE PROCESS THAT WAS STARTED, so a report from anything
+# else is not readiness. This is also the one establishment failure that happens AFTER the child
+# exists, which makes it the case that shows failing closed is not the same as walking away: the
+# proxy repudiates the report, closes the lifeline, and the guardian sweeps the group it still
+# holds the pin for.
+#
+# WHAT THIS CASE DOES NOT CLAIM, and the reason is worth more than the claim would be. The
+# obvious second assertion is that the child it had already started is swept — but the proxy
+# repudiates the report within a millisecond of the spawn, so the sweep's SIGTERM can reach the
+# fixture during interpreter startup, before it has installed a handler or announced anything. A
+# channel that never received an announcement is at EOF for the same reason a swept one is, so
+# this instrument cannot tell the two apart from where it stands and does not pretend to (§4).
+# The sweep is witnessed by the two cases below, where the child is demonstrably running first.
+_imp_nonce, _imp_chan, _imposter = unguarded_case(IO.GUARDIAN_IMPOSTER)
+try:
+    check("a ready report whose pid is not the guardian's is not readiness",
+          _imposter.triggers[:1] == [A.SPAWN_FAILED]
+          and (_imposter.only.spawn if _imposter.only else "no instance") is None
+          and not _imposter.verdict.clean,
+          f"`Popen` returning says a fork happened; what has to be established is that the "
+          f"guardian's own code ran in that process: {_imposter}")
+finally:
+    _imp_chan.close()
+
+# AND THE ENDING WHERE IT DIES LATER, which is the one the structure alone does not cover: the
+# child already exists, its pin is gone with its parent, and the proxy is the only thing left
+# that can act. `guardian_lost` is terminal rather than degraded, and the fallback cleanup is
+# what the liveness channel is here to observe — the fixture lingers far past the deadline and
+# ignores SIGTERM, so an EOF cannot be explained by it having finished on its own.
+_lost_nonce = uuid.uuid4().hex
+_lost_chan = Channel("lost")
+_lost_rec = None
+try:
+    _lost = run(args=[TARGET], tools=("alpha",), server="target", channels=(_lost_chan,),
+                env={"PT_NONCE": _lost_nonce, "PT_CHILD_FD": str(_lost_chan.writer),
+                     "PT_IGNORE_TERM": "1", "PT_LINGER": "90"},
+                guardian=IO.GUARDIAN_LATE, grace=1.0, reply_per_send=False)
+    _lost_rec = _lost_chan.record(DEADLINE)
+    check("a guardian that dies once the child exists latches `guardian_lost`",
+          _lost.triggers[:1] == [A.GUARDIAN_LOST] and not _lost.verdict.clean
+          and isinstance(_lost_rec, dict) and _lost_rec.get("nonce") == _lost_nonce, _lost)
+    check("...and the child's group is still terminated, by the proxy's own identity check",
+          _lost_chan.at_eof(DEADLINE),
+          f"the pin holder is gone, so `group_identity` is all that licenses the signal — and "
+          f"a fixture that lingers 90s cannot have EOF'd by finishing: {_lost}")
+finally:
+    reap_group(_lost_rec if isinstance(_lost_rec, dict) else None, _lost_nonce)
+    _lost_chan.close()
+
+# A TEARDOWN THAT RAN AND FAILED IS NOT A REASON TO STAND THE GUARDIAN DOWN. This is the review
+# reproduction turned into a check: with step 4 made to fail, the proxy exits 1 and records
+# `shutdown_group_kill_failed` — and the child's channel must still reach EOF, because the
+# record preserving the evidence is not a reason to leave a credential-bearing process running
+# (review, PR #103). Its mirror is the retention control above, where a fault point FIRED on
+# those facts and the survivors are kept on purpose; between them the two pin the rule from both
+# sides, which is why `fail` and `suppress` are different modes.
+# TWO CONFIGURATIONS, because the sweep has two entry points and neither covers the other. With
+# only step 4 failed, the reap order is still sent and the survivor is a HELPER: the child exits
+# when its stdin closes, so `Guardian.release` reaps successfully and returns — and if it did
+# not terminate the group first, it would be exiting with the pin released and the helper still
+# running, which is the one moment nothing can act any more. With both steps failed no order is
+# sent at all, the guardian keeps the pin, and the sweep is the one on the lifeline's EOF; the
+# survivor there has to be the child itself, since nothing reaps it. Nothing FIRED in either, so
+# neither stands the guardian down — which is the reviewed defect, from both sides.
+for _label, _fault, _extra, _watch in (
+        ("step 4 failed, so the reap order sweeps before it releases the pin",
+         f"{A.GROUP_TERMINATED}={IO.FAIL}", {}, "helper"),
+        ("steps 4 and 5 both failed, so the sweep is the one on the lifeline's EOF",
+         f"{A.GROUP_TERMINATED}={IO.FAIL},{A.CHILD_REAPED}={IO.FAIL}",
+         {"PT_CLOSE_STDOUT": "1", "PT_LINGER": "90"}, "child")):
+    _kept_nonce = uuid.uuid4().hex
+    _kept_chans = {"child": Channel("kept-child"), "helper": Channel("kept-helper")}
+    _kept_recs = {}
+    try:
+        _kept = run(args=[TARGET], tools=("alpha",), server="target",
+                    channels=tuple(_kept_chans.values()),
+                    env={"PT_NONCE": _kept_nonce,
+                         "PT_CHILD_FD": str(_kept_chans["child"].writer),
+                         "PT_HELPER_FD": str(_kept_chans["helper"].writer), **_extra},
+                    fault=_fault)
+        _kept_recs = {k: c.record(DEADLINE) for k, c in _kept_chans.items()}
+        check(f"{_label}: recorded rather than fired, so nothing stands the guardian down",
+              _kept.state(A.GROUP_TERMINATED) == A.FAILED
+              and A.SHUTDOWN_GROUP_KILL_FAILED in _kept.outcomes
+              and not _kept.only.terminator.get("fired")
+              and not _kept.verdict.clean, _kept)
+        check(f"{_label}: and the group is swept anyway, evidence kept",
+              all(isinstance(r, dict) and r.get("nonce") == _kept_nonce
+                  for r in _kept_recs.values())
+              and _kept_chans[_watch].at_eof(DEADLINE),
+              f"standing down on a teardown that merely RAN left exactly these survivors, "
+              f"which is the reproduction this pair of cases is. Both holders announced "
+              f"first, so an EOF here is a termination rather than a channel nobody took: "
+              f"{_kept_recs} {_kept}")
+    finally:
+        for _rec in _kept_recs.values():
+            reap_group(_rec if isinstance(_rec, dict) else None, _kept_nonce)
+        for _chan in _kept_chans.values():
+            _chan.close()
 
 # THE LIMIT, MEASURED RATHER THAN ASSUMED. A descendant that calls `setsid()` leaves the child's
 # process group, and no group signal can reach it afterwards — nor can the guardian, which
@@ -1011,6 +1174,25 @@ try:
 finally:
     reap_group(_escape_rec if isinstance(_escape_rec, dict) else None, _escape_nonce)
     _escape_chan.close()
+
+# ---------------------------------------------------------------------------------------
+# 9. Totality, over everything above (§10.5.1)
+# ---------------------------------------------------------------------------------------
+# LAST IN THE FILE, because that is what "every reason was actually produced" quantifies over.
+# These sat at the end of their own sections, where they were answered by the runs above them
+# and blind to every run below — and the first reason added after them was `guardian_lost`,
+# which is driven in section 8. A fleet-wide claim needs every row answered (§4).
+section("every reason in the two enumerations was actually produced (§10.5.1):")
+
+check("every trigger in the enumeration was actually produced by a run in this file",
+      driven_triggers == set(A.TRIGGERS),
+      f"missing={sorted(set(A.TRIGGERS) - driven_triggers)} "
+      f"unenumerated={sorted(driven_triggers - set(A.TRIGGERS))}")
+
+check("every cleanup outcome in the enumeration was actually produced by a run in this file",
+      driven_outcomes == set(A.OUTCOMES),
+      f"missing={sorted(set(A.OUTCOMES) - driven_outcomes)} "
+      f"unenumerated={sorted(driven_outcomes - set(A.OUTCOMES))}")
 
 print()
 # SELF-REPORTED, for the reason the selftest's arm count is: a total kept by hand in

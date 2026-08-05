@@ -289,12 +289,12 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 558 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 560 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py                        # 292/292 production + 2/2 instrument + 8/8 fixture
+python3 -u harness/tools/mutate_mcp.py                        # 302/302 production + 2/2 instrument + 8/8 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 278 checks
-harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 58 here
+harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 68 here
 git diff --check
 ```
 
@@ -307,6 +307,13 @@ because both sit in a directory another suite owns. The **class** is chosen by t
 there were two suites and stopped agreeing the moment `mcp_proxy_io.py` arrived — production
 code no arm can reach. Running `mutate_mcp.py` therefore covers the last two lines above as
 well, and its three totals are three different claims. Do not add them together.
+
+**Every command in that block runs without a network and without a privilege**, and that is a
+requirement rather than an observation: the proxy verifier's `read_failed` case used to open a
+loopback socket, so under a sandbox that denies `bind()` the whole file died at `EPERM` and a
+reviewer could not run the suite this work's evidence rests on (review, PR #103). If a case
+needs an arrangement the environment might refuse, find another arrangement — a skipped check
+and a check that cannot fail look identical from the outside.
 
 **The arm count is now self-reported** — the selftest ends with `SELFTEST PASSED — N arms`.
 It used to live here as a hand-maintained literal and was stale for two PRs running, because
@@ -849,9 +856,17 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   obvious arrangements do not: a directory as stdin makes CPython refuse to start (`<stdin> is
   a directory, cannot continue`), so the proxy never reaches its own boundary and there is no
   log at all; a pty whose master is closed reads as **plain EOF** on macOS, which is the very
-  thing the case must distinguish itself from. A loopback socket with `SO_LINGER {1, 0}` turns
-  the driver's close into an RST and the read into `ECONNRESET`. **Check that the failure you
-  are injecting arrives at the layer you are testing**, rather than upstream of it.
+  thing the case must distinguish itself from. **Check that the failure you are injecting
+  arrives at the layer you are testing**, rather than upstream of it — which is also how the
+  next two candidates were rejected: a write-only *regular file* as stdin is never reported
+  ready by kqueue, so the proxy blocks and the case times out, and `/dev/null` opened write-only
+  makes `kevent` itself fail, so the error surfaces in the pump's catch-all rather than in the
+  read handler the case is about. What works is the **write end of a pipe whose reader is
+  already closed**: ready to select, `EBADF` to read, and — unlike the loopback socket with
+  `SO_LINGER {1, 0}` it replaces — it needs no network, which is what made the whole file
+  unrunnable under a sandbox that denies `bind()` (review, PR #103). **An instrument that needs
+  a privilege is an instrument some reviewer cannot run**, and a suite nobody else can run is
+  evidence nobody else can check.
 - **CLASSIFYING BY THE WRONG AXIS SURVIVES UNTIL THE THIRD CASE.** `mutate_mcp.py` derived a
   mutation's class (`M` production / `I` selftest / `F` instrument) from *which suite proves
   it*, which agreed with the file's role for as long as there were two suites. The third suite
@@ -878,10 +893,36 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   fails the cell — and the credential-bearing server it was fronting is still running, because
   `start_new_session=True` put it out of reach of every ancestor's group kill. Recording an
   ending is not ending it. The fix is a **guardian**: a third process in its own session
-  holding a lifeline, which kills the child's group when the proxy dies. **It stands down on a
-  BYTE rather than on the proxy's exit**, so a teardown that ran and *failed* still silences
-  it — otherwise the guardian would sweep up exactly the survivors §10.9's liveness cases exist
-  to observe, and the mechanism for one failure would erase the evidence for another.
+  holding a lifeline, which kills the child's group when the proxy dies.
+- **CONTAINMENT THAT IS OPTIONAL, LATE, OR ANONYMOUS IS NOT CONTAINMENT — one review round, three
+  faults, one fix.** The guardian above was spawned *after* the child, was "best effort" so a
+  failure to start let the run continue, and signalled a bare pgid it could not show was still
+  the group it created. Each looks like a separate hardening job and each was a consequence of
+  the same structural choice: the guardian was a bystander. Making it the child's **parent**
+  answers all three at once — it cannot be late because it is what starts the server, it cannot
+  be absent because no guardian means no spawn (`spawn_failed`, fail closed), and it holds the
+  group's identity because an **unreaped member pins the pgid against reuse** and only a parent
+  can hold one. The general rule: when three defenses of one property each need their own
+  patch, the property is being defended from the wrong place. Corollaries worth keeping:
+  - **A pin, not a probe.** `killpg(pgid, 0)` succeeding says something is there, not that it is
+    *yours*. Only an unreaped member establishes that, so every real signal goes through the
+    process holding one — and that process stops signalling the moment it reaps, because
+    releasing the pin ends its licence to act. A probe that delivers nothing is the one group
+    operation that stays sound without a pin, which is why the emptiness check is signal 0.
+  - **Readiness is a handshake, not a return value.** `Popen` returning says a fork succeeded.
+    The guardian reports its own pid, the proxy checks it against the process it spawned, and
+    the spawn record — which the reader now REQUIRES to carry it — is written only afterwards.
+    An optional field whose value nothing validated stayed clean with it missing, `false`, and
+    `"alive"`.
+- **CLEANING UP AFTER A FAILURE DOES NOT ERASE THE EVIDENCE OF IT.** The guardian stood down
+  whenever the proxy's teardown had merely **run**, on the reasoning that a group kill which was
+  attempted and failed should leave its survivors for §10.9's liveness cases to observe. That
+  reasoning is wrong, and the shape of the error is worth more than the case: the audit record
+  already holds the failure, so the survivors were not the evidence — they were a leak with a
+  justification attached. The rule is that the record carries the evidence and the mechanism
+  carries the cleanup, and only an **explicitly armed test-only control** may retain a process.
+  That distinction is exactly why the fault point has separate `suppress` and `fail` modes, and
+  both directions are now driven: firing retains, failing sweeps.
 - **A GUARANTEE MUST BE STATED AT THE WIDTH OF ITS MECHANISM.** "Nothing from this instance is
   still alive" was the claim; a process group was the mechanism; and a descendant that calls
   `setsid()` leaves the group and survives a clean run unreported. There is no portable
@@ -917,6 +958,26 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   closed set for the log and its prose for stderr, and the reader validates the code against
   that set. The tell is a field the writer formats and the reader accepts as any non-empty
   string.
+- **THE OBVIOUS TYPE CHECK ADMITS THE VALUE THAT IS NOT A VALUE — third instance.** `isinstance(
+  True, int)` was the first, `null` under a present-but-unread optional the second, and
+  `isinstance(float("nan"), float)` the third: a timestamp reader accepted `NaN` and `Infinity`,
+  which are floats and are not times. Same as the first two, the check has to name the property
+  the field is *for* — finite, here — and not the type that carries it. Note the value arrives
+  by two routes and both needed closing: the decoder produces it from a bare `NaN` token unless
+  told not to, so the log reader now refuses those constants with the same `parse_constant` the
+  wire does, imported rather than restated.
+- **A TOTALITY CHECK IS BLIND TO EVERY CASE BELOW IT.** "Every reason in the enumeration was
+  actually produced" sat at the end of its own section, where it quantified over the runs above
+  it and nothing else. It passed the day a new trigger was added and driven two sections
+  further down, and would have kept passing had the case been deleted. A fleet-wide claim goes
+  **last in the file**, for the same reason a fleet-wide negative requires every row answered.
+- **A MUTATION THAT REDDENS THE RECORD CHECKS WHILE THE LIVENESS CHECKS STAY GREEN IS A
+  MUTATION AIMED ONE LEVEL AWAY FROM THE DEFECT.** Two arrived in one round. Removing step 4
+  left the group alive in the record but not in fact, because the reap order sweeps it too;
+  neutering the guardian's watch loop made it exit, which the proxy reads as `guardian_lost`
+  and cleans up from. Both are the M53/M270 pattern — a property defended in two places needs
+  a mutation that removes **both** — and the tell is the same each time: the intended arm is
+  green and a dozen unintended ones are red.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s

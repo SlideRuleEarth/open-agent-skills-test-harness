@@ -1821,9 +1821,31 @@ MUTATIONS = [
      "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
     # §10.7's claim for this log is that it is wire-level evidence "per call ... and WHEN".
     ("M250-a-record-need-not-say-when", AUDIT,
-     "        if not is_json_int(ts) and not isinstance(ts, float):",
-     "        if False:",
+     "        usable = is_json_int(ts) or (isinstance(ts, float) and math.isfinite(ts))",
+     "        usable = True",
      "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
+    # ...and the half of that rule that `isinstance(x, float)` alone gets wrong: `NaN` and
+    # `Infinity` are floats and are not times, which is `isinstance(True, int)` one type over.
+    ("M296-a-non-finite-float-is-a-timestamp", AUDIT,
+     "        usable = is_json_int(ts) or (isinstance(ts, float) and math.isfinite(ts))",
+     "        usable = is_json_int(ts) or isinstance(ts, float)",
+     "audit_log.a_timestamp_is_a_finite_number_and_NaN_is_not_a_line"),
+    # ...and the decoder half, which is why a NaN never reaches the check above from a real
+    # log: the same `parse_constant` refusal the wire uses, applied to the file.
+    ("M297-the-log-decoder-accepts-a-python-extension", AUDIT,
+     "            raw = json.loads(line, parse_constant=refuse_json_extension)",
+     "            raw = json.loads(line)",
+     "audit_log.a_timestamp_is_a_finite_number_and_NaN_is_not_a_line"),
+    # The guardian's evidence unvalidated again: optional and unread is how it read clean with
+    # the field missing, `false`, or `"alive"` (review, PR #103).
+    ("M298-guardian-evidence-is-optional-again", AUDIT,
+     '    LINE_SPAWN: (("child_pid", "child_pgid", "guardian_pid"), ()),',
+     '    LINE_SPAWN: (("child_pid", "child_pgid"), ("guardian_pid",)),',
+     "audit_log.a_spawn_record_must_carry_usable_guardian_evidence"),
+    ("M299-any-guardian-value-will-do", AUDIT,
+     "        if not is_json_int(guardian) or guardian <= 0:",
+     "        if guardian is None:",
+     "audit_log.a_spawn_record_must_carry_usable_guardian_evidence"),
     # ...and the half of §10.7's claim that is actually about calls: the rule applied to the
     # three lifecycle records and not to the event records it exists for.
     ("M279-only-the-lifecycle-records-need-a-time", AUDIT,
@@ -1981,11 +2003,19 @@ MUTATIONS = [
     # STEP 4 AS A NO-OP, claiming success. This is the mutation the two liveness channels exist
     # for: every other check in that file passes against it, the record says `group_terminated:
     # done`, and a credential-bearing grandchild outlives the run.
+    # DEFENDED IN TWO PLACES since the guardian became the child's parent (cf. M53, M270), and
+    # the second one is deliberate rather than incidental: the reap order sweeps the group
+    # before it releases the pin, because reaping is what ends the guardian's licence to signal.
+    # Removing step 4 alone therefore leaves nothing alive and reddens only the record checks —
+    # which is the arm agreeing with the defect one level away from where the defect lives. The
+    # single-edit version was written first and reported exactly that.
     ("M272-the-process-group-is-never-terminated", PROXY_IO,
-     "        delivered = self._step(audit.GROUP_TERMINATED, self._terminate_group)   # step 4",
-     ("        delivered = True\n"
-      "        self._done(audit.GROUP_TERMINATED)                                   # step 4"),
-     "an ordinary clean shutdown leaves NOTHING from the instance alive"),
+     ("        delivered = self._step(audit.GROUP_TERMINATED, self._terminate_group)   # step 4",
+      "        self._signal(signal.SIGKILL)\n        try:\n            self.child.wait("),
+     (("        delivered = True\n"
+       "        self._done(audit.GROUP_TERMINATED)                                   # step 4"),
+      "        try:\n            self.child.wait("),
+     "an ordinary clean shutdown leaves nothing in the child's process group alive"),
     # Forced termination made a failure, so a server that merely needed SIGKILL fails the cell —
     # which §10.5.1 classifies CLEAN because the spec only SHOULDs a prompt exit.
     ("M273-a-killed-child-fails-the-cell", PROXY_IO,
@@ -1995,8 +2025,11 @@ MUTATIONS = [
     # The drain given its own deadline again, so the escalation never runs and a server that
     # needed SIGKILL is reported as a `shutdown_anomaly` instead of ending cleanly.
     ("M274-the-drain-gives-up-before-the-escalation", PROXY_IO,
-     "        for escalation in (signal.SIGTERM, signal.SIGKILL):\n            self._signal_group(escalation)",
-     "        for escalation in ():\n            self._signal_group(escalation)",
+     ("        for order, escalation in ((ORDER_TERM, signal.SIGTERM), "
+      "(ORDER_KILL, signal.SIGKILL)):\n            self._deliver(order, escalation)\n"
+      "            if escalation == signal.SIGKILL:"),
+     ("        for order, escalation in ():\n            self._deliver(order, escalation)\n"
+      "            if escalation == signal.SIGKILL:"),
      "shutdown_child_killed: forced termination is the standard escalation, so CLEAN"),
     # An unbounded drain instead of an anomaly: something outside the child's group holds its
     # stdout and the proxy waits for it, which is a hang rather than a verdict.
@@ -2057,7 +2090,7 @@ MUTATIONS = [
      "            if self.triggers and not shutting_down:",
      "a malformed frame during the drain stops it, and what followed is not forwarded"),
     ("M285-NaN-and-Infinity-reach-the-decision-layer", PROXY,
-     "        msg = json.loads(line, parse_constant=_refuse_constant)",
+     "        msg = json.loads(line, parse_constant=refuse_json_extension)",
      "        msg = json.loads(line)",
      "proxy.a_json_extension_constant_is_not_a_legal_message"),
 
@@ -2069,11 +2102,10 @@ MUTATIONS = [
     # outcome where two are true, and would certify a live member a sandbox had made
     # unsignallable (review, PR #103).
     ("M286-an-unsignallable-group-is-confirmed-gone", PROXY_IO,
-     ("            except OSError:\n"
-      "                pass                     # present but unsignallable; still present"),
-     ("            except OSError:\n"
-      "                self._done(audit.GROUP_TERMINATED)\n"
-      "                return"),
+     ("        except OSError:\n"
+      "            pass                         # present but unsignallable; still present"),
+     ("        except OSError:\n"
+      "            return True"),
      "shutdown_reap_failed: recorded, paired to child_reaped, and anomalous"),
     ("M287-the-group-is-never-confirmed-empty", PROXY_IO,
      "            self._guard(audit.GROUP_TERMINATED, self._confirm_group_gone)",
@@ -2082,47 +2114,106 @@ MUTATIONS = [
     # ...and the false-failure direction, which §10.5 weighs the same: `ESRCH` — the group is
     # gone, which is the goal — no longer read as confirmation, so every clean cell fails.
     ("M294-ESRCH-is-not-read-as-confirmation", PROXY_IO,
-     ("            except ProcessLookupError:\n"
-      "                self._done(audit.GROUP_TERMINATED)\n"
-      "                return\n"
-      "            except OSError:"),
-     ("            except ProcessLookupError:\n"
-      "                pass\n"
-      "            except OSError:"),
+     ("        except ProcessLookupError:\n"
+      "            return True\n"
+      "        except OSError:"),
+     ("        except ProcessLookupError:\n"
+      "            return False\n"
+      "        except OSError:"),
      "...and the whole exchange still ends clean"),
+    # NO MUTATION for preferring the guardian's report over a probe of the proxy's own, and it
+    # is worth saying why rather than leaving the gap: by the time the fact is settled the reap
+    # has happened either way, so the two answers differ only inside the pid-reuse window — the
+    # thing nothing can stage. The report is kept because it is the tighter measurement, taken
+    # in the process that did the reaping; the probe is not wrong, it is later.
 
     # ---- the guardian ------------------------------------------------------------------
-    # No guardian at all: a proxy SIGKILLed before its teardown leaves a credential-bearing
-    # server with nothing that will ever terminate it. The audit still fails the cell, which is
-    # exactly why this needs a case that looks at the PROCESS rather than at the record.
-    ("M288-no-guardian-is-started", PROXY_IO,
-     "        self._start_guardian()",
+    # A guardian that never watches: it is the child's parent, so a proxy SIGKILLed before its
+    # teardown leaves a credential-bearing server with nothing that will terminate it. The
+    # audit still fails the cell, which is exactly why this needs a case that looks at the
+    # PROCESS rather than at the record.
+    # THE SWEEP ITSELF, made a no-op: the guardian still notices the death, still exits, and
+    # leaves the group running. This is the mutation that proves the whole mechanism, and it is
+    # deliberately aimed at the ACTION rather than at the detection — a guardian that exits
+    # early instead closes the report pipe, which the proxy reads as `guardian_lost` and cleans
+    # up from, so it reddens the record checks while leaving nothing alive. The arm and the
+    # defect agreeing one level away from the defect, again; the first version did exactly that.
+    ("M288-the-guardian-notices-and-does-nothing", PROXY_IO,
+     ("        self._signal(signal.SIGTERM)\n"
+      "        time.sleep(min(self.grace, 0.2))\n"
+      "        self._signal(signal.SIGKILL)"),
      "        pass",
-     "a proxy SIGKILLed before its teardown: nothing from the instance is left alive"),
-    # The guardian recorded but never started, so the spawn record's claim is the only thing
-    # that would notice — which is why the liveness check above is NOT nested inside the
-    # record check.
-    ("M295-the-guardian-is-recorded-but-not-watched", PROXY_IO,
-     "        return run_guardian(int(args[1]), int(args[2]))",
+     "a proxy SIGKILLed before its teardown: nothing in the child's process group is left alive"),
+    # ...and the detection: the lifeline's EOF no longer read as the proxy being gone, so the
+    # one ending the guardian exists for is the one it sits through.
+    ("M289-an-EOF-on-the-lifeline-is-not-a-death", PROXY_IO,
+     ("            if not order:\n"
+      "                break                    # EOF: the proxy is gone and never released "
+      "the pin"),
+     ("            if not order:\n"
+      "                continue"),
+     "a proxy SIGKILLed before its teardown: nothing in the child's process group is left alive"),
+    # The guardian's program never runs the guardian, so no child is ever started and the
+    # handshake times out. Fail-closed is the intended behaviour of a MISSING guardian, so the
+    # arm this reddens is the one that drives that on purpose.
+    ("M295-the-guardian-program-does-nothing", PROXY_IO,
+     "        return run_guardian(int(args[1]))",
      "        return 0",
-     "a proxy SIGKILLed before its teardown: nothing from the instance is left alive"),
-    # The guardian stands down on the proxy's EXIT rather than on a byte, so the ending it
-    # exists for — a proxy that never ran its teardown — silences it too.
-    ("M289-the-guardian-stands-down-on-any-EOF", PROXY_IO,
-     "                if os.read(lifeline, 1) != b\"\":",
-     "                if True:",
-     "a proxy SIGKILLed before its teardown: nothing from the instance is left alive"),
+     "the control: with a working guardian, this wiring DOES start a server that announces"),
+    # Standing down on anything but a FIRED retention, which is the reviewed defect: a teardown
+    # that ran and failed silenced the mechanism that exists to clean up after it.
+    ("M290-any-teardown-that-ran-stands-the-guardian-down", PROXY_IO,
+     ("        retained = [f for f in (audit.GROUP_TERMINATED, audit.CHILD_REAPED) "
+      "if f in self.fired]"),
+     "        retained = [audit.GROUP_TERMINATED]",
+     ("steps 4 and 5 both failed, so the sweep is the one on the lifeline's EOF: and the group "
+      "is swept anyway, evidence kept")),
     # ...and the other direction: standing down never happens, so the guardian sweeps up the
     # survivors §10.9's control deliberately leaves alive and the evidence goes with them.
-    ("M290-the-guardian-is-never-stood-down", PROXY_IO,
-     "            _write_all(self._lifeline, GUARDIAN_STAND_DOWN)",
-     "            pass",
+    ("M302-the-guardian-is-never-stood-down", PROXY_IO,
+     "        if retained and self._lifeline is not None:",
+     "        if False:",
      "with steps 3-5 suppressed, BOTH channels are still open after the proxy exits"),
-    # NO MUTATION for the guardian's ask-before-signal guard, and that is a statement rather
-    # than an omission: its whole purpose is a pid recycled between the child being reaped by
-    # init and the guardian waking, which nothing can stage on demand. Removing it changes no
-    # observable behaviour in any case here, so a mutation would report MISSED for a check that
-    # cannot exist — the same limit as the three cleanup outcomes driven through injection.
+    # The reap that releases the pin no longer sweeps first, so a step 4 that failed leaves the
+    # group alive at exactly the moment the guardian stops being able to signal it.
+    ("M303-the-pin-is-released-without-a-sweep", PROXY_IO,
+     "        self._signal(signal.SIGKILL)\n        try:\n            self.child.wait(",
+     "        try:\n            self.child.wait(",
+     ("step 4 failed, so the reap order sweeps before it releases the pin: and the group is "
+      "swept anyway, evidence kept")),
+    # A guardian established after the child, which is the window a SIGKILL fits through — and
+    # is unreachable now that the guardian is what spawns it. What IS reachable is the other
+    # half of the same rule: a guardian that could not be established, not failing the run.
+    ("M304-an-unestablished-guardian-is-not-a-spawn-failure", PROXY_IO,
+     ("        ready = self._establish_guardian()\n"
+      "        if ready is None:"),
+     ("        ready = self._establish_guardian() or {\n"
+      "            \"guardian_pid\": 0, \"child_pid\": 0, \"child_pgid\": 0}\n"
+      "        if False:"),
+     "the guardian's program is not there: no server runs, and the instance ends `spawn_failed`"),
+    # The readiness handshake reduced to `Popen` having returned, which says a fork happened and
+    # nothing about whether our code ran in it.
+    ("M305-any-ready-report-will-do", PROXY_IO,
+     '        if (ready.get("guardian_pid") != self.guardian.pid',
+     "        if (False",
+     "a ready report whose pid is not the guardian's is not readiness"),
+    # The guardian's death during a run treated as ordinary, so a live credential-bearing child
+    # keeps being forwarded to with nothing holding its identity.
+    ("M306-a-lost-guardian-is-not-terminal", PROXY_IO,
+     "        self._trigger(audit.GUARDIAN_LOST)",
+     "        pass",
+     "a guardian that dies once the child exists latches `guardian_lost`"),
+    # ...and the fallback that ending needs, refusing to act. The identity check is what
+    # licenses the signal, so a mutant that never finds it satisfied leaves the child alive.
+    ("M307-the-fallback-never-signals", PROXY_IO,
+     "        if identity != GROUP_SAME:",
+     "        if identity != GROUP_UNKNOWN:",
+     "...and the child's group is still terminated, by the proxy's own identity check"),
+    # NO MUTATION for the fallback's identity check in the PERMISSIVE direction, and that is a
+    # statement rather than an omission: removing it lets the proxy signal a pgid it can no
+    # longer show is the child's, which is only observable in the pid-reuse race nothing can
+    # stage on demand. Every case here would still pass, so it would report MISSED for a check
+    # that cannot exist — the same limit as the three cleanup outcomes driven through injection.
 
     # ---- the archived log carries codes, not prose --------------------------------------
     ("M292-the-drop-event-carries-the-peers-own-text", PROXY_IO,

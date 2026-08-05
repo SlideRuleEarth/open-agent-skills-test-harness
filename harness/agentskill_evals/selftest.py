@@ -10423,7 +10423,7 @@ def _check_mcp_audit_log(failures, verbose):
 
     def spawn(instance="i1", **over):
         return line(**{"instance": instance, "kind": A.LINE_SPAWN, "child_pid": 4002,
-                       "child_pgid": 4002, **over})
+                       "child_pgid": 4002, "guardian_pid": 4000, **over})
 
     def event(kind, instance="i1", **payload):
         return line(instance=instance, kind=A.LINE_EVENT, event=kind, **payload)
@@ -10688,6 +10688,47 @@ def _check_mcp_audit_log(failures, verbose):
            f"went on to kill was not the group the child was in, which is a surviving "
            f"credential-bearing grandchild reported as a successful cleanup: {codes(not_leader)}",
            failures, verbose)
+
+    # ---- the guardian is required, so its evidence is checked like any other -------------
+    no_guardian = log(start(),
+                      line(instance="i1", kind=A.LINE_SPAWN, child_pid=4002, child_pgid=4002),
+                      term())
+    unusable = {v: codes(log(start(), spawn(guardian_pid=v), term()))
+                for v in (None, True, "alive", 0, -1)}
+    _check("audit_log.a_spawn_record_must_carry_usable_guardian_evidence",
+           "spawn_key_missing:guardian_pid" in codes(no_guardian)
+           and all(f"spawn_guardian:{v!r}" in found for v, found in unusable.items())
+           and "spawn_guardian_is_the_child:4002" in codes(
+               log(start(), spawn(guardian_pid=4002), term()))
+           and read(log(start(), spawn(), term())).clean,
+           f"the guardian is the child's PARENT and is established before it exists (§10.5), so "
+           f"a spawn record is written only after the guardian has reported ready about itself "
+           f"— its `guardian_pid` is the readiness evidence rather than a note. While the field "
+           f"was optional and unvalidated, a synthetic log stayed clean with it missing, `false` "
+           f"and `\"alive\"` (review, PR #103), and `true` is the case that slips past the "
+           f"obvious type check because `isinstance(True, int)` holds. The last two conjuncts "
+           f"are the pair that keeps this falsifiable in both directions: a guardian that is "
+           f"the child describes a topology this proxy cannot produce, and the ordinary record "
+           f"must still read clean: {no_guardian!r} {unusable}", failures, verbose)
+
+    # ---- a timestamp is a finite number, and NaN is not JSON -----------------------------
+    nan_line = log(start(), spawn(ts=float("nan")), term())
+    infinite = A.instance_verdict(
+        A.Instance("i1", start=json.loads(start()), spawn=json.loads(spawn()),
+                   terminator=json.loads(term(ts=float("inf")))),
+        server="echo", allowed=allow)
+    _check("audit_log.a_timestamp_is_a_finite_number_and_NaN_is_not_a_line",
+           "unparseable_line:1" in codes(nan_line)
+           and "terminator_ts:inf" in infinite.problems
+           and read(log(start(ts=1.5), spawn(), term())).clean,
+           f"two rules, one about what JSON is and one about what a time is, because the value "
+           f"arrives by two routes. `NaN` and `Infinity` are a Python decoder EXTENSION, so a "
+           f"log line carrying one is unparseable here exactly as it is on the wire — the same "
+           f"`refuse_json_extension` the proxy uses, imported rather than restated. And "
+           f"`isinstance(x, float)` accepts both of them, so a record built any other way "
+           f"carried a timestamp that is not a time and read clean (review, PR #103). The "
+           f"finite float is the control: this must reject non-times, not floats: "
+           f"{codes(nan_line)} {infinite.problems}", failures, verbose)
 
     # ---- the fault point rides on the start record, and only there ----------------------
     armed = log(start(fault_point={"suppresses": []}), spawn(), term())

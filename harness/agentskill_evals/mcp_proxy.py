@@ -192,7 +192,7 @@ RESULT = "result"
 ERROR = "error"
 
 
-def _refuse_constant(name: str):
+def refuse_json_extension(name: str):
     """`NaN`, `Infinity` and `-Infinity` are not JSON, so they do not reach the decision layer.
 
     Python's decoder accepts all three by default, as a documented EXTENSION — and §10.4
@@ -214,7 +214,7 @@ def parse_line(line: str) -> dict | Anomaly:
     malformed.
     """
     try:
-        msg = json.loads(line, parse_constant=_refuse_constant)
+        msg = json.loads(line, parse_constant=refuse_json_extension)
     except (json.JSONDecodeError, ValueError) as exc:
         return Anomaly(UNPARSEABLE, f"line is not JSON: {exc}")
     if isinstance(msg, list):
