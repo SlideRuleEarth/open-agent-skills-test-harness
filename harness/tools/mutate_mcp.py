@@ -144,9 +144,13 @@ MUTATIONS = [
      "            command=_abs_command(s.command, base_dir),\n            args=[_abs_arg(a, base_dir) for a in s.args],",
      "            command=_abs_command(sub(s.command) if s.command else None, base_dir),\n            args=[_abs_arg(sub(a), base_dir) for a in s.args],",
      "mcp.interpolation_cannot_choose_what_program_runs"),
+    # The `str` redactor. Its `bytes` twin two functions down runs the identical loop, so the
+    # bare line matched both and this mutation only ever reached whichever came first.
     ("M7-redact-shortest-first", MCP,
-     "    for form in sorted(forms, key=len, reverse=True):",
-     "    for form in sorted(forms, key=len):",
+     ("    for form in sorted(forms, key=len, reverse=True):\n"
+      "        text = text.replace(form, REDACTED)"),
+     ("    for form in sorted(forms, key=len):\n"
+      "        text = text.replace(form, REDACTED)"),
      "mcp.longest_secret_is_redacted_first"),
     ("M8-no-short-secret-floor", MCP,
      "MIN_REDACTABLE_LEN = 6",
@@ -1412,9 +1416,12 @@ MUTATIONS = [
     # the validator assume a shape instead of checking it, and the arm they redden catches the
     # resulting exception — a traceback out of `verify_post_run` is not a failed cell, it is an
     # absent verdict, which is the outcome §10.5 exists to make impossible.
+    # LEADING NEWLINE, per §4: `parse_log` runs the same test on each LINE at 8 spaces, and this
+    # 4-space anchor is a substring of it. The newline pins it to `parse()`, which is the reader
+    # this mutation names.
     ("M184-reader-assumes-its-input-is-a-map", AUDIT,
-     "    if not isinstance(raw, dict):",
-     "    if False:",
+     "\n    if not isinstance(raw, dict):",
+     "\n    if False:",
      "audit.every_malformed_shape_is_a_problem_code_not_an_exception"),
     ("M185-reader-assumes-a-list-where-json-allows-anything", AUDIT,
      "    if not isinstance(value, list):",
@@ -1426,9 +1433,17 @@ MUTATIONS = [
      ('        if False:\n'
       '            problems.append(f"trigger_not_a_map:{i}")'),
      "audit.every_malformed_shape_is_a_problem_code_not_an_exception"),
+    # BOTH SITES, per M53. `_str_or` and `_opt_str` run the identical test on identical lines —
+    # `_opt_str`'s own docstring says "it is the same idiom" — so no leading newline separates
+    # them and removing the rule from one leaves the other enforcing it. A property defended in
+    # two places needs a mutation that removes both.
     ("M187-reader-assumes-a-scalar-is-a-string", AUDIT,
-     "    if isinstance(value, str):",
-     "    if True:",
+     (("def _str_or(value: Any, problems: list[str], code: str) -> str | None:\n"
+       "    if isinstance(value, str):"),
+      "    value = entry[key]\n    if isinstance(value, str):"),
+     (("def _str_or(value: Any, problems: list[str], code: str) -> str | None:\n"
+       "    if True:"),
+      "    value = entry[key]\n    if True:"),
      "audit.every_malformed_shape_is_a_problem_code_not_an_exception"),
     # `raw.get(k) or []` in its original form: a writer that forgot an axis entirely then
     # validates as one that recorded nothing on it, and recording nothing is legal.
@@ -1665,9 +1680,11 @@ MUTATIONS = [
      "audit.a_suppressed_step_is_recorded_without_being_excused"),
 
     # ---- the verdict as a conjunction over everything -------------------------------------
+    # Leading newline again: `instance_verdict` computes the same tuple at 8 spaces, and the
+    # 4-space anchor is a substring of it. This one is `verdict()`, the entry point the arm reads.
     ("M217-verdict-reads-only-the-first-reason", AUDIT,
-     "    anomalous = tuple(r for r in reasons(record) if not is_clean(r))",
-     "    anomalous = tuple(r for r in reasons(record)[:1] if not is_clean(r))",
+     "\n    anomalous = tuple(r for r in reasons(record) if not is_clean(r))",
+     "\n    anomalous = tuple(r for r in reasons(record)[:1] if not is_clean(r))",
      "audit.each_axis_can_fail_the_instance_on_its_own"),
     ("M218-cleanup-outcomes-do-not-reach-the-verdict", AUDIT,
      "    out += [o.kind for o in record.outcomes]",
@@ -1978,9 +1995,11 @@ MUTATIONS = [
      "signal_term: the client signals, and the handler still writes a terminator"),
     # The runners-up sweep dropped, so a signal arriving during the teardown goes unrecorded and
     # the log cannot say a CLI closed stdin and then signalled.
+    # Leading newline: `_pump`'s select loop calls the same handler at 24 spaces. The site this
+    # names is the runners-up collection AFTER the pump, which is where a signal is lost.
     ("M269-a-signal-during-the-teardown-is-lost", PROXY_IO,
-     "            self._on_signal(wake_r)",
-     "            pass",
+     "\n            self._on_signal(wake_r)",
+     "\n            pass",
      "a client that closes stdin and THEN signals records both, and stays clean"),
     # A buffered log, which makes a killed proxy indistinguishable from one that never ran —
     # and "never ran" is the half of §10.5's partition that is NOT a failure.
@@ -2024,12 +2043,25 @@ MUTATIONS = [
      "shutdown_child_killed: forced termination is the standard escalation, so CLEAN"),
     # The drain given its own deadline again, so the escalation never runs and a server that
     # needed SIGKILL is reported as a `shutdown_anomaly` instead of ending cleanly.
+    # BOTH ANCHORS CARRY CONTEXT UNIQUE TO STEP 3, because step 4's loop is now textually
+    # identical — same orders, same `_deliver`, same refusal check. `replace(..., 1)` would take
+    # whichever came first in the file and report CAUGHT either way, so an ambiguous anchor here
+    # is a mutation that quietly stops testing what it names.
     ("M274-the-drain-gives-up-before-the-escalation", PROXY_IO,
-     ("        for order in (ORDER_TERM, ORDER_KILL):\n            self._deliver(order)\n"
-      "            if order == ORDER_KILL:"),
-     ("        for order in ():\n            self._deliver(order)\n"
-      "            if order == ORDER_KILL:"),
+     ('            raise TimeoutError("step 3 is suppressed, and the child has not finished")\n'
+      "        for order in (ORDER_TERM, ORDER_KILL):"),
+     ('            raise TimeoutError("step 3 is suppressed, and the child has not finished")\n'
+      "        for order in ():"),
      "shutdown_child_killed: forced termination is the standard escalation, so CLEAN"),
+    # The escalation's refusal ignored, so `shutdown_child_killed` is written on the path where
+    # NOTHING was signalled — the guardian-loss ending, whose policy is deliberately to signal
+    # nothing, logging a kill beside the two failures proving it did not happen.
+    ("M317-a-kill-that-could-not-be-delivered-is-recorded-as-delivered", PROXY_IO,
+     ("                raise _EscalationUndelivered(\n"
+      '                    f"the child\'s stdout was still open and step 3\'s escalation could '
+      'not be "\n                    f"delivered: {error}")'),
+     "                pass",
+     "...and records no kill it did not deliver"),
     # An unbounded drain instead of an anomaly: something outside the child's group holds its
     # stdout and the proxy waits for it, which is a hang rather than a verdict.
     ("M275-a-drain-that-never-ends-is-not-reported", PROXY_IO,
@@ -2278,9 +2310,17 @@ MUTATIONS = [
      "            return cls(armed=False, guardian=guardian)",
      "the guardian's program is not there: the injection is recorded in the start record"),
     ("M314-any-guardian-mode-is-accepted", AUDIT,
-     "    if record.guardian is not _MISSING and record.guardian not in GUARDIAN_MODES:",
-     "    if False:",
+     "        elif record.guardian not in GUARDIAN_MODES:",
+     "        elif False:",
      "audit.the_guardian_injection_is_recorded_beside_the_suppression_targets"),
+    ("M316-the-guardian-mode-is-membership-tested-before-it-is-typed", AUDIT,
+     ("        if not isinstance(record.guardian, str):\n"
+      '            problems.append(f"guardian_mode_not_a_string:{record.guardian!r}")\n'
+      "        elif record.guardian not in GUARDIAN_MODES:"),
+     ("        if False:\n"
+      '            problems.append(f"guardian_mode_not_a_string:{record.guardian!r}")\n'
+      "        elif record.guardian not in GUARDIAN_MODES:"),
+     "audit.no_json_value_can_make_the_reader_raise"),
     ("M315-the-fault-point-map-is-open", AUDIT,
      '            for key in sorted(set(raw["fault_point"]) - {"suppresses", "guardian"}):',
      '            for key in sorted(set(raw["fault_point"]) - set(raw["fault_point"])):',
@@ -2515,11 +2555,26 @@ def main():
         # `find`/`repl` may be tuples: some properties are now defended in two places, and
         # reintroducing the defect means removing both (see M53).
         edits = list(zip(find, repl)) if isinstance(find, tuple) else [(find, repl)]
-        if any(f not in original for f, _ in edits):
+        counts = [original.count(f) for f, _ in edits]
+        if any(c == 0 for c in counts):
             # No time to report, and "(0.0s)" would read as a suite that ran instantly rather
             # than one that never started — the same lie the None/[] distinction exists to
             # prevent elsewhere. Say which it is.
             print(f"{mid}: STALE ANCHOR — text not found in {rel} ({suite} not run)")
+            continue
+        if any(c > 1 for c in counts):
+            # THE OTHER HALF OF THE SAME GUARD, and the half that fails silently. `replace(f, r,
+            # 1)` takes whichever occurrence comes first, so an anchor matching twice still
+            # produces a mutant, still reddens SOME arm, and still prints CAUGHT — while testing
+            # whichever site happens to be earlier in the file rather than the one the mutation
+            # is named for. Five entries were in this state, four of them because a 4-space
+            # anchor is a substring of the same line indented 8 (the leading-newline lesson in
+            # §4, which nothing enforced), and one because a fix here made two functions
+            # textually identical. Refused rather than warned: a mutation that has quietly
+            # stopped testing what it names is exactly the failure this suite exists to prevent
+            # in the code it mutates (review, PR #103).
+            print(f"{mid}: AMBIGUOUS ANCHOR — matches {counts} times in {rel}; pin it with a "
+                  f"leading newline or adjacent context ({suite} not run)")
             continue
         mutated = original
         for f, r in edits:

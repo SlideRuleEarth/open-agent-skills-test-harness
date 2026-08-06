@@ -289,12 +289,12 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 561 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 562 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py                        # 309/309 production + 2/2 instrument + 8/8 fixture
+python3 -u harness/tools/mutate_mcp.py                        # 311/311 production + 2/2 instrument + 8/8 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 278 checks
-harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 76 here
+harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 77 here
 git diff --check
 ```
 
@@ -1033,6 +1033,57 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   and pair the run that must stop early with one that must go further. Two rules met there — a
   claim and its subject must not share an author (the guardian reports on the proxy's
   behaviour), and an absent string proves nothing without a run in which it is present.
+- **A FIELD CARRIED RAW OWES A TOTAL PREDICATE.** The audit reader's contract is that arbitrary
+  decoded JSON produces a verdict and never an exception, and `[] in FROZENSET` raises
+  `TypeError: unhashable type`. Every field the validator looks up in a closed set is narrowed
+  to a string by the parser first — except the two carried **raw**, because for them "present
+  but wrong" is a different verdict from "absent". `child_status` survived by accident:
+  `is_json_int` is an `isinstance` check and so total over any value. The guardian injection was
+  the same shape with a set lookup, and `"guardian": []` crashed `log_verdict`, which is the
+  function that decides whether a gated cell passed — **a crash there is not a failed cell, it
+  is no verdict at all**. Two things to carry forward. The rule is *the predicate must be total*,
+  not *this field needs an isinstance*; and the regression arm drives an unhashable value
+  through **every** membership-tested position rather than the one that broke, because what
+  makes the other nine safe is a parser invariant, and an invariant nothing drives is a comment.
+  The rule was already written down twice in the same tree — over `kind` in the log reader and
+  in `valid_request_id` — which is what makes this a *third* instance rather than a discovery:
+  a rule stated at one site is a rule about that site.
+- **AN OUTCOME THAT NAMES AN ACT IS WRITTEN ONLY WHERE THE ACT HAPPENED.** `shutdown_child_killed`
+  says this instance delivered a `SIGKILL`; step 3's escalation wrote it whether or not
+  `_deliver` reported success. The ending that exposed it is the one whose policy is to signal
+  **nothing** — guardian gone, no pin, delivery refused — so the archived log recorded a kill
+  beside the two failures proving nothing was signalled. Step 4 had read that same return value
+  since the day it was written. The tell is a call whose result is discarded on one path and
+  consulted on another, when both paths record what the call did. Two corollaries:
+  - The escalation now **ends** on the refusal rather than trying the next order — the only
+    process that could signal is gone, so the second order fails identically and the message
+    after the loop would then claim a kill was delivered.
+  - Making step 3's loop read the return value made it **textually identical to step 4's**, so
+    two mutation anchors silently became ambiguous — which is what turned up the next entry.
+- **AN AMBIGUOUS MUTATION ANCHOR IS A MUTATION THAT HAS QUIETLY STOPPED TESTING WHAT IT NAMES.**
+  `mutate_mcp.py` applies `original.replace(find, repl, 1)`, so an anchor matching twice still
+  produces a mutant, still reddens some arm, and still prints `CAUGHT` — while perturbing
+  whichever site is earlier in the file. **Five entries were in this state**, and the run was
+  green throughout: M7 (the `str` redactor's loop, identical to its `bytes` twin), M184, M187,
+  M217, M269. Four of them are the leading-newline lesson already recorded three bullets down —
+  a 4-space anchor is a substring of the same line indented 8 — **which nothing enforced**, so
+  it had been true since the day it was written down. The fix is therefore not five edits but
+  the guard beside the stale-anchor check: an anchor matching a number of times other than one
+  is **refused, not warned**, and a refused mutation is uncaught, so the suite exits non-zero.
+  Two general points worth more than the five:
+  - **A rule written in a lessons file is not enforced by having been written.** This one had
+    been, verbatim, and four entries violated it anyway. If a rule is checkable, the check is
+    the artifact; the prose is a comment on it.
+  - **The failure mode of an instrument is not the failure mode of the code it tests.** A
+    mutation suite whose count is unchanged can still have lost coverage — the sibling of
+    "fewer mutations than last time" in §4's header, and the harder one to see, because the
+    number that would have told you is the one that stayed the same.
+  Note what the guard does **not** claim: it pins each mutation to one site, and it does not
+  say the other site is covered. Four of the five siblings — the `bytes` redactor's loop,
+  `parse_log`'s per-line map check, `instance_verdict`'s `anomalous`, and `_pump`'s in-loop
+  signal handler — have no mutation of their own. M187's pair was merged into one tuple edit
+  because `_str_or` and `_opt_str` are the same rule (M53's pattern); the other three are a
+  coverage question, recorded here rather than answered.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s

@@ -27,9 +27,9 @@ credential-bearing child exists, it is the thing that starts it, and a guardian 
 established is `spawn_failed` with no server ever running. Because it is the parent it can keep
 the child unreaped, which is the only way any process here can show that a process-group id
 still names the group it created rather than one the kernel has since handed to a stranger. So
-every real signal to that group is sent by the guardian, on the proxy's order, and the proxy's
-own fallback exists for exactly one ending — the guardian dying mid-run — and says out loud
-that it is the weaker claim (review, PR #103).
+every real signal to that group is sent by the guardian, on the proxy's order, and there is NO
+fallback for the one ending that outlives the pin — a guardian dying mid-run — because a
+remembered pgid is not an identity and no weaker claim was worth making (review, PR #103).
 
 WHAT IS DELIBERATELY NOT WRITTEN TO THE AUDIT LOG: argv, the environment, the config, and the
 detail text of any anomaly. The config carries interpolated credentials (§10.3) and an anomaly
@@ -117,6 +117,17 @@ class _DrainFailed(Exception):
     Without this the `shutdown_anomaly` catch-all would fire on top of the `shutdown_read_failed`
     the drain just recorded, and the fact would carry two causes — which §10.5.1 rejects as two
     incompatible accounts of one step, correctly.
+    """
+
+
+class _EscalationUndelivered(Exception):
+    """Step 3's escalation had nobody to deliver it, so the drain ends UNDIAGNOSED by it.
+
+    Distinct from `_DrainFailed` because the opposite is true of it: nothing was recorded here,
+    so the `shutdown_anomaly` catch-all is exactly what should fire. It is a named class rather
+    than a `TimeoutError` because it is not one — no bound expired; the only process that could
+    signal the group had gone — and the exception's `repr` is what lands in the audit record as
+    `shutdown_anomaly`'s payload, where a wrong name is a wrong diagnosis in an archived file.
     """
 
 
@@ -386,8 +397,10 @@ def _is_own_group(pgid: int) -> bool:
     """Signalling this would reach the caller, whatever spawned it, and every sibling.
 
     Which means `start_new_session=True` did not take effect. A cleanup must not reach further
-    than what it created (§4), so both signalling sites — the guardian and the proxy's fallback
-    — ask this before they deliver anything, and both refuse rather than guess.
+    than what it created (§4), so the ONE signalling site left — the guardian, which is the only
+    process holding the pin — asks this before it delivers anything, and refuses rather than
+    guesses. It was two sites until the proxy's fallback signaller was deleted; a guard whose
+    docstring counts call sites it no longer has is how the deletion gets quietly undone.
     """
     return pgid == os.getpgid(0)
 
@@ -1086,8 +1099,10 @@ class Instance:
         child's parent, so a guardian that dies mid-run leaves a live credential-bearing server
         with no process holding its identity — the reap will not be ours to make and the group's
         pin is gone. That is a terminal condition rather than a degraded mode: the report pipe
-        reaching EOF latches `guardian_lost`, forwarding stops, and the teardown falls back to
-        the weaker identity check `group_identity` describes.
+        reaching EOF latches `guardian_lost`, forwarding stops, and the teardown then RECORDS a
+        group it cannot account for rather than signalling one it cannot identify: steps 3 and 4
+        fail on `_deliver`'s refusal, and step 5 has no guardian left to ask for the reap. §10.6
+        carries that leak as a stated limit of the design, which is its honest form (PR #103).
         """
         sel = selectors.DefaultSelector()
         try:
@@ -1395,7 +1410,23 @@ class Instance:
             # step 4 would pass on the helper's good manners" is the failure mode being avoided.
             raise TimeoutError("step 3 is suppressed, and the child has not finished")
         for order in (ORDER_TERM, ORDER_KILL):
-            self._deliver(order)
+            error = self._deliver(order)
+            if error is not None:
+                # NOTHING WAS SENT, SO NOTHING MAY BE RECORDED AS SENT. `shutdown_child_killed`
+                # is this instance's statement that it delivered a `SIGKILL` to the child's
+                # group; writing it from the path where delivery FAILED puts an act in the
+                # archived record that did not happen — and the ending it happened in is the
+                # one where the policy is deliberately to signal nothing, so the log read
+                # `shutdown_child_killed` beside the two failures proving the opposite
+                # (review, PR #103). Step 4 has read this return since it was written; step 3
+                # discarded it, which is the whole defect.
+                #
+                # The escalation also ENDS here rather than trying the next order: the only
+                # process that can signal is gone, so `SIGKILL` would fail exactly as `SIGTERM`
+                # just did, and the message below would then claim a kill was delivered.
+                raise _EscalationUndelivered(
+                    f"the child's stdout was still open and step 3's escalation could not be "
+                    f"delivered: {error}")
             if order == ORDER_KILL:
                 # The spec makes forced termination the standard escalation and only SHOULDs a
                 # prompt exit, so this is worth recording and not worth failing on. The

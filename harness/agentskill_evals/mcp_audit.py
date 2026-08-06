@@ -547,8 +547,22 @@ def validate(record: Record) -> tuple[str, ...]:
     # Same rule, same reason, for the other injection. A run whose guardian was broken on
     # purpose has to SAY which way, or the audit cannot tell an injected failure from a real
     # one — and the arming is once again the only thing that would otherwise be reported.
-    if record.guardian is not _MISSING and record.guardian not in GUARDIAN_MODES:
-        problems.append(f"guardian_mode_unknown:{record.guardian!r}")
+    #
+    # `isinstance` FIRST, for the reason the log reader states over `kind`: `[] in
+    # GUARDIAN_MODES` raises `TypeError: unhashable type`, inside the one function whose whole
+    # contract is that it does not raise (review, PR #103). EVERY OTHER MEMBERSHIP TEST HERE
+    # READS A FIELD THE PARSER ALREADY NARROWED to `str | None`; this field and `child_status`
+    # are the only two carried RAW, because for both of them "present but wrong" is a different
+    # verdict from "absent" and normalizing would erase the difference. `child_status` was safe
+    # by luck rather than by design — `is_json_int` is an isinstance check and so total over
+    # any value — so the rule a raw field owes is that ITS PREDICATE IS TOTAL, and the arm
+    # `audit.no_json_value_can_make_the_reader_raise` drives an unhashable value through every
+    # membership-tested position so the next raw field cannot be added without meeting it.
+    if record.guardian is not _MISSING:
+        if not isinstance(record.guardian, str):
+            problems.append(f"guardian_mode_not_a_string:{record.guardian!r}")
+        elif record.guardian not in GUARDIAN_MODES:
+            problems.append(f"guardian_mode_unknown:{record.guardian!r}")
 
     return tuple(problems)
 

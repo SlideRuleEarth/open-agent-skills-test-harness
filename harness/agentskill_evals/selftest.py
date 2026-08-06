@@ -10383,6 +10383,52 @@ def _check_mcp_audit_verdict(failures, verbose):
            f"one here, and a key nobody reads can say anything at all: "
            f"{probs(guarded)} {probs(bad_mode)} {probs(bad_key)}", failures, verbose)
 
+    # EVERY POSITION THE VALIDATOR MEMBERSHIP-TESTS, driven with a value that is legal JSON and
+    # unhashable. `[] in FROZENSET` raises `TypeError: unhashable type`, and `verdict()` is
+    # called by every consumer under a contract that it does not raise — so each of these is a
+    # decoded log line that CRASHES the reader instead of failing the cell. `guardian` was the
+    # one that did (review, PR #103): it is carried raw, like `child_status`, because for both
+    # of them "present but wrong" is a different verdict from "absent" — but `child_status`'s
+    # predicate is an isinstance check and total, and `guardian`'s was a set lookup.
+    #
+    # THE ARM IS OVER THE POSITIONS, NOT OVER THE ONE THAT BROKE. What makes the other nine safe
+    # is a parser invariant — every string-typed field is narrowed before the validator sees it
+    # — and an invariant nothing drives is a comment. The next raw field added has to meet this.
+    unhashable = {
+        "trigger reason": rec(triggers=[{"reason": []}]),
+        "trigger anomaly": rec(triggers=[{"reason": A.PROTOCOL_ANOMALY, "anomaly": []}]),
+        "outcome kind": rec(outcomes=[{"kind": []}]),
+        "outcome fact": rec(outcomes=[{"kind": A.SHUTDOWN_ANOMALY, "fact": [],
+                                       "exception": "OSError"}]),
+        "fact state": rec(fact_map=facts(**{A.DRAIN_ENDED: {"state": []}})),
+        "fact cause": rec(fact_map=facts(**{A.DRAIN_ENDED: {"state": A.FAILED, "cause": []}})),
+        "fired fact": rec(fault_point={"suppresses": []}, fired=[{"fact": []}]),
+        "suppression target": rec(fault_point={"suppresses": [[]]}),
+        "guardian mode": rec(fault_point={"suppresses": [], "guardian": []}),
+        "child status": rec(child_status=[]),
+    }
+
+    def survives(raw):
+        """The verdict, or the exception the reader's contract says cannot happen."""
+        try:
+            return A.verdict(raw)
+        except BaseException as exc:              # noqa: BLE001 — that is the claim under test
+            return exc
+
+    read = {name: survives(raw) for name, raw in unhashable.items()}
+    _check("audit.no_json_value_can_make_the_reader_raise",
+           # The structural clause first: `all()` over an empty dict is the vacuous pass this
+           # arm would otherwise hand out for free. Then `problems` non-empty rather than
+           # `not clean`, because a reader that swallowed the value and shrugged would be a
+           # different defect with the same symptom, and this arm has to reject both.
+           bool(read) and all(isinstance(v, A.Verdict) and v.problems for v in read.values()),
+           f"the reader's whole contract is that arbitrary decoded JSON produces a VERDICT and "
+           f"never an exception, and a membership test is where that contract gets lost: the "
+           f"crashing value is legal JSON, and the caller that would have to handle the raise "
+           f"is `log_verdict`, which is what decides whether a gated cell passed. A crash there "
+           f"is not a failed cell — it is no verdict at all: "
+           f"{ {k: repr(v) for k, v in read.items()} }", failures, verbose)
+
     _check("audit.a_suppressed_step_is_recorded_without_being_excused",
            not A.verdict(fired_ok).clean
            and A.verdict(fired_ok).anomalous == (A.FAULT_POINT_CONFIGURED,),

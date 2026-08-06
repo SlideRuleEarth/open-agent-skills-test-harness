@@ -1081,10 +1081,12 @@ for _knob, _how in ((A.GUARDIAN_MISSING, "the guardian's program is not there"),
         _un_chan.close()
 
 # THE READY REPORT IS CHECKED AGAINST THE PROCESS THAT WAS STARTED, so a report from anything
-# else is not readiness. This is also the one establishment failure that happens AFTER the child
-# exists, which makes it the case that shows failing closed is not the same as walking away: the
-# proxy repudiates the report, closes the lifeline, and the guardian sweeps the group it still
-# holds the pin for.
+# else is not readiness. Phase one carries NO COMMAND, which is what makes the repudiation
+# total: the imposter's report is refused before the launch order is written, so no child was
+# ever started and there is no group for anyone to sweep. That is the two-phase handshake doing
+# the work — under the single-phase version the order had already gone down the pipe by the time
+# the pid was compared, and the declared command ran in runs the audit called `spawn_failed`
+# (review, PR #103). The marker sampling below is what holds that claim to its word.
 _imp_nonce, _imp_chan, _imposter = unguarded_case(A.GUARDIAN_IMPOSTER)
 try:
     check("a ready report whose pid is not the guardian's is not readiness",
@@ -1184,6 +1186,20 @@ try:
           f"a loud anomaly does not authorize signalling an uncertain identity: the server is "
           f"left running and the record says the group was not accounted for. §10.6 carries "
           f"this as a limit of the design: {_lost}")
+    # AND THE RECORD MUST NOT CLAIM THE SIGNAL IT REFUSED TO SEND. `shutdown_child_killed` is
+    # step 3's statement that this instance delivered a `SIGKILL` to the child's group; the
+    # escalation used to write it whether or not `_deliver` reported success, so this exact run
+    # — the one whose policy is to signal NOTHING — logged a kill beside the two failures
+    # proving nothing was signalled (review, PR #103). Pinned as an ABSENCE, which is worth
+    # something only beside the two cases far above that pin its PRESENCE — the clean forced
+    # termination and the `stuck` run whose outcomes are exactly `[child_killed, anomaly]`. With
+    # those, this is not a check that passes because the string is never produced anywhere.
+    check("...and records no kill it did not deliver",
+          A.SHUTDOWN_CHILD_KILLED not in _lost.outcomes
+          and _lost.state(A.DRAIN_ENDED) == A.FAILED,
+          f"an audit that reports an act the code declined to perform is worse than one that "
+          f"reports nothing: the drain failed because there was nobody to signal, and that is "
+          f"what it has to say: {_lost.outcomes}")
 finally:
     reap_group(_lost_rec if isinstance(_lost_rec, dict) else None, _lost_nonce, _lost_chan)
     _lost_chan.close()
