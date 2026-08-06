@@ -106,9 +106,17 @@ SELFTEST = "agentskill_evals/selftest.py"
 SHIM = "fixtures/probe_era_mcp_server.py"
 ECHO = "fixtures/echo_mcp_server.py"
 PIPEPROBE = "tools/probe_mcp_pipelining.py"
-# Not a target, the second suite itself. A mutation aimed here would be asking the verifier
-# whether it notices being broken.
+# The proxy's I/O half and the awkward server it is driven against. PRODUCTION code that no
+# selftest arm can reach — it is only executed by running the real program over real pipes —
+# so it is `M*` like any other production target, proven by a THIRD suite. The classification
+# and the suite are different questions, and conflating them is what the split below fixes:
+# `M`/`I`/`F` says what a mutation perturbs, `_suite_for` says who would notice.
+PROXY_IO = "agentskill_evals/mcp_proxy_io.py"
+TARGET = "fixtures/proxy_target_server.py"
+# Not targets, the suites themselves. A mutation aimed here would be asking a verifier whether
+# it notices being broken.
 VERIFIER = "tools/verify_mcp_fixtures.py"
+PROXY_VERIFIER = "tools/verify_mcp_proxy.py"
 SELF = "tools/mutate_mcp.py"
 
 MUTATIONS = [
@@ -136,9 +144,13 @@ MUTATIONS = [
      "            command=_abs_command(s.command, base_dir),\n            args=[_abs_arg(a, base_dir) for a in s.args],",
      "            command=_abs_command(sub(s.command) if s.command else None, base_dir),\n            args=[_abs_arg(sub(a), base_dir) for a in s.args],",
      "mcp.interpolation_cannot_choose_what_program_runs"),
+    # The `str` redactor. Its `bytes` twin two functions down runs the identical loop, so the
+    # bare line matched both and this mutation only ever reached whichever came first.
     ("M7-redact-shortest-first", MCP,
-     "    for form in sorted(forms, key=len, reverse=True):",
-     "    for form in sorted(forms, key=len):",
+     ("    for form in sorted(forms, key=len, reverse=True):\n"
+      "        text = text.replace(form, REDACTED)"),
+     ("    for form in sorted(forms, key=len):\n"
+      "        text = text.replace(form, REDACTED)"),
      "mcp.longest_secret_is_redacted_first"),
     ("M8-no-short-secret-floor", MCP,
      "MIN_REDACTABLE_LEN = 6",
@@ -1300,9 +1312,9 @@ MUTATIONS = [
     # the side this boundary does not trust, and one observed response says nothing about the
     # next — so cancel, one straggler, reuse, second straggler, forwarded unfiltered.
     ("M178-quarantine-lifts-once-a-straggler-is-seen", PROXY,
-     '            return Drop(msg, f"late response to cancelled {origin} id {req_id!r}")\n',
+     "            return Drop(msg, DROP_LATE_CANCELLED,\n",
      ("            inflight._spent[origin].pop(inflight._key(req_id), None)\n"
-      '            return Drop(msg, f"late response to cancelled {origin} id {req_id!r}")\n'),
+      "            return Drop(msg, DROP_LATE_CANCELLED,\n"),
      "proxy.a_late_response_to_a_cancelled_request_is_dropped_not_fatal"),
     # The nested `requestId` goes unvalidated, so `requestId: []` reaches `dict.pop` through a
     # tuple and raises `TypeError: unhashable` inside a pump — the crash `valid_request_id`
@@ -1404,9 +1416,12 @@ MUTATIONS = [
     # the validator assume a shape instead of checking it, and the arm they redden catches the
     # resulting exception — a traceback out of `verify_post_run` is not a failed cell, it is an
     # absent verdict, which is the outcome §10.5 exists to make impossible.
+    # LEADING NEWLINE, per §4: `parse_log` runs the same test on each LINE at 8 spaces, and this
+    # 4-space anchor is a substring of it. The newline pins it to `parse()`, which is the reader
+    # this mutation names.
     ("M184-reader-assumes-its-input-is-a-map", AUDIT,
-     "    if not isinstance(raw, dict):",
-     "    if False:",
+     "\n    if not isinstance(raw, dict):",
+     "\n    if False:",
      "audit.every_malformed_shape_is_a_problem_code_not_an_exception"),
     ("M185-reader-assumes-a-list-where-json-allows-anything", AUDIT,
      "    if not isinstance(value, list):",
@@ -1418,9 +1433,17 @@ MUTATIONS = [
      ('        if False:\n'
       '            problems.append(f"trigger_not_a_map:{i}")'),
      "audit.every_malformed_shape_is_a_problem_code_not_an_exception"),
+    # BOTH SITES, per M53. `_str_or` and `_opt_str` run the identical test on identical lines —
+    # `_opt_str`'s own docstring says "it is the same idiom" — so no leading newline separates
+    # them and removing the rule from one leaves the other enforcing it. A property defended in
+    # two places needs a mutation that removes both.
     ("M187-reader-assumes-a-scalar-is-a-string", AUDIT,
-     "    if isinstance(value, str):",
-     "    if True:",
+     (("def _str_or(value: Any, problems: list[str], code: str) -> str | None:\n"
+       "    if isinstance(value, str):"),
+      "    value = entry[key]\n    if isinstance(value, str):"),
+     (("def _str_or(value: Any, problems: list[str], code: str) -> str | None:\n"
+       "    if True:"),
+      "    value = entry[key]\n    if True:"),
      "audit.every_malformed_shape_is_a_problem_code_not_an_exception"),
     # `raw.get(k) or []` in its original form: a writer that forgot an axis entirely then
     # validates as one that recorded nothing on it, and recording nothing is legal.
@@ -1575,7 +1598,7 @@ MUTATIONS = [
     # Presence back in place of the value: `null`, `"fabricated"` and `true` are then all a
     # clean verdict, and the record claims evidence it does not carry.
     ("M226-child-status-is-checked-for-presence-not-content", AUDIT,
-     "    if present and not is_exit_status(record.child_status):",
+     "    if present and not is_json_int(record.child_status):",
      "    if False:",
      "audit.child_status_is_an_exit_status_and_not_merely_present"),
     # ...and the type check that a boolean walks straight through, because `isinstance(True,
@@ -1657,9 +1680,11 @@ MUTATIONS = [
      "audit.a_suppressed_step_is_recorded_without_being_excused"),
 
     # ---- the verdict as a conjunction over everything -------------------------------------
+    # Leading newline again: `instance_verdict` computes the same tuple at 8 spaces, and the
+    # 4-space anchor is a substring of it. This one is `verdict()`, the entry point the arm reads.
     ("M217-verdict-reads-only-the-first-reason", AUDIT,
-     "    anomalous = tuple(r for r in reasons(record) if not is_clean(r))",
-     "    anomalous = tuple(r for r in reasons(record)[:1] if not is_clean(r))",
+     "\n    anomalous = tuple(r for r in reasons(record) if not is_clean(r))",
+     "\n    anomalous = tuple(r for r in reasons(record)[:1] if not is_clean(r))",
      "audit.each_axis_can_fail_the_instance_on_its_own"),
     ("M218-cleanup-outcomes-do-not-reach-the-verdict", AUDIT,
      "    out += [o.kind for o in record.outcomes]",
@@ -1699,6 +1724,617 @@ MUTATIONS = [
      "    SHUTDOWN_CHILD_KILLED,\n})",
      "    SHUTDOWN_CHILD_KILLED,\n    SHUTDOWN_READ_FAILED,\n})",
      "audit.is_clean_is_total_and_has_no_default_clean_branch"),
+
+    # ---- the audit LOG: instances, the absence rule, and the cell verdict ---------------
+    # Everything above judges one instance from a map. These perturb the layer that decides
+    # WHICH records make up an instance and whether the file as a whole clears the cell —
+    # where the failures have nothing to enumerate, because the process that would have named
+    # a reason is already gone.
+
+    # The false-failure direction, which §10.5 weighs exactly as heavily as the false pass.
+    # Every line then reports its own required keys as unrecognized, so the reader refuses
+    # every log ever written and the arms that assert a rule fires stay green throughout.
+    ("M233-the-reader-rejects-every-log", AUDIT,
+     "    known = _ENVELOPE_KEYS.union(required, optional)",
+     "    known = _ENVELOPE_KEYS",
+     "audit_log.an_ordinary_gated_run_reads_clean"),
+    # The refinement §10.5 spells out: a proper-subset allowlist normally MEANS the server
+    # advertises off-list tools and the proxy strips them, so a rule read off `removed` the
+    # same way as `forwarded` fails precisely the cell where filtering worked.
+    ("M234-a-stripped-tool-is-read-as-a-leaked-one", AUDIT,
+     "                if name in allowed:",
+     "                if name not in allowed:",
+     "audit_log.a_filtered_advertisement_is_an_expected_event"),
+
+    # ---- the endings with no reason to record --------------------------------------------
+    ("M235-a-start-with-no-terminator-passes", AUDIT,
+     '        problems.append("terminator_absent")',
+     "        pass",
+     "audit_log.a_start_with_no_terminator_is_an_anomaly"),
+    # The partial final line waved through as "just a partial write", which turns a proxy
+    # killed mid-record into one that ended cleanly — and leaves nothing in the file saying so.
+    ("M236-a-truncated-line-is-silently-skipped", AUDIT,
+     '            problems.append(f"unparseable_line:{i}")',
+     "            pass",
+     "audit_log.a_truncated_final_line_is_absent_rather_than_repaired"),
+    # The vacuity guard removed: `all()` over no instances is True, so a gated server whose
+    # proxy never wrote a start record certifies an UNGATED run.
+    ("M237-an-empty-log-is-vacuously-clean", AUDIT,
+     '        problems = problems + ("no_instances",)',
+     "        pass",
+     "audit_log.an_empty_log_is_not_a_clean_log"),
+    ("M238-a-blank-line-is-not-worth-reporting", AUDIT,
+     '            problems.append(f"blank_line:{i}")',
+     "            pass",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
+
+    # ---- the no-heal rule ------------------------------------------------------------------
+    # "Find the latest verdict for this server", written exactly as anyone would write it.
+    # Every clean restart then papers over the anomalous instance ahead of it.
+    ("M239-the-last-instance-answers-for-the-file", AUDIT,
+     "    return LogVerdict(clean=not problems and all(v.clean for v in verdicts),",
+     "    return LogVerdict(clean=not problems and all(v.clean for v in verdicts[-1:]),",
+     "audit_log.a_clean_restart_never_heals_the_instance_before_it"),
+    ("M240-a-terminator-with-no-start-is-forgiven", AUDIT,
+     '        problems.append("start_absent")',
+     "        pass",
+     "audit_log.a_terminator_answers_only_for_its_own_instance"),
+    # The second record wins, which is what a writer reusing an instance id across restarts
+    # produces: the later run's clean terminator read as the earlier run's.
+    ("M241-a-second-record-overwrites-the-first", AUDIT,
+     "        elif entry[kind] is not None:",
+     "        elif False:",
+     "audit_log.a_second_record_never_overwrites_the_first"),
+    ("M242-the-per-instance-grammar-is-not-checked", AUDIT,
+     "        if ranks != sorted(ranks):",
+     "        if False:",
+     "audit_log.the_terminator_is_last_and_the_start_is_first"),
+    # The half that WAS checked before, so this one pins the half that was not: a start-first
+    # test accepts a terminator with a spawn, an event, or anything else recorded after it —
+    # a terminator that does not terminate.
+    ("M280-only-the-start-record-has-to-be-first", AUDIT,
+     "        if ranks != sorted(ranks):",
+     "        if kinds and kinds[0] != LINE_START:",
+     "audit_log.the_terminator_is_last_and_the_start_is_first"),
+
+    # ---- §10.6's guarantee, read back off the log -----------------------------------------
+    ("M243-an-off-list-tool-may-be-advertised", AUDIT,
+     "                if name not in allowed:",
+     "                if False:",
+     "audit_log.the_allowlist_is_checked_in_both_directions"),
+    ("M244-an-off-list-call-may-be-forwarded", AUDIT,
+     "            elif kind == CALL_FORWARDED and tool not in allowed:",
+     "            elif False:",
+     "audit_log.the_allowlist_is_checked_in_both_directions"),
+    # The direction a "reject everything" proxy passes: refusing a tool the scenario allowed
+    # is a silently reduced tool surface, which is a WRONG eval rather than a failed one.
+    ("M245-an-allowed-tool-may-be-refused", AUDIT,
+     "            elif kind == CALL_REFUSED and tool in allowed:",
+     "            elif False:",
+     "audit_log.the_allowlist_is_checked_in_both_directions"),
+
+    # ---- the line and event envelopes ------------------------------------------------------
+    # `["start"] in LINE_KINDS` raises `TypeError: unhashable type` — §10.4's envelope crash
+    # arriving inside the one component whose contract is that it does not raise.
+    ("M246-a-line-kind-is-looked-up-before-it-is-typed", AUDIT,
+     "        if not isinstance(kind, str) or kind not in LINE_KINDS:",
+     "        if kind not in LINE_KINDS:",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
+    # An unrecognized key on a record, unreported — which is how an interpolated credential
+    # ends up in an artifact nobody is checking the shape of.
+    ("M247-an-unrecognized-key-on-a-record-is-ignored", AUDIT,
+     "    for key in sorted(set(record) - known):",
+     "    for key in ():",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
+    ("M248-an-event-need-not-carry-its-payload", AUDIT,
+     "        for key in _EVENT_FIELDS[kind]:",
+     "        for key in ():",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
+    # The tagged-union rule the record layer already applies, one level up: a payload on the
+    # wrong event kind is read by nobody, so it can say anything and nothing disagrees.
+    ("M249-a-payload-on-the-wrong-event-kind-is-tolerated", AUDIT,
+     "        for key in sorted(_EVENT_PAYLOAD_KEYS - set(_EVENT_FIELDS[kind])):",
+     "        for key in ():",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
+    # §10.7's claim for this log is that it is wire-level evidence "per call ... and WHEN".
+    ("M250-a-record-need-not-say-when", AUDIT,
+     "        usable = is_json_int(ts) or (isinstance(ts, float) and math.isfinite(ts))",
+     "        usable = True",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
+    # ...and the half of that rule that `isinstance(x, float)` alone gets wrong: `NaN` and
+    # `Infinity` are floats and are not times, which is `isinstance(True, int)` one type over.
+    ("M296-a-non-finite-float-is-a-timestamp", AUDIT,
+     "        usable = is_json_int(ts) or (isinstance(ts, float) and math.isfinite(ts))",
+     "        usable = is_json_int(ts) or isinstance(ts, float)",
+     "audit_log.a_timestamp_is_a_finite_number_and_NaN_is_not_a_line"),
+    # ...and the decoder half, which is why a NaN never reaches the check above from a real
+    # log: the same `parse_constant` refusal the wire uses, applied to the file.
+    ("M297-the-log-decoder-accepts-a-python-extension", AUDIT,
+     "            raw = json.loads(line, parse_constant=refuse_json_extension)",
+     "            raw = json.loads(line)",
+     "audit_log.a_timestamp_is_a_finite_number_and_NaN_is_not_a_line"),
+    # The guardian's evidence unvalidated again: optional and unread is how it read clean with
+    # the field missing, `false`, or `"alive"` (review, PR #103).
+    ("M298-guardian-evidence-is-optional-again", AUDIT,
+     '    LINE_SPAWN: (("child_pid", "child_pgid", "guardian_pid"), ()),',
+     '    LINE_SPAWN: (("child_pid", "child_pgid"), ("guardian_pid",)),',
+     "audit_log.a_spawn_record_must_carry_usable_guardian_evidence"),
+    ("M299-any-guardian-value-will-do", AUDIT,
+     "        if not is_json_int(guardian) or guardian <= 0:",
+     "        if guardian is None:",
+     "audit_log.a_spawn_record_must_carry_usable_guardian_evidence"),
+    # ...and the half of §10.7's claim that is actually about calls: the rule applied to the
+    # three lifecycle records and not to the event records it exists for.
+    ("M279-only-the-lifecycle-records-need-a-time", AUDIT,
+     "    for record in inst.records:",
+     "    for record in (inst.start or {}, inst.spawn or {}, inst.terminator or {}):",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
+
+    # ---- the start and spawn records' own claims -------------------------------------------
+    ("M251-the-log-need-not-name-the-server-it-gates", AUDIT,
+     "        if not isinstance(name, str) or name != server:",
+     "        if False:",
+     "audit_log.the_log_belongs_to_the_server_it_gates"),
+    ("M252-a-spawn-record-may-survive-spawn-failed", AUDIT,
+     "    if record.latch == SPAWN_FAILED and inst.spawn is not None:",
+     "    if False:",
+     "audit_log.a_spawn_record_and_spawn_failed_are_exact_complements"),
+    ("M253-a-child-may-be-forwarded-to-without-a-spawn-record", AUDIT,
+     "    if record.latch != SPAWN_FAILED and inst.spawn is None:",
+     "    if False:",
+     "audit_log.a_spawn_record_and_spawn_failed_are_exact_complements"),
+    # `start_new_session=True` makes the child its own group leader, so a spawn record where
+    # pid and pgid disagree says the group step 4 killed was not the group the child was in —
+    # a surviving credential-bearing grandchild, reported as a successful cleanup.
+    ("M254-the-child-need-not-lead-its-own-group", AUDIT,
+     "        elif pid != pgid:",
+     "        elif False:",
+     "audit_log.the_spawn_record_must_name_a_group_leader"),
+    ("M255-a-pid-is-taken-on-trust", AUDIT,
+     "        if not is_json_int(pid) or not is_json_int(pgid):",
+     "        if False:",
+     "audit_log.the_spawn_record_must_name_a_group_leader"),
+
+    # ---- arming rides on the start record --------------------------------------------------
+    # A terminator allowed to declare an arming that never happened...
+    ("M256-a-terminator-may-declare-its-own-arming", AUDIT,
+     '    raw = {k: v for k, v in (inst.terminator or {}).items() if k != "fault_point"}',
+     "    raw = dict(inst.terminator or {})",
+     "audit_log.arming_is_read_from_the_start_record_and_nowhere_else"),
+    # ...and the direction that matters more: one allowed to hide an arming that did.
+    ("M257-arming-recorded-at-the-start-is-not-read", AUDIT,
+     '    if inst.start is not None and "fault_point" in inst.start:',
+     "    if False:",
+     "audit_log.arming_is_read_from_the_start_record_and_nowhere_else"),
+
+    # ---- §10.7's telemetry as evidence about the gate --------------------------------------
+    ("M258-an-unimplemented-version-may-be-observed", AUDIT,
+     "        elif version not in IMPLEMENTED_VERSIONS:",
+     "        elif False:",
+     "audit_log.an_observed_version_the_proxy_cannot_implement_is_a_leak"),
+
+    # ---- the proxy's I/O half, proven by tools/verify_mcp_proxy.py ----------------------
+    # Production code the selftest cannot reach: it is only executed by running the real
+    # program over real pipes, which is why the third suite exists. Every entry below is a
+    # defect that would produce a plausible-looking run — the whole failure mode §10.5 names,
+    # where a bug is a silently wrong eval rather than a loud failure.
+
+    # The audit log's evidence about the one thing it exists to record. The client still sees a
+    # filtered list, so nothing on the wire looks wrong; only the log is lying.
+    ("M259-the-log-understates-what-was-forwarded", PROXY_IO,
+     "                            forwarded=[n for n in kept if isinstance(n, str)],",
+     "                            forwarded=[],",
+     "...and the audit log records the filtering as the expected event it is"),
+    # The filtered list sent back to the SERVER instead of on to the client, so the client is
+    # answered by nothing and the server is told what its own tools are.
+    ("M260-a-filtered-result-goes-back-the-way-it-came", PROXY_IO,
+     ("                            removed=list(action.removed))\n"
+      "            self._send(direction, action.msg, back=False, shutting_down=shutting_down)"),
+     ("                            removed=list(action.removed))\n"
+      "            self._send(direction, action.msg, back=True, shutting_down=shutting_down)"),
+     "an off-list tool is stripped from the advertisement the client sees"),
+    # ...and the mirror image: the refusal forwarded to the server, which is the whole boundary
+    # inverted — the off-list call reaches the server and the client is never answered.
+    ("M261-a-refusal-is-forwarded-instead-of-answered", PROXY_IO,
+     ("            self.sink.write(audit.LINE_EVENT, event=audit.CALL_REFUSED, "
+      "tool=action.tool)\n"
+      "            self._send(direction, action.msg, back=True, shutting_down=shutting_down)"),
+     ("            self.sink.write(audit.LINE_EVENT, event=audit.CALL_REFUSED, "
+      "tool=action.tool)\n"
+      "            self._send(direction, action.msg, back=False, shutting_down=shutting_down)"),
+     "an off-list `tools/call` is answered by the proxy and never reaches the server"),
+    # `Fail` stops being terminal, which is the one thing §10.5 says it must be. The connection
+    # carries on and the cell passes with an unaccounted-for message in it.
+    ("M262-an-anomaly-does-not-stop-the-connection", PROXY_IO,
+     "            self._trigger(audit.PROTOCOL_ANOMALY, anomaly=action.anomaly.kind)",
+     "            pass",
+     "a JSON-RPC batch array is an anomaly, not traffic"),
+    # The tag without its payload: torn down for a protocol reason, declining to say which.
+    ("M263-the-anomaly-kind-is-not-recorded", PROXY_IO,
+     "            self._trigger(audit.PROTOCOL_ANOMALY, anomaly=action.anomaly.kind)",
+     "            self._trigger(audit.PROTOCOL_ANOMALY, anomaly=None)",
+     "protocol_anomaly: it carries WHICH anomaly, not just that there was one"),
+
+    # ---- the three ways an ending gets the wrong name -------------------------------------
+    # A server that died mid-request read as the client hanging up. The spec tells clients to
+    # RESTART an unexpectedly exited server, so this is the case most easily mistaken for
+    # normality — and it is the difference between a failed cell and a clean one.
+    ("M264-a-dead-child-reads-as-a-departing-client", PROXY_IO,
+     "                self._trigger(audit.CHILD_EXIT)",
+     "                self._trigger(audit.CLIENT_EOF)",
+     "child_exit: a server that exits while the connection is live"),
+    # §4's canonical defect, in the proxy this time: a swallowed read error presenting as a
+    # clean end of stream, so an instrument failure wears the clean-shutdown label.
+    ("M265-a-read-error-wears-the-clean-shutdown-label", PROXY_IO,
+     ("            _note(f\"mcp-proxy: read failed on {direction}: {exc}\")\n"
+      "            self._trigger(audit.READ_FAILED)"),
+     ("            _note(f\"mcp-proxy: read failed on {direction}: {exc}\")\n"
+      "            self._trigger(audit.CLIENT_EOF)"),
+     "read_failed: a read error is not an end of stream"),
+    # PHASE IS PART OF THE REASON, and these are the two directions of getting it wrong. First:
+    # the shutdown-phase write failure recorded as a live one, which fails every clean agy cell
+    # — C3-1 measured agy closing stdin and ceasing to read at once.
+    ("M266-the-shutdown-drain-fails-the-cell-on-EPIPE", PROXY_IO,
+     "            if shutting_down:",
+     "            if False:",
+     "shutdown_write_failed: measured against agy — recorded, swallowed, and CLEAN"),
+    # ...and the reverse: a write that failed MID-CONVERSATION, with what it carried never
+    # arriving, recorded as the clean teardown outcome and the cell passing.
+    ("M267-a-live-write-failure-is-forgiven-as-a-teardown-one", PROXY_IO,
+     "            if shutting_down:",
+     "            if True:",
+     "client_write_failed: a write to a departed client DURING forwarding"),
+
+    # ---- the shutdown sequence -------------------------------------------------------------
+    # No handlers, so default disposition terminates without running one and no terminator is
+    # written — on HALF THE SHIPPED FLEET, since C3-1 measured codex and copilot signalling
+    # rather than closing stdin. A false failure indistinguishable from the real one.
+    ("M268-the-signal-handlers-are-never-installed", PROXY_IO,
+     "            signal.signal(sig, lambda _sig, _frame: None)",
+     "            pass",
+     "signal_term: the client signals, and the handler still writes a terminator"),
+    # The runners-up sweep dropped, so a signal arriving during the teardown goes unrecorded and
+    # the log cannot say a CLI closed stdin and then signalled.
+    # Leading newline: `_pump`'s select loop calls the same handler at 24 spaces. The site this
+    # names is the runners-up collection AFTER the pump, which is where a signal is lost.
+    ("M269-a-signal-during-the-teardown-is-lost", PROXY_IO,
+     "\n            self._on_signal(wake_r)",
+     "\n            pass",
+     "a client that closes stdin and THEN signals records both, and stays clean"),
+    # A buffered log, which makes a killed proxy indistinguishable from one that never ran —
+    # and "never ran" is the half of §10.5's partition that is NOT a failure.
+    # DEFENDED IN TWO PLACES, so reintroducing the defect has to remove both (cf. M53): the
+    # handle is opened LINE-BUFFERED and every write is flushed besides, which means neither
+    # edit alone changes the bytes on disk. A block-buffered log is the actual failure — the
+    # start record sits in userspace when the SIGKILL lands, and a killed proxy becomes
+    # indistinguishable from one that never ran.
+    ("M270-the-audit-log-is-not-flushed-per-record", PROXY_IO,
+     ('            self._handle = open(path, "a", buffering=1, encoding="utf-8")',
+      "        self._handle.flush()"),
+     ('            self._handle = open(path, "a", encoding="utf-8")',
+      "        pass"),
+     "...and the start record was flushed before the child was spawned"),
+    # Truncation instead of append, so the anomalous first instance vanishes rather than fails.
+    ("M271-a-restart-truncates-the-log", PROXY_IO,
+     '            self._handle = open(path, "a", buffering=1, encoding="utf-8")',
+     '            self._handle = open(path, "w", buffering=1, encoding="utf-8")',
+     "a restarted proxy APPENDS, so the killed instance is still in the file"),
+    # STEP 4 AS A NO-OP, claiming success. This is the mutation the two liveness channels exist
+    # for: every other check in that file passes against it, the record says `group_terminated:
+    # done`, and a credential-bearing grandchild outlives the run.
+    # DEFENDED IN TWO PLACES since the guardian became the child's parent (cf. M53, M270), and
+    # the second one is deliberate rather than incidental: the reap order sweeps the group
+    # before it releases the pin, because reaping is what ends the guardian's licence to signal.
+    # Removing step 4 alone therefore leaves nothing alive and reddens only the record checks —
+    # which is the arm agreeing with the defect one level away from where the defect lives. The
+    # single-edit version was written first and reported exactly that.
+    ("M272-the-process-group-is-never-terminated", PROXY_IO,
+     ("        delivered = self._step(audit.GROUP_TERMINATED, self._terminate_group)   # step 4",
+      "        self._signal(signal.SIGKILL)\n        try:\n            self.child.wait("),
+     (("        delivered = True\n"
+       "        self._done(audit.GROUP_TERMINATED)                                   # step 4"),
+      "        try:\n            self.child.wait("),
+     "an ordinary clean shutdown leaves nothing in the child's process group alive"),
+    # Forced termination made a failure, so a server that merely needed SIGKILL fails the cell —
+    # which §10.5.1 classifies CLEAN because the spec only SHOULDs a prompt exit.
+    ("M273-a-killed-child-fails-the-cell", PROXY_IO,
+     "                self._outcome(audit.SHUTDOWN_CHILD_KILLED)",
+     "                self._outcome(audit.SHUTDOWN_READ_FAILED)",
+     "shutdown_child_killed: forced termination is the standard escalation, so CLEAN"),
+    # The drain given its own deadline again, so the escalation never runs and a server that
+    # needed SIGKILL is reported as a `shutdown_anomaly` instead of ending cleanly.
+    # BOTH ANCHORS CARRY CONTEXT UNIQUE TO STEP 3, because step 4's loop is now textually
+    # identical — same orders, same `_deliver`, same refusal check. `replace(..., 1)` would take
+    # whichever came first in the file and report CAUGHT either way, so an ambiguous anchor here
+    # is a mutation that quietly stops testing what it names.
+    ("M274-the-drain-gives-up-before-the-escalation", PROXY_IO,
+     ('            raise TimeoutError("step 3 is suppressed, and the child has not finished")\n'
+      "        for order in (ORDER_TERM, ORDER_KILL):"),
+     ('            raise TimeoutError("step 3 is suppressed, and the child has not finished")\n'
+      "        for order in ():"),
+     "shutdown_child_killed: forced termination is the standard escalation, so CLEAN"),
+    # The escalation's refusal ignored, so `shutdown_child_killed` is written on the path where
+    # NOTHING was signalled — the guardian-loss ending, whose policy is deliberately to signal
+    # nothing, logging a kill beside the two failures proving it did not happen.
+    ("M317-a-kill-that-could-not-be-delivered-is-recorded-as-delivered", PROXY_IO,
+     ("                raise _EscalationUndelivered(\n"
+      '                    f"the child\'s stdout was still open and step 3\'s escalation could '
+      'not be "\n                    f"delivered: {error}")'),
+     "                pass",
+     "...and records no kill it did not deliver"),
+    # An unbounded drain instead of an anomaly: something outside the child's group holds its
+    # stdout and the proxy waits for it, which is a hang rather than a verdict.
+    ("M275-a-drain-that-never-ends-is-not-reported", PROXY_IO,
+     '        raise TimeoutError(\n            f"the child\'s stdout was still open after a group SIGKILL',
+     '        self._done(audit.DRAIN_ENDED)\n        return\n        raise TimeoutError(\n            f"the child\'s stdout was still open after a group SIGKILL',
+     "shutdown_anomaly: a bounded drain that never reaches EOF says so"),
+
+    # ---- the fault point, which is itself under test ---------------------------------------
+    # Arming not recorded, so a hook that silently never fires produces a PASSING run — the
+    # exact case §10.9 spends a dedicated arm-only run on.
+    ("M276-arming-is-not-recorded-in-the-start-record", PROXY_IO,
+     '            started["fault_point"] = self.fault.record()',
+     "            pass",
+     "armed and wired to suppress nothing STILL fails the instance"),
+    # Suppression that relabels the fact instead of skipping the step, so the control's steps
+    # 3-5 run after all and the processes it needs alive are killed.
+    ("M277-a-suppressed-step-runs-anyway", PROXY_IO,
+     ("        self.fired.append(fact)\n"
+      "        self._failed(fact, audit.FAULT_POINT_FIRED)\n"
+      "        return True"),
+     ("        self.fired.append(fact)\n"
+      "        self._failed(fact, audit.FAULT_POINT_FIRED)\n"
+      "        return False"),
+     "with steps 3-5 suppressed, BOTH channels are still open after the proxy exits"),
+    # Two incompatible accounts of one step: the typed outcome AND a firing, which says the step
+    # was attempted and failed and also that it never ran.
+    ("M278-an-injected-failure-also-claims-suppression", PROXY_IO,
+     ("        if mode == FAIL:\n"
+      "            typed = audit.typed_outcome(fact)"),
+     ("        if mode == FAIL:\n"
+      "            self.fired.append(fact)\n"
+      "            typed = audit.typed_outcome(fact)"),
+     "shutdown_read_failed: recorded, paired to drain_ended, and anomalous"),
+
+    # ---- framing: every way a line can fail to BE a line (review, PR #103) --------------
+    ("M281-an-empty-line-is-skipped-rather-than-refused", PROXY_IO,
+     "            try:\n                text = line.decode(\"utf-8\")",
+     ("            if not line.strip():\n                continue\n"
+      "            try:\n                text = line.decode(\"utf-8\")"),
+     "a blank line is not a message, and is terminal"),
+    # `errors="replace"` on a trust boundary is a REWRITE, not a tolerance: it forwards bytes
+    # the peer never sent, and the cell passes.
+    ("M282-undecodable-bytes-are-rewritten-and-forwarded", PROXY_IO,
+     '                text = line.decode("utf-8")',
+     '                text = line.decode("utf-8", "replace")',
+     "bytes that are not UTF-8 are not a message, and are terminal"),
+    # The residue discarded at EOF, so a stream that ended mid-message reads as one that ended.
+    ("M283-a-half-written-line-at-EOF-is-discarded", PROXY_IO,
+     "            self._flush_residue(direction)",
+     "            self._buffers[direction] = b\"\"",
+     "a partial line at EOF is not a message, and is terminal"),
+    # The drain's terminality test back to a truthiness check on an accumulator that the
+    # teardown guarantees is already non-empty, so a malformed frame is recorded and then
+    # followed by more forwarding.
+    ("M284-a-drain-anomaly-does-not-stop-the-drain", PROXY_IO,
+     "            if len(self.triggers) > before:",
+     "            if self.triggers and not shutting_down:",
+     "a malformed frame during the drain stops it, and what followed is not forwarded"),
+    ("M285-NaN-and-Infinity-reach-the-decision-layer", PROXY,
+     "        msg = json.loads(line, parse_constant=refuse_json_extension)",
+     "        msg = json.loads(line)",
+     "proxy.a_json_extension_constant_is_not_a_legal_message"),
+
+    # ---- the group's verdict is positive evidence, not an errno ------------------------
+    # THE REVIEWED DEFECT ITSELF: `EPERM` read as an empty group. It is drivable because a
+    # zombie-only group answers the probe with exactly that errno on macOS — which is how the
+    # original inference came to look measured — and the `child_reaped=fail` case leaves our own
+    # unreaped child in the group on purpose. A mutant that reads it as confirmation records one
+    # outcome where two are true, and would certify a live member a sandbox had made
+    # unsignallable (review, PR #103).
+    ("M286-an-unsignallable-group-is-confirmed-gone", PROXY_IO,
+     ("        except OSError:\n"
+      "            pass                         # present but unsignallable; still present"),
+     ("        except OSError:\n"
+      "            return True"),
+     "shutdown_reap_failed: recorded, paired to child_reaped, and anomalous"),
+    ("M287-the-group-is-never-confirmed-empty", PROXY_IO,
+     "            self._guard(audit.GROUP_TERMINATED, self._confirm_group_gone)",
+     "            self._done(audit.GROUP_TERMINATED)",
+     "shutdown_reap_failed: recorded, paired to child_reaped, and anomalous"),
+    # ...and the false-failure direction, which §10.5 weighs the same: `ESRCH` — the group is
+    # gone, which is the goal — no longer read as confirmation, so every clean cell fails.
+    ("M294-ESRCH-is-not-read-as-confirmation", PROXY_IO,
+     ("        except ProcessLookupError:\n"
+      "            return True\n"
+      "        except OSError:"),
+     ("        except ProcessLookupError:\n"
+      "            return False\n"
+      "        except OSError:"),
+     "...and the whole exchange still ends clean"),
+    # NO MUTATION for preferring the guardian's report over a probe of the proxy's own, and it
+    # is worth saying why rather than leaving the gap: by the time the fact is settled the reap
+    # has happened either way, so the two answers differ only inside the pid-reuse window — the
+    # thing nothing can stage. The report is kept because it is the tighter measurement, taken
+    # in the process that did the reaping; the probe is not wrong, it is later.
+
+    # ---- the guardian ------------------------------------------------------------------
+    # A guardian that never watches: it is the child's parent, so a proxy SIGKILLed before its
+    # teardown leaves a credential-bearing server with nothing that will terminate it. The
+    # audit still fails the cell, which is exactly why this needs a case that looks at the
+    # PROCESS rather than at the record.
+    # THE SWEEP ITSELF, made a no-op: the guardian still notices the death, still exits, and
+    # leaves the group running. This is the mutation that proves the whole mechanism, and it is
+    # deliberately aimed at the ACTION rather than at the detection — a guardian that exits
+    # early instead closes the report pipe, which the proxy reads as `guardian_lost` and cleans
+    # up from, so it reddens the record checks while leaving nothing alive. The arm and the
+    # defect agreeing one level away from the defect, again; the first version did exactly that.
+    ("M288-the-guardian-notices-and-does-nothing", PROXY_IO,
+     ("        self._signal(signal.SIGTERM)\n"
+      "        time.sleep(min(self.grace, 0.2))\n"
+      "        self._signal(signal.SIGKILL)"),
+     "        pass",
+     "a proxy SIGKILLed before its teardown: nothing in the child's process group is left alive"),
+    # ...and the detection: the lifeline's EOF no longer read as the proxy being gone, so the
+    # one ending the guardian exists for is the one it sits through.
+    # `return` RATHER THAN `continue`, and the difference is not stylistic. The first version
+    # spun: with the lifeline at EOF the descriptor is always readable, so the loop turned into
+    # a busy wait in a process that is its own session leader and has no parent to reap it —
+    # 24 orphans at 35% CPU each, accumulated across three runs before anyone looked at
+    # Activity Monitor, with the machine's load average at 186.
+    #
+    # A MUTANT IS BROKEN CODE BY CONSTRUCTION, SO THE BOUND IT BREAKS MAY BE ITS ONLY WAY OUT.
+    # That is a constraint on how mutations are WRITTEN and not something to be cleaned up
+    # after: the cleanup this incident first grew — a `ps`-scanning reaper in the runner — was
+    # a process-killing loop added to a test tool, and the mutation written to prove it worked
+    # was `kill(SIGKILL)` over every line of `ps ax`. Both are gone. A mutation of a loop exit
+    # must leave the process able to exit, and that is checked by reading it, here, before it
+    # is added.
+    ("M289-an-EOF-on-the-lifeline-is-not-a-death", PROXY_IO,
+     ("            if not order:\n"
+      "                break                    # EOF: the proxy is gone and never released "
+      "the pin"),
+     ("            if not order:\n"
+      "                return"),
+     "a proxy SIGKILLed before its teardown: nothing in the child's process group is left alive"),
+    # The guardian's program never runs the guardian, so no child is ever started and the
+    # handshake times out. Fail-closed is the intended behaviour of a MISSING guardian, so the
+    # arm this reddens is the one that drives that on purpose.
+    ("M295-the-guardian-program-does-nothing", PROXY_IO,
+     "        return run_guardian(int(args[1]))",
+     "        return 0",
+     "the control: with a working guardian, this wiring DOES start a server that announces"),
+    # Standing down on anything but a FIRED retention, which is the reviewed defect: a teardown
+    # that ran and failed silenced the mechanism that exists to clean up after it.
+    ("M290-any-teardown-that-ran-stands-the-guardian-down", PROXY_IO,
+     ("        retained = [f for f in (audit.GROUP_TERMINATED, audit.CHILD_REAPED) "
+      "if f in self.fired]"),
+     "        retained = [audit.GROUP_TERMINATED]",
+     ("steps 4 and 5 both failed, so the sweep is the one on the lifeline's EOF: and the group "
+      "is swept anyway, evidence kept")),
+    # ...and the other direction: standing down never happens, so the guardian sweeps up the
+    # survivors §10.9's control deliberately leaves alive and the evidence goes with them.
+    ("M302-the-guardian-is-never-stood-down", PROXY_IO,
+     "        if retained and self._lifeline is not None:",
+     "        if False:",
+     "with steps 3-5 suppressed, BOTH channels are still open after the proxy exits"),
+    # The reap that releases the pin no longer sweeps first, so a step 4 that failed leaves the
+    # group alive at exactly the moment the guardian stops being able to signal it.
+    ("M303-the-pin-is-released-without-a-sweep", PROXY_IO,
+     "        self._signal(signal.SIGKILL)\n        try:\n            self.child.wait(",
+     "        try:\n            self.child.wait(",
+     ("step 4 failed, so the reap order sweeps before it releases the pin: and the group is "
+      "swept anyway, evidence kept")),
+    # A guardian established after the child, which is the window a SIGKILL fits through — and
+    # is unreachable now that the guardian is what spawns it. What IS reachable is the other
+    # half of the same rule: a guardian that could not be established, not failing the run.
+    ("M304-an-unestablished-guardian-is-not-a-spawn-failure", PROXY_IO,
+     ("        ready = self._establish_guardian()\n"
+      "        if ready is None:"),
+     ("        ready = self._establish_guardian() or {\n"
+      "            \"guardian_pid\": 0, \"child_pid\": 0, \"child_pgid\": 0}\n"
+      "        if False:"),
+     "the guardian's program is not there: no server runs, and the instance ends `spawn_failed`"),
+    # The readiness handshake reduced to `Popen` having returned, which says a fork happened and
+    # nothing about whether our code ran in it.
+    ("M305-any-ready-report-will-do", PROXY_IO,
+     ("        if ready is None or not audit.is_json_int(ready.get(\"guardian_pid\")) \\\n"
+      "                or ready[\"guardian_pid\"] != self.guardian.pid:"),
+     "        if ready is None:",
+     "a ready report whose pid is not the guardian's is not readiness"),
+    # The guardian's death during a run treated as ordinary, so a live credential-bearing child
+    # keeps being forwarded to with nothing holding its identity.
+    ("M306-a-lost-guardian-is-not-terminal", PROXY_IO,
+     "        self._trigger(audit.GUARDIAN_LOST)",
+     "        pass",
+     "a guardian that dies once the child exists latches `guardian_lost`"),
+    # ...and the reviewed defect itself, reintroduced: with the pin holder gone, signal the
+    # remembered pgid anyway. `getpgid(pid) == pgid` is what used to authorize this, and it is
+    # not an identity — a reaped pid can be reused, and a group leader's pgid IS its pid, so the
+    # check degenerates to "some group leader has this number" (review, PR #103). The arm is the
+    # one that requires the server to be STILL RUNNING and the record to say so.
+    ("M307-a-lost-pin-signals-the-remembered-pgid-anyway", PROXY_IO,
+     ("        report = None if self._guardian_lost() else self._ask(order)\n"
+      "        if report is None:"),
+     ("        report = None if self._guardian_lost() else self._ask(order)\n"
+      "        if report is None and os.getpgid(self.child_pid) == self.child_pgid:\n"
+      "            os.killpg(self.child_pgid, signal.SIGKILL)\n"
+      "            return None\n"
+      "        if report is None:"),
+     "...and the proxy REFUSES to signal a group nothing can identify, and says so"),
+    # A DIAGNOSTIC THAT CAN ABORT THE CLEANUP IT DESCRIBES. The sweep's own log line, moved back
+    # ahead of the signal and written with a bare `print`: with the CLI's end of stderr closed
+    # it raises `BrokenPipeError`, the guardian exits, and a credential-bearing group survives.
+    ("M308-the-sweep-announces-itself-before-it-acts", PROXY_IO,
+     "        self._signal(signal.SIGTERM)\n        time.sleep(min(self.grace, 0.2))",
+     ('        print(f"mcp-proxy guardian: terminating group {self.child_pgid}",\n'
+      "              file=sys.stderr)\n"
+      "        self._signal(signal.SIGTERM)\n        time.sleep(min(self.grace, 0.2))"),
+     "...and the guardian still sweeps: a diagnostic cannot abort the cleanup it describes"),
+    # ...and the same rule one process over: a raising diagnostic inside the pump, which the
+    # catch-all then reports as `read_failed` — a protocol fault logged as a pipe fault.
+    ("M309-a-diagnostic-in-the-pump-can-raise", PROXY_IO,
+     '            _note(f"mcp-proxy: anomaly {action.anomaly.kind}: {action.anomaly.detail}")',
+     ('            print(f"mcp-proxy: anomaly {action.anomaly.kind}: '
+      '{action.anomaly.detail}",\n                  file=sys.stderr)'),
+     "a broken stderr does not turn a protocol anomaly into a read failure"),
+    # THE TWO-PHASE HANDSHAKE COLLAPSED BACK INTO ONE: the launch order written before the ready
+    # report is read, so the guardian holds a command before it has been authenticated and
+    # spawns the server the proxy is about to repudiate. The audit still says `spawn_failed` and
+    # records no spawn — which is exactly the point, since the marker proves the command ran.
+    # ONE EDIT, in the proxy, because the guardian needs none: it reads the next line whenever
+    # that line arrives, so writing it early is the whole defect.
+    ("M310-the-launch-order-goes-out-before-the-guardian-is-trusted", PROXY_IO,
+     ("        if not self._order(order_w, setup):\n"
+      "            return None\n"
+      "        ready = self._read_report(time.monotonic() + self.grace)"),
+     ("        if not self._order(order_w, setup):\n"
+      "            return None\n"
+      '        if not self._order(order_w, {"command": self.cfg.command,\n'
+      '                                     "args": list(self.cfg.args), "env": env,\n'
+      '                                     "cwd": self.cfg.cwd,\n'
+      '                                     "inherit": list(inherit)}):\n'
+      "            return None\n"
+      "        ready = self._read_report(time.monotonic() + self.grace)"),
+     "a rejected guardian is never told what to run, and says which phase it reached"),
+    # The guardian injection unrecorded again, so an injected guardian failure and a real one
+    # are the same record — a fault point with no provenance.
+    ("M312-the-guardian-injection-is-not-recorded", PROXY_IO,
+     ('        found = {"suppresses": sorted(self.targets)}\n'
+      "        if self.guardian:"),
+     ('        found = {"suppresses": sorted(self.targets)}\n'
+      "        if False:"),
+     "the guardian's program is not there: the injection is recorded in the start record"),
+    ("M313-a-guardian-injection-alone-does-not-arm-the-fault-point", PROXY_IO,
+     "            return cls(armed=bool(guardian), guardian=guardian)",
+     "            return cls(armed=False, guardian=guardian)",
+     "the guardian's program is not there: the injection is recorded in the start record"),
+    ("M314-any-guardian-mode-is-accepted", AUDIT,
+     "        elif record.guardian not in GUARDIAN_MODES:",
+     "        elif False:",
+     "audit.the_guardian_injection_is_recorded_beside_the_suppression_targets"),
+    ("M316-the-guardian-mode-is-membership-tested-before-it-is-typed", AUDIT,
+     ("        if not isinstance(record.guardian, str):\n"
+      '            problems.append(f"guardian_mode_not_a_string:{record.guardian!r}")\n'
+      "        elif record.guardian not in GUARDIAN_MODES:"),
+     ("        if False:\n"
+      '            problems.append(f"guardian_mode_not_a_string:{record.guardian!r}")\n'
+      "        elif record.guardian not in GUARDIAN_MODES:"),
+     "audit.no_json_value_can_make_the_reader_raise"),
+    ("M315-the-fault-point-map-is-open", AUDIT,
+     '            for key in sorted(set(raw["fault_point"]) - {"suppresses", "guardian"}):',
+     '            for key in sorted(set(raw["fault_point"]) - set(raw["fault_point"])):',
+     "audit.the_guardian_injection_is_recorded_beside_the_suppression_targets"),
+
+    # ---- the archived log carries codes, not prose --------------------------------------
+    ("M292-the-drop-event-carries-the-peers-own-text", PROXY_IO,
+     "self.sink.write(audit.LINE_EVENT, event=audit.MESSAGE_DROPPED, reason=action.code)",
+     "self.sink.write(audit.LINE_EVENT, event=audit.MESSAGE_DROPPED, reason=action.detail)",
+     "a late response to a cancelled request is dropped, and recorded as a CODE"),
+    ("M293-a-drop-reason-may-be-any-string", AUDIT,
+     "            if not isinstance(reason, str) or reason not in DROP_REASONS:",
+     "            if not isinstance(reason, str) or not reason:",
+     "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
 
     # ---- F: instruments, proven by tools/verify_mcp_fixtures.py -------------------------
     # Everything above asks whether the selftest notices a defect in production code. These
@@ -1762,6 +2398,7 @@ MUTATIONS = [
      "            if key in live:\n                duplicates.append(key)",
      "            if key in live:\n                reuse.append(key)",
      "a repeat BEFORE the response is a live duplicate, not that reuse"),
+
 ]
 
 
@@ -1781,7 +2418,15 @@ _SUITE_TIMEOUT = 300
 _SUITES = {
     "selftest": (("-m", "agentskill_evals", "selftest"), r"\[FAIL\]\s+([^:]+):"),
     "fixtures": ((VERIFIER,), r"^\s*FAIL\s+(.+?)\s\s<- "),
+    "proxy": ((PROXY_VERIFIER,), r"^\s*FAIL\s+(.+?)\s\s<- "),
 }
+
+# The two files the third suite proves, named rather than derived: `mcp_proxy_io.py` sits in
+# `agentskill_evals/` where the selftest would otherwise be asked to catch it and would report
+# MISSED for every entry, and `proxy_target_server.py` sits in `fixtures/` where
+# `verify_mcp_fixtures.py` would. A path prefix cannot express either, because both directories
+# hold files belonging to the other suites.
+_PROXY_SUITE = (PROXY_IO, TARGET)
 
 
 def _suite_for(rel):
@@ -1792,7 +2437,13 @@ def _suite_for(rel):
     import them. Routing by hand would put a sixth field on 180-odd entries whose value is
     already implied by the second, and a wrong one reports MISSED for a defect whose checker
     never ran — indistinguishable, in the output, from a decorative check.
+
+    The proxy's I/O half is the exception the path cannot express, so it is named: it lives in
+    `agentskill_evals/` but no arm can reach it, and its fixture lives in `fixtures/` but the
+    other verifier does not drive it.
     """
+    if rel in _PROXY_SUITE:
+        return "proxy"
     return "fixtures" if rel.startswith(("fixtures/", "tools/")) else "selftest"
 
 
@@ -1834,12 +2485,17 @@ def _classify(mid, rel):
     Raises rather than warns: a suite that reports a wrong total is worse than one that
     refuses to start, and this runs before any baseline so the cost is a second.
     """
-    if rel in (SELF, VERIFIER):
+    if rel in (SELF, VERIFIER, PROXY_VERIFIER):
         raise SystemExit(
             f"mutation {mid!r} targets {rel}, which is a suite rather than something a suite "
-            f"checks. Asking the mutation runner whether it notices being mutated, or the "
-            f"fixture verifier whether it notices, establishes nothing about either.")
-    expected = "I" if rel == SELFTEST else "F" if _suite_for(rel) == "fixtures" else "M"
+            f"checks. Asking the mutation runner whether it notices being mutated, or either "
+            f"verifier whether it notices, establishes nothing about any of them.")
+    # BY THE FILE'S ROLE, not by which suite proves it. Reading the class off `_suite_for` was
+    # right while there were two suites and wrong the moment a third arrived: `mcp_proxy_io.py`
+    # is production proven by a driver, and `proxy_target_server.py` is an instrument proven by
+    # the same one, so the suite says nothing about which total either belongs in.
+    expected = ("I" if rel == SELFTEST
+                else "F" if rel.startswith(("fixtures/", "tools/")) else "M")
     kind = mid[0] if mid[0] in "MIF" else "?"
     if kind != expected:
         raise SystemExit(
@@ -1899,11 +2555,26 @@ def main():
         # `find`/`repl` may be tuples: some properties are now defended in two places, and
         # reintroducing the defect means removing both (see M53).
         edits = list(zip(find, repl)) if isinstance(find, tuple) else [(find, repl)]
-        if any(f not in original for f, _ in edits):
+        counts = [original.count(f) for f, _ in edits]
+        if any(c == 0 for c in counts):
             # No time to report, and "(0.0s)" would read as a suite that ran instantly rather
             # than one that never started — the same lie the None/[] distinction exists to
             # prevent elsewhere. Say which it is.
             print(f"{mid}: STALE ANCHOR — text not found in {rel} ({suite} not run)")
+            continue
+        if any(c > 1 for c in counts):
+            # THE OTHER HALF OF THE SAME GUARD, and the half that fails silently. `replace(f, r,
+            # 1)` takes whichever occurrence comes first, so an anchor matching twice still
+            # produces a mutant, still reddens SOME arm, and still prints CAUGHT — while testing
+            # whichever site happens to be earlier in the file rather than the one the mutation
+            # is named for. Five entries were in this state, four of them because a 4-space
+            # anchor is a substring of the same line indented 8 (the leading-newline lesson in
+            # §4, which nothing enforced), and one because a fix here made two functions
+            # textually identical. Refused rather than warned: a mutation that has quietly
+            # stopped testing what it names is exactly the failure this suite exists to prevent
+            # in the code it mutates (review, PR #103).
+            print(f"{mid}: AMBIGUOUS ANCHOR — matches {counts} times in {rel}; pin it with a "
+                  f"leading newline or adjacent context ({suite} not run)")
             continue
         mutated = original
         for f, r in edits:
@@ -1935,9 +2606,9 @@ def main():
               f"the selftest itself (see SELFTEST in the target list), and are NOT evidence "
               f"of production coverage")
     if totals["F"]:
-        print(f"{caught['F']}/{totals['F']} fixture/tool mutation(s) caught by "
-              f"{VERIFIER} — these perturb instruments rather than production code, so they "
-              f"are NOT part of the production total either")
+        print(f"{caught['F']}/{totals['F']} fixture/tool mutation(s) caught — these perturb "
+              f"instruments rather than production code, so they are NOT part of the "
+              f"production total either")
     total = time.monotonic() - started
     slow = f"slowest {slowest[1]} at {slowest[0]:.1f}s" if slowest[1] else "no mutation ran"
     bases = ", ".join(f"{s} baseline {v:.1f}s" for s, v in sorted(baseline.items()))

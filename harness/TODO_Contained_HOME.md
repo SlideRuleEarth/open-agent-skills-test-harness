@@ -289,20 +289,31 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 541 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 562 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 harness/tools/mutate_mcp.py                           # 230/230 production + 2/2 instrument + 8/8 fixture
+python3 -u harness/tools/mutate_mcp.py                        # 311/311 production + 2/2 instrument + 8/8 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 278 checks
+harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 77 here
 git diff --check
 ```
 
-**The mutation suite now runs TWO suites, chosen by the file each mutation perturbs.**
-`agentskill_evals/` is proven by the selftest; `fixtures/` and `tools/` are proven by
-`verify_mcp_fixtures.py`, and those are the `F*` ids, counted apart from production for the
-same reason `I*` is — they perturb an instrument rather than the code under test. Running
-`mutate_mcp.py` therefore covers the third line above as well, and its three totals are three
-different claims. Do not add them together.
+**The mutation suite now runs THREE suites, and which one runs is a different question from
+which total a mutation counts in.** The suite is chosen by the file: `agentskill_evals/` is
+proven by the selftest, `fixtures/` and `tools/` by `verify_mcp_fixtures.py`, and the proxy's
+I/O half plus its awkward server by `verify_mcp_proxy.py` — the two files named explicitly,
+because both sit in a directory another suite owns. The **class** is chosen by the file's role:
+`M*` perturbs production, `I*` the selftest itself, `F*` an instrument. Those agreed while
+there were two suites and stopped agreeing the moment `mcp_proxy_io.py` arrived — production
+code no arm can reach. Running `mutate_mcp.py` therefore covers the last two lines above as
+well, and its three totals are three different claims. Do not add them together.
+
+**Every command in that block runs without a network and without a privilege**, and that is a
+requirement rather than an observation: the proxy verifier's `read_failed` case used to open a
+loopback socket, so under a sandbox that denies `bind()` the whole file died at `EPERM` and a
+reviewer could not run the suite this work's evidence rests on (review, PR #103). If a case
+needs an arrangement the environment might refuse, find another arrangement — a skipped check
+and a check that cannot fail look identical from the outside.
 
 **The arm count is now self-reported** — the selftest ends with `SELFTEST PASSED — N arms`.
 It used to live here as a hand-maintained literal and was stale for two PRs running, because
@@ -800,6 +811,279 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   verdict formula passes a run whose whole purpose was to fail. The **configuration** is the
   anomalous fact, not the firing — and there is a case for the no-op injection specifically,
   because the failure mode is a hook that quietly does nothing.
+- **A STEP ORDER CAN ENCODE A CORRECTNESS PROPERTY, AND THE OBVIOUS IMPLEMENTATION BREAKS IT
+  SILENTLY.** §10.5 says terminate the group (step 4) *before* reaping the child (step 5), which
+  reads like tidiness and is not: the group is named by the child's pid, and that pid stops
+  being unique the instant it is reaped, so `killpg` after `wait()` names a group the kernel may
+  have reassigned. Holding the child as an unreaped **zombie** through step 4 is the whole
+  mechanism. Then the constraint propagates upward in a way nothing warned about — step 3 may
+  not call `wait()` either, and `os.waitid(..., WNOWAIT)`, the POSIX way to wait without
+  consuming, **is not available on macOS**. **When a design fixes an order, ask what property
+  the order buys and then check every call that could violate it**, because the violating
+  version passes every test and differs only in which processes it signals.
+- **AN ERRNO IS A MEASUREMENT, NOT A MEANING.** `killpg` returns `EPERM` on macOS for a group
+  whose members are all zombies, where Linux returns 0 — and this proxy deliberately keeps a
+  zombie in that group, so reading `EPERM` as failure reports `shutdown_group_kill_failed` on
+  **every clean shutdown on one of the two supported platforms**. That is the false-failure half
+  of §10.5's rule, and it is the half that is easy to write while feeling careful. The check is
+  the same one the C3 probes exist for: before treating a return value as evidence, produce it
+  on purpose and look.
+- **A BOUND BELONGS TO THE STEP THAT OWNS THE WAIT, NOT TO EACH STEP THAT TOUCHES IT.** The
+  drain (step 2) and the escalation (step 3) were bounded separately, so a server that merely
+  needed `SIGKILL` — an outcome §10.5.1 classifies **clean** — had its drain time out first and
+  came out as a teardown anomaly. Two timers over one wait always disagree about something. The
+  tell is two steps asking the same question of the same descriptor.
+- **NON-BLOCKING ON ONE END OF A PIPE IS NOT NON-BLOCKING.** `signal.set_wakeup_fd` requires the
+  *write* end to be non-blocking and says nothing about the read end, so the sweep that collects
+  signals arriving during the teardown blocked forever on an empty pipe — after every clean
+  shutdown. No terminator was written, so the absence rule reported an anomaly for a run that
+  had done everything right. The failure only shows on the path that reads an *empty* channel,
+  which is the ordinary path; every case with something to read passed.
+- **AN INSTRUMENT MUST NOT BE COUPLED TO THE THING IT OBSERVES.** The credential-bearing helper
+  inherited the proxy's stderr, which is a descriptor the *driver* holds — so the driver's read
+  of it blocked until the helper exited, and the helper is precisely the process the case needs
+  to still be running. A liveness test that deadlocks on its subject surviving proves nothing.
+  Fixed on both sides: the helper gets `DEVNULL`, and the driver gives the proxy a stderr
+  **file** rather than a pipe, because anything in the group can hold a pipe open.
+- **A CONTROL CAN PASS ON THE FIXTURE'S MANNERS — SECOND INSTANCE, ONE LEVEL DOWN.** The rule
+  was already written for the helper ("must survive everything except a group signal"), and the
+  control then failed because the *child* exited on stdin close and EOF'd its own channel. The
+  suppressed steps were never under test. The fixture now closes stdout while staying alive, so
+  the drain settles cleanly and the only anomalies in the record are the injected ones. Same
+  quantifier lesson as the liveness channels: the rule was about one participant when it was
+  about every participant.
+- **THE INSTRUMENT FOR "A READ ERROR THAT IS NOT EOF" HAS TO PRODUCE AN OBSERVABLE ERROR.** Two
+  obvious arrangements do not: a directory as stdin makes CPython refuse to start (`<stdin> is
+  a directory, cannot continue`), so the proxy never reaches its own boundary and there is no
+  log at all; a pty whose master is closed reads as **plain EOF** on macOS, which is the very
+  thing the case must distinguish itself from. **Check that the failure you are injecting
+  arrives at the layer you are testing**, rather than upstream of it — which is also how the
+  next two candidates were rejected: a write-only *regular file* as stdin is never reported
+  ready by kqueue, so the proxy blocks and the case times out, and `/dev/null` opened write-only
+  makes `kevent` itself fail, so the error surfaces in the pump's catch-all rather than in the
+  read handler the case is about. What works is the **write end of a pipe whose reader is
+  already closed**: ready to select, `EBADF` to read, and — unlike the loopback socket with
+  `SO_LINGER {1, 0}` it replaces — it needs no network, which is what made the whole file
+  unrunnable under a sandbox that denies `bind()` (review, PR #103). **An instrument that needs
+  a privilege is an instrument some reviewer cannot run**, and a suite nobody else can run is
+  evidence nobody else can check.
+- **CLASSIFYING BY THE WRONG AXIS SURVIVES UNTIL THE THIRD CASE.** `mutate_mcp.py` derived a
+  mutation's class (`M` production / `I` selftest / `F` instrument) from *which suite proves
+  it*, which agreed with the file's role for as long as there were two suites. The third suite
+  broke it in both directions at once: `mcp_proxy_io.py` is production proven by a driver, and
+  `proxy_target_server.py` is an instrument proven by the same driver. "What does this perturb?"
+  and "who would notice?" are two questions, and only the first determines which total a
+  mutation belongs in. A derivation that has never been wrong is not the same as a correct one.
+- **AN UNTESTED PATH THAT NOBODY SAYS IS UNTESTED READS AS TESTED.** Three cleanup outcomes —
+  `shutdown_read_failed`, `shutdown_reap_failed`, `shutdown_group_kill_failed` — cannot be
+  arranged from outside the proxy at all, so the driver reaches them through the fault point's
+  `fail` mode. That drives the **record** and not the code that would produce it in the wild.
+  The driver says so in its own header, and §10.9 says so too, because "every outcome driven"
+  is otherwise a claim about coverage the file does not have.
+- **AN ERRNO WITH MORE THAN ONE CAUSE IS NOT EVIDENCE — the `EPERM` lesson, corrected.** §4
+  already said "produce it on purpose and look", and I did: macOS returns `EPERM` from `killpg`
+  for an all-zombie group where Linux returns 0. What that establishes is ONE cause, not an
+  equivalence, and `kill(2)` defines the errno as the inability to signal group members — which
+  a sandbox restriction or a differently credentialed descendant also produces, either of them
+  leaving a live member while the branch certified success. **A measurement licenses the
+  direction it measured, never the converse.** The fix is not a better errno reading but
+  positive evidence: deliver the signal while the group is provably ours, then confirm
+  emptiness after the reap with a signal-0 probe, whose worst outcome is a false failure.
+- **DETECTION IS NOT CLEANUP.** The absence rule catches a proxy killed before its teardown and
+  fails the cell — and the credential-bearing server it was fronting is still running, because
+  `start_new_session=True` put it out of reach of every ancestor's group kill. Recording an
+  ending is not ending it. The fix is a **guardian**: a third process in its own session
+  holding a lifeline, which kills the child's group when the proxy dies.
+- **CONTAINMENT THAT IS OPTIONAL, LATE, OR ANONYMOUS IS NOT CONTAINMENT — one review round, three
+  faults, one fix.** The guardian above was spawned *after* the child, was "best effort" so a
+  failure to start let the run continue, and signalled a bare pgid it could not show was still
+  the group it created. Each looks like a separate hardening job and each was a consequence of
+  the same structural choice: the guardian was a bystander. Making it the child's **parent**
+  answers all three at once — it cannot be late because it is what starts the server, it cannot
+  be absent because no guardian means no spawn (`spawn_failed`, fail closed), and it holds the
+  group's identity because an **unreaped member pins the pgid against reuse** and only a parent
+  can hold one. The general rule: when three defenses of one property each need their own
+  patch, the property is being defended from the wrong place. Corollaries worth keeping:
+  - **A pin, not a probe.** `killpg(pgid, 0)` succeeding says something is there, not that it is
+    *yours*. Only an unreaped member establishes that, so every real signal goes through the
+    process holding one — and that process stops signalling the moment it reaps, because
+    releasing the pin ends its licence to act. A probe that delivers nothing is the one group
+    operation that stays sound without a pin, which is why the emptiness check is signal 0.
+  - **Readiness is a handshake, not a return value.** `Popen` returning says a fork succeeded.
+    The guardian reports its own pid, the proxy checks it against the process it spawned, and
+    the spawn record — which the reader now REQUIRES to carry it — is written only afterwards.
+    An optional field whose value nothing validated stayed clean with it missing, `false`, and
+    `"alive"`.
+- **CLEANING UP AFTER A FAILURE DOES NOT ERASE THE EVIDENCE OF IT.** The guardian stood down
+  whenever the proxy's teardown had merely **run**, on the reasoning that a group kill which was
+  attempted and failed should leave its survivors for §10.9's liveness cases to observe. That
+  reasoning is wrong, and the shape of the error is worth more than the case: the audit record
+  already holds the failure, so the survivors were not the evidence — they were a leak with a
+  justification attached. The rule is that the record carries the evidence and the mechanism
+  carries the cleanup, and only an **explicitly armed test-only control** may retain a process.
+  That distinction is exactly why the fault point has separate `suppress` and `fail` modes, and
+  both directions are now driven: firing retains, failing sweeps.
+- **A GUARANTEE MUST BE STATED AT THE WIDTH OF ITS MECHANISM.** "Nothing from this instance is
+  still alive" was the claim; a process group was the mechanism; and a descendant that calls
+  `setsid()` leaves the group and survives a clean run unreported. There is no portable
+  containment stronger than a process group on both supported platforms, so the claim was the
+  thing that had to move. The limit is now driven as a case that asserts what actually happens
+  — clean verdict, `group_terminated: done`, helper alive — because **a documented boundary
+  nothing checks outdates itself quietly**, and this one fails loudly if containment is widened.
+- **A RULE ENFORCED AT ONE FIELD IS A RULE ABOUT THAT FIELD.** `NaN`/`Infinity` were "refused"
+  only because `valid_request_id` rejects a NaN id; nothing looked anywhere else in a message,
+  because Python's JSON decoder accepts all three as a documented extension. The check belongs
+  at the decoder (`parse_constant`), which is the one place that quantifies over the message.
+  Same shape in the framing: an empty line, undecodable bytes and a partial line at EOF were
+  each skipped by a different guard written for a different purpose — `strip()`,
+  `errors="replace"`, and an EOF path that discarded its buffer — and each produced a clean
+  verdict for a stream that had gone wrong. **`errors="replace"` on a boundary is a rewrite,
+  not a tolerance**: it forwards bytes the peer never sent.
+- **"HAS SOMETHING GONE WRONG" IS NOT "DID THIS GO WRONG HERE".** The drain stopped on
+  `if self.triggers`, which is always true during a teardown — there is already the trigger
+  that started it — so a malformed frame arriving on the way out was recorded as an anomaly and
+  then followed by more forwarding. The terminality test has to be a **count compared across
+  the call**, not a truthiness test on an accumulator. The tell is a guard that reads state
+  which the surrounding phase guarantees is already set.
+- **A GRAMMAR IS AN ORDERING, SO CHECK IT AS ONE.** The log reader checked that the start record
+  came first and nothing else, which accepted `start → terminator → spawn` and
+  `start → spawn → terminator → event` as clean — a terminator that does not terminate, with
+  work recorded after the record on which the absence rule, the no-heal rule and every
+  completion fact rest. One rank per line kind and "the sequence is sorted" cannot disagree with
+  itself about a case, where a hand-written first-record test only ever covers the end someone
+  thought about.
+- **AN ARCHIVED ARTIFACT MUST CARRY ENUMERATED REASONS, NOT PROSE.** The dropped-message event
+  logged the decision layer's human-readable reason, which quotes the request id — an arbitrary
+  wire value of any length and content the peer chose. `Drop` now carries a **code** from a
+  closed set for the log and its prose for stderr, and the reader validates the code against
+  that set. The tell is a field the writer formats and the reader accepts as any non-empty
+  string.
+- **THE OBVIOUS TYPE CHECK ADMITS THE VALUE THAT IS NOT A VALUE — third instance.** `isinstance(
+  True, int)` was the first, `null` under a present-but-unread optional the second, and
+  `isinstance(float("nan"), float)` the third: a timestamp reader accepted `NaN` and `Infinity`,
+  which are floats and are not times. Same as the first two, the check has to name the property
+  the field is *for* — finite, here — and not the type that carries it. Note the value arrives
+  by two routes and both needed closing: the decoder produces it from a bare `NaN` token unless
+  told not to, so the log reader now refuses those constants with the same `parse_constant` the
+  wire does, imported rather than restated.
+- **A TOTALITY CHECK IS BLIND TO EVERY CASE BELOW IT.** "Every reason in the enumeration was
+  actually produced" sat at the end of its own section, where it quantified over the runs above
+  it and nothing else. It passed the day a new trigger was added and driven two sections
+  further down, and would have kept passing had the case been deleted. A fleet-wide claim goes
+  **last in the file**, for the same reason a fleet-wide negative requires every row answered.
+- **A MUTATION THAT REDDENS THE RECORD CHECKS WHILE THE LIVENESS CHECKS STAY GREEN IS A
+  MUTATION AIMED ONE LEVEL AWAY FROM THE DEFECT.** Two arrived in one round. Removing step 4
+  left the group alive in the record but not in fact, because the reap order sweeps it too;
+  neutering the guardian's watch loop made it exit, which the proxy reads as `guardian_lost`
+  and cleans up from. Both are the M53/M270 pattern — a property defended in two places needs
+  a mutation that removes **both** — and the tell is the same each time: the intended arm is
+  green and a dozen unintended ones are red.
+- **A MUTATION MUST NOT BE ABLE TO DO MORE DAMAGE THAN THE DEFECT IT MODELS.** This one cost a
+  developer machine, so it is written down at the length it earned.
+  M289 replaced the guardian's EOF exit with `continue`. With the lifeline at EOF the descriptor
+  is always readable, so the mutant's wait became a busy loop — in a process that is its own
+  session leader with no parent to reap it. **24 orphans at ~35% CPU each accumulated across
+  three runs, load average 186**, unnoticed until someone opened Activity Monitor. A mutant is
+  broken code by construction, so the bound a mutation removes may be the process's only way
+  out; that is a constraint on how mutations are WRITTEN.
+  The first fix made it worse. A `ps`-scanning reaper was added to the runner to kill anything
+  still executing out of the work tree — a process-killing loop in a test tool — and then, to
+  prove the reaper did not over-reach, a mutation that **deleted its filter**: `kill(SIGKILL)`
+  over every line of `ps ax`, which is every process the user owns. It was inert only because
+  its anchor accidentally matched the mutation table rather than the function, and the next
+  commit "fixed" the anchor. Both the reaper and its mutation are gone. Three rules came out of
+  it, and the third is the one that matters:
+  - a mutation of a loop exit must leave the process able to exit, checked by reading it before
+    it is added;
+  - `substring in command` matches EVERY process when the substring is empty, so any predicate
+    that selects processes to kill needs its blast radius bounded before the first candidate is
+    read — not as defence against a defect anyone made, but because the failure mode is
+    unbounded while the purpose is narrow;
+  - **when the tooling that verifies safety becomes the most dangerous code in the tree, delete
+    it rather than making it safer.** The leak had already been fixed at its source; the reaper
+    was insurance against a class of mistake that should not be made in the first place, and it
+    bought that insurance with a `kill` loop running unattended for an hour at a time.
+- **A DIAGNOSTIC MUST NEVER BE ABLE TO PREVENT THE ACTION IT DESCRIBES.** The guardian's sweep
+  announced itself before signalling, and stderr is inherited from the CLI — so with that pipe
+  closed the `print` raised `BrokenPipeError` and a credential-bearing process group survived,
+  killed by nothing because its executioner stopped to write a log line. The reproduction was
+  one function; the rule quantifies over **every** stderr write in the program, so all of them
+  go through a helper that swallows `OSError` and `ValueError`, and the sweep additionally acts
+  before it speaks so the ordering says what the helper guarantees. The general shape: **an
+  I/O call on a channel you do not own, placed on a path that must complete.**
+- **A LOUD ANOMALY DOES NOT AUTHORIZE ACTING ON AN UNCERTAIN IDENTITY.** The `guardian_lost`
+  path signalled the remembered pgid after checking `getpgid(child_pid) == child_pgid` — a
+  check whose own docstring admitted a reaped pid can be reused, and which for a group leader
+  degenerates to "some group leader has this number". Recording the ending honestly does not
+  make the signal safe: the two are independent. The path now refuses to signal and records the
+  failure, and §10.6 carries the surviving server as a **limit** rather than a branch. The tell
+  is a guard documented as weak and then used as though it were strong.
+- **A PARTITION THE RECORD ASSERTS MUST BE A PARTITION THE CODE ENFORCES.** `spawn_failed` meant
+  "no server ran", four `not_applicable` facts said so, and the audit was observably false: the
+  guardian spawned the child and reported readiness in one step, so a report the proxy REJECTED
+  still left a `/usr/bin/touch` child that had created its marker — 6 runs in 20. The fix is
+  structural rather than defensive: two phases, and a guardian that has not been accepted is
+  never told what to run. Note where the error was — not in the record, which reported what it
+  could see, but in an implementation that drew the boundary one step later than the document.
+- **WHEN THE END-TO-END WITNESS IS A RACE, FIND A SECOND ONE THAT IS NOT.** The marker file
+  above catches a regression about one time in twenty, because the wrongly-spawned child is
+  killed within a millisecond or two — a detector that misses 95% of the time is not a check,
+  it is a coin. The deterministic witness was already available and one line away: have the
+  process under suspicion **say which phase it reached**, on a channel the driver already reads,
+  and pair the run that must stop early with one that must go further. Two rules met there — a
+  claim and its subject must not share an author (the guardian reports on the proxy's
+  behaviour), and an absent string proves nothing without a run in which it is present.
+- **A FIELD CARRIED RAW OWES A TOTAL PREDICATE.** The audit reader's contract is that arbitrary
+  decoded JSON produces a verdict and never an exception, and `[] in FROZENSET` raises
+  `TypeError: unhashable type`. Every field the validator looks up in a closed set is narrowed
+  to a string by the parser first — except the two carried **raw**, because for them "present
+  but wrong" is a different verdict from "absent". `child_status` survived by accident:
+  `is_json_int` is an `isinstance` check and so total over any value. The guardian injection was
+  the same shape with a set lookup, and `"guardian": []` crashed `log_verdict`, which is the
+  function that decides whether a gated cell passed — **a crash there is not a failed cell, it
+  is no verdict at all**. Two things to carry forward. The rule is *the predicate must be total*,
+  not *this field needs an isinstance*; and the regression arm drives an unhashable value
+  through **every** membership-tested position rather than the one that broke, because what
+  makes the other nine safe is a parser invariant, and an invariant nothing drives is a comment.
+  The rule was already written down twice in the same tree — over `kind` in the log reader and
+  in `valid_request_id` — which is what makes this a *third* instance rather than a discovery:
+  a rule stated at one site is a rule about that site.
+- **AN OUTCOME THAT NAMES AN ACT IS WRITTEN ONLY WHERE THE ACT HAPPENED.** `shutdown_child_killed`
+  says this instance delivered a `SIGKILL`; step 3's escalation wrote it whether or not
+  `_deliver` reported success. The ending that exposed it is the one whose policy is to signal
+  **nothing** — guardian gone, no pin, delivery refused — so the archived log recorded a kill
+  beside the two failures proving nothing was signalled. Step 4 had read that same return value
+  since the day it was written. The tell is a call whose result is discarded on one path and
+  consulted on another, when both paths record what the call did. Two corollaries:
+  - The escalation now **ends** on the refusal rather than trying the next order — the only
+    process that could signal is gone, so the second order fails identically and the message
+    after the loop would then claim a kill was delivered.
+  - Making step 3's loop read the return value made it **textually identical to step 4's**, so
+    two mutation anchors silently became ambiguous — which is what turned up the next entry.
+- **AN AMBIGUOUS MUTATION ANCHOR IS A MUTATION THAT HAS QUIETLY STOPPED TESTING WHAT IT NAMES.**
+  `mutate_mcp.py` applies `original.replace(find, repl, 1)`, so an anchor matching twice still
+  produces a mutant, still reddens some arm, and still prints `CAUGHT` — while perturbing
+  whichever site is earlier in the file. **Five entries were in this state**, and the run was
+  green throughout: M7 (the `str` redactor's loop, identical to its `bytes` twin), M184, M187,
+  M217, M269. Four of them are the leading-newline lesson already recorded three bullets down —
+  a 4-space anchor is a substring of the same line indented 8 — **which nothing enforced**, so
+  it had been true since the day it was written down. The fix is therefore not five edits but
+  the guard beside the stale-anchor check: an anchor matching a number of times other than one
+  is **refused, not warned**, and a refused mutation is uncaught, so the suite exits non-zero.
+  Two general points worth more than the five:
+  - **A rule written in a lessons file is not enforced by having been written.** This one had
+    been, verbatim, and four entries violated it anyway. If a rule is checkable, the check is
+    the artifact; the prose is a comment on it.
+  - **The failure mode of an instrument is not the failure mode of the code it tests.** A
+    mutation suite whose count is unchanged can still have lost coverage — the sibling of
+    "fewer mutations than last time" in §4's header, and the harder one to see, because the
+    number that would have told you is the one that stayed the same.
+  Note what the guard does **not** claim: it pins each mutation to one site, and it does not
+  say the other site is covered. Four of the five siblings — the `bytes` redactor's loop,
+  `parse_log`'s per-line map check, `instance_verdict`'s `anomalous`, and `_pump`'s in-loop
+  signal handler — have no mutation of their own. M187's pair was merged into one tuple edit
+  because `_str_or` and `_opt_str` are the same rule (M53's pattern); the other three are a
+  coverage question, recorded here rather than answered.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s
