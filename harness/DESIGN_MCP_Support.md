@@ -249,7 +249,7 @@ CLI-native keeps values off disk but is inconsistent (copilot/agy have nothing).
 - `used_tool` (`assertions.py:217-224`) matches normalized tool names case-insensitively, so it works as soon as parsers emit stable MCP names. Parser state: **claude** passes `tool_use` names through untouched — MCP names should arrive as `mcp__<server>__<tool>` (verify); **codex** currently emits `item["tool"]` alone (`codex.py:175`) — change to canonical `mcp__{server}__{tool}` when both fields are present; **copilot** MCP naming unverified; **agy** likely `mcp_<server>_<tool>` (verify).
 - New assertion **`used_mcp_tool {server, tool?}`** matching all four naming conventions (`mcp__s__t`, `mcp_s_t`, `s(t)`, bare `t` with adapter context), so scenarios stay portable across runners. `validate_spec` errors when it references a server not declared in `mcp_servers` (mirroring the `skill_triggered` pattern). Optionally extend `used_tool` with a `matches:` regex for wildcards.
 - **Fixture**: `harness/fixtures/echo_mcp_server.py` — a zero-dependency Python stdio MCP server (JSON-RPC 2.0 over stdin/stdout: `initialize`, `tools/list`, `tools/call`; tools `echo` and `add`; ~100 lines). Used for (i) offline parser goldens in `selftest.py` (like the existing `CODEX_EXTRA` sample that already covers `mcp_tool_call`), and (ii) a live smoke scenario `scenarios/mcp_echo_smoke.yaml` asserting `used_mcp_tool {server: echo, tool: echo}` + `final_contains`. CI never depends on the real SlideRule server.
-- A documented example scenario shows the SlideRule pattern: remote `url` + `Authorization: Bearer ${SLIDERULE_MCP_TOKEN}` + `tools:` allowlist + rubric/assertions on the returned data.
+- A documented example scenario shows the SlideRule pattern: remote `url` + `Authorization: Bearer ${SLIDERULE_MCP_TOKEN}` + `tools:` allowlist + rubric/assertions on the returned data. **This exact combination is refused today and will stay refused until the transport bridge lands** — `url` + `tools:` is outside C3's first cut (§10), and the remote JSON shape itself is still inferred rather than measured (§9 probe #1). The example is the target, not a description of what runs.
 
 ## 8. Phasing
 
@@ -373,6 +373,20 @@ CLI-native keeps values off disk but is inconsistent (copilot/agy have nothing).
 ## 10. C3 — the harness-owned filtering proxy (design)
 
 Decision recorded in §6-C3; this is the mechanism. **Scope of the first cut: stdio servers only.** A remote (`url:`) server with `tools:` stays the validation error it is today — the transport bridge is a separate piece of work and nothing should read "C3 landed" as "`tools:` works everywhere".
+
+**And the motivating use case is on the far side of that line (confirmed 2026-08-06).** The SlideRule server will be **remote**, and §8's documented pattern for it is exactly `url` + a bearer token + a `tools:` allowlist — the one combination this scope excludes. So the bridge is not a completeness item to be picked up whenever; it is what stands between the harness and the thing it was built for. It was tracked nowhere until this date, which is the more useful half of the observation: the scope note above was correct and had been read as a limitation of an edge case rather than of the main case.
+
+**The bridge is not "the same proxy with an HTTP client", and that is what makes it a design round rather than a port.** Almost every guarantee §10.5 and §10.5.1 make is stated over a **child process**: six shutdown steps that close its stdin, drain its stdout, signal its group and reap it; a `spawn_failed` partition that says no server ran; and a guardian whose whole purpose is to hold a pid unreaped so a process-group id provably still names the group this instance created. **A remote connection has no pid, no process group, and nothing to reap.**
+
+The completion facts show the split exactly. Of the five, **four name the child** — `child_stdin_closed`, `drain_ended`, `child_reaped`, `group_terminated` — and have no counterpart in a socket. The fifth, `intake_closed`, is about the *client* half and generalizes unchanged, because the CLI still speaks stdio to the proxy no matter what the proxy speaks upstream. That asymmetry is the shape of the whole problem: the bridge keeps §10's entire client-facing story and has to re-derive its server-facing one.
+
+What has to be re-derived, not ported:
+
+- **What "this instance ended cleanly" means** when the resource is a socket. A connection left open is the honest analogue of a leaked child — a credential-bearing session the run no longer accounts for — but "closed" is a weaker claim than "reaped": the peer may hold it, a proxy in between may hold it, and `close()` returning says nothing about the far end. The pin argument that makes the stdio case sound has no counterpart here, so the limit should be stated the way §10.6 states the `setsid` one rather than papered over.
+- **Where the credential lives.** For stdio it is the child's environment, contained by the child's lifetime. For remote it is an `Authorization` header on every request, held in the proxy's own memory for the life of the connection, and travelling to a host the harness does not control. That is a different exposure with a different scrub story, and §5.3's rules were written for the first one.
+- **What the audit record says.** The five completion facts are a closed set checked in both directions by `mcp_audit.validate()`, so the reader cannot simply be handed a record about a socket. Either the facts generalize — which needs an argument, not an edit — or remote instances are a different record shape with their own validator, and the verdict function has to be total over both.
+
+Sequence it behind the stdio integration regardless. The proxy has never faced a client that was not our own driver, and meeting a real CLI for the first time while also growing a network client means a failure has two candidate causes instead of one.
 
 ### 10.1 What it is
 
