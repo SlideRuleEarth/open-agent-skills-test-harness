@@ -327,11 +327,19 @@ This is a nice bit of meta-engineering, and it's why the project trusts its own 
   never a silent skip.
 
 - **Mutation testing** ([`tools/mutate_mcp.py`](tools/mutate_mcp.py)). This tests the
-  *tests*. It deliberately breaks the production code in over a hundred small ways ("what
-  if this security check were deleted?") and confirms that a specific self-test arm
-  **catches** each break — the *named* one, not just "something went red". A test that
-  nothing can break is decorative; mutation testing proves each arm actually earns its
-  keep. Run it with `make mutation` (§11).
+  *tests*. It deliberately breaks the production code in hundreds of small, specific ways
+  ("what if this security check were deleted?") and confirms that a **named** check
+  catches each break — that one, not just "something went red". A test that nothing can
+  break is decorative; mutation testing proves each check actually earns its keep. Run it
+  with `make mutation` (§11).
+
+  It drives **three** suites, not one, and which suite runs is decided by which file the
+  mutation edits: most of `agentskill_evals/` is proven by the self-test, the stdio
+  fixtures by `verify_mcp_fixtures.py`, and the MCP proxy by `verify_mcp_proxy.py` — the
+  proxy being production code that no self-test arm can reach, because proving it needs
+  real pipes and a real child process. The totals are reported separately and deliberately
+  never summed: only one of the three measures coverage of production code, and adding
+  them would claim more than exists.
 
 - **A local pre-push git hook** (`.git/hooks/pre-push`). Since GitHub-hosted macOS
   runners aren't available for this org — and the self-test is verified on macOS, where
@@ -340,8 +348,14 @@ This is a nice bit of meta-engineering, and it's why the project trusts its own 
   `git push`, and blocks the push if anything fails (bypass with `git push --no-verify`).
   It's the local stand-in for a cloud CI service.
 
-The layering is worth appreciating: **the harness tests agents, the self-test tests the
-harness, and mutation testing tests the self-test.**
+The layering is worth appreciating: **the harness tests agents; the self-test and the two
+verifiers test the harness; and mutation testing tests all three of those.** Each layer
+exists because the one below it can be wrong in a way nothing else would notice.
+
+> **Exact counts live in exactly one place** — the verification block in
+> [`TODO_Contained_HOME.md`](TODO_Contained_HOME.md) §4, which lists every command and the
+> number each one currently prints. They are deliberately not repeated here or anywhere
+> else: a count that lives in two places drifts, and it drifts silently.
 
 ---
 
@@ -354,8 +368,10 @@ cd harness && make dev && . .venv/bin/activate
 # the self-test — no agent CLIs or API keys needed, runs in seconds
 python3 -m agentskill_evals selftest
 
-# mutation-test the self-test itself — SLOW (~11 min), needs `make dev` first.
-# Run it whenever you add or change an arm; it is not wired into the pre-push hook.
+# mutation-test the checks themselves — VERY SLOW: budget an hour, not a coffee break.
+# (It runs a whole suite per mutation, and there are hundreds. It prints its own elapsed
+# time at the end, plus the slowest single mutation, so read those rather than this note.)
+# Run it whenever you add or change a check; it is not wired into the pre-push hook.
 make mutation
 
 # see what would run, and which skills the model would see — spends nothing
@@ -394,6 +410,27 @@ Grouped by the job each file does. Start with the **bold** ones.
 - [`workspace_view.py`](agentskill_evals/workspace_view.py) — after-the-fact leak detection.
 - [`mcp.py`](agentskill_evals/mcp.py) — MCP server config and secret redaction.
 
+**Sit between the agent and an MCP server (the "C3" proxy)**
+
+When an eval says a server may only expose *some* of its tools, the harness cannot ask the
+CLI to enforce that — the four CLIs disagree about whether they can, and one cannot at all.
+So it puts its own program in the middle: the CLI is told to start *this*, and this starts
+the real server. It filters the tool list, refuses off-list calls at the wire, and writes an
+audit log that says what it did. Split into three files by how testable each part is:
+
+- [`mcp_proxy.py`](agentskill_evals/mcp_proxy.py) — the **decisions**, as pure functions:
+  given a message, forward / filter / refuse. No I/O, so every rule is directly testable.
+- [`mcp_audit.py`](agentskill_evals/mcp_audit.py) — the **record and the verdict**: what a
+  proxy run must write down, and whether a given log describes a clean one. Written *before*
+  the code that produces those records, so the writer had a contract to satisfy.
+- [`mcp_proxy_io.py`](agentskill_evals/mcp_proxy_io.py) — the **program**: pipes, signals,
+  shutdown, and a *guardian* process that owns the server so a killed proxy cannot leave a
+  credential-bearing server running loose. This is the only part that needs real processes
+  to test, which is why it has a verifier of its own rather than self-test arms.
+
+Nothing routes traffic through it yet — the adapter integration is the next piece of work,
+and until it lands the `tools:` field is still refused.
+
 **Understand the output**
 - **[`schema.py`](agentskill_evals/schema.py)** — `NormalizedEvent` + `RunResult`, the common shape.
 
@@ -410,6 +447,7 @@ Grouped by the job each file does. Start with the **bold** ones.
 - [`tools/probe_contained_home.py`](tools/probe_contained_home.py) — measures what a CLI *actually* needs from your real home, by driving the harness's own launch path against a progressively emptier HOME. This is how each adapter's credential surface was determined; it answers questions no amount of reading the source can.
 - [`fixtures/probe_era_mcp_server.py`](fixtures/probe_era_mcp_server.py) — the same idea aimed at the wire: an MCP server that measures the *CLI on the other end* — which version of the protocol it speaks, and how it shuts a server down. This is how we learned the four CLIs are not all speaking the same protocol, which a reasonable person would have assumed.
 - [`tools/verify_mcp_fixtures.py`](tools/verify_mcp_fixtures.py) — drives both stdio fixtures against a scripted client, because a measurement is only as good as the thing that took it, and a test double only as good as its resemblance to a real server.
+- [`tools/verify_mcp_proxy.py`](tools/verify_mcp_proxy.py) — the third suite: it runs the real proxy over real pipes, with a real child process, and checks what actually happened to that process afterwards. Some things cannot be established from inside the program under test — "the server it was fronting is really gone" is a claim about the operating system, and a program asserting it about itself is the one witness you cannot trust. Its awkward counterpart is [`fixtures/proxy_target_server.py`](fixtures/proxy_target_server.py), a deliberately badly-behaved MCP server that ignores signals, lingers, and spawns helpers that escape their process group.
 
 ---
 
