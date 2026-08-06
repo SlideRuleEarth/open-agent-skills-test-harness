@@ -289,12 +289,12 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 560 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 561 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py                        # 302/302 production + 2/2 instrument + 8/8 fixture
+python3 -u harness/tools/mutate_mcp.py                        # 309/309 production + 2/2 instrument + 8/8 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 278 checks
-harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 68 here
+harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 76 here
 git diff --check
 ```
 
@@ -978,6 +978,61 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   and cleans up from. Both are the M53/M270 pattern — a property defended in two places needs
   a mutation that removes **both** — and the tell is the same each time: the intended arm is
   green and a dozen unintended ones are red.
+- **A MUTATION MUST NOT BE ABLE TO DO MORE DAMAGE THAN THE DEFECT IT MODELS.** This one cost a
+  developer machine, so it is written down at the length it earned.
+  M289 replaced the guardian's EOF exit with `continue`. With the lifeline at EOF the descriptor
+  is always readable, so the mutant's wait became a busy loop — in a process that is its own
+  session leader with no parent to reap it. **24 orphans at ~35% CPU each accumulated across
+  three runs, load average 186**, unnoticed until someone opened Activity Monitor. A mutant is
+  broken code by construction, so the bound a mutation removes may be the process's only way
+  out; that is a constraint on how mutations are WRITTEN.
+  The first fix made it worse. A `ps`-scanning reaper was added to the runner to kill anything
+  still executing out of the work tree — a process-killing loop in a test tool — and then, to
+  prove the reaper did not over-reach, a mutation that **deleted its filter**: `kill(SIGKILL)`
+  over every line of `ps ax`, which is every process the user owns. It was inert only because
+  its anchor accidentally matched the mutation table rather than the function, and the next
+  commit "fixed" the anchor. Both the reaper and its mutation are gone. Three rules came out of
+  it, and the third is the one that matters:
+  - a mutation of a loop exit must leave the process able to exit, checked by reading it before
+    it is added;
+  - `substring in command` matches EVERY process when the substring is empty, so any predicate
+    that selects processes to kill needs its blast radius bounded before the first candidate is
+    read — not as defence against a defect anyone made, but because the failure mode is
+    unbounded while the purpose is narrow;
+  - **when the tooling that verifies safety becomes the most dangerous code in the tree, delete
+    it rather than making it safer.** The leak had already been fixed at its source; the reaper
+    was insurance against a class of mistake that should not be made in the first place, and it
+    bought that insurance with a `kill` loop running unattended for an hour at a time.
+- **A DIAGNOSTIC MUST NEVER BE ABLE TO PREVENT THE ACTION IT DESCRIBES.** The guardian's sweep
+  announced itself before signalling, and stderr is inherited from the CLI — so with that pipe
+  closed the `print` raised `BrokenPipeError` and a credential-bearing process group survived,
+  killed by nothing because its executioner stopped to write a log line. The reproduction was
+  one function; the rule quantifies over **every** stderr write in the program, so all of them
+  go through a helper that swallows `OSError` and `ValueError`, and the sweep additionally acts
+  before it speaks so the ordering says what the helper guarantees. The general shape: **an
+  I/O call on a channel you do not own, placed on a path that must complete.**
+- **A LOUD ANOMALY DOES NOT AUTHORIZE ACTING ON AN UNCERTAIN IDENTITY.** The `guardian_lost`
+  path signalled the remembered pgid after checking `getpgid(child_pid) == child_pgid` — a
+  check whose own docstring admitted a reaped pid can be reused, and which for a group leader
+  degenerates to "some group leader has this number". Recording the ending honestly does not
+  make the signal safe: the two are independent. The path now refuses to signal and records the
+  failure, and §10.6 carries the surviving server as a **limit** rather than a branch. The tell
+  is a guard documented as weak and then used as though it were strong.
+- **A PARTITION THE RECORD ASSERTS MUST BE A PARTITION THE CODE ENFORCES.** `spawn_failed` meant
+  "no server ran", four `not_applicable` facts said so, and the audit was observably false: the
+  guardian spawned the child and reported readiness in one step, so a report the proxy REJECTED
+  still left a `/usr/bin/touch` child that had created its marker — 6 runs in 20. The fix is
+  structural rather than defensive: two phases, and a guardian that has not been accepted is
+  never told what to run. Note where the error was — not in the record, which reported what it
+  could see, but in an implementation that drew the boundary one step later than the document.
+- **WHEN THE END-TO-END WITNESS IS A RACE, FIND A SECOND ONE THAT IS NOT.** The marker file
+  above catches a regression about one time in twenty, because the wrongly-spawned child is
+  killed within a millisecond or two — a detector that misses 95% of the time is not a check,
+  it is a coin. The deterministic witness was already available and one line away: have the
+  process under suspicion **say which phase it reached**, on a channel the driver already reads,
+  and pair the run that must stop early with one that must go further. Two rules met there — a
+  claim and its subject must not share an author (the guardian reports on the proxy's
+  behaviour), and an absent string proves nothing without a run in which it is present.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s

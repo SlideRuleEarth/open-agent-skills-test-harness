@@ -10366,6 +10366,23 @@ def _check_mcp_audit_verdict(failures, verbose):
            f"case above, which is the whole reason both exist: ok={probs(fired_ok)} "
            f"unconf={probs(fired_unconf)} unpaired={probs(fired_unpaired)}", failures, verbose)
 
+    guarded = rec(fault_point={"suppresses": [], "guardian": A.GUARDIAN_IMPOSTER})
+    bad_mode = rec(fault_point={"suppresses": [], "guardian": "banana"})
+    bad_key = rec(fault_point={"suppresses": [], "guardian": A.GUARDIAN_LATE, "sabotage": 1})
+    _check("audit.the_guardian_injection_is_recorded_beside_the_suppression_targets",
+           not probs(guarded)
+           and A.verdict(guarded).anomalous == (A.FAULT_POINT_CONFIGURED,)
+           and "guardian_mode_unknown:'banana'" in probs(bad_mode)
+           and "fault_point_key_unknown:sabotage" in probs(bad_key),
+           f"§10.9 breaks the guardian four ways, and while that lived in an env var the proxy "
+           f"read and never wrote down, an INJECTED guardian failure was indistinguishable in "
+           f"the audit from a real one (review, PR #103) — a fault point with no provenance, "
+           f"which is the one property `fault_point_configured` exists to supply. It rides in "
+           f"the same map, so the same clause makes it anomalous, and the same closed-set rule "
+           f"applies to its value and to the map's keys: it is a tagged union like every other "
+           f"one here, and a key nobody reads can say anything at all: "
+           f"{probs(guarded)} {probs(bad_mode)} {probs(bad_key)}", failures, verbose)
+
     _check("audit.a_suppressed_step_is_recorded_without_being_excused",
            not A.verdict(fired_ok).clean
            and A.verdict(fired_ok).anomalous == (A.FAULT_POINT_CONFIGURED,),

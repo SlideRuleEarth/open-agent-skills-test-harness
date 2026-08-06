@@ -1949,9 +1949,9 @@ MUTATIONS = [
     # §4's canonical defect, in the proxy this time: a swallowed read error presenting as a
     # clean end of stream, so an instrument failure wears the clean-shutdown label.
     ("M265-a-read-error-wears-the-clean-shutdown-label", PROXY_IO,
-     ("            print(f\"mcp-proxy: read failed on {direction}: {exc}\", file=sys.stderr)\n"
+     ("            _note(f\"mcp-proxy: read failed on {direction}: {exc}\")\n"
       "            self._trigger(audit.READ_FAILED)"),
-     ("            print(f\"mcp-proxy: read failed on {direction}: {exc}\", file=sys.stderr)\n"
+     ("            _note(f\"mcp-proxy: read failed on {direction}: {exc}\")\n"
       "            self._trigger(audit.CLIENT_EOF)"),
      "read_failed: a read error is not an end of stream"),
     # PHASE IS PART OF THE REASON, and these are the two directions of getting it wrong. First:
@@ -2025,11 +2025,10 @@ MUTATIONS = [
     # The drain given its own deadline again, so the escalation never runs and a server that
     # needed SIGKILL is reported as a `shutdown_anomaly` instead of ending cleanly.
     ("M274-the-drain-gives-up-before-the-escalation", PROXY_IO,
-     ("        for order, escalation in ((ORDER_TERM, signal.SIGTERM), "
-      "(ORDER_KILL, signal.SIGKILL)):\n            self._deliver(order, escalation)\n"
-      "            if escalation == signal.SIGKILL:"),
-     ("        for order, escalation in ():\n            self._deliver(order, escalation)\n"
-      "            if escalation == signal.SIGKILL:"),
+     ("        for order in (ORDER_TERM, ORDER_KILL):\n            self._deliver(order)\n"
+      "            if order == ORDER_KILL:"),
+     ("        for order in ():\n            self._deliver(order)\n"
+      "            if order == ORDER_KILL:"),
      "shutdown_child_killed: forced termination is the standard escalation, so CLEAN"),
     # An unbounded drain instead of an anomaly: something outside the child's group holds its
     # stdout and the proxy waits for it, which is a hang rather than a verdict.
@@ -2042,7 +2041,7 @@ MUTATIONS = [
     # Arming not recorded, so a hook that silently never fires produces a PASSING run — the
     # exact case §10.9 spends a dedicated arm-only run on.
     ("M276-arming-is-not-recorded-in-the-start-record", PROXY_IO,
-     '            started["fault_point"] = {"suppresses": sorted(self.fault.targets)}',
+     '            started["fault_point"] = self.fault.record()',
      "            pass",
      "armed and wired to suppress nothing STILL fails the instance"),
     # Suppression that relabels the fact instead of skipping the step, so the control's steps
@@ -2146,12 +2145,25 @@ MUTATIONS = [
      "a proxy SIGKILLed before its teardown: nothing in the child's process group is left alive"),
     # ...and the detection: the lifeline's EOF no longer read as the proxy being gone, so the
     # one ending the guardian exists for is the one it sits through.
+    # `return` RATHER THAN `continue`, and the difference is not stylistic. The first version
+    # spun: with the lifeline at EOF the descriptor is always readable, so the loop turned into
+    # a busy wait in a process that is its own session leader and has no parent to reap it —
+    # 24 orphans at 35% CPU each, accumulated across three runs before anyone looked at
+    # Activity Monitor, with the machine's load average at 186.
+    #
+    # A MUTANT IS BROKEN CODE BY CONSTRUCTION, SO THE BOUND IT BREAKS MAY BE ITS ONLY WAY OUT.
+    # That is a constraint on how mutations are WRITTEN and not something to be cleaned up
+    # after: the cleanup this incident first grew — a `ps`-scanning reaper in the runner — was
+    # a process-killing loop added to a test tool, and the mutation written to prove it worked
+    # was `kill(SIGKILL)` over every line of `ps ax`. Both are gone. A mutation of a loop exit
+    # must leave the process able to exit, and that is checked by reading it, here, before it
+    # is added.
     ("M289-an-EOF-on-the-lifeline-is-not-a-death", PROXY_IO,
      ("            if not order:\n"
       "                break                    # EOF: the proxy is gone and never released "
       "the pin"),
      ("            if not order:\n"
-      "                continue"),
+      "                return"),
      "a proxy SIGKILLed before its teardown: nothing in the child's process group is left alive"),
     # The guardian's program never runs the guardian, so no child is ever started and the
     # handshake times out. Fail-closed is the intended behaviour of a MISSING guardian, so the
@@ -2194,8 +2206,9 @@ MUTATIONS = [
     # The readiness handshake reduced to `Popen` having returned, which says a fork happened and
     # nothing about whether our code ran in it.
     ("M305-any-ready-report-will-do", PROXY_IO,
-     '        if (ready.get("guardian_pid") != self.guardian.pid',
-     "        if (False",
+     ("        if ready is None or not audit.is_json_int(ready.get(\"guardian_pid\")) \\\n"
+      "                or ready[\"guardian_pid\"] != self.guardian.pid:"),
+     "        if ready is None:",
      "a ready report whose pid is not the guardian's is not readiness"),
     # The guardian's death during a run treated as ordinary, so a live credential-bearing child
     # keeps being forwarded to with nothing holding its identity.
@@ -2203,17 +2216,75 @@ MUTATIONS = [
      "        self._trigger(audit.GUARDIAN_LOST)",
      "        pass",
      "a guardian that dies once the child exists latches `guardian_lost`"),
-    # ...and the fallback that ending needs, refusing to act. The identity check is what
-    # licenses the signal, so a mutant that never finds it satisfied leaves the child alive.
-    ("M307-the-fallback-never-signals", PROXY_IO,
-     "        if identity != GROUP_SAME:",
-     "        if identity != GROUP_UNKNOWN:",
-     "...and the child's group is still terminated, by the proxy's own identity check"),
-    # NO MUTATION for the fallback's identity check in the PERMISSIVE direction, and that is a
-    # statement rather than an omission: removing it lets the proxy signal a pgid it can no
-    # longer show is the child's, which is only observable in the pid-reuse race nothing can
-    # stage on demand. Every case here would still pass, so it would report MISSED for a check
-    # that cannot exist — the same limit as the three cleanup outcomes driven through injection.
+    # ...and the reviewed defect itself, reintroduced: with the pin holder gone, signal the
+    # remembered pgid anyway. `getpgid(pid) == pgid` is what used to authorize this, and it is
+    # not an identity — a reaped pid can be reused, and a group leader's pgid IS its pid, so the
+    # check degenerates to "some group leader has this number" (review, PR #103). The arm is the
+    # one that requires the server to be STILL RUNNING and the record to say so.
+    ("M307-a-lost-pin-signals-the-remembered-pgid-anyway", PROXY_IO,
+     ("        report = None if self._guardian_lost() else self._ask(order)\n"
+      "        if report is None:"),
+     ("        report = None if self._guardian_lost() else self._ask(order)\n"
+      "        if report is None and os.getpgid(self.child_pid) == self.child_pgid:\n"
+      "            os.killpg(self.child_pgid, signal.SIGKILL)\n"
+      "            return None\n"
+      "        if report is None:"),
+     "...and the proxy REFUSES to signal a group nothing can identify, and says so"),
+    # A DIAGNOSTIC THAT CAN ABORT THE CLEANUP IT DESCRIBES. The sweep's own log line, moved back
+    # ahead of the signal and written with a bare `print`: with the CLI's end of stderr closed
+    # it raises `BrokenPipeError`, the guardian exits, and a credential-bearing group survives.
+    ("M308-the-sweep-announces-itself-before-it-acts", PROXY_IO,
+     "        self._signal(signal.SIGTERM)\n        time.sleep(min(self.grace, 0.2))",
+     ('        print(f"mcp-proxy guardian: terminating group {self.child_pgid}",\n'
+      "              file=sys.stderr)\n"
+      "        self._signal(signal.SIGTERM)\n        time.sleep(min(self.grace, 0.2))"),
+     "...and the guardian still sweeps: a diagnostic cannot abort the cleanup it describes"),
+    # ...and the same rule one process over: a raising diagnostic inside the pump, which the
+    # catch-all then reports as `read_failed` — a protocol fault logged as a pipe fault.
+    ("M309-a-diagnostic-in-the-pump-can-raise", PROXY_IO,
+     '            _note(f"mcp-proxy: anomaly {action.anomaly.kind}: {action.anomaly.detail}")',
+     ('            print(f"mcp-proxy: anomaly {action.anomaly.kind}: '
+      '{action.anomaly.detail}",\n                  file=sys.stderr)'),
+     "a broken stderr does not turn a protocol anomaly into a read failure"),
+    # THE TWO-PHASE HANDSHAKE COLLAPSED BACK INTO ONE: the launch order written before the ready
+    # report is read, so the guardian holds a command before it has been authenticated and
+    # spawns the server the proxy is about to repudiate. The audit still says `spawn_failed` and
+    # records no spawn — which is exactly the point, since the marker proves the command ran.
+    # ONE EDIT, in the proxy, because the guardian needs none: it reads the next line whenever
+    # that line arrives, so writing it early is the whole defect.
+    ("M310-the-launch-order-goes-out-before-the-guardian-is-trusted", PROXY_IO,
+     ("        if not self._order(order_w, setup):\n"
+      "            return None\n"
+      "        ready = self._read_report(time.monotonic() + self.grace)"),
+     ("        if not self._order(order_w, setup):\n"
+      "            return None\n"
+      '        if not self._order(order_w, {"command": self.cfg.command,\n'
+      '                                     "args": list(self.cfg.args), "env": env,\n'
+      '                                     "cwd": self.cfg.cwd,\n'
+      '                                     "inherit": list(inherit)}):\n'
+      "            return None\n"
+      "        ready = self._read_report(time.monotonic() + self.grace)"),
+     "a rejected guardian is never told what to run, and says which phase it reached"),
+    # The guardian injection unrecorded again, so an injected guardian failure and a real one
+    # are the same record — a fault point with no provenance.
+    ("M312-the-guardian-injection-is-not-recorded", PROXY_IO,
+     ('        found = {"suppresses": sorted(self.targets)}\n'
+      "        if self.guardian:"),
+     ('        found = {"suppresses": sorted(self.targets)}\n'
+      "        if False:"),
+     "the guardian's program is not there: the injection is recorded in the start record"),
+    ("M313-a-guardian-injection-alone-does-not-arm-the-fault-point", PROXY_IO,
+     "            return cls(armed=bool(guardian), guardian=guardian)",
+     "            return cls(armed=False, guardian=guardian)",
+     "the guardian's program is not there: the injection is recorded in the start record"),
+    ("M314-any-guardian-mode-is-accepted", AUDIT,
+     "    if record.guardian is not _MISSING and record.guardian not in GUARDIAN_MODES:",
+     "    if False:",
+     "audit.the_guardian_injection_is_recorded_beside_the_suppression_targets"),
+    ("M315-the-fault-point-map-is-open", AUDIT,
+     '            for key in sorted(set(raw["fault_point"]) - {"suppresses", "guardian"}):',
+     '            for key in sorted(set(raw["fault_point"]) - set(raw["fault_point"])):',
+     "audit.the_guardian_injection_is_recorded_beside_the_suppression_targets"),
 
     # ---- the archived log carries codes, not prose --------------------------------------
     ("M292-the-drop-event-carries-the-peers-own-text", PROXY_IO,
@@ -2287,6 +2358,7 @@ MUTATIONS = [
      "            if key in live:\n                duplicates.append(key)",
      "            if key in live:\n                reuse.append(key)",
      "a repeat BEFORE the response is a live duplicate, not that reuse"),
+
 ]
 
 

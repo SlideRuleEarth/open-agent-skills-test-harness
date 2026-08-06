@@ -127,6 +127,18 @@ FAULT_POINT_CONFIGURED = "fault_point_configured"
 # the record. It is the only thing a suppressed step's `failed` may name as its cause.
 FAULT_POINT_FIRED = "fault_point_fired"
 
+# §10.9's OTHER fault injection: the four ways the guardian is broken on demand. They live here,
+# beside the suppression targets, because they are the same kind of thing — a test-only control
+# whose PRESENCE must make the instance anomalous and, above all, must be VISIBLE. While this
+# was an env var the proxy read and never recorded, an injected guardian failure was
+# indistinguishable in the audit from a real one (review, PR #103), which is a fault point with
+# no provenance: the one property `fault_point_configured` exists to guarantee.
+GUARDIAN_MISSING = "missing"             # its program is not there, so `Popen` raises
+GUARDIAN_SILENT = "silent"               # it exits BEFORE reporting ready — no child is started
+GUARDIAN_IMPOSTER = "imposter"           # it reports a pid that is not its own — likewise
+GUARDIAN_LATE = "late"                   # it exits after the child exists, so the pin is lost
+GUARDIAN_MODES = frozenset({GUARDIAN_MISSING, GUARDIAN_SILENT, GUARDIAN_IMPOSTER, GUARDIAN_LATE})
+
 # Every reason, on either axis, that leaves an instance clean. Everything else is an anomaly,
 # INCLUDING an unrecognized one — see `is_clean`.
 CLEAN_REASONS = frozenset({
@@ -289,6 +301,7 @@ class Record:
     fired: tuple[str, ...] = ()
     fault_point: bool = False                # PRESENT, which is the anomalous fact
     suppresses: frozenset[str] = frozenset()
+    guardian: Any = _MISSING                 # §10.9's guardian injection; the VALUE, or missing
     child_status: Any = _MISSING             # the VALUE, or `_MISSING`; never a flag
 
     @property
@@ -412,6 +425,7 @@ def parse(raw: Any) -> tuple[Record, tuple[str, ...]]:
     # passing verdict the arm-only case exists to reject.
     fault_point = "fault_point" in raw and raw["fault_point"] is not None
     suppresses: set[str] = set()
+    guardian: Any = _MISSING
     if "fault_point" in raw and raw["fault_point"] is None:
         problems.append("null:fault_point")
     elif fault_point:
@@ -424,9 +438,15 @@ def parse(raw: Any) -> tuple[Record, tuple[str, ...]]:
                     suppresses.add(item)
                 else:
                     problems.append(f"suppresses_not_a_string:{i}")
+            guardian = raw["fault_point"].get("guardian", _MISSING)
+            # CLOSED IN BOTH DIRECTIONS, like every other tagged map here. A key nobody reads is
+            # a key that can say anything, and this map is the record of what was injected.
+            for key in sorted(set(raw["fault_point"]) - {"suppresses", "guardian"}):
+                problems.append(f"fault_point_key_unknown:{key}")
 
     return (Record(tuple(triggers), tuple(outcomes), facts, fact_keys, tuple(fired),
-                   fault_point, frozenset(suppresses), raw.get("child_status", _MISSING)),
+                   fault_point, frozenset(suppresses), guardian,
+                   raw.get("child_status", _MISSING)),
             tuple(problems))
 
 
@@ -524,6 +544,11 @@ def validate(record: Record) -> tuple[str, ...]:
     # only thing that would have been reported.
     for name in sorted(record.suppresses - set(FACTS)):
         problems.append(f"suppresses_unknown:{name}")
+    # Same rule, same reason, for the other injection. A run whose guardian was broken on
+    # purpose has to SAY which way, or the audit cannot tell an injected failure from a real
+    # one — and the arming is once again the only thing that would otherwise be reported.
+    if record.guardian is not _MISSING and record.guardian not in GUARDIAN_MODES:
+        problems.append(f"guardian_mode_unknown:{record.guardian!r}")
 
     return tuple(problems)
 
