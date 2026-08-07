@@ -9,13 +9,14 @@ a tempdir, checks the baseline passes, then applies one mutation at a time and r
 suite that owns the mutated file. Exit 0 only when every mutation is caught BY ITS NAMED ARM
 — "some arm failed" is not the same claim.
 
-TWO SUITES, chosen by the file the mutation perturbs rather than declared per entry.
-`agentskill_evals/` is proven by the selftest; `fixtures/` and `tools/` are proven by
-`tools/verify_mcp_fixtures.py`, which is the only thing that drives them. Deriving the suite
-from the target rather than adding a sixth field is the same argument `_classify` already
-makes about the id prefix: a fact that can be stated independently will eventually be stated
-wrongly, and here the wrong suite means a mutation reported as uncaught because the program
-that would have caught it never ran.
+THREE SUITES, chosen by the file the mutation perturbs rather than declared per entry.
+`agentskill_evals/` is proven by the selftest; `fixtures/` and `tools/` by
+`tools/verify_mcp_fixtures.py`; and the proxy's I/O half plus the awkward server it is driven
+against by `tools/verify_mcp_proxy.py`, those two named explicitly because each sits in a
+directory another suite owns. Deriving the suite from the target rather than adding a sixth
+field is the same argument `_classify` already makes about the id prefix: a fact that can be
+stated independently will eventually be stated wrongly, and here the wrong suite means a
+mutation reported as uncaught because the program that would have caught it never ran.
 
 Three failure modes it reports, all of which have happened and none of which mean the code
 is fine:
@@ -77,6 +78,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 # Repo-relative: this file lives at <repo>/harness/tools/, so the harness package root is
 # its grandparent. Was an absolute path while it lived in a scratchpad, which is exactly how
@@ -107,6 +109,10 @@ SHIM = "fixtures/probe_era_mcp_server.py"
 ECHO = "fixtures/echo_mcp_server.py"
 PIPEPROBE = "tools/probe_mcp_pipelining.py"
 HTTPFIX = "fixtures/http_mcp_server.py"
+# The opt-in live probe. A target like any other despite never running in the block: its
+# startup path is driven offline by `verify_mcp_fixtures.py` §E18, precisely because "nothing
+# routine runs it" is what let a fix land in one copy and not this one.
+PROBE1 = "tools/probe_remote_mcp.py"
 # The proxy's I/O half and the awkward server it is driven against. PRODUCTION code that no
 # selftest arm can reach — it is only executed by running the real program over real pipes —
 # so it is `M*` like any other production target, proven by a THIRD suite. The classification
@@ -114,10 +120,13 @@ HTTPFIX = "fixtures/http_mcp_server.py"
 # `M`/`I`/`F` says what a mutation perturbs, `_suite_for` says who would notice.
 PROXY_IO = "agentskill_evals/mcp_proxy_io.py"
 TARGET = "fixtures/proxy_target_server.py"
-# Not targets, the suites themselves. A mutation aimed here would be asking a verifier whether
-# it notices being broken.
+# Not targets: a mutation aimed at a verifier asks that verifier whether it notices being
+# broken, and the mutated program and the judging program are then the same one.
 VERIFIER = "tools/verify_mcp_fixtures.py"
 PROXY_VERIFIER = "tools/verify_mcp_proxy.py"
+# THIS FILE IS A TARGET, which it was not until `verify_mcp_fixtures.py` §E17 began driving the
+# readers below from a different program. See `_classify` for where the line falls: what §E17
+# drives is fair game, and this runner's own scoring is not.
 SELF = "tools/mutate_mcp.py"
 
 MUTATIONS = [
@@ -2469,6 +2478,77 @@ MUTATIONS = [
      "        if not self.path.startswith(PATH_SSE):",
      "...and a prefix of the SSE path is not the SSE path"),
 
+    # ---- the MUST the Origin argument already covered, and the witness of the call ---------
+    ("F22-the-protocol-version-header-is-never-validated", HTTPFIX,
+     ("        if not self._version_ok():\n            self._empty(400)\n            return\n"
+      "        # STREAMABLE HTTP: the reply is this response's body."),
+     "        # STREAMABLE HTTP: the reply is this response's body.",
+     "an unsupported MCP-Protocol-Version is refused 400 — the binding's other MUST"),
+    # Deny-everything again: it scores full marks on F22's check, and only a control driving a
+    # version the server really supports can tell the two apart.
+    ("F23-every-protocol-version-is-refused-including-none", HTTPFIX,
+     "        return claimed is None or claimed in SUPPORTED_VERSIONS",
+     "        return False",
+     ("...while EVERY version `initialize` can negotiate is served, so the set it is checked "
+      "against cannot narrow away from the set it is chosen from")),
+    # The drift the import exists to prevent: a set narrower than the one `_initialize` selects
+    # from lets this server 400 a version it negotiated itself.
+    ("F24-the-supported-set-drifts-from-the-negotiated-one", HTTPFIX,
+     "SUPPORTED_VERSIONS = echo.LEGACY_VERSIONS",
+     "SUPPORTED_VERSIONS = echo.LEGACY_VERSIONS[:1]",
+     ("...while EVERY version `initialize` can negotiate is served, so the set it is checked "
+      "against cannot narrow away from the set it is chosen from")),
+    # The witness stops recording the call, so nothing but the model's own final text says a
+    # tool ran — which is the assertion the live probe was found to be making (PR #106).
+    ("F25-the-call-itself-is-never-recorded", HTTPFIX,
+     ('    RECEIPTS.write("rpc", method=method, id=req_id,\n'
+      '                   tool=params.get("name") if method == "tools/call" else None)'),
+     "    pass",
+     ("the witness records the CALL ITSELF, so 'the tool ran' and 'the model repeated its "
+      "prompt' stop looking alike")),
+    # A tool name on every message: it satisfies the check above while identifying nothing.
+    ("F26-every-message-is-recorded-as-a-tool-call", HTTPFIX,
+     '                   tool=params.get("name") if method == "tools/call" else None)',
+     '                   tool="echo")',
+     ("...and a message that is NOT a tool call records no tool name, so the field tells them "
+      "apart")),
+
+    # ---- the runner's own readers, which nothing but a full run used to execute -----------
+    # THE REGRESSION THAT SHIPPED, pinned. `_SUITES` grew a third field, `run()` kept unpacking
+    # two, and `mutate_mcp.py` could not start either verifier suite — for a whole push, with
+    # no check able to say so (review, PR #106).
+    # ANCHORED ACROSS LINES, and that is forced rather than stylistic — a hazard particular to
+    # mutating THIS file. An anchor of a single unescaped line appears twice here: once in the
+    # code, once as the `find` string quoting it a hundred lines up. The ambiguous-anchor guard
+    # caught it on the first run. Any anchor spanning a newline is written with a `\n` escape,
+    # so the literal's source bytes differ from the code's and the match is unique again.
+    ("F27-the-suite-record-is-read-positionally-again", SELF,
+     '    return [str(cwd / ".venv/bin/python"), *_SUITES[suite].argv]\n\n\ndef run(',
+     ('    argv, _ = _SUITES[suite]\n'
+      '    return [str(cwd / ".venv/bin/python"), *argv]\n\n\ndef run('),
+     "every declared suite yields a runnable command, which is the line that broke"),
+    # A suite that prints a line per check but declares no parser for them: the arm guard skips
+    # it silently, which is the disarm rather than a failure.
+    ("F28-a-label-printing-suite-declares-no-label-parser", SELF,
+     '    "fixtures": _Suite((VERIFIER,), r"^\\s*FAIL\\s+(.+?)\\s\\s<- ", _ALL_LABELS),',
+     '    "fixtures": _Suite((VERIFIER,), r"^\\s*FAIL\\s+(.+?)\\s\\s<- "),',
+     ("...and the two suites that print a line per check both declare one, since a `None` "
+      "there disarms the arm guard without saying so")),
+    # A label parser matching every line makes the empty parse unreachable, and the guard's
+    # fail-closed branch becomes unreachable code that reads like a safeguard.
+    ("F29-the-label-parser-matches-lines-that-are-not-checks", SELF,
+     '_ALL_LABELS = r"^\\s*(?:ok|FAIL)\\s+(.+?)(?:\\s\\s<- .*)?$"',
+     '_ALL_LABELS = r"^(.+)$"',
+     ("...and finds nothing in output that is not a check, so the empty parse it now refuses "
+      "on is a state that can really occur")),
+    # THE REPORTED DEFECT ITSELF, in the copy it was reported in: parse in the `return`, and a
+    # first line that is not JSON raises out with the child alive and the caller holding None.
+    ("F30-the-probe-parses-the-announcement-undefended-again", PROBE1,
+     ("    try:\n        info = json.loads(line)\n    except ValueError:\n"
+      "        return reaped("),
+     "    info = json.loads(line)\n    if False:\n        return reaped(",
+     "a fixture that says something that is not JSON is a NAMED failure, not a traceback"),
+
 ]
 
 
@@ -2485,15 +2565,35 @@ _SUITE_TIMEOUT = 300
 # the fixture verifier prints `FAIL label  <- detail` — and a runner that guessed one format
 # for both would read every failure of the other as "failed, but NOT via", which reports a
 # working arm as a broken one.
-# (argv, the regex for a FAILED check, and — where the suite prints its passes too — the regex
-# for EVERY label it printed. The third is what lets the arm-names-a-real-check guard run; the
-# selftest has none because it prints section headings rather than one line per arm, so its
-# full label set is not recoverable from the output.)
 _ALL_LABELS = r"^\s*(?:ok|FAIL)\s+(.+?)(?:\s\s<- .*)?$"
+
+
+class _Suite(NamedTuple):
+    """How to run one suite, and how to read two different things out of its output.
+
+    A NAMED RECORD RATHER THAN A BARE TUPLE, and that is the fix rather than the tidying. The
+    third field arrived with the arm-names-a-real-check guard, and three readers had to agree
+    about the new shape: two were updated, and `run()` — which said `argv, _ = _SUITES[suite]`
+    — was not. So the runner raised `ValueError: too many values to unpack` before its first
+    baseline, for BOTH suites that declare a parser, and the guard's own code path had
+    therefore never executed once (review, PR #106; found by driving it rather than by reading
+    it). A positional record with an optional tail is a shape every reader must re-derive
+    independently, which is the same class of mistake as a rule duplicated instead of imported.
+    A named one cannot be mis-unpacked and the next field costs no reader a change.
+    """
+
+    argv: tuple            # ...appended to the venv interpreter
+    failed: str            # the regex naming a check that went RED
+    labels: str | None = None   # ...and EVERY label printed, where the suite prints its passes
+
+
+# `labels` is None for the selftest and only for it: that suite prints section headings and
+# `[FAIL]` lines rather than one line per arm, so its full label set is not recoverable from
+# its output and the arm guard cannot run against it.
 _SUITES = {
-    "selftest": (("-m", "agentskill_evals", "selftest"), r"\[FAIL\]\s+([^:]+):"),
-    "fixtures": ((VERIFIER,), r"^\s*FAIL\s+(.+?)\s\s<- ", _ALL_LABELS),
-    "proxy": ((PROXY_VERIFIER,), r"^\s*FAIL\s+(.+?)\s\s<- ", _ALL_LABELS),
+    "selftest": _Suite(("-m", "agentskill_evals", "selftest"), r"\[FAIL\]\s+([^:]+):"),
+    "fixtures": _Suite((VERIFIER,), r"^\s*FAIL\s+(.+?)\s\s<- ", _ALL_LABELS),
+    "proxy": _Suite((PROXY_VERIFIER,), r"^\s*FAIL\s+(.+?)\s\s<- ", _ALL_LABELS),
 }
 
 # The two files the third suite proves, named rather than derived: `mcp_proxy_io.py` sits in
@@ -2522,16 +2622,28 @@ def _suite_for(rel):
     return "fixtures" if rel.startswith(("fixtures/", "tools/")) else "selftest"
 
 
+def command_for(cwd, suite):
+    """The argv `run` will spawn for `suite`, under `cwd`'s venv.
+
+    A FUNCTION RATHER THAN AN EXPRESSION INSIDE `run`, so it can be driven without paying for
+    a suite. This is the exact line that raised `ValueError` for every fixture and proxy
+    mutation, and the reason it reached a push is that nothing but a 63-minute run ever
+    executed it — a tool whose own readers are only exercised by its slowest path is one whose
+    breakage is discovered late by definition. §4's rule about probes applies to the runner
+    too: keep the logic in named functions so a check can drive it on synthetic input.
+    """
+    return [str(cwd / ".venv/bin/python"), *_SUITES[suite].argv]
+
+
 def run(cwd, suite):
     """Run one suite in `cwd`. Returns (returncode, output, elapsed_seconds).
 
     Elapsed is measured with a monotonic clock so a wall-clock adjustment mid-suite (a run
     this long can straddle one) cannot produce a negative or wildly inflated duration.
     """
-    argv, _ = _SUITES[suite]
     t0 = time.monotonic()
     try:
-        p = subprocess.run([str(cwd / ".venv/bin/python"), *argv],
+        p = subprocess.run(command_for(cwd, suite),
                            cwd=cwd, capture_output=True, text=True, timeout=_SUITE_TIMEOUT)
     except subprocess.TimeoutExpired:
         return 124, "__TIMEOUT__", time.monotonic() - t0
@@ -2545,7 +2657,7 @@ def failed_checks(suite, out):
     silently matches nothing turns every catch into "failed, but NOT via", which looks like
     a coverage problem and is a tooling one.
     """
-    return re.findall(_SUITES[suite][1], out, re.MULTILINE)
+    return re.findall(_SUITES[suite].failed, out, re.MULTILINE)
 
 
 def _classify(mid, rel):
@@ -2560,11 +2672,26 @@ def _classify(mid, rel):
     Raises rather than warns: a suite that reports a wrong total is worse than one that
     refuses to start, and this runs before any baseline so the cost is a second.
     """
-    if rel in (SELF, VERIFIER, PROXY_VERIFIER):
+    if rel in (VERIFIER, PROXY_VERIFIER):
         raise SystemExit(
             f"mutation {mid!r} targets {rel}, which is a suite rather than something a suite "
-            f"checks. Asking the mutation runner whether it notices being mutated, or either "
-            f"verifier whether it notices, establishes nothing about any of them.")
+            f"checks. Asking a verifier whether it notices being mutated establishes nothing "
+            f"about it: the mutated program and the program judging the mutation are the same "
+            f"one.")
+    # `SELF` USED TO BE REFUSED HERE TOO, on that same argument, and the argument stopped
+    # applying: `verify_mcp_fixtures.py` §E17 now drives this runner's suite-readers, and it is
+    # a DIFFERENT program, executed from the mutated copy while the runner doing the judging
+    # keeps running from the original tree. That separation is the whole content of the rule —
+    # a claim and the thing it claims about must not have the same author — and it holds here.
+    # It was worth reopening because the alternative had a cost: the `_SUITES` record grew a
+    # field, `run()` was not updated with it, and the runner could not start EITHER verifier
+    # suite for a full push, with nothing able to say so (review, PR #106).
+    #
+    # WHAT IS STILL INADMISSIBLE, and the line is not the file: this runner's own SCORING —
+    # `_classify`, the caught/missed accounting, the anchor guards — is executed only by the
+    # unmutated original, so a mutation of it would be judged by the code it perturbs and
+    # would report MISSED for a defect nothing ever ran. Aim at what §E17 drives, or write the
+    # check first.
     # BY THE FILE'S ROLE, not by which suite proves it. Reading the class off `_suite_for` was
     # right while there were two suites and wrong the moment a third arrived: `mcp_proxy_io.py`
     # is production proven by a driver, and `proxy_target_server.py` is an instrument proven by
@@ -2615,9 +2742,23 @@ def main():
         # instead of a broken reference. It happened to F10 during review (PR #106). The
         # baseline run is the only place the full label set is known, and it is already paid
         # for, so the check costs nothing. Refused rather than warned, like the anchor guards.
-        printed = set(re.findall(_SUITES[suite][2], out, re.MULTILINE)) if len(
-            _SUITES[suite]) > 2 else None
-        if printed:
+        #
+        # AND THE PARSE MUST HAVE FOUND SOMETHING FIRST. `if printed:` skipped the guard
+        # entirely when the label regex matched nothing, so a change to a verifier's output
+        # format would clear every arm in that suite at once — the guard containing, inside
+        # itself, the vacuous-success class it was written to close (review, PR #106). It is
+        # §4's `all(...)` over a collection nothing was put into, and it takes the same
+        # remedy: a structural clause saying something must be there, ahead of the universal
+        # one. The wrong-arm control proves membership works against a NON-EMPTY parse and is
+        # silent about the empty one, which is why it did not catch this.
+        pattern = _SUITES[suite].labels
+        if pattern is not None:
+            printed = set(re.findall(pattern, out, re.MULTILINE))
+            if not printed:
+                print(f"NO CHECK LABELS PARSED from the {suite} baseline — its output format "
+                      f"moved out from under {pattern!r}, and every arm below would be "
+                      f"cleared by a guard with nothing to compare against.")
+                return 1
             orphan = sorted({a for m, r, _f, _r, a in MUTATIONS
                              if suites[m] == suite and a not in printed})
             if orphan:

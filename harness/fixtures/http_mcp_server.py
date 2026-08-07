@@ -34,15 +34,32 @@ rather than different spellings:
     POST's own response, under `sse` the POST is answered `202 Accepted` and the reply
     arrives somewhere else entirely.
 
-THE HTTP BINDING IS DELIBERATELY LEGACY-ONLY, AND THAT IS A SCOPE CHOICE RATHER THAN AN
-OVERSIGHT. The protocol logic imported below is dual-era and will answer a modern request; the
-TRANSPORT here implements the `2025-11-25` binding, which is what every CLI in the measured
-fleet speaks over HTTP and what §9 probe #1 was asked about. Modern Streamable HTTP adds
-mandatory request headers — a protocol version, and per-request method and name metadata —
-which this does not enforce, so a client that got them wrong would not be caught here. That is
-acceptable for a fixture whose job is the legacy binding and NOT acceptable silently: a modern
-HTTP arm is real work, it is not done, and anything reading this file as evidence about modern
-HTTP would be reading it wrong (review, PR #106).
+THE HTTP BINDING IS DELIBERATELY LEGACY-ONLY, AND THIS IS THE SECOND ATTEMPT AT SAYING SO
+ACCURATELY. The first said the transport "implements the `2025-11-25` binding" and filed
+`MCP-Protocol-Version` under the things modern HTTP adds. Both halves were wrong in the same
+direction: that header is required BY `2025-11-25`, on every request after initialization, with
+a 400 owed for a value the server does not support — so a sentence written to disclaim modern
+work was quietly claiming legacy conformance this file did not have (review, PR #106). An
+overstated scope note is worse than none, because it is what a later reader trusts INSTEAD of
+reading the code.
+
+WHAT IS SERVED, precisely: Streamable HTTP as specified in `2025-11-25`, on `/mcp`; and the
+deprecated `2024-11-05` HTTP+SSE pair on `/sse` + `/messages`, which that same revision keeps
+for backwards compatibility and which `claude._write_mcp_config` still emits as `"type":
+"sse"`. The server-side MUSTs of the former are swept rather than sampled, and listed here so
+the claim is checkable against the code instead of taken: bind to loopback only; validate
+`Origin`; answer 400 to an unsupported `MCP-Protocol-Version`; answer 202 and no body to a POST
+carrying only notifications; answer JSON or an SSE stream to a POST carrying requests; answer
+405 to a GET this server will not open a stream for.
+
+WHAT IS NOT SERVED, deliberately, each because nothing in the harness reaches it yet: modern
+Streamable HTTP (`2026-07-28`) and its per-request metadata — the imported protocol logic is
+dual-era and WILL answer a modern message, which is precisely why the TRANSPORT gap has to be
+stated rather than inferred from the replies; sessions (below); stream resumability and
+`Last-Event-ID`; and authentication, which is a SHOULD this fixture inverts on purpose, its
+whole job being to RECORD the credential rather than to check it. A modern HTTP arm is real
+work, it is not done, and anything reading this file as evidence about modern HTTP would be
+reading it wrong.
 
 SESSIONS ARE NOT IMPLEMENTED, AND SO NONE IS ADVERTISED. The transport makes `Mcp-Session-Id`
 optional; a server that keeps no session state is conformant without it. What is not
@@ -120,6 +137,28 @@ PATH_STREAMABLE = "/mcp"
 PATH_SSE = "/sse"
 PATH_MESSAGES = "/messages"
 
+# THE PROTOCOL-VERSION HEADER IS THE BINDING'S OTHER MUST, and it is implemented here for the
+# reason the `Origin` block above gives rather than for a reason of its own. That argument — a
+# fixture more permissive than the spec teaches the harness that a permissive server is normal
+# — quantifies over every server-side MUST in the binding, not over the one that happened to be
+# reported, so honouring it meant sweeping the rest of them. This is what the sweep found
+# missing: `2025-11-25` requires the client to send `MCP-Protocol-Version` on every request
+# after initialization, and requires the server to answer 400 when the value is one it does not
+# support (review, PR #106).
+#
+# THE SUPPORTED SET IS IMPORTED, AND THAT IS LOAD-BEARING RATHER THAN TIDY. `echo._initialize`
+# picks the negotiated version out of `echo.LEGACY_VERSIONS`; any set narrower than that one
+# lets this server 400 a version it negotiated itself one request earlier, which presents as an
+# intermittent client bug. Importing is what makes the two unable to disagree (§4), and the
+# check driving every member of the tuple is what makes a later narrowing fail loudly.
+#
+# ABSENT IS ALLOWED, and is not a gap. The transport tells a server to assume `2025-03-26` when
+# the header is missing; more to the point, the `initialize` request that PRECEDES negotiation
+# legitimately carries none, and a server keeping no session state cannot tell that request
+# from a client that simply omits the header. Refusing would break the handshake the header is
+# defined relative to.
+SUPPORTED_VERSIONS = echo.LEGACY_VERSIONS
+
 
 class Receipts:
     """What actually arrived, written where a different process can read it.
@@ -160,10 +199,24 @@ def dispatch(msg: dict) -> dict | None:
     """
     method = msg.get("method")
     req_id = msg.get("id")
+    params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+    # THE WITNESS RECORDS THE MESSAGE, not only the HTTP request that carried it. The header
+    # record answers "did the credential arrive"; this answers "was the tool actually INVOKED",
+    # which is a different question and the one a LIVE probe cannot ask of itself. A model that
+    # never calls the tool and simply repeats its prompt back produces the same final text as
+    # one that did, so an assertion over that text is satisfiable without a tool call ever
+    # happening (review, PR #106). Only the server can say otherwise.
+    #
+    # Written HERE rather than in either transport, because both call this: where the reply
+    # goes is what the two transports disagree about, and the fact that the call arrived is
+    # not. The tool NAME is recorded, and only for `tools/call`, so the field distinguishes a
+    # tool call from every other message rather than being a constant that would satisfy the
+    # check without carrying anything.
+    RECEIPTS.write("rpc", method=method, id=req_id,
+                   tool=params.get("name") if method == "tools/call" else None)
     if method is None or req_id is None:
         return None                      # a notification, or a response; nothing to answer
     modern = echo._modern_intent(msg)
-    params = msg.get("params") or {}
     if method == "initialize":
         return echo.result_envelope(req_id, echo._initialize(params))
     if method == "server/discover":
@@ -230,6 +283,11 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         return origin is None or origin in ALLOWED_ORIGINS
 
+    def _version_ok(self) -> bool:
+        """Absent is fine; present must name a version this server implements. See above."""
+        claimed = self.headers.get("MCP-Protocol-Version")
+        return claimed is None or claimed in SUPPORTED_VERSIONS
+
     def do_POST(self) -> None:                                   # noqa: N802 — BaseHTTPRequestHandler
         self._record()
         if not self._origin_ok():
@@ -263,6 +321,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path != PATH_STREAMABLE:
             self._empty(404)
+            return
+        # Checked on THIS endpoint only. `MCP-Protocol-Version` belongs to the Streamable HTTP
+        # binding; the `/messages` half above is the `2024-11-05` transport, which predates the
+        # header and whose clients are not required to send one.
+        if not self._version_ok():
+            self._empty(400)
             return
         # STREAMABLE HTTP: the reply is this response's body.
         reply = dispatch(msg)

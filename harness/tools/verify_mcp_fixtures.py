@@ -30,7 +30,9 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -1416,6 +1418,23 @@ with _Remote() as _rm:
         check("...and a request sent without one records its absence, so the check can fail",
               None in _auth, _auth)
 
+        # THE OTHER HALF OF THE WITNESS, and the half a LIVE probe cannot do without. Its
+        # "the model called the tool" check reads the model's final text, and the text it
+        # looks for was handed to the model in the prompt — so a client that advertised the
+        # tools and never invoked one passed by repeating itself (review, PR #106). Only the
+        # server can distinguish those, and only if it records the call rather than just the
+        # HTTP request carrying it. `id` 3 is the `tools/call` above.
+        _rpc = [{k: r.get(k) for k in ("method", "id", "tool")} for r in _rm.rows("rpc")]
+        check("the witness records the CALL ITSELF, so 'the tool ran' and 'the model repeated "
+              "its prompt' stop looking alike",
+              {"method": "tools/call", "id": 3, "tool": "echo"} in _rpc, _rpc)
+        # Without this the field could be the constant "echo" and the check above would still
+        # pass — an identifier that names everything identifies nothing.
+        _named = {r["tool"] for r in _rpc if r["method"] == "tools/list"}
+        check("...and a message that is NOT a tool call records no tool name, so the field "
+              "tells them apart",
+              _named == {None}, _rpc)
+
         check("an unroutable method is an error, not a hang",
               dig(_rm.rpc({"jsonrpc": "2.0", "id": 4, "method": "no/such"}),
                   2, "error", "code") == -32601)
@@ -1436,6 +1455,25 @@ with _Remote() as _rm:
         # both checks above — "rejects everything passes" is the defect §10.9 spends a case on.
         check("...while a request with no Origin at all is served, as a non-browser client",
               _rm.rpc({"jsonrpc": "2.0", "id": 6, "method": "ping"})[0] == 200)
+
+        # THE BINDING'S OTHER MUST, found by asking what else the Origin argument covered
+        # rather than by it being reported: `2025-11-25` requires 400 for a protocol version
+        # the server does not support, and the scope note used to file that header under
+        # MODERN additions while claiming legacy conformance (review, PR #106).
+        check("an unsupported MCP-Protocol-Version is refused 400 — the binding's other MUST",
+              _rm.rpc({"jsonrpc": "2.0", "id": 11, "method": "ping"},
+                      {"MCP-Protocol-Version": "1999-01-01"})[0] == 400)
+        # THE CONTROL, and simultaneously the pin: `_initialize` selects out of this same
+        # tuple, so a version list narrower than it would 400 a version the server itself had
+        # just negotiated. Driving EVERY member is what makes a later narrowing fail here
+        # instead of intermittently against a real client.
+        _served = {v: _rm.rpc({"jsonrpc": "2.0", "id": 12, "method": "ping"},
+                              {"MCP-Protocol-Version": v})[0] for v in ECHO_MOD.LEGACY_VERSIONS}
+        check("...while EVERY version `initialize` can negotiate is served, so the set it is "
+              "checked against cannot narrow away from the set it is chosen from",
+              bool(_served) and set(_served.values()) == {200}, _served)
+        check("...and an absent header is served too, because `initialize` itself carries none",
+              _rm.rpc({"jsonrpc": "2.0", "id": 13, "method": "ping"})[0] == 200)
 
         # EXACTLY THE CONFIGURED PATH. `/definitely-not-mcp` used to be served, so a config
         # whose URL had been mangled still reached a working server and the probe that was
@@ -1502,6 +1540,157 @@ with _Remote() as _rm2:
                        url=_rm2.url("/messages?sessionId=nosuch"))[0] == 404)
         check("...and a prefix of the SSE path is not the SSE path",
               _rm2.get("/sse-anything") == 405)
+
+print()
+print("E17. mutate_mcp.py's own readers, driven without paying for a 63-minute run")
+
+# WHY THE RUNNER IS UNDER TEST HERE. It is the instrument every "N/N caught" claim rests on,
+# and until now nothing executed its suite-reading code except a full run — so a change to the
+# record those readers share broke `run()` for BOTH verifier suites, shipped, and was found by
+# hand-driving the tool rather than by any check (review, PR #106). An instrument exercised
+# only by its slowest path is one whose breakage is discovered late by construction; §4 makes
+# this point about probes and it is no weaker about the thing that scores them.
+#
+# `mutate_mcp` is importable from here — same directory — so these drive the real functions.
+# A check that restated their logic could not disagree with them, which is the whole failure
+# mode being closed (§4's duplicated-rule rule, satisfied by import).
+import mutate_mcp as MUT  # noqa: E402 — a section-local import, beside the checks that use it
+
+
+def survives(fn, *a, **k):
+    """`fn`'s value, or the exception it raised — never the exception itself.
+
+    `dig` one level out, and for the same reason. The defect these checks exist to catch
+    RAISES rather than returning something wrong: the mis-unpack was a `ValueError`, and a bad
+    parser is a `re.error`. Evaluated inside a `check(...)` argument either of those takes the
+    verifier down and reports nothing at all, which is strictly less than a red line saying
+    which reader broke.
+    """
+    try:
+        return fn(*a, **k)
+    except Exception as exc:                                   # noqa: BLE001 — any of them
+        return exc
+
+
+def field(suite, name):
+    """One named field of a suite record, or None where the record has no such field.
+
+    `getattr` with a default rather than an attribute access, so a record that is a bare tuple
+    again — the shape the named one replaced — reads as a MISSING field and reddens a check,
+    instead of raising `AttributeError` out of a `check(...)` argument.
+    """
+    return getattr(MUT._SUITES[suite], name, None)
+
+
+_ARGVS = {s: survives(MUT.command_for, pathlib.Path("/x"), s) for s in MUT._SUITES}
+check("every declared suite yields a runnable command, which is the line that broke",
+      bool(_ARGVS) and all(isinstance(c, list) and len(c) > 1
+                           and c[1:] == list(field(s, "argv") or [])
+                           for s, c in _ARGVS.items()), _ARGVS)
+# The three fields have three different readers, and a record one of them cannot read is the
+# defect above — so name them rather than trusting the record's arity. Parenthesized: as
+# `A and B or C` this is true by precedence whenever a labels parser is a string, which is
+# every real entry, and the interesting term would never be reached (§4).
+check("...and each names a FAILED-check parser, with a full-label parser or an explicit None",
+      bool(MUT._SUITES) and all(          # the structural clause: `all` over {} is true
+          isinstance(field(s, "failed"), str)
+          and (field(s, "labels") is None or isinstance(field(s, "labels"), str))
+          for s in MUT._SUITES), MUT._SUITES)
+# `None` is legitimate for the selftest, which prints section headings rather than a line per
+# arm. It is a SILENT DISARM for any suite that does print one, because the arm guard simply
+# skips a suite declaring none. Both of these print a line per check — this file is one of
+# them, four lines up.
+check("...and the two suites that print a line per check both declare one, since a `None` "
+      "there disarms the arm guard without saying so",
+      all(isinstance(field(s, "labels"), str) for s in ("fixtures", "proxy")), MUT._SUITES)
+
+# THE PARSERS, ON THIS SUITE'S REAL OUTPUT FORMAT — which is the format printed a few lines
+# above, so a change to `check()` moves the sample and the parser together.
+_sample = "  ok   a passing label\n  FAIL a failing label  <- detail here\nALL PASS\n"
+check("the FAILED parser reads a red check out of this verifier's own format",
+      survives(MUT.failed_checks, "fixtures", _sample) == ["a failing label"], _sample)
+check("...and the label parser reads BOTH lines, since arms name passing checks too",
+      survives(re.findall, MUT._ALL_LABELS, _sample, re.MULTILINE)
+      == ["a passing label", "a failing label"], _sample)
+# THE POSITIVE FACT BEHIND THE FAIL-CLOSED BRANCH. The arm guard used to skip itself when the
+# parse came back empty, which cleared every arm at once if a verifier's output format moved.
+# Making it refuse instead is only worth something if an empty parse is REACHABLE — a parser
+# that matched every line would turn the new branch into unreachable code that reads like a
+# safeguard (review, PR #106).
+check("...and finds nothing in output that is not a check, so the empty parse it now refuses "
+      "on is a state that can really occur",
+      survives(re.findall, MUT._ALL_LABELS, "E1. a section heading\n\nALL PASS\n",
+               re.MULTILINE) == [],
+      "otherwise the guard's fail-closed branch is unreachable")
+
+print()
+print("E18. probe_remote_mcp.py's startup path — the copy a fix was left out of")
+
+# WHY THIS IS CHECKED OFFLINE. That probe is opt-in: it needs `claude` on PATH and spends an
+# API call, so nothing in the ordinary block runs it, and its startup path had therefore never
+# been driven at all. The consequence was reported rather than caught — the verifier's own
+# startup was hardened and the probe, which exists to be REUSED, kept the defect: a first line
+# that was not JSON raised out of `start_fixture` with the child alive and the caller's handle
+# still `None`, leaking a listening server (review, PR #106). The fix belongs to both copies
+# and so does the check; that is §4's rule about a duplicated rule, applied to a duplicated FIX.
+import probe_remote_mcp as PROBE  # noqa: E402 — section-local, beside the checks that use it
+
+
+class _Watched:
+    """`subprocess`, with a memory of what was started through it.
+
+    THE WITNESS MUST COME FROM OUTSIDE `start_fixture`. What is under test is what it does with
+    a handle it does not return: every failure path returns `(None, reason)`, so from the
+    caller's side "reaped correctly" and "still running and leaking a port" are the same value.
+    A check reading only the return value cannot tell them apart, which is why it gets a
+    witness with a different vantage point rather than a cleverer assertion (§4).
+    """
+
+    PIPE = subprocess.PIPE
+
+    def __init__(self):
+        self.started = []
+
+    def Popen(self, *a, **k):                                  # noqa: N802 — it stands in for one
+        proc = subprocess.Popen(*a, **k)
+        self.started.append(proc)
+        return proc
+
+
+# Each one is a way a fixture can fail to announce itself. All three sleep afterwards, so a
+# process that was NOT reaped is still running when the check reads it — a fake that exited on
+# its own would make the reap check pass without anything reaping.
+_FAKES = {
+    "says something that is not JSON": 'print("definitely not a port", flush=True)',
+    "announces no endpoints": "print('{\"port\": 1}', flush=True)",
+    "dies before saying anything": ('import sys\nsys.stderr.write("bind: refused\\n")\n'
+                                    "raise SystemExit(3)"),
+}
+_startup_tmp = tempfile.mkdtemp(prefix="probe-startup-")
+_real_fixture = PROBE.FIXTURE
+for _desc, _body in _FAKES.items():
+    _fake = os.path.join(_startup_tmp, "fake.py")
+    with open(_fake, "w", encoding="utf-8") as _fh:
+        _fh.write(_body + "\nimport time\ntime.sleep(300)\n")
+    _watch = _Watched()
+    PROBE.subprocess, PROBE.FIXTURE = _watch, _fake
+    try:
+        _got = survives(PROBE.start_fixture, os.path.join(_startup_tmp, "r.jsonl"), "MARKER")
+    finally:
+        PROBE.subprocess, PROBE.FIXTURE = subprocess, _real_fixture
+    _proc, _why = _got if isinstance(_got, tuple) else (None, _got)
+    check(f"a fixture that {_desc} is a NAMED failure, not a traceback",
+          _proc is None and isinstance(_why, str) and bool(_why), _got)
+    # Read BEFORE the cleanup below, or this asks whether the tidy-up worked.
+    _reaped = bool(_watch.started) and all(p.poll() is not None for p in _watch.started)
+    # Named per case, not "...and the child is reaped" three times: an arm names a check by its
+    # text, and three checks sharing one make the report unable to say which case broke.
+    check(f"...and the child of the one that {_desc} is reaped, leaking no listening server",
+          _reaped, [(p.pid, p.poll()) for p in _watch.started])
+    for _p in _watch.started:                    # so a MUTANT that leaks does not leak for 5m
+        _p.kill()
+        _p.wait(timeout=DEADLINE)
+shutil.rmtree(_startup_tmp, ignore_errors=True)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")

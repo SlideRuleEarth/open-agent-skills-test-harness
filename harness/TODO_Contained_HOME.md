@@ -292,15 +292,17 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 562 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py                        # 311/311 production + 2/2 instrument + 21/21 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 300 checks
+python3 -u harness/tools/mutate_mcp.py                        # 311/311 production + 2/2 instrument + 30/30 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 317 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 77 here
 git diff --check
 
 # OPT-IN, not part of the block above: needs `claude` on PATH and spends an API call.
 # Run it when the CLI updates — §9's probe-#1 result is version-qualified, and this is
-# what remeasures it rather than trusting a paragraph.
-harness/.venv/bin/python harness/tools/probe_remote_mcp.py    # 13 checks; claude 2.1.113
+# what remeasures it rather than trusting a paragraph. Its own startup path and the
+# mutation runner's suite-readers are driven OFFLINE by the fixture verifier (§E17, §E18),
+# because "nothing routine runs it" is exactly how a fix lands in one copy and not the other.
+harness/.venv/bin/python harness/tools/probe_remote_mcp.py    # 17 checks; claude 2.1.113
 ```
 
 **The mutation suite now runs THREE suites, and which one runs is a different question from
@@ -368,12 +370,14 @@ either mistake miscounts exactly what the split reporting exists to keep straigh
 
 Things that have gone wrong in the *tests*, so you can skip learning them again:
 
-- **The recurring one, eight times now: a check aimed BESIDE the thing that matters.** Every
-  instance looks like coverage and is not, and the shape is always the same — the arm and its
+- **The recurring one — a check aimed BESIDE the thing that matters — and the list below is
+  what keeps growing, so read its length rather than a numeral here.** Every instance looks
+  like coverage and is not, and the shape is always the same — the arm and its
   mutation agree with each other while both sit one level away from where the defect lives.
   Seen as: an arm whose two cases could not see the condition they guarded (M117); a live
   assertion the model could satisfy from its prompt without the mechanism running at all
-  (`regress_mcp_two_servers`, twice); two cells sharing an artifacts directory so the second
+  (`regress_mcp_two_servers`, twice, and §9 probe #1 — see the marker entry below); two cells
+  sharing an artifacts directory so the second
   overwrote what the first was meant to prove (M125); an arm exercising the delta HELPER
   while the regression was the banner's ASSIGNMENT of it (I2); an arm calling the proxy's
   refusal FORMATTER, which is green whether or not any call is ever refused (M158); and — the
@@ -1133,6 +1137,60 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   asserts every `F*` arm names a label the suite actually printed. The general form: **when two
   artifacts refer to each other by copied string, something has to check the reference
   resolves** — the same rule as §4's pinned duplicates, applied to a name rather than a value.
+- **A GUARD THAT SKIPS ITSELF ON AN EMPTY INPUT IS THE DEFECT IT WAS WRITTEN AGAINST.** The
+  sweep above ran under `if printed:`, so a verifier whose output format moved out from under
+  the label regex parsed **nothing** and thereby cleared **every** arm — vacuous success,
+  inside the guard closing vacuous success. It is §4's `all(...)` over a collection nothing was
+  put into, one file later, and it takes the same remedy: a structural clause saying something
+  must be there, ahead of the universal one. Note why the wrong-arm control missed it — that
+  control proves membership works against a non-empty parse and is silent about the empty one,
+  which is the ordinary blind spot of a control built from a passing case.
+- **A RECORD THAT GROWS A FIELD HAS TO BE RE-READ BY EVERY READER, AND A POSITIONAL ONE CANNOT
+  BE.** `_SUITES` gained a third element for that same guard. Two readers were updated by
+  index; `run()` still said `argv, _ = _SUITES[suite]`, so `mutate_mcp.py` raised `ValueError`
+  before its first baseline and **could not start either verifier suite at all** — for a whole
+  push, while the review round in flight was about the guard's finer points. The repair is not
+  a third careful index but a **named record**, which no reader can mis-unpack and whose next
+  field costs nobody a change; the same argument as importing a rule rather than restating it.
+  The deeper half is why nothing said so: those readers were executed **only by the 63-minute
+  path**, so the tool's own breakage was discovered late by construction. §4 already says a
+  probe's classification is under test because its printout is the evidence; a runner's suite
+  plumbing is under test for the identical reason, and it now is — `verify_mcp_fixtures.py`
+  drives it in six seconds from a different program, which is also what makes `mutate_mcp.py`
+  admissible as a mutation target for the first time.
+- **A FIX LANDS IN THE COPY THAT WAS REVIEWED, NOT THE COPY MEANT TO BE REUSED.** The fixture
+  verifier's startup was hardened — bounded wait, stderr preserved, reap on every failed
+  `__enter__`. `probe_remote_mcp.py` exists precisely so the same procedure can be RE-RUN, and
+  it kept parsing the port announcement inside its `return`: a first line that was not JSON
+  raised out with the child alive and the caller's handle still `None`, leaking a listening
+  server. **Opt-in tools are where this happens**, because "nothing routine runs it" is the
+  same sentence as "nothing routine would notice". The rule that generalizes is the first one
+  in `CLAUDE.md`: the justification for the verifier's fix never mentioned verifiers. Its error
+  paths are now driven offline against fakes that announce garbage, announce nothing, and die —
+  with the reap checked by a witness outside the function, since from the caller's side a
+  correct reap and a leaked server are the same returned `None`.
+- **A SCOPE NOTE THAT OVERSTATES IS WORSE THAN NO SCOPE NOTE, AND PROSE DOES NOT CHECK PROSE.**
+  The HTTP fixture's header said it "implements the `2025-11-25` binding" while filing
+  `MCP-Protocol-Version` under what MODERN HTTP adds. That header is required BY `2025-11-25`,
+  which §9 — written days earlier, in the same PR, from this fixture's own receipts — already
+  recorded the real client sending. Two files disagreed and nothing compares one paragraph to
+  another. Two things came out of it. **A sentence written to disclaim one thing can claim
+  another**, and the disclaimer is what a later reader trusts instead of reading the code. And
+  the missing enforcement was already implied: the `Origin` fix had been justified by "a
+  fixture more permissive than the spec teaches the harness that a permissive server is
+  normal", an argument quantifying over **every** server-side MUST in the binding — so
+  honouring it meant sweeping the rest and finding this one, rather than waiting to be told.
+  What the note says now is what is served, what is not, and which list each item is on.
+- **A MECHANISM BUILT TO ANSWER AN ARGUMENT DOES NOT ANSWER IT IN THE NEXT FILE.** Probe #1's
+  live check that "the model calls the tool and gets its answer" read the model's final text
+  for the string the tool had been asked to echo — a string the PROMPT supplied, so a client
+  that advertised the tools and never invoked one passed by repeating itself. `ECHO_MCP_IDENTITY`
+  exists for exactly this, added a round earlier with a comment stating exactly this argument
+  ("a marker it could reconstruct from what it was already given proves nothing"). Knowing the
+  rule, and having built the mechanism, did not make me reach for it in a new file. The fix
+  separates two facts that were being read off one: the server's receipts say the call
+  **arrived**, and the opaque marker says the answer **came back** — and the receipts cannot
+  witness the second, because a server can say what it wrote and not what was read.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s

@@ -24,15 +24,28 @@ WHAT IT ASSERTS, and each of these is a separate failure mode:
      unparseable config produces exactly the same word (§4).
   3. An UNREACHABLE url reports `failed` — the negative control, which is what makes (2)
      informative rather than tautological.
-  4. The tools are advertised as `mcp__<server>__<tool>` and the model calls one.
-  5. EVERY request the fixture received carried the declared `Authorization` header, with the
+  4. The tools are advertised as `mcp__<server>__<tool>`, and the model INVOKES one — read
+     from the fixture's receipts.
+  5. The tool's ANSWER gets back to the model, proved by an opaque marker the fixture
+     generates and the prompt never contains. (4) and (5) were once one assertion over the
+     model's final text, and that text was supplied BY the prompt: a client that advertised the
+     tools and never called one passed it by repeating itself (review, PR #106).
+  6. EVERY request the fixture received carried the declared `Authorization` header, with the
      sentinel value intact. Read from the fixture's receipts — the server's account of what
      arrived, not the client's account of what it sent, because a claim and the thing it
      claims about must not have the same author.
+  7. The `MCP-Protocol-Version` the client declares is one the fixture implements. This is
+     what keeps the fixture's 400-on-unsupported path safe: it refuses a version outside
+     `echo.LEGACY_VERSIONS`, and that refusal stops being correct the moment a CLI moves to a
+     revision outside it. §9 records `2025-11-25` for claude; this is what remeasures it.
 
-The sentinel is generated per run and never written to disk outside the receipts file, which
-lives in a temp dir this script removes. It is a fake token; the point is that a REAL one
-would follow the same path.
+THE SENTINEL AND THE MARKER are generated per run and both are fake. The sentinel reaches disk
+in TWO files, not one: the receipts, and `mcp.json` — which is where a bearer token has to be
+for the CLI to send it at all. An earlier version of this paragraph named only the receipts,
+which made the file's own security note its least accurate line (review, PR #106). Both files
+live under a `0700` temp dir this script removes on every exit path. The marker never reaches
+disk here at all; it is handed to the fixture in its environment. The point of the sentinel is
+that a REAL credential would travel exactly this path.
 """
 from __future__ import annotations
 
@@ -50,6 +63,15 @@ import uuid
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURES = os.path.join(os.path.dirname(HERE), "fixtures")
 FIXTURE = os.path.join(FIXTURES, "http_mcp_server.py")
+sys.path.insert(0, FIXTURES)
+
+# Imported for the ONE tuple this file asserts against — the versions the fixture implements,
+# which is also the set it now answers 400 outside of. Restating it here would let this probe
+# pass while the fixture refused every request a real client sent (§4: where import is
+# possible, import). The config shape a few lines down is restated for the opposite reason,
+# and the two are not in tension: that one is checking the ADAPTER against the CLI, so
+# importing the adapter's writer would make it agree by construction.
+import echo_mcp_server as ECHO  # noqa: E402 — the path insert above has to come first
 DEADLINE = 60.0
 
 findings: list[str] = []
@@ -67,12 +89,32 @@ def _pump(fh, q):
     q.put(None)
 
 
-def start_fixture(receipts: str):
-    """The fixture, or a named reason it could not start. Never an unbounded wait."""
-    proc = subprocess.Popen([sys.executable, FIXTURE], stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            env={**os.environ, "HTTP_MCP_RECEIPTS": receipts,
-                                 "HTTP_MCP_ALLOWED_ORIGINS": ""})
+def start_fixture(receipts: str, marker: str):
+    """The fixture, or a named reason it could not start. Never an unbounded wait, and never a
+    running server the caller has no handle to kill.
+
+    EVERY FAILURE PATH REAPS, INCLUDING THE PARSING ONES. An earlier version parsed the
+    announcement in its `return` statement, so a first line that was not JSON raised out of
+    here with the child still running and the caller's `proc` still `None` — leaving its
+    `finally` nothing to kill. This is the verifier's startup defect, which was fixed there and
+    left standing in the copy meant to be REUSED (review, PR #106); a leaked HTTP server holds
+    its port, so the leak fails the next run rather than this one.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, FIXTURE], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env={**os.environ, "HTTP_MCP_RECEIPTS": receipts, "HTTP_MCP_ALLOWED_ORIGINS": "",
+             # The opaque marker `echo` prefixes its reply with. It travels in the ENVIRONMENT
+             # and not in the prompt, which is the whole of what makes it evidence.
+             "ECHO_MCP_IDENTITY": marker})
+
+    def reaped(reason: str):
+        """Kill FIRST and read stderr after: a live child's stderr can block forever."""
+        proc.kill()
+        proc.wait(timeout=15)
+        said = [x for x in (proc.stderr.read() or b"").decode(errors="replace").splitlines()
+                if x.strip()]
+        return None, reason + (f"; its last word on stderr: {said[-1].strip()}" if said else "")
+
     q: queue.Queue = queue.Queue()
     threading.Thread(target=_pump, args=(proc.stdout, q), daemon=True).start()
     try:
@@ -80,12 +122,14 @@ def start_fixture(receipts: str):
     except queue.Empty:
         line = None
     if not line:
-        proc.kill()
-        proc.wait(timeout=15)
-        err = (proc.stderr.read() or b"").decode(errors="replace").strip().splitlines()
-        return None, (f"the fixture died with: {err[-1].strip()}" if err
-                      else "the fixture announced no port and said nothing")
-    return proc, json.loads(line)
+        return reaped("the fixture announced no port within the deadline")
+    try:
+        info = json.loads(line)
+    except ValueError:
+        return reaped(f"the fixture's first line was not a port announcement: {line[:200]!r}")
+    if not (isinstance(info, dict) and info.get("streamable") and info.get("sse")):
+        return reaped(f"the port announcement named no endpoints: {str(info)[:200]}")
+    return proc, info
 
 
 def run_claude(config_path: str, prompt: str, cwd: str) -> dict:
@@ -120,9 +164,10 @@ def probe_transport(transport: str) -> None:
     tmp = tempfile.mkdtemp(prefix=f"probe1-{transport}-")
     receipts = os.path.join(tmp, "receipts.jsonl")
     sentinel = f"PROBE1-{uuid.uuid4().hex[:12]}"
+    marker = f"MARK-{uuid.uuid4().hex[:12]}"
     proc = None
     try:
-        proc, info = start_fixture(receipts)
+        proc, info = start_fixture(receipts, marker)
         if proc is None:
             check(f"{transport}: the fixture starts", False, info)
             return
@@ -136,8 +181,11 @@ def probe_transport(transport: str) -> None:
                 "type": transport, "url": url,
                 "headers": {"Authorization": f"Bearer {sentinel}"}}}}, fh)
 
-        run = run_claude(cfg, "Call the echo tool with the text 'probe one'. "
-                              "Then reply with just its output.", tmp)
+        # "Verbatim" matters: the tool's reply is prefixed with the marker, and a model that
+        # tidies the prefix away would fail the round-trip check for a reason that is about
+        # presentation rather than transport.
+        run = run_claude(cfg, "Call the echo tool with the text 'probe one'. Then reply with "
+                              "its output, verbatim and with nothing else.", tmp)
         servers = run["init"].get("mcp_servers") or []
         status = {s.get("name"): s.get("status") for s in servers}
         check(f"{transport}: the config is ACCEPTED — the server appears in the init event",
@@ -147,8 +195,22 @@ def probe_transport(transport: str) -> None:
         tools = [t for t in (run["init"].get("tools") or []) if t.startswith("mcp__probe__")]
         check(f"{transport}: ...its tools are advertised as mcp__<server>__<tool>",
               sorted(tools) == ["mcp__probe__add", "mcp__probe__echo"], tools)
-        check(f"{transport}: ...and the model calls one and gets its answer",
-              (run["result"] or "").strip().strip('"').endswith("probe one"), run["result"])
+        # THAT A TOOL RAN IS THE SERVER'S FACT, NOT THE MODEL'S. The assertion this replaces
+        # read the model's final text for the string the tool was asked to echo — and that
+        # string came from the prompt, so a client which advertised the tools and never
+        # invoked one satisfied it by repeating itself (review, PR #106).
+        calls = [r for r in receipts_rows(receipts, "rpc") if r.get("method") == "tools/call"]
+        check(f"{transport}: ...the model INVOKES one — from the server's record of the call, "
+              f"not the model's account of itself",
+              any(c.get("tool") == "echo" for c in calls), calls)
+        # AND THE ANSWER TRAVELS BACK, which the receipts cannot witness: the server can say
+        # what it wrote, not what was read. What proves it is a value the model had no other
+        # way to hold — `ECHO_MCP_IDENTITY`, an opaque marker the fixture prefixes its reply
+        # with, absent from the prompt and from everything else the model was given. That
+        # mechanism exists one layer up for precisely this argument (see echo_mcp_server.py).
+        check(f"{transport}: ...and its ANSWER reaches the model — carrying a marker the "
+              f"server generated, which the prompt never contained",
+              marker in (run["result"] or ""), run["result"])
 
         # THE HEADER QUESTION, from the server's own account. `all`, not `any`: one request
         # carrying the token while others do not is a client that drops it on retry, which a
@@ -160,6 +222,19 @@ def probe_transport(transport: str) -> None:
         check(f"{transport}: EVERY request carried the declared bearer token, intact",
               bool(auth) and all(a == f"Bearer {sentinel}" for a in auth),
               [a if a is None else a[:20] + "..." for a in auth])
+
+        # THE VERSION THE CLIENT DECLARES, pinned because the fixture now answers 400 to one it
+        # does not support and that refusal is only safe while the CLI keeps naming a version
+        # the fixture implements. §9 records `2025-11-25` for claude; this is what re-measures
+        # it. Asserted as "every version seen is supported" rather than as one literal, so a
+        # CLI that legitimately moves to another revision the fixture ALSO implements does not
+        # read as a regression — and one that moves outside the set does.
+        versions = [r["headers"].get("mcp-protocol-version") for r in reqs]
+        named = [v for v in versions if v is not None]
+        check(f"{transport}: ...and names a protocol version the fixture implements, on the "
+              f"requests that carry one",
+              bool(named) and all(v in ECHO.LEGACY_VERSIONS for v in named),
+              {"seen": sorted(set(versions), key=str), "supported": ECHO.LEGACY_VERSIONS})
     finally:
         if proc is not None:
             proc.kill()
