@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 562 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py                        # 311/311 production + 2/2 instrument + 8/8 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 278 checks
+python3 -u harness/tools/mutate_mcp.py                        # 311/311 production + 2/2 instrument + 14/14 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 293 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 77 here
 git diff --check
 ```
@@ -1084,6 +1084,24 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   signal handler — have no mutation of their own. M187's pair was merged into one tuple edit
   because `_str_or` and `_opt_str` are the same rule (M53's pattern); the other three are a
   coverage question, recorded here rather than answered.
+- **A SHAPE CAPTURED FROM A WRITER IS NOT A CLAIM ABOUT A READER.** §9 probe #1 asked whether
+  claude accepts the `{"type","url","headers"}` config the adapter writes. `claude mcp add
+  --transport http` writes exactly that shape for itself, which is authoritative — about
+  `.mcp.json`, the project-scope file. The adapter uses `--mcp-config`, **a different entry
+  point**, and "they share a parser" was an assumption of precisely the kind a probe exists to
+  remove. Both were measured; both agreed; the point is that agreeing was a finding rather than
+  a foregone conclusion.
+- **THE STATED QUESTION WAS NARROWER THAN THE ONE THAT MATTERED, and the gap held the
+  credential.** Probe #1 was written as a question about JSON shape. What §8's SlideRule
+  pattern actually needs is a bearer token in `headers` **arriving at the server**, and nothing
+  in the probe's wording asked that — yet a token that never arrives is a broken run presenting
+  as an empty result, which is the failure mode hardest to attribute. Answering it needed a
+  server that could say what it received, so the probe grew a fixture. **When a probe's
+  question is about a format, ask what the format is FOR, and whether that survives the trip.**
+  Two more facts fell out of the same receipts at no cost — the client's `MCP-Protocol-Version`
+  header confirming C3-0 from the other side, and an in-band CLI version string on a channel
+  the agent's own output cannot reach — which is the ordinary return on recording everything an
+  instrument sees rather than only the field under test.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s

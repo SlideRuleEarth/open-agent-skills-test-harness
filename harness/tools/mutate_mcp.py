@@ -106,6 +106,7 @@ SELFTEST = "agentskill_evals/selftest.py"
 SHIM = "fixtures/probe_era_mcp_server.py"
 ECHO = "fixtures/echo_mcp_server.py"
 PIPEPROBE = "tools/probe_mcp_pipelining.py"
+HTTPFIX = "fixtures/http_mcp_server.py"
 # The proxy's I/O half and the awkward server it is driven against. PRODUCTION code that no
 # selftest arm can reach — it is only executed by running the real program over real pipes —
 # so it is `M*` like any other production target, proven by a THIRD suite. The classification
@@ -2398,6 +2399,41 @@ MUTATIONS = [
      "            if key in live:\n                duplicates.append(key)",
      "            if key in live:\n                reuse.append(key)",
      "a repeat BEFORE the response is a live duplicate, not that reuse"),
+
+    ("F9-remote-header-is-dropped-before-it-is-recorded", HTTPFIX,
+     '                       headers={k.lower(): v for k, v in self.headers.items()})',
+     '                       headers={})',
+     "a declared header ARRIVES, with its value intact \u2014 \u00a79 probe #1's real question"),
+    # The witness that says nothing at startup: its later silence stops being readable, which
+    # is the defect the startup row exists to prevent rather than a cosmetic one.
+    ("F10-the-receipts-witness-never-announces-itself", HTTPFIX,
+     '    RECEIPTS.write("listening", port=actual,',
+     '    _skip = (lambda *a, **k: None)("listening", port=actual,',
+     "...and the receipts witness records its own startup, so silence is readable later"),
+    # SSE answered in place: the reply rides the POST's own response, which satisfies a client
+    # that never implemented the transport and fails the one that did.
+    ("F11-the-legacy-transport-answers-in-place", HTTPFIX,
+     ("            if reply is not None:\n                stream.send(_sse_frame(reply))\n"
+      "            self._empty(202)"),
+     "            self._json(200, reply)",
+     "...a POST there is answered 202, with the reply NOT in its response"),
+    # The endpoint event is what tells the client where to POST; without it the client has
+    # nowhere to send and the failure looks like a server that is simply not answering.
+    ("F12-the-sse-stream-never-names-its-endpoint", HTTPFIX,
+     '        stream.send(f"event: endpoint\\ndata: {PATH_MESSAGES}?sessionId={session}\\n\\n".encode())',
+     '        stream.send(b"")',
+     "the SSE stream's FIRST event names the endpoint to POST to"),
+    # A reply with nowhere to go, accepted anyway.
+    ("F13-a-post-for-an-unopened-session-is-accepted", HTTPFIX,
+     "            if stream is None:\n                self._empty(404)\n                return",
+     "            if stream is None:\n                self._empty(202)\n                return",
+     "...while a POST for an unopened session is 404, not a silently stranded 202"),
+    # The tools stop being the stdio fixture's tools, which is the whole reason this fixture
+    # imports rather than restates them.
+    ("F14-the-http-fixture-serves-its-own-tool-list", HTTPFIX,
+     '        return echo.result_envelope(req_id, {"tools": echo.TOOLS},',
+     '        return echo.result_envelope(req_id, {"tools": []},',
+     "...and serves the SAME tools as the stdio fixture, because it imports them"),
 
 ]
 

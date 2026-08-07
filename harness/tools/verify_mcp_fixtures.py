@@ -38,6 +38,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURES = os.path.join(os.path.dirname(HERE), "fixtures")
@@ -903,6 +905,9 @@ from agentskill_evals.mcp_proxy import classify_envelope  # noqa: E402
 
 sys.path.insert(0, FIXTURES)
 import probe_era_mcp_server as SHIM_MOD  # noqa: E402
+# The HTTP fixture serves the stdio one's tools by IMPORTING them; this reads the same
+# module so "they match" is checked against the definition rather than against a copy.
+import echo_mcp_server as ECHO_MOD  # noqa: E402
 
 # The shim cannot import the proxy — CLIs spawn it with only the stdlib reachable — so it
 # carries its own copy of the rule. A copy that could drift silently is worse than the
@@ -1237,6 +1242,164 @@ check("the shim's RequestId rule matches the proxy's",
           for v in (1, 1.0, 0, -0.0, "1", "", True, False, None, 2**70, -5, 1.5)),
       [(v, SHIM_MOD._valid_request_id(v), P_valid(v))
        for v in (1, 1.0, 0, -0.0, "1", "", True, False, None, 2**70, -5, 1.5)])
+
+print()
+print("E16. http_mcp_server.py: the two REMOTE transports, and the header question §9 "
+      "probe #1 could not answer without a server")
+
+# WHY THIS FIXTURE IS DRIVEN HERE and not left to the live probe: the probe costs an API call
+# and needs `claude` installed, so it runs when someone asks. This runs in every suite, offline,
+# and it is what keeps the fixture trustworthy in between — the C3-1 lesson, where an
+# instrument's own defect changed a published measurement (§9).
+
+
+class _Remote:
+    """The fixture under a context manager, because a leaked HTTP server is a leaked port.
+
+    Reaped on every exit path including a check that raises. §4's incident was a test tool
+    leaving processes behind, and a server bound to a port is the version of that which fails
+    the NEXT run rather than this one.
+    """
+
+    def __enter__(self):
+        self.receipts = tempfile.mkdtemp(prefix="http-mcp-")
+        self.path = os.path.join(self.receipts, "receipts.jsonl")
+        self.proc = subprocess.Popen(
+            [sys.executable, os.path.join(FIXTURES, "http_mcp_server.py")],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            env={**os.environ, "HTTP_MCP_RECEIPTS": self.path})
+        line = self.proc.stdout.readline()          # the port announcement, or "" if it died
+        self.info = json.loads(line) if line.strip() else {}
+        return self
+
+    def __exit__(self, *exc):
+        self.proc.kill()
+        self.proc.wait(timeout=DEADLINE)
+        shutil.rmtree(self.receipts, ignore_errors=True)
+
+    def rpc(self, msg, headers=None, url=None):
+        req = urllib.request.Request(
+            url or self.info["streamable"], data=json.dumps(msg).encode(),
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream", **(headers or {})})
+        with urllib.request.urlopen(req, timeout=DEADLINE) as r:
+            body = r.read()
+            return r.status, dict(r.headers), (json.loads(body) if body else None)
+
+    def rows(self, kind=None):
+        if not os.path.exists(self.path):
+            return []
+        out = [json.loads(x) for x in open(self.path, encoding="utf-8") if x.strip()]
+        return [r for r in out if kind is None or r["kind"] == kind]
+
+
+with _Remote() as _rm:
+    check("the fixture announces the port it actually bound",
+          bool(_rm.info.get("port")) and _rm.info.get("streamable", "").endswith("/mcp"),
+          _rm.info)
+    # THE WITNESS SAYS SOMETHING POSITIVE BEFORE ITS SILENCE IS EVIDENCE. Every header check
+    # below reads "no such header in any row" as a finding; an unwired receipts file, a server
+    # that never started, and a server that received nothing all produce exactly that. The
+    # startup row is what separates them (§4).
+    check("...and the receipts witness records its own startup, so silence is readable later",
+          [r["kind"] for r in _rm.rows()][:1] == ["listening"], _rm.rows())
+
+    _s, _h, _init = _rm.rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                             "params": {"protocolVersion": "2025-11-25", "capabilities": {}}},
+                            {"Authorization": "Bearer FIXTURE_SENTINEL"})
+    check("streamable HTTP answers `initialize` in the POST's own response",
+          _s == 200 and _init["result"]["protocolVersion"] == "2025-11-25", (_s, _init))
+    check("...and assigns a session id there, where the transport puts it",
+          "Mcp-Session-Id" in _h, sorted(_h))
+
+    _s, _, _tl = _rm.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    check("...and serves the SAME tools as the stdio fixture, because it imports them",
+          [t["name"] for t in _tl["result"]["tools"]] == [t["name"] for t in ECHO_MOD.TOOLS],
+          _tl)
+
+    _s, _, _call = _rm.rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                            "params": {"name": "echo", "arguments": {"text": "over http"}}})
+    check("...and calls a tool", _call["result"]["content"][0]["text"] == "over http", _call)
+
+    # THE QUESTION THE FIXTURE EXISTS FOR, from the only place it is answerable: what the
+    # server RECEIVED, not what the client believes it sent.
+    _auth = [r["headers"].get("authorization") for r in _rm.rows("request")]
+    check("a declared header ARRIVES, with its value intact — §9 probe #1's real question",
+          "Bearer FIXTURE_SENTINEL" in _auth, _auth)
+    # ...and the negative control, without which the check above passes for a fixture that
+    # records a constant. A request sent WITHOUT the header must show its absence.
+    check("...and a request sent without one records its absence, so the check can fail",
+          None in _auth, _auth)
+
+    check("an unroutable method is an error, not a hang",
+          _rm.rpc({"jsonrpc": "2.0", "id": 4, "method": "no/such"})[2]["error"]["code"] == -32601)
+    _s, _, _body = _rm.rpc({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    check("...and a NOTIFICATION is accepted with no answer at all",
+          _s == 202 and _body is None, (_s, _body))
+
+    # THE STREAMABLE ENDPOINT DECLINES A SERVER->CLIENT STREAM, which the transport permits
+    # explicitly. Asserted rather than assumed: a fixture that opened an idle stream would add
+    # a shutdown path nothing here drives.
+    try:
+        urllib.request.urlopen(urllib.request.Request(_rm.info["streamable"], method="GET"),
+                               timeout=DEADLINE)
+        _get_code = 200
+    except urllib.error.HTTPError as exc:
+        _get_code = exc.code
+    check("GET on the streamable endpoint is refused 405, as the transport allows",
+          _get_code == 405, _get_code)
+
+# THE LEGACY SSE TRANSPORT IS A DIFFERENT PROTOCOL, not a different spelling, and this is the
+# check that says so: the reply to a POST does NOT come back in that POST's response. A fixture
+# that answered in place would satisfy a client that had never implemented SSE.
+with _Remote() as _rm2:
+    _events, _endpoint = [], []
+
+    def _read_stream(rm=None, events=None, endpoint=None):
+        req = urllib.request.Request(rm.info["sse"], headers={"Accept": "text/event-stream"})
+        name = None
+        with urllib.request.urlopen(req, timeout=DEADLINE) as r:
+            for raw in r:
+                line = raw.decode().rstrip("\n")
+                if line.startswith("event: "):
+                    name = line[7:]
+                elif line.startswith("data: "):
+                    if name == "endpoint":
+                        endpoint.append(line[6:])
+                        name = None
+                    else:
+                        events.append(json.loads(line[6:]))
+                        return
+
+    _t = threading.Thread(target=_read_stream,
+                          kwargs={"rm": _rm2, "events": _events, "endpoint": _endpoint},
+                          daemon=True)
+    _t.start()
+    _deadline = time.monotonic() + DEADLINE
+    while not _endpoint and time.monotonic() < _deadline:
+        time.sleep(0.05)
+    check("the SSE stream's FIRST event names the endpoint to POST to",
+          bool(_endpoint) and _endpoint[0].startswith("/messages?sessionId="), _endpoint)
+    if _endpoint:
+        _post = f"http://127.0.0.1:{_rm2.info['port']}{_endpoint[0]}"
+        _s, _, _body = _rm2.rpc({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                                 "params": {"name": "add", "arguments": {"a": 2, "b": 3}}},
+                                url=_post)
+        check("...a POST there is answered 202, with the reply NOT in its response",
+              _s == 202 and _body is None, (_s, _body))
+        _t.join(timeout=DEADLINE)
+        check("...and the reply arrives on the stream the client is still holding",
+              bool(_events) and _events[0]["result"]["content"][0]["text"] == "5", _events)
+    # A POST naming a session nobody opened has nowhere to deliver a reply, and saying 202
+    # would strand it silently.
+    try:
+        _rm2.rpc({"jsonrpc": "2.0", "id": 8, "method": "ping"},
+                 url=f"http://127.0.0.1:{_rm2.info['port']}/messages?sessionId=nosuch")
+        _orphan = 202
+    except urllib.error.HTTPError as exc:
+        _orphan = exc.code
+    check("...while a POST for an unopened session is 404, not a silently stranded 202",
+          _orphan == 404, _orphan)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")
