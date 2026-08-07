@@ -34,6 +34,20 @@ rather than different spellings:
     POST's own response, under `sse` the POST is answered `202 Accepted` and the reply
     arrives somewhere else entirely.
 
+THE HTTP BINDING IS DELIBERATELY LEGACY-ONLY, AND THAT IS A SCOPE CHOICE RATHER THAN AN
+OVERSIGHT. The protocol logic imported below is dual-era and will answer a modern request; the
+TRANSPORT here implements the `2025-11-25` binding, which is what every CLI in the measured
+fleet speaks over HTTP and what §9 probe #1 was asked about. Modern Streamable HTTP adds
+mandatory request headers — a protocol version, and per-request method and name metadata —
+which this does not enforce, so a client that got them wrong would not be caught here. That is
+acceptable for a fixture whose job is the legacy binding and NOT acceptable silently: a modern
+HTTP arm is real work, it is not done, and anything reading this file as evidence about modern
+HTTP would be reading it wrong (review, PR #106).
+
+SESSIONS ARE NOT IMPLEMENTED, AND SO NONE IS ADVERTISED. The transport makes `Mcp-Session-Id`
+optional; a server that keeps no session state is conformant without it. What is not
+conformant is issuing one and ignoring it, which is what an earlier revision did.
+
 THE PROTOCOL LOGIC IS IMPORTED, NOT RESTATED. `initialize`, `server/discover`, `tools/list`,
 `tools/call`, the era rules and the modern result shaping all come from `echo_mcp_server.py`,
 which is a sibling in this directory and therefore importable. §4's rule is that a duplicated
@@ -78,6 +92,24 @@ import echo_mcp_server as echo  # noqa: E402 — the path insert above has to co
 
 RECEIPTS_ENV = "HTTP_MCP_RECEIPTS"
 PORT_ENV = "HTTP_MCP_PORT"           # 0 (the default) means "pick a free one and say which"
+ORIGINS_ENV = "HTTP_MCP_ALLOWED_ORIGINS"   # comma-separated; empty means "no Origin allowed"
+
+# ORIGIN VALIDATION IS A TRANSPORT-LEVEL **MUST**, and this server is the case the requirement
+# was written for: it listens on loopback while a model is running, so any page the user's
+# browser is on can POST to it cross-origin unless the server refuses. The attack is DNS
+# rebinding — a hostile page resolves its own name to 127.0.0.1 and then speaks to whatever is
+# listening, and "it is only bound to localhost" is precisely the false comfort the rule
+# exists to remove.
+#
+# A fixture that skipped this would be non-conformant in the direction that matters: every
+# check here is evidence about what a REAL server does, so a fixture more permissive than the
+# spec teaches the harness that a permissive server is normal (review, PR #106).
+#
+# Default is DENY: a request with no `Origin` at all is fine — that is what a non-browser
+# client sends, and it is every client this fixture serves — but a present `Origin` must be on
+# the allowlist, which is empty unless the caller names one.
+ALLOWED_ORIGINS = frozenset(
+    o.strip() for o in (os.environ.get(ORIGINS_ENV) or "").split(",") if o.strip())
 
 # The two endpoint paths. `/mcp` is the streamable-HTTP endpoint and the only one that
 # transport uses. `/sse` and `/messages` are the legacy pair, and they are SEPARATE paths
@@ -193,13 +225,27 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- streamable HTTP --------------------------------------------------------------------
 
+    def _origin_ok(self) -> bool:
+        """Absent is fine; present must be allowlisted. See ALLOWED_ORIGINS above."""
+        origin = self.headers.get("Origin")
+        return origin is None or origin in ALLOWED_ORIGINS
+
     def do_POST(self) -> None:                                   # noqa: N802 — BaseHTTPRequestHandler
         self._record()
+        if not self._origin_ok():
+            self._empty(403)
+            return
         msg = self._body()
         if msg is None:
             self._empty(400)
             return
-        if self.path.startswith(PATH_MESSAGES):
+        # EXACTLY THE CONFIGURED PATHS, matched whole. `startswith` accepted `/mcp-anything`
+        # and, worse, the catch-all below accepted `/definitely-not-mcp` — so a config whose
+        # URL had been mangled or rewritten still reached a working server, and the probe that
+        # was supposed to prove the URL correct proved nothing about it (review, PR #106). The
+        # query string is split off first because `/messages` legitimately carries one.
+        path = self.path.split("?", 1)[0]
+        if path == PATH_MESSAGES:
             # LEGACY SSE: the reply does NOT belong to this response. It goes to the stream
             # the client opened with GET /sse and is still holding; this POST is answered
             # `202 Accepted` and nothing else. Getting this wrong by answering here would
@@ -215,19 +261,29 @@ class Handler(BaseHTTPRequestHandler):
                 stream.send(_sse_frame(reply))
             self._empty(202)
             return
+        if path != PATH_STREAMABLE:
+            self._empty(404)
+            return
         # STREAMABLE HTTP: the reply is this response's body.
         reply = dispatch(msg)
         if reply is None:
             self._empty(202)             # a notification carries no answer
             return
-        # `Mcp-Session-Id` on the initialize reply only, which is where the spec puts it.
-        extra = ({"Mcp-Session-Id": uuid.uuid4().hex}
-                 if msg.get("method") == "initialize" else None)
-        self._json(200, reply, extra)
+        # NO `Mcp-Session-Id`. An earlier version minted one on the initialize reply because
+        # that is where the transport puts it — but this fixture keeps no session state, so a
+        # later request with no id, or with a wrong one, was answered exactly like a correct
+        # one. Issuing an identifier nothing checks is worse than issuing none: it teaches a
+        # client that the id is honoured, and the fixture would pass a client that never echoed
+        # it (review, PR #106). Sessions are optional in the transport; not having them is a
+        # conformant choice, and pretending to have them is not.
+        self._json(200, reply)
 
     def do_GET(self) -> None:                                    # noqa: N802
         self._record()
-        if not self.path.startswith(PATH_SSE):
+        if not self._origin_ok():
+            self._empty(403)
+            return
+        if self.path.split("?", 1)[0] != PATH_SSE:
             # The streamable endpoint MAY decline to open a server→client stream, and 405 is
             # the documented way to say so. A fixture that opened an idle stream instead
             # would add a path nothing here exercises and a shutdown case to go with it.

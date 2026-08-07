@@ -2409,7 +2409,7 @@ MUTATIONS = [
     ("F10-the-receipts-witness-never-announces-itself", HTTPFIX,
      '    RECEIPTS.write("listening", port=actual,',
      '    _skip = (lambda *a, **k: None)("listening", port=actual,',
-     "...and the receipts witness records its own startup, so silence is readable later"),
+     "...and the receipts witness records its own startup, so silence is readable"),
     # SSE answered in place: the reply rides the POST's own response, which satisfies a client
     # that never implemented the transport and fails the one that did.
     ("F11-the-legacy-transport-answers-in-place", HTTPFIX,
@@ -2435,6 +2435,40 @@ MUTATIONS = [
      '        return echo.result_envelope(req_id, {"tools": []},',
      "...and serves the SAME tools as the stdio fixture, because it imports them"),
 
+    # ---- the transport-level MUSTs and the endpoint's identity (review, PR #106) --------
+    ("F15-origin-is-not-validated-on-POST", HTTPFIX,
+     ("        if not self._origin_ok():\n            self._empty(403)\n            return\n"
+      "        msg = self._body()"),
+     "        msg = self._body()",
+     "a cross-origin POST is refused 403 \u2014 the transport's DNS-rebinding MUST"),
+    ("F16-origin-is-not-validated-on-GET", HTTPFIX,
+     ("        if not self._origin_ok():\n            self._empty(403)\n            return\n"
+      "        if self.path.split(\"?\", 1)[0] != PATH_SSE:"),
+     "        if self.path.split(\"?\", 1)[0] != PATH_SSE:",
+     "...and a cross-origin GET on the SSE endpoint is refused too, not just POST"),
+    # Deny-everything scores full marks on both checks above unless something asserts the
+    # ordinary request still works.
+    ("F17-every-origin-is-refused-including-none", HTTPFIX,
+     "        return origin is None or origin in ALLOWED_ORIGINS",
+     "        return False",
+     "...while a request with no Origin at all is served, as a non-browser client"),
+    ("F18-any-path-is-the-streamable-endpoint", HTTPFIX,
+     "        if path != PATH_STREAMABLE:\n            self._empty(404)\n            return",
+     "        if False:\n            self._empty(404)\n            return",
+     "a POST to a path that is not the endpoint is 404, not quietly served"),
+    ("F19-the-endpoint-is-matched-by-prefix", HTTPFIX,
+     "        if path != PATH_STREAMABLE:",
+     "        if not path.startswith(PATH_STREAMABLE):",
+     "...and a prefix of the endpoint is not the endpoint either"),
+    ("F20-a-session-id-is-minted-that-nothing-honours", HTTPFIX,
+     "        self._json(200, reply)\n\n    def do_GET",
+     "        self._json(200, reply, {\"Mcp-Session-Id\": uuid.uuid4().hex})\n\n    def do_GET",
+     "...and advertises NO session id, because it keeps no session state"),
+    ("F21-the-sse-path-is-matched-by-prefix", HTTPFIX,
+     '        if self.path.split("?", 1)[0] != PATH_SSE:',
+     "        if not self.path.startswith(PATH_SSE):",
+     "...and a prefix of the SSE path is not the SSE path"),
+
 ]
 
 
@@ -2451,10 +2485,15 @@ _SUITE_TIMEOUT = 300
 # the fixture verifier prints `FAIL label  <- detail` — and a runner that guessed one format
 # for both would read every failure of the other as "failed, but NOT via", which reports a
 # working arm as a broken one.
+# (argv, the regex for a FAILED check, and — where the suite prints its passes too — the regex
+# for EVERY label it printed. The third is what lets the arm-names-a-real-check guard run; the
+# selftest has none because it prints section headings rather than one line per arm, so its
+# full label set is not recoverable from the output.)
+_ALL_LABELS = r"^\s*(?:ok|FAIL)\s+(.+?)(?:\s\s<- .*)?$"
 _SUITES = {
     "selftest": (("-m", "agentskill_evals", "selftest"), r"\[FAIL\]\s+([^:]+):"),
-    "fixtures": ((VERIFIER,), r"^\s*FAIL\s+(.+?)\s\s<- "),
-    "proxy": ((PROXY_VERIFIER,), r"^\s*FAIL\s+(.+?)\s\s<- "),
+    "fixtures": ((VERIFIER,), r"^\s*FAIL\s+(.+?)\s\s<- ", _ALL_LABELS),
+    "proxy": ((PROXY_VERIFIER,), r"^\s*FAIL\s+(.+?)\s\s<- ", _ALL_LABELS),
 }
 
 # The two files the third suite proves, named rather than derived: `mcp_proxy_io.py` sits in
@@ -2570,6 +2609,23 @@ def main():
         # The reference every per-mutation time below is read against; without it those
         # numbers describe the machine, not the mutation.
         baseline[suite] = secs
+        # EVERY ARM MUST NAME A CHECK THIS SUITE ACTUALLY PRINTS. The arm is a second, untyped
+        # reference to a check — a copied string — so renaming the check silently unhooks the
+        # mutation, which then reports "failed, but NOT via" and reads like a coverage problem
+        # instead of a broken reference. It happened to F10 during review (PR #106). The
+        # baseline run is the only place the full label set is known, and it is already paid
+        # for, so the check costs nothing. Refused rather than warned, like the anchor guards.
+        printed = set(re.findall(_SUITES[suite][2], out, re.MULTILINE)) if len(
+            _SUITES[suite]) > 2 else None
+        if printed:
+            orphan = sorted({a for m, r, _f, _r, a in MUTATIONS
+                             if suites[m] == suite and a not in printed})
+            if orphan:
+                print(f"ARM NAMES NO CHECK in the {suite} suite — a renamed check unhooks its "
+                      f"mutation silently:")
+                for a in orphan:
+                    print(f"  {a!r}")
+                return 1
         print(f"baseline: {suite} PASSED in {secs:.1f}s")
     print()
 

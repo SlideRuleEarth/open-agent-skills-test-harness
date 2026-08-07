@@ -292,10 +292,15 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 562 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py                        # 311/311 production + 2/2 instrument + 14/14 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 293 checks
+python3 -u harness/tools/mutate_mcp.py                        # 311/311 production + 2/2 instrument + 21/21 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 300 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 77 here
 git diff --check
+
+# OPT-IN, not part of the block above: needs `claude` on PATH and spends an API call.
+# Run it when the CLI updates — §9's probe-#1 result is version-qualified, and this is
+# what remeasures it rather than trusting a paragraph.
+harness/.venv/bin/python harness/tools/probe_remote_mcp.py    # 13 checks; claude 2.1.113
 ```
 
 **The mutation suite now runs THREE suites, and which one runs is a different question from
@@ -1102,6 +1107,32 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   header confirming C3-0 from the other side, and an in-band CLI version string on a channel
   the agent's own output cannot reach — which is the ordinary return on recording everything an
   instrument sees rather than only the field under test.
+- **A VERIFIER THAT CRASHES ON THE DEFECT IT EXISTS TO DETECT REPORTS LESS THAN ONE THAT SAYS
+  NOTHING — and it turned up twice in one file, at two levels.** First at startup: an unbounded
+  `readline()` on a fixture that could not `bind()` returned "", every check below then raised
+  `KeyError`, and a reviewer got a traceback instead of a finding. Then one level in: a mutation
+  that made the fixture deny every request left `initialize` with no body, an indexing check
+  raised, and the block reported ONE red check where a dozen were wrong — which read as a
+  mutation escaping rather than as a verifier falling over. **Both fixes are the same shape**:
+  bound the wait, keep the child's stderr, and never index a possibly-broken subject directly.
+  The tell for the second one is a mutation reported "failed, but NOT via" when the defect is
+  obviously in scope — the arm is fine, the driver never reached it.
+- **AN INSTRUMENT MAY NEED A PRIVILEGE IT CANNOT GIVE UP, and then the obligation changes.** §4
+  already said a suite needing a privilege is a suite some reviewer cannot run, and the proxy
+  verifier's loopback case was redesigned to obey it. The HTTP fixture cannot be: binding a TCP
+  socket IS the thing under test. So the rule it owes instead is to **fail by name, with the
+  child's own stderr attached** — and the diagnostic has to survive the printer, which truncates.
+  A 400-byte tail of a traceback gets cut mid-frame and names a line number; the traceback's
+  LAST line names the cause. `PermissionError: [Errno 1] Operation not permitted` is the whole
+  value of preserving stderr, and taking the wrong slice of it throws that away while looking
+  thorough.
+- **A RENAMED CHECK SILENTLY UNHOOKS ITS MUTATION.** Rewriting a check's label during review
+  left `F10` pointing at a string nothing prints; the mutation still ran, still broke the code,
+  and was reported "failed, but NOT via" — visible, but only to someone reading closely. The
+  arm names are a second, untyped reference to a check, so the file now ends with a sweep that
+  asserts every `F*` arm names a label the suite actually printed. The general form: **when two
+  artifacts refer to each other by copied string, something has to check the reference
+  resolves** — the same rule as §4's pinned duplicates, applied to a name rather than a value.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s
