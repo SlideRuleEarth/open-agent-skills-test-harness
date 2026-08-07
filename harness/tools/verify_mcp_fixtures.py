@@ -1412,7 +1412,8 @@ with _Remote() as _rm:
 
         # THE QUESTION THE FIXTURE EXISTS FOR, answered from the only place it is answerable:
         # what the server RECEIVED, not what the client believes it sent.
-        _auth = [r["headers"].get("authorization") for r in _rm.rows("request")]
+        _reqs = _rm.rows("request")
+        _auth = [r["headers"].get("authorization") for r in _reqs]
         check("a declared header ARRIVES, with its value intact — §9 probe #1's real question",
               "Bearer FIXTURE_SENTINEL" in _auth, _auth)
         check("...and a request sent without one records its absence, so the check can fail",
@@ -1434,6 +1435,17 @@ with _Remote() as _rm:
         check("...and a message that is NOT a tool call records no tool name, so the field "
               "tells them apart",
               _named == {None}, _rpc)
+
+        # THE HEADER ROW MUST NAME THE MESSAGE IT CARRIED, or every header question can only be
+        # asked of the run as a whole — and one of them is per-message, since `initialize`
+        # precedes the negotiation `MCP-Protocol-Version` reports. Correlation by adjacency
+        # against the `rpc` rows would be unsound here: this is a threading server (PR #106).
+        _carried = [(r.get("rpc"), r["headers"].get("authorization")) for r in _reqs]
+        check("a request row names the message it carried, on the same row as its headers",
+              ("initialize", "Bearer FIXTURE_SENTINEL") in _carried, _carried)
+        check("...and a request carrying a DIFFERENT method records that one, so the field is "
+              "not the same word every time",
+              ("tools/call", None) in _carried, _carried)
 
         check("an unroutable method is an error, not a hang",
               dig(_rm.rpc({"jsonrpc": "2.0", "id": 4, "method": "no/such"}),

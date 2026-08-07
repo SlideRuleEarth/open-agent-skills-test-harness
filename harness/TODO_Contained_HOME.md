@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 562 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py                        # 311/311 production + 2/2 instrument + 30/30 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 317 checks
+python3 -u harness/tools/mutate_mcp.py                        # 311/311 production + 2/2 instrument + 32/32 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 319 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 77 here
 git diff --check
 
@@ -302,7 +302,7 @@ git diff --check
 # what remeasures it rather than trusting a paragraph. Its own startup path and the
 # mutation runner's suite-readers are driven OFFLINE by the fixture verifier (§E17, §E18),
 # because "nothing routine runs it" is exactly how a fix lands in one copy and not the other.
-harness/.venv/bin/python harness/tools/probe_remote_mcp.py    # 17 checks; claude 2.1.113
+harness/.venv/bin/python harness/tools/probe_remote_mcp.py    # 19 checks; claude 2.1.113 (http asserts 2 more than sse)
 ```
 
 **The mutation suite now runs THREE suites, and which one runs is a different question from
@@ -1181,6 +1181,24 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   normal", an argument quantifying over **every** server-side MUST in the binding — so
   honouring it meant sweeping the rest and finding this one, rather than waiting to be told.
   What the note says now is what is served, what is not, and which list each item is on.
+- **AN ASSERTION WEAKER THAN THE SENTENCE IT PROTECTS IS NOT PROTECTING IT.** §9 publishes
+  "every post-handshake request carries `MCP-Protocol-Version`". The check dropped the requests
+  with no header and required only that one remained — so a client sending it once and omitting
+  it on every later request passed, while the document kept claiming otherwise. **Read the
+  published sentence and the assertion side by side**; the gap here was a filter, which is the
+  usual shape, because dropping the inconvenient rows is how a per-item rule quietly becomes an
+  existential one. Two things had to change with it. The exempt case must be *identified*
+  rather than inferred from being the one that was missing, which is why the fixture records
+  the JSON-RPC method beside the headers — and by construction, not by adjacency to the `rpc`
+  rows, since a threading server interleaves them. And the check must **print its tally on a
+  green run**: `check()` shows detail only when it fails and the receipts are deleted on the
+  way out, so the published number was unrecoverable from a passing probe.
+- **A COUNT IS AN OBSERVATION OF ONE RUN — second instance, now in a measurement.** §4 already
+  said a count restated in prose beside the table it counts will be wrong. §9 published "4 of
+  5 requests"; the next run measured 3 of 4, because the tally moves with how many messages the
+  model happens to drive. Nothing was broken and the sentence was false. **State the rule and
+  let the instrument print the number**, which is the same fix as "every child-and-group fact"
+  one document over.
 - **A MECHANISM BUILT TO ANSWER AN ARGUMENT DOES NOT ANSWER IT IN THE NEXT FILE.** Probe #1's
   live check that "the model calls the tool and gets its answer" read the model's final text
   for the string the tool had been asked to echo — a string the PROMPT supplied, so a client

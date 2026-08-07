@@ -2447,8 +2447,8 @@ MUTATIONS = [
     # ---- the transport-level MUSTs and the endpoint's identity (review, PR #106) --------
     ("F15-origin-is-not-validated-on-POST", HTTPFIX,
      ("        if not self._origin_ok():\n            self._empty(403)\n            return\n"
-      "        msg = self._body()"),
-     "        msg = self._body()",
+      "        if msg is None:"),
+     "        if msg is None:",
      "a cross-origin POST is refused 403 \u2014 the transport's DNS-rebinding MUST"),
     ("F16-origin-is-not-validated-on-GET", HTTPFIX,
      ("        if not self._origin_ok():\n            self._empty(403)\n            return\n"
@@ -2548,6 +2548,21 @@ MUTATIONS = [
       "        return reaped("),
      "    info = json.loads(line)\n    if False:\n        return reaped(",
      "a fixture that says something that is not JSON is a NAMED failure, not a traceback"),
+    # The header row stops naming the message it carried, so the per-message header questions
+    # collapse back into one question about the run — which is how "every post-handshake
+    # request declares a version" degraded into "at least one did" (review, PR #106).
+    ("F31-the-header-row-forgets-which-message-it-carried", HTTPFIX,
+     "                       rpc=msg.get(\"method\") if isinstance(msg, dict) else None,",
+     "                       rpc=None,",
+     "a request row names the message it carried, on the same row as its headers"),
+    # ...or names the same message every time, which satisfies the check above while
+    # identifying nothing — the F26 shape, one row over.
+    ("F32-every-request-row-names-the-same-message", HTTPFIX,
+     ("                       rpc=msg.get(\"method\") if isinstance(msg, dict) else None,\n"
+      "                       # EVERY header"),
+     '                       rpc="initialize",\n                       # EVERY header',
+     ("...and a request carrying a DIFFERENT method records that one, so the field is not the "
+      "same word every time")),
 
 ]
 

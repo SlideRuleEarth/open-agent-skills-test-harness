@@ -245,8 +245,19 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         """Silence. The receipts file is the record; stderr belongs to whoever started us."""
 
-    def _record(self) -> None:
+    def _record(self, msg: dict | None = None) -> None:
         RECEIPTS.write("request", method=self.command, path=self.path,
+                       # THE MESSAGE THIS REQUEST CARRIED, on the SAME ROW as its headers.
+                       # Without it the header questions can only be asked of the run as a
+                       # whole, and at least one of them is per-message: `initialize` precedes
+                       # the negotiation `MCP-Protocol-Version` reports, so "did the header
+                       # arrive" has a different right answer for it than for every request
+                       # after it. The `rpc` rows written by `dispatch` carry the method too,
+                       # but pairing them with these by ADJACENCY is unsound — this is a
+                       # `ThreadingHTTPServer`, and two requests in flight interleave their
+                       # rows. Correlated by construction is the only kind that holds (review,
+                       # PR #106). `None` for a GET, which carries no message.
+                       rpc=msg.get("method") if isinstance(msg, dict) else None,
                        # EVERY header, lowercased for lookup but otherwise verbatim. The
                        # question is whether `authorization` arrives AND with what value, so
                        # recording names only would answer half of it.
@@ -289,11 +300,16 @@ class Handler(BaseHTTPRequestHandler):
         return claimed is None or claimed in SUPPORTED_VERSIONS
 
     def do_POST(self) -> None:                                   # noqa: N802 — BaseHTTPRequestHandler
-        self._record()
+        # THE BODY IS READ BEFORE ANYTHING IS DECIDED, which buys two things. The receipt can
+        # name the message the request carried, without which the per-message header questions
+        # are unaskable (see `_record`). And the refusal paths below now DRAIN the request:
+        # an unread body desynchronizes a keep-alive connection, and `protocol_version` above
+        # commits this server to keep-alive because both transports assume it.
+        msg = self._body()
+        self._record(msg)
         if not self._origin_ok():
             self._empty(403)
             return
-        msg = self._body()
         if msg is None:
             self._empty(400)
             return

@@ -26,10 +26,13 @@ WHAT IT ASSERTS, and each of these is a separate failure mode:
      informative rather than tautological.
   4. The tools are advertised as `mcp__<server>__<tool>`, and the model INVOKES one — read
      from the fixture's receipts.
-  5. The tool's ANSWER gets back to the model, proved by an opaque marker the fixture
-     generates and the prompt never contains. (4) and (5) were once one assertion over the
-     model's final text, and that text was supplied BY the prompt: a client that advertised the
-     tools and never called one passed it by repeating itself (review, PR #106).
+  5. The tool's ANSWER gets back to the model, proved by an opaque per-run marker that THIS
+     SCRIPT generates and hands to the fixture privately, in its environment, for `echo` to
+     prefix its reply with. What makes it evidence is that it appears nowhere in the prompt —
+     not who generated it, which an earlier wording got backwards (review, PR #106). (4) and
+     (5) were once one assertion over the model's final text, and that text was supplied BY
+     the prompt: a client that advertised the tools and never called one passed it by
+     repeating itself.
   6. EVERY request the fixture received carried the declared `Authorization` header, with the
      sentinel value intact. Read from the fixture's receipts — the server's account of what
      arrived, not the client's account of what it sent, because a claim and the thing it
@@ -205,11 +208,12 @@ def probe_transport(transport: str) -> None:
               any(c.get("tool") == "echo" for c in calls), calls)
         # AND THE ANSWER TRAVELS BACK, which the receipts cannot witness: the server can say
         # what it wrote, not what was read. What proves it is a value the model had no other
-        # way to hold — `ECHO_MCP_IDENTITY`, an opaque marker the fixture prefixes its reply
-        # with, absent from the prompt and from everything else the model was given. That
-        # mechanism exists one layer up for precisely this argument (see echo_mcp_server.py).
-        check(f"{transport}: ...and its ANSWER reaches the model — carrying a marker the "
-              f"server generated, which the prompt never contained",
+        # way to hold — the per-run marker above, handed to the fixture in its environment and
+        # prefixed onto `echo`'s reply by `ECHO_MCP_IDENTITY`, absent from the prompt and from
+        # everything else the model was given. That mechanism exists one layer up for
+        # precisely this argument (see echo_mcp_server.py).
+        check(f"{transport}: ...and its ANSWER reaches the model — carrying a per-run marker "
+              f"the prompt never contained, so only a tool result could have supplied it",
               marker in (run["result"] or ""), run["result"])
 
         # THE HEADER QUESTION, from the server's own account. `all`, not `any`: one request
@@ -223,18 +227,43 @@ def probe_transport(transport: str) -> None:
               bool(auth) and all(a == f"Bearer {sentinel}" for a in auth),
               [a if a is None else a[:20] + "..." for a in auth])
 
-        # THE VERSION THE CLIENT DECLARES, pinned because the fixture now answers 400 to one it
-        # does not support and that refusal is only safe while the CLI keeps naming a version
-        # the fixture implements. §9 records `2025-11-25` for claude; this is what re-measures
-        # it. Asserted as "every version seen is supported" rather than as one literal, so a
-        # CLI that legitimately moves to another revision the fixture ALSO implements does not
-        # read as a regression — and one that moves outside the set does.
-        versions = [r["headers"].get("mcp-protocol-version") for r in reqs]
-        named = [v for v in versions if v is not None]
-        check(f"{transport}: ...and names a protocol version the fixture implements, on the "
-              f"requests that carry one",
-              bool(named) and all(v in ECHO.LEGACY_VERSIONS for v in named),
-              {"seen": sorted(set(versions), key=str), "supported": ECHO.LEGACY_VERSIONS})
+        # THE VERSION THE CLIENT DECLARES, asked PER MESSAGE. The first version of this dropped
+        # the requests with no header and then required only that one remained — under which a
+        # client sending the header once and omitting it on every later request passed, while
+        # §9 went on publishing that every post-handshake request carries it (review, PR #106).
+        # An assertion weaker than the sentence it is supposed to protect is not protecting it.
+        #
+        # `initialize` is the one message legitimately without it: it PRECEDES the negotiation
+        # the header reports. That is why the fixture records the JSON-RPC method beside the
+        # headers — the exemption has to be identified, not assumed to be "whichever one was
+        # missing".
+        msgs = [r for r in reqs if r.get("rpc")]           # a GET on /sse carries none
+        after = [r for r in msgs if r["rpc"] != "initialize"]
+        carried = [r for r in after if r["headers"].get("mcp-protocol-version")]
+        bare = sorted({r["rpc"] for r in msgs if not r["headers"].get("mcp-protocol-version")})
+        seen = {r["headers"].get("mcp-protocol-version") for r in msgs} - {None}
+        # PRINTED, PASS OR FAIL. §9 publishes a count, and `check()` shows its detail only when
+        # a check goes red — so on a green run the published number was unrecoverable, the
+        # receipts having been deleted on the way out (review, PR #106).
+        print(f"       {transport}: MCP-Protocol-Version on {len(carried)}/{len(msgs)} messages"
+              f" — absent on {bare or 'nothing'}, values {sorted(seen) or 'none'}")
+
+        check(f"{transport}: every protocol version it declares is one the fixture implements",
+              bool(seen) and seen <= set(ECHO.LEGACY_VERSIONS),
+              {"seen": sorted(seen), "supported": ECHO.LEGACY_VERSIONS})
+        if transport == "http":
+            # STREAMABLE HTTP ONLY, and the split is the transport's, not a convenience: this
+            # header belongs to that binding, and `/sse` + `/messages` is the `2024-11-05`
+            # transport, which predates it. The fixture enforces the 400 on `/mcp` alone for
+            # the same reason, so requiring it of `sse` here would assert something no
+            # specification asks that transport for. The sse tally is reported above instead.
+            check(f"{transport}: ...on EVERY post-handshake message, which is the published "
+                  f"§9 result — not merely on one of them",
+                  bool(after) and len(carried) == len(after),
+                  {"post-handshake": [r["rpc"] for r in after], "carried": len(carried)})
+            check(f"{transport}: ...and the only message without one is the `initialize` that "
+                  f"precedes the negotiation",
+                  set(bare) <= {"initialize"}, bare)
     finally:
         if proc is not None:
             proc.kill()
