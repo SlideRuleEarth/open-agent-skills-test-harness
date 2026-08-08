@@ -152,6 +152,12 @@ def _meta_of(msg: dict) -> dict:
     return meta if isinstance(meta, dict) else {}
 
 
+# IMPORTED BY `http_mcp_server.py`, along with `_initialize`, `_discover`, `_call_tool`,
+# `TOOLS`, `result_envelope` and `error_envelope`. The underscore says "private to the
+# stdio transport", which stopped being true when a sibling started serving the same
+# protocol over HTTP — they are renamed at the cost of that fixture, and the coupling is
+# deliberate: one definition of the era rules means the two transports cannot disagree
+# about what a conformant reply is (§4's duplicated-rule rule, satisfied by import).
 def _modern_intent(msg: dict) -> bool:
     """Whether this request is TRYING to be modern — the question that must be asked before
     "is it well-formed", because otherwise a malformed modern request is indistinguishable
@@ -227,15 +233,23 @@ def _reject(req_id, msg: dict, method) -> bool:
     return False
 
 
-def _result(req_id, result: dict, *, modern: bool = False,
-            cacheable: bool = False) -> None:
-    """Send a result, shaped for the era of the request being answered.
+def result_envelope(req_id, result: dict, *, modern: bool = False,
+                    cacheable: bool = False) -> dict:
+    """The result message, shaped for the era of the request being answered. PURE.
 
     Modern results MUST carry `resultType`, and the operations the caching spec lists —
     `server/discover` and `tools/list` among them — MUST additionally carry `ttlMs` and
     `cacheScope`. `ttlMs: 0` means "immediately stale", which is the right answer for a
     fixture: a client caching this tool list across a scenario would be answering from
-    memory rather than from the server the scenario is exercising."""
+    memory rather than from the server the scenario is exercising.
+
+    SPLIT FROM THE SENDING, and public, so `http_mcp_server.py` can answer identically over
+    a different transport by IMPORTING this rather than restating it. The era rules above
+    are protocol, not transport — a second copy of them could drift from this one silently,
+    and then the two fixtures would disagree about what a conformant modern result is while
+    both looked right in isolation (§4's duplicated-rule rule; import where import is
+    possible, which between siblings in this directory it is).
+    """
     if modern:
         out = {"resultType": "complete"}
         out.update(result)
@@ -243,11 +257,21 @@ def _result(req_id, result: dict, *, modern: bool = False,
             out["ttlMs"] = 0
             out["cacheScope"] = "public"
         result = out
-    _send({"jsonrpc": "2.0", "id": req_id, "result": result})
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+
+def error_envelope(req_id, code: int, message: str) -> dict:
+    """The error message. PURE, and public for the same reason as `result_envelope`."""
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+
+def _result(req_id, result: dict, *, modern: bool = False,
+            cacheable: bool = False) -> None:
+    _send(result_envelope(req_id, result, modern=modern, cacheable=cacheable))
 
 
 def _error(req_id, code: int, message: str) -> None:
-    _send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
+    _send(error_envelope(req_id, code, message))
 
 
 def _text(s: str, *, is_error: bool = False) -> dict:
