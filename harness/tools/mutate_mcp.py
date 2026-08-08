@@ -2446,14 +2446,14 @@ MUTATIONS = [
 
     # ---- the transport-level MUSTs and the endpoint's identity (review, PR #106) --------
     ("F15-origin-is-not-validated-on-POST", HTTPFIX,
-     ("        if not self._origin_ok():\n            self._empty(403)\n            return\n"
-      "        if msg is None:"),
-     "        if msg is None:",
+     "        if not self._origin_ok():\n            return 403\n",
+     "",
      "a cross-origin POST is refused 403 \u2014 the transport's DNS-rebinding MUST"),
     ("F16-origin-is-not-validated-on-GET", HTTPFIX,
-     ("        if not self._origin_ok():\n            self._empty(403)\n            return\n"
-      "        if self.path.split(\"?\", 1)[0] != PATH_SSE:"),
-     "        if self.path.split(\"?\", 1)[0] != PATH_SSE:",
+     ("        if not self._origin_ok():\n"
+      "            self._refuse(403)                # a GET carries no body, but it ends the "
+      "same way\n            return\n"),
+     "",
      "...and a cross-origin GET on the SSE endpoint is refused too, not just POST"),
     # Deny-everything scores full marks on both checks above unless something asserts the
     # ordinary request still works.
@@ -2462,12 +2462,12 @@ MUTATIONS = [
      "        return False",
      "...while a request with no Origin at all is served, as a non-browser client"),
     ("F18-any-path-is-the-streamable-endpoint", HTTPFIX,
-     "        if path != PATH_STREAMABLE:\n            self._empty(404)\n            return",
-     "        if False:\n            self._empty(404)\n            return",
+     "        if path not in (PATH_STREAMABLE, PATH_MESSAGES):\n            return 404",
+     "        if False:\n            return 404",
      "a POST to a path that is not the endpoint is 404, not quietly served"),
     ("F19-the-endpoint-is-matched-by-prefix", HTTPFIX,
-     "        if path != PATH_STREAMABLE:",
-     "        if not path.startswith(PATH_STREAMABLE):",
+     "        if path not in (PATH_STREAMABLE, PATH_MESSAGES):",
+     "        if path.startswith((PATH_STREAMABLE, PATH_MESSAGES)) is False:",
      "...and a prefix of the endpoint is not the endpoint either"),
     ("F20-a-session-id-is-minted-that-nothing-honours", HTTPFIX,
      "        self._json(200, reply)\n\n    def do_GET",
@@ -2480,9 +2480,8 @@ MUTATIONS = [
 
     # ---- the MUST the Origin argument already covered, and the witness of the call ---------
     ("F22-the-protocol-version-header-is-never-validated", HTTPFIX,
-     ("        if not self._version_ok():\n            self._empty(400)\n            return\n"
-      "        # STREAMABLE HTTP: the reply is this response's body."),
-     "        # STREAMABLE HTTP: the reply is this response's body.",
+     "        if path == PATH_STREAMABLE and not self._version_ok():\n            return 400",
+     "        if False:\n            return 400",
      "an unsupported MCP-Protocol-Version is refused 400 — the binding's other MUST"),
     # Deny-everything again: it scores full marks on F22's check, and only a control driving a
     # version the server really supports can tell the two apart.
@@ -2563,6 +2562,37 @@ MUTATIONS = [
      '                       rpc="initialize",\n                       # EVERY header',
      ("...and a request carrying a DIFFERENT method records that one, so the field is not the "
       "same word every time")),
+
+    # ---- the ORDER of the refusal, which every body-sending check is blind to -------------
+    # THE REPORTED REGRESSION, exactly: read the body, then decide. Accepted requests behave
+    # identically — which is why the three Origin checks that send bodies all stayed green over
+    # it — and a refused cross-origin caller gets to name the read (review, PR #106).
+    ("F33-origin-is-validated-only-after-the-body-is-read", HTTPFIX,
+     ('        refusal = self._refusal_for(path)\n        if refusal is not None:\n'
+      '            # Recorded anyway, with no message, because "did the credential arrive" '
+      'must stay\n'
+      "            # answerable for a request that was REFUSED — a token sent to a rejected "
+      "origin\n            # still left the client.\n"
+      "            self._record(None)\n            self._refuse(refusal)\n            return\n"
+      "        msg = self._body()\n        self._record(msg)"),
+     ("        msg = self._body()\n        refusal = self._refusal_for(path)\n"
+      "        if refusal is not None:\n            self._record(msg)\n"
+      "            self._refuse(refusal)\n            return\n        self._record(msg)"),
+     ("a cross-origin POST is refused WITHOUT its body — 403 arrives though the declared 50MB "
+      "never does")),
+    # Refused, promptly, and then left open — so the undelivered body desynchronizes the
+    # connection and whatever arrives next is read as a request.
+    ("F34-a-refusal-leaves-the-connection-open", HTTPFIX,
+     '        self.send_header("Connection", "close")\n',
+     "",
+     "...and the connection is CLOSED, since an unread body has desynchronized it"),
+    # The refusal stops being recorded, so the credential question goes unanswered for exactly
+    # the requests most worth asking it about.
+    ("F35-a-refused-request-is-not-recorded", HTTPFIX,
+     "            self._record(None)\n            self._refuse(refusal)",
+     "            self._refuse(refusal)",
+     ("...while the refused POST is still RECORDED, so a credential sent to a rejected origin "
+      "is not invisible")),
 
 ]
 

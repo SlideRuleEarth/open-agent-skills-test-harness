@@ -52,6 +52,14 @@ the claim is checkable against the code instead of taken: bind to loopback only;
 carrying only notifications; answer JSON or an SSE stream to a POST carrying requests; answer
 405 to a GET this server will not open a stream for.
 
+VALIDATION HAPPENS BEFORE THE BODY IS READ, and that ordering is part of the `Origin` defence
+rather than an implementation detail of it. A refusal that reads first lets the caller it is
+refusing choose how much this server reads, or hold a handler open indefinitely by declaring
+a body and never sending it — so `_refusal_for` decides from the request line and headers
+alone, and `_refuse` answers and closes without touching the body. Every check that sends a
+body is blind to this, which is how a revision that read first passed all three `Origin`
+checks; the case that sees it is a hand-written request over a raw socket (review, PR #106).
+
 WHAT IS NOT SERVED, deliberately, each because nothing in the harness reaches it yet: modern
 Streamable HTTP (`2026-07-28`) and its per-request metadata — the imported protocol logic is
 dual-era and WILL answer a modern message, which is precisely why the TRANSPORT gap has to be
@@ -299,26 +307,65 @@ class Handler(BaseHTTPRequestHandler):
         claimed = self.headers.get("MCP-Protocol-Version")
         return claimed is None or claimed in SUPPORTED_VERSIONS
 
+    def _refusal_for(self, path: str) -> int | None:
+        """The status this request is refused with, or None to accept it.
+
+        DECIDED FROM THE REQUEST LINE AND HEADERS ALONE, which is the whole point of it being
+        a function: everything answerable without the body is listed here, so it can be
+        answered BEFORE the body is read. A revision that read the body first — to put the
+        message's method on the receipt row — bought that convenience with the ordering, and
+        the ordering was the defence: a rejected cross-origin caller could then make this
+        server read a `Content-Length` of its choosing, or hold the handler open forever by
+        declaring a body and sending none, before collecting its 403 (review, PR #106).
+        Origin validation exists to spend nothing on a caller that failed it, and the comment
+        justifying the reorder listed what it bought while never mentioning what it cost.
+        """
+        if not self._origin_ok():
+            return 403
+        # EXACTLY THE CONFIGURED PATHS, matched whole. `startswith` accepted `/mcp-anything`
+        # and, worse, a catch-all accepted `/definitely-not-mcp` — so a config whose URL had
+        # been mangled or rewritten still reached a working server, and the probe that was
+        # supposed to prove the URL correct proved nothing about it (review, PR #106).
+        if path not in (PATH_STREAMABLE, PATH_MESSAGES):
+            return 404
+        # The version header belongs to the Streamable HTTP binding; `/messages` is the
+        # `2024-11-05` transport, which predates it and whose clients need not send one.
+        if path == PATH_STREAMABLE and not self._version_ok():
+            return 400
+        return None
+
+    def _refuse(self, code: int) -> None:
+        """Answer, and CLOSE, WITHOUT having read the body.
+
+        Closing is not tidiness — it is the only other way to end a refusal. An unread body
+        desynchronizes a keep-alive connection, so a server that refuses must either read what
+        it declined to look at or stop talking, and for a request refused on `Origin` reading
+        is precisely what must not happen. `send_header("Connection", "close")` both tells the
+        client and sets `close_connection` in `http.server`, so the two cannot disagree.
+        """
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
     def do_POST(self) -> None:                                   # noqa: N802 — BaseHTTPRequestHandler
-        # THE BODY IS READ BEFORE ANYTHING IS DECIDED, which buys two things. The receipt can
-        # name the message the request carried, without which the per-message header questions
-        # are unaskable (see `_record`). And the refusal paths below now DRAIN the request:
-        # an unread body desynchronizes a keep-alive connection, and `protocol_version` above
-        # commits this server to keep-alive because both transports assume it.
+        # THE ORDER HERE IS A SECURITY PROPERTY, not a style: every decision that can be made
+        # from the request line and headers is made before a byte of the body is read. See
+        # `_refusal_for`. The query string is split off first because `/messages` carries one.
+        path = self.path.split("?", 1)[0]
+        refusal = self._refusal_for(path)
+        if refusal is not None:
+            # Recorded anyway, with no message, because "did the credential arrive" must stay
+            # answerable for a request that was REFUSED — a token sent to a rejected origin
+            # still left the client.
+            self._record(None)
+            self._refuse(refusal)
+            return
         msg = self._body()
         self._record(msg)
-        if not self._origin_ok():
-            self._empty(403)
-            return
         if msg is None:
             self._empty(400)
             return
-        # EXACTLY THE CONFIGURED PATHS, matched whole. `startswith` accepted `/mcp-anything`
-        # and, worse, the catch-all below accepted `/definitely-not-mcp` — so a config whose
-        # URL had been mangled or rewritten still reached a working server, and the probe that
-        # was supposed to prove the URL correct proved nothing about it (review, PR #106). The
-        # query string is split off first because `/messages` legitimately carries one.
-        path = self.path.split("?", 1)[0]
         if path == PATH_MESSAGES:
             # LEGACY SSE: the reply does NOT belong to this response. It goes to the stream
             # the client opened with GET /sse and is still holding; this POST is answered
@@ -335,15 +382,11 @@ class Handler(BaseHTTPRequestHandler):
                 stream.send(_sse_frame(reply))
             self._empty(202)
             return
-        if path != PATH_STREAMABLE:
-            self._empty(404)
-            return
-        # Checked on THIS endpoint only. `MCP-Protocol-Version` belongs to the Streamable HTTP
-        # binding; the `/messages` half above is the `2024-11-05` transport, which predates the
-        # header and whose clients are not required to send one.
-        if not self._version_ok():
-            self._empty(400)
-            return
+        # NO SECOND PATH OR VERSION CHECK HERE. Both moved into `_refusal_for`, and leaving a
+        # copy behind would be one rule implemented in two places — the drift §4 spends a rule
+        # on. Reaching this line already means the path is `/mcp` and the version is one this
+        # server implements.
+        #
         # STREAMABLE HTTP: the reply is this response's body.
         reply = dispatch(msg)
         if reply is None:
@@ -361,7 +404,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:                                    # noqa: N802
         self._record()
         if not self._origin_ok():
-            self._empty(403)
+            self._refuse(403)                # a GET carries no body, but it ends the same way
             return
         if self.path.split("?", 1)[0] != PATH_SSE:
             # The streamable endpoint MAY decline to open a server→client stream, and 405 is

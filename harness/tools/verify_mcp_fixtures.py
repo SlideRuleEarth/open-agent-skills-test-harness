@@ -35,6 +35,7 @@ import queue
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1350,6 +1351,37 @@ class _Remote:
         out = [json.loads(x) for x in open(self.path, encoding="utf-8") if x.strip()]
         return [r for r in out if kind is None or r["kind"] == kind]
 
+    def promise_a_body(self, headers: str, declared: int = 50_000_000, bound=5.0):
+        """Send a request that DECLARES a large body and never sends it. Returns
+        (status_line, elapsed, closed) — with `status_line` empty if nothing came back.
+
+        HAND-WRITTEN OVER A RAW SOCKET because `urllib` cannot express this: it writes the
+        body it declares. The case is the whole question of ordering — a server that validates
+        `Origin` only after reading the body will sit in `rfile.read(declared)` waiting for
+        bytes that never arrive, so the discriminator is whether an answer comes back AT ALL
+        within a bound, not what the answer says (review, PR #106).
+        """
+        sock = socket.create_connection(("127.0.0.1", self.info["port"]), timeout=bound)
+        try:
+            started = time.monotonic()
+            sock.sendall(headers.encode())          # headers and the blank line; NO body
+            got, closed = b"", False
+            try:
+                while b"\r\n\r\n" not in got:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    got += chunk
+                # A refusal must also END the connection: an unread body has desynchronized
+                # it, so anything after this response would be read as a new request.
+                closed = sock.recv(4096) == b""
+            except (TimeoutError, OSError):
+                pass
+            elapsed = time.monotonic() - started
+            return got.split(b"\r\n", 1)[0].decode(errors="replace"), elapsed, closed
+        finally:
+            sock.close()
+
 
 def dig(obj, *path, default=None):
     """Walk `path` through nested dicts/lists, returning `default` at the first miss.
@@ -1467,6 +1499,36 @@ with _Remote() as _rm:
         # both checks above — "rejects everything passes" is the defect §10.9 spends a case on.
         check("...while a request with no Origin at all is served, as a non-browser client",
               _rm.rpc({"jsonrpc": "2.0", "id": 6, "method": "ping"})[0] == 200)
+
+        # THE REFUSAL MUST COST THE REFUSED CALLER MORE THAN IT COSTS THIS SERVER, and that is
+        # a property of ORDER, which the three checks above cannot see: they send bodies, so a
+        # server reading the body first still answers 403 and passes all of them. A revision
+        # that read first — to put the message's method on the receipt row — let a rejected
+        # cross-origin caller name a `Content-Length` of its choosing, or pin the handler open
+        # by declaring a body and sending none (review, PR #106).
+        _line, _secs, _closed = _rm.promise_a_body(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://evil.example\r\n"
+            "Content-Type: application/json\r\nContent-Length: 50000000\r\n\r\n")
+        check("a cross-origin POST is refused WITHOUT its body — 403 arrives though the "
+              "declared 50MB never does",
+              _line.startswith("HTTP/1.1 403"), (_line, f"{_secs:.2f}s"))
+        check("...promptly, rather than after a wait for bytes that are not coming",
+              _secs < 4.0, f"{_secs:.2f}s")
+        check("...and the connection is CLOSED, since an unread body has desynchronized it",
+              _closed, (_line, _closed))
+        # `_record` on the POST refusal path is what keeps this true; without it the credential
+        # question goes unanswered for exactly the requests most worth asking it about.
+        #
+        # THE VERB IS PART OF THE ASSERTION, and leaving it out made this pass over its own
+        # mutation. `do_GET` records before it refuses, by a different line — so a cross-origin
+        # GET above put an `evil.example` row in the file, and a check that asked only "is there
+        # such a row" was answered by a request it was not about. §4's recurring one, in the
+        # check written to close a finding about ordering (F35, caught by its own mutation).
+        check("...while the refused POST is still RECORDED, so a credential sent to a rejected "
+              "origin is not invisible",
+              any(r["method"] == "POST" and r["headers"].get("origin") == "https://evil.example"
+                  for r in _rm.rows("request")),
+              [(r["method"], r["headers"].get("origin")) for r in _rm.rows("request")])
 
         # THE BINDING'S OTHER MUST, found by asking what else the Origin argument covered
         # rather than by it being reported: `2025-11-25` requires 400 for a protocol version

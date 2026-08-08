@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 562 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py                        # 311/311 production + 2/2 instrument + 32/32 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 319 checks
+python3 -u harness/tools/mutate_mcp.py                        # 311/311 production + 2/2 instrument + 35/35 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 323 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 77 here
 git diff --check
 
@@ -1181,6 +1181,27 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   normal", an argument quantifying over **every** server-side MUST in the binding — so
   honouring it meant sweeping the rest and finding this one, rather than waiting to be told.
   What the note says now is what is served, what is not, and which list each item is on.
+- **A REFUSAL IS AN ORDERING, AND EVERY WELL-BEHAVED CLIENT IS BLIND TO IT.** To put the
+  message's method on the receipt row, I moved the body read ahead of the `Origin` check — and
+  wrote a comment saying the reorder "buys two things", listing both, never asking what it
+  cost. It cost the defence: a rejected cross-origin caller could then name a `Content-Length`
+  this server would read, or pin a handler open by declaring a body and sending none, before
+  collecting its 403. **All three `Origin` checks stayed green**, because each sends a body, so
+  reading it first changes nothing they can see. The case that sees it is a hand-written
+  request over a raw socket that declares 50MB and sends none, and the discriminator is
+  whether an answer comes back AT ALL within a bound — not what the answer says. Two rules.
+  When a security property is about ORDER, a check whose client behaves well cannot test it;
+  write the misbehaving client. And **a justification that lists what a change buys and not
+  what it spends is not a justification** — the first rule in `CLAUDE.md` in its other
+  direction, since the argument for the reorder never mentioned refusals.
+- **THE CHECK CLOSING A FINDING WAS ANSWERED BY A DIFFERENT REQUEST — the recurring one, in
+  the fix for the entry above.** "A refused request is still recorded" asked only whether some
+  row carried the rejected origin. `do_GET` records before it refuses, by a different line, so
+  a cross-origin GET four checks earlier had already put such a row in the file: the mutation
+  removing the POST refusal's `_record` was **MISSED**, and the check passed on evidence from a
+  request it was not about. The verb belonged in the assertion. Worth noting how it was found —
+  not by review of the check, which reads correctly, but by the mutation written alongside it,
+  which is the entire argument for writing one in the same commit.
 - **AN ASSERTION WEAKER THAN THE SENTENCE IT PROTECTS IS NOT PROTECTING IT.** §9 publishes
   "every post-handshake request carries `MCP-Protocol-Version`". The check dropped the requests
   with no header and required only that one remained — so a client sending it once and omitting
