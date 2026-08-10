@@ -616,6 +616,30 @@ class Adapter(ABC):
     ENFORCING_TOOL_FILTERS = frozenset({"native", "complement", "proxy"})
     mcp_tool_filter = "none"
 
+    def tool_filter_for(self, server: Any) -> tuple[str, str | None]:
+        """How `tools:` on THIS server would be enforced, plus a reason when it would not be.
+
+        PER-SERVER, because enforcement is not always a property of the CLI alone. `native`
+        and `complement` are: the CLI applies them however the server is reached. `proxy` is
+        not — the harness puts a program of its OWN between the CLI and the server, so whether
+        the allowlist can be applied depends on the transport that program would have to
+        speak, and the transport is a property of the SERVER.
+
+        An adapter-wide constant cannot say "enforced here, not there", and the direction it
+        fails in is the dangerous one: it answers yes for a server nothing filters. That is not
+        hypothetical. `mcp_tool_filter` was `unbuilt` on claude until the C3 integration, so
+        the refusal below covered every gated server and a remote one INCIDENTALLY; flipping
+        the constant to `proxy` for the stdio case it was built for silently un-refused the
+        remote case that DESIGN §10 still says is out of scope, and the run got as far as a
+        proxy config naming no command (review, PR #107).
+
+        Returns the mechanism from the vocabulary above, and a detail that replaces the
+        generic per-mechanism one when the adapter can say something truer about this server.
+        Overriding this is how an adapter narrows its claim; the default repeats the class
+        attribute for every server, which is right for a filter the CLI applies itself.
+        """
+        return self.mcp_tool_filter, None
+
     def validate_mcp_support(self, mcp_servers: dict) -> tuple[list[str], list[str]]:
         """Can THIS runner honour these declared servers? Returns (errors, warnings).
 
@@ -638,15 +662,27 @@ class Adapter(ABC):
                 "had the tools it asked for. Run this eval on an adapter that supports "
                 "them, or remove `mcp_servers:`.")
             return errors, warnings
-        gated = sorted(n for n, s in mcp_servers.items() if getattr(s, "tools", None) is not None)
-        if gated and self.mcp_tool_filter not in self.ENFORCING_TOOL_FILTERS:
-            detail = {
+        # ASKED ONCE PER GATED SERVER, then grouped by the reason, so a scenario mixing a
+        # server this adapter can filter with one it cannot gets an error naming the second
+        # and keeps the first. A single question about the adapter answers for the whole
+        # mapping, which is only correct while every server has the same answer.
+        by_detail: dict[str, list[str]] = {}
+        for name in sorted(mcp_servers):
+            server = mcp_servers[name]
+            if getattr(server, "tools", None) is None:
+                continue
+            mechanism, why = self.tool_filter_for(server)
+            if mechanism in self.ENFORCING_TOOL_FILTERS:
+                continue
+            detail = why or {
                 "none": (f"{self.name} has no tool-filtering mechanism at all"),
                 "unbuilt": (f"tool filtering on {self.name} is not implemented in this "
                             "harness yet"),
-            }.get(self.mcp_tool_filter, f"{self.name} cannot enforce it")
+            }.get(mechanism, f"{self.name} cannot enforce it")
+            by_detail.setdefault(detail, []).append(name)
+        for detail, names in sorted(by_detail.items()):
             errors.append(
-                f"MCP server(s) {', '.join(gated)} set `tools:`, but {detail}. An allowlist "
+                f"MCP server(s) {', '.join(names)} set `tools:`, but {detail}. An allowlist "
                 "that is accepted and not enforced is worse than no allowlist, because "
                 "nothing in the results would show it never applied — refusing instead. "
                 "Remove `tools:` to run with the server's full tool surface.")

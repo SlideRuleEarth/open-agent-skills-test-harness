@@ -310,8 +310,30 @@ class ClaudeAdapter(Adapter):
     #
     # This field read `"unbuilt"` from #84 until the C3 adapter integration, and the validator
     # refused every gated server for that whole time — the honest state while the mechanism
-    # the allowlist would need did not exist.
+    # the allowlist would need did not exist. Which is why `tool_filter_for` below exists: the
+    # blanket refusal was also what kept REMOTE servers out, and flipping this constant took
+    # that refusal away for a case the proxy still cannot serve.
     mcp_tool_filter = "proxy"
+
+    def tool_filter_for(self, server: Any) -> tuple[str, str | None]:
+        """`proxy`, but only for a server the proxy can actually be put in front of.
+
+        `mcp_proxy_io.py` is spawned AS the server and speaks JSON-RPC over pipes in both
+        directions; it holds no HTTP or SSE client, so a remote server gives it nothing to
+        connect to. The transport bridge that would (stdio in, HTTP/SSE out) is the next piece
+        of work and is not built — DESIGN §10's first cut is stdio only.
+
+        Answering `proxy` here regardless would be this class asserting a filter that is not
+        there, and the failure it produced was not even a loud one: the run reached a proxy
+        config whose `command` was `null`, spending a model call to arrive at a missing audit
+        log — a cell that fails for a reason bearing no resemblance to the cause (PR #107).
+        """
+        if not server.is_stdio:
+            return "unbuilt", (
+                "the harness's filtering proxy speaks stdio to the declared server and this "
+                "one is remote (`url:`), so there is nothing for it to connect to — the "
+                "transport bridge that would give it one is not built yet (DESIGN §10)")
+        return self.mcp_tool_filter, None
 
     # TODO: Claude Code has no `list-models` command yet (feature request pending).
     # When one ships, add has_model_list = True and a discover_models() override
@@ -446,7 +468,22 @@ class ClaudeAdapter(Adapter):
         second opinion about what a name may contain, and the one that matters is the one the
         parser enforced (§4). Today it admits no separator and no `..`, so this cannot escape
         the scratch dir — the check is what keeps that true if the schema ever widens.
+
+        THE TRANSPORT IS RE-ASSERTED HERE, not assumed from `validate_mcp_support` having run.
+        That validator is the friendly refusal, reached before tokens are spent and skippable
+        by any caller that builds argv directly; this is the layer nothing routes around. What
+        it prevents is specific and was observed: a remote server produced a config with
+        `"command": null` and no trace of the `url` and `headers` it was actually declared
+        with, which is a launch failure two processes away from anything naming the cause.
         """
+        if not s.is_stdio:
+            raise RuntimeError(
+                f"claude: MCP server {name!r} sets `tools:` but is remote (`url:`), and the "
+                "filtering proxy speaks stdio — there is nothing for it to connect to. "
+                "`validate_mcp_support` refuses this before a run starts, so reaching here "
+                "means validation was skipped. Refusing rather than writing a proxy config "
+                "with no command, which drops the declared url and headers and fails at "
+                "launch instead of here.")
         if not _NAME_RE.match(name):
             raise RuntimeError(
                 f"claude: MCP server name {name!r} is not one the schema admits, and it is "

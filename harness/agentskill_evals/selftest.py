@@ -11060,6 +11060,43 @@ def _check_mcp_declared_servers(failures, verbose):
            f"is about the proxy existing and not about the check being gone — "
            f"{_UnbuiltFilter().validate_mcp_support(gated)[0]}", failures, verbose)
 
+    # THE PROXY IS STDIO-ONLY, and until the C3 integration nothing said so out loud: the
+    # filter read "unbuilt", so the blanket refusal above covered a remote server too and the
+    # remote case never needed a check of its own. Flipping the constant to "proxy" for the
+    # stdio case it was built for therefore un-refused a case DESIGN §10 still calls out of
+    # scope, and the run got as far as a proxy config naming no command (review, PR #107).
+    _cla = get_adapter("claude")
+    remote_gated = parse_mcp_servers(
+        {"r": {"url": "https://example.invalid/mcp", "tools": ["echo"]}}, where="t")
+    remote_errs = _cla.validate_mcp_support(remote_gated)[0]
+    _check("mcp.a_remote_server_cannot_be_gated_by_a_proxy_that_speaks_stdio",
+           (len(remote_errs) == 1
+            and "stdio" in remote_errs[0] and "url" in remote_errs[0]
+            # claude's override glues the deny-the-complement explanation onto the GENERIC
+            # "not implemented" wording. This refusal has a reason of its own, and inheriting
+            # a paragraph about a mechanism that is not the obstacle would send the reader to
+            # C3 — which is built, and is exactly what refused them.
+            and "deny-the-complement" not in remote_errs[0]
+            and _cla.tool_filter_for(remote_gated["r"])[0]
+            not in _cla.ENFORCING_TOOL_FILTERS
+            and _cla.tool_filter_for(gated["e"])[0] in _cla.ENFORCING_TOOL_FILTERS),
+           f"`mcp_proxy_io.py` is spawned as the server and speaks pipes, so a `url:` server "
+           f"gives it nothing to connect to — and the refusal names the transport rather than "
+           f"claiming the feature is missing, which it is not for the stdio server checked in "
+           f"the same breath: {remote_errs}", failures, verbose)
+
+    # ...and the question is asked PER SERVER. One answer for the whole mapping is correct only
+    # while every server has the same one, which is exactly what stopped being true.
+    _mixed = parse_mcp_servers({"local": {"command": "python3", "tools": ["echo"]},
+                                "remote": {"url": "https://x.invalid/mcp", "tools": ["echo"]}},
+                               where="t")
+    _mixed_errs = _cla.validate_mcp_support(_mixed)[0]
+    _check("mcp.the_gating_question_is_asked_per_server_not_per_scenario",
+           len(_mixed_errs) == 1 and "MCP server(s) remote set" in _mixed_errs[0],
+           f"a scenario mixing a server this adapter can filter with one it cannot keeps the "
+           f"first and refuses the second BY NAME — an error listing both would send someone "
+           f"to delete a `tools:` that works: {_mixed_errs}", failures, verbose)
+
     # --- claude's config materialization --------------------------------------
     scratch = _tempfile.mkdtemp(prefix="ase-mcptest-")
     cl = get_adapter("claude")
@@ -11266,6 +11303,24 @@ def _check_mcp_declared_servers(failures, verbose):
            f"it is joined onto a path — and the refusal SAYS SO, so it cannot be confused with "
            f"whatever error that name would have caused downstream: {_bad[:110]!r}",
            failures, verbose)
+
+    # THE SECOND LAYER of the stdio-only rule. `validate_mcp_support` is the friendly refusal
+    # and is skippable — any caller that builds argv directly never reaches it — so the writer
+    # re-asserts the transport rather than assuming a validator ran. Without it the file it
+    # produced said `"command": null` and dropped the declared url and headers entirely, which
+    # fails two processes later with nothing naming the cause.
+    _remote_res, _ = resolve_mcp_servers(remote_gated, env={})
+    _remote_bad = ""
+    try:
+        cl._write_proxy_config("r", _remote_res["r"], gscratch)
+    except Exception as exc:                             # noqa: BLE001 — the message is the test
+        _remote_bad = f"{type(exc).__name__}: {exc}"
+    _check("mcp.the_proxy_config_writer_refuses_what_it_cannot_proxy",
+           _remote_bad.startswith("RuntimeError:") and "speaks stdio" in _remote_bad
+           and not os.path.exists(os.path.join(gscratch, "mcp-proxy-r.json")),
+           f"the refusal happens before the file exists, and SAYS which transport — a writer "
+           f"that emitted the config and let the proxy reject it would spend a model call to "
+           f"arrive at a missing audit log: {_remote_bad[:120]!r}", failures, verbose)
 
     _shutil.rmtree(gscratch, ignore_errors=True)
 

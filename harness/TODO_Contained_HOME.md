@@ -289,12 +289,12 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 574 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 577 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py                        # 322/322 production + 2/2 instrument + 35/35 fixture
+python3 -u harness/tools/mutate_mcp.py                        # 327/327 production + 2/2 instrument + 35/35 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 322 checks
-harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 77 here
+harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 80 here
 git diff --check
 
 # OPT-IN, not part of the block above: needs `claude` on PATH and spends an API call.
@@ -1300,6 +1300,31 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   separates two facts that were being read off one: the server's receipts say the call
   **arrived**, and the opaque marker says the answer **came back** — and the receipts cannot
   witness the second, because a server can say what it wrote and not what was read.
+- **A REFUSAL THAT COVERED YOUR CASE INCIDENTALLY DISAPPEARS WHEN THE BLANKET IS LIFTED.**
+  DESIGN §10 has said since it was written that remote `tools:` is out of scope, and the
+  sentence was true for months without anything checking it: `mcp_tool_filter` read `"unbuilt"`
+  on claude, so the validator refused **every** gated server, and the remote case was inside a
+  refusal written for a different reason. Building the stdio proxy flipped that constant to
+  `"proxy"` — narrowing nothing, because the constant had no way to express a narrowing — and
+  the remote case walked through, spending a model call to arrive at a proxy config whose
+  `command` was `null`. **When a rule you rely on is enforced only as a side effect of a
+  broader one, lifting the broader one is the moment to write the specific check** — not the
+  moment to trust the document that still describes the old behaviour. The tell is a constant
+  answering a question whose real subject is a pair: enforceability was never a property of the
+  adapter alone, since a `proxy` filter is a *program the harness launches* and what it can
+  reach depends on the server. The fix is `tool_filter_for(server)`, asked per server, plus the
+  same rule re-asserted in the config writer, because a validator is skippable by any caller
+  that builds argv directly.
+- **ABSENT AND EMPTY, ONCE MORE, IN THE GUARD RATHER THAN THE READER.** §4 already carries
+  `x.get(k) or []` erasing missing/null/empty. This is its sibling one line further on:
+  `if not tools or not all(...)` refused an allowlist that was **present and empty**, using the
+  argument written for one that was **absent**. The docstring beside it made the distinction
+  correctly — "no configuration in which this program is asked to pass everything" is about
+  absence — and the code did not, so `tools: []`, a state the schema documents and warns about,
+  passed every preflight the harness has and then died at launch with a message about a
+  non-empty list. **A validity check whose justification is about a different input than the
+  one it rejects is a merged condition.** The two cases are not even close: a missing allowlist
+  could become "pass everything", and an empty one is a filter that admits nothing.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s

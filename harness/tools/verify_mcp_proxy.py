@@ -471,6 +471,59 @@ check("a non-tool method passes through verbatim",
 check("...and the whole exchange still ends clean",
       wire.verdict.clean and wire.returncode == 0, wire)
 
+# THE EMPTY ALLOWLIST, END TO END. `tools: []` is a state the schema admits — with a warning
+# that the server stays reachable and unusable — so it has to START. The distinction turns on
+# something no config-level check makes: a proxy that REFUSES the config and one that admits
+# nothing both leave the client with no tools, and only one of them ran the server at all.
+# `load_config` rejected it outright, so the documented state passed every preflight the harness
+# has and then died at launch (review, PR #107).
+none_allowed = run(tools=(), send=[INIT, req(2, "tools/list"), req(3, "ping"),
+                                   req(4, "tools/call", name="echo", arguments={"text": "hi"})])
+check("an empty allowlist is a filter that admits nothing, not a config the proxy rejects",
+      [(e.get("forwarded"), e.get("removed"))
+       for e in none_allowed.events(A.TOOLS_ADVERTISED)] == [([], ["echo", "add"])]
+      and (reply_to(none_allowed.replies, 2) or {}).get("result", {}).get("tools") == [],
+      f"the removed list is the POSITIVE fact — an advertisement of nothing is also what a "
+      f"proxy that never started produces: {none_allowed}")
+check("...and the server behind it is still reachable, with every call refused",
+      (reply_to(none_allowed.replies, 3) or {}).get("result") == {}
+      and (reply_to(none_allowed.replies, 4) or {}).get("error", {}).get("code") == -32601
+      and [e.get("tool") for e in none_allowed.events(A.CALL_REFUSED)] == ["echo"]
+      and none_allowed.verdict.clean and none_allowed.returncode == 0, none_allowed)
+
+
+def started_on(config: dict) -> tuple[int, str, bool]:
+    """Run the proxy on a hand-written config; return (exit code, stderr, audit log exists?).
+
+    `run()` cannot express these — it always writes a well-formed config, which is right for
+    every case about the wire. What is under test here is the boundary BEFORE the instance
+    exists, where a refusal writes no log at all.
+    """
+    tmp = tempfile.mkdtemp(prefix="ase-mcp-cfg-")
+    try:
+        log_path = os.path.join(tmp, "audit.jsonl")
+        cfg_path = os.path.join(tmp, "proxy.json")
+        with open(cfg_path, "w", encoding="utf-8") as handle:
+            json.dump({"audit_log": log_path, **config}, handle)
+        # `input=""` is a PIPE closed immediately, not `DEVNULL`: the proxy selects on its
+        # stdin, and a character device is not something kqueue will register — the control
+        # would then fail with `EINVAL` from the pump and look like a rejected config.
+        done = subprocess.run([sys.executable, PROXY, cfg_path], input="",
+                              capture_output=True, text=True, timeout=DEADLINE)
+        return done.returncode, done.stderr, os.path.exists(log_path)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+_base_cfg = {"server": "echo", "command": sys.executable, "args": [ECHO], "env": {}}
+_absent = started_on(_base_cfg)
+_present = started_on({**_base_cfg, "tools": []})
+check("an ABSENT `tools` key is still refused, and the two are not the same fact",
+      _absent[0] == 2 and "no 'tools'" in _absent[1] and not _absent[2]
+      and _present[0] == 0 and _present[2],
+      f"a missing key is the one that could quietly become 'pass everything'; an empty one is "
+      f"a filter whose allowlist happens to be empty. absent={_absent} present={_present}")
+
 # THE NOTIFICATION RULE HAS TWO HALVES and only one of them is visible from the client alone.
 # "Never answered" is observable here; "forwarded verbatim" needs the server to say it saw one,
 # which is what `PT_NOTIFY_ECHO` is for. Checking only the half that is easy would pass against

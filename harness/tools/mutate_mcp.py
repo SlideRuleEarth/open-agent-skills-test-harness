@@ -2356,6 +2356,20 @@ MUTATIONS = [
      "            if not isinstance(reason, str) or not reason:",
      "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
 
+    # ---- absent and empty are two facts, not one ----------------------------------------
+    # THE DEFECT AS SHIPPED: `tools: []` is a state the schema admits, and the proxy refused to
+    # start on it — so the documented configuration passed every preflight and died at launch.
+    ("M332-the-empty-allowlist-is-refused-again", PROXY_IO,
+     "    if not all(isinstance(t, str) and t for t in tools):",
+     "    if not tools or not all(isinstance(t, str) and t for t in tools):",
+     "an empty allowlist is a filter that admits nothing, not a config the proxy rejects"),
+    # ...and the same conflation in the direction that matters more: an ABSENT key becomes an
+    # empty allowlist, so a config that never named a filter starts a proxy that reports one.
+    ("M333-a-missing-allowlist-becomes-an-empty-one", PROXY_IO,
+     '    tools = _require(raw, "tools", list, "the declared `tools:` allowlist")',
+     '    tools = raw.get("tools") or []',
+     "an ABSENT `tools` key is still refused, and the two are not the same fact"),
+
     # ---- F: instruments, proven by tools/verify_mcp_fixtures.py -------------------------
     # Everything above asks whether the selftest notices a defect in production code. These
     # ask whether the fixture verifier notices a defect in a fixture or probe — the gap named
@@ -2504,8 +2518,8 @@ MUTATIONS = [
     # ...and the other direction: a set that admits everything accepts an allowlist nothing
     # applies, which is the exact degradation the refusal exists for.
     ("M320-every-filter-value-counts-as-enforcement", BASE,
-     "        if gated and self.mcp_tool_filter not in self.ENFORCING_TOOL_FILTERS:",
-     "        if gated and False:",
+     "            if mechanism in self.ENFORCING_TOOL_FILTERS:\n                continue",
+     "            if True:\n                continue",
      "mcp.a_tool_filter_outside_the_enforcing_set_still_refuses"),
     # THE SUBSTITUTION ITSELF: the gated server is handed to claude directly, so the CLI talks
     # to the real server and the allowlist is a comment.
@@ -2562,6 +2576,24 @@ MUTATIONS = [
      "        if not _NAME_RE.match(name):",
      "        if False:",
      "mcp.a_server_name_that_could_escape_the_scratch_dir_is_refused"),
+    # THE FILTER ANSWERS FOR THE ADAPTER AGAIN, which is the state this branch was added to
+    # leave: `proxy` for every gated server, including one the proxy has no way to reach.
+    ("M329-the-filter-claim-ignores-the-transport", CLAUDE,
+     '        if not server.is_stdio:\n            return "unbuilt", (',
+     '        if False:\n            return "unbuilt", (',
+     "mcp.a_remote_server_cannot_be_gated_by_a_proxy_that_speaks_stdio"),
+    # ...and the caller asks the class attribute instead of the server, which is the same defect
+    # one level up: correct only while every declared server has the same answer.
+    ("M330-the-gating-question-is-asked-once-for-the-whole-mapping", BASE,
+     "            mechanism, why = self.tool_filter_for(server)",
+     "            mechanism, why = self.mcp_tool_filter, None",
+     "mcp.the_gating_question_is_asked_per_server_not_per_scenario"),
+    # The writer trusts that a validator ran. It produces `"command": null` and drops the url
+    # and headers the server was actually declared with.
+    ("M331-the-proxy-config-writer-forgets-the-transport", CLAUDE,
+     "        if not s.is_stdio:\n            raise RuntimeError(",
+     "        if False:\n            raise RuntimeError(",
+     "mcp.the_proxy_config_writer_refuses_what_it_cannot_proxy"),
 
     # ---- the MUST the Origin argument already covered, and the witness of the call ---------
     ("F22-the-protocol-version-header-is-never-validated", HTTPFIX,
