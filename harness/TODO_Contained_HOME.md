@@ -1204,15 +1204,21 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   like a second defence masking the first (the M53 pattern), and the fix that follows from that
   reading — make the mutation remove both — would have left the real defect in place. Producing
   the condition on purpose is what separated them, and it took one run to do.
-- **A PIPELINE'S EXIT STATUS IS THE LAST COMMAND'S, AND `| tail` IS THE LAST COMMAND.** Four
-  rounds of `python3 -u tools/mutate_mcp.py 2>&1 | tail -14` reported "exit code 0" — `tail`'s,
-  every time. The run that finally mattered returned **1** with `320/322` and was announced as
-  a success by the shell. Nothing was misreported, because the totals line is what was actually
-  read and it had been clean; but the exit code, the one signal that costs nothing to check,
-  had been meaningless for the whole sequence. **Do not pipe a command whose exit status is the
-  result**, or read `PIPESTATUS`. The general form is §4's own: a channel that reports the same
-  thing whether or not the underlying condition holds is not a channel, and this one was
-  believed precisely because it agreed with the truth four times running.
+- **THE STATUS YOU REPORT MUST COME FROM THE COMMAND WHOSE STATUS YOU MEAN — and it went wrong
+  twice in one session, in both directions.** First: four rounds of `python3 -u
+  tools/mutate_mcp.py 2>&1 | tail -14` reported "exit code 0", which is `tail`'s, every time.
+  The run that finally mattered returned **1** with `320/322` and was announced as a success.
+  Then, having "fixed" that by capturing `$?` into an echoed line, the wrapper ended with
+  `grep -c … || echo 0` — and `grep -c` exits **1** when the count is zero, so a **clean**
+  322/322 run was announced as a **failure**. A false green and then a false red, from the same
+  root: the last command in the script was not the command under test.
+  The lesson is not "don't pipe to `tail`", which is what I wrote after the first instance and
+  which is why the second one landed. It is that a status is evidence ABOUT a specific process,
+  so it has to be **captured from that process** — `rc=$?` immediately after it, printed, and
+  read — and every convenience wrapped around it afterwards is a different process with its own
+  status. The captured line said `RUNNER EXIT: 0` and was right both times; the surrounding
+  shell was wrong both times. **When a fix is a prohibition on one spelling, ask what the rule
+  quantifies over**, because the next spelling is already being typed.
 - **RENAMING AN ARM UNHOOKS ITS MUTATION, AND THE GUARD DID NOT COVER THE SUITE WHERE IT
   HAPPENED.** #106 added a guard for exactly this and pointed it at printed check labels — so
   it covers the two verifiers and NOT the selftest, which prints section headings rather than a
