@@ -289,10 +289,10 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 562 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 574 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py                        # 311/311 production + 2/2 instrument + 35/35 fixture
+python3 -u harness/tools/mutate_mcp.py                        # 322/322 production + 2/2 instrument + 35/35 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 322 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 77 here
 git diff --check
@@ -1181,6 +1181,34 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   normal", an argument quantifying over **every** server-side MUST in the binding — so
   honouring it meant sweeping the rest and finding this one, rather than waiting to be told.
   What the note says now is what is served, what is not, and which list each item is on.
+- **A PIPELINE'S EXIT STATUS IS THE LAST COMMAND'S, AND `| tail` IS THE LAST COMMAND.** Four
+  rounds of `python3 -u tools/mutate_mcp.py 2>&1 | tail -14` reported "exit code 0" — `tail`'s,
+  every time. The run that finally mattered returned **1** with `320/322` and was announced as
+  a success by the shell. Nothing was misreported, because the totals line is what was actually
+  read and it had been clean; but the exit code, the one signal that costs nothing to check,
+  had been meaningless for the whole sequence. **Do not pipe a command whose exit status is the
+  result**, or read `PIPESTATUS`. The general form is §4's own: a channel that reports the same
+  thing whether or not the underlying condition holds is not a channel, and this one was
+  believed precisely because it agreed with the truth four times running.
+- **RENAMING AN ARM UNHOOKS ITS MUTATION, AND THE GUARD DID NOT COVER THE SUITE WHERE IT
+  HAPPENED.** #106 added a guard for exactly this and pointed it at printed check labels — so
+  it covers the two verifiers and NOT the selftest, which prints section headings rather than a
+  line per arm. Changing `mcp.claude_refuses_tools_it_cannot_enforce` to its opposite therefore
+  left `M4` naming a check that no longer existed, and the same edit made its find-text stale;
+  the mutation reported as a **skip**, which is uncaught, and the totals moved by one in a
+  number nobody reads per-line. The fix is that the arm set is recoverable from the suite's
+  SOURCE even when it is not recoverable from its OUTPUT — a substring test over `selftest.py`,
+  cruder than reading labels and sufficient for the case that matters. **When a guard is
+  written against one representation of a fact, check whether the fact has another
+  representation somewhere the guard cannot see.**
+- **ADDING A SECOND SITE THAT LOOKS LIKE THE FIRST IS THE OTHER WAY TO CREATE AN AMBIGUOUS
+  ANCHOR.** #103 recorded this arriving from a REFACTOR that made two functions identical.
+  Here it arrived from new code: `_write_proxy_config` creates its file exactly the way
+  `_write_mcp_config` creates `mcp.json`, so `M9`'s anchor silently began matching twice and
+  was refused. Two things worth keeping. The guard worked — a refused mutation is uncaught and
+  the suite says so, which is the behaviour that entry argued for. And **the trigger is not
+  refactoring, it is textual coincidence**, so the moment to check is whenever a new site is
+  written in the image of an existing one, which is most of the time.
 - **A REFUSAL IS AN ORDERING, AND EVERY WELL-BEHAVED CLIENT IS BLIND TO IT.** To put the
   message's method on the receipt row, I moved the body read ahead of the `Origin` check — and
   wrote a comment saying the reorder "buys two things", listing both, never asking what it

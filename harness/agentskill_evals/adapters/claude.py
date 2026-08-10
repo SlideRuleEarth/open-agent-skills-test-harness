@@ -20,12 +20,21 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any
 
+from .. import mcp_audit
+from ..mcp import _NAME_RE
 from ..notices import warn
 from ..schema import EventKind, NormalizedEvent
 from .base import (Adapter, MCPOffMechanism, ParseOutput, ProbeResult, RunOptions,
                    VersionProvenance, extract_command, extract_path, iter_jsonl, warn_unknown_usage)
+
+# The proxy, as a path rather than a module name: it is spawned by the CLI, not imported here.
+# Derived from this file's location so a harness running out of any checkout finds its own —
+# hard-coding it would make a second checkout gate traffic through the first one's proxy.
+_PROXY_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mcp_proxy_io.py")
 
 _FILE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Create"}
 _READ_TOOLS = {"Read", "View"}
@@ -290,16 +299,19 @@ class ClaudeAdapter(Adapter):
     # buys is that an unaudited build is visible, and that re-establishing the claim has a
     # documented procedure (clear_hint).
     mcp_off_mechanism = MCPOffMechanism.CLI
-    # Per-server `tools:` is REFUSED here rather than half-enforced. The only claude
-    # mechanism that gates MCP tools is `--disallowedTools` on the complement of the
-    # allowlist (`--allowedTools` does nothing under --dangerously-skip-permissions —
-    # measured, DESIGN_MCP_Support.md §6-C2), and computing a complement requires the
-    # server's full tool list, which is knowable only by starting the server and asking it
-    # — a SECOND server instance that can answer differently from the one claude launches.
-    # That gap is the design's C3 (a harness-owned filtering proxy), deliberately not built
-    # yet, so the honest state is "no enforcement mechanism implemented" and the validator
-    # refuses `tools:` instead of accepting an allowlist that would not apply.
-    mcp_tool_filter = "unbuilt"
+    # Per-server `tools:` is enforced BY THE HARNESS, not by claude. No claude mechanism can
+    # do it: `--allowedTools` does nothing to MCP tools under --dangerously-skip-permissions
+    # (measured, DESIGN_MCP_Support.md §6-C2), and the only alternative — `--disallowedTools`
+    # over the complement of the allowlist — needs the server's full tool list, knowable only
+    # by starting the server and asking it, which is a SECOND instance free to answer
+    # differently from the one claude launches. So the filter moved to where the traffic is:
+    # `mcp_proxy_io.py` sits between the CLI and the declared server, and the CLI is handed
+    # the proxy as if it were the server (§10). Nothing here trusts claude to filter anything.
+    #
+    # This field read `"unbuilt"` from #84 until the C3 adapter integration, and the validator
+    # refused every gated server for that whole time — the honest state while the mechanism
+    # the allowlist would need did not exist.
+    mcp_tool_filter = "proxy"
 
     # TODO: Claude Code has no `list-models` command yet (feature request pending).
     # When one ships, add has_model_list = True and a discover_models() override
@@ -382,16 +394,23 @@ class ClaudeAdapter(Adapter):
                 "which is archived into artifacts and inlined into report.md.")
         servers: dict[str, Any] = {}
         for name, s in opts.mcp_servers.items():
-            if s.is_stdio:
-                entry: dict[str, Any] = {"command": s.command}
+            if s.tools is not None:
+                # GATED: claude is handed the PROXY as if it were the server, and never learns
+                # the real command. The allowlist is applied to the wire by a program this
+                # harness owns (§10), which is the only arrangement in which "the agent could
+                # only call these tools" is a statement about what happened rather than about
+                # what a CLI flag was asked to do.
+                entry = self._write_proxy_config(name, s, opts.mcp_scratch_dir)
+            elif s.is_stdio:
+                entry = {"command": s.command}
                 if s.args:
                     entry["args"] = list(s.args)
                 if s.env:
                     entry["env"] = dict(s.env)
             else:
                 # `type` is claude's transport discriminator; `http` and `sse` are the two
-                # documented values (§2 — this half is still INFERRED, unlike the stdio
-                # shape which is verified live against fixtures/echo_mcp_server.py).
+                # documented values (§2 — verified live against fixtures/http_mcp_server.py
+                # by §9 probe #1: the shape is accepted and declared headers arrive).
                 entry = {"type": s.transport, "url": s.url}
                 if s.headers:
                     entry["headers"] = dict(s.headers)
@@ -404,6 +423,97 @@ class ClaudeAdapter(Adapter):
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump({"mcpServers": servers}, fh)
         return path
+
+    @staticmethod
+    def audit_log_path(scratch_dir: str, name: str) -> str:
+        """Where the proxy for `name` writes its audit log, and where `verify_post_run` reads
+        it. ONE function, because a writer and a reader that each build the path themselves
+        agree until one of them is edited — and a log the reader cannot find is `no_instances`,
+        which is a FAILED cell reported as an unproven one (§4)."""
+        return os.path.join(scratch_dir, f"mcp-audit-{name}.jsonl")
+
+    def _write_proxy_config(self, name: str, s: Any, scratch_dir: str) -> dict[str, Any]:
+        """Materialize the proxy's own config for one gated server; return the `mcpServers`
+        entry that launches it.
+
+        THE CREDENTIALS MOVE OUT OF `mcp.json` AND INTO THIS FILE, which is the same class of
+        secret in the same 0600 scratch dir — but the entry claude reads now names only two
+        paths, so a gated server's interpolated `env` is one file further from anything the
+        CLI echoes back. Both files die with the scratch dir.
+
+        THE SERVER NAME BECOMES PART OF A FILENAME, so it is checked against the schema's own
+        regex rather than trusted. `mcp._NAME_RE` is IMPORTED, not restated: a copy would be a
+        second opinion about what a name may contain, and the one that matters is the one the
+        parser enforced (§4). Today it admits no separator and no `..`, so this cannot escape
+        the scratch dir — the check is what keeps that true if the schema ever widens.
+        """
+        if not _NAME_RE.match(name):
+            raise RuntimeError(
+                f"claude: MCP server name {name!r} is not one the schema admits, and it is "
+                "about to become a filename in the scratch dir. Refusing rather than writing "
+                "a path this name could have chosen.")
+        cfg_path = os.path.join(scratch_dir, f"mcp-proxy-{name}.json")
+        config = {
+            "server": name,
+            "command": s.command,
+            "args": list(s.args or ()),
+            "env": dict(s.env or {}),
+            "tools": sorted(s.tools),
+            "audit_log": self.audit_log_path(scratch_dir, name),
+        }
+        # 0600 from the start, for the reason `mcp.json` is: this one carries the interpolated
+        # `env`, so a writable-then-chmod'ed file has a window where it is world-readable.
+        fd = os.open(cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(config, fh)
+        # `sys.executable`, not "python": the proxy is part of this harness and must run on
+        # the interpreter the harness is running on, whatever venv that is. It is spawned as a
+        # plain script rather than `-m`, which is what `mcp_proxy_io.py`'s own sys.path
+        # bootstrap is for and what `tools/verify_mcp_proxy.py` already drives it as.
+        return {"command": sys.executable, "args": [_PROXY_PATH, cfg_path]}
+
+    def gating_failure(self, opts: RunOptions) -> str | None:
+        """The reason this run's tool gating cannot be called clean, or None.
+
+        A FUNCTION, not an `if` inside `verify_post_run`, so it can be driven on a written log
+        rather than only by a live claude — the same argument §4 makes about a probe's
+        classifier. `log_verdict` never raises, and neither does this: a traceback out of
+        `verify_post_run` is not a failed cell, it is an ABSENT verdict, which is the outcome
+        the whole audit exists to make impossible.
+
+        FAIL-CLOSED ON A MISSING LOG, and that is the case worth stating. A gated server whose
+        proxy wrote nothing means the gating never happened — indistinguishable, from here,
+        from a proxy that was never started at all. `log_verdict` reports it as `no_instances`
+        rather than as a vacuous pass for exactly that reason (§10.5.1), and this must not
+        soften it back into one.
+        """
+        scratch = getattr(opts, "mcp_scratch_dir", None)
+        gated = {n: s for n, s in (getattr(opts, "mcp_servers", None) or {}).items()
+                 if getattr(s, "tools", None) is not None}
+        if not gated:
+            return None
+        if not scratch:
+            return ("claude: MCP server(s) " + ", ".join(sorted(gated)) + " declared `tools:`, "
+                    "but this run has no scratch dir, so the proxy's audit log cannot be "
+                    "found. The allowlist cannot be shown to have applied; failing closed.")
+        for name in sorted(gated):
+            try:
+                with open(self.audit_log_path(scratch, name), encoding="utf-8") as handle:
+                    text = handle.read()
+            except OSError:
+                text = ""          # judged as `no_instances` below, not excused
+            verdict = mcp_audit.log_verdict(
+                text, server=name, allowed=frozenset(gated[name].tools))
+            if not verdict.clean:
+                detail = ", ".join(verdict.problems) or ", ".join(
+                    str(v.anomalous or v.problems) for v in verdict.unclean)
+                return (f"claude: the tool gating for MCP server {name!r} did not hold: "
+                        f"{detail}. The proxy is what applies `tools:`, so a run whose audit "
+                        "log is missing, unreadable or anomalous is a run whose allowlist "
+                        "cannot be shown to have been enforced — which is a failed cell, not "
+                        "a warning. If this cell also failed for another reason, that reason "
+                        "came first and this check is reporting only what the log can show.")
+        return None
 
     def validate_mcp_support(self, mcp_servers: dict) -> tuple[list[str], list[str]]:
         errors, warnings = super().validate_mcp_support(mcp_servers)
@@ -496,6 +606,15 @@ class ClaudeAdapter(Adapter):
                 "config planted inside the launch window and reverted before exit would — "
                 "but the run itself was not MCP-hermetic."
             )
+        # THE GATING, judged from the proxy's own log. Placed after the undeclared-server
+        # check and before the warnings, because the two raises answer different questions and
+        # one is broader: `undeclared` asks whether something got IN that was never declared,
+        # this asks whether what was declared stayed inside its allowlist. A leak is the wider
+        # failure and is reported first. Both are raises rather than warnings — an allowlist
+        # that cannot be shown to have applied is the case `tools:` exists to prevent.
+        gating = self.gating_failure(opts)
+        if gating:
+            raise RuntimeError(gating)
         # A DECLARED server that is missing from the witness is not a hermeticity failure
         # (nothing leaked) and is not silently fine either: the scenario asked for a tool
         # surface it did not get, so assertions about it will fail confusingly. Surfaced as

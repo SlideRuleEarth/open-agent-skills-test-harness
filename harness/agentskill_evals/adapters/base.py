@@ -600,10 +600,20 @@ class Adapter(ABC):
     # How `tools:` on a declared server is enforced here:
     #   "native"     — a hard CLI filter (codex enabled_tools, copilot per-server tools)
     #   "complement" — deny-the-rest, bounded by what enumeration saw (claude, §6-C2)
+    #   "proxy"      — the HARNESS filters, by putting `mcp_proxy_io.py` between the CLI and
+    #                  the declared server (C3, §10). The CLI needs no mechanism of its own
+    #                  and is not trusted to have one; the allowlist is applied to the wire.
     #   "none"       — no mechanism exists in this CLI (antigravity)
     #   "unbuilt"    — a mechanism exists but this harness has not implemented it yet
-    # Anything other than "native"/"complement" means `tools:` cannot be honoured, and the
-    # validator refuses it rather than accepting a filter that would quietly not apply.
+    # Anything outside the ENFORCING set means `tools:` cannot be honoured, and the validator
+    # refuses it rather than accepting a filter that would quietly not apply.
+    #
+    # The set is named rather than spelled out at the one site that tests it, because the
+    # question "is this value an enforcement?" is asked by the validator and answered by each
+    # adapter's class attribute — two places that must agree about a vocabulary. A literal
+    # tuple inside the `if` was that agreement written down once and consulted once, which is
+    # how a fourth value gets added and silently refuses every gated server (review, PR #106).
+    ENFORCING_TOOL_FILTERS = frozenset({"native", "complement", "proxy"})
     mcp_tool_filter = "none"
 
     def validate_mcp_support(self, mcp_servers: dict) -> tuple[list[str], list[str]]:
@@ -629,7 +639,7 @@ class Adapter(ABC):
                 "them, or remove `mcp_servers:`.")
             return errors, warnings
         gated = sorted(n for n, s in mcp_servers.items() if getattr(s, "tools", None) is not None)
-        if gated and self.mcp_tool_filter not in ("native", "complement"):
+        if gated and self.mcp_tool_filter not in self.ENFORCING_TOOL_FILTERS:
             detail = {
                 "none": (f"{self.name} has no tool-filtering mechanism at all"),
                 "unbuilt": (f"tool filtering on {self.name} is not implemented in this "
