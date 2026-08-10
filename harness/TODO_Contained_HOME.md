@@ -1181,6 +1181,29 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   normal", an argument quantifying over **every** server-side MUST in the binding — so
   honouring it meant sweeping the rest and finding this one, rather than waiting to be told.
   What the note says now is what is served, what is not, and which list each item is on.
+- **AN OBSERVATION WINDOW EQUAL TO THE SUBJECT'S LIFETIME DECIDES NOTHING, AND IT LOOKS LIKE
+  FLAKINESS.** The orphan case asks whether a credential-bearing child is still alive after its
+  proxy was `SIGKILL`ed. The child was told to linger `30` seconds; `at_eof` was given
+  `DEADLINE`, which is `30.0`. Same number. So the child exits on its own at the exact moment
+  the checker stops waiting for it, and which one happens first is scheduling noise — the check
+  reddened on an idle machine and went **green under full-suite load, over a proxy that had
+  swept nothing.** M289 was reported `CAUGHT` alone and "failed, but NOT via" about one full run
+  in four, which reads as an unreliable mutation and is really an instrument that cannot answer
+  the question it was asked.
+  §4 already had "a bound belongs to the step that owns the wait" for two timers that disagree;
+  this is the degenerate case where they are the SAME timer, and it has no safe side — the
+  failure direction is a check going green over the defect it exists to catch. The linger is now
+  `DEADLINE * 3`, **derived** rather than a literal that happens to differ, and it costs nothing
+  on the green path because a working guardian sweeps the child immediately; the linger is only
+  ever reached when the sweep did not happen, which is the defect. Verified by manufacturing the
+  condition — every core saturated — and watching the named arm redden twice where it used to
+  flip.
+  Two things generalize. **A test whose result depends on which of two equal timers wins is not
+  intermittent, it is undefined**, and calling it flaky is what stops anyone looking. And the
+  first diagnosis was wrong in an instructive way: the two checks that reddened instead looked
+  like a second defence masking the first (the M53 pattern), and the fix that follows from that
+  reading — make the mutation remove both — would have left the real defect in place. Producing
+  the condition on purpose is what separated them, and it took one run to do.
 - **A PIPELINE'S EXIT STATUS IS THE LAST COMMAND'S, AND `| tail` IS THE LAST COMMAND.** Four
   rounds of `python3 -u tools/mutate_mcp.py 2>&1 | tail -14` reported "exit code 0" — `tail`'s,
   every time. The run that finally mattered returned **1** with `320/322` and was announced as

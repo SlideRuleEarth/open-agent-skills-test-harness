@@ -991,12 +991,26 @@ def orphan_case(*, kill: bool):
     lingers — so its process group is still there when the proxy goes away. What happens next
     is the whole case: a proxy that ran its teardown terminated the group itself, and one that
     was SIGKILLed never got to, which is what the guardian is for.
+
+    THE LINGER MUST OUTLAST THE OBSERVATION WINDOW, AND IT IS DERIVED SO IT CANNOT DRIFT BACK.
+    It was the literal `30` while `DEADLINE` is `30.0`: the child exits on its own at the same
+    moment `at_eof` stops waiting for it, so "the group is still alive" was decided by
+    scheduling noise. On an idle machine the check reddened; under full-suite load the child
+    won the race, the channel reached EOF, and the check went GREEN over a proxy that had
+    swept nothing — which is how M289 came back "failed, but NOT via" roughly one run in four
+    while being CAUGHT every time it was run alone.
+    §4 already has this as "two timers over one wait always disagree about something"; here
+    they were the SAME timer, which is the version with no safe side. The check needs the
+    child's survival to be unambiguous for the whole window it looks at, so the linger is a
+    multiple of `DEADLINE` rather than a number that happens to equal it. It costs nothing on
+    the green path — a working guardian sweeps the child immediately and `at_eof` returns at
+    once; the linger is only ever reached when the sweep did NOT happen, which is the defect.
     """
     nonce = uuid.uuid4().hex
     channel = Channel("orphan")
     found = run(args=[TARGET], tools=("alpha",), server="target", channels=(channel,),
                 env={"PT_NONCE": nonce, "PT_CHILD_FD": str(channel.writer),
-                     "PT_IGNORE_TERM": "1", "PT_LINGER": "30"},
+                     "PT_IGNORE_TERM": "1", "PT_LINGER": str(int(DEADLINE * 3))},
                 kill_after=0.0 if kill else None, settle=0.6)
     return nonce, channel, found
 
