@@ -293,7 +293,7 @@ harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N ar
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
 python3 -u harness/tools/mutate_mcp.py                        # 311/311 production + 2/2 instrument + 35/35 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 323 checks
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 322 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 77 here
 git diff --check
 
@@ -1194,6 +1194,19 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   write the misbehaving client. And **a justification that lists what a change buys and not
   what it spends is not a justification** — the first rule in `CLAUDE.md` in its other
   direction, since the argument for the reorder never mentioned refusals.
+- **AN ASSERTION MUST BE ABLE TO FAIL FOR THE REASON IT NAMES — AND ONLY FOR THAT REASON.**
+  §4's standing rule is that every assertion must be able to fail. Its dual arrived with the
+  raw-socket case above: beside "the 403 arrived" I added "and it arrived within four seconds",
+  which could not fail for the reason it named, because the socket's own five-second deadline
+  already bounds the answer — a server reading the body first is still blocked when that expires
+  and returns no status line at all, so the first check has the coverage. What remained was a
+  check that could fail **only** for a reason it was not about: the host pausing the process.
+  Zero coverage, non-zero flakiness. I had flagged it as *possibly flaky* and stopped there
+  rather than asking the next question, which is the one that settles it: **name the defect this
+  assertion catches that its neighbour does not.** If there is none, the assertion is a false
+  failure waiting for a loaded machine. Wall-clock thresholds are where this concentrates, since
+  a bound is usually already enforced somewhere by a timeout; keep the elapsed time as DETAIL,
+  which explains a red check without being able to cause one.
 - **THE CHECK CLOSING A FINDING WAS ANSWERED BY A DIFFERENT REQUEST — the recurring one, in
   the fix for the entry above.** "A refused request is still recorded" asked only whether some
   row carried the rejected origin. `do_GET` records before it refuses, by a different line, so

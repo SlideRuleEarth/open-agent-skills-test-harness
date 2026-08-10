@@ -1509,11 +1509,16 @@ with _Remote() as _rm:
         _line, _secs, _closed = _rm.promise_a_body(
             "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://evil.example\r\n"
             "Content-Type: application/json\r\nContent-Length: 50000000\r\n\r\n")
+        # THE SOCKET'S DEADLINE IS THE BOUND, so arriving at all is the whole assertion — a
+        # server that reads the body first is still blocked in `rfile.read` when that deadline
+        # expires, and returns no status line to start with. A separate `elapsed < 4.0` check
+        # stood here briefly and was deleted: it could not fail for the reason it named, only
+        # for one it did not — the host pausing this process — which is a false failure with no
+        # coverage attached (review, PR #106). Elapsed stays as DETAIL, where it explains a red
+        # check without being able to cause one.
         check("a cross-origin POST is refused WITHOUT its body — 403 arrives though the "
               "declared 50MB never does",
               _line.startswith("HTTP/1.1 403"), (_line, f"{_secs:.2f}s"))
-        check("...promptly, rather than after a wait for bytes that are not coming",
-              _secs < 4.0, f"{_secs:.2f}s")
         check("...and the connection is CLOSED, since an unread body has desynchronized it",
               _closed, (_line, _closed))
         # `_record` on the POST refusal path is what keeps this true; without it the credential
