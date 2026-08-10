@@ -30,14 +30,19 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import queue
+import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURES = os.path.join(os.path.dirname(HERE), "fixtures")
@@ -903,6 +908,13 @@ from agentskill_evals.mcp_proxy import classify_envelope  # noqa: E402
 
 sys.path.insert(0, FIXTURES)
 import probe_era_mcp_server as SHIM_MOD  # noqa: E402
+# The HTTP fixture serves the stdio one's tools by IMPORTING them; this reads the same
+# module so "they match" is checked against the definition rather than against a copy.
+import echo_mcp_server as ECHO_MOD  # noqa: E402
+# The endpoint paths come FROM the fixture: a verifier that retyped them would still
+# pass if the fixture moved its endpoint, which is the one thing these path checks are for.
+from http_mcp_server import PATH_SSE as PATH_SSE_T  # noqa: E402
+from http_mcp_server import PATH_STREAMABLE as PATH_STREAMABLE_T  # noqa: E402
 
 # The shim cannot import the proxy — CLIs spawn it with only the stdlib reachable — so it
 # carries its own copy of the rule. A copy that could drift silently is worse than the
@@ -1237,6 +1249,527 @@ check("the shim's RequestId rule matches the proxy's",
           for v in (1, 1.0, 0, -0.0, "1", "", True, False, None, 2**70, -5, 1.5)),
       [(v, SHIM_MOD._valid_request_id(v), P_valid(v))
        for v in (1, 1.0, 0, -0.0, "1", "", True, False, None, 2**70, -5, 1.5)])
+
+print()
+print("E16. http_mcp_server.py: the two REMOTE transports, and the header question §9 "
+      "probe #1 could not answer without a server")
+
+# WHY THIS FIXTURE IS DRIVEN HERE and not left to the live probe: the live probe costs an API
+# call and needs `claude` installed, so it runs when someone asks (`tools/probe_remote_mcp.py`).
+# This runs in every suite, offline, and is what keeps the fixture trustworthy in between —
+# the C3-1 lesson, where an instrument's own defect changed a published measurement (§9).
+#
+# IT NEEDS TO BIND A TCP SOCKET, which §4 warns about: an instrument that needs a privilege is
+# an instrument some reviewer cannot run, and a sandbox denying `bind()` is exactly where the
+# proxy verifier's loopback case had to be redesigned. This one cannot be redesigned out of it
+# — HTTP is the thing under test — so the obligation is different: it must FAIL BY NAME, with
+# the fixture's own stderr attached, never hang and never crash the suite (review, PR #106).
+
+
+class _Remote:
+    """The fixture under a context manager, because a leaked HTTP server is a leaked port.
+
+    Reaped on every exit path, INCLUDING a failed `__enter__` — which never reaches `__exit__`,
+    so a process started there and abandoned is leaked with no one to notice. §4's incident was
+    a test tool leaving processes behind; a server holding a port is the version of that which
+    fails the next run rather than this one.
+    """
+
+    def __enter__(self):
+        self.receipts = tempfile.mkdtemp(prefix="http-mcp-")
+        self.path = os.path.join(self.receipts, "receipts.jsonl")
+        self.info, self.failure = {}, ""
+        self.proc = subprocess.Popen(
+            [sys.executable, os.path.join(FIXTURES, "http_mcp_server.py")],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            # Cleared then set, for the reason `run()` gives: an ambient export must not be
+            # able to change what these checks measure. An allowlisted origin in the
+            # environment would silently disarm the Origin checks below.
+            env={**os.environ, "HTTP_MCP_RECEIPTS": self.path,
+                 "HTTP_MCP_ALLOWED_ORIGINS": ""})
+        q = queue.Queue()
+        threading.Thread(target=_pump, args=(self.proc.stdout, q), daemon=True).start()
+        line = _readline(q, time.monotonic() + DEADLINE)
+        if not line:
+            self.proc.kill()
+            self.proc.wait(timeout=DEADLINE)
+            err = (self.proc.stderr.read() or b"").decode(errors="replace").strip()
+            shutil.rmtree(self.receipts, ignore_errors=True)
+            # THE LAST LINE, not a tail of bytes. A traceback's final line is the exception,
+            # and `check()` truncates the detail to 300 characters — so a 400-byte tail gets
+            # cut in the printer and shows the traceback's MIDDLE, which names a frame instead
+            # of a cause. The whole reason for keeping stderr is to say "Operation not
+            # permitted" out loud; a diagnostic that survives to the terminal in a useless
+            # form is the same defect as no diagnostic (review, PR #106).
+            lines = [x for x in err.splitlines() if x.strip()]
+            self.failure = ("the fixture announced no port within the deadline"
+                            + (f"; it died with: {lines[-1].strip()}" if lines
+                               else ", and said nothing on stderr either"))
+        else:
+            try:
+                self.info = json.loads(line)
+            except ValueError:
+                self.failure = f"the port announcement was not JSON: {line[:200]!r}"
+        return self
+
+    def __exit__(self, *exc):
+        self.proc.kill()
+        self.proc.wait(timeout=DEADLINE)
+        shutil.rmtree(self.receipts, ignore_errors=True)
+
+    @property
+    def up(self) -> bool:
+        return bool(self.info.get("port"))
+
+    def url(self, path=""):
+        return f"http://127.0.0.1:{self.info['port']}{path}" if path else self.info["streamable"]
+
+    def rpc(self, msg, headers=None, url=None):
+        """One JSON-RPC POST. Returns (status, headers, body) — or the HTTP error's status."""
+        req = urllib.request.Request(
+            url or self.info["streamable"], data=json.dumps(msg).encode(),
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream", **(headers or {})})
+        try:
+            with urllib.request.urlopen(req, timeout=DEADLINE) as r:
+                body = r.read()
+                return r.status, dict(r.headers), (json.loads(body) if body else None)
+        except urllib.error.HTTPError as exc:
+            return exc.code, dict(exc.headers), None
+
+    def get(self, path, headers=None):
+        req = urllib.request.Request(self.url(path), headers=headers or {}, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=DEADLINE) as r:
+                return r.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    def rows(self, kind=None):
+        if not os.path.exists(self.path):
+            return []
+        out = [json.loads(x) for x in open(self.path, encoding="utf-8") if x.strip()]
+        return [r for r in out if kind is None or r["kind"] == kind]
+
+    def promise_a_body(self, headers: str, declared: int = 50_000_000, bound=5.0):
+        """Send a request that DECLARES a large body and never sends it. Returns
+        (status_line, elapsed, closed) — with `status_line` empty if nothing came back.
+
+        HAND-WRITTEN OVER A RAW SOCKET because `urllib` cannot express this: it writes the
+        body it declares. The case is the whole question of ordering — a server that validates
+        `Origin` only after reading the body will sit in `rfile.read(declared)` waiting for
+        bytes that never arrive, so the discriminator is whether an answer comes back AT ALL
+        within a bound, not what the answer says (review, PR #106).
+        """
+        sock = socket.create_connection(("127.0.0.1", self.info["port"]), timeout=bound)
+        try:
+            started = time.monotonic()
+            sock.sendall(headers.encode())          # headers and the blank line; NO body
+            got, closed = b"", False
+            try:
+                while b"\r\n\r\n" not in got:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    got += chunk
+                # A refusal must also END the connection: an unread body has desynchronized
+                # it, so anything after this response would be read as a new request.
+                closed = sock.recv(4096) == b""
+            except (TimeoutError, OSError):
+                pass
+            elapsed = time.monotonic() - started
+            return got.split(b"\r\n", 1)[0].decode(errors="replace"), elapsed, closed
+        finally:
+            sock.close()
+
+
+def dig(obj, *path, default=None):
+    """Walk `path` through nested dicts/lists, returning `default` at the first miss.
+
+    THE CHECKS BELOW ASSERT THINGS ABOUT A POSSIBLY-BROKEN FIXTURE, so indexing its replies
+    directly is where a defect turns into a traceback instead of a red check — which is the
+    exact failure the startup path was fixed for, one level in. It surfaced as a mutation that
+    denied every request: `initialize` returned no body, `_init["result"]` raised, and the
+    suite reported ONE failure where the block should have reported several (review, PR #106).
+    A verifier that crashes on the defect it exists to detect reports less than one that says
+    nothing.
+    """
+    cur = obj
+    for key in path:
+        try:
+            cur = cur[key]
+        except (KeyError, IndexError, TypeError):
+            return default
+    return cur
+
+
+with _Remote() as _rm:
+    # THE INSTRUMENT'S OWN LIVENESS IS CHECK ONE and everything else is inside its `if`. Not a
+    # skip — this reddens — because a suite that quietly ran fewer checks reports the same
+    # "ALL PASS" as one that ran them all. (The third result state that would let this be an
+    # honest SKIP is a backlog item, not something to invent here.)
+    check("the fixture announces the port it actually bound",
+          _rm.up and _rm.info.get("streamable", "").endswith("/mcp"),
+          _rm.failure or _rm.info)
+
+    if _rm.up:
+        # THE WITNESS SAYS SOMETHING POSITIVE BEFORE ITS SILENCE IS EVIDENCE. Every header
+        # check below reads "no such header in any row" as a finding; an unwired receipts
+        # file, a server that never started, and a server that received nothing all produce
+        # exactly that. The startup row separates them (§4).
+        check("...and the receipts witness records its own startup, so silence is readable",
+              [r["kind"] for r in _rm.rows()][:1] == ["listening"], _rm.rows())
+
+        _s, _h, _init = _rm.rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                 "params": {"protocolVersion": "2025-11-25",
+                                            "capabilities": {}}},
+                                {"Authorization": "Bearer FIXTURE_SENTINEL"})
+        check("streamable HTTP answers `initialize` in the POST's own response",
+              _s == 200 and dig(_init, "result", "protocolVersion") == "2025-11-25", (_s, _init))
+        # NO SESSION IS ADVERTISED, because none is kept. Issuing an id nothing checks is
+        # worse than issuing none: it tells a client the id is honoured, and this fixture
+        # answered a wrong id exactly like a right one (review, PR #106).
+        check("...and advertises NO session id, because it keeps no session state",
+              "Mcp-Session-Id" not in _h, sorted(_h))
+
+        _s, _, _tl = _rm.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        check("...and serves the SAME tools as the stdio fixture, because it imports them",
+              [t.get("name") for t in (dig(_tl, "result", "tools", default=[]) or [])]
+              == [t["name"] for t in ECHO_MOD.TOOLS], _tl)
+
+        _s, _, _call = _rm.rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                                "params": {"name": "echo", "arguments": {"text": "over http"}}})
+        check("...and calls a tool",
+              dig(_call, "result", "content", 0, "text") == "over http", _call)
+
+        # THE QUESTION THE FIXTURE EXISTS FOR, answered from the only place it is answerable:
+        # what the server RECEIVED, not what the client believes it sent.
+        _reqs = _rm.rows("request")
+        _auth = [r["headers"].get("authorization") for r in _reqs]
+        check("a declared header ARRIVES, with its value intact — §9 probe #1's real question",
+              "Bearer FIXTURE_SENTINEL" in _auth, _auth)
+        check("...and a request sent without one records its absence, so the check can fail",
+              None in _auth, _auth)
+
+        # THE OTHER HALF OF THE WITNESS, and the half a LIVE probe cannot do without. Its
+        # "the model called the tool" check reads the model's final text, and the text it
+        # looks for was handed to the model in the prompt — so a client that advertised the
+        # tools and never invoked one passed by repeating itself (review, PR #106). Only the
+        # server can distinguish those, and only if it records the call rather than just the
+        # HTTP request carrying it. `id` 3 is the `tools/call` above.
+        _rpc = [{k: r.get(k) for k in ("method", "id", "tool")} for r in _rm.rows("rpc")]
+        check("the witness records the CALL ITSELF, so 'the tool ran' and 'the model repeated "
+              "its prompt' stop looking alike",
+              {"method": "tools/call", "id": 3, "tool": "echo"} in _rpc, _rpc)
+        # Without this the field could be the constant "echo" and the check above would still
+        # pass — an identifier that names everything identifies nothing.
+        _named = {r["tool"] for r in _rpc if r["method"] == "tools/list"}
+        check("...and a message that is NOT a tool call records no tool name, so the field "
+              "tells them apart",
+              _named == {None}, _rpc)
+
+        # THE HEADER ROW MUST NAME THE MESSAGE IT CARRIED, or every header question can only be
+        # asked of the run as a whole — and one of them is per-message, since `initialize`
+        # precedes the negotiation `MCP-Protocol-Version` reports. Correlation by adjacency
+        # against the `rpc` rows would be unsound here: this is a threading server (PR #106).
+        _carried = [(r.get("rpc"), r["headers"].get("authorization")) for r in _reqs]
+        check("a request row names the message it carried, on the same row as its headers",
+              ("initialize", "Bearer FIXTURE_SENTINEL") in _carried, _carried)
+        check("...and a request carrying a DIFFERENT method records that one, so the field is "
+              "not the same word every time",
+              ("tools/call", None) in _carried, _carried)
+
+        check("an unroutable method is an error, not a hang",
+              dig(_rm.rpc({"jsonrpc": "2.0", "id": 4, "method": "no/such"}),
+                  2, "error", "code") == -32601)
+        _s, _, _body = _rm.rpc({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        check("...and a NOTIFICATION is accepted with no answer at all",
+              _s == 202 and _body is None, (_s, _body))
+
+        # ORIGIN VALIDATION IS A TRANSPORT-LEVEL MUST and this server is the case it was
+        # written for: it listens on loopback while a model runs, so any page the user's
+        # browser is on can reach it cross-origin unless the server refuses. A fixture more
+        # permissive than the spec teaches the harness that a permissive server is normal.
+        check("a cross-origin POST is refused 403 — the transport's DNS-rebinding MUST",
+              _rm.rpc({"jsonrpc": "2.0", "id": 5, "method": "ping"},
+                      {"Origin": "https://evil.example"})[0] == 403)
+        check("...and a cross-origin GET on the SSE endpoint is refused too, not just POST",
+              _rm.get(PATH_SSE_T, {"Origin": "https://evil.example"}) == 403)
+        # The control: without it, a fixture that refused EVERYTHING would score full marks on
+        # both checks above — "rejects everything passes" is the defect §10.9 spends a case on.
+        check("...while a request with no Origin at all is served, as a non-browser client",
+              _rm.rpc({"jsonrpc": "2.0", "id": 6, "method": "ping"})[0] == 200)
+
+        # THE REFUSAL MUST COST THE REFUSED CALLER MORE THAN IT COSTS THIS SERVER, and that is
+        # a property of ORDER, which the three checks above cannot see: they send bodies, so a
+        # server reading the body first still answers 403 and passes all of them. A revision
+        # that read first — to put the message's method on the receipt row — let a rejected
+        # cross-origin caller name a `Content-Length` of its choosing, or pin the handler open
+        # by declaring a body and sending none (review, PR #106).
+        _line, _secs, _closed = _rm.promise_a_body(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://evil.example\r\n"
+            "Content-Type: application/json\r\nContent-Length: 50000000\r\n\r\n")
+        # THE SOCKET'S DEADLINE IS THE BOUND, so arriving at all is the whole assertion — a
+        # server that reads the body first is still blocked in `rfile.read` when that deadline
+        # expires, and returns no status line to start with. A separate `elapsed < 4.0` check
+        # stood here briefly and was deleted: it could not fail for the reason it named, only
+        # for one it did not — the host pausing this process — which is a false failure with no
+        # coverage attached (review, PR #106). Elapsed stays as DETAIL, where it explains a red
+        # check without being able to cause one.
+        check("a cross-origin POST is refused WITHOUT its body — 403 arrives though the "
+              "declared 50MB never does",
+              _line.startswith("HTTP/1.1 403"), (_line, f"{_secs:.2f}s"))
+        check("...and the connection is CLOSED, since an unread body has desynchronized it",
+              _closed, (_line, _closed))
+        # `_record` on the POST refusal path is what keeps this true; without it the credential
+        # question goes unanswered for exactly the requests most worth asking it about.
+        #
+        # THE VERB IS PART OF THE ASSERTION, and leaving it out made this pass over its own
+        # mutation. `do_GET` records before it refuses, by a different line — so a cross-origin
+        # GET above put an `evil.example` row in the file, and a check that asked only "is there
+        # such a row" was answered by a request it was not about. §4's recurring one, in the
+        # check written to close a finding about ordering (F35, caught by its own mutation).
+        check("...while the refused POST is still RECORDED, so a credential sent to a rejected "
+              "origin is not invisible",
+              any(r["method"] == "POST" and r["headers"].get("origin") == "https://evil.example"
+                  for r in _rm.rows("request")),
+              [(r["method"], r["headers"].get("origin")) for r in _rm.rows("request")])
+
+        # THE BINDING'S OTHER MUST, found by asking what else the Origin argument covered
+        # rather than by it being reported: `2025-11-25` requires 400 for a protocol version
+        # the server does not support, and the scope note used to file that header under
+        # MODERN additions while claiming legacy conformance (review, PR #106).
+        check("an unsupported MCP-Protocol-Version is refused 400 — the binding's other MUST",
+              _rm.rpc({"jsonrpc": "2.0", "id": 11, "method": "ping"},
+                      {"MCP-Protocol-Version": "1999-01-01"})[0] == 400)
+        # THE CONTROL, and simultaneously the pin: `_initialize` selects out of this same
+        # tuple, so a version list narrower than it would 400 a version the server itself had
+        # just negotiated. Driving EVERY member is what makes a later narrowing fail here
+        # instead of intermittently against a real client.
+        _served = {v: _rm.rpc({"jsonrpc": "2.0", "id": 12, "method": "ping"},
+                              {"MCP-Protocol-Version": v})[0] for v in ECHO_MOD.LEGACY_VERSIONS}
+        check("...while EVERY version `initialize` can negotiate is served, so the set it is "
+              "checked against cannot narrow away from the set it is chosen from",
+              bool(_served) and set(_served.values()) == {200}, _served)
+        check("...and an absent header is served too, because `initialize` itself carries none",
+              _rm.rpc({"jsonrpc": "2.0", "id": 13, "method": "ping"})[0] == 200)
+
+        # EXACTLY THE CONFIGURED PATH. `/definitely-not-mcp` used to be served, so a config
+        # whose URL had been mangled still reached a working server and the probe that was
+        # meant to prove the URL correct proved nothing about it (review, PR #106).
+        check("a POST to a path that is not the endpoint is 404, not quietly served",
+              _rm.rpc({"jsonrpc": "2.0", "id": 7, "method": "ping"},
+                      url=_rm.url("/definitely-not-mcp"))[0] == 404)
+        check("...and a prefix of the endpoint is not the endpoint either",
+              _rm.rpc({"jsonrpc": "2.0", "id": 8, "method": "ping"},
+                      url=_rm.url("/mcp-anything"))[0] == 404)
+
+        # The streamable endpoint declines a server->client stream, which the transport
+        # permits explicitly. Asserted rather than assumed: a fixture that opened an idle
+        # stream would add a shutdown path nothing here drives.
+        check("GET on the streamable endpoint is refused 405, as the transport allows",
+              _rm.get(PATH_STREAMABLE_T) == 405)
+
+# THE LEGACY SSE TRANSPORT IS A DIFFERENT PROTOCOL, not a different spelling, and this is the
+# check that says so: the reply to a POST does NOT come back in that POST's response. A fixture
+# that answered in place would satisfy a client that had never implemented SSE.
+with _Remote() as _rm2:
+    check("the SSE fixture starts too", _rm2.up, _rm2.failure)
+    if _rm2.up:
+        _events, _endpoint = [], []
+
+        def _read_stream(rm=None, events=None, endpoint=None):
+            req = urllib.request.Request(rm.info["sse"], headers={"Accept": "text/event-stream"})
+            name = None
+            with urllib.request.urlopen(req, timeout=DEADLINE) as r:
+                for raw in r:
+                    line = raw.decode().rstrip("\n")
+                    if line.startswith("event: "):
+                        name = line[7:]
+                    elif line.startswith("data: "):
+                        if name == "endpoint":
+                            endpoint.append(line[6:])
+                            name = None
+                        else:
+                            events.append(json.loads(line[6:]))
+                            return
+
+        _t = threading.Thread(target=_read_stream,
+                              kwargs={"rm": _rm2, "events": _events, "endpoint": _endpoint},
+                              daemon=True)
+        _t.start()
+        _deadline = time.monotonic() + DEADLINE
+        while not _endpoint and time.monotonic() < _deadline:
+            time.sleep(0.05)
+        check("the SSE stream's FIRST event names the endpoint to POST to",
+              bool(_endpoint) and _endpoint[0].startswith("/messages?sessionId="), _endpoint)
+        if _endpoint:
+            _s, _, _body = _rm2.rpc({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                     "params": {"name": "add", "arguments": {"a": 2, "b": 3}}},
+                                    url=_rm2.url(_endpoint[0]))
+            check("...a POST there is answered 202, with the reply NOT in its response",
+                  _s == 202 and _body is None, (_s, _body))
+            _t.join(timeout=DEADLINE)
+            check("...and the reply arrives on the stream the client is still holding",
+                  dig(_events, 0, "result", "content", 0, "text") == "5", _events)
+        # A POST naming a session nobody opened has nowhere to deliver a reply, and 202 would
+        # strand it silently.
+        check("...while a POST for an unopened session is 404, not a silently stranded 202",
+              _rm2.rpc({"jsonrpc": "2.0", "id": 10, "method": "ping"},
+                       url=_rm2.url("/messages?sessionId=nosuch"))[0] == 404)
+        check("...and a prefix of the SSE path is not the SSE path",
+              _rm2.get("/sse-anything") == 405)
+
+print()
+print("E17. mutate_mcp.py's own readers, driven without paying for a 63-minute run")
+
+# WHY THE RUNNER IS UNDER TEST HERE. It is the instrument every "N/N caught" claim rests on,
+# and until now nothing executed its suite-reading code except a full run — so a change to the
+# record those readers share broke `run()` for BOTH verifier suites, shipped, and was found by
+# hand-driving the tool rather than by any check (review, PR #106). An instrument exercised
+# only by its slowest path is one whose breakage is discovered late by construction; §4 makes
+# this point about probes and it is no weaker about the thing that scores them.
+#
+# `mutate_mcp` is importable from here — same directory — so these drive the real functions.
+# A check that restated their logic could not disagree with them, which is the whole failure
+# mode being closed (§4's duplicated-rule rule, satisfied by import).
+import mutate_mcp as MUT  # noqa: E402 — a section-local import, beside the checks that use it
+
+
+def survives(fn, *a, **k):
+    """`fn`'s value, or the exception it raised — never the exception itself.
+
+    `dig` one level out, and for the same reason. The defect these checks exist to catch
+    RAISES rather than returning something wrong: the mis-unpack was a `ValueError`, and a bad
+    parser is a `re.error`. Evaluated inside a `check(...)` argument either of those takes the
+    verifier down and reports nothing at all, which is strictly less than a red line saying
+    which reader broke.
+    """
+    try:
+        return fn(*a, **k)
+    except Exception as exc:                                   # noqa: BLE001 — any of them
+        return exc
+
+
+def field(suite, name):
+    """One named field of a suite record, or None where the record has no such field.
+
+    `getattr` with a default rather than an attribute access, so a record that is a bare tuple
+    again — the shape the named one replaced — reads as a MISSING field and reddens a check,
+    instead of raising `AttributeError` out of a `check(...)` argument.
+    """
+    return getattr(MUT._SUITES[suite], name, None)
+
+
+_ARGVS = {s: survives(MUT.command_for, pathlib.Path("/x"), s) for s in MUT._SUITES}
+check("every declared suite yields a runnable command, which is the line that broke",
+      bool(_ARGVS) and all(isinstance(c, list) and len(c) > 1
+                           and c[1:] == list(field(s, "argv") or [])
+                           for s, c in _ARGVS.items()), _ARGVS)
+# The three fields have three different readers, and a record one of them cannot read is the
+# defect above — so name them rather than trusting the record's arity. Parenthesized: as
+# `A and B or C` this is true by precedence whenever a labels parser is a string, which is
+# every real entry, and the interesting term would never be reached (§4).
+check("...and each names a FAILED-check parser, with a full-label parser or an explicit None",
+      bool(MUT._SUITES) and all(          # the structural clause: `all` over {} is true
+          isinstance(field(s, "failed"), str)
+          and (field(s, "labels") is None or isinstance(field(s, "labels"), str))
+          for s in MUT._SUITES), MUT._SUITES)
+# `None` is legitimate for the selftest, which prints section headings rather than a line per
+# arm. It is a SILENT DISARM for any suite that does print one, because the arm guard simply
+# skips a suite declaring none. Both of these print a line per check — this file is one of
+# them, four lines up.
+check("...and the two suites that print a line per check both declare one, since a `None` "
+      "there disarms the arm guard without saying so",
+      all(isinstance(field(s, "labels"), str) for s in ("fixtures", "proxy")), MUT._SUITES)
+
+# THE PARSERS, ON THIS SUITE'S REAL OUTPUT FORMAT — which is the format printed a few lines
+# above, so a change to `check()` moves the sample and the parser together.
+_sample = "  ok   a passing label\n  FAIL a failing label  <- detail here\nALL PASS\n"
+check("the FAILED parser reads a red check out of this verifier's own format",
+      survives(MUT.failed_checks, "fixtures", _sample) == ["a failing label"], _sample)
+check("...and the label parser reads BOTH lines, since arms name passing checks too",
+      survives(re.findall, MUT._ALL_LABELS, _sample, re.MULTILINE)
+      == ["a passing label", "a failing label"], _sample)
+# THE POSITIVE FACT BEHIND THE FAIL-CLOSED BRANCH. The arm guard used to skip itself when the
+# parse came back empty, which cleared every arm at once if a verifier's output format moved.
+# Making it refuse instead is only worth something if an empty parse is REACHABLE — a parser
+# that matched every line would turn the new branch into unreachable code that reads like a
+# safeguard (review, PR #106).
+check("...and finds nothing in output that is not a check, so the empty parse it now refuses "
+      "on is a state that can really occur",
+      survives(re.findall, MUT._ALL_LABELS, "E1. a section heading\n\nALL PASS\n",
+               re.MULTILINE) == [],
+      "otherwise the guard's fail-closed branch is unreachable")
+
+print()
+print("E18. probe_remote_mcp.py's startup path — the copy a fix was left out of")
+
+# WHY THIS IS CHECKED OFFLINE. That probe is opt-in: it needs `claude` on PATH and spends an
+# API call, so nothing in the ordinary block runs it, and its startup path had therefore never
+# been driven at all. The consequence was reported rather than caught — the verifier's own
+# startup was hardened and the probe, which exists to be REUSED, kept the defect: a first line
+# that was not JSON raised out of `start_fixture` with the child alive and the caller's handle
+# still `None`, leaking a listening server (review, PR #106). The fix belongs to both copies
+# and so does the check; that is §4's rule about a duplicated rule, applied to a duplicated FIX.
+import probe_remote_mcp as PROBE  # noqa: E402 — section-local, beside the checks that use it
+
+
+class _Watched:
+    """`subprocess`, with a memory of what was started through it.
+
+    THE WITNESS MUST COME FROM OUTSIDE `start_fixture`. What is under test is what it does with
+    a handle it does not return: every failure path returns `(None, reason)`, so from the
+    caller's side "reaped correctly" and "still running and leaking a port" are the same value.
+    A check reading only the return value cannot tell them apart, which is why it gets a
+    witness with a different vantage point rather than a cleverer assertion (§4).
+    """
+
+    PIPE = subprocess.PIPE
+
+    def __init__(self):
+        self.started = []
+
+    def Popen(self, *a, **k):                                  # noqa: N802 — it stands in for one
+        proc = subprocess.Popen(*a, **k)
+        self.started.append(proc)
+        return proc
+
+
+# Each one is a way a fixture can fail to announce itself. All three sleep afterwards, so a
+# process that was NOT reaped is still running when the check reads it — a fake that exited on
+# its own would make the reap check pass without anything reaping.
+_FAKES = {
+    "says something that is not JSON": 'print("definitely not a port", flush=True)',
+    "announces no endpoints": "print('{\"port\": 1}', flush=True)",
+    "dies before saying anything": ('import sys\nsys.stderr.write("bind: refused\\n")\n'
+                                    "raise SystemExit(3)"),
+}
+_startup_tmp = tempfile.mkdtemp(prefix="probe-startup-")
+_real_fixture = PROBE.FIXTURE
+for _desc, _body in _FAKES.items():
+    _fake = os.path.join(_startup_tmp, "fake.py")
+    with open(_fake, "w", encoding="utf-8") as _fh:
+        _fh.write(_body + "\nimport time\ntime.sleep(300)\n")
+    _watch = _Watched()
+    PROBE.subprocess, PROBE.FIXTURE = _watch, _fake
+    try:
+        _got = survives(PROBE.start_fixture, os.path.join(_startup_tmp, "r.jsonl"), "MARKER")
+    finally:
+        PROBE.subprocess, PROBE.FIXTURE = subprocess, _real_fixture
+    _proc, _why = _got if isinstance(_got, tuple) else (None, _got)
+    check(f"a fixture that {_desc} is a NAMED failure, not a traceback",
+          _proc is None and isinstance(_why, str) and bool(_why), _got)
+    # Read BEFORE the cleanup below, or this asks whether the tidy-up worked.
+    _reaped = bool(_watch.started) and all(p.poll() is not None for p in _watch.started)
+    # Named per case, not "...and the child is reaped" three times: an arm names a check by its
+    # text, and three checks sharing one make the report unable to say which case broke.
+    check(f"...and the child of the one that {_desc} is reaped, leaking no listening server",
+          _reaped, [(p.pid, p.poll()) for p in _watch.started])
+    for _p in _watch.started:                    # so a MUTANT that leaks does not leak for 5m
+        _p.kill()
+        _p.wait(timeout=DEADLINE)
+shutil.rmtree(_startup_tmp, ignore_errors=True)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")
