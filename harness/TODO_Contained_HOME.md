@@ -1352,6 +1352,21 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   standalone GET licensing a global blank and, worse, "proving" no server-initiated message
   could arrive — which would have retired the filtering of POST stream events, laundering the
   exact traffic §10.6 exists to catch, with a clean audit log (review, PR #108).
+- **A PARALLEL COPIED FROM THE OTHER TRANSPORT CARRIED A PREMISE THAT DOES NOT HOLD THERE.**
+  `connect_failed` was given `spawn_failed`'s exact shape — trigger ⟺ no record, licensing
+  every fact of the phase — because the two occupy the same slot in their respective
+  lifecycles. They are not the same in the way that decides this: a failed spawn produces
+  **nothing** (no pid, no pgid, nothing to clean up), while a failed connect can already have
+  produced **a session**. An initialization that succeeded and was then refused for an
+  unsupported negotiated version is a `connect_failed` holding a live session id, and blanking
+  `session_released` there says "there was nothing to release" about a thing the run created.
+  **When reusing a structure across two implementations of the same abstraction, ask what the
+  original's shape was PROVING, not what position it occupied** — `spawn_failed ⟺ no record`
+  was true because nothing survives a failed spawn, and that premise is what failed to carry.
+  The repair partitions by evidence (`none` / `<id>` / `indeterminate`) and needed a fourth
+  fact state, `unknown`, for a residue the prose had been acknowledging for three rounds while
+  the grammar had no shape for it — a paragraph admitting a gap the record cannot express is
+  its own defect (review, PR #108).
 - **AN OBSERVATION WHOSE WINDOW INCLUDES THE SUBJECT'S EXIT CANNOT ATTRIBUTE WHAT IT SEES TO
   THE SUBJECT — the C3-3 lesson, third instance, and this one was already written down.** The
   positive control for §10.10's stream teardown had the fixture witness the closes, which is
@@ -1539,7 +1554,10 @@ ABA fix and its route to `parallel_safe_config = True`.
   ~~the **I/O half** (spawn, the two pumps, `SIGTERM`/`SIGINT` handlers, §10.5's shutdown,
   writing the audit log) plus a wire-level driver (#103)~~ →
   ~~the **adapter integration** that unlocks `tools:` for stdio (#107)~~ → **the bridge**,
-  in §10.10's five slices: the ending model on synthetic records, then a **session arm for
+  in §10.10's slices, of which the **zeroth is a stdio fix that owes nothing to the bridge**:
+  `mcp_audit` licenses `not_applicable` off the LATCH, so a signal racing a failed spawn
+  already reports a false `not_applicable_unlicensed` today. Then the ending model on
+  synthetic records, then a **session arm for
   `fixtures/http_mcp_server.py`** (which implements none today, and everything downstream of
   `session_released` needs one), then the HTTP client half, then the guardian's session
   release with its kill inside the minting window, then the adapter branch.
