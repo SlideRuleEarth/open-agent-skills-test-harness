@@ -73,6 +73,13 @@ FAULT_ENV = "ASE_MCP_FAULT_SUPPRESS"     # PRESENCE arms it; the value names the
 INHERIT_ENV = "ASE_MCP_INHERIT_FDS"      # fds to hand the child and then close (§10.9)
 GRACE_ENV = "ASE_MCP_GRACE"              # seconds; scales every bound below
 GUARDIAN_ENV = "ASE_MCP_GUARDIAN"        # how to break the guardian, for §10.9's cases
+# A driver-supplied nonce the `mute` guardian echoes on stderr immediately before it starts
+# waiting. It exists so a case can observe that the window it needs was actually ENTERED rather
+# than inferring it from elapsed time — an assumption that fails under startup load in the one
+# direction that matters, delivering a signal before the handlers are installed and killing the
+# proxy under the default disposition (review, PR #109). Nonce-bound so the line cannot be
+# satisfied by anything but this invocation.
+PHASE_NONCE_ENV = "ASE_MCP_PHASE_NONCE"
 
 DEFAULT_GRACE = 5.0
 
@@ -545,10 +552,19 @@ class Guardian:
             # ALIVE AND SILENT, which is what `silent` is not: that one exits, the report pipe
             # reaches EOF, and `_read_report` returns at once. Here the pipe stays open, so the
             # proxy waits out its whole `grace` — the only window in this program during which
-            # establishment is still failing and an external event can land. Bounded well past
-            # any grace the driver sets, because a guardian that outlived its proxy would be
-            # the leak this file exists to prevent.
-            time.sleep(_MUTE_CEILING)
+            # establishment is still failing and an external event can land.
+            #
+            # IT WAITS ON THE LIFELINE, and the first version slept on a timer instead. That is
+            # the leak this whole file exists to prevent, introduced by a test knob: the proxy
+            # gave up after its grace, closed the lifeline and exited, and this process carried
+            # on sleeping with `PPID 1` for the rest of the ceiling — reproduced by review as a
+            # survivor still running after the verifier had printed ALL PASS. The ceiling is a
+            # backstop for a proxy that dies without closing anything, never the normal path.
+            self._phase(f"mute-waiting {os.environ.get(PHASE_NONCE_ENV, '')}")
+            deadline = time.monotonic() + _MUTE_CEILING
+            while time.monotonic() < deadline:
+                if _readable(self.lifeline, GUARDIAN_POLL):
+                    break            # readable in this mode means EOF: the proxy is gone
             return False
         mine = os.getpid() + 1 if self.knob == audit.GUARDIAN_IMPOSTER else os.getpid()
         self.report(guardian_pid=mine)

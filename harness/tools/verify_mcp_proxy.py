@@ -272,7 +272,7 @@ def run(*, command=None, args=None, tools=("echo",), env=None, fault=None, guard
         send=(), signal_after=None, kill_after=None, close_stdout=False, stdin_fd=None,
         stderr_broken=False,
         channels=(), server="echo", settle=0.3, grace=GRACE, warmup=0.0, reply_per_send=True,
-        after_send=None):
+        after_send=None, await_stderr=None, phase_nonce=None):
     """One proxy instance, driven to completion, with its audit log read back.
 
     Everything runs behind a DEADLINE and the proxy is always reaped: a proxy that stops
@@ -297,6 +297,8 @@ def run(*, command=None, args=None, tools=("echo",), env=None, fault=None, guard
             child_env[IO.FAULT_ENV] = fault
         if guardian is not None:
             child_env[IO.GUARDIAN_ENV] = guardian
+        if phase_nonce is not None:
+            child_env[IO.PHASE_NONCE_ENV] = phase_nonce
         writers = [c.writer for c in channels]
         if writers:
             child_env[IO.INHERIT_ENV] = ",".join(str(w) for w in writers)
@@ -376,6 +378,28 @@ def run(*, command=None, args=None, tools=("echo",), env=None, fault=None, guard
             pass                      # the proxy went away mid-conversation; the log says why
 
         time.sleep(settle)
+        # A POSITIVE WITNESS THAT THE WINDOW WAS ENTERED, for cases whose whole point is to
+        # deliver something into a specific phase. `settle` is elapsed time, which under startup
+        # load can pass before the proxy has installed its signal handlers at all — and a
+        # `SIGTERM` arriving then kills it under the default disposition, producing an absence
+        # that reads as the assertion failing rather than as the case never happening (review,
+        # PR #109). The marker is nonce-bound and written by the process it is about.
+        if await_stderr is not None:
+            _seen, _limit = False, time.monotonic() + REPLY_DEADLINE
+            while time.monotonic() < _limit:
+                try:
+                    with open(err_path, encoding="utf-8") as _handle:
+                        _seen = await_stderr in _handle.read()
+                except OSError:
+                    _seen = False
+                if _seen:
+                    break
+                time.sleep(0.05)
+            if not _seen:
+                # Reported here rather than left to the case's own assertion, which would fail
+                # for a reason that looks nothing like "the window never opened".
+                print(f"  NOTE  the awaited marker {await_stderr!r} never appeared; the case "
+                      f"below is measuring something other than what it was written for")
         if after_send is not None:
             after_send(proc)
         if kill_after is not None:
@@ -1147,6 +1171,34 @@ for _knob, _how in ((A.GUARDIAN_MISSING, "the guardian's program is not there"),
     finally:
         _un_chan.close()
 
+def guardian_pids() -> set[int]:
+    """Every live guardian's pid, read from OUTSIDE this program.
+
+    `ps` rather than anything the proxy reports, because the question is whether something the
+    driver has stopped tracking is still alive — precisely the question a process cannot answer
+    about itself.
+
+    PIDS RATHER THAN A COUNT, so the check below can name the survivors it means. A count made
+    the check read every guardian on the machine, including one a PREVIOUS mutation deliberately
+    leaked: `M337` reintroduces the sleep and leaves a guardian running for its ceiling, so the
+    next mutation's verifier would have seen it and failed for the previous mutation's reason.
+    Identity removes that coupling without the driver deciding which processes "look like" ours —
+    a pid absent before the case and present after it appeared during the case, and the suite is
+    serial.
+    """
+    try:
+        out = subprocess.run(["ps", "-eo", "pid=,command="], capture_output=True, text=True,
+                             timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    found = set()
+    for line in out.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if IO.GUARDIAN_FLAG in command and "mcp_proxy_io" in command and pid.isdigit():
+            found.add(int(pid))
+    return found
+
+
 # THE WRITER SIDE OF THE LATCH RULE, and the case whose absence let a false claim reach a PR.
 # `mcp_audit` licenses a blank `not_applicable` off the LATCH, so what the audit reader depends
 # on is that a failed spawn is always FIRST in the trigger list. PR #109 justified that by
@@ -1158,8 +1210,12 @@ for _knob, _how in ((A.GUARDIAN_MISSING, "the guardian's program is not there"),
 #
 # `mute` is what makes the window exist — every other establishment failure returns in
 # microseconds, leaving nothing to signal into (review, PR #109).
+_mute_nonce = uuid.uuid4().hex
+# BEFORE the case, so the survivor check below is scoped to what this case introduced.
+_guardians_before = guardian_pids()
 _sig_spawn = run(guardian=A.GUARDIAN_MUTE, grace=3.0, signal_after=signal.SIGTERM,
-                 settle=0.5, send=[], reply_per_send=False)
+                 settle=0.0, send=[], reply_per_send=False,
+                 phase_nonce=_mute_nonce, await_stderr=f"mute-waiting {_mute_nonce}")
 check("a signal during a failing spawn does not displace `spawn_failed` as the latch",
       _sig_spawn.triggers[:1] == [A.SPAWN_FAILED]
       and (_sig_spawn.only.spawn if _sig_spawn.only else "no instance") is None,
@@ -1171,6 +1227,26 @@ check("...and the signal IS recorded behind it, rather than being lost",
       f"the post-teardown drain exists so a signal arriving mid-teardown is not silently "
       f"dropped, and an arm asserting the list has exactly one entry would forbid the very "
       f"behaviour the code is written for: {_sig_spawn.triggers}")
+
+
+# THE KNOB MUST NOT OUTLIVE THE CASE, and the first version of `mute` did. It slept on a timer,
+# so when the proxy gave up after its grace and exited, the guardian carried on for the rest of
+# the ceiling with `PPID 1` — a survivor still running after the verifier had printed ALL PASS,
+# found by review rather than by anything here. That is the exact leak class §10.6 is about,
+# introduced by an instrument. `mute` now waits on the lifeline and the ceiling is a backstop,
+# and this is what says so: measured from outside, bounded well under the ceiling.
+_new_guardians = set()
+for _attempt in range(20):
+    _new_guardians = guardian_pids() - _guardians_before
+    if not _new_guardians:
+        break
+    time.sleep(0.25)
+check("the `mute` guardian goes when its proxy goes, rather than sleeping out its ceiling",
+      not _new_guardians,
+      f"a test knob that leaks a process is worse than no knob: every later case then runs "
+      f"beside a survivor and a green suite certifies it. Read from `ps` and scoped to pids "
+      f"this case introduced, well inside the {IO._MUTE_CEILING:.0f}s ceiling: "
+      f"{sorted(_new_guardians)} still alive")
 
 # THE READY REPORT IS CHECKED AGAINST THE PROCESS THAT WAS STARTED, so a report from anything
 # else is not readiness. Phase one carries NO COMMAND, which is what makes the repudiation

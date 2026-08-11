@@ -2360,6 +2360,16 @@ MUTATIONS = [
      ("                and not ({t.reason for t in record.triggers}\n"
       "                         & _NOT_APPLICABLE_LICENSED_BY[key])):"),
      "audit.the_licence_reads_the_latch_and_not_the_trigger_list"),
+    # THE INSTRUMENT'S OWN LEAK, reintroduced. Sleeping the ceiling instead of waiting on the
+    # lifeline is what the first `mute` did, and it left a guardian running with `PPID 1` after
+    # the verifier printed ALL PASS — found by review, not by the suite, because nothing looked.
+    ("M337-the-mute-guardian-sleeps-instead-of-watching-its-lifeline", PROXY_IO,
+     ("            deadline = time.monotonic() + _MUTE_CEILING\n"
+      "            while time.monotonic() < deadline:\n"
+      "                if _readable(self.lifeline, GUARDIAN_POLL):\n"
+      "                    break"),
+     "            time.sleep(_MUTE_CEILING)",
+     "the `mute` guardian goes when its proxy goes, rather than sleeping out its ceiling"),
     # NO MUTATION FOR "spawn_failed IS FIRST", and the reason is worth more than a mutation.
     # The obvious one — drain the wakeup pipe before `_spawn()` — was written, driven, and came
     # back MISSED, correctly: there is no window between `signal.signal()` and `_spawn()` in
