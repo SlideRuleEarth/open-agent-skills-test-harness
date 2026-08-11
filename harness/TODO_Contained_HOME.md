@@ -1352,6 +1352,27 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   standalone GET licensing a global blank and, worse, "proving" no server-initiated message
   could arrive — which would have retired the filtering of POST stream events, laundering the
   exact traffic §10.6 exists to catch, with a clean audit log (review, PR #108).
+- **A UNIVERSAL WRITTEN TO CLOSE ONE LOOPHOLE CONTRADICTS THE RULE IT WAS CARVED OUT OF.**
+  Having established that a server declining a capability must not blank a completion fact, the
+  next sentence said `streams_closed` is "never `not_applicable`" — flatly, three paragraphs
+  from a list where `connect_failed` licenses exactly that. Both statements were about blanks
+  and they meant different things by one: *the capability was never offered* and *the phase was
+  never entered* are different facts, and only the second is an ending. The scope that was
+  missing is one clause — "after the connect record exists" — and the tell is a claim written
+  as an absolute in a document that had just spent a paragraph distinguishing two sources for
+  the same word. **When a rule is stated to exclude one case, say which of the existing sources
+  it excludes**, or it reads as excluding all of them (review, PR #108).
+- **A RECORD WITH THREE DISPOSITIONS NEEDS THREE ENDINGS, AND THE THIRD IS THE ONE NOBODY
+  WRITES.** The new stream record could read `open`, `unavailable` or `failed`, and every
+  instance must latch a terminal trigger — but `failed` had none: it happens after the connect
+  record so it is not `connect_failed`, and no stream ever opened so it is not `stream_lost`.
+  The enumeration that catches this is mechanical and worth running on any new record: **for
+  each value the record may hold, name the trigger that ends the instance, and for each
+  trigger, name the record state that implies it.** Both directions, because the one-directional
+  version admits a terminator carrying a trigger the record contradicts. It also forced the
+  useful question of what the new trigger licenses — nothing, since the connection and session
+  still exist, and an ending that skipped the session release because the *stream* failed would
+  leak on the strength of an unrelated failure.
 - **A FACT OBSERVED AFTER A RECORD IS WRITTEN CANNOT BE IN THAT RECORD.** Obvious stated
   plainly, invisible in prose: the same section had the server→client stream opened *after* the
   connect record and its outcome recorded *in* it. An append-only log is exactly the structure
