@@ -1352,6 +1352,33 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   standalone GET licensing a global blank and, worse, "proving" no server-initiated message
   could arrive — which would have retired the filtering of POST stream events, laundering the
   exact traffic §10.6 exists to catch, with a clean audit log (review, PR #108).
+- **AN OBSERVATION WHOSE WINDOW INCLUDES THE SUBJECT'S EXIT CANNOT ATTRIBUTE WHAT IT SEES TO
+  THE SUBJECT — the C3-3 lesson, third instance, and this one was already written down.** The
+  positive control for §10.10's stream teardown had the fixture witness the closes, which is
+  worth nothing on its own: a proxy that records the right identities, closes nothing, writes
+  its terminator and exits closes every socket on the way out, and the fixture sees the same
+  EOF. It is the same sentence as the entry above about reaping — "a proxy that exits without
+  reaping leaves a child that init adopts and reaps, and afterwards the two are identical" —
+  with sockets substituted for a child, and the remedy stated there is the one that applies:
+  prefer evidence that cannot race the exit, then check the witness's discriminating power.
+  Sockets admit no monotone equivalent of the inherited pipe, so the window gets constrained
+  instead: observe while the subject is provably alive, behind a test-only gate, **and** add a
+  negative control proving the witness can report the other answer. **The general check is to
+  ask what the witness would report if the subject did nothing and then died** — if that is the
+  same reading, the case is decorative however elaborate it looks (review, PR #108).
+- **A RULE THAT READS A LIST AS A SLOT TURNS AN ORDINARY RACE INTO A MALFORMED RECORD.**
+  `stream_open_failed` was defined as the trigger that *latches* iff its record reads `failed`.
+  But §10.5.1 says outright that the latch decides which trigger stopped forwarding and not
+  which triggers count — a `SIGTERM` may latch while the connection fails microseconds later —
+  so the biconditional belongs over **membership** in the trigger list. Writing it over the
+  latch made a legal ordering illegal.
+  Fixing it surfaced the sharper question, which is not remote-specific: `not_applicable` is
+  licensed by the latch today, on the argument that a later trigger arrives during teardown
+  when the step has already had its chance. That is sound only for triggers that can *only*
+  arrive during a teardown, and `spawn_failed`/`connect_failed` are the opposite — they can
+  only arrive before their phase exists. **A licence belongs to a trigger that can only occur
+  before its step's phase, wherever it sits in the list**; latch position was standing in for
+  that property. The stdio half has the same race today.
 - **A UNIVERSAL WRITTEN TO CLOSE ONE LOOPHOLE CONTRADICTS THE RULE IT WAS CARVED OUT OF.**
   Having established that a server declining a capability must not blank a completion fact, the
   next sentence said `streams_closed` is "never `not_applicable`" — flatly, three paragraphs
