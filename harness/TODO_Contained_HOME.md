@@ -1325,6 +1325,190 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   non-empty list. **A validity check whose justification is about a different input than the
   one it rejects is a merged condition.** The two cases are not even close: a missing allowlist
   could become "pass everything", and an empty one is a filter that admits nothing.
+- **PROSE CAN CONTRADICT AN INVARIANT THE CODE STATES IN SO MANY WORDS.** §10.10's first draft
+  had the proxy perform the HTTP initialization, learn the session id, and hand it to the
+  guardian — leaving a network round trip during which a killed proxy takes the only knowledge
+  of a live session with it, which is the exact leak the guardian exists to close. The stdio
+  half has never worked that way, and says so in a comment on the field: *"The child is the
+  GUARDIAN's process, not this one's."* The invariant is **whatever can create a thing that
+  outlives this instance is created by the process whose job is to outlive the proxy**, and it
+  was already written down, in the file the new design was extending. **When designing an
+  extension, re-derive the existing half's invariant from its code rather than from memory of
+  what it does** — the failure mode is not forgetting the rule, it is restating it at the level
+  of behaviour ("the guardian cleans up") instead of structure ("the guardian owns creation"),
+  where the behaviour survives paraphrase and the structure does not (review, PR #108).
+- **ONE NOUN COVERING TWO LIFETIMES PRODUCES A FACT THAT CANNOT BE STATED TRUTHFULLY.**
+  §10.10's `streams_closed` was written over "every SSE stream this instance opened", which is
+  false on the clean path — a POST answered `text/event-stream` closes after its correlated
+  response, so most streams are gone long before a teardown. Repairing it to "closed **by the
+  teardown**" made it false the other way, saying of a stream that ended an hour earlier that
+  the teardown closed it. Both spellings were attempts to describe *two* populations with one
+  sentence: request streams, which end on their own, and the standalone channel, which does
+  not. The fix is to quantify the fact over **what was still open when the teardown began** —
+  and then, because that set can be empty, to record its size, since `done` over an empty
+  enumeration and `done` over a broken one are otherwise the same word (§4's `all(...)` rule,
+  arriving in a design rather than in code).
+  **The second-order damage is the one to watch for**: the same conflation had a `405` to the
+  standalone GET licensing a global blank and, worse, "proving" no server-initiated message
+  could arrive — which would have retired the filtering of POST stream events, laundering the
+  exact traffic §10.6 exists to catch, with a clean audit log (review, PR #108).
+- **NAMING A VALUE'S LAST USE READS AS NAMING ITS ONLY USE.** §10.10 said the proxy holds the
+  session id "for the ordinary teardown" — true, and the whole of it only if you already know
+  the transport requires the id on **every** request after initialization. A bridge built from
+  that sentence attaches the header on `DELETE`, passes every check against a fixture that
+  issues no session at all, and fails against the first stateful server it meets. The tell is a
+  purpose clause on a retained value that mentions one phase of a lifecycle: **say what the
+  value is for across its whole life, or say nothing and let the requirement list carry it** —
+  a partial purpose is worse than none, because it reads as complete (review, PR #108).
+- **"WHICH FIELD IS SECRET" IS THE WRONG AXIS; THE QUESTION IS WHOSE VALUE SPACE IT IS.**
+  §10.10 twice put the resolved endpoint in an audit record, and once wrote the rule out loud
+  as "endpoint only, never the headers" — a sentence that sounds careful and sorts the fields
+  by the wrong property. `${VAR}` is honoured in `url`; `interpolated_refs` lists it beside
+  `env` and `headers` for exactly that reason. So `https://host/mcp?token=${TOKEN}` resolves to
+  a URL that IS a credential, written to a file the harness reads and can quote into a failure
+  message. (The first draft of this entry said "a log archived per cell"; it is not archived —
+  see the §10.7 correction. The rule never needed that premise, and reaching for it was the
+  same reflex as citing a spec page without checking which revision it was on.)
+  **Sort by whether the value
+  space is under this harness's control**: the declared server name is safe by construction —
+  the schema admits `[A-Za-z0-9_-]+` and forbids interpolation — while no subset of a resolved
+  URL is, since a secret can sit in the query, the path, the userinfo or a subdomain. "It would
+  be scrubbed" is not the answer either: §4 already records that redaction skips values under
+  `MIN_REDACTABLE_LEN` and that a short credential is still a credential.
+  Applying the same test one field further found a second instance the review had not named —
+  the session id, a capability handle for a session still open, was being persisted to answer a
+  question the reader never asks. The record keeps the *state*; the **guardian** retains the id,
+  because it is the process that must release the session if the proxy dies first, and reports
+  it up the **report** pipe for the proxy to hold in memory. (Two drafts said "order pipe" —
+  the lifeline carries orders *out* and its EOF fires the sweep, so a report sent that way
+  would run against the traffic and take guardian-loss detection with it. Naming a channel by
+  what it is *for* rather than by reading the topology is the same slip as the guardian
+  ownership round, one file over.) (review, PR #108)
+- **"THE PROCESS SURVIVED" IS NOT EVIDENCE ABOUT WHAT IT ASKED SOMEONE ELSE TO DO.** §10.10
+  inferred "no order to initialize was ever issued" from *a terminator with no connect record*:
+  the proxy lived, so it would have written the record had there been anything to write.
+  The two events bound different windows. The guardian's identity report comes **before** the
+  launch order; the connect record cannot be written until the initialization *result* returns.
+  A guardian can authenticate, take the order, mint a session and die in between, leaving a live
+  proxy writing a terminator over a session that exists — recorded as `not_applicable`, the one
+  answer that is certainly wrong. **An absence is only evidence against an event if the record
+  that would have carried it is written BEFORE that event**, which is why §10.5 puts the
+  instance boundary ahead of the spawn attempt and why the audit sink flushes on every write.
+  The repair is the same move one level down: a `connect_attempt` record, flushed before the
+  order goes down the pipe, turning "never ordered" and "ordered, outcome unknown" into two
+  recorded states instead of one inference (review, PR #108).
+- **A VALUE FROM AN OPEN DOMAIN CANNOT CARRY ITS OWN STATUS IN-BAND.** §10.10's connect record
+  held `session: none | <id> | indeterminate`, which is unsound the moment you look at what an
+  id may be: visible ASCII, so a real session id may literally *be* `"none"`. A live session
+  would then decode as no session and its release would be skipped — the failure landing on the
+  one path the whole record exists to protect. The tagged form is `{"state": …, "id": …}` with
+  `id` required for `known` and forbidden otherwise, malformed in both directions. This repo had
+  already solved the same problem: `_MISSING` exists in `mcp_audit` because `child_status: null`
+  is "a record claiming the evidence exists while carrying none of it". **The generalization is
+  wider than absence** — any status multiplexed into a field whose value space you do not
+  control is a collision waiting for a peer that picks the wrong string (review, PR #108).
+- **NARROWING A RULE TOO FAR LEAVES A CASE WITH NO LEGAL SPELLING, AND THE FIX IS THE
+  CROSS-PRODUCT.** Told that `connect_failed` must not blank `session_released`, the repair said
+  "never" — and the branch where there is *no connect record at all*, because the guardian never
+  completed phase one and so never received a launch order, then had no legal fact: nothing was
+  minted, nothing can be released, and the only honest state was the one just forbidden. Two
+  rounds, two overshoots, in opposite directions, on one predicate. **When a rule is corrected
+  by narrowing, enumerate the cross-product of its inputs and give each cell a value** — here
+  {no record, none, known, indeterminate} × the fact — rather than editing the sentence that was
+  wrong. Enumerating it also produced the premise that makes the first cell sound: the terminator
+  must be *present*, since a missing connect record without one is the absence case and may well
+  be hiding a session.
+- **A PARALLEL COPIED FROM THE OTHER TRANSPORT CARRIED A PREMISE THAT DOES NOT HOLD THERE.**
+  `connect_failed` was given `spawn_failed`'s exact shape — trigger ⟺ no record, licensing
+  every fact of the phase — because the two occupy the same slot in their respective
+  lifecycles. They are not the same in the way that decides this: a failed spawn produces
+  **nothing** (no pid, no pgid, nothing to clean up), while a failed connect can already have
+  produced **a session**. An initialization that succeeded and was then refused for an
+  unsupported negotiated version is a `connect_failed` holding a live session id, and blanking
+  `session_released` there says "there was nothing to release" about a thing the run created.
+  **When reusing a structure across two implementations of the same abstraction, ask what the
+  original's shape was PROVING, not what position it occupied** — `spawn_failed ⟺ no record`
+  was true because nothing survives a failed spawn, and that premise is what failed to carry.
+  The repair partitions by evidence (`none` / `<id>` / `indeterminate`) and needed a fourth
+  fact state, `unknown`, for a residue the prose had been acknowledging for three rounds while
+  the grammar had no shape for it — a paragraph admitting a gap the record cannot express is
+  its own defect (review, PR #108).
+- **AN OBSERVATION WHOSE WINDOW INCLUDES THE SUBJECT'S EXIT CANNOT ATTRIBUTE WHAT IT SEES TO
+  THE SUBJECT — the C3-3 lesson, third instance, and this one was already written down.** The
+  positive control for §10.10's stream teardown had the fixture witness the closes, which is
+  worth nothing on its own: a proxy that records the right identities, closes nothing, writes
+  its terminator and exits closes every socket on the way out, and the fixture sees the same
+  EOF. It is the same sentence as the entry above about reaping — "a proxy that exits without
+  reaping leaves a child that init adopts and reaps, and afterwards the two are identical" —
+  with sockets substituted for a child, and the remedy stated there is the one that applies:
+  prefer evidence that cannot race the exit, then check the witness's discriminating power.
+  Sockets admit no monotone equivalent of the inherited pipe, so the window gets constrained
+  instead: observe while the subject is provably alive, behind a test-only gate, **and** add a
+  negative control proving the witness can report the other answer. **The general check is to
+  ask what the witness would report if the subject did nothing and then died** — if that is the
+  same reading, the case is decorative however elaborate it looks (review, PR #108).
+- **A RULE THAT READS A LIST AS A SLOT TURNS AN ORDINARY RACE INTO A MALFORMED RECORD.**
+  `stream_open_failed` was defined as the trigger that *latches* iff its record reads `failed`.
+  But §10.5.1 says outright that the latch decides which trigger stopped forwarding and not
+  which triggers count — a `SIGTERM` may latch while the connection fails microseconds later —
+  so the biconditional belongs over **membership** in the trigger list. Writing it over the
+  latch made a legal ordering illegal.
+  Fixing it surfaced the sharper question, which is not remote-specific: `not_applicable` is
+  licensed by the latch today, on the argument that a later trigger arrives during teardown
+  when the step has already had its chance. That is sound only for triggers that can *only*
+  arrive during a teardown, and `spawn_failed`/`connect_failed` are the opposite — they can
+  only arrive before their phase exists. **A licence belongs to a trigger that can only occur
+  before its step's phase, wherever it sits in the list**; latch position was standing in for
+  that property. The stdio half has the same race today.
+- **A UNIVERSAL WRITTEN TO CLOSE ONE LOOPHOLE CONTRADICTS THE RULE IT WAS CARVED OUT OF.**
+  Having established that a server declining a capability must not blank a completion fact, the
+  next sentence said `streams_closed` is "never `not_applicable`" — flatly, three paragraphs
+  from a list where `connect_failed` licenses exactly that. Both statements were about blanks
+  and they meant different things by one: *the capability was never offered* and *the phase was
+  never entered* are different facts, and only the second is an ending. The scope that was
+  missing is one clause — "after the connect record exists" — and the tell is a claim written
+  as an absolute in a document that had just spent a paragraph distinguishing two sources for
+  the same word. **When a rule is stated to exclude one case, say which of the existing sources
+  it excludes**, or it reads as excluding all of them (review, PR #108).
+- **A RECORD WITH THREE DISPOSITIONS NEEDS THREE ENDINGS, AND THE THIRD IS THE ONE NOBODY
+  WRITES.** The new stream record could read `open`, `unavailable` or `failed`, and every
+  instance must latch a terminal trigger — but `failed` had none: it happens after the connect
+  record so it is not `connect_failed`, and no stream ever opened so it is not `stream_lost`.
+  The enumeration that catches this is mechanical and worth running on any new record: **for
+  each value the record may hold, name the trigger that ends the instance, and for each
+  trigger, name the record state that implies it.** Both directions, because the one-directional
+  version admits a terminator carrying a trigger the record contradicts. It also forced the
+  useful question of what the new trigger licenses — nothing, since the connection and session
+  still exist, and an ending that skipped the session release because the *stream* failed would
+  leak on the strength of an unrelated failure.
+- **A FACT OBSERVED AFTER A RECORD IS WRITTEN CANNOT BE IN THAT RECORD.** Obvious stated
+  plainly, invisible in prose: the same section had the server→client stream opened *after* the
+  connect record and its outcome recorded *in* it. An append-only log is exactly the structure
+  that makes this impossible, and it is the structure the whole audit design rests on. **When a
+  design says "recorded in X", check that every fact named is available at the moment X is
+  written** — the repair is either to move the observation earlier or to give it a record of
+  its own with its own absence semantics, and which one is right depends on what the earlier
+  record is *for*.
+- **AN INSTRUMENT THAT SUPPLIES THE THING IT SHOULD OBSERVE CLEARS EVERY CHECK BUILT ON IT.**
+  `Channel.rpc` sets `Accept: application/json, text/event-stream` on every request it makes,
+  which is right for a helper testing the *fixture* and disqualifying for one meant to witness
+  whether a *client* sends it: the bridge could omit the header entirely and every green check
+  would stay green. Same family as the probe marker the prompt supplied — a claim and the thing
+  it claims about must not have the same author — and it is worth stating separately because
+  the giveaway is different. There the instrument generated the value; here it fills in a
+  default so ordinary that nobody reads the line. **Before asserting a peer sends X, check
+  what the test client does with X when nobody asks it to** (review, PR #108).
+- **A PROMISE STATED WIDER THAN THE MECHANISM IS THE §10.6 DEFECT, NOW IN A DESIGN DOC.** The
+  bridge was specified for Streamable HTTP and its adapter step described as "stops refusing a
+  remote server" — but the schema admits two remote transports, and the deprecated `2024-11-05`
+  pair is a different state machine: a GET opens the receiving stream, an `endpoint` event
+  supplies a second URL, POSTs are answered `202` and replies arrive on the original stream.
+  Nothing about it appeared anywhere in the section. This is the third instance of one family —
+  §10.6's tool-definition scan, #107's per-adapter filter constant, and now a scope sentence —
+  and the new part is that **it can be committed before any code exists**, where nothing runs
+  and no mutation can catch it. The check is mechanical: for each capability the design
+  promises, enumerate what the *schema* admits under it, and confirm the specified mechanism
+  covers each one or that the design refuses it by name.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s
@@ -1413,16 +1597,38 @@ ABA fix and its route to `parallel_safe_config = True`.
 - **Phase 3 antigravity** — MCP injection.
 - **C3 harness-owned filtering proxy** — required before any scenario points `tools:` at a
   server its author does not control, and required for agy tool gating regardless.
-  **Designed in `DESIGN_MCP_Support.md` §10 (2026-07-29); being built.** stdio only in the
-  first cut — remote `tools:` stays refused. Build order: ~~probe **C3-0**~~ →
+  **Designed in `DESIGN_MCP_Support.md` §10 (2026-07-29); built and shipped for stdio
+  (#107).** The first cut is stdio only — remote `tools:` stays refused, and since #107 by a
+  per-server check that names the transport rather than by the blanket refusal that had been
+  covering it incidentally. **The transport bridge that lifts it is designed in §10.10
+  (2026-08-11)**, and for `transport: http` only — `sse` + `tools:` stays refused by name,
+  because the `2024-11-05` pair is a second state machine rather than an option on this one.
+  The decision layer is reused verbatim; the ending model forks per transport (`FACTS_REMOTE`,
+  `connect_failed`, a connect record, a session to release instead of a group to signal); and
+  the guardian generalizes rather than disappearing — **it owns the request that mints the
+  session**, exactly as it already owns the spawn, because a proxy that learned the session id
+  and then handed it over leaves a window with the shape of the leak the guardian exists to
+  close. The standalone server→client `GET` stream is in the first cut with a lifecycle of its
+  own, because the proxy presents *stdio* to the CLI and stdio is symmetric: not opening it
+  would turn a bidirectional channel into a half-duplex one with nothing able to notice. Probe **C3-4** decides whether a session the server declines to terminate is clean,
+  and asks first whether that server is even in the era this machinery belongs to — modern
+  removed protocol sessions. Build order: ~~probe **C3-0**~~ →
   ~~probe **C3-1**~~ → ~~a **dual-era mode for `fixtures/echo_mcp_server.py`** (#98)~~ →
   ~~the **decision layer** + its arms, wired to nothing (#100)~~ →
   ~~the **audit record types**, the structural validator and `verdict()`
-  (`agentskill_evals/mcp_audit.py`), written before the code that produces them~~ → the
-  **I/O half** (spawn, the two pumps, `SIGTERM`/`SIGINT` handlers, §10.5's shutdown, writing
-  the audit log) plus a wire-level driver → the adapter integration that unlocks `tools:`.
-  Everything before the last slice cannot affect any run, which is the point: this is harness
-  code in the request path of every gated cell.
+  (`agentskill_evals/mcp_audit.py`), written before the code that produces them~~ →
+  ~~the **I/O half** (spawn, the two pumps, `SIGTERM`/`SIGINT` handlers, §10.5's shutdown,
+  writing the audit log) plus a wire-level driver (#103)~~ →
+  ~~the **adapter integration** that unlocks `tools:` for stdio (#107)~~ → **the bridge**,
+  in §10.10's slices, of which the **zeroth is a stdio fix that owes nothing to the bridge**:
+  `mcp_audit` licenses `not_applicable` off the LATCH, so a signal racing a failed spawn
+  already reports a false `not_applicable_unlicensed` today. Then the ending model on
+  synthetic records, then a **session arm for
+  `fixtures/http_mcp_server.py`** (which implements none today, and everything downstream of
+  `session_released` needs one), then the HTTP client half, then the guardian's session
+  release with its kill inside the minting window, then the adapter branch.
+  Everything before an adapter slice cannot affect any run, which is the point: this is
+  harness code in the request path of every gated cell.
   **The I/O half starts from §10.5.1, written before its code**: every way an instance can end,
   on two axes — the triggers, latched in order, plus the cleanup outcomes accumulated after
   them — together with a positive completion fact per teardown step, since a list of things
