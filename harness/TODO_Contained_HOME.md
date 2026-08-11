@@ -1337,6 +1337,29 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   what it does** — the failure mode is not forgetting the rule, it is restating it at the level
   of behaviour ("the guardian cleans up") instead of structure ("the guardian owns creation"),
   where the behaviour survives paraphrase and the structure does not (review, PR #108).
+- **ONE NOUN COVERING TWO LIFETIMES PRODUCES A FACT THAT CANNOT BE STATED TRUTHFULLY.**
+  §10.10's `streams_closed` was written over "every SSE stream this instance opened", which is
+  false on the clean path — a POST answered `text/event-stream` closes after its correlated
+  response, so most streams are gone long before a teardown. Repairing it to "closed **by the
+  teardown**" made it false the other way, saying of a stream that ended an hour earlier that
+  the teardown closed it. Both spellings were attempts to describe *two* populations with one
+  sentence: request streams, which end on their own, and the standalone channel, which does
+  not. The fix is to quantify the fact over **what was still open when the teardown began** —
+  and then, because that set can be empty, to record its size, since `done` over an empty
+  enumeration and `done` over a broken one are otherwise the same word (§4's `all(...)` rule,
+  arriving in a design rather than in code).
+  **The second-order damage is the one to watch for**: the same conflation had a `405` to the
+  standalone GET licensing a global blank and, worse, "proving" no server-initiated message
+  could arrive — which would have retired the filtering of POST stream events, laundering the
+  exact traffic §10.6 exists to catch, with a clean audit log (review, PR #108).
+- **A FACT OBSERVED AFTER A RECORD IS WRITTEN CANNOT BE IN THAT RECORD.** Obvious stated
+  plainly, invisible in prose: the same section had the server→client stream opened *after* the
+  connect record and its outcome recorded *in* it. An append-only log is exactly the structure
+  that makes this impossible, and it is the structure the whole audit design rests on. **When a
+  design says "recorded in X", check that every fact named is available at the moment X is
+  written** — the repair is either to move the observation earlier or to give it a record of
+  its own with its own absence semantics, and which one is right depends on what the earlier
+  record is *for*.
 - **AN INSTRUMENT THAT SUPPLIES THE THING IT SHOULD OBSERVE CLEARS EVERY CHECK BUILT ON IT.**
   `Channel.rpc` sets `Accept: application/json, text/event-stream` on every request it makes,
   which is right for a helper testing the *fixture* and disqualifying for one meant to witness
