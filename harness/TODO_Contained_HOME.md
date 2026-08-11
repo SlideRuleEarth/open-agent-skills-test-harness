@@ -1325,6 +1325,29 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   non-empty list. **A validity check whose justification is about a different input than the
   one it rejects is a merged condition.** The two cases are not even close: a missing allowlist
   could become "pass everything", and an empty one is a filter that admits nothing.
+- **PROSE CAN CONTRADICT AN INVARIANT THE CODE STATES IN SO MANY WORDS.** §10.10's first draft
+  had the proxy perform the HTTP initialization, learn the session id, and hand it to the
+  guardian — leaving a network round trip during which a killed proxy takes the only knowledge
+  of a live session with it, which is the exact leak the guardian exists to close. The stdio
+  half has never worked that way, and says so in a comment on the field: *"The child is the
+  GUARDIAN's process, not this one's."* The invariant is **whatever can create a thing that
+  outlives this instance is created by the process whose job is to outlive the proxy**, and it
+  was already written down, in the file the new design was extending. **When designing an
+  extension, re-derive the existing half's invariant from its code rather than from memory of
+  what it does** — the failure mode is not forgetting the rule, it is restating it at the level
+  of behaviour ("the guardian cleans up") instead of structure ("the guardian owns creation"),
+  where the behaviour survives paraphrase and the structure does not (review, PR #108).
+- **A PROMISE STATED WIDER THAN THE MECHANISM IS THE §10.6 DEFECT, NOW IN A DESIGN DOC.** The
+  bridge was specified for Streamable HTTP and its adapter step described as "stops refusing a
+  remote server" — but the schema admits two remote transports, and the deprecated `2024-11-05`
+  pair is a different state machine: a GET opens the receiving stream, an `endpoint` event
+  supplies a second URL, POSTs are answered `202` and replies arrive on the original stream.
+  Nothing about it appeared anywhere in the section. This is the third instance of one family —
+  §10.6's tool-definition scan, #107's per-adapter filter constant, and now a scope sentence —
+  and the new part is that **it can be committed before any code exists**, where nothing runs
+  and no mutation can catch it. The check is mechanical: for each capability the design
+  promises, enumerate what the *schema* admits under it, and confirm the specified mechanism
+  covers each one or that the design refuses it by name.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s
@@ -1417,11 +1440,16 @@ ABA fix and its route to `parallel_safe_config = True`.
   (#107).** The first cut is stdio only — remote `tools:` stays refused, and since #107 by a
   per-server check that names the transport rather than by the blanket refusal that had been
   covering it incidentally. **The transport bridge that lifts it is designed in §10.10
-  (2026-08-11)**: the decision layer is reused verbatim, the ending model forks per transport
-  (`FACTS_REMOTE`, a connect record, a session to release instead of a group to signal), the
-  guardian generalizes rather than disappearing — and probe **C3-4** decides whether a session
-  the server declines to terminate is clean, which is a question about real servers rather
-  than a preference. Build order: ~~probe **C3-0**~~ →
+  (2026-08-11)**, and for `transport: http` only — `sse` + `tools:` stays refused by name,
+  because the `2024-11-05` pair is a second state machine rather than an option on this one.
+  The decision layer is reused verbatim; the ending model forks per transport (`FACTS_REMOTE`,
+  `connect_failed`, a connect record, a session to release instead of a group to signal); and
+  the guardian generalizes rather than disappearing — **it owns the request that mints the
+  session**, exactly as it already owns the spawn, because a proxy that learned the session id
+  and then handed it over leaves a window with the shape of the leak the guardian exists to
+  close. Probe **C3-4** decides whether a session the server declines to terminate is clean,
+  and asks first whether that server is even in the era this machinery belongs to — modern
+  removed protocol sessions. Build order: ~~probe **C3-0**~~ →
   ~~probe **C3-1**~~ → ~~a **dual-era mode for `fixtures/echo_mcp_server.py`** (#98)~~ →
   ~~the **decision layer** + its arms, wired to nothing (#100)~~ →
   ~~the **audit record types**, the structural validator and `verdict()`
@@ -1429,8 +1457,10 @@ ABA fix and its route to `parallel_safe_config = True`.
   ~~the **I/O half** (spawn, the two pumps, `SIGTERM`/`SIGINT` handlers, §10.5's shutdown,
   writing the audit log) plus a wire-level driver (#103)~~ →
   ~~the **adapter integration** that unlocks `tools:` for stdio (#107)~~ → **the bridge**,
-  in §10.10's four slices: the ending model, then the HTTP client half against the fixture,
-  then the guardian's session release, then the two-line adapter flip.
+  in §10.10's five slices: the ending model on synthetic records, then a **session arm for
+  `fixtures/http_mcp_server.py`** (which implements none today, and everything downstream of
+  `session_released` needs one), then the HTTP client half, then the guardian's session
+  release with its kill inside the minting window, then the adapter branch.
   Everything before an adapter slice cannot affect any run, which is the point: this is
   harness code in the request path of every gated cell.
   **The I/O half starts from §10.5.1, written before its code**: every way an instance can end,
