@@ -1337,6 +1337,15 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   what it does** — the failure mode is not forgetting the rule, it is restating it at the level
   of behaviour ("the guardian cleans up") instead of structure ("the guardian owns creation"),
   where the behaviour survives paraphrase and the structure does not (review, PR #108).
+- **AN INSTRUMENT THAT SUPPLIES THE THING IT SHOULD OBSERVE CLEARS EVERY CHECK BUILT ON IT.**
+  `Channel.rpc` sets `Accept: application/json, text/event-stream` on every request it makes,
+  which is right for a helper testing the *fixture* and disqualifying for one meant to witness
+  whether a *client* sends it: the bridge could omit the header entirely and every green check
+  would stay green. Same family as the probe marker the prompt supplied — a claim and the thing
+  it claims about must not have the same author — and it is worth stating separately because
+  the giveaway is different. There the instrument generated the value; here it fills in a
+  default so ordinary that nobody reads the line. **Before asserting a peer sends X, check
+  what the test client does with X when nobody asks it to** (review, PR #108).
 - **A PROMISE STATED WIDER THAN THE MECHANISM IS THE §10.6 DEFECT, NOW IN A DESIGN DOC.** The
   bridge was specified for Streamable HTTP and its adapter step described as "stops refusing a
   remote server" — but the schema admits two remote transports, and the deprecated `2024-11-05`
