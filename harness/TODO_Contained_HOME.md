@@ -1453,13 +1453,24 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   which triggers count — a `SIGTERM` may latch while the connection fails microseconds later —
   so the biconditional belongs over **membership** in the trigger list. Writing it over the
   latch made a legal ordering illegal.
-  Fixing it surfaced the sharper question, which is not remote-specific: `not_applicable` is
-  licensed by the latch today, on the argument that a later trigger arrives during teardown
-  when the step has already had its chance. That is sound only for triggers that can *only*
-  arrive during a teardown, and `spawn_failed`/`connect_failed` are the opposite — they can
-  only arrive before their phase exists. **A licence belongs to a trigger that can only occur
-  before its step's phase, wherever it sits in the list**; latch position was standing in for
-  that property. The stdio half has the same race today.
+  Fixing it raised a second question and I answered it from the shape of the rule instead of
+  from the code, which is its own lesson. `not_applicable` is licensed by the LATCH, and I
+  argued that a signal could latch ahead of a failed spawn, making the check a false anomaly in
+  shipped code and requiring the licence to be loosened to list membership. **Reading the path
+  says otherwise, and says it structurally.** The signal handler does nothing; `set_wakeup_fd`
+  writes a byte drained only by `_on_signal`, which runs only inside `_pump`'s loop; and `run()`
+  is `if self._spawn(): … self._pump(…)`, so a failed spawn returns without ever entering the
+  loop and the byte is never read. `spawn_failed` is alone in the list every time —
+  `_spawn_partition`'s own docstring had said so, and I contradicted it. **A claim that shipped
+  code has a race is a claim about control flow, so it has to be traced rather than argued
+  from the shape of the predicate**; the general form is the one this file already carries about
+  the guardian and about the pipe topology, arriving a third time (review, PR #108).
+  The decision that follows is the opposite of the one I proposed: keep the latch key, require
+  the bridge to preserve the property by construction, and add the arms nobody had written —
+  one on the reader (a `[signal_term, spawn_failed]` record with blanks must be refused) and one
+  on the writer (a signal during a failing spawn never reaches the trigger list). Weakening a
+  rule to tolerate a state that cannot occur would also have accepted a blank in some future
+  arrangement where the phase really had run.
 - **A UNIVERSAL WRITTEN TO CLOSE ONE LOOPHOLE CONTRADICTS THE RULE IT WAS CARVED OUT OF.**
   Having established that a server declining a capability must not blank a completion fact, the
   next sentence said `streams_closed` is "never `not_applicable`" — flatly, three paragraphs

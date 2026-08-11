@@ -2351,6 +2351,15 @@ MUTATIONS = [
      "self.sink.write(audit.LINE_EVENT, event=audit.MESSAGE_DROPPED, reason=action.code)",
      "self.sink.write(audit.LINE_EVENT, event=audit.MESSAGE_DROPPED, reason=action.detail)",
      "a late response to a cancelled request is dropped, and recorded as a CODE"),
+    # THE LOOSENING THAT WAS PROPOSED AND REJECTED (PR #108). Licensing off the trigger LIST
+    # accepts a blank behind any runner-up, which is only sound while no arrangement can put a
+    # pre-phase trigger behind an ending that did enter the phase — a premise the reader would
+    # then be resting on without checking.
+    ("M334-the-licence-reads-the-trigger-list-instead-of-the-latch", AUDIT,
+     "                and record.latch not in _NOT_APPLICABLE_LICENSED_BY[key]):",
+     ("                and not ({t.reason for t in record.triggers}\n"
+      "                         & _NOT_APPLICABLE_LICENSED_BY[key])):"),
+     "audit.the_licence_reads_the_latch_and_not_the_trigger_list"),
     ("M293-a-drop-reason-may-be-any-string", AUDIT,
      "            if not isinstance(reason, str) or reason not in DROP_REASONS:",
      "            if not isinstance(reason, str) or not reason:",

@@ -10072,6 +10072,28 @@ def _check_mcp_audit_verdict(failures, verbose):
            f"close: unlicensed={probs(na_unlicensed)} intake={probs(na_intake)}",
            failures, verbose)
 
+    # ...and it reads the LATCH, not the trigger list. The distinction is invisible to every
+    # single-trigger record above, so it needs a record with a runner-up: `spawn_failed` behind
+    # a signal licenses nothing, because what a blank claims is that the step never applied and
+    # only the event that ENDED the instance can say that.
+    #
+    # This is decidable rather than academic — the writer cannot produce this list. A signal is
+    # latched only by `_on_signal`, which runs only inside `_pump`, and `run()` enters `_pump`
+    # only when `_spawn()` succeeded, so a failed spawn returns with the wakeup byte unread. The
+    # arm exists because that is a property of control flow with nothing watching it: a refactor
+    # moving the spawn inside the loop would make this list producible, and the blanks it
+    # carries would then be accepted by a membership rule and refused by this one (PR #108).
+    na_runner_up = rec(triggers=({"reason": A.SIGNAL_TERM}, {"reason": A.SPAWN_FAILED}),
+                       fact_map={A.INTAKE_CLOSED: {"state": A.DONE},
+                                 **{k: {"state": A.NOT_APPLICABLE} for k in A.FACTS[1:]}})
+    _check("audit.the_licence_reads_the_latch_and_not_the_trigger_list",
+           all(f"not_applicable_unlicensed:{k}" in probs(na_runner_up) for k in A.FACTS[1:])
+           and len(A.FACTS[1:]) == 4,
+           f"`spawn_failed` as a RUNNER-UP licenses nothing: a blank says the step never "
+           f"applied, and only the trigger that ended the instance can establish that. The "
+           f"structural clause is the arity — an `all()` over an empty tail would pass while "
+           f"checking nothing: {probs(na_runner_up)}", failures, verbose)
+
     # ---- structural: `failed` names ONE cause, and the record must bear it ------------
     unpaired = rec(fact_map=facts(**{A.CHILD_REAPED: failed(A.SHUTDOWN_REAP_FAILED)}))
     orphan_outcome = rec(outcomes=({"kind": A.SHUTDOWN_REAP_FAILED},))
