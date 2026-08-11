@@ -1352,6 +1352,21 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   standalone GET licensing a global blank and, worse, "proving" no server-initiated message
   could arrive — which would have retired the filtering of POST stream events, laundering the
   exact traffic §10.6 exists to catch, with a clean audit log (review, PR #108).
+- **"WHICH FIELD IS SECRET" IS THE WRONG AXIS; THE QUESTION IS WHOSE VALUE SPACE IT IS.**
+  §10.10 twice put the resolved endpoint in an audit record, and once wrote the rule out loud
+  as "endpoint only, never the headers" — a sentence that sounds careful and sorts the fields
+  by the wrong property. `${VAR}` is honoured in `url`; `interpolated_refs` lists it beside
+  `env` and `headers` for exactly that reason. So `https://host/mcp?token=${TOKEN}` resolves to
+  a URL that IS a credential, headed for a log archived per cell. **Sort by whether the value
+  space is under this harness's control**: the declared server name is safe by construction —
+  the schema admits `[A-Za-z0-9_-]+` and forbids interpolation — while no subset of a resolved
+  URL is, since a secret can sit in the query, the path, the userinfo or a subdomain. "It would
+  be scrubbed" is not the answer either: §4 already records that redaction skips values under
+  `MIN_REDACTABLE_LEN` and that a short credential is still a credential.
+  Applying the same test one field further found a second instance the review had not named —
+  the session id, a capability handle for a session still open, was being persisted to answer a
+  question the reader never asks. The record keeps the *state*; the id stays on the order pipe
+  where the release actually needs it (review, PR #108).
 - **"THE PROCESS SURVIVED" IS NOT EVIDENCE ABOUT WHAT IT ASKED SOMEONE ELSE TO DO.** §10.10
   inferred "no order to initialize was ever issued" from *a terminator with no connect record*:
   the proxy lived, so it would have written the record had there been anything to write.
