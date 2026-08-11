@@ -1413,16 +1413,26 @@ ABA fix and its route to `parallel_safe_config = True`.
 - **Phase 3 antigravity** — MCP injection.
 - **C3 harness-owned filtering proxy** — required before any scenario points `tools:` at a
   server its author does not control, and required for agy tool gating regardless.
-  **Designed in `DESIGN_MCP_Support.md` §10 (2026-07-29); being built.** stdio only in the
-  first cut — remote `tools:` stays refused. Build order: ~~probe **C3-0**~~ →
+  **Designed in `DESIGN_MCP_Support.md` §10 (2026-07-29); built and shipped for stdio
+  (#107).** The first cut is stdio only — remote `tools:` stays refused, and since #107 by a
+  per-server check that names the transport rather than by the blanket refusal that had been
+  covering it incidentally. **The transport bridge that lifts it is designed in §10.10
+  (2026-08-11)**: the decision layer is reused verbatim, the ending model forks per transport
+  (`FACTS_REMOTE`, a connect record, a session to release instead of a group to signal), the
+  guardian generalizes rather than disappearing — and probe **C3-4** decides whether a session
+  the server declines to terminate is clean, which is a question about real servers rather
+  than a preference. Build order: ~~probe **C3-0**~~ →
   ~~probe **C3-1**~~ → ~~a **dual-era mode for `fixtures/echo_mcp_server.py`** (#98)~~ →
   ~~the **decision layer** + its arms, wired to nothing (#100)~~ →
   ~~the **audit record types**, the structural validator and `verdict()`
-  (`agentskill_evals/mcp_audit.py`), written before the code that produces them~~ → the
-  **I/O half** (spawn, the two pumps, `SIGTERM`/`SIGINT` handlers, §10.5's shutdown, writing
-  the audit log) plus a wire-level driver → the adapter integration that unlocks `tools:`.
-  Everything before the last slice cannot affect any run, which is the point: this is harness
-  code in the request path of every gated cell.
+  (`agentskill_evals/mcp_audit.py`), written before the code that produces them~~ →
+  ~~the **I/O half** (spawn, the two pumps, `SIGTERM`/`SIGINT` handlers, §10.5's shutdown,
+  writing the audit log) plus a wire-level driver (#103)~~ →
+  ~~the **adapter integration** that unlocks `tools:` for stdio (#107)~~ → **the bridge**,
+  in §10.10's four slices: the ending model, then the HTTP client half against the fixture,
+  then the guardian's session release, then the two-line adapter flip.
+  Everything before an adapter slice cannot affect any run, which is the point: this is
+  harness code in the request path of every gated cell.
   **The I/O half starts from §10.5.1, written before its code**: every way an instance can end,
   on two axes — the triggers, latched in order, plus the cleanup outcomes accumulated after
   them — together with a positive completion fact per teardown step, since a list of things
