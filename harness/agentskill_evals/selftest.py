@@ -10072,27 +10072,35 @@ def _check_mcp_audit_verdict(failures, verbose):
            f"close: unlicensed={probs(na_unlicensed)} intake={probs(na_intake)}",
            failures, verbose)
 
-    # ...and it reads the LATCH, not the trigger list. The distinction is invisible to every
-    # single-trigger record above, so it needs a record with a runner-up: `spawn_failed` behind
-    # a signal licenses nothing, because what a blank claims is that the step never applied and
-    # only the event that ENDED the instance can say that.
+    # ...and it reads the LATCH, not the trigger list — which needs a record with a runner-up,
+    # since every single-trigger record above satisfies both rules identically.
     #
-    # This is decidable rather than academic — the writer cannot produce this list. A signal is
-    # latched only by `_on_signal`, which runs only inside `_pump`, and `run()` enters `_pump`
-    # only when `_spawn()` succeeded, so a failed spawn returns with the wakeup byte unread. The
-    # arm exists because that is a property of control flow with nothing watching it: a refactor
-    # moving the spawn inside the loop would make this list producible, and the blanks it
-    # carries would then be accepted by a membership rule and refused by this one (PR #108).
+    # BOTH ORDERINGS, because only one of them is what the writer actually emits and the other
+    # is what the rule is about. `run()` drains the signal wakeup pipe AFTER the teardown,
+    # unconditionally, so a signal arriving while a spawn is failing lands as a runner-up and
+    # the producible list is `[spawn_failed, signal_term]` — which must be ACCEPTED, blanks and
+    # all. The reverse order licenses nothing, because a blank says the step never applied and
+    # only the event that ENDED the instance can establish that.
+    #
+    # PR #109 first justified this arm by claiming the writer could not produce either list at
+    # all — that a failed spawn never enters `_pump` and so never latches a signal. That was
+    # false, and a reader-only arm could not have shown it: `verify_mcp_proxy.py` now drives the
+    # writer against a `mute` guardian and asserts the ordering directly.
     na_runner_up = rec(triggers=({"reason": A.SIGNAL_TERM}, {"reason": A.SPAWN_FAILED}),
                        fact_map={A.INTAKE_CLOSED: {"state": A.DONE},
                                  **{k: {"state": A.NOT_APPLICABLE} for k in A.FACTS[1:]}})
+    na_latched = rec(triggers=({"reason": A.SPAWN_FAILED}, {"reason": A.SIGNAL_TERM}),
+                     fact_map={A.INTAKE_CLOSED: {"state": A.DONE},
+                               **{k: {"state": A.NOT_APPLICABLE} for k in A.FACTS[1:]}})
     _check("audit.the_licence_reads_the_latch_and_not_the_trigger_list",
-           all(f"not_applicable_unlicensed:{k}" in probs(na_runner_up) for k in A.FACTS[1:])
-           and len(A.FACTS[1:]) == 4,
-           f"`spawn_failed` as a RUNNER-UP licenses nothing: a blank says the step never "
-           f"applied, and only the trigger that ended the instance can establish that. The "
-           f"structural clause is the arity — an `all()` over an empty tail would pass while "
-           f"checking nothing: {probs(na_runner_up)}", failures, verbose)
+           (all(f"not_applicable_unlicensed:{k}" in probs(na_runner_up) for k in A.FACTS[1:])
+            and len(A.FACTS[1:]) == 4
+            and not any(p.startswith("not_applicable_unlicensed") for p in probs(na_latched))),
+           f"`spawn_failed` FIRST licenses the blanks and a trailing signal does not revoke "
+           f"them — that pair is what the writer really emits; `spawn_failed` behind a signal "
+           f"licenses nothing. The structural clause is the arity, since an `all()` over an "
+           f"empty tail would pass while checking nothing: runner_up={probs(na_runner_up)} "
+           f"latched={probs(na_latched)}", failures, verbose)
 
     # ---- structural: `failed` names ONE cause, and the record must bear it ------------
     unpaired = rec(fact_map=facts(**{A.CHILD_REAPED: failed(A.SHUTDOWN_REAP_FAILED)}))

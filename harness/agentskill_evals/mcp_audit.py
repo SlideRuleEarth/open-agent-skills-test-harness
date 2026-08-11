@@ -137,7 +137,14 @@ GUARDIAN_MISSING = "missing"             # its program is not there, so `Popen` 
 GUARDIAN_SILENT = "silent"               # it exits BEFORE reporting ready — no child is started
 GUARDIAN_IMPOSTER = "imposter"           # it reports a pid that is not its own — likewise
 GUARDIAN_LATE = "late"                   # it exits after the child exists, so the pin is lost
-GUARDIAN_MODES = frozenset({GUARDIAN_MISSING, GUARDIAN_SILENT, GUARDIAN_IMPOSTER, GUARDIAN_LATE})
+# It stays ALIVE and says nothing, so the proxy's readiness wait runs to its deadline instead of
+# ending on EOF. That distinction is the whole reason this mode exists next to `silent`: every
+# other way of failing establishment returns in microseconds, which leaves no window in which an
+# external event — a signal — can arrive while the spawn is still failing. §10.9 uses it to
+# produce the one ordering `spawn_failed` shares the trigger list with (review, PR #109).
+GUARDIAN_MUTE = "mute"
+GUARDIAN_MODES = frozenset({GUARDIAN_MISSING, GUARDIAN_SILENT, GUARDIAN_IMPOSTER, GUARDIAN_LATE,
+                            GUARDIAN_MUTE})
 
 # Every reason, on either axis, that leaves an instance clean. Everything else is an anomaly,
 # INCLUDING an unrecognized one — see `is_clean`.
@@ -1094,11 +1101,21 @@ def _observed_problems(terminator: dict) -> list[str]:
 def _spawn_partition(record: Record, inst: Instance) -> list[str]:
     """`spawn_failed` and a spawn record are exact complements, and both directions matter.
 
-    The signal handlers are why this is exact rather than approximate: a handler sets a flag and
-    the control path acts on it (§10.5), so a signal arriving between the start record and the
-    spawn does not skip the spawn. There is therefore no ending in which a terminator exists,
-    the spawn did not happen, and the latch says anything but `spawn_failed` — and a record
-    claiming one is claiming four `not_applicable` facts it has no licence for.
+    The invariant is about POSITION, not membership, and the difference is not cosmetic. A
+    signal arriving while a spawn is failing IS recorded — as a RUNNER-UP, because `run()`
+    drains the wakeup pipe again after the teardown, deliberately, so that a signal landing
+    mid-teardown is not silently dropped. What cannot happen is a signal getting there FIRST:
+    the handler does nothing but let `set_wakeup_fd` write a byte, that byte is read only by
+    `_on_signal`, and the only `_on_signal` a failed spawn reaches runs after `_spawn()` has
+    already latched. So `[spawn_failed, signal_term]` is an ordinary list, `[signal_term,
+    spawn_failed]` is not producible, and the latch-keyed licence in `verdict()` rests on the
+    second fact alone — a record claiming `spawn_failed` while carrying a spawn record is
+    claiming four `not_applicable` facts it has no licence for.
+
+    An earlier version of this docstring said a handler "sets a flag and the control path acts
+    on it", and a PR reasoning from that reading concluded the signal was never latched at all
+    (review, PR #109). `tools/verify_mcp_proxy.py` now drives the ordering against a `mute`
+    guardian rather than leaving it to be re-derived from prose.
     """
     if record.latch is None:
         return []                       # `triggers_empty` already says what is wrong here

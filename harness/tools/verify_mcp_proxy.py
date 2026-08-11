@@ -1147,6 +1147,31 @@ for _knob, _how in ((A.GUARDIAN_MISSING, "the guardian's program is not there"),
     finally:
         _un_chan.close()
 
+# THE WRITER SIDE OF THE LATCH RULE, and the case whose absence let a false claim reach a PR.
+# `mcp_audit` licenses a blank `not_applicable` off the LATCH, so what the audit reader depends
+# on is that a failed spawn is always FIRST in the trigger list. PR #109 justified that by
+# arguing the signal is never latched at all — the wakeup byte being drained only inside
+# `_pump`, which a failed spawn never enters. That is false: `run()` drains it again after the
+# teardown, unconditionally, so a signal delivered during a failing spawn lands as a RUNNER-UP.
+# The invariant is therefore narrower than the claim, and this is what holds it: `spawn_failed`
+# is structurally first because `_spawn()` records it before anything can read that pipe.
+#
+# `mute` is what makes the window exist — every other establishment failure returns in
+# microseconds, leaving nothing to signal into (review, PR #109).
+_sig_spawn = run(guardian=A.GUARDIAN_MUTE, grace=3.0, signal_after=signal.SIGTERM,
+                 settle=0.5, send=[], reply_per_send=False)
+check("a signal during a failing spawn does not displace `spawn_failed` as the latch",
+      _sig_spawn.triggers[:1] == [A.SPAWN_FAILED]
+      and (_sig_spawn.only.spawn if _sig_spawn.only else "no instance") is None,
+      f"the audit's whole licence rule reads position 0, so this is the property the reader "
+      f"rests on rather than 'the list has one entry': {_sig_spawn}")
+check("...and the signal IS recorded behind it, rather than being lost",
+      A.SIGNAL_TERM in _sig_spawn.triggers
+      and _sig_spawn.triggers.index(A.SPAWN_FAILED) < _sig_spawn.triggers.index(A.SIGNAL_TERM),
+      f"the post-teardown drain exists so a signal arriving mid-teardown is not silently "
+      f"dropped, and an arm asserting the list has exactly one entry would forbid the very "
+      f"behaviour the code is written for: {_sig_spawn.triggers}")
+
 # THE READY REPORT IS CHECKED AGAINST THE PROCESS THAT WAS STARTED, so a report from anything
 # else is not readiness. Phase one carries NO COMMAND, which is what makes the repudiation
 # total: the imposter's report is refused before the launch order is written, so no child was

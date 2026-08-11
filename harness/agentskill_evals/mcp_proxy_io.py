@@ -101,6 +101,11 @@ GROUP_GONE = "gone"
 GROUP_PRESENT = "present"
 
 _READ_CHUNK = 65536
+# How long §10.9's `mute` guardian stays alive saying nothing. A CEILING rather than a wait on
+# anything: the point is to outlast the proxy's readiness deadline so the wait ends on the
+# deadline instead of on EOF, and the proxy has already gone by the time this returns. Bounded
+# so a driver that crashes mid-case cannot leave one of these behind.
+_MUTE_CEILING = 30.0
 
 # The client's own descriptors, by number rather than through `sys.stdin`/`sys.stdout`. Those
 # are buffered wrappers this program must not use — a line left in a userspace buffer is a line
@@ -535,6 +540,15 @@ class Guardian:
         clean up on either path, because there is nothing yet.
         """
         if self.knob == audit.GUARDIAN_SILENT:
+            return False
+        if self.knob == audit.GUARDIAN_MUTE:
+            # ALIVE AND SILENT, which is what `silent` is not: that one exits, the report pipe
+            # reaches EOF, and `_read_report` returns at once. Here the pipe stays open, so the
+            # proxy waits out its whole `grace` — the only window in this program during which
+            # establishment is still failing and an external event can land. Bounded well past
+            # any grace the driver sets, because a guardian that outlived its proxy would be
+            # the leak this file exists to prevent.
+            time.sleep(_MUTE_CEILING)
             return False
         mine = os.getpid() + 1 if self.knob == audit.GUARDIAN_IMPOSTER else os.getpid()
         self.report(guardian_pid=mine)

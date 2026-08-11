@@ -2360,6 +2360,24 @@ MUTATIONS = [
      ("                and not ({t.reason for t in record.triggers}\n"
       "                         & _NOT_APPLICABLE_LICENSED_BY[key])):"),
      "audit.the_licence_reads_the_latch_and_not_the_trigger_list"),
+    # NO MUTATION FOR "spawn_failed IS FIRST", and the reason is worth more than a mutation.
+    # The obvious one — drain the wakeup pipe before `_spawn()` — was written, driven, and came
+    # back MISSED, correctly: there is no window between `signal.signal()` and `_spawn()` in
+    # which a signal can arrive, so an earlier drain finds an empty pipe and changes nothing.
+    # Displacing `spawn_failed` would require latching a signal from INSIDE `_spawn()`, where
+    # the wakeup fd is a local of `run()` and not in scope. The first position is therefore
+    # structural at a level this file cannot perturb, which is a stronger guarantee than a
+    # caught mutation and a weaker one than it looks: it holds because of a scope boundary, so
+    # a refactor that threads the fd into `_spawn()` would end it silently. That is what the
+    # writer check in `verify_mcp_proxy.py` stands guard over, mutation or no mutation.
+    #
+    # What IS producible is the other half: dropping the post-teardown drain loses a signal the
+    # log is written to carry. The pair matters — an arm asserting only "spawn_failed is first"
+    # is equally satisfied by a proxy that never records a signal at all.
+    ("M336-a-signal-arriving-during-teardown-is-dropped", PROXY_IO,
+     "            self._on_signal(wake_r)\n        finally:",
+     "            pass\n        finally:",
+     "...and the signal IS recorded behind it, rather than being lost"),
     ("M293-a-drop-reason-may-be-any-string", AUDIT,
      "            if not isinstance(reason, str) or reason not in DROP_REASONS:",
      "            if not isinstance(reason, str) or not reason:",
