@@ -1352,6 +1352,27 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   standalone GET licensing a global blank and, worse, "proving" no server-initiated message
   could arrive — which would have retired the filtering of POST stream events, laundering the
   exact traffic §10.6 exists to catch, with a clean audit log (review, PR #108).
+- **A VALUE FROM AN OPEN DOMAIN CANNOT CARRY ITS OWN STATUS IN-BAND.** §10.10's connect record
+  held `session: none | <id> | indeterminate`, which is unsound the moment you look at what an
+  id may be: visible ASCII, so a real session id may literally *be* `"none"`. A live session
+  would then decode as no session and its release would be skipped — the failure landing on the
+  one path the whole record exists to protect. The tagged form is `{"state": …, "id": …}` with
+  `id` required for `known` and forbidden otherwise, malformed in both directions. This repo had
+  already solved the same problem: `_MISSING` exists in `mcp_audit` because `child_status: null`
+  is "a record claiming the evidence exists while carrying none of it". **The generalization is
+  wider than absence** — any status multiplexed into a field whose value space you do not
+  control is a collision waiting for a peer that picks the wrong string (review, PR #108).
+- **NARROWING A RULE TOO FAR LEAVES A CASE WITH NO LEGAL SPELLING, AND THE FIX IS THE
+  CROSS-PRODUCT.** Told that `connect_failed` must not blank `session_released`, the repair said
+  "never" — and the branch where there is *no connect record at all*, because the guardian never
+  completed phase one and so never received a launch order, then had no legal fact: nothing was
+  minted, nothing can be released, and the only honest state was the one just forbidden. Two
+  rounds, two overshoots, in opposite directions, on one predicate. **When a rule is corrected
+  by narrowing, enumerate the cross-product of its inputs and give each cell a value** — here
+  {no record, none, known, indeterminate} × the fact — rather than editing the sentence that was
+  wrong. Enumerating it also produced the premise that makes the first cell sound: the terminator
+  must be *present*, since a missing connect record without one is the absence case and may well
+  be hiding a session.
 - **A PARALLEL COPIED FROM THE OTHER TRANSPORT CARRIED A PREMISE THAT DOES NOT HOLD THERE.**
   `connect_failed` was given `spawn_failed`'s exact shape — trigger ⟺ no record, licensing
   every fact of the phase — because the two occupy the same slot in their respective
