@@ -1456,7 +1456,9 @@ ABA fix and its route to `parallel_safe_config = True`.
   the guardian generalizes rather than disappearing — **it owns the request that mints the
   session**, exactly as it already owns the spawn, because a proxy that learned the session id
   and then handed it over leaves a window with the shape of the leak the guardian exists to
-  close. Probe **C3-4** decides whether a session the server declines to terminate is clean,
+  close. The standalone server→client `GET` stream is in the first cut with a lifecycle of its
+  own, because the proxy presents *stdio* to the CLI and stdio is symmetric: not opening it
+  would turn a bidirectional channel into a half-duplex one with nothing able to notice. Probe **C3-4** decides whether a session the server declines to terminate is clean,
   and asks first whether that server is even in the era this machinery belongs to — modern
   removed protocol sessions. Build order: ~~probe **C3-0**~~ →
   ~~probe **C3-1**~~ → ~~a **dual-era mode for `fixtures/echo_mcp_server.py`** (#98)~~ →
