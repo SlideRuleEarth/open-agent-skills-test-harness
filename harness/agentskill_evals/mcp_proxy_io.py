@@ -81,6 +81,15 @@ GUARDIAN_ENV = "ASE_MCP_GUARDIAN"        # how to break the guardian, for §10.9
 # satisfied by anything but this invocation.
 PHASE_NONCE_ENV = "ASE_MCP_PHASE_NONCE"
 
+# EVERY VAR ABOVE, AS ONE SET, because the rule is about the category and not about the members:
+# what the proxy reads to configure ITSELF is never the declared server's business, so the child's
+# environment is built by subtracting this set rather than by subtracting a list someone remembered
+# to extend. `PHASE_NONCE_ENV` is why it exists — it was added as a fifth control var and the strip
+# site kept naming four, so a driver-set var reached the child (review, PR #109). A sixth added
+# below is stripped by having been declared here, and `verify_mcp_proxy.py` asserts over this same
+# tuple rather than over a copy of it, so the check widens with the set.
+CONTROL_ENV = (FAULT_ENV, INHERIT_ENV, GRACE_ENV, GUARDIAN_ENV, PHASE_NONCE_ENV)
+
 DEFAULT_GRACE = 5.0
 
 GUARDIAN_FLAG = "--guardian"
@@ -978,8 +987,11 @@ class Instance:
         env = dict(os.environ)
         env.update(self.cfg.env)
         # The proxy's own control vars are not the child's business, and one of them names
-        # descriptors the child is about to be handed by inheritance rather than by name.
-        for key in (FAULT_ENV, INHERIT_ENV, GRACE_ENV, GUARDIAN_ENV):
+        # descriptors the child is about to be handed by inheritance rather than by name. The
+        # SET is the authority (see `CONTROL_ENV`): naming the members here is what let a fifth
+        # one through. The guardian is unaffected — it inherits this process's environment
+        # rather than this dict, which is how it still reads `PHASE_NONCE_ENV` for its marker.
+        for key in CONTROL_ENV:
             env.pop(key, None)
         inherit = _inherit_fds()
         child_in_r, child_in_w = os.pipe()

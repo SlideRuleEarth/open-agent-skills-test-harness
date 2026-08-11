@@ -2388,6 +2388,30 @@ MUTATIONS = [
      "            self._on_signal(wake_r)\n        finally:",
      "            pass\n        finally:",
      "...and the signal IS recorded behind it, rather than being lost"),
+    # THE WITNESS ITSELF, removed. The nonce marker is what says the case's window was entered,
+    # and while its absence was a printed NOTE the run carried on and the case was scored over a
+    # window that never opened. This is the mutation that would have reported MISSED then: it
+    # takes the marker away and nothing else, so what catches it is the witness being an
+    # assertion rather than a remark (review, PR #109).
+    ("M338-the-phase-marker-is-never-written", PROXY_IO,
+     "            self._phase(f\"mute-waiting {os.environ.get(PHASE_NONCE_ENV, '')}\")\n",
+     "",
+     "the awaited phase marker appears, so the case below measures its own window"),
+    # THE DEFECT THIS BRANCH SHIPPED: a fifth control var was declared and the strip site kept
+    # naming four, so `ASE_MCP_PHASE_NONCE` was handed to the declared server. Removing it from
+    # the set is that state exactly, and the check reads the set rather than a copy of it, so
+    # the mutation is caught by the same clause a sixth var would be covered by.
+    ("M339-a-control-var-is-left-out-of-the-strip-set", PROXY_IO,
+     "CONTROL_ENV = (FAULT_ENV, INHERIT_ENV, GRACE_ENV, GUARDIAN_ENV, PHASE_NONCE_ENV)",
+     "CONTROL_ENV = (FAULT_ENV, INHERIT_ENV, GRACE_ENV, GUARDIAN_ENV)",
+     "...and no variable the proxy reads for itself is in it"),
+    # ...and the site as well as the declaration. M339 perturbs WHAT is declared a control var
+    # and this perturbs whether the declaration is acted on, which are two different edits a
+    # refactor can make. The pair is what says the tuple and the loop are load-bearing together.
+    ("M340-the-child-inherits-the-proxys-control-vars", PROXY_IO,
+     "        for key in CONTROL_ENV:\n            env.pop(key, None)\n",
+     "",
+     "...and no variable the proxy reads for itself is in it"),
     ("M293-a-drop-reason-may-be-any-string", AUDIT,
      "            if not isinstance(reason, str) or reason not in DROP_REASONS:",
      "            if not isinstance(reason, str) or not reason:",
@@ -2747,6 +2771,14 @@ MUTATIONS = [
      "            self._refuse(refusal)",
      ("...while the refused POST is still RECORDED, so a credential sent to a rejected origin "
       "is not invisible")),
+    # THE POSITIVE CONTROL'S OWN CONTROL. `env_seen: []` is what the child reports when the
+    # strip works, when the environment never arrived, and when this reporter is broken — so
+    # the case asserts a variable it must see, and this is the mutation proving that clause can
+    # fail. Without it the leak check passes against a fixture that answers nothing.
+    ("F36-the-child-reports-no-environment-at-all", TARGET,
+     '"pgid": os.getpgid(0), "env_seen": sorted(set(seen))}',
+     '"pgid": os.getpgid(0), "env_seen": []}',
+     "the child's environment arrives by the route a control var would take"),
 
 ]
 

@@ -221,11 +221,16 @@ def _readable(fd: int, timeout: float) -> bool:
 
 
 class Result:
-    def __init__(self, returncode, replies, log, allowed, server, stderr="") -> None:
+    def __init__(self, returncode, replies, log, allowed, server, stderr="",
+                 control_installed=frozenset()) -> None:
         self.returncode = returncode
         self.replies = replies
         self.log = log
         self.stderr = stderr
+        # The control vars THIS DRIVER put into the proxy's environment, read off the dict it
+        # built rather than named a second time. It is the independent source the control-var
+        # case needs — see the check, and the MISSED that made it necessary.
+        self.control_installed = frozenset(control_installed)
         self.verdict = A.log_verdict(log, server=server, allowed=frozenset(allowed))
         self.instances, self.parse_problems = A.parse_log(log)
 
@@ -290,6 +295,11 @@ def run(*, command=None, args=None, tools=("echo",), env=None, fault=None, guard
                        "audit_log": log_path}, handle)
 
         child_env = dict(os.environ)
+        # SNAPSHOT FIRST, so the control vars below can be recovered as "the keys this function
+        # added" instead of being listed again somewhere a copy could drift. An ambient
+        # `ASE_MCP_*` in the verifier's own environment would be missing from that difference,
+        # and the case that reads it fails closed and says which name it could not account for.
+        _pre_control = set(child_env)
         child_env[IO.GRACE_ENV] = str(grace)
         child_env.pop(IO.FAULT_ENV, None)
         child_env.pop(IO.GUARDIAN_ENV, None)
@@ -395,11 +405,17 @@ def run(*, command=None, args=None, tools=("echo",), env=None, fault=None, guard
                 if _seen:
                     break
                 time.sleep(0.05)
-            if not _seen:
-                # Reported here rather than left to the case's own assertion, which would fail
-                # for a reason that looks nothing like "the window never opened".
-                print(f"  NOTE  the awaited marker {await_stderr!r} never appeared; the case "
-                      f"below is measuring something other than what it was written for")
+            # AN ASSERTION RATHER THAN A NOTE, which is the same defect this witness exists to
+            # prevent, one level up: a `print` let the run continue, so the case was evaluated
+            # over a window that was never entered and its result — red OR green — was about a
+            # different run than the one it names. A witness that only advises is not a witness,
+            # and the failure it would have to be inferred from is a neighbouring assertion
+            # going red for a reason that looks nothing like this one (review, PR #109).
+            check("the awaited phase marker appears, so the case below measures its own window",
+                  _seen,
+                  f"{await_stderr!r} never reached stderr inside {REPLY_DEADLINE:.0f}s: the "
+                  f"proxy never entered the phase this case delivers into, so nothing after "
+                  f"this point is evidence about the phase it names")
         if after_send is not None:
             after_send(proc)
         if kill_after is not None:
@@ -435,7 +451,8 @@ def run(*, command=None, args=None, tools=("echo",), env=None, fault=None, guard
             # here it means the proxy died before the boundary — which is a finding, not a
             # crash in the verifier.
             log = ""
-        return Result(returncode, replies, log, tools, server, stderr).observe()
+        return Result(returncode, replies, log, tools, server, stderr,
+                      control_installed=set(child_env) - _pre_control).observe()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1171,12 +1188,49 @@ for _knob, _how in ((A.GUARDIAN_MISSING, "the guardian's program is not there"),
     finally:
         _un_chan.close()
 
-def guardian_pids() -> set[int]:
-    """Every live guardian's pid, read from OUTSIDE this program.
+class ObserverFailed(Exception):
+    """`ps` did not answer. NOT the same fact as `ps` answering "nothing", and the whole
+    reason this is an exception rather than an empty set: the survivor check reads absence as
+    proof, so an observation channel that was never connected would report the same silence as
+    one reporting success — and the suite would certify a leak it never looked for. Reproduced
+    by review with `ps` denied: rc 127, and the verifier printed ALL PASS including "the mute
+    guardian goes" (PR #109).
+    """
+
+
+def process_table() -> dict[int, str]:
+    """Every live pid and its command line, read from OUTSIDE this program.
 
     `ps` rather than anything the proxy reports, because the question is whether something the
     driver has stopped tracking is still alive — precisely the question a process cannot answer
     about itself.
+
+    THREE WAYS IT CAN FAIL AND ALL THREE RAISE, including the one that looks like an answer:
+    a non-zero exit with output on stderr used to be read as an empty process table. The third
+    is the self-witness — `ps -e` that cannot see THIS process has not enumerated the machine,
+    whatever it exited with, and what it says about any other pid is not evidence. That is a
+    positive fact about the channel, obtained before any conclusion is drawn from its silence.
+    """
+    try:
+        done = subprocess.run(["ps", "-eo", "pid=,command="], capture_output=True, text=True,
+                              timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ObserverFailed(f"`ps` did not run: {exc!r}") from exc
+    if done.returncode != 0:
+        raise ObserverFailed(f"`ps` exited {done.returncode}: {done.stderr.strip()[:200]!r}")
+    table = {}
+    for line in done.stdout.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if pid.isdigit():
+            table[int(pid)] = command
+    if os.getpid() not in table:
+        raise ObserverFailed(f"`ps` answered without listing this process ({os.getpid()}) among "
+                             f"its {len(table)} row(s), so it did not enumerate the machine")
+    return table
+
+
+def guardian_pids() -> set[int]:
+    """Every live guardian's pid.
 
     PIDS RATHER THAN A COUNT, so the check below can name the survivors it means. A count made
     the check read every guardian on the machine, including one a PREVIOUS mutation deliberately
@@ -1186,17 +1240,8 @@ def guardian_pids() -> set[int]:
     a pid absent before the case and present after it appeared during the case, and the suite is
     serial.
     """
-    try:
-        out = subprocess.run(["ps", "-eo", "pid=,command="], capture_output=True, text=True,
-                             timeout=10).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return set()
-    found = set()
-    for line in out.splitlines():
-        pid, _, command = line.strip().partition(" ")
-        if IO.GUARDIAN_FLAG in command and "mcp_proxy_io" in command and pid.isdigit():
-            found.add(int(pid))
-    return found
+    return {pid for pid, command in process_table().items()
+            if IO.GUARDIAN_FLAG in command and "mcp_proxy_io" in command}
 
 
 # THE WRITER SIDE OF THE LATCH RULE, and the case whose absence let a false claim reach a PR.
@@ -1211,10 +1256,38 @@ def guardian_pids() -> set[int]:
 # `mute` is what makes the window exist — every other establishment failure returns in
 # microseconds, leaving nothing to signal into (review, PR #109).
 _mute_nonce = uuid.uuid4().hex
+# EVERY READING GOES THROUGH HERE, so a broken observer is a recorded fact rather than a set
+# that happens to be empty. Collected rather than raised because the failure has to arrive as a
+# NAMED check: a traceback out of the middle of the file ends the run without saying which
+# property went unproven, and the two claims below both rest on this one.
+_observer_fault: list[str] = []
+
+
+def observed_guardians(when: str) -> set[int]:
+    try:
+        return guardian_pids()
+    except ObserverFailed as exc:
+        _observer_fault.append(f"{when}: {exc}")
+        return set()
+
+
 # BEFORE the case, so the survivor check below is scoped to what this case introduced.
-_guardians_before = guardian_pids()
+_guardians_before = observed_guardians("before the case")
+_guardians_during: set[int] = set()
+
+
+def _watch_mute_guardian(_proc) -> None:
+    """Sampled INSIDE the window, which is what makes the absence afterwards mean anything.
+
+    `run` calls this after the awaited marker has been witnessed and before it signals, so the
+    guardian is in its lifeline wait and known alive — the one moment at which `ps` finding it
+    is a fact about the observer rather than about the guardian.
+    """
+    _guardians_during.update(observed_guardians("during the case") - _guardians_before)
+
+
 _sig_spawn = run(guardian=A.GUARDIAN_MUTE, grace=3.0, signal_after=signal.SIGTERM,
-                 settle=0.0, send=[], reply_per_send=False,
+                 settle=0.0, send=[], reply_per_send=False, after_send=_watch_mute_guardian,
                  phase_nonce=_mute_nonce, await_stderr=f"mute-waiting {_mute_nonce}")
 check("a signal during a failing spawn does not displace `spawn_failed` as the latch",
       _sig_spawn.triggers[:1] == [A.SPAWN_FAILED]
@@ -1235,18 +1308,95 @@ check("...and the signal IS recorded behind it, rather than being lost",
 # found by review rather than by anything here. That is the exact leak class §10.6 is about,
 # introduced by an instrument. `mute` now waits on the lifeline and the ceiling is a backstop,
 # and this is what says so: measured from outside, bounded well under the ceiling.
-_new_guardians = set()
+#
+# THE POSITIVE CONTROL COMES FIRST, and it is not a courtesy. "No guardian survives" is a claim
+# read off an absence, so it is satisfied by an observer that sees nothing at all — including
+# one that failed. This says the same instrument found this exact guardian a moment earlier,
+# while the case held it alive, which is the only thing that makes the absence below a
+# measurement rather than a silence.
+check("the survivor observer finds the `mute` guardian while the case is holding it alive",
+      not _observer_fault and bool(_guardians_during),
+      f"either `ps` did not answer ({_observer_fault[:1]}) or it answered without the guardian "
+      f"the awaited marker just proved was waiting — in both cases the check below would read "
+      f"'gone' off an instrument that never saw it arrive. before={len(_guardians_before)} "
+      f"during={sorted(_guardians_during)}")
+_survivors = set(_guardians_during)
 for _attempt in range(20):
-    _new_guardians = guardian_pids() - _guardians_before
-    if not _new_guardians:
+    _survivors = _guardians_during & observed_guardians("after the case")
+    if not _survivors or _observer_fault:
         break
     time.sleep(0.25)
 check("the `mute` guardian goes when its proxy goes, rather than sleeping out its ceiling",
-      not _new_guardians,
+      not _observer_fault and bool(_guardians_during) and not _survivors,
       f"a test knob that leaks a process is worse than no knob: every later case then runs "
-      f"beside a survivor and a green suite certifies it. Read from `ps` and scoped to pids "
-      f"this case introduced, well inside the {IO._MUTE_CEILING:.0f}s ceiling: "
-      f"{sorted(_new_guardians)} still alive")
+      f"beside a survivor and a green suite certifies it. Read from `ps`, scoped to the pids "
+      f"this case was watched to introduce, well inside the {IO._MUTE_CEILING:.0f}s ceiling: "
+      f"{sorted(_survivors)} still alive; observer={_observer_fault[:1]}")
+
+# ---------------------------------------------------------------------------------------
+# The proxy's own knobs are not the declared server's environment
+# ---------------------------------------------------------------------------------------
+# WHAT THE PROXY READS TO CONFIGURE ITSELF NEVER REACHES THE CHILD, and the rule is about the
+# category rather than the members: the strip site named four variables while five existed, so
+# `ASE_MCP_PHASE_NONCE` was handed to the declared server (review, PR #109). The set moved into
+# `IO.CONTROL_ENV` and this asserts over that same tuple — imported, not copied — so a sixth
+# control var is covered by having been declared rather than by anyone remembering this file.
+#
+# ALL FIVE ARE ACTUALLY PRESENT in the proxy's environment here, which takes two no-op values:
+# `fault=""` is arm-only mode (present, suppresses nothing) and `guardian=""` names no injection,
+# so both variables exist without changing what the run does. A case that only set the vars it
+# found convenient would prove the strip for those and quantify over all of them.
+#
+# THE CHILD IS ASKED BY PREFIX, NOT BY LIST, and the first version of this asked with
+# `IO.CONTROL_ENV` itself — which reads well and cannot fail. Driven by hand before the suite,
+# the mutation that removes a name from that tuple came back MISSED: the question and the answer
+# were the same expression, so deleting a member deleted the query for it too, and a var the
+# proxy no longer stripped was a var the case no longer asked about. What the child reports here
+# is every name it can see sharing the control family's prefix, and what it is measured against
+# is the set the DRIVER installed — two sources, neither of them the definition under test.
+_env_nonce = uuid.uuid4().hex
+_env_chan = Channel("control-env")
+# Derived from the family rather than typed, and required to be non-empty below: a prefix that
+# collapsed to "" would silently turn this into a question about the whole environment.
+_control_prefix = os.path.commonprefix(list(IO.CONTROL_ENV))
+# PATH RIDES ALONG AS THE POSITIVE CONTROL. `env_seen: []` is what a child reports when the
+# reporting itself is broken, when the environment never arrived, and when the strip works —
+# three states one empty list cannot distinguish. PATH is inherited by the same route the
+# control vars would take, so seeing it says the route exists and the reporter answers.
+_env_rec = None                  # bound before the `try`, so the `finally` cannot raise instead
+try:
+    _env_found = run(args=[TARGET], tools=("alpha",), server="target", channels=(_env_chan,),
+                     env={"PT_NONCE": _env_nonce, "PT_CHILD_FD": str(_env_chan.writer),
+                          "PT_REPORT_ENV": f"{_control_prefix}*,PATH"},
+                     fault="", guardian="", phase_nonce=_env_nonce,
+                     send=[], reply_per_send=False)
+    _env_rec = _env_chan.record(DEADLINE)
+    _env_seen = set(_env_rec.get("env_seen") or ()) if isinstance(_env_rec, dict) else set()
+    check("the child's environment arrives by the route a control var would take",
+          isinstance(_env_rec, dict) and _env_rec.get("nonce") == _env_nonce
+          and "PATH" in _env_seen and "PATH" in os.environ,
+          f"without this, the assertion below is satisfied by a child that never started, never "
+          f"read `PT_REPORT_ENV`, or was handed no environment at all: {_env_rec}")
+    # THE CASE IS PINNED TO THE DECLARATION, which is the other half of asking by prefix. The
+    # question no longer widens by itself when a sixth control var is declared, so this is what
+    # says so: the run must have installed every name the proxy calls a control var, and a set
+    # that has grown or shrunk under it fails here rather than going quietly unexercised.
+    check("the case installs every variable the proxy declares as its own",
+          bool(_control_prefix) and _env_found.control_installed == set(IO.CONTROL_ENV),
+          f"declared {sorted(IO.CONTROL_ENV)} under prefix {_control_prefix!r}; this run put "
+          f"{sorted(_env_found.control_installed)} into the proxy's environment, so the two "
+          f"disagree about what is being tested")
+    check("...and no variable the proxy reads for itself is in it",
+          isinstance(_env_rec, dict) and "PATH" in _env_seen
+          and not (_env_seen & _env_found.control_installed)
+          and not {n for n in _env_seen if n.startswith(_control_prefix)},
+          f"a control var in the server's environment is a knob the server can read and a "
+          f"harness detail in its process image; the driver installed "
+          f"{sorted(_env_found.control_installed)} and the child saw {sorted(_env_seen)}")
+finally:
+    reap_group(_env_rec if isinstance(_env_rec, dict) else None, _env_nonce, _env_chan)
+    _env_chan.close()
+
 
 # THE READY REPORT IS CHECKED AGAINST THE PROCESS THAT WAS STARTED, so a report from anything
 # else is not readiness. Phase one carries NO COMMAND, which is what makes the repudiation
