@@ -1357,7 +1357,11 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   as "endpoint only, never the headers" — a sentence that sounds careful and sorts the fields
   by the wrong property. `${VAR}` is honoured in `url`; `interpolated_refs` lists it beside
   `env` and `headers` for exactly that reason. So `https://host/mcp?token=${TOKEN}` resolves to
-  a URL that IS a credential, headed for a log archived per cell. **Sort by whether the value
+  a URL that IS a credential, written to a file the harness reads and can quote into a failure
+  message. (The first draft of this entry said "a log archived per cell"; it is not archived —
+  see the §10.7 correction. The rule never needed that premise, and reaching for it was the
+  same reflex as citing a spec page without checking which revision it was on.)
+  **Sort by whether the value
   space is under this harness's control**: the declared server name is safe by construction —
   the schema admits `[A-Za-z0-9_-]+` and forbids interpolation — while no subset of a resolved
   URL is, since a secret can sit in the query, the path, the userinfo or a subdomain. "It would
@@ -1365,8 +1369,13 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   `MIN_REDACTABLE_LEN` and that a short credential is still a credential.
   Applying the same test one field further found a second instance the review had not named —
   the session id, a capability handle for a session still open, was being persisted to answer a
-  question the reader never asks. The record keeps the *state*; the id stays on the order pipe
-  where the release actually needs it (review, PR #108).
+  question the reader never asks. The record keeps the *state*; the **guardian** retains the id,
+  because it is the process that must release the session if the proxy dies first, and reports
+  it up the **report** pipe for the proxy to hold in memory. (Two drafts said "order pipe" —
+  the lifeline carries orders *out* and its EOF fires the sweep, so a report sent that way
+  would run against the traffic and take guardian-loss detection with it. Naming a channel by
+  what it is *for* rather than by reading the topology is the same slip as the guardian
+  ownership round, one file over.) (review, PR #108)
 - **"THE PROCESS SURVIVED" IS NOT EVIDENCE ABOUT WHAT IT ASKED SOMEONE ELSE TO DO.** §10.10
   inferred "no order to initialize was ever issued" from *a terminator with no connect record*:
   the proxy lived, so it would have written the record had there been anything to write.
