@@ -107,6 +107,34 @@ SERVER_NAME = os.environ.get("ECHO_MCP_SERVER_NAME", "echo")
 # `mcp_echo_*` scenarios assert against.
 IDENTITY = os.environ.get("ECHO_MCP_IDENTITY") or ""
 
+# Opt-in receipts, for the one question no reply can answer: what did the CLIENT actually
+# send? `IDENTITY` proves an answer travelled back; this proves a request arrived. Measuring
+# whether a CLI's own `tools:` filter is a real boundary needs exactly that and nothing else —
+# §6-C2 measured claude's flag NOT stopping the call, which is the finding C3 exists because
+# of, and it is a fact about arrival rather than about the model's account of itself.
+#
+# ONE LINE OF JSON PER REQUEST, FLUSHED, and a `listening` record at startup — the same shape
+# as `http_mcp_server.py`, deliberately, because an observation channel that was never
+# connected reports the same silence as one reporting a clean run (§4). The startup record is
+# what lets a reader tell "the filter stopped it" from "the server never ran".
+#
+# It records the METHOD and, for `tools/call`, the tool name. Not the arguments: they are
+# chosen by a model and this file is archived.
+RECEIPTS = os.environ.get("ECHO_MCP_RECEIPTS") or ""
+
+
+def _receipt(**fields) -> None:
+    """Append one record. Never raises: an instrument that can kill the subject it observes
+    turns a measurement into a different measurement."""
+    if not RECEIPTS:
+        return
+    try:
+        with open(RECEIPTS, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(fields) + "\n")
+            handle.flush()
+    except OSError:
+        pass
+
 # Set by an accepted `initialize`, and the only state carried across requests. Modern
 # supplies its context per request; legacy semantics exist only once initialize selects
 # them, which is why "no modern metadata" cannot be read as "legacy".
@@ -333,6 +361,11 @@ def _call_tool(params: dict) -> dict:
 
 
 def main() -> int:
+    # THE POSITIVE FACT, written before a single request is read. Absence of a `tools/call`
+    # receipt is the whole finding a gating measurement rests on, and absence is also what a
+    # server that never started produces — so the reader checks this record first and calls
+    # the run unmeasured without it, rather than reading silence as a filter working.
+    _receipt(kind="listening", server=SERVER_NAME, tools=[t["name"] for t in TOOLS])
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -349,6 +382,14 @@ def main() -> int:
         method = msg.get("method")
         req_id = msg.get("id")
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+
+        # BEFORE `_reject`, and before the notification check below. What a measurement of a
+        # client's filter needs is what the client SENT, which is not the same set as what
+        # this server chose to answer — a request refused here still arrived, and a filter
+        # that let it through has already failed whether or not it got a reply.
+        _receipt(kind="request", method=method if isinstance(method, str) else None,
+                 tool=(params.get("name") if method == "tools/call"
+                       and isinstance(params.get("name"), str) else None))
 
         # A NOTIFICATION carries no id and must never be answered — `notifications/
         # initialized` is the one every client sends, and replying to it is a protocol
