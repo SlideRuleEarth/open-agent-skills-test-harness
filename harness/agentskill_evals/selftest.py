@@ -11032,13 +11032,70 @@ def _check_mcp_declared_servers(failures, verbose):
            f"assertion would fail for a reason that looks nothing like the cause",
            failures, verbose)
 
-    _check("mcp.claude_refuses_tools_it_cannot_enforce",
-           len(tools_claude) == 1 and "C3" in tools_claude[0]
-           and "tools:" in tools_claude[0],
-           f"`tools:` on claude is a validation ERROR, not an accepted no-op: the only "
-           f"mechanism is deny-the-complement, which needs a tool list obtainable only "
-           f"from a second server instance that can answer differently than the one claude "
-           f"launches (§6-C2). The error points at C3 — {tools_claude}", failures, verbose)
+    # `tools:` on claude was a validation ERROR from #84 until the C3 adapter integration,
+    # because the only claude-side mechanism is deny-the-complement and that needs a tool list
+    # obtainable only from a second server instance free to answer differently than the one
+    # claude launches (§6-C2). The filter now lives in the harness instead: claude is handed
+    # `mcp_proxy_io.py` as if it were the server. So this arm flipped direction, and its
+    # CONTROL below is what keeps the flip from reading as "everything is accepted now".
+    _check("mcp.claude_gates_tools_through_the_harness_proxy",
+           tools_claude == []
+           and get_adapter("claude").mcp_tool_filter == "proxy",
+           f"a declared `tools:` allowlist is ACCEPTED on claude now, and accepted because "
+           f"something enforces it: the filter is `proxy`, meaning the harness puts its own "
+           f"program on the wire rather than asking the CLI for a guarantee it has no "
+           f"mechanism to give — errors={tools_claude}", failures, verbose)
+
+    class _UnbuiltFilter(get_adapter("claude").__class__):
+        """An injecting adapter whose filter is NOT an enforcement. Subclassed from claude so
+        the only difference from the arm above is the one field under test."""
+        name = "fake-unbuilt"
+        mcp_tool_filter = "unbuilt"
+
+    _check("mcp.a_tool_filter_outside_the_enforcing_set_still_refuses",
+           len(_UnbuiltFilter().validate_mcp_support(gated)[0]) == 1
+           and "unbuilt" not in get_adapter("claude").ENFORCING_TOOL_FILTERS,
+           f"the control for the arm above: an adapter that can inject but whose filter is "
+           f"not in ENFORCING_TOOL_FILTERS still refuses `tools:`, so the acceptance above "
+           f"is about the proxy existing and not about the check being gone — "
+           f"{_UnbuiltFilter().validate_mcp_support(gated)[0]}", failures, verbose)
+
+    # THE PROXY IS STDIO-ONLY, and until the C3 integration nothing said so out loud: the
+    # filter read "unbuilt", so the blanket refusal above covered a remote server too and the
+    # remote case never needed a check of its own. Flipping the constant to "proxy" for the
+    # stdio case it was built for therefore un-refused a case DESIGN §10 still calls out of
+    # scope, and the run got as far as a proxy config naming no command (review, PR #107).
+    _cla = get_adapter("claude")
+    remote_gated = parse_mcp_servers(
+        {"r": {"url": "https://example.invalid/mcp", "tools": ["echo"]}}, where="t")
+    remote_errs = _cla.validate_mcp_support(remote_gated)[0]
+    _check("mcp.a_remote_server_cannot_be_gated_by_a_proxy_that_speaks_stdio",
+           (len(remote_errs) == 1
+            and "stdio" in remote_errs[0] and "url" in remote_errs[0]
+            # claude's override glues the deny-the-complement explanation onto the GENERIC
+            # "not implemented" wording. This refusal has a reason of its own, and inheriting
+            # a paragraph about a mechanism that is not the obstacle would send the reader to
+            # C3 — which is built, and is exactly what refused them.
+            and "deny-the-complement" not in remote_errs[0]
+            and _cla.tool_filter_for(remote_gated["r"])[0]
+            not in _cla.ENFORCING_TOOL_FILTERS
+            and _cla.tool_filter_for(gated["e"])[0] in _cla.ENFORCING_TOOL_FILTERS),
+           f"`mcp_proxy_io.py` is spawned as the server and speaks pipes, so a `url:` server "
+           f"gives it nothing to connect to — and the refusal names the transport rather than "
+           f"claiming the feature is missing, which it is not for the stdio server checked in "
+           f"the same breath: {remote_errs}", failures, verbose)
+
+    # ...and the question is asked PER SERVER. One answer for the whole mapping is correct only
+    # while every server has the same one, which is exactly what stopped being true.
+    _mixed = parse_mcp_servers({"local": {"command": "python3", "tools": ["echo"]},
+                                "remote": {"url": "https://x.invalid/mcp", "tools": ["echo"]}},
+                               where="t")
+    _mixed_errs = _cla.validate_mcp_support(_mixed)[0]
+    _check("mcp.the_gating_question_is_asked_per_server_not_per_scenario",
+           len(_mixed_errs) == 1 and "MCP server(s) remote set" in _mixed_errs[0],
+           f"a scenario mixing a server this adapter can filter with one it cannot keeps the "
+           f"first and refuses the second BY NAME — an error listing both would send someone "
+           f"to delete a `tools:` that works: {_mixed_errs}", failures, verbose)
 
     # --- claude's config materialization --------------------------------------
     scratch = _tempfile.mkdtemp(prefix="ase-mcptest-")
@@ -11087,6 +11144,185 @@ def _check_mcp_declared_servers(failures, verbose):
            "--strict-mcp-config" in argv,
            "--mcp-config is paired with --strict-mcp-config, so declaring servers grants "
            "exactly those and not the user's ambient ones", failures, verbose)
+
+    # --- a GATED server goes through the harness's proxy, not to the CLI --------
+    # The `tools:` allowlist is applied on the wire by `mcp_proxy_io.py` (C3, §10), so what
+    # claude is handed names the proxy and never the declared command. Everything below is
+    # about that substitution being real rather than declared.
+    gscratch = _tempfile.mkdtemp(prefix="ase-mcpgate-")
+    gresolved, _ = resolve_mcp_servers(
+        parse_mcp_servers({"gated": {"command": "python3", "args": ["real.py"],
+                                     "env": {"TOKEN": "s3cr3t-sentinel"},
+                                     "tools": ["echo"]}}, where="t"), env={})
+    gopts = RunOptions(mcp_servers=gresolved, mcp_scratch_dir=gscratch)
+    _try(lambda: cl.build_argv("hi", gopts, cwd=gscratch), [])
+    gcfg = _try(lambda: _json.loads(open(os.path.join(gscratch, "mcp.json")).read()), {})
+    gentry = (gcfg.get("mcpServers") or {}).get("gated") or {}
+    pcfg_path = (gentry.get("args") or ["", ""])[-1]
+    pcfg = _try(lambda: _json.loads(open(pcfg_path).read()), {})
+
+    _check("mcp.a_gated_server_is_replaced_by_the_proxy_in_the_cli_config",
+           gentry.get("command") == _sys.executable
+           and (gentry.get("args") or [""])[0].endswith("mcp_proxy_io.py")
+           and "real.py" not in _json.dumps(gcfg),
+           f"claude is handed the PROXY as if it were the server and never learns the real "
+           f"command — an allowlist the CLI could route around is not an allowlist: {gentry}",
+           failures, verbose)
+
+    # The credential moving files is the point: `mcp.json` is what the CLI reads and echoes,
+    # the proxy config is read only by a program this harness owns. Both die with the scratch
+    # dir; neither is archived. An arm on the ABSENCE alone would pass if the config were
+    # empty, so the same string is required to be present in the file that should hold it.
+    _check("mcp.a_gated_servers_credential_leaves_the_cli_facing_config",
+           "s3cr3t-sentinel" not in _json.dumps(gcfg)
+           and pcfg.get("env") == {"TOKEN": "s3cr3t-sentinel"},
+           f"the interpolated env moves out of the file the CLI reads and into the proxy's "
+           f"own — present in one, absent from the other, rather than merely absent: "
+           f"cli={_json.dumps(gcfg)[:80]!r}", failures, verbose)
+
+    _check("mcp.the_proxy_config_carries_the_allowlist_and_its_audit_path",
+           pcfg.get("tools") == ["echo"] and pcfg.get("server") == "gated"
+           and pcfg.get("command") == "python3" and pcfg.get("args") == ["real.py"]
+           and pcfg.get("audit_log") == cl.audit_log_path(gscratch, "gated"),
+           f"the proxy is told the real server, the allowlist, and where to write the log "
+           f"the verdict is read from — {pcfg}", failures, verbose)
+
+    _check("mcp.the_proxy_config_is_not_world_readable",
+           _try(lambda: os.stat(pcfg_path).st_mode & 0o777) == 0o600,
+           f"it holds the interpolated credential `mcp.json` no longer does, so it is created "
+           f"0600 in one step for the same reason — got "
+           f"{oct(_try(lambda: os.stat(pcfg_path).st_mode & 0o777) or 0)}", failures, verbose)
+
+    # --- the verdict `verify_post_run` computes from that log ------------------
+    # `log_verdict` is `mcp_audit`'s and is proven there; what is proven HERE is that the
+    # adapter reads the right file and fails closed when it cannot.
+    _alog = cl.audit_log_path(gscratch, "gated")
+    # THE COMPLETION FACTS ARE IMPORTED, NOT TYPED OUT. A hand-written "clean" log is a second
+    # opinion about what clean means, and the first version of this fixture was wrong in a way
+    # that made the positive control fail — it listed the facts as cleanup `outcomes`, which
+    # is the OTHER axis of §10.5.1's two. Building it from `mcp_audit.FACTS` means this fixture
+    # cannot disagree with the module that defines the vocabulary (§4).
+    from . import mcp_audit as _audit
+
+    def _log(reason):
+        """The three records of one instance, ending for `reason`. Built rather than typed,
+        so the clean and anomalous fixtures differ in EXACTLY the field under test — an
+        earlier version derived one from the other by string replacement, which silently
+        stopped matching the moment the fixture was serialized differently."""
+        return "".join(_json.dumps(r) + "\n" for r in (
+            {"instance": "i1", "kind": "start", "ts": 1, "server": "gated", "pid": 9},
+            {"instance": "i1", "kind": "spawn", "ts": 2, "child_pid": 10, "child_pgid": 10,
+             "guardian_pid": 11},
+            {"instance": "i1", "kind": "terminator", "ts": 3, "observed": ["2025-11-25"],
+             "triggers": [{"reason": reason}], "outcomes": [],
+             "facts": {f: {"state": "done"} for f in _audit.FACTS}, "child_status": 0},
+        ))
+
+    _clean = _log(_audit.CLIENT_EOF)
+
+    _missing_log = _try(lambda: cl.gating_failure(gopts), "RAISED")
+    _check("mcp.a_gated_server_with_no_audit_log_fails_the_cell",
+           isinstance(_missing_log, str) and "no_instances" in _missing_log,
+           f"a gated server whose proxy wrote nothing means the gating never happened, which "
+           f"is indistinguishable from a proxy that never started — reported as a FAILURE, "
+           f"never as a vacuous pass: {str(_missing_log)[:90]!r}", failures, verbose)
+
+    open(_alog, "w", encoding="utf-8").write(_clean)
+    _clean_verdict = _try(lambda: cl.gating_failure(gopts), "RAISED")
+    _check("mcp.a_clean_audit_log_is_the_positive_control",
+           _clean_verdict is None,
+           f"the arm above is only evidence if a GOOD log passes — otherwise 'always fails' "
+           f"would score full marks on it: {_clean_verdict!r}", failures, verbose)
+
+    open(_alog, "w", encoding="utf-8").write(_log(_audit.PROTOCOL_ANOMALY))
+    _anom = _try(lambda: cl.gating_failure(gopts), "RAISED")
+    _check("mcp.an_anomalous_instance_fails_the_cell_too",
+           isinstance(_anom, str) and "did not hold" in _anom
+           and _audit.PROTOCOL_ANOMALY not in _audit.CLEAN_REASONS,
+           f"a log that EXISTS and records an anomalous ending is a different failure from an "
+           f"absent one, and both fail. The second clause pins WHY this fixture is anomalous "
+           f"to the module's own list, so a reason moving into CLEAN_REASONS breaks the arm "
+           f"instead of quietly making it a duplicate of the positive control: "
+           f"{str(_anom)[:90]!r}", failures, verbose)
+
+    # NEVER RAISES is the contract `log_verdict` is built to, and this is the adapter half of
+    # it: a traceback out of `verify_post_run` is not a failed cell, it is an ABSENT verdict.
+    open(_alog, "w", encoding="utf-8").write("{this is not json\n\x00\n")
+    _check("mcp.an_unreadable_audit_log_is_a_verdict_rather_than_a_traceback",
+           isinstance(_try(lambda: cl.gating_failure(gopts), "RAISED"), str)
+           and _try(lambda: cl.gating_failure(gopts), "RAISED") != "RAISED",
+           "garbage in the log produces a failing VERDICT, not an exception — the whole "
+           "audit exists to make an absent verdict impossible", failures, verbose)
+
+    # THE PATH HAS TO BE TAKEN, not merely exist. Every arm above calls `gating_failure`
+    # directly, and all of them would stay green if `verify_post_run` never called it — the
+    # §4 trap where a helper is exercised and the site that reaches it is not. So this one
+    # goes through `verify_post_run` itself, with a witness that clears every check ahead of
+    # the gating one, and requires the RAISE.
+    open(_alog, "w", encoding="utf-8").write("")            # empty → no_instances → must fail
+    _post_run = ""
+    try:
+        cl.verify_post_run(
+            [], gopts, cwd=gscratch, exit_code=0,
+            stdout=_json.dumps({"type": "system", "subtype": "init",
+                                "claude_code_version": "2.1.113",
+                                "mcp_servers": [{"name": "gated", "status": "connected"}],
+                                "tools": []}) + "\n")
+    except RuntimeError as exc:
+        _post_run = str(exc)
+    _check("mcp.verify_post_run_actually_reaches_the_gating_verdict",
+           "did not hold" in _post_run and "gated" in _post_run,
+           f"the verdict is reached through the function the runner calls, not only by the "
+           f"arms calling it directly — a gating check nothing invokes is a check that cannot "
+           f"fail, and every arm above would stay green without this one: {_post_run[:90]!r}",
+           failures, verbose)
+
+    _check("mcp.an_ungated_server_is_not_audited_at_all",
+           cl.gating_failure(RunOptions(mcp_servers=resolved, mcp_scratch_dir=scratch)) is None
+           and cl.gating_failure(None) is None,
+           "a server with no `tools:` is not proxied, so there is no log to read and nothing "
+           "to fail on — and a direct call with no options at all is not a gated run either",
+           failures, verbose)
+
+    # The server name becomes part of a filename. The schema's own regex is what says that is
+    # safe, so the adapter checks against THAT regex rather than a second opinion (§4).
+    #
+    # THE MESSAGE IS PART OF THE ASSERTION. "Any exception counts as refused" passed with the
+    # check deleted: `mcp-proxy-../../escape.json` names a directory that does not exist, so
+    # `os.open` raises `FileNotFoundError` and an arm reading only "did it raise" cannot tell
+    # a deliberate refusal from an accident of this particular name. Same repair the
+    # no-scratch-dir arm above already carries, and the mutation is what found it.
+    _bad = ""
+    try:
+        cl._write_proxy_config("../../escape", gresolved["gated"], gscratch)
+    except Exception as exc:                             # noqa: BLE001 — the message is the test
+        _bad = f"{type(exc).__name__}: {exc}"
+    _check("mcp.a_server_name_that_could_escape_the_scratch_dir_is_refused",
+           _bad.startswith("RuntimeError:") and "schema admits" in _bad,
+           f"the name is checked against `mcp._NAME_RE`, imported rather than restated, before "
+           f"it is joined onto a path — and the refusal SAYS SO, so it cannot be confused with "
+           f"whatever error that name would have caused downstream: {_bad[:110]!r}",
+           failures, verbose)
+
+    # THE SECOND LAYER of the stdio-only rule. `validate_mcp_support` is the friendly refusal
+    # and is skippable — any caller that builds argv directly never reaches it — so the writer
+    # re-asserts the transport rather than assuming a validator ran. Without it the file it
+    # produced said `"command": null` and dropped the declared url and headers entirely, which
+    # fails two processes later with nothing naming the cause.
+    _remote_res, _ = resolve_mcp_servers(remote_gated, env={})
+    _remote_bad = ""
+    try:
+        cl._write_proxy_config("r", _remote_res["r"], gscratch)
+    except Exception as exc:                             # noqa: BLE001 — the message is the test
+        _remote_bad = f"{type(exc).__name__}: {exc}"
+    _check("mcp.the_proxy_config_writer_refuses_what_it_cannot_proxy",
+           _remote_bad.startswith("RuntimeError:") and "speaks stdio" in _remote_bad
+           and not os.path.exists(os.path.join(gscratch, "mcp-proxy-r.json")),
+           f"the refusal happens before the file exists, and SAYS which transport — a writer "
+           f"that emitted the config and let the proxy reject it would spend a model call to "
+           f"arrive at a missing audit log: {_remote_bad[:120]!r}", failures, verbose)
+
+    _shutil.rmtree(gscratch, ignore_errors=True)
 
     # --- the witness now permits declared servers, and only those --------------
     init_echo = _json.dumps({"type": "system", "subtype": "init",
@@ -11664,16 +11900,31 @@ def _check_mcp_declared_servers(failures, verbose):
             _shutil.rmtree(d, ignore_errors=True)
 
     prog_unsupported = _try(lambda: _prog_run("antigravity", plain), "")
-    prog_gated = _try(lambda: _prog_run("claude", gated), "")
+
+    # NOT claude, and the reason is worth stating: claude ENFORCES `tools:` now, so putting it
+    # here would no longer be refused — it would spawn the real CLI and spend an API call
+    # inside the selftest. The rule under test is "a refusal survives off the CLI's pre-flight
+    # path", and the refusal that still exists is a filter outside the enforcing set. `true`
+    # as the binary, so even the unrefused direction costs nothing.
+    class _UnbuiltProg(get_adapter("claude").__class__):
+        name = "fake-unbuilt-prog"
+        binary = "true"
+        mcp_tool_filter = "unbuilt"
+
+    _registry_bypass = _UnbuiltProg()
+    prog_gated = _try(lambda: (lambda d: exec_mod.execute(
+        _registry_bypass, "hi", RunOptions(mcp_servers=gated, mcp_scratch_dir=d),
+        cwd=d, timeout=5).result.error or "")(_tempfile.mkdtemp(prefix="ase-mcpprog2-")), "")
+
     _check("mcp.refusals_hold_on_the_programmatic_path",
            "cannot inject MCP servers" in prog_unsupported
            and "tools:" in prog_gated and "not implemented" in prog_gated,
-           f"an adapter that cannot inject declared servers, and claude with a `tools:` "
-           f"allowlist it cannot enforce, are BOTH refused without the CLI's pre-flight in "
-           f"the picture — re-asserted at the one choke point every invocation passes "
-           f"through, so the refusal cannot be routed around by calling Runner.run() or "
-           f"the adapter directly: unsupported={prog_unsupported[:60]!r} "
-           f"gated={prog_gated[:60]!r}", failures, verbose)
+           f"an adapter that cannot inject declared servers, and one whose tool filter is not "
+           f"an enforcement, are BOTH refused without the CLI's pre-flight in the picture — "
+           f"re-asserted at the one choke point every invocation passes through, so the "
+           f"refusal cannot be routed around by calling Runner.run() or the adapter "
+           f"directly: unsupported={prog_unsupported[:60]!r} gated={prog_gated[:60]!r}",
+           failures, verbose)
 
     # --- a declared surface with no overlay is a different experiment ----------
     # `isolated: false` is the documented opt-out from the overlay-build guard, and that is

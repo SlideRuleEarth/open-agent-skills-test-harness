@@ -166,10 +166,18 @@ def _require(raw: dict, key: str, kind: type, what: str):
 def load_config(path: str) -> Config:
     """The whole configuration, or a refusal naming what is wrong with it.
 
-    `tools` is REQUIRED and may not be empty. There is no "no allowlist" mode anywhere in C3: a
-    server that declares no `tools:` is not proxied at all (§10.1), so there is no configuration
-    in which this program is asked to pass everything — and none in which a missing key could
-    quietly become one.
+    `tools` is REQUIRED, and the EMPTY list is a legal value meaning "admit nothing". Those are
+    two different facts and merging them cost the documented state its ability to start.
+
+    Missing is refused because there is no "no allowlist" mode anywhere in C3: a server that
+    declares no `tools:` is not proxied at all (§10.1), so no configuration asks this program
+    to pass everything, and an absent key must not quietly become one.
+
+    Empty is honoured because it is a filter, not the absence of one — `frozenset()` is a real
+    set, the decision layer already applies it correctly (every advertised tool stripped, every
+    call refused), and `validate_mcp_servers` explicitly admits `tools: []` with a warning that
+    the server stays reachable and unusable. Rejecting it here made a state the schema documents
+    pass every preflight and then fail at launch (review, PR #107).
     """
     try:
         with open(path, encoding="utf-8") as handle:
@@ -189,8 +197,8 @@ def load_config(path: str) -> Config:
             isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
         raise ConfigError(f"config 'env' is {env!r}, not a map of strings")
     tools = _require(raw, "tools", list, "the declared `tools:` allowlist")
-    if not tools or not all(isinstance(t, str) and t for t in tools):
-        raise ConfigError(f"config 'tools' is {tools!r}, not a non-empty list of tool names")
+    if not all(isinstance(t, str) and t for t in tools):
+        raise ConfigError(f"config 'tools' is {tools!r}, not a list of tool names")
     cwd = raw.get("cwd")
     if cwd is not None and not isinstance(cwd, str):
         raise ConfigError(f"config 'cwd' is {cwd!r}, not a path")

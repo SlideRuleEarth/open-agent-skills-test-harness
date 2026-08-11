@@ -289,12 +289,12 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 562 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 577 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py                        # 311/311 production + 2/2 instrument + 35/35 fixture
+python3 -u harness/tools/mutate_mcp.py                        # 327/327 production + 2/2 instrument + 35/35 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 322 checks
-harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 77 here
+harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 80 here
 git diff --check
 
 # OPT-IN, not part of the block above: needs `claude` on PATH and spends an API call.
@@ -1181,6 +1181,63 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   normal", an argument quantifying over **every** server-side MUST in the binding — so
   honouring it meant sweeping the rest and finding this one, rather than waiting to be told.
   What the note says now is what is served, what is not, and which list each item is on.
+- **AN OBSERVATION WINDOW EQUAL TO THE SUBJECT'S LIFETIME DECIDES NOTHING, AND IT LOOKS LIKE
+  FLAKINESS.** The orphan case asks whether a credential-bearing child is still alive after its
+  proxy was `SIGKILL`ed. The child was told to linger `30` seconds; `at_eof` was given
+  `DEADLINE`, which is `30.0`. Same number. So the child exits on its own at the exact moment
+  the checker stops waiting for it, and which one happens first is scheduling noise — the check
+  reddened on an idle machine and went **green under full-suite load, over a proxy that had
+  swept nothing.** M289 was reported `CAUGHT` alone and "failed, but NOT via" about one full run
+  in four, which reads as an unreliable mutation and is really an instrument that cannot answer
+  the question it was asked.
+  §4 already had "a bound belongs to the step that owns the wait" for two timers that disagree;
+  this is the degenerate case where they are the SAME timer, and it has no safe side — the
+  failure direction is a check going green over the defect it exists to catch. The linger is now
+  `DEADLINE * 3`, **derived** rather than a literal that happens to differ, and it costs nothing
+  on the green path because a working guardian sweeps the child immediately; the linger is only
+  ever reached when the sweep did not happen, which is the defect. Verified by manufacturing the
+  condition — every core saturated — and watching the named arm redden twice where it used to
+  flip.
+  Two things generalize. **A test whose result depends on which of two equal timers wins is not
+  intermittent, it is undefined**, and calling it flaky is what stops anyone looking. And the
+  first diagnosis was wrong in an instructive way: the two checks that reddened instead looked
+  like a second defence masking the first (the M53 pattern), and the fix that follows from that
+  reading — make the mutation remove both — would have left the real defect in place. Producing
+  the condition on purpose is what separated them, and it took one run to do.
+- **THE STATUS YOU REPORT MUST COME FROM THE COMMAND WHOSE STATUS YOU MEAN — and it went wrong
+  twice in one session, in both directions.** First: four rounds of `python3 -u
+  tools/mutate_mcp.py 2>&1 | tail -14` reported "exit code 0", which is `tail`'s, every time.
+  The run that finally mattered returned **1** with `320/322` and was announced as a success.
+  Then, having "fixed" that by capturing `$?` into an echoed line, the wrapper ended with
+  `grep -c … || echo 0` — and `grep -c` exits **1** when the count is zero, so a **clean**
+  322/322 run was announced as a **failure**. A false green and then a false red, from the same
+  root: the last command in the script was not the command under test.
+  The lesson is not "don't pipe to `tail`", which is what I wrote after the first instance and
+  which is why the second one landed. It is that a status is evidence ABOUT a specific process,
+  so it has to be **captured from that process** — `rc=$?` immediately after it, printed, and
+  read — and every convenience wrapped around it afterwards is a different process with its own
+  status. The captured line said `RUNNER EXIT: 0` and was right both times; the surrounding
+  shell was wrong both times. **When a fix is a prohibition on one spelling, ask what the rule
+  quantifies over**, because the next spelling is already being typed.
+- **RENAMING AN ARM UNHOOKS ITS MUTATION, AND THE GUARD DID NOT COVER THE SUITE WHERE IT
+  HAPPENED.** #106 added a guard for exactly this and pointed it at printed check labels — so
+  it covers the two verifiers and NOT the selftest, which prints section headings rather than a
+  line per arm. Changing `mcp.claude_refuses_tools_it_cannot_enforce` to its opposite therefore
+  left `M4` naming a check that no longer existed, and the same edit made its find-text stale;
+  the mutation reported as a **skip**, which is uncaught, and the totals moved by one in a
+  number nobody reads per-line. The fix is that the arm set is recoverable from the suite's
+  SOURCE even when it is not recoverable from its OUTPUT — a substring test over `selftest.py`,
+  cruder than reading labels and sufficient for the case that matters. **When a guard is
+  written against one representation of a fact, check whether the fact has another
+  representation somewhere the guard cannot see.**
+- **ADDING A SECOND SITE THAT LOOKS LIKE THE FIRST IS THE OTHER WAY TO CREATE AN AMBIGUOUS
+  ANCHOR.** #103 recorded this arriving from a REFACTOR that made two functions identical.
+  Here it arrived from new code: `_write_proxy_config` creates its file exactly the way
+  `_write_mcp_config` creates `mcp.json`, so `M9`'s anchor silently began matching twice and
+  was refused. Two things worth keeping. The guard worked — a refused mutation is uncaught and
+  the suite says so, which is the behaviour that entry argued for. And **the trigger is not
+  refactoring, it is textual coincidence**, so the moment to check is whenever a new site is
+  written in the image of an existing one, which is most of the time.
 - **A REFUSAL IS AN ORDERING, AND EVERY WELL-BEHAVED CLIENT IS BLIND TO IT.** To put the
   message's method on the receipt row, I moved the body read ahead of the `Origin` check — and
   wrote a comment saying the reorder "buys two things", listing both, never asking what it
@@ -1243,6 +1300,31 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   separates two facts that were being read off one: the server's receipts say the call
   **arrived**, and the opaque marker says the answer **came back** — and the receipts cannot
   witness the second, because a server can say what it wrote and not what was read.
+- **A REFUSAL THAT COVERED YOUR CASE INCIDENTALLY DISAPPEARS WHEN THE BLANKET IS LIFTED.**
+  DESIGN §10 has said since it was written that remote `tools:` is out of scope, and the
+  sentence was true for months without anything checking it: `mcp_tool_filter` read `"unbuilt"`
+  on claude, so the validator refused **every** gated server, and the remote case was inside a
+  refusal written for a different reason. Building the stdio proxy flipped that constant to
+  `"proxy"` — narrowing nothing, because the constant had no way to express a narrowing — and
+  the remote case walked through, spending a model call to arrive at a proxy config whose
+  `command` was `null`. **When a rule you rely on is enforced only as a side effect of a
+  broader one, lifting the broader one is the moment to write the specific check** — not the
+  moment to trust the document that still describes the old behaviour. The tell is a constant
+  answering a question whose real subject is a pair: enforceability was never a property of the
+  adapter alone, since a `proxy` filter is a *program the harness launches* and what it can
+  reach depends on the server. The fix is `tool_filter_for(server)`, asked per server, plus the
+  same rule re-asserted in the config writer, because a validator is skippable by any caller
+  that builds argv directly.
+- **ABSENT AND EMPTY, ONCE MORE, IN THE GUARD RATHER THAN THE READER.** §4 already carries
+  `x.get(k) or []` erasing missing/null/empty. This is its sibling one line further on:
+  `if not tools or not all(...)` refused an allowlist that was **present and empty**, using the
+  argument written for one that was **absent**. The docstring beside it made the distinction
+  correctly — "no configuration in which this program is asked to pass everything" is about
+  absence — and the code did not, so `tools: []`, a state the schema documents and warns about,
+  passed every preflight the harness has and then died at launch with a message about a
+  non-empty list. **A validity check whose justification is about a different input than the
+  one it rejects is a merged condition.** The two cases are not even close: a missing allowlist
+  could become "pass everything", and an empty one is a filter that admits nothing.
 - A FIFO fixture on the main thread wedged the whole suite under the mutation that makes the
   scrub read every non-directory. Use a **socket** — same `_give_up` branch, but `open()`
   fails `ENXIO` instead of blocking. The one arm that genuinely needs a FIFO joins a 20s

@@ -142,10 +142,15 @@ MUTATIONS = [
      '        declared = set(getattr(opts, "mcp_servers", None) or {})',
      '        declared = set(getattr(opts, "mcp_servers", None) or {}) if opts else set(live)',
      "mcp.witness_without_options_treats_everything_as_undeclared"),
+    # Claiming a CLI-NATIVE filter, which claude has never had. Re-anchored and re-armed by
+    # the C3 adapter integration: the declared value moved from `"unbuilt"` to `"proxy"`, so
+    # this entry's find-text went stale and its arm named a check that no longer exists —
+    # uncaught on both counts, and reported only as a skip. M318 is the sibling that goes the
+    # other way, back to a value that refuses.
     ("M4-claude-claims-native-tool-filter", CLAUDE,
-     '    mcp_tool_filter = "unbuilt"',
+     '    mcp_tool_filter = "proxy"',
      '    mcp_tool_filter = "native"',
-     "mcp.claude_refuses_tools_it_cannot_enforce"),
+     "mcp.claude_gates_tools_through_the_harness_proxy"),
     ("M5-all-adapters-claim-injection", BASE,
      "    supports_mcp_injection = False",
      "    supports_mcp_injection = True",
@@ -166,9 +171,14 @@ MUTATIONS = [
      "MIN_REDACTABLE_LEN = 6",
      "MIN_REDACTABLE_LEN = 0",
      "mcp.too_short_to_redact_is_warned_and_left_alone"),
+    # The variable name is the disambiguator, and it is load-bearing rather than incidental:
+    # the C3 adapter integration added a SECOND file created exactly this way — the proxy's
+    # own config, which now carries the credential this one used to. Two identical lines, and
+    # this anchor silently began matching both (caught by the ambiguity guard, not by review).
+    # M323 is the other one.
     ("M9-config-world-readable", CLAUDE,
-     "os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)",
-     "os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)",
+     "fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)",
+     "fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)",
      "mcp.claude_config_is_not_world_readable"),
     ("M10-inline-json-instead-of-file", CLAUDE,
      '            argv += ["--mcp-config", self._write_mcp_config(opts)]',
@@ -2346,6 +2356,20 @@ MUTATIONS = [
      "            if not isinstance(reason, str) or not reason:",
      "audit_log.every_malformed_line_is_a_code_rather_than_an_exception"),
 
+    # ---- absent and empty are two facts, not one ----------------------------------------
+    # THE DEFECT AS SHIPPED: `tools: []` is a state the schema admits, and the proxy refused to
+    # start on it — so the documented configuration passed every preflight and died at launch.
+    ("M332-the-empty-allowlist-is-refused-again", PROXY_IO,
+     "    if not all(isinstance(t, str) and t for t in tools):",
+     "    if not tools or not all(isinstance(t, str) and t for t in tools):",
+     "an empty allowlist is a filter that admits nothing, not a config the proxy rejects"),
+    # ...and the same conflation in the direction that matters more: an ABSENT key becomes an
+    # empty allowlist, so a config that never named a filter starts a proxy that reports one.
+    ("M333-a-missing-allowlist-becomes-an-empty-one", PROXY_IO,
+     '    tools = _require(raw, "tools", list, "the declared `tools:` allowlist")',
+     '    tools = raw.get("tools") or []',
+     "an ABSENT `tools` key is still refused, and the two are not the same fact"),
+
     # ---- F: instruments, proven by tools/verify_mcp_fixtures.py -------------------------
     # Everything above asks whether the selftest notices a defect in production code. These
     # ask whether the fixture verifier notices a defect in a fixture or probe — the gap named
@@ -2477,6 +2501,99 @@ MUTATIONS = [
      '        if self.path.split("?", 1)[0] != PATH_SSE:',
      "        if not self.path.startswith(PATH_SSE):",
      "...and a prefix of the SSE path is not the SSE path"),
+
+    # ---- C3 adapter integration: the harness's filter is on the wire or it is nowhere ------
+    # `tools:` goes back to being refused. The validator's message would even look right, which
+    # is why the arm reads the FILTER VALUE and not just the absence of an error.
+    ("M318-claude-goes-back-to-refusing-tools-it-can-now-enforce", CLAUDE,
+     '    mcp_tool_filter = "proxy"',
+     '    mcp_tool_filter = "unbuilt"',
+     "mcp.claude_gates_tools_through_the_harness_proxy"),
+    # The enforcing set forgets the value that reaches it, which refuses every gated server
+    # while every adapter still declares a filter it believes in.
+    ("M319-the-enforcing-set-drops-the-proxy", BASE,
+     'ENFORCING_TOOL_FILTERS = frozenset({"native", "complement", "proxy"})',
+     'ENFORCING_TOOL_FILTERS = frozenset({"native", "complement"})',
+     "mcp.claude_gates_tools_through_the_harness_proxy"),
+    # ...and the other direction: a set that admits everything accepts an allowlist nothing
+    # applies, which is the exact degradation the refusal exists for.
+    ("M320-every-filter-value-counts-as-enforcement", BASE,
+     "            if mechanism in self.ENFORCING_TOOL_FILTERS:\n                continue",
+     "            if True:\n                continue",
+     "mcp.a_tool_filter_outside_the_enforcing_set_still_refuses"),
+    # THE SUBSTITUTION ITSELF: the gated server is handed to claude directly, so the CLI talks
+    # to the real server and the allowlist is a comment.
+    ("M321-a-gated-server-is-handed-to-the-cli-unproxied", CLAUDE,
+     "            if s.tools is not None:",
+     "            if False:",
+     "mcp.a_gated_server_is_replaced_by_the_proxy_in_the_cli_config"),
+    # The credential is written into the file the CLI reads as well as the proxy's own.
+    ("M322-the-gated-credential-is-also-left-in-the-cli-config", CLAUDE,
+     "                entry = self._write_proxy_config(name, s, opts.mcp_scratch_dir)",
+     ("                entry = self._write_proxy_config(name, s, opts.mcp_scratch_dir)\n"
+      "                entry[\"env\"] = dict(s.env or {})"),
+     "mcp.a_gated_servers_credential_leaves_the_cli_facing_config"),
+    # The proxy's config is world-readable for the window it exists, which is the same
+    # exposure `mcp.json` is created 0600 to avoid — and it now holds the credential.
+    # `cfg_path` rather than `path` is what separates this from M9 — see the note there.
+    ("M323-the-proxy-config-is-world-readable", CLAUDE,
+     "fd = os.open(cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)",
+     "fd = os.open(cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)",
+     "mcp.the_proxy_config_is_not_world_readable"),
+    # The allowlist never reaches the proxy, which then has no filter to apply.
+    ("M324-the-allowlist-is-not-passed-to-the-proxy", CLAUDE,
+     '            "tools": sorted(s.tools),',
+     '            "tools": ["*"],',
+     "mcp.the_proxy_config_carries_the_allowlist_and_its_audit_path"),
+    # WRITER AND READER DISAGREE ABOUT THE PATH, which is why it is one function: the log gets
+    # written, the verdict reads elsewhere, and `no_instances` fails a run that was fine.
+    #
+    # It has to INLINE the path on one side. Mutating `audit_log_path` itself is not a defect
+    # this design admits — both sides call it, so both move together and the agreement holds;
+    # the first version of this entry did that and was MISSED for the right reason. The defect
+    # the shared function prevents is someone spelling the path out at one of the two sites.
+    ("M325-the-writer-spells-the-audit-path-out-instead-of-sharing-it", CLAUDE,
+     '            "audit_log": self.audit_log_path(scratch_dir, name),',
+     '            "audit_log": os.path.join(scratch_dir, "audit.jsonl"),',
+     "mcp.the_proxy_config_carries_the_allowlist_and_its_audit_path"),
+    # FAIL-OPEN on the case that matters most: no log at all reads as nothing to complain
+    # about, so a gated server whose proxy never ran passes.
+    ("M326-a-missing-audit-log-is-excused", CLAUDE,
+     '                text = ""          # judged as `no_instances` below, not excused',
+     "                return None",
+     "mcp.a_gated_server_with_no_audit_log_fails_the_cell"),
+    # The verdict is computed and discarded — the arms that call `gating_failure` directly all
+    # stay green, and only the one going through `verify_post_run` notices.
+    ("M327-the-gating-verdict-is-computed-and-not-raised", CLAUDE,
+     ("        gating = self.gating_failure(opts)\n        if gating:\n"
+      "            raise RuntimeError(gating)"),
+     ("        gating = self.gating_failure(opts)\n        if False:\n"
+      "            raise RuntimeError(gating)"),
+     "mcp.verify_post_run_actually_reaches_the_gating_verdict"),
+    # The name is trusted into a path. Harmless while the schema forbids separators, which is
+    # exactly the premise the check exists to keep from becoming load-bearing silently.
+    ("M328-a-server-name-is-trusted-into-a-filename", CLAUDE,
+     "        if not _NAME_RE.match(name):",
+     "        if False:",
+     "mcp.a_server_name_that_could_escape_the_scratch_dir_is_refused"),
+    # THE FILTER ANSWERS FOR THE ADAPTER AGAIN, which is the state this branch was added to
+    # leave: `proxy` for every gated server, including one the proxy has no way to reach.
+    ("M329-the-filter-claim-ignores-the-transport", CLAUDE,
+     '        if not server.is_stdio:\n            return "unbuilt", (',
+     '        if False:\n            return "unbuilt", (',
+     "mcp.a_remote_server_cannot_be_gated_by_a_proxy_that_speaks_stdio"),
+    # ...and the caller asks the class attribute instead of the server, which is the same defect
+    # one level up: correct only while every declared server has the same answer.
+    ("M330-the-gating-question-is-asked-once-for-the-whole-mapping", BASE,
+     "            mechanism, why = self.tool_filter_for(server)",
+     "            mechanism, why = self.mcp_tool_filter, None",
+     "mcp.the_gating_question_is_asked_per_server_not_per_scenario"),
+    # The writer trusts that a validator ran. It produces `"command": null` and drops the url
+    # and headers the server was actually declared with.
+    ("M331-the-proxy-config-writer-forgets-the-transport", CLAUDE,
+     "        if not s.is_stdio:\n            raise RuntimeError(",
+     "        if False:\n            raise RuntimeError(",
+     "mcp.the_proxy_config_writer_refuses_what_it_cannot_proxy"),
 
     # ---- the MUST the Origin argument already covered, and the witness of the call ---------
     ("F22-the-protocol-version-header-is-never-validated", HTTPFIX,
@@ -2630,13 +2747,20 @@ class _Suite(NamedTuple):
     argv: tuple            # ...appended to the venv interpreter
     failed: str            # the regex naming a check that went RED
     labels: str | None = None   # ...and EVERY label printed, where the suite prints its passes
+    source: str | None = None   # ...or the file whose TEXT must contain each arm, where not
 
 
 # `labels` is None for the selftest and only for it: that suite prints section headings and
 # `[FAIL]` lines rather than one line per arm, so its full label set is not recoverable from
-# its output and the arm guard cannot run against it.
+# its OUTPUT. It is recoverable from its SOURCE, which is what `source` is for — and the gap
+# between those two sentences cost two mutations. Renaming an arm left `M4` naming a check
+# that no longer existed; the mutation still ran, still broke the code, and was reported as a
+# skip, because the guard that would have caught it only covers suites that print their passes
+# (review, PR #106 → the C3 adapter integration). A substring test over the file is cruder than
+# reading printed labels and catches exactly the case that matters: an arm nothing names.
 _SUITES = {
-    "selftest": _Suite(("-m", "agentskill_evals", "selftest"), r"\[FAIL\]\s+([^:]+):"),
+    "selftest": _Suite(("-m", "agentskill_evals", "selftest"), r"\[FAIL\]\s+([^:]+):",
+                       source=SELFTEST),
     "fixtures": _Suite((VERIFIER,), r"^\s*FAIL\s+(.+?)\s\s<- ", _ALL_LABELS),
     "proxy": _Suite((PROXY_VERIFIER,), r"^\s*FAIL\s+(.+?)\s\s<- ", _ALL_LABELS),
 }
@@ -2796,6 +2920,21 @@ def main():
         # remedy: a structural clause saying something must be there, ahead of the universal
         # one. The wrong-arm control proves membership works against a NON-EMPTY parse and is
         # silent about the empty one, which is why it did not catch this.
+        # THE SOURCE VARIANT, for a suite whose passes never reach its output. Same guard, same
+        # refusal, different evidence: the arm must appear as a literal somewhere in the file
+        # that defines the checks. It cannot tell a live arm from a commented-out one, and does
+        # not need to — what it catches is an arm naming a check that no longer exists at all.
+        src = _SUITES[suite].source
+        if src is not None:
+            text = (work / src).read_text()
+            orphan = sorted({a for m, _r, _f, _rp, a in MUTATIONS
+                             if suites[m] == suite and f'"{a}"' not in text})
+            if orphan:
+                print(f"ARM NAMES NO CHECK in {src} — a renamed arm unhooks its mutation and "
+                      f"reports only as a skip:")
+                for a in orphan:
+                    print(f"  {a!r}")
+                return 1
         pattern = _SUITES[suite].labels
         if pattern is not None:
             printed = set(re.findall(pattern, out, re.MULTILINE))
