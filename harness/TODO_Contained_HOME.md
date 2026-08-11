@@ -1352,6 +1352,19 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   standalone GET licensing a global blank and, worse, "proving" no server-initiated message
   could arrive — which would have retired the filtering of POST stream events, laundering the
   exact traffic §10.6 exists to catch, with a clean audit log (review, PR #108).
+- **"THE PROCESS SURVIVED" IS NOT EVIDENCE ABOUT WHAT IT ASKED SOMEONE ELSE TO DO.** §10.10
+  inferred "no order to initialize was ever issued" from *a terminator with no connect record*:
+  the proxy lived, so it would have written the record had there been anything to write.
+  The two events bound different windows. The guardian's identity report comes **before** the
+  launch order; the connect record cannot be written until the initialization *result* returns.
+  A guardian can authenticate, take the order, mint a session and die in between, leaving a live
+  proxy writing a terminator over a session that exists — recorded as `not_applicable`, the one
+  answer that is certainly wrong. **An absence is only evidence against an event if the record
+  that would have carried it is written BEFORE that event**, which is why §10.5 puts the
+  instance boundary ahead of the spawn attempt and why the audit sink flushes on every write.
+  The repair is the same move one level down: a `connect_attempt` record, flushed before the
+  order goes down the pipe, turning "never ordered" and "ordered, outcome unknown" into two
+  recorded states instead of one inference (review, PR #108).
 - **A VALUE FROM AN OPEN DOMAIN CANNOT CARRY ITS OWN STATUS IN-BAND.** §10.10's connect record
   held `session: none | <id> | indeterminate`, which is unsound the moment you look at what an
   id may be: visible ASCII, so a real session id may literally *be* `"none"`. A live session
