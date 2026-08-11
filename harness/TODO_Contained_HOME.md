@@ -1352,6 +1352,14 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   standalone GET licensing a global blank and, worse, "proving" no server-initiated message
   could arrive — which would have retired the filtering of POST stream events, laundering the
   exact traffic §10.6 exists to catch, with a clean audit log (review, PR #108).
+- **NAMING A VALUE'S LAST USE READS AS NAMING ITS ONLY USE.** §10.10 said the proxy holds the
+  session id "for the ordinary teardown" — true, and the whole of it only if you already know
+  the transport requires the id on **every** request after initialization. A bridge built from
+  that sentence attaches the header on `DELETE`, passes every check against a fixture that
+  issues no session at all, and fails against the first stateful server it meets. The tell is a
+  purpose clause on a retained value that mentions one phase of a lifecycle: **say what the
+  value is for across its whole life, or say nothing and let the requirement list carry it** —
+  a partial purpose is worse than none, because it reads as complete (review, PR #108).
 - **"WHICH FIELD IS SECRET" IS THE WRONG AXIS; THE QUESTION IS WHOSE VALUE SPACE IT IS.**
   §10.10 twice put the resolved endpoint in an audit record, and once wrote the rule out loud
   as "endpoint only, never the headers" — a sentence that sounds careful and sorts the fields
