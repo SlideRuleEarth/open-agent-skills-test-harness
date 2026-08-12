@@ -398,9 +398,10 @@ def main() -> int:
         version, version_ok = agreed_version([control_out, gated_out])
         print(f"copilot: {version}")
         # THE ROUND TRIP, read from the GATED arm because that is the run whose usability is
-        # in question. The marker is MINTED BY THE SERVER and read back out of its receipts —
-        # never chosen here — so copilot's only route to it is a tool reply, and `answered` is
-        # a fact about that reply rather than about anything copilot could dump.
+        # in question. What comes back out of the receipts is a DIGEST; the marker itself never
+        # leaves the server except in a reply, so `answered` asks whether the transcript holds
+        # a token that hashes to it — a fact about the reply rather than about anything copilot
+        # could read.
         answered = reply_carried_marker(gated_out, minted_digest(gated))
         verdict, reason = classify(gated, control, answered)
 

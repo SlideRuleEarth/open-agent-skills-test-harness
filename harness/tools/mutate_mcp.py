@@ -3024,6 +3024,19 @@ MUTATIONS = [
      "             identity_digest=identity_digest())",
      "             identity_digest=identity_digest(), leaked_plaintext=IDENTITY)",
      "the receipts carry a DIGEST, and that marker VALUE appears nowhere in them"),
+    # A CONSTANT IS NOT A MINT. Every digest/reply/receipt check above passes on a fixed
+    # 32-hex marker, and a constant in this file's SOURCE is readable by a CLI that can read
+    # files — which restores the non-reply route the digest was introduced to close.
+    ("F78-the-minted-marker-is-a-constant", ECHO,
+     "    IDENTITY = uuid.uuid4().hex",
+     '    IDENTITY = "a" * 32',
+     "two `@generate` instances mint DIFFERENT markers, so it is not a constant"),
+    # AND THE POOLED VERSION AGREEMENT: per-transport singletons let two builds each enforce
+    # one transport and report as one build enforcing both.
+    ("F79-each-transport-certifies-against-its-own-build", CGATE_REMOTE,
+     "        return 0 if (ok and pooled_ok) else 1",
+     "        return 0 if ok else 1",
+     "remote: every arm of every transport names ONE build, not one per transport"),
     ("F36-the-child-reports-no-environment-at-all", TARGET,
      '"pgid": os.getpgid(0), "env_seen": sorted(set(seen))}',
      '"pgid": os.getpgid(0), "env_seen": []}',

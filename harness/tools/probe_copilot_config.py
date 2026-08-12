@@ -55,9 +55,11 @@ EXPECTED = {
     # had, and it was reported as a surprise on every run — which meant `surprises` was NEVER
     # empty, so the exit status was 1 whatever else happened and the remote-shape verdict could
     # not move it. A finding that cannot change is not a finding; it is a constant. Now that
-    # 1.0.79 has been measured writing `local`/`http`/`sse` here, it is a key the adapter must
+    # copilot has been measured writing `local`/`http`/`sse` here, it is a key the adapter must
     # write, and the remaining surprises are the ones nobody has seen yet (review, PR #110).
-    # §3 owes a line for it, and that is adapter work rather than probe work.
+    # §3 owes a line for it, and that is adapter work rather than probe work. NO VERSION IS
+    # NAMED: this probe reads no in-band witness, so it reports shape and attributes it to no
+    # build — see `exit_code`.
     "type": "type",
 }
 
@@ -193,9 +195,8 @@ def exit_code(differs: list, surprises: list, remote_ok: bool) -> int:
     a separate one (review, PR #110).
 
     A CONJUNCTION OVER EVERY FINDING, not a lookup on the most recent: a differing key, a key
-    nobody planned for, an unconfirmed remote shape and an unidentifiable build are four
-    independent ways this probe's answer is not the one the design assumed, and all four are
-    true of the same run.
+    nobody planned for and an unconfirmed remote shape are three independent ways this probe's
+    answer is not the one the design assumed, and all three are true of the same run.
 
     THE VERSION IS DELIBERATELY NOT A TERM. `copilot mcp add` emits no in-band witness, so any
     version this probe reads comes from a different execution and is unverifiable BY

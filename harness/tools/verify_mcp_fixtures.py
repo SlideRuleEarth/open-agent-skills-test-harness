@@ -1995,6 +1995,27 @@ try:
     # THE SENTINEL IS NOT A MARKER. A receipt reporting `@generate` is exactly what a broken
     # mint produces, and the live probe used to accept it — a transcript containing that word
     # then scored ENFORCED. Shape-validation is what refuses it.
+    # TWO INSTANCES, AND THEY MUST DIFFER. Excluding the sentinel says the value is not THAT
+    # constant; it says nothing about any other. `IDENTITY = "a" * 32` satisfies every digest,
+    # reply and receipt check above — and a constant in the fixture SOURCE is readable by a CLI
+    # that can read files, which is the non-reply route this whole clause exists to close. Only
+    # comparing two independent instances distinguishes "minted" from "hard-coded" (review, PR
+    # #110). The reply tokens are compared, not just the digests, so a fixture that varied the
+    # digest while emitting a constant marker would fail too.
+    _second = os.path.join(_e19, "minted2.jsonl")
+    _replies2, _n2, _r2, _s2 = run(
+        [legacy_init(1),
+         {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+          "params": {"name": "echo", "arguments": {"text": "PAYLOAD"}}}],
+        server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": _second,
+                                "ECHO_MCP_IDENTITY": ECHOMOD.IDENTITY_GENERATE})
+    _digest2 = CG.minted_digest(CG.read_receipts(_second))
+    _marker2 = next((tok for tok in set(CG._CANDIDATE_RE.findall(json.dumps(_replies2)))
+                     if hashlib.sha256(tok.encode()).hexdigest() == _digest2), "")
+    check("two `@generate` instances mint DIFFERENT markers, so it is not a constant",
+          bool(_marker_in_reply) and bool(_marker2) and _marker_in_reply != _marker2
+          and _digest != _digest2,
+          (_marker_in_reply, _marker2))
     check("a receipt whose identity is the generation sentinel is not a minted marker",
           CG.minted_digest([{"kind": "listening", "identity_digest": ECHOMOD.IDENTITY_GENERATE}])
           == "" and CG.minted_digest([{"kind": "listening", "identity_digest": "nope"}]) == ""
@@ -2205,6 +2226,36 @@ try:
     finally:
         CRG.start_fixture, CRG.run_arm = _real
         shutil.rmtree(_remote_tmp, ignore_errors=True)
+
+    # THE POOLED VERSION, driven through the consumer rather than read off the helper. Each
+    # transport agreeing with ITSELF is not one build enforcing both: review drove HTTP at
+    # 1.0.79 and SSE at 9.9.9 and got exit 0, two builds reported as one.
+    def _streams_for(version):
+        line = json.dumps({"type": "session.skills_loaded", "data": {"skills": [
+            {"source": "builtin",
+             "path": f"/x/pkg/darwin-arm64/{version}/builtin/s/SKILL.md"}]}})
+        rows = [{"kind": "listening"}] + [
+            {"kind": "rpc", "method": "tools/call", "tool": n} for n in ("echo", "add")]
+        return {"control": (rows, line), "gated": (rows, line)}
+
+    _per_transport: list = []
+
+    def _fake_measure(_workdir, kind, _endpoint, _sentinel):
+        return (CRG.ENFORCED, "canned", _streams_for(_per_transport.pop(0)), True, True)
+
+    _real_measure = CRG.measure
+    _mt = tempfile.mkdtemp(prefix="verify-pooled-")
+    try:
+        CRG.measure = _fake_measure
+        _per_transport[:] = ["1.0.79", "1.0.79"]
+        _same = CRG.main()
+        _per_transport[:] = ["1.0.79", "9.9.9"]
+        _split = CRG.main()
+        check("remote: every arm of every transport names ONE build, not one per transport",
+              _same == 0 and _split == 1, (_same, _split))
+    finally:
+        CRG.measure = _real_measure
+        shutil.rmtree(_mt, ignore_errors=True)
 
     # THE TWO VOCABULARIES ARE ONE VOCABULARY, asserted rather than assumed. Neither probe can
     # import the other (each is a standalone opt-in tool), so this is §4's duplicated-rule rule:

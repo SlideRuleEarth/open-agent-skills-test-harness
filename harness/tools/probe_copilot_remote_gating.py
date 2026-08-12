@@ -341,15 +341,20 @@ def main() -> int:
         # promising it could not. Exit 0 now means every transport measured ENFORCED with an
         # intact bearer and a readable version.
         ok = True
+        # EVERY ARM OF EVERY TRANSPORT, pooled. Agreeing WITHIN a transport and then combining
+        # booleans lets HTTP run 1.0.79 and SSE run 9.9.9 and still exit 0 — two builds, each
+        # enforcing one transport, reported as one build enforcing both. The claim is about a
+        # BUILD, so the singleton has to be taken over the whole probe (review, PR #110).
+        all_streams: list[str] = []
         for kind, endpoint in TRANSPORTS:
             verdict, reason, results, bearer_ok, answered = measure(
                 workdir, kind, endpoint, sentinel)
-            version, version_ok = agreed_version(
-                [out for _recs, out in results.values()])
+            streams = [out for _recs, out in results.values()]
+            all_streams += streams
+            version, version_ok = agreed_version(streams)
             print(f"probe C2-copilot-remote [{kind}]: {verdict}   (copilot: {version})")
             if not version_ok:
-                print("  VERSION UNVERIFIED: no in-band witness in this run's stream, so the "
-                      "result names no build and certifies nothing")
+                print("  VERSION UNVERIFIED: this transport's arms name no single build")
             print(f"  {reason}")
             for label, (recs, _out) in results.items():
                 print(f"  {label:<8} server_ran={server_ran(recs)} "
@@ -368,7 +373,9 @@ def main() -> int:
                 print("  FACT 1 UNPROVEN: the declared bearer did not arrive INTACT on every "
                       "request in both arms, so §8's credential path is not established by "
                       "this run whatever the filter did")
-            good = certifies_native(verdict, bearer_ok, version_ok)
+            # The per-transport version is DIAGNOSTIC here; certification takes the pooled
+            # agreement below, so a transport cannot certify itself against its own build.
+            good = certifies_native(verdict, bearer_ok, True)
             if verdict != ENFORCED or not bearer_ok:
                 for label, (_recs, out) in results.items():
                     print(f"  --- {label} ---\n  "
@@ -377,7 +384,12 @@ def main() -> int:
                 print(f"  SETTLED, AND THE ANSWER IS NO for {kind}: {verdict} is a definite "
                       f"result and it says §8's pattern cannot be declared `native` here")
             ok = ok and good
-        return 0 if ok else 1
+        pooled, pooled_ok = agreed_version(all_streams)
+        print(f"across every arm of every transport: copilot {pooled}")
+        if not pooled_ok:
+            print("  NOT ONE BUILD: no single copilot build was shown to enforce every "
+                  "transport, so this run certifies none of them")
+        return 0 if (ok and pooled_ok) else 1
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
