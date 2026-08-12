@@ -29,10 +29,13 @@ from typing import Any
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+
+_VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
 
 DEADLINE = 60.0
 CONFIG_NAME = "mcp-config.json"
@@ -203,7 +206,14 @@ def exit_code(differs: list, surprises: list, remote_ok: bool, version_ok: bool)
 
 
 def version_verdict(rc: int, out: str, err: str) -> tuple[str, bool]:
-    """(text, usable) for a `copilot --version` result.
+    """(text, usable) for a `copilot --version` result — and it is a PREFLIGHT reading.
+
+    THIS PROBE CANNOT DO BETTER, and that is worth stating rather than papering over. Its two
+    siblings recover the version from the run's own stream, because copilot's launcher can
+    resolve different cached code between two executions. `copilot mcp add` emits no such
+    stream, so the spellings this probe reports are attributed to a build it identified in a
+    DIFFERENT execution. It reports them as UNVERIFIED for that reason; the alternative — a
+    version this file simply asserts — would be the stronger-sounding and weaker claim.
 
     PURE, so §E19 can drive every branch without a copilot install — and SEPARATE from the
     subprocess call for the same reason every other classifier here is. A measurement whose
@@ -214,7 +224,9 @@ def version_verdict(rc: int, out: str, err: str) -> tuple[str, bool]:
     text = (out or "").strip() or (err or "").strip()
     if rc != 0:
         return (text or f"exit {rc}"), False
-    return (text, bool(text))
+    # SHAPE-CHECKED: `rc == 0` with any text used to count, so a run whose only output was a
+    # warning returned "usable" while naming no version (review, PR #110).
+    return (text, bool(_VERSION_RE.search(text)))
 
 
 def cli_version() -> tuple[str, bool]:
@@ -231,9 +243,11 @@ def main() -> int:
     home = tempfile.mkdtemp(prefix="probe-copilot-home-")
     try:
         version, version_ok = cli_version()
-        print(f"copilot: {version}")
+        print(f"copilot: {version}  (UNVERIFIED — read from a separate execution; "
+              f"`copilot mcp add` emits no in-band witness)")
         if not version_ok:
-            print("  VERSION UNREADABLE: the spellings below cannot be attributed to a build")
+            print("  VERSION UNREADABLE: no version at all, so the spellings below name no "
+                  "build even weakly")
         # AN ENV VAR IS SET ON THE STDIO ADD, so `env` is exercised rather than reported
         # `unexercised` — the PR body claimed every listed spelling was confirmed while this
         # run never gave copilot an env var to write (review, PR #110).

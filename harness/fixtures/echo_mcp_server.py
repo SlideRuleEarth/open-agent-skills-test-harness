@@ -65,6 +65,7 @@ be a dependency of every scenario that uses it.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -121,6 +122,11 @@ IDENTITY = os.environ.get("ECHO_MCP_IDENTITY") or ""
 IDENTITY_GENERATE = "@generate"
 if IDENTITY == IDENTITY_GENERATE:
     IDENTITY = uuid.uuid4().hex
+
+
+def identity_digest() -> str:
+    """sha256 of the marker, or "" when there is no marker. Never the marker itself."""
+    return hashlib.sha256(IDENTITY.encode("utf-8")).hexdigest() if IDENTITY else ""
 
 # Opt-in receipts, for the one question no reply can answer: what did the CLIENT actually
 # send? `IDENTITY` proves an answer travelled back; this proves a request arrived. Measuring
@@ -380,12 +386,17 @@ def main() -> int:
     # receipt is the whole finding a gating measurement rests on, and absence is also what a
     # server that never started produces — so the reader checks this record first and calls
     # the run unmeasured without it, rather than reading silence as a filter working.
-    # THE IDENTITY GOES IN THE RECEIPT, which is how a minted marker reaches the driver without
-    # passing through the CLI: the driver reads this file after the run, and the CLI's only
-    # passive route to the same value is a tool reply. Empty when the knob is off, so nothing
-    # that does not ask for a marker gains one.
+    # A DIGEST, NEVER THE MARKER. The receipts path is handed to the CLI in its own config —
+    # it has to be, that is how the server is told where to write — and the file lands in the
+    # CLI's working directory under `--allow-all`, so a shell or file-read tool can print it.
+    # Minting moved the secret out of the config and left it readable one hop away: the plain
+    # marker in this record is a second route to the value the round-trip clause exists to
+    # prove only a REPLY can carry. A sha256 is not invertible, so the driver can still
+    # recognise the marker when it sees it and the CLI cannot produce it from this file
+    # (review, PR #110). The marker itself now exists only in this process's memory and in the
+    # replies `echo` emits.
     _receipt(kind="listening", server=SERVER_NAME, tools=[t["name"] for t in TOOLS],
-             identity=IDENTITY)
+             identity_digest=identity_digest())
     for line in sys.stdin:
         line = line.strip()
         if not line:

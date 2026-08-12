@@ -33,8 +33,10 @@ THE THREE FACTS THIS SETTLES, and they are separable:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -42,12 +44,17 @@ import tempfile
 import uuid
 
 HARNESS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, HARNESS)
 sys.path.insert(0, os.path.join(HARNESS, "tools"))
 
 from probe_remote_mcp import start_fixture           # noqa: E402 — after the path bootstrap
 
 sys.path.insert(0, os.path.join(HARNESS, "fixtures"))
 from echo_mcp_server import IDENTITY_GENERATE        # noqa: E402 — imported, never retyped
+
+from agentskill_evals.adapters.copilot import _stream_cli_version  # noqa: E402 — the run's own witness
+
+_VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
 
 ALLOWED = "echo"
 OFF_LIST = "add"
@@ -118,16 +125,57 @@ def credential_arrived(records: list[dict], sentinel: str) -> bool:
     return all((r.get("headers") or {}).get("authorization", "") == expected for r in seen)
 
 
-def minted_identity(records: list[dict]) -> str:
-    """The marker the SERVER minted, read out of its own startup receipt — see the stdio
-    probe. This transport never had the leak that one did, since `start_fixture` sets the knob
-    on the FIXTURE's process and copilot cannot see it; both use the minted form anyway, so
-    there is one mechanism to reason about rather than two with different guarantees."""
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+# The minted marker is `uuid4().hex`: 32 lowercase hex characters. Candidates are pulled out of
+# the transcript by that shape and HASHED, so the driver recognises the marker without ever
+# holding it and the CLI cannot manufacture it from anything it can read.
+_CANDIDATE_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def minted_digest(records: list[dict]) -> str:
+    """The sha256 the SERVER reported for its minted marker, or "" if there is none.
+
+    A DIGEST RATHER THAN THE MARKER, because the receipts path is in the config the CLI reads
+    and the file lands in the CLI's working directory under `--allow-all`. Minting moved the
+    marker out of the config; it left it readable one hop away, so a file-read tool could put
+    it in the transcript with no reply having returned. sha256 is not invertible, so this
+    channel can carry recognition without carrying the secret (review, PR #110).
+
+    SHAPE-VALIDATED, which is the other half. This used to accept any string, so a receipt
+    reporting the literal `@generate` sentinel — the exact state a broken mint produces — was
+    accepted as a marker, and a transcript containing that word scored ENFORCED. The offline
+    verifier caught the mutation; the measurement executable itself failed open.
+    """
     for record in records:
         if record.get("kind") == "listening":
-            ident = record.get("identity")
-            return ident if isinstance(ident, str) else ""
+            digest = record.get("identity_digest")
+            return digest if isinstance(digest, str) and _DIGEST_RE.match(digest) else ""
     return ""
+
+
+def reply_carried_marker(transcript: str, digest: str) -> bool:
+    """Whether the transcript contains a token whose sha256 is `digest`.
+
+    The empty digest is never satisfied: a server that minted nothing cannot have answered.
+    """
+    if not digest:
+        return False
+    return any(hashlib.sha256(tok.encode("utf-8")).hexdigest() == digest
+               for tok in set(_CANDIDATE_RE.findall(transcript or "")))
+
+
+def control_verdict(control: list[dict]) -> tuple[str, str] | None:
+    """The verdict the CONTROL alone already decides — one authority, consulted by `classify`
+    and by `measure`, which uses it to skip a second model call that could not change it."""
+    if not server_ran(control):
+        return INSTRUMENT_FAILED, "the fixture did not start in the control arm"
+    # BOTH TOOLS UNGATED, because the gated arm is read for two facts of opposite sign.
+    if not called(control, OFF_LIST) or not called(control, ALLOWED):
+        return UNMEASURED, (f"the CONTROL called {OFF_LIST}={called(control, OFF_LIST)} "
+                            f"{ALLOWED}={called(control, ALLOWED)} over HTTP; whichever it "
+                            f"skipped, the gated arm's reading for that tool is the model's "
+                            f"doing rather than the filter's")
+    return None
 
 
 def classify(gated: list[dict], control: list[dict], answered: bool) -> tuple[str, str]:
@@ -136,14 +184,11 @@ def classify(gated: list[dict], control: list[dict], answered: bool) -> tuple[st
     `answered` is REQUIRED and has no default: the only default that would keep older calls
     working is the permissive one, and a caller that forgot it would be handed ENFORCED.
     """
-    if not server_ran(control) or not server_ran(gated):
-        return INSTRUMENT_FAILED, "the fixture did not start in one or both arms"
-    # BOTH TOOLS UNGATED, because the gated arm is read for two facts of opposite sign.
-    if not called(control, OFF_LIST) or not called(control, ALLOWED):
-        return UNMEASURED, (f"the CONTROL called {OFF_LIST}={called(control, OFF_LIST)} "
-                            f"{ALLOWED}={called(control, ALLOWED)} over HTTP; whichever it "
-                            f"skipped, the gated arm's reading for that tool is the model's "
-                            f"doing rather than the filter's")
+    decided = control_verdict(control)
+    if decided is not None:
+        return decided
+    if not server_ran(gated):
+        return INSTRUMENT_FAILED, "the fixture did not start in the gated arm"
     if called(gated, OFF_LIST):
         return LEAKED, (f"{OFF_LIST!r} reached the REMOTE server despite `tools: "
                         f"[{ALLOWED!r}]` — §8's pattern is not gated on copilot, and the "
@@ -230,19 +275,33 @@ def certifies_native(verdict: str, bearer_ok: bool, version_ok: bool) -> bool:
 
 
 def version_verdict(rc: int, out: str, err: str) -> tuple[str, bool]:
-    """(text, usable) for a `copilot --version` result.
+    """(text, usable) for a `copilot --version` result — the PREFLIGHT reading.
 
-    PURE, so §E19 can drive every branch without a copilot install — and SEPARATE from the
-    subprocess call for the same reason every other classifier here is. A measurement whose
-    write-up is qualified "at 1.0.79" is worth nothing if the run could not read a version:
-    this used to return a string like "(version unreadable: ...)" and `main` carried on, so
-    the probe would print a verdict attributed to a build it never identified (review, PR #110).
+    Kept for probes that never run a model session, and NOT used to gate a measurement: a
+    preflight is a different execution from the run, and copilot's launcher can resolve a
+    different cached app.js between the two (see `adapters/copilot.py:_stream_cli_version`,
+    which is why that adapter reads the version out of the run's own stream). Gating on this
+    would identify a build that may not be the one that answered (review, PR #110).
+
+    SHAPE-CHECKED, because `rc == 0` with any text on stdout used to count: a run whose only
+    output was a warning returned "usable" while naming no version at all.
     """
     text = (out or "").strip() or (err or "").strip()
     if rc != 0:
         return (text or f"exit {rc}"), False
-    return (text, bool(text))
+    return (text, bool(_VERSION_RE.search(text)))
 
+
+def run_version(stdout: str) -> tuple[str, bool]:
+    """The version that ACTUALLY EXECUTED, read out of the run's own stream.
+
+    IMPORTED, NOT REIMPLEMENTED. `adapters/copilot.py` already recovers this from
+    `session.skills_loaded` built-in skill paths, and already carries the reasoning about why
+    the rest of the stream is model-controlled and must not be scanned. A second copy here
+    would be a second thing to keep right (§4).
+    """
+    found = _stream_cli_version(stdout or "")
+    return (found or "(no in-band version witness in the run's stream)"), bool(found)
 
 def cli_version() -> tuple[str, bool]:
     """`copilot --version`, and whether it is usable. See `version_verdict`."""
@@ -261,6 +320,12 @@ def measure(workdir: str, kind: str, endpoint: str, sentinel: str):
     # with each other rather than each being measured (§4).
     results = {}
     for label, tools in (("control", None), ("gated", [ALLOWED])):
+        # SHORT-CIRCUIT. Once the control has failed to exercise both tools, nothing the gated
+        # arm reports can move the verdict, and running it spends a model call for a number
+        # that will not be read.
+        if label == "gated" and control_verdict(results["control"][0]) is not None:
+            verdict, reason = control_verdict(results["control"][0])
+            return verdict, reason + " (the gated arm was NOT run)", results, False, False
         receipts = os.path.join(workdir, f"receipts-{kind}-{label}.jsonl")
         # `(proc, info)` on success and `(None, reason)` on failure — the announcement is
         # already parsed there, so this does not re-parse it. Re-deriving a contract the
@@ -275,8 +340,7 @@ def measure(workdir: str, kind: str, endpoint: str, sentinel: str):
             proc.wait(timeout=15)
         results[label] = (read_receipts(receipts), out)
     gated_out = results["gated"][1]
-    marker = minted_identity(results["gated"][0])
-    answered = bool(marker) and marker in (gated_out or "")
+    answered = reply_carried_marker(gated_out, minted_digest(results["gated"][0]))
     verdict, reason = classify(results["gated"][0], results["control"][0], answered)
     bearer_ok = all(credential_arrived(recs, sentinel) for recs, _out in results.values())
     return verdict, reason, results, bearer_ok, answered
@@ -286,11 +350,9 @@ def main() -> int:
     workdir = tempfile.mkdtemp(prefix="probe-copilot-remote-")
     sentinel = uuid.uuid4().hex
     try:
-        version, version_ok = cli_version()
-        print(f"copilot: {version}")
-        if not version_ok:
-            print("  VERSION UNREADABLE: this result is qualified by a copilot build it could "
-                  "not identify, so it certifies nothing whatever the filter did")
+        # THE VERSION COMES FROM THE RUNS THEMSELVES, per transport, and is reported below
+        # with each. A preflight `copilot --version` is a different execution and can resolve
+        # different cached code than the run it would be qualifying.
         # EVERY TRANSPORT THE SCHEMA ADMITS, and the exit status is a conjunction of
         # CERTIFICATIONS over them — not of "settled", which is the bug review found: `LEAKED`
         # is settled, so an SSE leak beside a green Streamable result exited 0 under a comment
@@ -300,7 +362,12 @@ def main() -> int:
         for kind, endpoint in TRANSPORTS:
             verdict, reason, results, bearer_ok, answered = measure(
                 workdir, kind, endpoint, sentinel)
-            print(f"probe C2-copilot-remote [{kind}]: {verdict}")
+            version, version_ok = run_version(
+                "".join(out for _recs, out in results.values()))
+            print(f"probe C2-copilot-remote [{kind}]: {verdict}   (copilot: {version})")
+            if not version_ok:
+                print("  VERSION UNVERIFIED: no in-band witness in this run's stream, so the "
+                      "result names no build and certifies nothing")
             print(f"  {reason}")
             for label, (recs, _out) in results.items():
                 print(f"  {label:<8} server_ran={server_ran(recs)} "

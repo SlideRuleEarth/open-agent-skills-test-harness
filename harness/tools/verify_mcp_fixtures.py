@@ -28,6 +28,7 @@ most likely to produce.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
@@ -1930,11 +1931,12 @@ try:
               and _p.classify([], _both, True)[0] == _p.INSTRUMENT_FAILED)
 
     # -- the marker must be unreachable except through a tool result -----------------------
-    # `answered` is "the opaque marker appeared in the CLI's output", which is evidence about a
-    # reply only while the CLI has no other copy. Two versions put one where it could: in the
-    # config file copilot reads, then in copilot's own environment, which copilot and any shell
-    # tool it launches can dump. The marker is MINTED BY THE SERVER now and read back out of its
-    # receipts, so the driver never holds a value to leak in the first place.
+    # `answered` is "the marker appeared in the CLI's output", which is evidence about a reply
+    # only while the CLI has no other copy. Three revisions put one where it could: the config
+    # file copilot reads, then copilot's own environment, then the receipts file — whose path
+    # is in that same config and which lands in copilot's working directory under `--allow-all`.
+    # The receipts now carry a sha256 and never the marker, so recognition travels without the
+    # secret, and the plaintext exists only in the server's memory and its replies.
     _cfg_written = CG.mcp_config(os.path.join(_e19, "cfg.json"),
                                  os.path.join(_e19, "receipts.jsonl"), tools=["echo"])
     with open(_cfg_written, encoding="utf-8") as _fh:
@@ -1942,50 +1944,59 @@ try:
     check("the config asks the server to MINT a marker rather than carrying one",
           CG.IDENTITY_GENERATE in _cfg_text
           and '"tools": ["echo"]' in _cfg_text.replace("'", '"'), _cfg_text)
-    # THE SENTINEL IS PINNED TO THE FIXTURE THAT READS IT — imported by the probe, not retyped,
-    # so this asserts the import rather than a copy. A probe asking for a sentinel the server
-    # no longer recognises would get that literal string back as the marker, and every reply
-    # would then "contain the marker" for free.
     check("...and that sentinel is the fixture's own, not a second spelling of it",
           CG.IDENTITY_GENERATE == ECHOMOD.IDENTITY_GENERATE == CRG.IDENTITY_GENERATE,
           (CG.IDENTITY_GENERATE, ECHOMOD.IDENTITY_GENERATE))
-    # AND THE SERVER REALLY MINTS ONE, from the fixture itself rather than from a claim about
-    # it: a `listening` receipt whose identity is empty would make `answered` false forever,
-    # and one that echoed the sentinel would make it true forever.
+    # DRIVEN THROUGH THE FIXTURE ITSELF, so the digest is the server's and not a claim about it.
     _mint_receipts = os.path.join(_e19, "minted.jsonl")
-    run([{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-          "params": {"name": "echo", "arguments": {"text": "HI"}}}],
-        server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": _mint_receipts,
-                                "ECHO_MCP_IDENTITY": ECHOMOD.IDENTITY_GENERATE})
-    _minted = CG.minted_identity(CG.read_receipts(_mint_receipts))
-    check("the server mints a marker of its own and reports it in the startup receipt",
-          bool(_minted) and _minted != ECHOMOD.IDENTITY_GENERATE and len(_minted) >= 16,
-          _minted)
-    # ...and it is the marker the REPLY actually carries, which is the whole point: a receipt
-    # reporting one value while `echo` prefixes another would make `answered` unfalsifiable.
     _replies, _n, _r, _stream = run(
         [legacy_init(1),
          {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
           "params": {"name": "echo", "arguments": {"text": "PAYLOAD"}}}],
-        server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": os.path.join(_e19, "m2.jsonl"),
+        server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": _mint_receipts,
                                 "ECHO_MCP_IDENTITY": ECHOMOD.IDENTITY_GENERATE})
-    _m2 = CG.minted_identity(CG.read_receipts(os.path.join(_e19, "m2.jsonl")))
+    _rows = CG.read_receipts(_mint_receipts)
+    _digest = CG.minted_digest(_rows)
     _reply_text = json.dumps(_replies)
-    check("...and the reply carries that same minted marker, so the two cannot disagree",
-          bool(_m2) and f"{_m2}:PAYLOAD" in _reply_text, (_m2, _reply_text[:300]))
+    # THE SERVER REALLY MINTED, asserted directly rather than inferred from the marker's shape.
+    # Under a broken mint `IDENTITY` stays the sentinel, whose digest is a perfectly well-formed
+    # 64-hex string — so every structural check passes and only this one notices.
+    check("the digest reported is not the sentinel's, so the server minted rather than echoed",
+          bool(_digest) and _digest != hashlib.sha256(
+              ECHOMOD.IDENTITY_GENERATE.encode("utf-8")).hexdigest(),
+          _digest)
+    check("the receipts carry a DIGEST, and the marker itself appears nowhere in them",
+          bool(_digest) and len(_digest) == 64
+          and not any("identity" == k for row in _rows for k in row),
+          _rows)
+    # THE PAIR THAT MAKES IT A MEASUREMENT: the reply carries a token matching that digest, and
+    # the receipts do not. Without the second half the digest could simply be of something the
+    # file already contains.
+    check("...and the reply carries a token whose digest is the one reported",
+          CG.reply_carried_marker(_reply_text, _digest), (_digest, _reply_text[:300]))
+    check("...while the receipts themselves do not satisfy it, so the file is not a route",
+          not CG.reply_carried_marker(json.dumps(_rows), _digest), _rows)
+    # THE SENTINEL IS NOT A MARKER. A receipt reporting `@generate` is exactly what a broken
+    # mint produces, and the live probe used to accept it — a transcript containing that word
+    # then scored ENFORCED. Shape-validation is what refuses it.
+    check("a receipt whose identity is the generation sentinel is not a minted marker",
+          CG.minted_digest([{"kind": "listening", "identity_digest": ECHOMOD.IDENTITY_GENERATE}])
+          == "" and CG.minted_digest([{"kind": "listening", "identity_digest": "nope"}]) == ""
+          and CG.minted_digest([{"kind": "listening", "identity_digest": 7}]) == "",
+          "only a 64-hex digest is a digest")
+    check("...and an empty digest is never satisfied by any transcript",
+          not CG.reply_carried_marker("@generate anything at all", ""),
+          "a server that minted nothing cannot have answered")
     # A run that did NOT ask for a marker must not gain one — the knob stays opt-in, or every
-    # existing verbatim-echo check changes meaning.
+    # existing verbatim-echo check changes meaning. `server_ran` first: a fixture that never
+    # started writes no receipts, and the claim would pass on that absence.
     _plain = os.path.join(_e19, "plain.jsonl")
     run([{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
           "params": {"name": "echo", "arguments": {"text": "HI"}}}],
         server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": _plain})
-    # THE STRUCTURAL CLAUSE FIRST. Without `server_ran`, this passes on a fixture that never
-    # started — no receipts, no identity, claim satisfied — which is how a mutation that broke
-    # the fixture outright came back NOT via instead of CAUGHT. An absence is only evidence
-    # once something positive says the thing that would have written it ran (§4).
     check("...while a server not asked for a marker reports none, so the knob stays opt-in",
           CG.server_ran(CG.read_receipts(_plain))
-          and CG.minted_identity(CG.read_receipts(_plain)) == "",
+          and CG.minted_digest(CG.read_receipts(_plain)) == "",
           CG.read_receipts(_plain))
 
     # -- and the VERDICTS, which are a separate claim from the classifiers -------------------
@@ -2020,16 +2031,34 @@ try:
     # THE VERSION GATE. A result written up as "at 1.0.79" is worth nothing from a run that
     # could not read a version, and this used to be a string in a `print`.
     for _p, _n in ((CG, "stdio"), (CRG, "remote"), (CFG, "config")):
-        check(f"{_n}: a readable version is usable and an unreadable one is not",
+        check(f"{_n}: a preflight version must LOOK like a version, not merely be output",
               _p.version_verdict(0, "GitHub Copilot CLI 1.0.79", "")[1] is True
+              and _p.version_verdict(0, "warning only", "")[1] is False
               and _p.version_verdict(1, "", "boom")[1] is False
               and _p.version_verdict(0, "", "")[1] is False,
-              [_p.version_verdict(0, "x", ""), _p.version_verdict(1, "", "boom"),
-               _p.version_verdict(0, "", "")])
+              [_p.version_verdict(0, s, e) for s, e in
+               (("GitHub Copilot CLI 1.0.79", ""), ("warning only", ""), ("", ""))])
     check("...and the text is carried through so the failure names what it saw",
           CG.version_verdict(1, "", "not found")[0] == "not found"
           and CG.version_verdict(0, "1.0.79", "")[0] == "1.0.79",
           [CG.version_verdict(1, "", "not found"), CG.version_verdict(0, "1.0.79", "")])
+    # THE GATING PROBES USE THE RUN'S OWN WITNESS, not a second execution: copilot's launcher
+    # can resolve different cached code between two invocations, which is why the adapter reads
+    # the version out of `session.skills_loaded` and why that reader is imported rather than
+    # reimplemented here.
+    _skills = json.dumps({"type": "session.skills_loaded", "data": {"skills": [
+        {"source": "builtin", "path": "/x/pkg/darwin-arm64/1.0.79/builtin/s/SKILL.md"}]}})
+    for _p, _n in ((CG, "stdio"), (CRG, "remote")):
+        check(f"{_n}: the version is recovered from the run's own stream",
+              _p.run_version(_skills) == ("1.0.79", True), _p.run_version(_skills))
+        check(f"{_n}: ...and a stream with no witness is UNVERIFIED rather than assumed",
+              _p.run_version("")[1] is False
+              and _p.run_version('{"type":"other"}')[1] is False, _p.run_version(""))
+        # MODEL-CONTROLLED TEXT MUST NOT FORGE IT — the reasoning the adapter already carries,
+        # asserted here because these probes now depend on it.
+        check(f"{_n}: ...and prose naming an app root does not count as a witness",
+              _p.run_version('{"type":"assistant","text":"pkg/darwin-arm64/9.9.9/builtin/"}')[1]
+              is False, "only builtin skill paths are structural")
     # The config probe's four findings, likewise a conjunction and not a lookup on the last.
     check("the config probe fails on ANY of its four findings, not just the stdio ones",
           CFG.exit_code([], [], True, True) == 0
@@ -2050,6 +2079,22 @@ try:
     check("...while a key nobody has measured yet is still reported",
           CFG.unexpected_keys({"mcpServers": {"e": {"type": "local", "wat": 1}}},
                               CFG.EXPECTED) == ["wat"])
+
+    # THE CONTROL DECIDES ALONE, or it does not — and `main` reads the same function
+    # `classify` does, so the short-circuit cannot drift from the verdict it is short-cutting.
+    for _p, _n in ((CG, "stdio"), (CRG, "remote")):
+        _both = _arms(_p, "echo", "add")
+        check(f"{_n}: a control that exercised both tools does NOT decide alone",
+              _p.control_verdict(_both) is None, _p.control_verdict(_both))
+        check(f"{_n}: ...a control that never started decides INSTRUMENT_FAILED",
+              (_p.control_verdict([]) or ("", ""))[0] == _p.INSTRUMENT_FAILED)
+        check(f"{_n}: ...and one that skipped a tool decides UNMEASURED, so no second call",
+              (_p.control_verdict(_arms(_p, "echo")) or ("", ""))[0] == _p.UNMEASURED
+              and (_p.control_verdict(_arms(_p, "add")) or ("", ""))[0] == _p.UNMEASURED)
+        # AND `classify` MUST AGREE WITH IT, since the whole point is one authority.
+        check(f"{_n}: ...and classify returns exactly what the control decided",
+              _p.classify(_both, _arms(_p, "echo"), True) ==
+              _p.control_verdict(_arms(_p, "echo")))
 
     # THE TWO VOCABULARIES ARE ONE VOCABULARY, asserted rather than assumed. Neither probe can
     # import the other (each is a standalone opt-in tool), so this is §4's duplicated-rule rule:

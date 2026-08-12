@@ -36,18 +36,23 @@ both probes and the verdict read ENFORCED off it. The prompt now asks for both, 
 arm carries a claim of each sign: `echo` must arrive, `add` must not. An allowlist that admits
 nothing is not a boundary the harness can declare `native` — it is a server that does not work.
 
-THE ANSWER THAT IS NOT A FAILURE. A run in which the model never calls a tool even ungated
-answers nothing about the filter, and saying so is the point: `UNMEASURED` is a verdict here,
-not an error. `LEAKED` and `SUPPRESSES_ALL` are the two ways the answer can be "copilot cannot
-be `native`" — definite results, exit 0 — and the exit status separates all of those from a run
-that measured nothing.
+WHAT THE EXIT STATUS MEANS, and it is the strong claim rather than the weak one. **0 means
+this run supports declaring `mcp_tool_filter = "native"`**: the filter held, the allowed tool
+answered, and the run identified the build it measured. `LEAKED`, `SUPPRESSES_ALL` and
+`ANSWER_LOST` are definite ANSWERS — the findings this probe exists to produce — and they exit
+1, because a caller reading only the status must never read "LEAKED" as permission. `UNMEASURED`
+and `INSTRUMENT_FAILED` are runs that settled nothing and exit 1 as well; the printed verdict is
+what distinguishes them. An earlier revision wired the status to "the question was settled" and
+described it as certification, which are not the same set (review, PR #110).
 
     python tools/probe_copilot_gating.py            # both arms; prints the tally either way
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -55,6 +60,7 @@ import tempfile
 import uuid
 
 HARNESS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, HARNESS)
 ECHO = os.path.join(HARNESS, "fixtures", "echo_mcp_server.py")
 sys.path.insert(0, os.path.join(HARNESS, "fixtures"))
 
@@ -63,6 +69,10 @@ sys.path.insert(0, os.path.join(HARNESS, "fixtures"))
 # would then treat the sentinel as a literal marker, which is the failure mode this whole
 # clause exists to prevent.
 from echo_mcp_server import IDENTITY_GENERATE  # noqa: E402 — after the path insert
+
+from agentskill_evals.adapters.copilot import _stream_cli_version  # noqa: E402 — the run's own witness
+
+_VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
 
 ALLOWED = "echo"
 OFF_LIST = "add"
@@ -115,19 +125,65 @@ def called(records: list[dict], tool: str) -> bool:
                and r.get("tool") == tool for r in records)
 
 
-def minted_identity(records: list[dict]) -> str:
-    """The marker the SERVER minted, read out of its own startup receipt.
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+# The minted marker is `uuid4().hex`: 32 lowercase hex characters. Candidates are pulled out of
+# the transcript by that shape and HASHED, so the driver recognises the marker without ever
+# holding it and the CLI cannot manufacture it from anything it can read.
+_CANDIDATE_RE = re.compile(r"[0-9a-f]{32}")
 
-    The driver never chooses it. Every value the driver could choose has to travel to the
-    server through the CLI under test — its config or its environment — which leaves the CLI
-    holding a copy before any tool runs, and "the marker appeared in the output" then has a
-    route that is not a reply (review, PR #110, twice).
+
+def minted_digest(records: list[dict]) -> str:
+    """The sha256 the SERVER reported for its minted marker, or "" if there is none.
+
+    A DIGEST RATHER THAN THE MARKER, because the receipts path is in the config the CLI reads
+    and the file lands in the CLI's working directory under `--allow-all`. Minting moved the
+    marker out of the config; it left it readable one hop away, so a file-read tool could put
+    it in the transcript with no reply having returned. sha256 is not invertible, so this
+    channel can carry recognition without carrying the secret (review, PR #110).
+
+    SHAPE-VALIDATED, which is the other half. This used to accept any string, so a receipt
+    reporting the literal `@generate` sentinel — the exact state a broken mint produces — was
+    accepted as a marker, and a transcript containing that word scored ENFORCED. The offline
+    verifier caught the mutation; the measurement executable itself failed open.
     """
     for record in records:
         if record.get("kind") == "listening":
-            ident = record.get("identity")
-            return ident if isinstance(ident, str) else ""
+            digest = record.get("identity_digest")
+            return digest if isinstance(digest, str) and _DIGEST_RE.match(digest) else ""
     return ""
+
+
+def reply_carried_marker(transcript: str, digest: str) -> bool:
+    """Whether the transcript contains a token whose sha256 is `digest`.
+
+    The empty digest is never satisfied: a server that minted nothing cannot have answered.
+    """
+    if not digest:
+        return False
+    return any(hashlib.sha256(tok.encode("utf-8")).hexdigest() == digest
+               for tok in set(_CANDIDATE_RE.findall(transcript or "")))
+
+
+def control_verdict(control: list[dict]) -> tuple[str, str] | None:
+    """The verdict the CONTROL alone already decides, or None if the gated arm is needed.
+
+    ONE AUTHORITY, TWO CALLERS. `classify` consults it first, and `main` consults it to skip
+    the second model call — the short-circuit its comment promised and never had, which spent
+    a call whose result could not change the answer. Duplicating the condition in `main`
+    instead would be a second copy of the rule that decides what a run means.
+    """
+    if not server_ran(control):
+        return INSTRUMENT_FAILED, ("the echo server did not start in the control arm, so an "
+                                   "absent call says nothing about a filter")
+    # BOTH TOOLS MUST HAVE BEEN EXERCISED UNGATED, not just the off-list one. The gated arm is
+    # read for two facts of opposite sign, so the control has to establish that the model
+    # reaches for each of them when nothing is stopping it.
+    if not called(control, OFF_LIST) or not called(control, ALLOWED):
+        return UNMEASURED, (f"the CONTROL called {OFF_LIST}={called(control, OFF_LIST)} "
+                            f"{ALLOWED}={called(control, ALLOWED)}; whichever it skipped, the "
+                            f"gated arm's reading for that tool is the model's choice rather "
+                            f"than the filter's doing")
+    return None
 
 
 def classify(gated: list[dict], control: list[dict], answered: bool) -> tuple[str, str]:
@@ -141,17 +197,12 @@ def classify(gated: list[dict], control: list[dict], answered: bool) -> tuple[st
     §4's rule for probes, and the reason C3-2's classifier has its own checks. Every branch
     below is reachable from a hand-written pair of record lists.
     """
-    if not server_ran(control) or not server_ran(gated):
-        return INSTRUMENT_FAILED, ("the echo server did not start in one or both arms, so an "
+    decided = control_verdict(control)
+    if decided is not None:
+        return decided
+    if not server_ran(gated):
+        return INSTRUMENT_FAILED, ("the echo server did not start in the gated arm, so an "
                                    "absent call says nothing about a filter")
-    # BOTH TOOLS MUST HAVE BEEN EXERCISED UNGATED, not just the off-list one. The gated arm is
-    # read for two facts of opposite sign, so the control has to establish that the model
-    # reaches for each of them when nothing is stopping it.
-    if not called(control, OFF_LIST) or not called(control, ALLOWED):
-        return UNMEASURED, (f"the CONTROL called {OFF_LIST}={called(control, OFF_LIST)} "
-                            f"{ALLOWED}={called(control, ALLOWED)}; whichever it skipped, the "
-                            f"gated arm's reading for that tool is the model's choice rather "
-                            f"than the filter's doing")
     if called(gated, OFF_LIST):
         return LEAKED, (f"{OFF_LIST!r} reached the server despite `tools: [{ALLOWED!r}]` — the "
                         f"filter is advisory, exactly as claude's `--allowedTools` measured "
@@ -267,19 +318,33 @@ def certifies_native(verdict: str, version_ok: bool) -> bool:
 
 
 def version_verdict(rc: int, out: str, err: str) -> tuple[str, bool]:
-    """(text, usable) for a `copilot --version` result.
+    """(text, usable) for a `copilot --version` result — the PREFLIGHT reading.
 
-    PURE, so §E19 can drive every branch without a copilot install — and SEPARATE from the
-    subprocess call for the same reason every other classifier here is. A measurement whose
-    write-up is qualified "at 1.0.79" is worth nothing if the run could not read a version:
-    this used to return a string like "(version unreadable: ...)" and `main` carried on, so
-    the probe would print a verdict attributed to a build it never identified (review, PR #110).
+    Kept for probes that never run a model session, and NOT used to gate a measurement: a
+    preflight is a different execution from the run, and copilot's launcher can resolve a
+    different cached app.js between the two (see `adapters/copilot.py:_stream_cli_version`,
+    which is why that adapter reads the version out of the run's own stream). Gating on this
+    would identify a build that may not be the one that answered (review, PR #110).
+
+    SHAPE-CHECKED, because `rc == 0` with any text on stdout used to count: a run whose only
+    output was a warning returned "usable" while naming no version at all.
     """
     text = (out or "").strip() or (err or "").strip()
     if rc != 0:
         return (text or f"exit {rc}"), False
-    return (text, bool(text))
+    return (text, bool(_VERSION_RE.search(text)))
 
+
+def run_version(stdout: str) -> tuple[str, bool]:
+    """The version that ACTUALLY EXECUTED, read out of the run's own stream.
+
+    IMPORTED, NOT REIMPLEMENTED. `adapters/copilot.py` already recovers this from
+    `session.skills_loaded` built-in skill paths, and already carries the reasoning about why
+    the rest of the stream is model-controlled and must not be scanned. A second copy here
+    would be a second thing to keep right (§4).
+    """
+    found = _stream_cli_version(stdout or "")
+    return (found or "(no in-band version witness in the run's stream)"), bool(found)
 
 def cli_version() -> tuple[str, bool]:
     """`copilot --version`, and whether it is usable. See `version_verdict`."""
@@ -294,18 +359,29 @@ def cli_version() -> tuple[str, bool]:
 def main() -> int:
     workdir = tempfile.mkdtemp(prefix="probe-copilot-gating-")
     try:
-        version, version_ok = cli_version()
-        print(f"copilot: {version}")
-        # THE CONTROL RUNS FIRST, deliberately. If it cannot get the model to call the tool at
-        # all, the gated arm is not worth a second model call and the tally says why.
+        # THE CONTROL RUNS FIRST, and if it already decides the verdict the gated arm is not
+        # worth a second model call — which this said and did not do until review pointed at
+        # the line (PR #110).
         control, control_out = run_arm(workdir, tools=None)
+        version, version_ok = run_version(control_out)
+        print(f"copilot: {version}")
+        decided = control_verdict(control)
+        if decided is not None:
+            verdict, reason = decided
+            print(f"probe C2-copilot: {verdict}\n  {reason}")
+            print(f"  control: server_ran={server_ran(control)} "
+                  f"called({OFF_LIST})={called(control, OFF_LIST)} "
+                  f"called({ALLOWED})={called(control, ALLOWED)} records={len(control)}")
+            print("  the gated arm was NOT run: its reading could not change this verdict")
+            print("  --- control transcript ---")
+            print("  " + (control_out or "").strip()[:1200].replace("\n", "\n  "))
+            return 1
         gated, gated_out = run_arm(workdir, tools=[ALLOWED])
         # THE ROUND TRIP, read from the GATED arm because that is the run whose usability is
         # in question. The marker is MINTED BY THE SERVER and read back out of its receipts —
         # never chosen here — so copilot's only route to it is a tool reply, and `answered` is
         # a fact about that reply rather than about anything copilot could dump.
-        marker = minted_identity(gated)
-        answered = bool(marker) and marker in (gated_out or "")
+        answered = reply_carried_marker(gated_out, minted_digest(gated))
         verdict, reason = classify(gated, control, answered)
 
         # PRINTED ON EVERY RUN, pass or fail. A green line shows no detail, the receipts are

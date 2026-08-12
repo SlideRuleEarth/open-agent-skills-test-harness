@@ -2915,18 +2915,18 @@ MUTATIONS = [
     ("F56-the-generate-sentinel-is-used-as-the-marker", ECHO,
      'if IDENTITY == IDENTITY_GENERATE:\n    IDENTITY = uuid.uuid4().hex',
      'if False:\n    IDENTITY = uuid.uuid4().hex',
-     "the server mints a marker of its own and reports it in the startup receipt"),
+     "the digest reported is not the sentinel's, so the server minted rather than echoed"),
     # ...and the route back to the driver that does not pass through the CLI.
     ("F57-the-minted-marker-is-not-reported-to-the-driver", ECHO,
-     '             identity=IDENTITY)',
-     '             identity="")',
-     "the server mints a marker of its own and reports it in the startup receipt"),
+     "             identity_digest=identity_digest())",
+     '             identity_digest="")',
+     "the receipts carry a DIGEST, and the marker itself appears nowhere in them"),
     # A RECEIPT THAT DISAGREES WITH THE REPLY makes `answered` unfalsifiable in the other
     # direction: the driver looks for a value the tool never emits.
     ("F58-the-reported-identity-is-not-the-one-the-reply-carries", ECHO,
      '        return _text(f"{IDENTITY}:{text}" if IDENTITY else text)',
      '        return _text(text)',
-     "...and the reply carries that same minted marker, so the two cannot disagree"),
+     "...and the reply carries a token whose digest is the one reported"),
     # THE KNOB STOPS BEING OPT-IN, which silently changes what every verbatim-echo check means.
     ("F59-every-server-mints-a-marker-whether-asked-or-not", ECHO,
      'IDENTITY = os.environ.get("ECHO_MCP_IDENTITY") or ""',
@@ -2945,9 +2945,11 @@ MUTATIONS = [
     # THE VERSION GATE, in each of the three. A run that cannot say which build it measured
     # certifies nothing, and this used to be a string in a `print`.
     ("F62-an-unreadable-version-is-usable-anyway", CGATE,
-     "    if rc != 0:\n        return (text or f\"exit {rc}\"), False\n    return (text, bool(text))",
-     "    if rc != 0:\n        return (text or f\"exit {rc}\"), True\n    return (text, True)",
-     "stdio: a readable version is usable and an unreadable one is not"),
+     ('    if rc != 0:\n        return (text or f"exit {rc}"), False\n'
+      "    return (text, bool(_VERSION_RE.search(text)))"),
+     ('    if rc != 0:\n        return (text or f"exit {rc}"), False\n'
+      "    return (text, bool(text))"),
+     "stdio: a preflight version must LOOK like a version, not merely be output"),
     ("F63-the-config-probe-ignores-an-unreadable-version", CCONFIG,
      "    return 1 if (differs or surprises or not remote_ok or not version_ok) else 0",
      "    return 1 if (differs or surprises or not remote_ok) else 0",
@@ -2970,6 +2972,41 @@ MUTATIONS = [
       "            and all(isinstance(t, str) and t for t in tools)):"),
      "    if False:",
      "...and an allowlist that is not a non-empty list of names is not one either"),
+    # THE RECEIPTS BECOME A ROUTE TO THE MARKER AGAIN. The path is in the config the CLI reads
+    # and the file is in its working directory under `--allow-all`, so a plaintext marker there
+    # is readable without any reply having returned.
+    ("F67-the-receipts-carry-the-marker-in-plaintext", ECHO,
+     "    return hashlib.sha256(IDENTITY.encode(\"utf-8\")).hexdigest() if IDENTITY else \"\"",
+     '    return IDENTITY',
+     "the receipts carry a DIGEST, and the marker itself appears nowhere in them"),
+    # THE LIVE PROBE FAILS OPEN on a receipt that reports the sentinel — the exact state a
+    # broken mint produces, and a transcript containing that word then scored ENFORCED.
+    ("F68-any-string-counts-as-a-minted-marker", CGATE,
+     "            return digest if isinstance(digest, str) and _DIGEST_RE.match(digest) else \"\"",
+     '            return digest if isinstance(digest, str) else ""',
+     "a receipt whose identity is the generation sentinel is not a minted marker"),
+    ("F69-an-empty-digest-is-satisfied-by-anything", CGATE,
+     "    if not digest:\n        return False",
+     "    if not digest:\n        return True",
+     "...and an empty digest is never satisfied by any transcript"),
+    # THE VERSION IDENTIFIES A DIFFERENT EXECUTION. copilot's launcher can resolve different
+    # cached code between two invocations, which is why the adapter reads it in-band.
+    ("F70-the-in-band-version-witness-is-not-required", CGATE,
+     '    return (found or "(no in-band version witness in the run\'s stream)"), bool(found)',
+     '    return (found or "(no in-band version witness in the run\'s stream)"), True',
+     "stdio: ...and a stream with no witness is UNVERIFIED rather than assumed"),
+    ("F71-the-remote-in-band-version-witness-is-not-required", CGATE_REMOTE,
+     '    return (found or "(no in-band version witness in the run\'s stream)"), bool(found)',
+     '    return (found or "(no in-band version witness in the run\'s stream)"), True',
+     "remote: ...and a stream with no witness is UNVERIFIED rather than assumed"),
+    # THE CONTROL STOPS DECIDING ALONE, so the second model call runs for a number that cannot
+    # move the verdict — and `classify` and `main` stop agreeing about what a run means.
+    ("F72-the-control-never-decides-on-its-own", CGATE,
+     ("    if not called(control, OFF_LIST) or not called(control, ALLOWED):\n"
+      "        return UNMEASURED, (f\"the CONTROL called {OFF_LIST}={called(control, OFF_LIST)} \""),
+     ("    if False:\n"
+      "        return UNMEASURED, (f\"the CONTROL called {OFF_LIST}={called(control, OFF_LIST)} \""),
+     "stdio: ...and one that skipped a tool decides UNMEASURED, so no second call"),
     ("F36-the-child-reports-no-environment-at-all", TARGET,
      '"pgid": os.getpgid(0), "env_seen": sorted(set(seen))}',
      '"pgid": os.getpgid(0), "env_seen": []}',
