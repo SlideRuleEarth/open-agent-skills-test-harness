@@ -2880,14 +2880,16 @@ MUTATIONS = [
     # THE VERDICT, NOT THE CLASSIFIER. Each of these leaves its named function correct and stops
     # `main` from acting on it — the exact gap that let `remote_shape` be right while the exit
     # status ignored it, and the reason the verdicts were extracted at all.
+    # RE-ANCHORED when `run_ok` became `certifies_native`. Caught by `stale_anchors` in a
+    # second, which is the entire argument for putting it before the baselines.
     ("F51-the-remote-verdict-ignores-the-credential", CGATE_REMOTE,
-     "    return verdict in (ENFORCED, LEAKED, SUPPRESSES_ALL, ANSWER_LOST) and bearer_ok",
-     "    return verdict in (ENFORCED, LEAKED, SUPPRESSES_ALL, ANSWER_LOST)",
-     "the remote verdict fails when the credential did not arrive, whatever the filter did"),
+     "    return verdict == ENFORCED and bearer_ok and version_ok",
+     "    return verdict == ENFORCED and version_ok",
+     "remote: ...and the same, per transport, over bearer and version too"),
     ("F52-the-config-verdict-ignores-the-remote-shape", CCONFIG,
-     "    return 1 if (differs or surprises or not remote_ok) else 0",
-     "    return 1 if (differs or surprises) else 0",
-     "the config probe fails on ANY of its three findings, not just the stdio ones"),
+     "    return 1 if (differs or surprises or not remote_ok or not version_ok) else 0",
+     "    return 1 if (differs or surprises or not version_ok) else 0",
+     "the config probe fails on ANY of its four findings, not just the stdio ones"),
     # THE ANCHOR VALIDATOR'S OWN TWO WAYS OF BEING WRONG. It exists because a stale anchor cost
     # a 77-minute run to discover; a validator that reads one half of a two-part `find`, or that
     # treats "matches twice" as fine, would hand back the same silence for the same money.
@@ -2901,13 +2903,73 @@ MUTATIONS = [
      "            if n != 1:\n                out.append((mid, rel, n))",
      "            if n == 0:\n                out.append((mid, rel, n))",
      "...and so is one that matches twice, which would mutate the wrong site"),
-    # THE MARKER BACK IN THE FILE THE CLI READS. `answered` is evidence about a reply only while
-    # the CLI holds no other copy of the marker; with it in the config's `env` map, a CLI that
-    # echoed its server config would satisfy the round-trip clause having returned nothing.
+    # THE MARKER BACK WHERE THE CLI CAN READ IT. `answered` is evidence about a reply only
+    # while the CLI holds no other copy; a driver-chosen marker in the config satisfies the
+    # round-trip clause with nothing having returned. Two versions of this line shipped wrong.
     ("F55-the-round-trip-marker-is-put-where-the-cli-can-read-it", CGATE,
-     '                    "env": {"ECHO_MCP_RECEIPTS": receipts}}',
-     '                    "env": {"ECHO_MCP_RECEIPTS": receipts, "ECHO_MCP_IDENTITY": marker}}',
-     "the config handed to the CLI does not carry the round-trip marker"),
+     '                            "ECHO_MCP_IDENTITY": IDENTITY_GENERATE}}',
+     '                            "ECHO_MCP_IDENTITY": "a-marker-the-driver-chose"}}',
+     "the config asks the server to MINT a marker rather than carrying one"),
+    # THE SERVER STOPS MINTING and treats the sentinel as a literal marker, which makes every
+    # reply "contain the marker" for free — the unfalsifiable form of the same clause.
+    ("F56-the-generate-sentinel-is-used-as-the-marker", ECHO,
+     'if IDENTITY == IDENTITY_GENERATE:\n    IDENTITY = uuid.uuid4().hex',
+     'if False:\n    IDENTITY = uuid.uuid4().hex',
+     "the server mints a marker of its own and reports it in the startup receipt"),
+    # ...and the route back to the driver that does not pass through the CLI.
+    ("F57-the-minted-marker-is-not-reported-to-the-driver", ECHO,
+     '             identity=IDENTITY)',
+     '             identity="")',
+     "the server mints a marker of its own and reports it in the startup receipt"),
+    # A RECEIPT THAT DISAGREES WITH THE REPLY makes `answered` unfalsifiable in the other
+    # direction: the driver looks for a value the tool never emits.
+    ("F58-the-reported-identity-is-not-the-one-the-reply-carries", ECHO,
+     '        return _text(f"{IDENTITY}:{text}" if IDENTITY else text)',
+     '        return _text(text)',
+     "...and the reply carries that same minted marker, so the two cannot disagree"),
+    # THE KNOB STOPS BEING OPT-IN, which silently changes what every verbatim-echo check means.
+    ("F59-every-server-mints-a-marker-whether-asked-or-not", ECHO,
+     'IDENTITY = os.environ.get("ECHO_MCP_IDENTITY") or ""',
+     'IDENTITY = os.environ.get("ECHO_MCP_IDENTITY") or "a-marker-nobody-asked-for"',
+     "...while a server not asked for a marker reports none, so the knob stays opt-in"),
+    # THE NAME AND THE MEANING PULLED APART AGAIN: certification widened back to "settled", so
+    # LEAKED — the finding these probes exist to catch — would exit 0 as permission.
+    ("F60-a-settled-negative-certifies-native", CGATE,
+     "    return verdict == ENFORCED and version_ok",
+     "    return settled(verdict) and version_ok",
+     "stdio: a settled negative does NOT certify `native`, which is what exit 0 claims"),
+    ("F61-a-leaked-transport-still-certifies-native", CGATE_REMOTE,
+     "    return verdict == ENFORCED and bearer_ok and version_ok",
+     "    return settled(verdict) and bearer_ok and version_ok",
+     "remote: ...and the same, per transport, over bearer and version too"),
+    # THE VERSION GATE, in each of the three. A run that cannot say which build it measured
+    # certifies nothing, and this used to be a string in a `print`.
+    ("F62-an-unreadable-version-is-usable-anyway", CGATE,
+     "    if rc != 0:\n        return (text or f\"exit {rc}\"), False\n    return (text, bool(text))",
+     "    if rc != 0:\n        return (text or f\"exit {rc}\"), True\n    return (text, True)",
+     "stdio: a readable version is usable and an unreadable one is not"),
+    ("F63-the-config-probe-ignores-an-unreadable-version", CCONFIG,
+     "    return 1 if (differs or surprises or not remote_ok or not version_ok) else 0",
+     "    return 1 if (differs or surprises or not remote_ok) else 0",
+     "the config probe fails on ANY of its four findings, not just the stdio ones"),
+    # THE DISCRIMINATOR LEAVES THE KNOWN SET, which is the state that made `remote_ok`
+    # unreachable: `type` a permanent surprise, exit 1 on every real run, no other term able
+    # to move it.
+    ("F64-the-measured-discriminator-goes-back-to-being-a-surprise", CCONFIG,
+     '    "type": "type",\n}',
+     "}",
+     "the discriminator copilot actually writes is a known key, not a permanent surprise"),
+    # PRESENCE IS NOT SHAPE: `headers: []` and `tools: "wrong"` are values §8's pattern cannot
+    # be built from, filed as confirmation that it can.
+    ("F65-a-headers-value-need-not-carry-a-bearer", CCONFIG,
+     "    if not (isinstance(auth, str) and auth.startswith(\"Bearer \") and auth[7:].strip()):",
+     "    if False:",
+     "a headers value that is not a mapping is not the credential half of §8's pattern"),
+    ("F66-an-allowlist-need-not-be-a-list-of-names", CCONFIG,
+     ("    if not (isinstance(tools, list) and tools\n"
+      "            and all(isinstance(t, str) and t for t in tools)):"),
+     "    if False:",
+     "...and an allowlist that is not a non-empty list of names is not one either"),
     ("F36-the-child-reports-no-environment-at-all", TARGET,
      '"pgid": os.getpgid(0), "env_seen": sorted(set(seen))}',
      '"pgid": os.getpgid(0), "env_seen": []}',

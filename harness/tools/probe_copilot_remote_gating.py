@@ -46,6 +46,9 @@ sys.path.insert(0, os.path.join(HARNESS, "tools"))
 
 from probe_remote_mcp import start_fixture           # noqa: E402 — after the path bootstrap
 
+sys.path.insert(0, os.path.join(HARNESS, "fixtures"))
+from echo_mcp_server import IDENTITY_GENERATE        # noqa: E402 — imported, never retyped
+
 ALLOWED = "echo"
 OFF_LIST = "add"
 DEADLINE = 240.0
@@ -113,6 +116,18 @@ def credential_arrived(records: list[dict], sentinel: str) -> bool:
     # the header arrived intact, which is an equality (review, PR #110).
     expected = f"Bearer {sentinel}"
     return all((r.get("headers") or {}).get("authorization", "") == expected for r in seen)
+
+
+def minted_identity(records: list[dict]) -> str:
+    """The marker the SERVER minted, read out of its own startup receipt — see the stdio
+    probe. This transport never had the leak that one did, since `start_fixture` sets the knob
+    on the FIXTURE's process and copilot cannot see it; both use the minted form anyway, so
+    there is one mechanism to reason about rather than two with different guarantees."""
+    for record in records:
+        if record.get("kind") == "listening":
+            ident = record.get("identity")
+            return ident if isinstance(ident, str) else ""
+    return ""
 
 
 def classify(gated: list[dict], control: list[dict], answered: bool) -> tuple[str, str]:
@@ -196,29 +211,50 @@ def run_arm(workdir: str, url: str, sentinel: str, kind: str, *, tools: list[str
         return f"copilot exceeded {DEADLINE}s", receipts_before
 
 
-def run_ok(verdict: str, bearer_ok: bool) -> bool:
-    """Whether one transport's pair of arms SETTLED the question, exit-status edition.
+def settled(verdict: str) -> bool:
+    """Whether this transport's arms ANSWERED the question, either way."""
+    return verdict in (ENFORCED, LEAKED, SUPPRESSES_ALL, ANSWER_LOST)
 
-    A CONJUNCTION, and extracted so §E19 can drive it. Both halves of §8's pattern have to
-    hold: `LEAKED`, `SUPPRESSES_ALL` and `ANSWER_LOST` are definite answers about the filter,
-    `UNMEASURED` and `INSTRUMENT_FAILED` are runs that answered nothing — and the bearer is an
-    independent fact that was printed and never consulted, which is why it is an `and` here
-    rather than a line in the tally (review, PR #110).
+
+def certifies_native(verdict: str, bearer_ok: bool, version_ok: bool) -> bool:
+    """Whether ONE transport supports declaring `native` — a conjunction over every fact.
+
+    THE NAME AND THE MEANING USED TO DISAGREE, which is exactly the defect this file keeps
+    finding in itself. The exit status was `settled and bearer_ok`, under a comment saying a
+    measured SSE failure could not ride out under a green Streamable result — but `LEAKED` is
+    settled, so `http: ENFORCED` plus `sse: LEAKED` exited 0 and the PR body's claim was false
+    of its own code. Certification is `ENFORCED`, an intact bearer, and a readable version;
+    everything else is a settled answer that says NOT to declare `native` (review, PR #110).
     """
-    return verdict in (ENFORCED, LEAKED, SUPPRESSES_ALL, ANSWER_LOST) and bearer_ok
+    return verdict == ENFORCED and bearer_ok and version_ok
 
 
-def cli_version() -> str:
-    """`copilot --version`, printed with every result — see the stdio probe for why."""
+def version_verdict(rc: int, out: str, err: str) -> tuple[str, bool]:
+    """(text, usable) for a `copilot --version` result.
+
+    PURE, so §E19 can drive every branch without a copilot install — and SEPARATE from the
+    subprocess call for the same reason every other classifier here is. A measurement whose
+    write-up is qualified "at 1.0.79" is worth nothing if the run could not read a version:
+    this used to return a string like "(version unreadable: ...)" and `main` carried on, so
+    the probe would print a verdict attributed to a build it never identified (review, PR #110).
+    """
+    text = (out or "").strip() or (err or "").strip()
+    if rc != 0:
+        return (text or f"exit {rc}"), False
+    return (text, bool(text))
+
+
+def cli_version() -> tuple[str, bool]:
+    """`copilot --version`, and whether it is usable. See `version_verdict`."""
     try:
         done = subprocess.run(["copilot", "--version"], capture_output=True, text=True,
                               timeout=30)
-        return done.stdout.strip() or done.stderr.strip() or "(version unreadable)"
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return f"(version unreadable: {exc!r})"
+        return f"could not run `copilot --version`: {exc!r}", False
+    return version_verdict(done.returncode, done.stdout, done.stderr)
 
 
-def measure(workdir: str, kind: str, endpoint: str, sentinel: str, marker: str):
+def measure(workdir: str, kind: str, endpoint: str, sentinel: str):
     """One transport, both arms. Returns (verdict, reason, results, bearer_ok, answered)."""
     # ONE RECEIPTS FILE PER ARM, because the fixture appends and two arms sharing a file
     # would let the control's `add` satisfy the gated arm's check — the two runs agreeing
@@ -229,7 +265,7 @@ def measure(workdir: str, kind: str, endpoint: str, sentinel: str, marker: str):
         # `(proc, info)` on success and `(None, reason)` on failure — the announcement is
         # already parsed there, so this does not re-parse it. Re-deriving a contract the
         # helper already establishes is how the two copies drift.
-        proc, info = start_fixture(receipts, marker)
+        proc, info = start_fixture(receipts, IDENTITY_GENERATE)
         if proc is None:
             return INSTRUMENT_FAILED, f"fixture: {info}", {}, False, False
         try:
@@ -239,7 +275,8 @@ def measure(workdir: str, kind: str, endpoint: str, sentinel: str, marker: str):
             proc.wait(timeout=15)
         results[label] = (read_receipts(receipts), out)
     gated_out = results["gated"][1]
-    answered = marker in (gated_out or "")
+    marker = minted_identity(results["gated"][0])
+    answered = bool(marker) and marker in (gated_out or "")
     verdict, reason = classify(results["gated"][0], results["control"][0], answered)
     bearer_ok = all(credential_arrived(recs, sentinel) for recs, _out in results.values())
     return verdict, reason, results, bearer_ok, answered
@@ -248,17 +285,21 @@ def measure(workdir: str, kind: str, endpoint: str, sentinel: str, marker: str):
 def main() -> int:
     workdir = tempfile.mkdtemp(prefix="probe-copilot-remote-")
     sentinel = uuid.uuid4().hex
-    marker = uuid.uuid4().hex
     try:
-        print(f"copilot: {cli_version()}")
-        # EVERY TRANSPORT THE SCHEMA ADMITS, and the exit status is a conjunction over them.
-        # Reporting a per-transport verdict and then exiting on the last one would let a
-        # measured SSE failure ride out under a green Streamable result — the fleet-wide-
-        # negative mistake (§4), one axis over.
+        version, version_ok = cli_version()
+        print(f"copilot: {version}")
+        if not version_ok:
+            print("  VERSION UNREADABLE: this result is qualified by a copilot build it could "
+                  "not identify, so it certifies nothing whatever the filter did")
+        # EVERY TRANSPORT THE SCHEMA ADMITS, and the exit status is a conjunction of
+        # CERTIFICATIONS over them — not of "settled", which is the bug review found: `LEAKED`
+        # is settled, so an SSE leak beside a green Streamable result exited 0 under a comment
+        # promising it could not. Exit 0 now means every transport measured ENFORCED with an
+        # intact bearer and a readable version.
         ok = True
         for kind, endpoint in TRANSPORTS:
             verdict, reason, results, bearer_ok, answered = measure(
-                workdir, kind, endpoint, sentinel, marker)
+                workdir, kind, endpoint, sentinel)
             print(f"probe C2-copilot-remote [{kind}]: {verdict}")
             print(f"  {reason}")
             for label, (recs, _out) in results.items():
@@ -278,11 +319,14 @@ def main() -> int:
                 print("  FACT 1 UNPROVEN: the declared bearer did not arrive INTACT on every "
                       "request in both arms, so §8's credential path is not established by "
                       "this run whatever the filter did")
-            good = run_ok(verdict, bearer_ok)
+            good = certifies_native(verdict, bearer_ok, version_ok)
             if verdict != ENFORCED or not bearer_ok:
                 for label, (_recs, out) in results.items():
                     print(f"  --- {label} ---\n  "
                           + (out or "").strip()[:1000].replace("\n", "\n  "))
+            if settled(verdict) and not good:
+                print(f"  SETTLED, AND THE ANSWER IS NO for {kind}: {verdict} is a definite "
+                      f"result and it says §8's pattern cannot be declared `native` here")
             ok = ok and good
         return 0 if ok else 1
     finally:

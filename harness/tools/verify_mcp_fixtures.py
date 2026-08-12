@@ -1821,6 +1821,7 @@ import probe_copilot_config as CFG              # noqa: E402 — after the path 
 import probe_copilot_gating as CG               # noqa: E402
 import probe_copilot_remote_gating as CRG       # noqa: E402
 import http_mcp_server as HTTPF                 # noqa: E402
+import echo_mcp_server as ECHOMOD               # noqa: E402 — the original the probes import
 
 _e19 = tempfile.mkdtemp(prefix="verify-copilot-")
 try:
@@ -1928,51 +1929,127 @@ try:
               _p.classify(_echo, [], True)[0] == _p.INSTRUMENT_FAILED
               and _p.classify([], _both, True)[0] == _p.INSTRUMENT_FAILED)
 
-    # -- the marker must not be reachable except through a tool result ----------------------
+    # -- the marker must be unreachable except through a tool result -----------------------
     # `answered` is "the opaque marker appeared in the CLI's output", which is evidence about a
-    # reply only while the CLI has no other copy of it. The stdio probe used to write the marker
-    # into the `env` map of the config file copilot READS, so a CLI that echoed its server
-    # config would have satisfied the round-trip clause with nothing having returned. It now
-    # travels by inheritance instead, and this is what holds that: the config text this probe
-    # hands to copilot must not contain the marker anywhere.
-    _cfg_probe_marker = "marker-that-must-not-appear"
+    # reply only while the CLI has no other copy. Two versions put one where it could: in the
+    # config file copilot reads, then in copilot's own environment, which copilot and any shell
+    # tool it launches can dump. The marker is MINTED BY THE SERVER now and read back out of its
+    # receipts, so the driver never holds a value to leak in the first place.
     _cfg_written = CG.mcp_config(os.path.join(_e19, "cfg.json"),
-                                 os.path.join(_e19, "receipts.jsonl"),
-                                 _cfg_probe_marker, tools=["echo"])
+                                 os.path.join(_e19, "receipts.jsonl"), tools=["echo"])
     with open(_cfg_written, encoding="utf-8") as _fh:
         _cfg_text = _fh.read()
-    check("the config handed to the CLI does not carry the round-trip marker",
-          _cfg_probe_marker not in _cfg_text, _cfg_text)
-    # ...and the structural clause, so the check above is not passing over an empty file: the
-    # config must really be the one under test, allowlist and receipts path and all.
-    check("...though it is otherwise the config under test, so that absence means something",
-          '"tools": ["echo"]' in _cfg_text.replace("'", '"') and "receipts.jsonl" in _cfg_text,
-          _cfg_text)
+    check("the config asks the server to MINT a marker rather than carrying one",
+          CG.IDENTITY_GENERATE in _cfg_text
+          and '"tools": ["echo"]' in _cfg_text.replace("'", '"'), _cfg_text)
+    # THE SENTINEL IS PINNED TO THE FIXTURE THAT READS IT — imported by the probe, not retyped,
+    # so this asserts the import rather than a copy. A probe asking for a sentinel the server
+    # no longer recognises would get that literal string back as the marker, and every reply
+    # would then "contain the marker" for free.
+    check("...and that sentinel is the fixture's own, not a second spelling of it",
+          CG.IDENTITY_GENERATE == ECHOMOD.IDENTITY_GENERATE == CRG.IDENTITY_GENERATE,
+          (CG.IDENTITY_GENERATE, ECHOMOD.IDENTITY_GENERATE))
+    # AND THE SERVER REALLY MINTS ONE, from the fixture itself rather than from a claim about
+    # it: a `listening` receipt whose identity is empty would make `answered` false forever,
+    # and one that echoed the sentinel would make it true forever.
+    _mint_receipts = os.path.join(_e19, "minted.jsonl")
+    run([{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+          "params": {"name": "echo", "arguments": {"text": "HI"}}}],
+        server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": _mint_receipts,
+                                "ECHO_MCP_IDENTITY": ECHOMOD.IDENTITY_GENERATE})
+    _minted = CG.minted_identity(CG.read_receipts(_mint_receipts))
+    check("the server mints a marker of its own and reports it in the startup receipt",
+          bool(_minted) and _minted != ECHOMOD.IDENTITY_GENERATE and len(_minted) >= 16,
+          _minted)
+    # ...and it is the marker the REPLY actually carries, which is the whole point: a receipt
+    # reporting one value while `echo` prefixes another would make `answered` unfalsifiable.
+    _replies, _n, _r, _stream = run(
+        [legacy_init(1),
+         {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+          "params": {"name": "echo", "arguments": {"text": "PAYLOAD"}}}],
+        server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": os.path.join(_e19, "m2.jsonl"),
+                                "ECHO_MCP_IDENTITY": ECHOMOD.IDENTITY_GENERATE})
+    _m2 = CG.minted_identity(CG.read_receipts(os.path.join(_e19, "m2.jsonl")))
+    _reply_text = json.dumps(_replies)
+    check("...and the reply carries that same minted marker, so the two cannot disagree",
+          bool(_m2) and f"{_m2}:PAYLOAD" in _reply_text, (_m2, _reply_text[:300]))
+    # A run that did NOT ask for a marker must not gain one — the knob stays opt-in, or every
+    # existing verbatim-echo check changes meaning.
+    _plain = os.path.join(_e19, "plain.jsonl")
+    run([{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+          "params": {"name": "echo", "arguments": {"text": "HI"}}}],
+        server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": _plain})
+    # THE STRUCTURAL CLAUSE FIRST. Without `server_ran`, this passes on a fixture that never
+    # started — no receipts, no identity, claim satisfied — which is how a mutation that broke
+    # the fixture outright came back NOT via instead of CAUGHT. An absence is only evidence
+    # once something positive says the thing that would have written it ran (§4).
+    check("...while a server not asked for a marker reports none, so the knob stays opt-in",
+          CG.server_ran(CG.read_receipts(_plain))
+          and CG.minted_identity(CG.read_receipts(_plain)) == "",
+          CG.read_receipts(_plain))
 
     # -- and the VERDICTS, which are a separate claim from the classifiers -------------------
     # A classifier proven correct says nothing about whether `main` acted on it. `remote_shape`
     # had its own function and its own mutation while the exit status read only the stdio half,
     # so a remote add that filed a LOCAL entry left the probe green — the finding is the shape
-    # of the gap, not the helper (review, PR #110). These three are the extracted verdicts.
-    check("a settled filter question exits 0 whichever way it settled",
-          all(CG.run_ok(v) for v in (CG.ENFORCED, CG.LEAKED, CG.SUPPRESSES_ALL, CG.ANSWER_LOST)),
-          "LEAKED and its siblings are answers, not errors")
-    check("...while a run that measured nothing does not",
-          not CG.run_ok(CG.UNMEASURED) and not CG.run_ok(CG.INSTRUMENT_FAILED))
-    # THE BEARER IS AN INDEPENDENT AXIS, so the remote verdict is a conjunction over both. A
-    # lookup on the verdict alone is exactly the state that shipped: green ENFORCED with the
-    # credential half of §8's pattern unproven.
-    check("the remote verdict fails when the credential did not arrive, whatever the filter did",
-          CRG.run_ok(CRG.ENFORCED, True) and not CRG.run_ok(CRG.ENFORCED, False)
-          and not CRG.run_ok(CRG.UNMEASURED, True),
-          "both halves of §8's pattern have to hold for the run to have settled it")
-    # The config probe's three findings, likewise a conjunction and not a lookup on the last.
-    check("the config probe fails on ANY of its three findings, not just the stdio ones",
-          CFG.exit_code([], [], True) == 0
-          and all(CFG.exit_code(d, s, r) == 1 for d, s, r in
-                  ((["k"], [], True), ([], ["k"], True), ([], [], False))),
-          [CFG.exit_code(d, s, r) for d, s, r in
-           (([], [], True), (["k"], [], True), ([], ["k"], True), ([], [], False))])
+    # of the gap, not the helper (review, PR #110).
+    #
+    # AND THE VERDICT MUST MEAN WHAT ITS NAME SAYS. The exit status was wired to "the question
+    # was settled", under comments claiming it certified the filter — so `LEAKED`, the finding
+    # these probes exist to catch, exited 0 beside `ENFORCED`. The two are separate functions
+    # now, and this is the pair that holds them apart.
+    for _p, _n in ((CG, "stdio"), (CRG, "remote")):
+        check(f"{_n}: every definite answer counts as the question having been settled",
+              all(_p.settled(v) for v in (_p.ENFORCED, _p.LEAKED, _p.SUPPRESSES_ALL,
+                                          _p.ANSWER_LOST))
+              and not _p.settled(_p.UNMEASURED) and not _p.settled(_p.INSTRUMENT_FAILED))
+    # THE DISTINCTION ITSELF: settled and certifying are not the same set, and the gap is
+    # exactly the verdicts that say NO.
+    check("stdio: a settled negative does NOT certify `native`, which is what exit 0 claims",
+          CG.certifies_native(CG.ENFORCED, True)
+          and not any(CG.certifies_native(v, True) for v in (CG.LEAKED, CG.SUPPRESSES_ALL,
+                                                             CG.ANSWER_LOST))
+          and all(CG.settled(v) for v in (CG.LEAKED, CG.SUPPRESSES_ALL, CG.ANSWER_LOST)),
+          "LEAKED is an answer; it is not permission")
+    check("remote: ...and the same, per transport, over bearer and version too",
+          CRG.certifies_native(CRG.ENFORCED, True, True)
+          and not CRG.certifies_native(CRG.LEAKED, True, True)
+          and not CRG.certifies_native(CRG.ENFORCED, False, True)
+          and not CRG.certifies_native(CRG.ENFORCED, True, False),
+          "an SSE leak beside a green Streamable result used to exit 0")
+    # THE VERSION GATE. A result written up as "at 1.0.79" is worth nothing from a run that
+    # could not read a version, and this used to be a string in a `print`.
+    for _p, _n in ((CG, "stdio"), (CRG, "remote"), (CFG, "config")):
+        check(f"{_n}: a readable version is usable and an unreadable one is not",
+              _p.version_verdict(0, "GitHub Copilot CLI 1.0.79", "")[1] is True
+              and _p.version_verdict(1, "", "boom")[1] is False
+              and _p.version_verdict(0, "", "")[1] is False,
+              [_p.version_verdict(0, "x", ""), _p.version_verdict(1, "", "boom"),
+               _p.version_verdict(0, "", "")])
+    check("...and the text is carried through so the failure names what it saw",
+          CG.version_verdict(1, "", "not found")[0] == "not found"
+          and CG.version_verdict(0, "1.0.79", "")[0] == "1.0.79",
+          [CG.version_verdict(1, "", "not found"), CG.version_verdict(0, "1.0.79", "")])
+    # The config probe's four findings, likewise a conjunction and not a lookup on the last.
+    check("the config probe fails on ANY of its four findings, not just the stdio ones",
+          CFG.exit_code([], [], True, True) == 0
+          and all(CFG.exit_code(d, s, r, v) == 1 for d, s, r, v in
+                  ((["k"], [], True, True), ([], ["k"], True, True),
+                   ([], [], False, True), ([], [], True, False))),
+          [CFG.exit_code(d, s, r, v) for d, s, r, v in
+           (([], [], True, True), (["k"], [], True, True), ([], ["k"], True, True),
+            ([], [], False, True), ([], [], True, False))])
+    # AND THE STATE THAT MADE `remote_ok` UNREACHABLE. `type` was a permanent surprise, so the
+    # exit status was 1 on every real run and no other term could move it — a conjunction whose
+    # terms cannot vary is a constant. This is the measured 1.0.79 body; it must surprise nobody.
+    check("the discriminator copilot actually writes is a known key, not a permanent surprise",
+          CFG.unexpected_keys({"mcpServers": {"e": {"type": "local", "command": "x",
+                                                    "args": [], "env": {}, "tools": ["*"]}}},
+                              CFG.EXPECTED) == [],
+          "while it was unknown, `surprises` was never empty and `remote_ok` could not matter")
+    check("...while a key nobody has measured yet is still reported",
+          CFG.unexpected_keys({"mcpServers": {"e": {"type": "local", "wat": 1}}},
+                              CFG.EXPECTED) == ["wat"])
 
     # THE TWO VOCABULARIES ARE ONE VOCABULARY, asserted rather than assumed. Neither probe can
     # import the other (each is a standalone opt-in tool), so this is §4's duplicated-rule rule:
@@ -1995,7 +2072,8 @@ try:
 
     # -- probe_copilot_config.py: three states, and the key nobody thought of ---------------
     _intended = {"mcpServers": {"echo": {"command": "python", "args": [], "env": {},
-                                         "tools": ["echo"], "url": "u", "headers": {}}}}
+                                         "tools": ["echo"], "url": "u", "headers": {},
+                                         "type": "http"}}}
     check("a config in the intended spelling reports every key confirmed",
           set(CFG.classify_keys(_intended, CFG.EXPECTED).values()) == {CFG.CONFIRMED},
           CFG.classify_keys(_intended, CFG.EXPECTED))
@@ -2009,8 +2087,8 @@ try:
     check("...while a config with no container at all leaves every key UNEXERCISED",
           set(CFG.classify_keys({}, CFG.EXPECTED).values()) == {CFG.UNEXERCISED})
     check("a key the adapter has no plan for is reported, since that is the one nobody sees",
-          CFG.unexpected_keys({"mcpServers": {"e": {"command": "x", "type": "local"}}},
-                              CFG.EXPECTED) == ["type"])
+          CFG.unexpected_keys({"mcpServers": {"e": {"command": "x", "gateway": "z"}}},
+                              CFG.EXPECTED) == ["gateway"])
     check("...and a body holding only known keys reports none, so the finding means something",
           CFG.unexpected_keys({"mcpServers": {"e": {"command": "x", "args": []}}},
                               CFG.EXPECTED) == [])
@@ -2033,6 +2111,20 @@ try:
               for drop in ("headers", "tools")),
           [CFG.remote_shape({k: v for k, v in _full.items() if k != d}) for d in
            ("headers", "tools")])
+    # PRESENCE IS NOT SHAPE. `headers: []` and `tools: "wrong"` are values §8's pattern cannot
+    # be built from, and key-presence alone filed both as confirmation that it can.
+    check("a headers value that is not a mapping is not the credential half of §8's pattern",
+          CFG.remote_shape({**_full, "headers": []})[0] is False
+          and CFG.remote_shape({**_full, "headers": {"X": "y"}})[0] is False
+          and CFG.remote_shape({**_full, "headers": {"Authorization": "Basic zzz"}})[0] is False
+          and CFG.remote_shape({**_full, "headers": {"authorization": "Bearer t"}})[0] is True,
+          [CFG.remote_shape({**_full, "headers": h}) for h in
+           ([], {"X": "y"}, {"Authorization": "Basic zzz"}, {"authorization": "Bearer t"})])
+    check("...and an allowlist that is not a non-empty list of names is not one either",
+          all(CFG.remote_shape({**_full, "tools": v})[0] is False
+              for v in ("wrong", [], [""], [1], {"echo": True})),
+          [CFG.remote_shape({**_full, "tools": v}) for v in
+           ("wrong", [], [""], [1], {"echo": True})])
     check("...and a transport discriminator that is not the one asked for is refused",
           CFG.remote_shape(_full, want_type="sse")[0] is False
           and CFG.remote_shape({**_full, "type": "sse"}, want_type="sse")[0] is True,

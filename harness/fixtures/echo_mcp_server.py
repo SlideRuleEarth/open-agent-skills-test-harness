@@ -54,7 +54,10 @@ Two environment knobs, both off by default so the shape every existing check ass
 one it gets: `ECHO_MCP_SERVER_NAME` sets the advertised `serverInfo.name`, and
 `ECHO_MCP_IDENTITY=<marker>` puts that marker in front of `echo`'s reply. The second exists
 because the first is invisible in a RESULT, and it takes a value rather than a flag so the
-marker can be one nothing else in the run knows — see `IDENTITY` below.
+marker can be one nothing else in the run knows — see `IDENTITY` below. `ECHO_MCP_IDENTITY=
+@generate` mints the marker HERE instead, after the CLI has started this process, and reports
+it in the `listening` receipt: a marker the driver chose has to travel through the CLI to get
+here, so the CLI holds it before any tool runs.
 
 No third-party imports, by rule: this runs as a subprocess of an agent CLI, inside a
 per-cell tempdir, on whatever interpreter `command:` resolves to. A dependency here would
@@ -65,6 +68,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import uuid
 
 # The legacy revisions this fixture actually implements — the two the shipped fleet was
 # measured speaking (§9: claude and copilot 2025-11-25, codex 2025-06-18). An earlier
@@ -106,6 +110,17 @@ SERVER_NAME = os.environ.get("ECHO_MCP_SERVER_NAME", "echo")
 # second round). Off by default: the verbatim contract is what every other check and both
 # `mcp_echo_*` scenarios assert against.
 IDENTITY = os.environ.get("ECHO_MCP_IDENTITY") or ""
+# `@generate` MEANS THE SERVER MINTS IT, and that is a different security property from a
+# marker the driver chose. A supplied marker has to reach this process somehow, and every route
+# runs through the CLI under test — its config file, or its environment — so the CLI holds a
+# copy before any tool is called, and a diagnostic dump or an `env` in a shell tool satisfies
+# "the marker appeared in the output" with nothing having returned. Minted here, after the CLI
+# has started us, the value exists in this process, in the receipts file, and in tool replies —
+# and the CLI's only passive route to it is the reply (review, PR #110, second round on the
+# same clause).
+IDENTITY_GENERATE = "@generate"
+if IDENTITY == IDENTITY_GENERATE:
+    IDENTITY = uuid.uuid4().hex
 
 # Opt-in receipts, for the one question no reply can answer: what did the CLIENT actually
 # send? `IDENTITY` proves an answer travelled back; this proves a request arrived. Measuring
@@ -365,7 +380,12 @@ def main() -> int:
     # receipt is the whole finding a gating measurement rests on, and absence is also what a
     # server that never started produces — so the reader checks this record first and calls
     # the run unmeasured without it, rather than reading silence as a filter working.
-    _receipt(kind="listening", server=SERVER_NAME, tools=[t["name"] for t in TOOLS])
+    # THE IDENTITY GOES IN THE RECEIPT, which is how a minted marker reaches the driver without
+    # passing through the CLI: the driver reads this file after the run, and the CLI's only
+    # passive route to the same value is a tool reply. Empty when the knob is off, so nothing
+    # that does not ask for a marker gains one.
+    _receipt(kind="listening", server=SERVER_NAME, tools=[t["name"] for t in TOOLS],
+             identity=IDENTITY)
     for line in sys.stdin:
         line = line.strip()
         if not line:

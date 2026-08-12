@@ -48,6 +48,14 @@ EXPECTED = {
     "tools": "tools",
     "url": "url",
     "headers": "headers",
+    # MEASURED INTO THE SET, which is what this probe is for. `type` was the key nothing in §3
+    # had, and it was reported as a surprise on every run — which meant `surprises` was NEVER
+    # empty, so the exit status was 1 whatever else happened and the remote-shape verdict could
+    # not move it. A finding that cannot change is not a finding; it is a constant. Now that
+    # 1.0.79 has been measured writing `local`/`http`/`sse` here, it is a key the adapter must
+    # write, and the remaining surprises are the ones nobody has seen yet (review, PR #110).
+    # §3 owes a line for it, and that is adapter work rather than probe work.
+    "type": "type",
 }
 
 CONFIRMED = "confirmed"
@@ -114,8 +122,24 @@ def remote_shape(body: Any, want_type: str = "http") -> tuple[bool, str]:
     if missing:
         return False, (f"remote type={kind!r} with a url, but no {missing} — the credential "
                        f"and the allowlist are the two things §8's pattern is made of")
-    return True, (f"remote: type={kind!r}, url present, headers present, tools present "
-                  f"({body.get('tools')!r})")
+    # PRESENCE IS NOT SHAPE, and checking only presence passed `headers: []` and
+    # `tools: "wrong"` — two values §8's pattern cannot be built from, filed as confirmation
+    # that it can (review, PR #110). What the gating probes write by hand is a header MAPPING
+    # carrying a bearer and a LIST of tool names, so that is what has to come back.
+    headers, tools = body.get("headers"), body.get("tools")
+    if not isinstance(headers, dict):
+        return False, f"headers is {type(headers).__name__}, not a mapping: {headers!r}"
+    auth = next((v for k, v in headers.items() if k.lower() == "authorization"), None)
+    if not (isinstance(auth, str) and auth.startswith("Bearer ") and auth[7:].strip()):
+        return False, (f"headers carries no usable `Authorization: Bearer <token>` — the "
+                       f"credential half of §8's pattern is the whole reason for `headers`: "
+                       f"{sorted(headers)!r}")
+    if not (isinstance(tools, list) and tools
+            and all(isinstance(t, str) and t for t in tools)):
+        return False, (f"tools is {tools!r}, not a non-empty list of tool names — an allowlist "
+                       f"that is not a list of names is not the thing under test")
+    return True, (f"remote: type={kind!r}, url present, bearer in headers, tools present "
+                  f"({tools!r})")
 
 
 def classify_keys(config: dict, expected: dict) -> dict[str, str]:
@@ -156,7 +180,7 @@ def add_server(home: str, name: str, argv_tail: list[str]) -> tuple[int, str]:
     return done.returncode, (done.stdout or "") + (done.stderr or "")
 
 
-def exit_code(differs: list, surprises: list, remote_ok: bool) -> int:
+def exit_code(differs: list, surprises: list, remote_ok: bool, version_ok: bool) -> int:
     """The probe's verdict over its three findings, as a function rather than an expression.
 
     EXTRACTED SO IT CAN BE DRIVEN. `remote_shape` was already a named function and already had
@@ -166,31 +190,50 @@ def exit_code(differs: list, surprises: list, remote_ok: bool) -> int:
     a separate one (review, PR #110).
 
     A CONJUNCTION OVER EVERY FINDING, not a lookup on the most recent: a differing key, a key
-    nobody planned for, and an unconfirmed remote shape are three independent ways this probe's
-    answer is not the one the design assumed, and all three are true of the same run.
+    nobody planned for, an unconfirmed remote shape and an unidentifiable build are four
+    independent ways this probe's answer is not the one the design assumed, and all four are
+    true of the same run.
+
+    `version_ok` JOINS THEM for the reason the others do. And note what had to change for
+    `remote_ok` to matter at all: `type` was a permanent member of `surprises`, so this
+    returned 1 on every real run and no other axis could move it — a conjunction is only a
+    conjunction while each term can be false (review, PR #110).
     """
-    return 1 if (differs or surprises or not remote_ok) else 0
+    return 1 if (differs or surprises or not remote_ok or not version_ok) else 0
 
 
-def cli_version() -> str:
-    """`copilot --version`, printed with every result.
+def version_verdict(rc: int, out: str, err: str) -> tuple[str, bool]:
+    """(text, usable) for a `copilot --version` result.
 
-    A result qualified by a version has to carry it: §9 records these spellings as copilot
-    1.0.79 and nothing in the output said so, leaving a rerun unable to establish which build
-    it read (review, PR #110). `probe_remote_mcp.py` has done this for claude all along.
+    PURE, so §E19 can drive every branch without a copilot install — and SEPARATE from the
+    subprocess call for the same reason every other classifier here is. A measurement whose
+    write-up is qualified "at 1.0.79" is worth nothing if the run could not read a version:
+    this used to return a string like "(version unreadable: ...)" and `main` carried on, so
+    the probe would print a verdict attributed to a build it never identified (review, PR #110).
     """
+    text = (out or "").strip() or (err or "").strip()
+    if rc != 0:
+        return (text or f"exit {rc}"), False
+    return (text, bool(text))
+
+
+def cli_version() -> tuple[str, bool]:
+    """`copilot --version`, and whether it is usable. See `version_verdict`."""
     try:
         done = subprocess.run(["copilot", "--version"], capture_output=True, text=True,
                               timeout=30)
-        return done.stdout.strip() or done.stderr.strip() or "(version unreadable)"
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return f"(version unreadable: {exc!r})"
+        return f"could not run `copilot --version`: {exc!r}", False
+    return version_verdict(done.returncode, done.stdout, done.stderr)
 
 
 def main() -> int:
     home = tempfile.mkdtemp(prefix="probe-copilot-home-")
     try:
-        print(f"copilot: {cli_version()}")
+        version, version_ok = cli_version()
+        print(f"copilot: {version}")
+        if not version_ok:
+            print("  VERSION UNREADABLE: the spellings below cannot be attributed to a build")
         # AN ENV VAR IS SET ON THE STDIO ADD, so `env` is exercised rather than reported
         # `unexercised` — the PR body claimed every listed spelling was confirmed while this
         # run never gave copilot an env var to write (review, PR #110).
@@ -283,7 +326,7 @@ def main() -> int:
             print("  REMOTE SPELLING UNCONFIRMED: the entries above are not the shape §8's "
                   "pattern needs, so the gating probes' hand-written config is not backed by "
                   "anything copilot produced")
-        return exit_code(differs, surprises, remote_ok)
+        return exit_code(differs, surprises, remote_ok, version_ok)
     finally:
         shutil.rmtree(home, ignore_errors=True)
 

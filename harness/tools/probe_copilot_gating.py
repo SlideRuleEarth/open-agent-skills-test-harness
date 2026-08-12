@@ -56,6 +56,13 @@ import uuid
 
 HARNESS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ECHO = os.path.join(HARNESS, "fixtures", "echo_mcp_server.py")
+sys.path.insert(0, os.path.join(HARNESS, "fixtures"))
+
+# IMPORTED, NOT RETYPED. §4: where import is possible, import — a probe holding its own copy of
+# the sentinel would keep asking for `@generate` after the fixture renamed it, and the server
+# would then treat the sentinel as a literal marker, which is the failure mode this whole
+# clause exists to prevent.
+from echo_mcp_server import IDENTITY_GENERATE  # noqa: E402 — after the path insert
 
 ALLOWED = "echo"
 OFF_LIST = "add"
@@ -108,11 +115,27 @@ def called(records: list[dict], tool: str) -> bool:
                and r.get("tool") == tool for r in records)
 
 
+def minted_identity(records: list[dict]) -> str:
+    """The marker the SERVER minted, read out of its own startup receipt.
+
+    The driver never chooses it. Every value the driver could choose has to travel to the
+    server through the CLI under test — its config or its environment — which leaves the CLI
+    holding a copy before any tool runs, and "the marker appeared in the output" then has a
+    route that is not a reply (review, PR #110, twice).
+    """
+    for record in records:
+        if record.get("kind") == "listening":
+            ident = record.get("identity")
+            return ident if isinstance(ident, str) else ""
+    return ""
+
+
 def classify(gated: list[dict], control: list[dict], answered: bool) -> tuple[str, str]:
-    # `answered` IS REQUIRED, with no default. A default would have to be `True` to keep the
-    # existing calls working, which is the permissive value — a caller that forgot it would get
-    # ENFORCED for free, and the clause added to close a hole would open it one level up.
     """(verdict, one-line reason) from the two arms' receipts.
+
+    `answered` IS REQUIRED, with no default. A default would have to be `True` to keep the
+    existing calls working, which is the permissive value — a caller that forgot it would get
+    ENFORCED for free, and the clause added to close a hole would open it one level up.
 
     A FUNCTION, not an `elif` chain inside `main()`, so it can be driven on synthetic rows —
     §4's rule for probes, and the reason C3-2's classifier has its own checks. Every branch
@@ -161,7 +184,7 @@ def classify(gated: list[dict], control: list[dict], answered: bool) -> tuple[st
                       f"and the allowed tool is usable, so copilot can be `native`")
 
 
-def mcp_config(path: str, receipts: str, marker: str, *, tools: list[str] | None) -> str:
+def mcp_config(path: str, receipts: str, *, tools: list[str] | None) -> str:
     """copilot's MCP config for one echo server, with or without the allowlist under test.
 
     The KEY SPELLING IS THE OTHER OPEN PROBE (§9 #3) and this file does not settle it: it
@@ -169,14 +192,15 @@ def mcp_config(path: str, receipts: str, marker: str, *, tools: list[str] | None
     server that never starts — which `server_ran` reports as INSTRUMENT_FAILED rather than as
     a filter result. Run `probe_copilot_config.py` first; that is what it is for.
     """
-    # THE MARKER IS NOT IN HERE, and that is the point. It reaches the echo server by
-    # INHERITANCE from copilot's own environment (see `run_arm`), never through this file —
-    # because this file is one copilot reads, and a CLI that echoed its server config into its
-    # transcript would put the marker in the output with no tool call having returned. The
-    # remote probe never had this hole: there the marker is set on the FIXTURE's process, which
-    # copilot cannot see. `answered` has to be evidence about a reply, not about a config.
+    # NO MARKER TRAVELS THROUGH HERE — only the instruction to MINT one. Two earlier versions
+    # of this line were wrong in the same direction: the marker in this file, which copilot
+    # reads, and then the marker in copilot's own environment, which copilot and any shell tool
+    # it launches can dump. Both put the value where "it appeared in the output" is satisfiable
+    # without a reply. `@generate` leaves the marker in the server's memory, its receipts file
+    # and its replies, and nowhere copilot can passively reach (review, PR #110).
     server: dict = {"command": sys.executable, "args": [ECHO],
-                    "env": {"ECHO_MCP_RECEIPTS": receipts}}
+                    "env": {"ECHO_MCP_RECEIPTS": receipts,
+                            "ECHO_MCP_IDENTITY": IDENTITY_GENERATE}}
     if tools is not None:
         server["tools"] = list(tools)
     with open(path, "w", encoding="utf-8") as handle:
@@ -184,7 +208,7 @@ def mcp_config(path: str, receipts: str, marker: str, *, tools: list[str] | None
     return path
 
 
-def run_arm(workdir: str, marker: str, *, tools: list[str] | None) -> tuple[list[dict], str]:
+def run_arm(workdir: str, *, tools: list[str] | None) -> tuple[list[dict], str]:
     """One copilot run. Returns (receipts, stdout+stderr) — the transcript for diagnosis only.
 
     The PROMPT names BOTH tools explicitly, in the order that matters. A probe that asked
@@ -197,7 +221,7 @@ def run_arm(workdir: str, marker: str, *, tools: list[str] | None) -> tuple[list
     ending the run before the second half of the measurement exists.
     """
     receipts = os.path.join(workdir, f"receipts-{uuid.uuid4().hex}.jsonl")
-    config = mcp_config(os.path.join(workdir, "mcp-config.json"), receipts, marker, tools=tools)
+    config = mcp_config(os.path.join(workdir, "mcp-config.json"), receipts, tools=tools)
     prompt = (f"Do both of these, in order, using the `echo` MCP server. "
               f"First: call the {ALLOWED} tool with the text HELLO, and quote the tool's "
               f"reply back VERBATIM, exactly as it returned it. "
@@ -209,13 +233,8 @@ def run_arm(workdir: str, marker: str, *, tools: list[str] | None) -> tuple[list
             "--additional-mcp-config", f"@{config}",
             "--output-format", "json", "--allow-all"]
     try:
-        # THE MARKER TRAVELS HERE, in copilot's environment, which the stdio server inherits.
-        # If copilot sanitised its child's environment instead, the marker would never reach
-        # `echo`, no reply would carry it, and this reports ANSWER_LOST — a loud failure rather
-        # than a quiet one, which is the right way round for an assumption about a CLI.
         done = subprocess.run(argv, cwd=workdir, capture_output=True, text=True,
-                              timeout=DEADLINE,
-                              env={**os.environ, "ECHO_MCP_IDENTITY": marker})
+                              timeout=DEADLINE)
         transcript = (done.stdout or "") + (done.stderr or "")
     except FileNotFoundError:
         return [], "copilot is not on PATH"
@@ -224,43 +243,69 @@ def run_arm(workdir: str, marker: str, *, tools: list[str] | None) -> tuple[list
     return read_receipts(receipts), transcript
 
 
-def run_ok(verdict: str) -> bool:
-    """Whether this run SETTLED the question, exit-status edition — extracted so §E19 can
-    drive it. `LEAKED`, `SUPPRESSES_ALL` and `ANSWER_LOST` are three definite ways the answer
-    is "copilot cannot be `native`"; `UNMEASURED` and `INSTRUMENT_FAILED` are runs that
-    answered nothing, which is a different thing and a different exit status."""
+def settled(verdict: str) -> bool:
+    """Whether the run ANSWERED the question, either way. `LEAKED`, `SUPPRESSES_ALL` and
+    `ANSWER_LOST` are three definite ways the answer is "copilot cannot be `native`";
+    `UNMEASURED` and `INSTRUMENT_FAILED` are runs that answered nothing."""
     return verdict in (ENFORCED, LEAKED, SUPPRESSES_ALL, ANSWER_LOST)
 
 
-def cli_version() -> str:
-    """`copilot --version`, printed with every result.
+def certifies_native(verdict: str, version_ok: bool) -> bool:
+    """Whether this run supports declaring `mcp_tool_filter = "native"` — the EXIT STATUS.
 
-    A RESULT QUALIFIED BY A VERSION HAS TO CARRY IT. §9 records this measurement as "copilot
-    1.0.79", and nothing in the output said so — a rerun six months from now would print the
-    same verdict with no way to establish which build it measured, which is the same expiry
-    `probe_remote_mcp.py` already guards against for claude (review, PR #110).
+    TWO DIFFERENT QUESTIONS, and conflating them is what review caught: `settled` was wired to
+    the exit status under a comment claiming the run "certified" the filter, so a `LEAKED`
+    result — the finding this probe exists to catch — exited 0 alongside an `ENFORCED` one. A
+    caller acting on the status would have declared `native` on the strength of a measurement
+    that said the opposite. Exit 0 here means the strong thing, and a settled non-`ENFORCED`
+    verdict is printed loudly and exits 1 (review, PR #110).
+
+    The VERSION joins it because the result is version-qualified: a run that could not say
+    which build it measured certifies nothing, whatever the filter did.
     """
+    return verdict == ENFORCED and version_ok
+
+
+def version_verdict(rc: int, out: str, err: str) -> tuple[str, bool]:
+    """(text, usable) for a `copilot --version` result.
+
+    PURE, so §E19 can drive every branch without a copilot install — and SEPARATE from the
+    subprocess call for the same reason every other classifier here is. A measurement whose
+    write-up is qualified "at 1.0.79" is worth nothing if the run could not read a version:
+    this used to return a string like "(version unreadable: ...)" and `main` carried on, so
+    the probe would print a verdict attributed to a build it never identified (review, PR #110).
+    """
+    text = (out or "").strip() or (err or "").strip()
+    if rc != 0:
+        return (text or f"exit {rc}"), False
+    return (text, bool(text))
+
+
+def cli_version() -> tuple[str, bool]:
+    """`copilot --version`, and whether it is usable. See `version_verdict`."""
     try:
         done = subprocess.run(["copilot", "--version"], capture_output=True, text=True,
                               timeout=30)
-        return done.stdout.strip() or done.stderr.strip() or "(version unreadable)"
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return f"(version unreadable: {exc!r})"
+        return f"could not run `copilot --version`: {exc!r}", False
+    return version_verdict(done.returncode, done.stdout, done.stderr)
 
 
 def main() -> int:
     workdir = tempfile.mkdtemp(prefix="probe-copilot-gating-")
-    marker = uuid.uuid4().hex
     try:
-        print(f"copilot: {cli_version()}")
+        version, version_ok = cli_version()
+        print(f"copilot: {version}")
         # THE CONTROL RUNS FIRST, deliberately. If it cannot get the model to call the tool at
         # all, the gated arm is not worth a second model call and the tally says why.
-        control, control_out = run_arm(workdir, marker, tools=None)
-        gated, gated_out = run_arm(workdir, marker, tools=[ALLOWED])
+        control, control_out = run_arm(workdir, tools=None)
+        gated, gated_out = run_arm(workdir, tools=[ALLOWED])
         # THE ROUND TRIP, read from the GATED arm because that is the run whose usability is
-        # in question. The marker reaches the server in its environment and the model only by
-        # way of a tool result, so its presence here is the reply having come back.
-        answered = marker in (gated_out or "")
+        # in question. The marker is MINTED BY THE SERVER and read back out of its receipts —
+        # never chosen here — so copilot's only route to it is a tool reply, and `answered` is
+        # a fact about that reply rather than about anything copilot could dump.
+        marker = minted_identity(gated)
+        answered = bool(marker) and marker in (gated_out or "")
         verdict, reason = classify(gated, control, answered)
 
         # PRINTED ON EVERY RUN, pass or fail. A green line shows no detail, the receipts are
@@ -280,11 +325,16 @@ def main() -> int:
             print("  " + (control_out or "").strip()[:1200].replace("\n", "\n  "))
             print("  --- gated transcript ---")
             print("  " + (gated_out or "").strip()[:1200].replace("\n", "\n  "))
-        # LEAKED is the finding this probe exists to catch and is not an error; SUPPRESSES_ALL
-        # and ANSWER_LOST are likewise definite answers — `tools:` cannot back `native`, for
-        # three different reasons with the same practical consequence. UNMEASURED and
-        # INSTRUMENT_FAILED are runs that answered nothing, which is a different thing again.
-        return 0 if run_ok(verdict) else 1
+        if not version_ok:
+            print("  VERSION UNREADABLE: this result is qualified by a copilot build it could "
+                  "not identify, so it certifies nothing whatever the filter did")
+        elif settled(verdict) and verdict != ENFORCED:
+            print(f"  SETTLED, AND THE ANSWER IS NO: {verdict} is a definite result and it "
+                  f"says copilot cannot be declared `native` on this evidence")
+        # EXIT 0 IS THE STRONG CLAIM — see `certifies_native`. A settled-but-negative verdict is
+        # a finding, printed above and exiting 1, because a caller reading only the status must
+        # never read "LEAKED" as permission.
+        return 0 if certifies_native(verdict, version_ok) else 1
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
