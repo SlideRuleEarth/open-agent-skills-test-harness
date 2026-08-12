@@ -1738,6 +1738,169 @@ try:
 finally:
     shutil.rmtree(_anchor_tmp, ignore_errors=True)
 
+# THE VERDICT, ON SYNTHETIC RUNS. It used to be an `elif` chain inside `main()`, reachable only
+# by paying for a suite — so the branch nobody arranged was the branch nobody checked. Every
+# case below is a record the chain would have had to be given a real hung or passing suite to
+# produce.
+
+
+def _outcome(rc, out, wall=1.0, cpu=1.0):
+    return MUT.Outcome(returncode=rc, output=out, wall=wall, cpu=cpu)
+
+
+check("a suite that goes red on the named arm is CAUGHT",
+      MUT.verdict(_outcome(1, "FAIL the arm  <- why"), "the arm", ["the arm"]) == MUT.CAUGHT,
+      "the one verdict that counts towards a coverage claim")
+check("...one that goes red on something else is NOT the same answer",
+      MUT.verdict(_outcome(1, "x"), "the arm", ["another check"]) == MUT.NOT_VIA,
+      "'some arm failed' is a different claim from 'the arm that names this defect failed', "
+      "and collapsing the two is how a mutation that has come unhooked reads as coverage")
+check("...one that still passes with the defect present is MISSED",
+      MUT.verdict(_outcome(0, "ALL PASS"), "the arm", []) == MUT.MISSED,
+      "an arm nothing can break is decorative, which is the whole point of the suite")
+# THE ORDERING, WHICH IS NOT A TIE-BREAK. A timed-out run carries rc 124 and no parsable
+# output, so the MISSED and NOT-via branches would both answer it if asked first — and NOT-via
+# is what they would say, over an empty list of failures, about a suite that never reported.
+check("...and a hung one is TIMEOUT rather than whatever the later branches would say of it",
+      MUT.verdict(_outcome(124, MUT._TIMEOUT_OUTPUT), "the arm", []) == MUT.TIMEOUT,
+      "no arm got to report, which is not the same fact as every arm passing")
+_caught_line = MUT.result_line("M1", "proxy", "the arm", _outcome(1, "x", 42.0, 5.0), ["the arm"])
+check("the printed line carries the verdict, the arm and BOTH clocks",
+      ("CAUGHT" in _caught_line and "the arm" in _caught_line
+       and "42.0s wall" in _caught_line and "5.0s cpu" in _caught_line), _caught_line)
+# The line and the verdict are two readers of one run, and they used to be two `elif` chains
+# over the same conditions. A line that said CAUGHT while the count said otherwise would make
+# the exit status disagree with the output — §4's trustworthy-predicate rule, one level up.
+check("...and it says MISSED exactly when the verdict does",
+      "MISSED" in MUT.result_line("M1", "proxy", "a", _outcome(0, "ALL PASS"), [])
+      and "MISSED" not in _caught_line, _caught_line)
+
+# THE ARGUMENT THE PARALLELISM IS ASKED FOR WITH. A typo'd `--job 8` that silently ran serially
+# would look exactly like a machine that did not speed up, which is why an unknown argument is
+# refused rather than ignored.
+check("`--jobs` is 1 unless asked for, in either spelling",
+      (survives(MUT.parse_jobs, []) == 1 and survives(MUT.parse_jobs, ["--jobs", "8"]) == 8
+       and survives(MUT.parse_jobs, ["--jobs=8"]) == 8), "the only argument this tool takes")
+check("...and every way of asking for it wrongly is refused rather than rounded to 1",
+      all(isinstance(survives(MUT.parse_jobs, a), ValueError)
+          for a in (["--jobs"], ["--jobs", "0"], ["--jobs", "x"], ["--jobs", "-2"],
+                    ["-j", "8"], ["--job", "8"])),
+      [survives(MUT.parse_jobs, a) for a in (["--jobs"], ["--jobs", "0"], ["--jobs", "x"],
+                                             ["--jobs", "-2"], ["-j", "8"], ["--job", "8"])])
+
+# THE SLOWEST-MUTATION WARNING, which §4 reads as the only notice before a defect that loops
+# becomes a defect that hangs. It has to rank on CPU: under `--jobs N` the loudest WALL figure
+# names whichever mutation was unluckiest with the scheduler, and the proxy suite spends ~40 of
+# its ~43 seconds waiting, so wall time there is a statement about sleep.
+_recs = [MUT.Record("slow-wall", "M", MUT.CAUGHT, "", wall=90.0, cpu=2.0),
+         MUT.Record("slow-cpu", "M", MUT.CAUGHT, "", wall=10.0, cpu=40.0),
+         MUT.Record("never-ran", "M", MUT.UNAPPLIED, "", wall=0.0, cpu=0.0)]
+check("the slowest mutation is the one that spent the most CPU, not the most wall clock",
+      MUT.slowest(_recs).mid == "slow-cpu", [(r.mid, r.wall, r.cpu) for r in _recs])
+check("...and a mutation that never ran is not ranked at all, nor mistaken for 'nothing ran'",
+      MUT.slowest([_recs[2]]) is None and MUT.slowest([]) is None,
+      "0.0s would read as a suite that finished instantly rather than one that never started")
+
+# APPLY / RUN / REVERT, with the run itself faked. The revert moved into a `finally` when the
+# trees became shared property: serially, an exception between the two writes ended the run
+# anyway, but a tree handed back to the pool still mutated would make every later result a fact
+# about two defects at once. Driven by an exception because that is the only way to reach it.
+_edit_tmp = tempfile.mkdtemp(prefix="verify-apply-")
+try:
+    _target = pathlib.Path(_edit_tmp) / "t.py"
+    _pristine = "before\nneedle\nafter\n"
+    _target.write_text(_pristine)
+    _entry = ("X3-example", "t.py", "needle", "haystack", "some arm")
+    _real_run, _calls = MUT.run, []
+
+    def _fake_run(cwd, suite):
+        _calls.append((str(cwd), suite, (pathlib.Path(cwd) / "t.py").read_text()))
+        return _outcome(1, "FAIL some arm  <- why", 3.0, 2.0)
+
+    def _raising_run(cwd, suite):
+        raise RuntimeError("the suite could not be started")
+
+    try:
+        MUT.run = _fake_run
+        _rec = MUT.apply_and_run(pathlib.Path(_edit_tmp), _entry, "fixtures", "F")
+        check("the file the suite sees is the MUTATED one, and it is put back afterwards",
+              (len(_calls) == 1 and "haystack" in _calls[0][2]
+               and _target.read_text() == _pristine),
+              (_calls, _target.read_text()))
+        check("...and the record carries the verdict, the class and the run's two clocks",
+              (_rec.verdict == MUT.CAUGHT and _rec.kind == "F"
+               and (_rec.wall, _rec.cpu) == (3.0, 2.0)), _rec)
+        MUT.run = _raising_run
+        _raised = survives(MUT.apply_and_run, pathlib.Path(_edit_tmp), _entry, "fixtures", "F")
+        check("...and it is put back even when the suite could not be run at all, since a "
+              "mutated tree goes back into the pool for the next mutation to draw",
+              isinstance(_raised, RuntimeError) and _target.read_text() == _pristine,
+              (_raised, _target.read_text()))
+    finally:
+        MUT.run = _real_run
+    # Both anchor faults, from the side that runs them. `stale_anchors` refuses the whole list
+    # up front; these are what a tree left mutated by a crashed worker would produce, and they
+    # must not be reported as a suite that ran and passed.
+    #
+    # `survives` AND AN `isinstance` AHEAD OF EVERY FIELD, because the interesting failure here
+    # RAISES. A guard that stopped refusing would let the call reach the suite runner, which
+    # would look for a venv this synthetic tree does not have — and an `OSError` out of a
+    # `check(...)` argument ends the verifier without naming the property that went unproven.
+    _target.write_text("nothing to find here\n")
+    _gone = survives(MUT.apply_and_run, pathlib.Path(_edit_tmp), _entry, "fixtures", "F")
+    check("an anchor that no longer matches is UNAPPLIED, and says the suite did not run",
+          (isinstance(_gone, MUT.Record) and _gone.verdict == MUT.UNAPPLIED
+           and "STALE ANCHOR" in _gone.line and "not run" in _gone.line), _gone)
+    _target.write_text("needle\nneedle\n")
+    _twice = survives(MUT.apply_and_run, pathlib.Path(_edit_tmp), _entry, "fixtures", "F")
+    check("...and one that matches twice is too, rather than mutating whichever site is first",
+          (isinstance(_twice, MUT.Record) and _twice.verdict == MUT.UNAPPLIED
+           and "AMBIGUOUS ANCHOR" in _twice.line), _twice)
+finally:
+    shutil.rmtree(_edit_tmp, ignore_errors=True)
+
+# THE TWO CLOCKS, AT THE ONE PLACE THEY ARE READ OFF THE KERNEL. `wait4` rather than a delta of
+# `getrusage(RUSAGE_CHILDREN)`, because the latter is a running total for the whole process and
+# under `--jobs N` a delta around one suite would include whatever the other seven workers
+# happened to finish inside the same window. That mistake is invisible at `--jobs 1`, where the
+# two agree, which is exactly why it needs a check rather than a reading.
+_burn = subprocess.Popen([sys.executable, "-c", "sum(range(4_000_000))"])
+_burn_status, _burn_cpu = MUT._await(_burn, 60.0)
+check("a child's CPU is measured from the wait that reaps THAT child",
+      _burn_status is not None and _burn.returncode == 0 and _burn_cpu > 0.0,
+      f"status={_burn_status} rc={_burn.returncode} cpu={_burn_cpu}")
+check("...and an exit status is read the way subprocess spells it, signals negative",
+      (MUT._exit_code(0) == 0 and MUT._exit_code(3 << 8) == 3
+       and MUT._exit_code(signal.SIGKILL) == -signal.SIGKILL),
+      f"a suite SIGKILLed at its bound must not read as exit {int(signal.SIGKILL)}, which is "
+      f"an ordinary failing run and would be scored as one")
+# THE TIMEOUT PATH, WHICH IS THE ONE THAT HAS TO REAP. A waiter that returned without killing
+# would leave the suite running beside every mutation after it; one that killed without waiting
+# would leave a zombie and, on the next mutation, a `wait4` on a pid nothing can wait for.
+_sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+_slept_status, _slept_cpu = MUT._await(_sleeper, 0.5)
+check("a child that outlives its bound is reported as such, killed, and reaped",
+      (_slept_status is None and _sleeper.returncode == -signal.SIGKILL
+       and isinstance(survives(os.waitpid, _sleeper.pid, 0), ChildProcessError)),
+      f"status={_slept_status} rc={_sleeper.returncode} cpu={_slept_cpu}")
+
+# THE WORK TREE, AND THE ONE THING IT HAS TO DO. The venv is 520MB of a 531MB tree and is now
+# SHARED rather than copied — which is safe only because nothing resolves through it: its
+# editable install of `agentskill_evals` hardcodes the ORIGINAL tree's path, and what makes a
+# mutation bite is the suite running with `cwd` at the work tree, ahead of that finder on
+# `sys.meta_path`. This is that argument asked as a question, which is the difference between a
+# tree that binds and a run that reports MISSED for all 413 entries an hour later.
+_tree_tmp = tempfile.mkdtemp(prefix="verify-worktree-")
+try:
+    _tree = survives(MUT.make_worktree, MUT.HARNESS, pathlib.Path(_tree_tmp) / "harness")
+    _bound = survives(MUT.worktree_binds, _tree) if isinstance(_tree, pathlib.Path) else _tree
+    check("a work tree binds its OWN copy of the package, not the original it was copied from",
+          (isinstance(_bound, str) and _bound
+           and pathlib.Path(_bound).resolve().is_relative_to(_tree.resolve())),
+          f"tree={_tree} resolved `agentskill_evals` to {_bound!r}")
+finally:
+    shutil.rmtree(_tree_tmp, ignore_errors=True)
+
 print()
 print("E18. probe_remote_mcp.py's startup path — the copy a fix was left out of")
 

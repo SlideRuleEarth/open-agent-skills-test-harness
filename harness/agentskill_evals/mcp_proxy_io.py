@@ -93,6 +93,40 @@ CONTROL_ENV = (FAULT_ENV, INHERIT_ENV, GRACE_ENV, GUARDIAN_ENV, PHASE_NONCE_ENV)
 DEFAULT_GRACE = 5.0
 
 GUARDIAN_FLAG = "--guardian"
+
+
+def guardian_argv(program: str, order_fd: int) -> list[str]:
+    """The exact argv `_establish_guardian` spawns, and the only place that shape is written.
+
+    A FUNCTION RATHER THAN A LITERAL AT THE SPAWN SITE because a second reader now exists:
+    `verify_mcp_proxy.py` finds live guardians in the process table, and what it matches has
+    to be what this launches. Two hand-written copies of an argv is §4's duplicated rule with
+    no way to notice the drift — the recogniser would go on matching an older shape and report
+    a leak-free run by looking for something nobody spawns.
+    """
+    return [program, os.path.abspath(__file__), GUARDIAN_FLAG, str(order_fd)]
+
+
+def is_guardian_command(command: str) -> bool:
+    """True if `command` is the argv of a guardian launched from THIS COPY of this module.
+
+    BOTH TERMS CARRY WEIGHT, and they answer different questions. The flag separates a guardian
+    from the proxy that spawned it — the proxy's own argv names this same file. The module path
+    separates a guardian of OURS from one belonging to another copy of the tree, which is what
+    `mutate_mcp.py --jobs N` creates: eight work trees running the proxy suite at once, each
+    with its own `mcp_proxy_io.py` at its own absolute path. Matching on the bare basename was
+    correct while the suite was serial and becomes a survivor check that fails for another
+    worker's reason the moment it is not — the same contamination pid-scoping already fixed
+    one level down, reappearing one level up.
+
+    NARROWING A CHECK CAN ALSO BREAK IT, and the thing that says so is already in place: if
+    this stopped matching our own guardians the verifier's positive control — the observer
+    finding the `mute` guardian while the case holds it alive — goes red before the absence
+    below is read as proof of anything.
+    """
+    return GUARDIAN_FLAG in command and os.path.abspath(__file__) in command
+
+
 # The four ways §10.9 breaks the guardian live in `mcp_audit`, with the rest of the record's
 # vocabulary, because the start record has to carry which one was armed (§10.5.1).
 GUARDIAN_MODES = audit.GUARDIAN_MODES
@@ -1007,7 +1041,7 @@ class Instance:
                    if self.fault.guardian == audit.GUARDIAN_MISSING else sys.executable)
         try:
             self.guardian = subprocess.Popen(   # noqa: S603 — this module, by absolute path
-                [program, os.path.abspath(__file__), GUARDIAN_FLAG, str(order_r)],
+                guardian_argv(program, order_r),
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 close_fds=True, pass_fds=handed + inherit,
                 # ITS OWN SESSION, so a group signal aimed at the proxy — which is what half the

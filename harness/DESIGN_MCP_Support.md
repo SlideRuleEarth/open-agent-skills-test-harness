@@ -467,6 +467,8 @@ The interpreter is `sys.executable`: the harness's own, the only one guaranteed 
 
 **The guardian is launched the same way and briefed down a pipe.** It runs the same file with `--guardian <fd>` and reads the launch order — command, args, `env`, cwd, and the descriptor numbers it is to hand on — from an inherited descriptor. Not from `argv`, and not from its own environment: the order carries the interpolated `env`, and both of those are readable through `ps`. That is the same rule the config file above obeys, applied to the one process that has to be told the same secrets.
 
+**That argv has a second reader, so it is built in one place.** §10.9's survivor check finds live guardians in the process table and its whole content is an *absence*, which makes it satisfied by a recogniser that looks for a shape nobody launches. `guardian_argv` builds the command line and `is_guardian_command` matches it, both from `os.path.abspath(__file__)`, so the launcher and the recogniser cannot drift — §4's duplicated-rule rule, satisfied by there being one rule. The path term is load-bearing rather than decorative: `mutate_mcp.py --jobs N` runs N copies of the tree at once, and a recogniser matching the bare module name would put a concurrent worker's guardian into this worker's before/during/after window, where it is genuinely absent before the case and genuinely present during it. Nothing in the argv is a secret — it is this file's path, a flag and a descriptor number — which is why the recogniser may read it from `ps` at all.
+
 ### 10.4 What is intercepted
 
 Newline-delimited JSON-RPC 2.0, one message per line, as the stdio binding specifies.

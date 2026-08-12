@@ -66,13 +66,30 @@ reporting exists to keep straight. It also refuses a mutation aimed at this file
 mutation runner to see whether the mutation runner notices is the circularity the `I*` heading
 exists to keep rare, with none of the justification.
 
-Every result line carries the wall time of the suite run that produced it, and the summary
-names the slowest. Read those against the `baseline:` lines: a mutation taking several times
-its suite's baseline is a defect that costs runtime rather than one that reddens an arm, and
-it is the only notice anyone gets before it grows past `_SUITE_TIMEOUT` and reports as a hang.
+Every result line carries TWO clocks, and the difference between them is the point. Wall time
+is what `_SUITE_TIMEOUT` bounds; CPU time is what the mutation actually spent. Read both
+against the `baseline:` lines: a mutation taking several times its suite's baseline IN CPU is
+the M65 shape — a defect that has turned some walk recursive and is burning a core — and it is
+the only notice anyone gets before it grows past the timeout and reports as a hang. Wall time
+alone stopped being able to say that the moment `--jobs` existed, because eight suites sharing
+a machine all take longer without any of them being wrong.
+
+`--jobs N` runs N mutations at once, each in its OWN copy of the tree, defaulting to 1. It is
+worth having because this suite is mostly WAITING: the proxy arms spend their time on settles
+and grace periods rather than on a core, which is why a serial run leaves the machine ~90%
+idle. What parallelism must not do is change a verdict, so everything that decides one stays
+where it was — the anchor and arm guards run serially up front, each worker mutates only its
+own tree, and results are printed in list order however they finish. The one thing that DID
+have to change is in the proxy verifier: its survivor check was scoped by pid identity, which
+excludes a leak from a previous mutation but not a live guardian from a concurrent worker, so
+`mcp_proxy_io.is_guardian_command` now scopes by tree as well.
 """
+import concurrent.futures
+import os
+import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -2375,6 +2392,31 @@ MUTATIONS = [
       "                    break"),
      "            time.sleep(_MUTE_CEILING)",
      "the `mute` guardian goes when its proxy goes, rather than sleeping out its ceiling"),
+    # THE RECOGNISER THE SURVIVOR CHECK READS ITS ABSENCES THROUGH, broken both ways. It is one
+    # predicate answering two questions — is this a guardian rather than the proxy that spawned
+    # it, and is it OURS rather than a concurrent `--jobs` worker's — so each term needs its own
+    # entry. Dropping the tree makes it match every worker's guardian, which is the survivor
+    # check failing for another worker's reason; dropping the flag makes it match the proxy too,
+    # which counts a live parent as a leaked child. Both are asked of synthetic argv rather than
+    # of the machine, because a serial verifier has no second tree to be wrong about.
+    ("M341-the-guardian-recogniser-ignores-which-tree-launched-it", PROXY_IO,
+     "    return GUARDIAN_FLAG in command and os.path.abspath(__file__) in command",
+     '    return GUARDIAN_FLAG in command and "mcp_proxy_io" in command',
+     ("...and one launched from another copy of the tree is NOT, which is what makes a "
+      "parallel run's survivor check scoped to its own worker")),
+    ("M342-every-process-naming-this-file-is-a-guardian", PROXY_IO,
+     "\n    return GUARDIAN_FLAG in command and os.path.abspath(__file__) in command",
+     "\n    return os.path.abspath(__file__) in command",
+     "...and the proxy itself is not, though its argv names this same file"),
+    # AND THE ARGV THE RECOGNISER IS PINNED TO. The two exist so a live guardian's command line
+    # and the string looked for in `ps` cannot drift apart; a launcher that spells the path
+    # differently breaks that pinning without either function looking wrong on its own. What
+    # notices is the POSITIVE CONTROL — the observer finding the `mute` guardian while the case
+    # holds it alive — which is the check that stops every absence below being read as proof.
+    ("M343-the-guardian-is-launched-under-a-name-nothing-matches", PROXY_IO,
+     "    return [program, os.path.abspath(__file__), GUARDIAN_FLAG, str(order_fd)]",
+     "    return [program, os.path.relpath(__file__), GUARDIAN_FLAG, str(order_fd)]",
+     "the survivor observer finds the `mute` guardian while the case is holding it alive"),
     # NO MUTATION FOR "spawn_failed IS FIRST", and the reason is worth more than a mutation.
     # The obvious one — drain the wakeup pipe before `_spawn()` — was written, driven, and came
     # back MISSED, correctly: there is no window between `signal.signal()` and `_spawn()` in
@@ -2705,9 +2747,9 @@ MUTATIONS = [
     # caught it on the first run. Any anchor spanning a newline is written with a `\n` escape,
     # so the literal's source bytes differ from the code's and the match is unique again.
     ("F27-the-suite-record-is-read-positionally-again", SELF,
-     '    return [str(cwd / ".venv/bin/python"), *_SUITES[suite].argv]\n\n\ndef run(',
+     '    return [str(cwd / ".venv/bin/python"), *_SUITES[suite].argv]\n\n\n_TIMEOUT_OUTPUT',
      ('    argv, _ = _SUITES[suite]\n'
-      '    return [str(cwd / ".venv/bin/python"), *argv]\n\n\ndef run('),
+      '    return [str(cwd / ".venv/bin/python"), *argv]\n\n\n_TIMEOUT_OUTPUT'),
      "every declared suite yields a runnable command, which is the line that broke"),
     # A suite that prints a line per check but declares no parser for them: the arm guard skips
     # it silently, which is the disarm rather than a failure.
@@ -3051,6 +3093,117 @@ MUTATIONS = [
      '"pgid": os.getpgid(0), "env_seen": []}',
      "the child's environment arrives by the route a control var would take"),
 
+    # ------------------------------------------------------------------------------------
+    # THE PARALLEL RUNNER'S OWN READERS (§E17), which are `F*` for the reason at the top of
+    # the file: they perturb an instrument, and what judges them is `verify_mcp_fixtures.py` —
+    # a different program, run from the mutated copy while the runner doing the scoring keeps
+    # executing from the original tree. The scoring itself is still off limits.
+    # ------------------------------------------------------------------------------------
+    # THE VERDICT, three ways. Each collapses a distinction the summary is a claim about: a
+    # hang counted as a defect nothing noticed, any red suite counted as the right red suite,
+    # and a green one counted as a catch.
+    ("F80-a-hung-suite-is-scored-as-a-defect-that-passed", SELF,
+     ("    if outcome.output == _TIMEOUT_OUTPUT:\n"
+      "        return TIMEOUT\n"),
+     "",
+     ("...and a hung one is TIMEOUT rather than whatever the later branches would say of it")),
+    ("F81-any-red-suite-counts-as-the-named-arm", SELF,
+     "\n    return CAUGHT if arm in failed else NOT_VIA",
+     "\n    return CAUGHT",
+     "...one that goes red on something else is NOT the same answer"),
+    ("F82-a-suite-that-still-passes-counts-as-a-catch", SELF,
+     ("    if outcome.returncode == 0:\n"
+      "        return MISSED"),
+     ("    if outcome.returncode == 0:\n"
+      "        return CAUGHT"),
+     "...one that still passes with the defect present is MISSED"),
+    # THE LINE AND THE VERDICT, made to disagree. Two readers of one run is how they drifted
+    # before `result_line` was written from `verdict`'s answer rather than from its conditions.
+    ("F83-the-printed-line-contradicts-the-verdict-it-was-built-from", SELF,
+     '\n    return f"{mid}: *** MISSED *** {suite} still passes with the defect present {took}"',
+     '\n    return f"{mid}: CAUGHT by {arm} {took}"',
+     "...and it says MISSED exactly when the verdict does"),
+    ("F84-only-the-wall-clock-is-printed", SELF,
+     '\n    took = f"({outcome.wall:.1f}s wall, {outcome.cpu:.1f}s cpu)"',
+     '\n    took = f"({outcome.wall:.1f}s wall)"',
+     "the printed line carries the verdict, the arm and BOTH clocks"),
+    # `--jobs`, BOTH WAYS OF ACCEPTING WHAT SHOULD BE REFUSED. A typo'd flag and a zero both
+    # end in a serial run that looks like a machine which did not speed up.
+    ("F85-an-unknown-argument-is-ignored-rather-than-refused", SELF,
+     '\n            raise ValueError(f"unknown argument {arg!r}; the only one is `--jobs N`")',
+     "\n            continue",
+     "...and every way of asking for it wrongly is refused rather than rounded to 1"),
+    ("F86-zero-jobs-is-accepted-and-quietly-becomes-one", SELF,
+     "\n    if not text.isdigit() or int(text) < 1:",
+     "\n    if not text.isdigit():",
+     "...and every way of asking for it wrongly is refused rather than rounded to 1"),
+    # THE SLOWEST-MUTATION WARNING, on the axis that stops meaning anything under load and on
+    # the entries that never ran.
+    ("F87-the-slowest-mutation-is-picked-by-wall-clock", SELF,
+     "\n    return max(ran, key=lambda r: r.cpu, default=None)",
+     "\n    return max(ran, key=lambda r: r.wall, default=None)",
+     "the slowest mutation is the one that spent the most CPU, not the most wall clock"),
+    ("F88-a-mutation-that-never-ran-is-ranked-among-those-that-did", SELF,
+     "\n    ran = [r for r in records if r.verdict != UNAPPLIED]",
+     "\n    ran = list(records)",
+     "...and a mutation that never ran is not ranked at all, nor mistaken for 'nothing ran'"),
+    # APPLY / RUN / REVERT. The first is the mutation never reaching the file the suite reads;
+    # the second is a tree going back into the pool still mutated, which is the defect that
+    # only exists because the trees became shared property.
+    ("F89-the-suite-is-run-before-the-mutation-is-written", SELF,
+     ("    path.write_text(mutated)\n"
+      "    try:\n"
+      "        outcome = run(work, suite)"),
+     "    try:\n        outcome = run(work, suite)",
+     "the file the suite sees is the MUTATED one, and it is put back afterwards"),
+    ("F90-the-revert-happens-only-when-the-suite-could-be-run", SELF,
+     ("    try:\n"
+      "        outcome = run(work, suite)\n"
+      "    finally:\n"
+      "        path.write_text(original)"),
+     ("    outcome = run(work, suite)\n"
+      "    path.write_text(original)"),
+     ("...and it is put back even when the suite could not be run at all, since a mutated "
+      "tree goes back into the pool for the next mutation to draw")),
+    ("F91-an-unapplied-mutation-is-counted-as-a-catch", SELF,
+     ("        return Record(mid, kind, UNAPPLIED,\n"
+      '                      f"{mid}: STALE ANCHOR'),
+     ("        return Record(mid, kind, CAUGHT,\n"
+      '                      f"{mid}: STALE ANCHOR'),
+     "an anchor that no longer matches is UNAPPLIED, and says the suite did not run"),
+    ("F92-an-anchor-matching-twice-is-applied-to-whichever-site-is-first", SELF,
+     "\n    if any(c > 1 for c in counts):",
+     "\n    if False and any(c > 1 for c in counts):",
+     "...and one that matches twice is too, rather than mutating whichever site is first"),
+    # THE WORK TREE. Sharing the venv is only safe because nothing resolves through it, and
+    # this is that argument's failure mode: a tree missing the package binds the ORIGINAL, runs
+    # unmutated code, and reports MISSED for every entry an hour later.
+    ("F93-the-work-tree-omits-the-package-and-binds-the-original", SELF,
+     '\n                    ignore=shutil.ignore_patterns("__pycache__", "artifacts", "build", ".venv"))',
+     '\n                    ignore=shutil.ignore_patterns("__pycache__", "artifacts", "build", ".venv", "agentskill_evals"))',
+     "a work tree binds its OWN copy of the package, not the original it was copied from"),
+    # THE TWO CLOCKS AT THE KERNEL. A signalled suite reported as a positive exit code reads as
+    # an ordinary failing run; a timeout that kills without reaping leaves a pid the NEXT
+    # mutation's `wait4` cannot wait for; and a CPU figure that is always zero silently retires
+    # the only early warning §4 has before a looping defect becomes a hang.
+    ("F94-a-signalled-suite-reports-a-positive-exit-code", SELF,
+     "\n    return -os.WTERMSIG(status) if os.WIFSIGNALED(status) else os.WEXITSTATUS(status)",
+     "\n    return os.WEXITSTATUS(status)",
+     "...and an exit status is read the way subprocess spells it, signals negative"),
+    ("F95-a-timed-out-suite-is-killed-but-never-reaped", SELF,
+     ("    _pid, status, usage = os.wait4(proc.pid, 0)\n"
+      "    proc.returncode = _exit_code(status)\n"
+      "    return None, usage.ru_utime + usage.ru_stime"),
+     ("    proc.returncode = -signal.SIGKILL\n"
+      "    return None, 0.0"),
+     "a child that outlives its bound is reported as such, killed, and reaped"),
+    ("F96-cpu-is-never-actually-read-off-the-wait", SELF,
+     ("            proc.returncode = _exit_code(status)\n"
+      "            return status, usage.ru_utime + usage.ru_stime"),
+     ("            proc.returncode = _exit_code(status)\n"
+      "            return status, 0.0"),
+     "a child's CPU is measured from the wait that reaps THAT child"),
+
 ]
 
 
@@ -3144,19 +3297,92 @@ def command_for(cwd, suite):
     return [str(cwd / ".venv/bin/python"), *_SUITES[suite].argv]
 
 
-def run(cwd, suite):
-    """Run one suite in `cwd`. Returns (returncode, output, elapsed_seconds).
+_TIMEOUT_OUTPUT = "__TIMEOUT__"
+# How often the waiter re-asks whether the suite has exited. It is not a busy loop at this
+# interval — a 40s proxy suite costs ~800 wakeups — and it bounds how late a TIMEOUT is
+# noticed, which against a 300s ceiling is noise.
+_POLL = 0.05
 
-    Elapsed is measured with a monotonic clock so a wall-clock adjustment mid-suite (a run
-    this long can straddle one) cannot produce a negative or wildly inflated duration.
+
+class Outcome(NamedTuple):
+    """One suite run, on both clocks.
+
+    TWO TIMES RATHER THAN ONE, and they answer different questions. `wall` is what
+    `_SUITE_TIMEOUT` is measured against, so it is the number to read for headroom. `cpu` is
+    what the run actually spent on a core, so it is the number that survives a loaded machine —
+    and under `--jobs N` the machine is loaded BY THIS PROGRAM, which makes the wall figure a
+    statement about the scheduler rather than about the mutation.
     """
-    t0 = time.monotonic()
+
+    returncode: int
+    output: str
+    wall: float
+    cpu: float
+
+
+def _exit_code(status):
+    """A `wait4` status as subprocess spells it: negative for a signal, else the exit code."""
+    return -os.WTERMSIG(status) if os.WIFSIGNALED(status) else os.WEXITSTATUS(status)
+
+
+def _await(proc, timeout):
+    """Reap `proc`, returning (status_or_None, cpu_seconds). None means it outlived `timeout`.
+
+    `os.wait4` RATHER THAN `subprocess.run`, and the reason is arithmetic rather than taste.
+    Per-child CPU has to come from the wait that reaps THAT child: `getrusage(RUSAGE_CHILDREN)`
+    is a running total for the whole process, so a delta around one suite is that suite's CPU
+    plus whatever the other seven workers happened to finish inside the same window. Under
+    `--jobs 1` the two agree, which is exactly why the mistake would have survived review.
+
+    What `cpu` covers is the suite process and every descendant IT reaped — so the proxy and
+    fixture servers a suite starts and waits for are included, and a process the suite LEAKED
+    is not. That is the right boundary for this purpose: a leak is a finding for the survivor
+    check, not a line item in a runtime budget.
+
+    Popen's own bookkeeping is bypassed on purpose. `proc.kill()` calls `poll()` first, which
+    would reap the child itself and leave the blocking `wait4` below raising `ChildProcessError`
+    on a pid nothing can wait for twice; `returncode` is assigned at the end instead, which is
+    what stops `__del__` reporting a still-running child.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        pid, status, usage = os.wait4(proc.pid, os.WNOHANG)
+        if pid == proc.pid:
+            proc.returncode = _exit_code(status)
+            return status, usage.ru_utime + usage.ru_stime
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(_POLL)
     try:
-        p = subprocess.run(command_for(cwd, suite),
-                           cwd=cwd, capture_output=True, text=True, timeout=_SUITE_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return 124, "__TIMEOUT__", time.monotonic() - t0
-    return p.returncode, p.stdout + p.stderr, time.monotonic() - t0
+        os.kill(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass                       # exited between the last poll and the signal; still to reap
+    _pid, status, usage = os.wait4(proc.pid, 0)
+    proc.returncode = _exit_code(status)
+    return None, usage.ru_utime + usage.ru_stime
+
+
+def run(cwd, suite):
+    """Run one suite in `cwd`, on both clocks.
+
+    Wall time is measured with a monotonic clock so a wall-clock adjustment mid-suite (a run
+    this long can straddle one) cannot produce a negative or wildly inflated duration.
+
+    OUTPUT GOES TO A FILE, NOT A PIPE. Reading a pipe means reading it until EOF, and EOF on a
+    suite's stdout is every process holding it — including one the suite leaked, which is a
+    thing these suites deliberately arrange. A file cannot deadlock, and it is what makes the
+    timeout above a bound on the SUITE rather than a bound on whatever outlived it.
+    """
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as sink:
+        t0 = time.monotonic()
+        proc = subprocess.Popen(command_for(cwd, suite), cwd=cwd,   # noqa: S603 — our own venv
+                                stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT)
+        status, cpu = _await(proc, _SUITE_TIMEOUT)
+        wall = time.monotonic() - t0
+        if status is None:
+            return Outcome(124, _TIMEOUT_OUTPUT, wall, cpu)
+        sink.seek(0)
+        return Outcome(proc.returncode, sink.read(), wall, cpu)
 
 
 def failed_checks(suite, out):
@@ -3167,6 +3393,128 @@ def failed_checks(suite, out):
     a coverage problem and is a tooling one.
     """
     return re.findall(_SUITES[suite].failed, out, re.MULTILINE)
+
+
+# The five ways one mutation can end. Named rather than spelled into the printed line at each
+# site, because the exit status and the output are two readers of the same fact and a run that
+# prints MISSED while returning 0 is the disagreement §4's trustworthy-predicate rule is about.
+CAUGHT = "CAUGHT"
+MISSED = "MISSED"
+NOT_VIA = "NOT-via"
+TIMEOUT = "TIMEOUT"
+UNAPPLIED = "UNAPPLIED"        # stale or ambiguous anchor: the suite never ran
+
+
+def verdict(outcome, arm, failed):
+    """How one mutation ended, from its run and the checks that went red.
+
+    A FUNCTION RATHER THAN THE `elif` CHAIN IT REPLACES, for the reason §4 gives about probes
+    and which is no weaker about the thing that scores them: a classifier inside `main()` can
+    only be exercised by paying for a suite, so the one case nobody arranges is the one nobody
+    finds. Every branch here is reachable from a synthetic `Outcome`.
+
+    TIMEOUT IS ASKED FIRST AND IT IS NOT A TIE-BREAK. A timed-out run carries `returncode` 124
+    and no parsable output, so both later branches would answer it — MISSED, in the reading
+    that matters, since `arm in failed` over an empty list is false and 124 is not 0. A hang is
+    uncaught, but calling it MISSED would say the defect was present and every arm passed, when
+    what happened is that no arm got to report.
+    """
+    if outcome.output == _TIMEOUT_OUTPUT:
+        return TIMEOUT
+    if outcome.returncode == 0:
+        return MISSED
+    return CAUGHT if arm in failed else NOT_VIA
+
+
+def result_line(mid, suite, arm, outcome, failed):
+    """The line one finished mutation prints, verdict included.
+
+    Built beside `verdict` and from its answer, so the two cannot disagree about what happened
+    — the printed text used to be chosen by a second `elif` chain over the same conditions.
+    """
+    took = f"({outcome.wall:.1f}s wall, {outcome.cpu:.1f}s cpu)"
+    kind = verdict(outcome, arm, failed)
+    if kind == TIMEOUT:
+        # Not a clean catch: the arm never got to report because the suite hung. A mutation
+        # whose defect is an infinite loop must be caught by an arm that BOUNDS the work (a
+        # thread + join), not by the suite's own timeout — so this counts as uncaught and fails
+        # the run, forcing a real fix rather than masking the hang.
+        return (f"{mid}: *** TIMEOUT *** {suite} exceeded {_SUITE_TIMEOUT}s — the defect hangs "
+                f"rather than reddening {arm} {took}")
+    if kind == CAUGHT:
+        return f"{mid}: CAUGHT by {arm} {took}"
+    if kind == NOT_VIA:
+        return f"{mid}: failed, but NOT via {arm} -> {failed} {took}"
+    return f"{mid}: *** MISSED *** {suite} still passes with the defect present {took}"
+
+
+def parse_jobs(argv):
+    """How many mutations to run at once, from the command line. 1 unless asked.
+
+    RAISES `ValueError`, NOT `SystemExit`, so the refusals below can be driven by a check
+    without ending the driver's own process — `SystemExit` is a `BaseException` and goes
+    straight past the `except Exception` that a driver wraps a call in. `main` is what turns
+    one into an exit status.
+
+    Refusing an unknown argument rather than ignoring it: a typo'd `--job 8` that silently ran
+    serially would look exactly like a machine that did not speed up.
+    """
+    jobs, rest = 1, list(argv)
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--jobs":
+            if not rest:
+                raise ValueError("--jobs needs a number, e.g. `--jobs 8`")
+            jobs = _positive(rest.pop(0))
+        elif arg.startswith("--jobs="):
+            jobs = _positive(arg.split("=", 1)[1])
+        else:
+            raise ValueError(f"unknown argument {arg!r}; the only one is `--jobs N`")
+    return jobs
+
+
+def _positive(text):
+    if not text.isdigit() or int(text) < 1:
+        raise ValueError(f"--jobs needs a positive whole number, not {text!r}")
+    return int(text)
+
+
+def make_worktree(src, dst):
+    """A copy of `src` at `dst` that a mutation bites, SHARING the venv rather than copying it.
+
+    THE VENV IS 520MB OF A 531MB TREE, and copying it never bought the isolation it looks like
+    it buys. That venv holds an editable install of `agentskill_evals` whose finder hardcodes
+    the ORIGINAL tree's absolute path, so the copy points where the original does. What makes a
+    mutation bite is something else entirely: the suite runs with `cwd` at the work tree, and
+    `-m` puts the cwd at `sys.path[0]`, ahead of the editable finder — which `install()`
+    APPENDS to `sys.meta_path`, behind the ordinary path finder. Measured both ways before this
+    was changed, and `worktree_binds` is what stops the argument being load-bearing.
+
+    So the copy cost 2.9s and half a gigabyte per worker to duplicate a directory nothing
+    resolves through, which at `--jobs 8` is 23s and 4GB. Shared, a tree is ~0.05s and 11MB.
+    Sharing is safe under parallelism for the same reason it is pointless: nothing writes to it.
+    """
+    src, dst = Path(src), Path(dst)
+    shutil.copytree(src, dst, symlinks=True,
+                    ignore=shutil.ignore_patterns("__pycache__", "artifacts", "build", ".venv"))
+    os.symlink(src / ".venv", dst / ".venv")
+    return dst
+
+
+def worktree_binds(work):
+    """Where `agentskill_evals` resolves for a suite run inside `work` — asked, not assumed.
+
+    THE ONE THING A WORK TREE HAS TO DO, and the only failure mode of the sharing above that
+    would not announce itself. A tree that resolved to the ORIGINAL package would run unmutated
+    code and report MISSED for every entry — which fails the run, but an hour later and while
+    reading like a total loss of coverage rather than like a broken tree. Asked once per tree,
+    for ~0.2s, and answered by the interpreter that will run the suites rather than by an
+    argument about `sys.meta_path`.
+    """
+    done = subprocess.run([str(work / ".venv/bin/python"), "-c",   # noqa: S603 — our own venv
+                           "import agentskill_evals as m; print(m.__file__)"],
+                          cwd=work, capture_output=True, text=True, timeout=120)
+    return done.stdout.strip()
 
 
 def _classify(mid, rel):
@@ -3243,8 +3591,110 @@ def stale_anchors(root, mutations):
     return out
 
 
-def main():
+class Record(NamedTuple):
+    """One finished mutation: what happened, what to print, and what it cost.
+
+    THE LINE TRAVELS WITH THE VERDICT rather than being printed where it is produced. Under
+    `--jobs N` the mutations finish out of order and the output has to come back in list order,
+    so a worker cannot print; and a worker that returned only a verdict would leave the text to
+    be rebuilt by a second reader of the same facts, which is how the two came to disagree
+    before `result_line` existed.
+    """
+
+    mid: str
+    kind: str          # M / I / F — which of the three totals this counts in
+    verdict: str
+    line: str
+    wall: float
+    cpu: float
+
+
+def apply_and_run(work, entry, suite, kind):
+    """Mutate `work`, run `suite`, put the file back, and say what happened.
+
+    THE REVERT IS IN A `finally`, which it was not while this was inline in the loop. Serially
+    an exception between the two writes ended the run anyway; with a tree handed back to a pool
+    it would leave a mutated file behind for whichever mutation drew that tree next, and every
+    result after it would be a fact about two defects at once.
+    """
+    mid, rel, find, repl, arm = entry
+    path = work / rel
+    original = path.read_text()
+    # `find`/`repl` may be tuples: some properties are now defended in two places, and
+    # reintroducing the defect means removing both (see M53).
+    edits = list(zip(find, repl)) if isinstance(find, tuple) else [(find, repl)]
+    counts = [original.count(f) for f, _ in edits]
+    if any(c == 0 for c in counts):
+        # No time to report, and "(0.0s)" would read as a suite that ran instantly rather than
+        # one that never started — the same lie the None/[] distinction exists to prevent
+        # elsewhere. Say which it is.
+        return Record(mid, kind, UNAPPLIED,
+                      f"{mid}: STALE ANCHOR — text not found in {rel} ({suite} not run)",
+                      0.0, 0.0)
+    if any(c > 1 for c in counts):
+        # THE OTHER HALF OF THE SAME GUARD, and the half that fails silently. `replace(f, r, 1)`
+        # takes whichever occurrence comes first, so an anchor matching twice still produces a
+        # mutant, still reddens SOME arm, and still prints CAUGHT — while testing whichever site
+        # happens to be earlier in the file rather than the one the mutation is named for. Five
+        # entries were in this state, four of them because a 4-space anchor is a substring of the
+        # same line indented 8 (the leading-newline lesson in §4, which nothing enforced), and one
+        # because a fix here made two functions textually identical. Refused rather than warned: a
+        # mutation that has quietly stopped testing what it names is exactly the failure this
+        # suite exists to prevent in the code it mutates (review, PR #103).
+        return Record(mid, kind, UNAPPLIED,
+                      f"{mid}: AMBIGUOUS ANCHOR — matches {counts} times in {rel}; pin it with "
+                      f"a leading newline or adjacent context ({suite} not run)", 0.0, 0.0)
+    mutated = original
+    for f, r in edits:
+        mutated = mutated.replace(f, r, 1)
+    path.write_text(mutated)
+    try:
+        outcome = run(work, suite)
+    finally:
+        path.write_text(original)
+    failed = failed_checks(suite, outcome.output)
+    return Record(mid, kind, verdict(outcome, arm, failed),
+                  result_line(mid, suite, arm, outcome, failed), outcome.wall, outcome.cpu)
+
+
+def _draw_and_run(trees, entry, suite, kind):
+    """One mutation, in whichever tree is free — and the tree goes back on every path.
+
+    The `finally` is what keeps the pool from draining. A worker that returned without putting
+    its tree back would take one thread's worth of parallelism with it, and eight such would
+    leave the run wedged on an empty queue with no output and nothing to say why.
+    """
+    work = trees.get()
+    try:
+        return apply_and_run(work, entry, suite, kind)
+    finally:
+        trees.put(work)
+
+
+def slowest(records):
+    """The record that spent the most CPU, or None where nothing ran.
+
+    CPU RATHER THAN WALL, which is the whole reason both are carried. §4 reads this number
+    against the baseline as the M65 early warning — a mutation that has turned some walk
+    recursive shows up here as several times its suite's baseline, long before it grows past
+    `_SUITE_TIMEOUT`. Wall time cannot say that under `--jobs N`: eight suites sharing a
+    machine each take longer, and the loudest wall figure would name whichever mutation was
+    unluckiest with the scheduler.
+
+    Mutations that never ran are excluded rather than ranked at 0.0, so "the slowest" is always
+    a statement about a suite that executed.
+    """
+    ran = [r for r in records if r.verdict != UNAPPLIED]
+    return max(ran, key=lambda r: r.cpu, default=None)
+
+
+def main(argv=None):
     started = time.monotonic()
+    try:
+        jobs = parse_jobs(sys.argv[1:] if argv is None else argv)
+    except ValueError as exc:
+        print(exc)
+        return 2
     # Before the baseline, which costs a selftest run: a misclassified entry makes every
     # number below it wrong, so it is worth nothing to discover that at the end.
     kinds = {mid: _classify(mid, rel) for mid, rel, _f, _r, _a in MUTATIONS}
@@ -3256,28 +3706,64 @@ def main():
         for mid, rel, n in stale:
             print(f"  {mid} -> {rel} matches {n} time(s), expected exactly 1")
         return 1
+    # THE TREES GO IN A `finally`, which they did not while there was one of them and four ways
+    # to leave. Every early return below — a hung baseline, a failed one, an arm naming no check
+    # — used to walk out past the `rmtree` at the bottom and leave the copy behind; the three
+    # that print a refusal are also the three anyone is most likely to hit twice in a row while
+    # fixing what they refuse over. One tree was a leak worth half a gigabyte and nobody's
+    # attention. Eight is the same leak eight times, which is how it was finally noticed.
     tmp = Path(tempfile.mkdtemp(prefix="mutate-mcp-"))
-    work = tmp / "harness"
-    shutil.copytree(HARNESS, work, symlinks=True,
-                    ignore=shutil.ignore_patterns("__pycache__", "artifacts", "build"))
+    try:
+        return _run_suite(tmp, jobs, kinds, suites, started)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _run_suite(tmp, jobs, kinds, suites, started):
+    # ONE TREE PER WORKER, never one tree shared: a mutation is a write to a file the next
+    # mutation reads, so two workers in one tree would be testing each other's defects. Never
+    # more trees than mutations either — the pool would hold a copy nothing ever draws.
+    trees: queue.Queue = queue.Queue()
+    made = []
+    for n in range(max(1, min(jobs, len(MUTATIONS)))):
+        one = make_worktree(HARNESS, tmp / f"w{n}" / "harness")
+        bound = worktree_binds(one)
+        if not bound or not Path(bound).resolve().is_relative_to(one.resolve()):
+            print(f"WORK TREE DOES NOT BIND — a suite run in {one} imports `agentskill_evals` "
+                  f"from {bound or '(nothing; the interpreter said nothing)'}, so every "
+                  f"mutation below would perturb a copy nothing executes and report MISSED.")
+            return 1
+        made.append(one)
+        trees.put(one)
+    work = made[0]
     # One baseline per suite actually used. Only the suites in play: paying for a green run
     # of a suite nothing below mutates would be measuring the machine, and a suite whose
     # baseline is never checked can be broken while its mutations all report CAUGHT for the
     # wrong reason.
+    #
+    # SERIAL, IN ONE TREE, EVEN AT `--jobs 8`. Two reasons, and the second is the one that
+    # matters: a baseline is a REFERENCE, so it has to be measured under the conditions its
+    # readers assume — an unloaded machine — and three baselines run concurrently would each
+    # report a slower number than any mutation is later compared against. The saving would be
+    # ~35s of a run this changes from 80 minutes to ten.
     baseline = {}
     for suite in sorted(set(suites.values())):
-        rc, out, secs = run(work, suite)
-        if out == "__TIMEOUT__":
+        base = run(work, suite)
+        if base.output == _TIMEOUT_OUTPUT:
             print(f"BASELINE TIMED OUT after {_SUITE_TIMEOUT}s — the unmutated {suite} suite "
                   f"hung, so nothing below would prove anything.")
             return 1
-        if rc != 0:
+        if base.returncode != 0:
             print(f"BASELINE FAILED ({suite}) — mutations prove nothing:")
-            print(out[-3000:])
+            print(base.output[-3000:])
             return 1
         # The reference every per-mutation time below is read against; without it those
-        # numbers describe the machine, not the mutation.
-        baseline[suite] = secs
+        # numbers describe the machine, not the mutation. BOTH CLOCKS, because the per-mutation
+        # lines now carry both and a CPU figure compared against a wall reference is nonsense
+        # in the direction that hides things — the proxy suite spends ~40 of its ~43 seconds
+        # waiting, so its CPU baseline is a fortieth of its wall one.
+        baseline[suite] = (base.wall, base.cpu)
+        out = base.output
         # EVERY ARM MUST NAME A CHECK THIS SUITE ACTUALLY PRINTS. The arm is a second, untyped
         # reference to a check — a copied string — so renaming the check silently unhooks the
         # mutation, which then reports "failed, but NOT via" and reads like a coverage problem
@@ -3324,8 +3810,8 @@ def main():
                 for a in orphan:
                     print(f"  {a!r}")
                 return 1
-        print(f"baseline: {suite} PASSED in {secs:.1f}s")
-    print()
+        print(f"baseline: {suite} PASSED in {base.wall:.1f}s wall / {base.cpu:.1f}s cpu")
+    print(f"\nrunning {len(MUTATIONS)} mutations across {len(made)} work tree(s)\n")
 
     # Counted apart, and reported apart. An `I*` mutation perturbs the INSTRUMENT (the
     # selftest itself) rather than the code under test, so folding it into one total would
@@ -3335,61 +3821,27 @@ def main():
     # up in the output rather than a quiet edit to the list.
     caught = {"M": 0, "I": 0, "F": 0}
     totals = {"M": 0, "I": 0, "F": 0}
-    slowest = (0.0, None)
-    for mid, rel, find, repl, arm in MUTATIONS:
-        kind = kinds[mid]                    # validated against `rel` before the baseline
-        suite = suites[mid]
+    for kind in kinds.values():
         totals[kind] += 1
-        path = work / rel
-        original = path.read_text()
-        # `find`/`repl` may be tuples: some properties are now defended in two places, and
-        # reintroducing the defect means removing both (see M53).
-        edits = list(zip(find, repl)) if isinstance(find, tuple) else [(find, repl)]
-        counts = [original.count(f) for f, _ in edits]
-        if any(c == 0 for c in counts):
-            # No time to report, and "(0.0s)" would read as a suite that ran instantly rather
-            # than one that never started — the same lie the None/[] distinction exists to
-            # prevent elsewhere. Say which it is.
-            print(f"{mid}: STALE ANCHOR — text not found in {rel} ({suite} not run)")
-            continue
-        if any(c > 1 for c in counts):
-            # THE OTHER HALF OF THE SAME GUARD, and the half that fails silently. `replace(f, r,
-            # 1)` takes whichever occurrence comes first, so an anchor matching twice still
-            # produces a mutant, still reddens SOME arm, and still prints CAUGHT — while testing
-            # whichever site happens to be earlier in the file rather than the one the mutation
-            # is named for. Five entries were in this state, four of them because a 4-space
-            # anchor is a substring of the same line indented 8 (the leading-newline lesson in
-            # §4, which nothing enforced), and one because a fix here made two functions
-            # textually identical. Refused rather than warned: a mutation that has quietly
-            # stopped testing what it names is exactly the failure this suite exists to prevent
-            # in the code it mutates (review, PR #103).
-            print(f"{mid}: AMBIGUOUS ANCHOR — matches {counts} times in {rel}; pin it with a "
-                  f"leading newline or adjacent context ({suite} not run)")
-            continue
-        mutated = original
-        for f, r in edits:
-            mutated = mutated.replace(f, r, 1)
-        path.write_text(mutated)
-        rc, out, elapsed = run(work, suite)
-        path.write_text(original)
-        took = f"({elapsed:.1f}s)"
-        if elapsed > slowest[0]:
-            slowest = (elapsed, mid)
-        failed = failed_checks(suite, out)
-        if out == "__TIMEOUT__":
-            # Not a clean catch: the arm never got to report because the suite hung. A
-            # mutation whose defect is an infinite loop must be caught by an arm that BOUNDS
-            # the work (a thread + join), not by the suite's own timeout — so this counts as
-            # uncaught and fails the run, forcing a real fix rather than masking the hang.
-            print(f"{mid}: *** TIMEOUT *** {suite} exceeded {_SUITE_TIMEOUT}s — the "
-                  f"defect hangs rather than reddening {arm} {took}")
-        elif rc != 0 and arm in failed:
-            print(f"{mid}: CAUGHT by {arm} {took}")
-            caught[kind] += 1
-        elif rc != 0:
-            print(f"{mid}: failed, but NOT via {arm} -> {failed} {took}")
-        else:
-            print(f"{mid}: *** MISSED *** {suite} still passes with the defect present {took}")
+    # A TREE IS DRAWN, NOT ASSIGNED. Mutations differ by two orders of magnitude in cost — a
+    # proxy arm is ~43s and a selftest arm ~6s — so dealing them out round-robin would leave
+    # one worker holding every proxy entry while the rest finished and idled. The queue hands
+    # each finishing worker whatever is next, which is the only scheduling this needs.
+    #
+    # AND THE OUTPUT IS IN LIST ORDER, however the runs finish. Iterating the futures in
+    # submission order blocks on the first unfinished one while every other worker keeps
+    # running, so the lines still stream — they just stream in the order a reader can diff
+    # against the last run.
+    records = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(made)) as pool:
+        futures = [pool.submit(_draw_and_run, trees, entry, suites[entry[0]], kinds[entry[0]])
+                   for entry in MUTATIONS]
+        for future in futures:
+            record = future.result()
+            records.append(record)
+            print(record.line, flush=True)
+            if record.verdict == CAUGHT:
+                caught[record.kind] += 1
     print(f"\n{caught['M']}/{totals['M']} production mutations caught by the intended arm")
     if totals["I"]:
         print(f"{caught['I']}/{totals['I']} instrument mutation(s) caught — these perturb "
@@ -3400,10 +3852,12 @@ def main():
               f"instruments rather than production code, so they are NOT part of the "
               f"production total either")
     total = time.monotonic() - started
-    slow = f"slowest {slowest[1]} at {slowest[0]:.1f}s" if slowest[1] else "no mutation ran"
-    bases = ", ".join(f"{s} baseline {v:.1f}s" for s, v in sorted(baseline.items()))
-    print(f"elapsed: {total / 60:.1f} min total, {bases}, {slow}")
-    shutil.rmtree(tmp, ignore_errors=True)
+    worst = slowest(records)
+    slow = (f"slowest {worst.mid} at {worst.cpu:.1f}s cpu ({worst.wall:.1f}s wall)"
+            if worst else "no mutation ran")
+    bases = ", ".join(f"{s} baseline {w:.1f}s wall / {c:.1f}s cpu"
+                      for s, (w, c) in sorted(baseline.items()))
+    print(f"elapsed: {total / 60:.1f} min total across {len(made)} tree(s), {bases}, {slow}")
     # Both must be clean: an instrument mutation surviving means the arm guarding the
     # selftest's own reporting is decorative, which is the same failure as any other MISSED.
     return 0 if caught == totals else 1

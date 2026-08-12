@@ -1230,18 +1230,48 @@ def process_table() -> dict[int, str]:
 
 
 def guardian_pids() -> set[int]:
-    """Every live guardian's pid.
+    """Every live guardian belonging to THIS tree, by pid.
 
     PIDS RATHER THAN A COUNT, so the check below can name the survivors it means. A count made
     the check read every guardian on the machine, including one a PREVIOUS mutation deliberately
     leaked: `M337` reintroduces the sleep and leaves a guardian running for its ceiling, so the
     next mutation's verifier would have seen it and failed for the previous mutation's reason.
     Identity removes that coupling without the driver deciding which processes "look like" ours —
-    a pid absent before the case and present after it appeared during the case, and the suite is
-    serial.
+    a pid absent before the case and present after it appeared during the case.
+
+    AND PID IDENTITY ALONE STOPPED BEING ENOUGH when the suite stopped being serial. `M337`'s
+    leak is a hazard from the PAST, which "absent before, present during" excludes; a concurrent
+    worker's guardian is a hazard from the SIDE, which it does not — it is genuinely absent
+    before this case and genuinely present during it, so it lands in `_guardians_during` and
+    outlives it for the previous reason under a new name. Scoping by tree closes that, and the
+    recogniser is imported rather than restated here: it is defined next to the argv it has to
+    match (§4's duplicated-rule rule, satisfied by import).
     """
-    return {pid for pid, command in process_table().items()
-            if IO.GUARDIAN_FLAG in command and "mcp_proxy_io" in command}
+    return {pid for pid, command in process_table().items() if IO.is_guardian_command(command)}
+
+
+# WHAT THE RECOGNISER IS FOR, driven on synthetic argv rather than on the machine. The live
+# positive control below says it finds our own guardian; nothing there can say it DOESN'T find
+# someone else's, because a serial run has no someone else — the case that matters is the one
+# `--jobs N` creates and this file cannot arrange. Synthetic command lines can: the same argv
+# with a different tree in it is exactly a concurrent worker's guardian.
+_other_tree = os.path.join(os.sep, "elsewhere", "harness", "agentskill_evals", "mcp_proxy_io.py")
+_ours = " ".join(IO.guardian_argv(sys.executable, 7))
+_theirs = f"{sys.executable} {_other_tree} {IO.GUARDIAN_FLAG} 7"
+check("a guardian launched from this tree is recognised as one",
+      IO.is_guardian_command(_ours),
+      f"the survivor check reads absence as proof, so a recogniser that matches nothing "
+      f"certifies every leak there is: {_ours!r}")
+check("...and one launched from another copy of the tree is NOT, which is what makes a "
+      "parallel run's survivor check scoped to its own worker",
+      not IO.is_guardian_command(_theirs),
+      f"under `mutate_mcp.py --jobs N` this argv belongs to a sibling worker, absent before "
+      f"this case and present during it: {_theirs!r}")
+_parent = f"{sys.executable} {PROXY} /tmp/proxy.json"
+check("...and the proxy itself is not, though its argv names this same file",
+      not IO.is_guardian_command(_parent),
+      f"the flag is what separates the guardian from its parent, and dropping it would count "
+      f"every proxy on the machine as a survivor: {_parent!r}")
 
 
 # THE WRITER SIDE OF THE LATCH RULE, and the case whose absence let a false claim reach a PR.

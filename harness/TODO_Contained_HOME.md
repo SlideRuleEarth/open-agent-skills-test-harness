@@ -292,9 +292,9 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 578 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py                        # 333/333 production + 2/2 instrument + 78/78 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 412 checks
-harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 88 here
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 95/95 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 431 checks
+harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 git diff --check
 
 # OPT-IN, not part of the block above: needs `claude` on PATH and spends an API call.
@@ -304,6 +304,39 @@ git diff --check
 # because "nothing routine runs it" is exactly how a fix lands in one copy and not the other.
 harness/.venv/bin/python harness/tools/probe_remote_mcp.py    # 19 checks; claude 2.1.113 (http asserts 2 more than sse)
 ```
+
+**`--jobs 8` is the recommended way to run it and `--jobs 1` is what it means.** The suite is
+mostly WAITING — the proxy arms are ~43s of settles and grace periods on ~5s of CPU, which is
+why a serial run leaves the machine ~90% idle — so N mutations at once is close to an N-fold
+saving in wall clock. Nothing that decides a verdict moved: the anchor guards, the arm guards
+and the class check still run serially before any tree is mutated, each worker mutates only its
+own copy of the tree, the baselines are measured one at a time on an unloaded machine because
+they are the REFERENCE every per-mutation number is read against, and results print in list
+order however they finish. Pick N from the performance cores, not the core count.
+
+Two things changed underneath so that this is true rather than merely fast, and both are the
+same shape — a rule that was right while there was one of something:
+
+- **The proxy verifier's survivor check is scoped by TREE, not by pid identity alone.** Pid
+  scoping excludes a guardian leaked by a PREVIOUS mutation, which is a hazard from the past;
+  a concurrent worker's guardian is a hazard from the SIDE, genuinely absent before the case
+  and genuinely present during it. `mcp_proxy_io.is_guardian_command` now matches the argv
+  `guardian_argv` builds, from this copy of the module. Measured during a `--jobs 8` run: 70%
+  of `ps` samples had a live guardian in more than one work tree, and 25% had one in all eight.
+  It was NOT possible to make the old predicate produce a red check — ~50 concurrent proxy
+  suites, including three with the deliberate 30s leak (`M337`), all passed — because
+  `_guardians_before` is sampled immediately before the case rather than at startup, leaving
+  only a ~1s window for a foreign guardian to be born in. So the fix is a narrowing that is
+  correct and cheap rather than one with a reproduction behind it; say so rather than implying
+  the run was broken.
+- **Per-mutation CPU is read from the `wait4` that reaps THAT child**, not from a
+  `getrusage(RUSAGE_CHILDREN)` delta. The delta is a running total for the whole process, so
+  under `--jobs N` it collects whatever the other N−1 workers finished inside the same window.
+  It is exactly right at `--jobs 1`, which is the only configuration anyone would have driven
+  it at — a measurement whose error is invisible in its own test conditions. The two clocks are
+  reported separately because they answer different questions: wall is what `_SUITE_TIMEOUT`
+  bounds, CPU is what survives a loaded machine, and the M65 early warning below needs the CPU
+  one now that wall time under load is a statement about the scheduler.
 
 **The mutation suite now runs THREE suites, and which one runs is a different question from
 which total a mutation counts in.** The suite is chosen by the file: `agentskill_evals/` is
@@ -1573,9 +1606,18 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   small contained-home fixtures only. `mutate_mcp.py` now also bounds each selftest with a
   `timeout` (reported as `TIMEOUT`, counted as *uncaught*), so a looping mutation is a finding
   rather than an infinite hang — but it is a backstop, not a licence to hang. Each result line
-  also carries its selftest's wall time, and the summary names the slowest; read them against
-  the `baseline:` line. A mutation at several times baseline is already the M65 shape, just not
-  yet past the timeout, and that gap is the only warning anyone gets before it becomes a hang.
+  carries TWO clocks and the summary names the slowest **by CPU**; read them against the
+  `baseline:` line, which carries both for the same reason. A mutation at several times its
+  suite's CPU baseline is already the M65 shape, just not yet past the timeout, and that gap is
+  the only warning anyone gets before it becomes a hang. Read the CPU figure and not the wall
+  one: under `--jobs N` every suite takes longer without any of them being wrong, and the
+  loudest wall number names whichever mutation was unluckiest with the scheduler.
+- **A single-line anchor aimed at `mutate_mcp.py` itself matches TWICE**, and one of the two is
+  the mutation entry quoting it. It is refused up front by `stale_anchors` rather than silently
+  mutating the list instead of the code, but the fix is not obvious from the message: pin it
+  with a leading `\n`, which is a real newline in the source and an escape sequence in the
+  entry, so the entry cannot match itself. Every `F*` aimed at `SELF` is written that way or
+  spans several lines, which has the same effect for the same reason.
 
 ---
 
