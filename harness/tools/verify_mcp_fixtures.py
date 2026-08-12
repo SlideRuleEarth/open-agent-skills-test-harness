@@ -29,6 +29,7 @@ most likely to produce.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import pathlib
@@ -1944,6 +1945,12 @@ try:
     check("the config asks the server to MINT a marker rather than carrying one",
           CG.IDENTITY_GENERATE in _cfg_text
           and '"tools": ["echo"]' in _cfg_text.replace("'", '"'), _cfg_text)
+    # ONE IMPLEMENTATION, NOT TWO. These were duplicated, and every offline check drove the
+    # stdio copy — so a fix applied to one would have shipped with everything green.
+    check("both probes share ONE digest reader, so a fix cannot land in only one of them",
+          CRG.minted_digest is CG.minted_digest
+          and CRG.reply_carried_marker is CG.reply_carried_marker,
+          (CRG.minted_digest, CG.minted_digest))
     check("...and that sentinel is the fixture's own, not a second spelling of it",
           CG.IDENTITY_GENERATE == ECHOMOD.IDENTITY_GENERATE == CRG.IDENTITY_GENERATE,
           (CG.IDENTITY_GENERATE, ECHOMOD.IDENTITY_GENERATE))
@@ -1965,9 +1972,18 @@ try:
           bool(_digest) and _digest != hashlib.sha256(
               ECHOMOD.IDENTITY_GENERATE.encode("utf-8")).hexdigest(),
           _digest)
-    check("the receipts carry a DIGEST, and the marker itself appears nowhere in them",
-          bool(_digest) and len(_digest) == 64
-          and not any("identity" == k for row in _rows for k in row),
+    # THE TOKEN THE REPLY CARRIED, recovered and then looked for in the serialized receipts.
+    # Checking that no KEY is named "identity" tests the schema and not the values — a record
+    # carrying the right digest plus `"leaked_plaintext": <marker>` passed it (review, PR #110).
+    # The marker is whichever candidate in the reply hashes to the reported digest, so this
+    # searches for the real value rather than for a field name.
+    _marker_in_reply = next((tok for tok in set(CG._CANDIDATE_RE.findall(_reply_text))
+                             if hashlib.sha256(tok.encode()).hexdigest() == _digest), "")
+    check("the marker is recoverable from the reply, which is what makes the next check real",
+          bool(_marker_in_reply), (_digest, _reply_text[:200]))
+    check("the receipts carry a DIGEST, and that marker VALUE appears nowhere in them",
+          bool(_digest) and len(_digest) == 64 and bool(_marker_in_reply)
+          and _marker_in_reply not in json.dumps(_rows),
           _rows)
     # THE PAIR THAT MAKES IT A MEASUREMENT: the reply carries a token matching that digest, and
     # the receipts do not. Without the second half the digest could simply be of something the
@@ -2048,26 +2064,45 @@ try:
     # reimplemented here.
     _skills = json.dumps({"type": "session.skills_loaded", "data": {"skills": [
         {"source": "builtin", "path": "/x/pkg/darwin-arm64/1.0.79/builtin/s/SKILL.md"}]}})
+    _skills99 = _skills.replace("1.0.79", "9.9.9")
     for _p, _n in ((CG, "stdio"), (CRG, "remote")):
         check(f"{_n}: the version is recovered from the run's own stream",
-              _p.run_version(_skills) == ("1.0.79", True), _p.run_version(_skills))
-        check(f"{_n}: ...and a stream with no witness is UNVERIFIED rather than assumed",
-              _p.run_version("")[1] is False
-              and _p.run_version('{"type":"other"}')[1] is False, _p.run_version(""))
+              _p.agreed_version([_skills]) == ("1.0.79", True), _p.agreed_version([_skills]))
+        # EVERY EXECUTED ARM MUST WITNESS. One witnessed arm beside one silent arm reads as
+        # witnessed under any rule that concatenates or samples — and the silent arm is exactly
+        # the one that could have been a different build.
+        check(f"{_n}: an executed arm with no witness leaves the run UNVERIFIED",
+              _p.agreed_version([_skills, ""])[1] is False
+              and _p.agreed_version([""])[1] is False
+              and _p.agreed_version([])[1] is False,
+              [_p.agreed_version([_skills, ""]), _p.agreed_version([])])
+        # ...AND THEY MUST AGREE. The decisive arm is not the one the version came from unless
+        # they are the same build: control at 1.0.79 with a gated arm at 9.9.9 exited 0
+        # reporting 1.0.79.
+        check(f"{_n}: ...and arms that ran different builds do not agree on one",
+              _p.agreed_version([_skills, _skills99])[1] is False
+              and _p.agreed_version([_skills, _skills])[1] is True,
+              _p.agreed_version([_skills, _skills99]))
         # MODEL-CONTROLLED TEXT MUST NOT FORGE IT — the reasoning the adapter already carries,
         # asserted here because these probes now depend on it.
         check(f"{_n}: ...and prose naming an app root does not count as a witness",
-              _p.run_version('{"type":"assistant","text":"pkg/darwin-arm64/9.9.9/builtin/"}')[1]
+              _p.agreed_version(
+                  ['{"type":"assistant","text":"pkg/darwin-arm64/9.9.9/builtin/"}'])[1]
               is False, "only builtin skill paths are structural")
-    # The config probe's four findings, likewise a conjunction and not a lookup on the last.
-    check("the config probe fails on ANY of its four findings, not just the stdio ones",
-          CFG.exit_code([], [], True, True) == 0
-          and all(CFG.exit_code(d, s, r, v) == 1 for d, s, r, v in
-                  ((["k"], [], True, True), ([], ["k"], True, True),
-                   ([], [], False, True), ([], [], True, False))),
-          [CFG.exit_code(d, s, r, v) for d, s, r, v in
-           (([], [], True, True), (["k"], [], True, True), ([], ["k"], True, True),
-            ([], [], False, True), ([], [], True, False))])
+    # The config probe's three findings, a conjunction and not a lookup on the last. The
+    # VERSION IS DELIBERATELY ABSENT: `copilot mcp add` emits no in-band witness, so a version
+    # term there is unverifiable by construction — always-false (exit 1 on every run, the state
+    # `type` used to create) or always-true (a check that cannot fail). It reports shape, and
+    # the two gating probes carry the version-qualified claims.
+    check("the config probe fails on ANY of its three findings, not just the stdio ones",
+          CFG.exit_code([], [], True) == 0
+          and all(CFG.exit_code(d, s, r) == 1 for d, s, r in
+                  ((["k"], [], True), ([], ["k"], True), ([], [], False))),
+          [CFG.exit_code(d, s, r) for d, s, r in
+           (([], [], True), (["k"], [], True), ([], ["k"], True), ([], [], False))])
+    check("...and it takes no version argument at all, so it cannot pretend to be qualified",
+          "version" not in inspect.signature(CFG.exit_code).parameters,
+          inspect.signature(CFG.exit_code))
     # AND THE STATE THAT MADE `remote_ok` UNREACHABLE. `type` was a permanent surprise, so the
     # exit status was 1 on every real run and no other term could move it — a conjunction whose
     # terms cannot vary is a constant. This is the measured 1.0.79 body; it must surprise nobody.
@@ -2095,6 +2130,81 @@ try:
         check(f"{_n}: ...and classify returns exactly what the control decided",
               _p.classify(_both, _arms(_p, "echo"), True) ==
               _p.control_verdict(_arms(_p, "echo")))
+
+    # -- and the SHORT-CIRCUIT is proved by counting calls, not by reading the condition ----
+    # `control_verdict` agreeing with `classify` says the RULE is right; it says nothing about
+    # whether `main` obeys it. Removing the actual short-circuit left every check above green
+    # and F72 green with it, because nothing here had ever invoked the consumer (review, PR
+    # #110). So: a fake runner, and the claim is a CALL COUNT.
+    _calls: list = []
+
+    def _fake_arm(_workdir, *, tools):
+        _calls.append(tools)
+        # `listening` plus whichever tools this canned control "called".
+        rows = [{"kind": "listening"}] + [
+            {"kind": "request", "method": "tools/call", "tool": name}
+            for name in _fake_arm.tools_called]
+        return rows, _fake_arm.transcript
+
+    _real_arm, _real_version = CG.run_arm, CG.agreed_version
+    try:
+        CG.run_arm = _fake_arm
+        CG.agreed_version = lambda streams: ("1.0.79", True)
+        # A control that skipped the on-list tool decides UNMEASURED on its own.
+        _fake_arm.tools_called, _fake_arm.transcript = ["add"], ""
+        _calls.clear()
+        _rc_short = CG.main()
+        check("stdio main does NOT run the gated arm once the control has decided",
+              len(_calls) == 1 and _calls == [None] and _rc_short == 1, _calls)
+        # ...and the positive control, or the check above is satisfied by a main that never
+        # runs anything at all.
+        _fake_arm.tools_called, _fake_arm.transcript = ["add", "echo"], ""
+        _calls.clear()
+        CG.main()
+        check("...while a control that decided nothing DOES run it, so the skip is conditional",
+              len(_calls) == 2 and _calls[1] == [CG.ALLOWED], _calls)
+    finally:
+        CG.run_arm, CG.agreed_version = _real_arm, _real_version
+
+    # The remote probe's `measure` has the same consumer, one layer in.
+    _rcalls: list = []
+
+    def _fake_start(receipts, _marker):
+        rows = [{"kind": "listening"}] + [
+            {"kind": "rpc", "method": "tools/call", "tool": name}
+            for name in _fake_remote.tools_called]
+        with open(receipts, "w", encoding="utf-8") as fh:
+            fh.writelines(json.dumps(r) + "\n" for r in rows)
+
+        class _P:
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                pass
+        return _P(), {"streamable": "http://x/mcp", "sse": "http://x/sse"}
+
+    def _fake_remote(_workdir, _url, _sentinel, _kind, *, tools):
+        _rcalls.append(tools)
+        return "", None
+
+    _real = (CRG.start_fixture, CRG.run_arm)
+    _remote_tmp = tempfile.mkdtemp(prefix="verify-shortcircuit-")
+    try:
+        CRG.start_fixture, CRG.run_arm = _fake_start, _fake_remote
+        _fake_remote.tools_called = ["add"]
+        _rcalls.clear()
+        CRG.measure(_remote_tmp, "http", "streamable", "sentinel")
+        check("remote measure does NOT run the gated arm once the control has decided",
+              len(_rcalls) == 1 and _rcalls == [None], _rcalls)
+        _fake_remote.tools_called = ["add", "echo"]
+        _rcalls.clear()
+        CRG.measure(_remote_tmp, "http", "streamable", "sentinel")
+        check("...while a control that decided nothing DOES run it, so the skip is conditional",
+              len(_rcalls) == 2 and _rcalls[1] == [CRG.ALLOWED], _rcalls)
+    finally:
+        CRG.start_fixture, CRG.run_arm = _real
+        shutil.rmtree(_remote_tmp, ignore_errors=True)
 
     # THE TWO VOCABULARIES ARE ONE VOCABULARY, asserted rather than assumed. Neither probe can
     # import the other (each is a standalone opt-in tool), so this is §4's duplicated-rule rule:

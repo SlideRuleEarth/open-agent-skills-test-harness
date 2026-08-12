@@ -222,9 +222,10 @@ def classify(gated: list[dict], control: list[dict], answered: bool) -> tuple[st
     # them can see whether its answer came back OUT. A client that forwards the call and then
     # drops, truncates or suppresses the response satisfies every clause so far, and a harness
     # that declared `native` on that strength would gate correctly onto a tool that returns
-    # nothing. The marker is opaque, travels to the server in its ENVIRONMENT, is never in the
-    # prompt, and comes back only inside the tool's result — so the model repeating it is the
-    # round trip completing (review, third instance of this family in one file).
+    # nothing. The marker is minted BY THE SERVER, is never in the prompt, never in the config,
+    # and never in the receipts — those carry only its digest — so the model reproducing a
+    # token that hashes to it is the round trip completing, and no file the CLI can read is a
+    # second route to the same value.
     if not answered:
         return ANSWER_LOST, (f"{ALLOWED!r} reached the server under the allowlist and its reply "
                              f"never came back: the run's output does not contain the opaque "
@@ -335,16 +336,31 @@ def version_verdict(rc: int, out: str, err: str) -> tuple[str, bool]:
     return (text, bool(_VERSION_RE.search(text)))
 
 
-def run_version(stdout: str) -> tuple[str, bool]:
-    """The version that ACTUALLY EXECUTED, read out of the run's own stream.
+def agreed_version(streams: list[str]) -> tuple[str, bool]:
+    """(text, usable) over EVERY arm that actually ran.
 
-    IMPORTED, NOT REIMPLEMENTED. `adapters/copilot.py` already recovers this from
-    `session.skills_loaded` built-in skill paths, and already carries the reasoning about why
-    the rest of the stream is model-controlled and must not be scanned. A second copy here
-    would be a second thing to keep right (§4).
+    ONE WITNESS PER EXECUTED ARM, AND THEY MUST AGREE. Reading the version from one arm and
+    deciding on another is not a version check: the stdio probe read `control_out` and then
+    launched the gated arm separately, so a control at 1.0.79 and a gated run at 9.9.9 exited 0
+    reporting 1.0.79 — driven by review, exactly so. Concatenating the streams instead, as the
+    remote probe did, is the one-sided form of the same hole: one witnessed arm plus one arm
+    with no witness at all reads as witnessed.
+
+    So: every stream must yield a witness, and the set must be a singleton. Absence in ANY
+    executed arm is unverified, because the arm with no witness is the one that could have been
+    a different build (review, PR #110).
     """
-    found = _stream_cli_version(stdout or "")
-    return (found or "(no in-band version witness in the run's stream)"), bool(found)
+    if not streams:
+        return "(no runs to witness)", False
+    found = [_stream_cli_version(s or "") for s in streams]
+    if any(f is None for f in found):
+        return (f"an executed arm produced no in-band version witness "
+                f"({[f or '-' for f in found]})"), False
+    if len(set(found)) != 1:
+        return (f"the arms did not run the same build: "
+                f"{sorted(str(f) for f in set(found))}"), False
+    return found[0], True
+
 
 def cli_version() -> tuple[str, bool]:
     """`copilot --version`, and whether it is usable. See `version_verdict`."""
@@ -363,11 +379,11 @@ def main() -> int:
         # worth a second model call — which this said and did not do until review pointed at
         # the line (PR #110).
         control, control_out = run_arm(workdir, tools=None)
-        version, version_ok = run_version(control_out)
-        print(f"copilot: {version}")
         decided = control_verdict(control)
         if decided is not None:
             verdict, reason = decided
+            version, version_ok = agreed_version([control_out])
+            print(f"copilot: {version}")
             print(f"probe C2-copilot: {verdict}\n  {reason}")
             print(f"  control: server_ran={server_ran(control)} "
                   f"called({OFF_LIST})={called(control, OFF_LIST)} "
@@ -377,6 +393,10 @@ def main() -> int:
             print("  " + (control_out or "").strip()[:1200].replace("\n", "\n  "))
             return 1
         gated, gated_out = run_arm(workdir, tools=[ALLOWED])
+        # EVERY ARM THAT RAN, and they must agree — the gated arm is the one the verdict is
+        # read from, so versioning the control alone identified the wrong execution.
+        version, version_ok = agreed_version([control_out, gated_out])
+        print(f"copilot: {version}")
         # THE ROUND TRIP, read from the GATED arm because that is the run whose usability is
         # in question. The marker is MINTED BY THE SERVER and read back out of its receipts —
         # never chosen here — so copilot's only route to it is a tool reply, and `answered` is

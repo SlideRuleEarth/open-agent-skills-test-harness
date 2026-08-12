@@ -116,9 +116,10 @@ IDENTITY = os.environ.get("ECHO_MCP_IDENTITY") or ""
 # runs through the CLI under test — its config file, or its environment — so the CLI holds a
 # copy before any tool is called, and a diagnostic dump or an `env` in a shell tool satisfies
 # "the marker appeared in the output" with nothing having returned. Minted here, after the CLI
-# has started us, the value exists in this process, in the receipts file, and in tool replies —
-# and the CLI's only passive route to it is the reply (review, PR #110, second round on the
-# same clause).
+# has started us, the value exists in this process and in the replies `echo` emits, and NOWHERE
+# ELSE: the receipts carry only its digest, because that file's path is in the CLI's own config
+# and the file lands in the CLI's working directory (review, PR #110, four rounds on this one
+# clause, each moving the marker one hop rather than changing what could reach it).
 IDENTITY_GENERATE = "@generate"
 if IDENTITY == IDENTITY_GENERATE:
     IDENTITY = uuid.uuid4().hex

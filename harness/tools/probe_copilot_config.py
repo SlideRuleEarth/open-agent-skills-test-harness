@@ -183,7 +183,7 @@ def add_server(home: str, name: str, argv_tail: list[str]) -> tuple[int, str]:
     return done.returncode, (done.stdout or "") + (done.stderr or "")
 
 
-def exit_code(differs: list, surprises: list, remote_ok: bool, version_ok: bool) -> int:
+def exit_code(differs: list, surprises: list, remote_ok: bool) -> int:
     """The probe's verdict over its three findings, as a function rather than an expression.
 
     EXTRACTED SO IT CAN BE DRIVEN. `remote_shape` was already a named function and already had
@@ -197,12 +197,19 @@ def exit_code(differs: list, surprises: list, remote_ok: bool, version_ok: bool)
     independent ways this probe's answer is not the one the design assumed, and all four are
     true of the same run.
 
-    `version_ok` JOINS THEM for the reason the others do. And note what had to change for
-    `remote_ok` to matter at all: `type` was a permanent member of `surprises`, so this
-    returned 1 on every real run and no other axis could move it — a conjunction is only a
-    conjunction while each term can be false (review, PR #110).
+    THE VERSION IS DELIBERATELY NOT A TERM. `copilot mcp add` emits no in-band witness, so any
+    version this probe reads comes from a different execution and is unverifiable BY
+    CONSTRUCTION — which means a term reading it is either always false (exit 1 on every run,
+    the state `type` used to create) or always true (a check that cannot fail). Neither is a
+    finding. The honest resolution is that **this probe measures shape, not a build**: it
+    reports the version as context and attributes nothing to it, and the two gating probes are
+    what carry a version-qualified claim, from their own streams (review, PR #110).
+
+    Note what had to change for `remote_ok` to matter at all: `type` was a permanent member of
+    `surprises`, so this returned 1 on every real run and no other axis could move it — a
+    conjunction is only a conjunction while each term can be false.
     """
-    return 1 if (differs or surprises or not remote_ok or not version_ok) else 0
+    return 1 if (differs or surprises or not remote_ok) else 0
 
 
 def version_verdict(rc: int, out: str, err: str) -> tuple[str, bool]:
@@ -242,12 +249,16 @@ def cli_version() -> tuple[str, bool]:
 def main() -> int:
     home = tempfile.mkdtemp(prefix="probe-copilot-home-")
     try:
-        version, version_ok = cli_version()
-        print(f"copilot: {version}  (UNVERIFIED — read from a separate execution; "
-              f"`copilot mcp add` emits no in-band witness)")
-        if not version_ok:
-            print("  VERSION UNREADABLE: no version at all, so the spellings below name no "
-                  "build even weakly")
+        version, _readable = cli_version()
+        # CONTEXT, NOT A CLAIM, and not a term in the verdict below. `copilot mcp add` emits no
+        # stream to read a version out of, so this one comes from a different execution and
+        # cannot be attributed to the build that wrote the file. The spellings this probe
+        # reports are therefore NOT version-qualified, and saying so is the whole fix: an
+        # earlier revision printed "UNVERIFIED" and then exited 0 as though it were not.
+        print(f"copilot: {version}")
+        print("  NOTE: this probe measures SHAPE, not a build. The version above was read from "
+              "a separate execution and nothing below is attributed to it; "
+              "`probe_copilot_gating.py` carries the version-qualified claims.")
         # AN ENV VAR IS SET ON THE STDIO ADD, so `env` is exercised rather than reported
         # `unexercised` — the PR body claimed every listed spelling was confirmed while this
         # run never gave copilot an env var to write (review, PR #110).
@@ -340,7 +351,7 @@ def main() -> int:
             print("  REMOTE SPELLING UNCONFIRMED: the entries above are not the shape §8's "
                   "pattern needs, so the gating probes' hand-written config is not backed by "
                   "anything copilot produced")
-        return exit_code(differs, surprises, remote_ok, version_ok)
+        return exit_code(differs, surprises, remote_ok)
     finally:
         shutil.rmtree(home, ignore_errors=True)
 

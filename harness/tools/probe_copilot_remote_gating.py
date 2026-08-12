@@ -33,7 +33,6 @@ THE THREE FACTS THIS SETTLES, and they are separable:
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -125,44 +124,11 @@ def credential_arrived(records: list[dict], sentinel: str) -> bool:
     return all((r.get("headers") or {}).get("authorization", "") == expected for r in seen)
 
 
-_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-# The minted marker is `uuid4().hex`: 32 lowercase hex characters. Candidates are pulled out of
-# the transcript by that shape and HASHED, so the driver recognises the marker without ever
-# holding it and the CLI cannot manufacture it from anything it can read.
-_CANDIDATE_RE = re.compile(r"[0-9a-f]{32}")
-
-
-def minted_digest(records: list[dict]) -> str:
-    """The sha256 the SERVER reported for its minted marker, or "" if there is none.
-
-    A DIGEST RATHER THAN THE MARKER, because the receipts path is in the config the CLI reads
-    and the file lands in the CLI's working directory under `--allow-all`. Minting moved the
-    marker out of the config; it left it readable one hop away, so a file-read tool could put
-    it in the transcript with no reply having returned. sha256 is not invertible, so this
-    channel can carry recognition without carrying the secret (review, PR #110).
-
-    SHAPE-VALIDATED, which is the other half. This used to accept any string, so a receipt
-    reporting the literal `@generate` sentinel — the exact state a broken mint produces — was
-    accepted as a marker, and a transcript containing that word scored ENFORCED. The offline
-    verifier caught the mutation; the measurement executable itself failed open.
-    """
-    for record in records:
-        if record.get("kind") == "listening":
-            digest = record.get("identity_digest")
-            return digest if isinstance(digest, str) and _DIGEST_RE.match(digest) else ""
-    return ""
-
-
-def reply_carried_marker(transcript: str, digest: str) -> bool:
-    """Whether the transcript contains a token whose sha256 is `digest`.
-
-    The empty digest is never satisfied: a server that minted nothing cannot have answered.
-    """
-    if not digest:
-        return False
-    return any(hashlib.sha256(tok.encode("utf-8")).hexdigest() == digest
-               for tok in set(_CANDIDATE_RE.findall(transcript or "")))
-
+# IMPORTED, NOT A SECOND COPY. These were duplicated here, and the offline checks only ever
+# exercised the stdio copy — so a fix applied to one and not the other would have shipped with
+# every check green, which is the exact shape §4 records for `probe_remote_mcp.start_fixture`.
+# Where import is possible, import.
+from probe_copilot_gating import minted_digest, reply_carried_marker  # noqa: E402
 
 def control_verdict(control: list[dict]) -> tuple[str, str] | None:
     """The verdict the CONTROL alone already decides — one authority, consulted by `classify`
@@ -176,6 +142,7 @@ def control_verdict(control: list[dict]) -> tuple[str, str] | None:
                             f"skipped, the gated arm's reading for that tool is the model's "
                             f"doing rather than the filter's")
     return None
+
 
 
 def classify(gated: list[dict], control: list[dict], answered: bool) -> tuple[str, str]:
@@ -292,16 +259,31 @@ def version_verdict(rc: int, out: str, err: str) -> tuple[str, bool]:
     return (text, bool(_VERSION_RE.search(text)))
 
 
-def run_version(stdout: str) -> tuple[str, bool]:
-    """The version that ACTUALLY EXECUTED, read out of the run's own stream.
+def agreed_version(streams: list[str]) -> tuple[str, bool]:
+    """(text, usable) over EVERY arm that actually ran.
 
-    IMPORTED, NOT REIMPLEMENTED. `adapters/copilot.py` already recovers this from
-    `session.skills_loaded` built-in skill paths, and already carries the reasoning about why
-    the rest of the stream is model-controlled and must not be scanned. A second copy here
-    would be a second thing to keep right (§4).
+    ONE WITNESS PER EXECUTED ARM, AND THEY MUST AGREE. Reading the version from one arm and
+    deciding on another is not a version check: the stdio probe read `control_out` and then
+    launched the gated arm separately, so a control at 1.0.79 and a gated run at 9.9.9 exited 0
+    reporting 1.0.79 — driven by review, exactly so. Concatenating the streams instead, as the
+    remote probe did, is the one-sided form of the same hole: one witnessed arm plus one arm
+    with no witness at all reads as witnessed.
+
+    So: every stream must yield a witness, and the set must be a singleton. Absence in ANY
+    executed arm is unverified, because the arm with no witness is the one that could have been
+    a different build (review, PR #110).
     """
-    found = _stream_cli_version(stdout or "")
-    return (found or "(no in-band version witness in the run's stream)"), bool(found)
+    if not streams:
+        return "(no runs to witness)", False
+    found = [_stream_cli_version(s or "") for s in streams]
+    if any(f is None for f in found):
+        return (f"an executed arm produced no in-band version witness "
+                f"({[f or '-' for f in found]})"), False
+    if len(set(found)) != 1:
+        return (f"the arms did not run the same build: "
+                f"{sorted(str(f) for f in set(found))}"), False
+    return found[0], True
+
 
 def cli_version() -> tuple[str, bool]:
     """`copilot --version`, and whether it is usable. See `version_verdict`."""
@@ -362,8 +344,8 @@ def main() -> int:
         for kind, endpoint in TRANSPORTS:
             verdict, reason, results, bearer_ok, answered = measure(
                 workdir, kind, endpoint, sentinel)
-            version, version_ok = run_version(
-                "".join(out for _recs, out in results.values()))
+            version, version_ok = agreed_version(
+                [out for _recs, out in results.values()])
             print(f"probe C2-copilot-remote [{kind}]: {verdict}   (copilot: {version})")
             if not version_ok:
                 print("  VERSION UNVERIFIED: no in-band witness in this run's stream, so the "

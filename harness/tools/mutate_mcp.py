@@ -2887,9 +2887,9 @@ MUTATIONS = [
      "    return verdict == ENFORCED and version_ok",
      "remote: ...and the same, per transport, over bearer and version too"),
     ("F52-the-config-verdict-ignores-the-remote-shape", CCONFIG,
-     "    return 1 if (differs or surprises or not remote_ok or not version_ok) else 0",
-     "    return 1 if (differs or surprises or not version_ok) else 0",
-     "the config probe fails on ANY of its four findings, not just the stdio ones"),
+     "    return 1 if (differs or surprises or not remote_ok) else 0",
+     "    return 1 if (differs or surprises) else 0",
+     "the config probe fails on ANY of its three findings, not just the stdio ones"),
     # THE ANCHOR VALIDATOR'S OWN TWO WAYS OF BEING WRONG. It exists because a stale anchor cost
     # a 77-minute run to discover; a validator that reads one half of a two-part `find`, or that
     # treats "matches twice" as fine, would hand back the same silence for the same money.
@@ -2920,7 +2920,7 @@ MUTATIONS = [
     ("F57-the-minted-marker-is-not-reported-to-the-driver", ECHO,
      "             identity_digest=identity_digest())",
      '             identity_digest="")',
-     "the receipts carry a DIGEST, and the marker itself appears nowhere in them"),
+     "the receipts carry a DIGEST, and that marker VALUE appears nowhere in them"),
     # A RECEIPT THAT DISAGREES WITH THE REPLY makes `answered` unfalsifiable in the other
     # direction: the driver looks for a value the tool never emits.
     ("F58-the-reported-identity-is-not-the-one-the-reply-carries", ECHO,
@@ -2950,13 +2950,6 @@ MUTATIONS = [
      ('    if rc != 0:\n        return (text or f"exit {rc}"), False\n'
       "    return (text, bool(text))"),
      "stdio: a preflight version must LOOK like a version, not merely be output"),
-    ("F63-the-config-probe-ignores-an-unreadable-version", CCONFIG,
-     "    return 1 if (differs or surprises or not remote_ok or not version_ok) else 0",
-     "    return 1 if (differs or surprises or not remote_ok) else 0",
-     "the config probe fails on ANY of its four findings, not just the stdio ones"),
-    # THE DISCRIMINATOR LEAVES THE KNOWN SET, which is the state that made `remote_ok`
-    # unreachable: `type` a permanent surprise, exit 1 on every real run, no other term able
-    # to move it.
     ("F64-the-measured-discriminator-goes-back-to-being-a-surprise", CCONFIG,
      '    "type": "type",\n}',
      "}",
@@ -2978,7 +2971,7 @@ MUTATIONS = [
     ("F67-the-receipts-carry-the-marker-in-plaintext", ECHO,
      "    return hashlib.sha256(IDENTITY.encode(\"utf-8\")).hexdigest() if IDENTITY else \"\"",
      '    return IDENTITY',
-     "the receipts carry a DIGEST, and the marker itself appears nowhere in them"),
+     "the receipts carry a DIGEST, and that marker VALUE appears nowhere in them"),
     # THE LIVE PROBE FAILS OPEN on a receipt that reports the sentinel — the exact state a
     # broken mint produces, and a transcript containing that word then scored ENFORCED.
     ("F68-any-string-counts-as-a-minted-marker", CGATE,
@@ -2991,14 +2984,22 @@ MUTATIONS = [
      "...and an empty digest is never satisfied by any transcript"),
     # THE VERSION IDENTIFIES A DIFFERENT EXECUTION. copilot's launcher can resolve different
     # cached code between two invocations, which is why the adapter reads it in-band.
-    ("F70-the-in-band-version-witness-is-not-required", CGATE,
-     '    return (found or "(no in-band version witness in the run\'s stream)"), bool(found)',
-     '    return (found or "(no in-band version witness in the run\'s stream)"), True',
-     "stdio: ...and a stream with no witness is UNVERIFIED rather than assumed"),
-    ("F71-the-remote-in-band-version-witness-is-not-required", CGATE_REMOTE,
-     '    return (found or "(no in-band version witness in the run\'s stream)"), bool(found)',
-     '    return (found or "(no in-band version witness in the run\'s stream)"), True',
-     "remote: ...and a stream with no witness is UNVERIFIED rather than assumed"),
+    ("F70-an-arm-with-no-witness-is-treated-as-witnessed", CGATE,
+     "    if any(f is None for f in found):",
+     "    if False:",
+     "stdio: an executed arm with no witness leaves the run UNVERIFIED"),
+    ("F71-the-arms-need-not-have-run-the-same-build", CGATE,
+     "    if len(set(found)) != 1:",
+     "    if False:",
+     "stdio: ...and arms that ran different builds do not agree on one"),
+    ("F73-the-remote-arms-need-not-agree-on-a-build", CGATE_REMOTE,
+     "    if len(set(found)) != 1:",
+     "    if False:",
+     "remote: ...and arms that ran different builds do not agree on one"),
+    ("F74-a-remote-arm-with-no-witness-is-treated-as-witnessed", CGATE_REMOTE,
+     "    if any(f is None for f in found):",
+     "    if False:",
+     "remote: an executed arm with no witness leaves the run UNVERIFIED"),
     # THE CONTROL STOPS DECIDING ALONE, so the second model call runs for a number that cannot
     # move the verdict — and `classify` and `main` stop agreeing about what a run means.
     ("F72-the-control-never-decides-on-its-own", CGATE,
@@ -3007,6 +3008,22 @@ MUTATIONS = [
      ("    if False:\n"
       "        return UNMEASURED, (f\"the CONTROL called {OFF_LIST}={called(control, OFF_LIST)} \""),
      "stdio: ...and one that skipped a tool decides UNMEASURED, so no second call"),
+    # THE CONSUMER, not the rule. F72 perturbs `control_verdict`; these perturb whether `main`
+    # and `measure` ACT on it — and removing either left every check green until §E19 started
+    # counting calls with a fake runner (review, PR #110).
+    ("F75-stdio-main-runs-the-gated-arm-anyway", CGATE,
+     "        decided = control_verdict(control)\n        if decided is not None:",
+     "        decided = control_verdict(control)\n        if False:",
+     "stdio main does NOT run the gated arm once the control has decided"),
+    ("F76-remote-measure-runs-the-gated-arm-anyway", CGATE_REMOTE,
+     '        if label == "gated" and control_verdict(results["control"][0]) is not None:',
+     "        if False:",
+     "remote measure does NOT run the gated arm once the control has decided"),
+    # THE PLAINTEXT BACK IN THE RECEIPTS, in a field the schema check would not have noticed.
+    ("F77-a-receipt-field-leaks-the-marker-beside-the-digest", ECHO,
+     "             identity_digest=identity_digest())",
+     "             identity_digest=identity_digest(), leaked_plaintext=IDENTITY)",
+     "the receipts carry a DIGEST, and that marker VALUE appears nowhere in them"),
     ("F36-the-child-reports-no-environment-at-all", TARGET,
      '"pgid": os.getpgid(0), "env_seen": sorted(set(seen))}',
      '"pgid": os.getpgid(0), "env_seen": []}',
