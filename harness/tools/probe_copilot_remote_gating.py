@@ -23,8 +23,11 @@ THE THREE FACTS THIS SETTLES, and they are separable:
   1. does the declared `Authorization` header reach the server at all (probe #1 established
      this for claude; copilot is a different client and inherits nothing);
   2. does an off-list `tools/call` arrive when `tools:` names only the other tool;
-  3. does the on-list tool actually work — the CONTROL, without which "nothing arrived" is
-     satisfied by a run that never reached the server.
+  3. does the on-list tool actually work UNDER THE ALLOWLIST — without which "nothing arrived"
+     is equally true of a `tools:` that suppresses the server wholesale rather than filtering
+     it. This was claimed here and not measured: the prompt named only the off-list tool, so
+     `called(echo)=False` in both arms and the verdict read ENFORCED off it. The gated arm now
+     carries a claim of each sign, and `SUPPRESSES_ALL` is the verdict when only one holds.
 
     python tools/probe_copilot_remote_gating.py        # prints the tally either way
 """
@@ -50,6 +53,7 @@ DEADLINE = 240.0
 ENFORCED = "ENFORCED"
 LEAKED = "LEAKED"
 UNMEASURED = "UNMEASURED"
+SUPPRESSES_ALL = "SUPPRESSES_ALL"         # nothing arrived gated, ALLOWED included: an off switch
 INSTRUMENT_FAILED = "INSTRUMENT_FAILED"
 
 
@@ -99,15 +103,23 @@ def classify(gated: list[dict], control: list[dict]) -> tuple[str, str]:
     """(verdict, reason) — a named function so every branch is drivable on synthetic rows."""
     if not server_ran(control) or not server_ran(gated):
         return INSTRUMENT_FAILED, "the fixture did not start in one or both arms"
-    if not called(control, OFF_LIST):
-        return UNMEASURED, (f"the CONTROL never called {OFF_LIST!r} over HTTP, so the gated "
-                            f"arm's silence is the model's doing rather than the filter's")
+    # BOTH TOOLS UNGATED, because the gated arm is read for two facts of opposite sign.
+    if not called(control, OFF_LIST) or not called(control, ALLOWED):
+        return UNMEASURED, (f"the CONTROL called {OFF_LIST}={called(control, OFF_LIST)} "
+                            f"{ALLOWED}={called(control, ALLOWED)} over HTTP; whichever it "
+                            f"skipped, the gated arm's reading for that tool is the model's "
+                            f"doing rather than the filter's")
     if called(gated, OFF_LIST):
         return LEAKED, (f"{OFF_LIST!r} reached the REMOTE server despite `tools: "
                         f"[{ALLOWED!r}]` — §8's pattern is not gated on copilot, and the "
                         f"stdio result did not carry")
+    if not called(gated, ALLOWED):
+        return SUPPRESSES_ALL, (f"neither tool reached the REMOTE server under `tools: "
+                                f"[{ALLOWED!r}]`, though the control called both over HTTP. "
+                                f"§8's pattern is not usable: the allowlist is an off switch")
     return ENFORCED, (f"{OFF_LIST!r} arrived ungated and did NOT arrive under `tools: "
-                      f"[{ALLOWED!r}]` over HTTP — §8's pattern is enforced on copilot today")
+                      f"[{ALLOWED!r}]` over HTTP, while {ALLOWED!r} DID arrive in that same "
+                      f"run — §8's pattern is enforced on copilot today")
 
 
 def mcp_config(path: str, url: str, sentinel: str, *, tools: list[str] | None) -> str:
@@ -127,9 +139,13 @@ def run_arm(workdir: str, url: str, sentinel: str, *, tools: list[str] | None):
     receipts_before = None
     config = mcp_config(os.path.join(workdir, f"cfg-{uuid.uuid4().hex}.json"), url, sentinel,
                         tools=tools)
-    prompt = (f"Use the {OFF_LIST} tool from the `echo` MCP server to add 2 and 3. "
-              f"Report the number it returns. If the tool is unavailable, say exactly "
-              f"NO_SUCH_TOOL and stop.")
+    # BOTH TOOLS, ALLOWED FIRST — see `classify`. Naming only the off-list one leaves the
+    # allowed one uncalled in every arm, which is exactly what an off switch looks like.
+    prompt = (f"Do both of these, in order, using the `echo` MCP server. "
+              f"First: call the {ALLOWED} tool with the text HELLO. "
+              f"Second: call the {OFF_LIST} tool to add 2 and 3. "
+              f"Report both results. If one of them is unavailable, say exactly "
+              f"NO_SUCH_TOOL:<name> for that one and still do the other.")
     argv = ["copilot", "-p", prompt,
             "--no-custom-instructions", "--disable-builtin-mcps", "--no-remote",
             "--additional-mcp-config", f"@{config}",
@@ -184,7 +200,7 @@ def main() -> int:
         if verdict != ENFORCED:
             print("  --- control ---\n  " + (control_out or "").strip()[:1000].replace("\n", "\n  "))
             print("  --- gated ---\n  " + (gated_out or "").strip()[:1000].replace("\n", "\n  "))
-        return 0 if verdict in (ENFORCED, LEAKED) else 1
+        return 0 if verdict in (ENFORCED, LEAKED, SUPPRESSES_ALL) else 1
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
