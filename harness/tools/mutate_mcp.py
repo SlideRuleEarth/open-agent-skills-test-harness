@@ -2810,9 +2810,16 @@ MUTATIONS = [
     # A CREDENTIAL SENT ONCE AND DROPPED is a different animal from one sent always, and this
     # is the weakening probe #1 already had to repair once (PR #106). Now that the bearer gates
     # the exit status rather than only the tally, the weakening has somewhere to hide.
+    # RE-ANCHORED, and the reason is worth more than the entry. This pointed at the containment
+    # form of `credential_arrived`; the equality fix rewrote that line, so the anchor went stale
+    # and the every-vs-any property lost its mutation — while `F48`, added in the same round,
+    # covers intact-vs-containing and looks like a replacement without being one. The full suite
+    # reported STALE ANCHOR and refused to claim 52/52; driving only the NEW mutations, which is
+    # what I did, could not have found it. Changing a line invalidates every mutation aimed at
+    # it, and the two axes over one expression are still two axes (review, PR #110).
     ("F41-the-bearer-need-only-arrive-once", CGATE_REMOTE,
-     "    return all(sentinel in (r.get(\"headers\") or {}).get(\"authorization\", \"\") for r in seen)",
-     "    return any(sentinel in (r.get(\"headers\") or {}).get(\"authorization\", \"\") for r in seen)",
+     '    return all((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
+     '    return any((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
      "the bearer counts only when it is on EVERY request that carried headers"),
     # "copilot wrote it differently" and "copilot never wrote it" lead to different work — one
     # is an adapter change, the other is another probe run. Collapsing them reports work that
@@ -2881,6 +2888,19 @@ MUTATIONS = [
      "    return 1 if (differs or surprises or not remote_ok) else 0",
      "    return 1 if (differs or surprises) else 0",
      "the config probe fails on ANY of its three findings, not just the stdio ones"),
+    # THE ANCHOR VALIDATOR'S OWN TWO WAYS OF BEING WRONG. It exists because a stale anchor cost
+    # a 77-minute run to discover; a validator that reads one half of a two-part `find`, or that
+    # treats "matches twice" as fine, would hand back the same silence for the same money.
+    ("F53-the-validator-reads-only-the-first-anchor", SELF,
+     ("        for f in (find if isinstance(find, tuple) else (find,)):\n"
+      "            n = text.count(f)"),
+     ("        for f in (find[:1] if isinstance(find, tuple) else (find,)):\n"
+      "            n = text.count(f)"),
+     "...and a two-part anchor is checked in both parts, not just the first"),
+    ("F54-an-anchor-matching-twice-is-accepted", SELF,
+     "            if n != 1:\n                out.append((mid, rel, n))",
+     "            if n == 0:\n                out.append((mid, rel, n))",
+     "...and so is one that matches twice, which would mutate the wrong site"),
     ("F36-the-child-reports-no-environment-at-all", TARGET,
      '"pgid": os.getpgid(0), "env_seen": sorted(set(seen))}',
      '"pgid": os.getpgid(0), "env_seen": []}',
@@ -3052,12 +3072,45 @@ def _classify(mid, rel):
     return kind
 
 
+def stale_anchors(root, mutations):
+    """Every `(id, target, occurrences)` whose `find` text is not in its target exactly once.
+
+    THE SAME ARGUMENT AS `_classify`, and it was learned the expensive way. A stale anchor was
+    already detected — but only when the loop REACHED that mutation, which for an entry two
+    thirds of the way down a 387-mutation list is 60 minutes in. Worse, the failure it reports
+    is silent about its own cause: `credential_arrived` was rewritten from containment to
+    equality, `F41` still pointed at the line that no longer existed, and a NEW mutation added
+    in the same round covered a DIFFERENT axis over the same expression — so the list looked
+    like it had gained coverage while it had lost some. Driving only the new mutations, which
+    is the natural thing to do, cannot find that (review, PR #110).
+
+    A FUNCTION OVER A ROOT so §E17 can drive it on a synthetic tree, and never called from
+    inside a mutated copy: under an applied mutation the target legitimately no longer contains
+    its own anchor, so this belongs before the run and not during it.
+    """
+    out = []
+    for mid, rel, find, _repl, _arm in mutations:
+        text = (Path(root) / rel).read_text()
+        for f in (find if isinstance(find, tuple) else (find,)):
+            n = text.count(f)
+            if n != 1:
+                out.append((mid, rel, n))
+    return out
+
+
 def main():
     started = time.monotonic()
     # Before the baseline, which costs a selftest run: a misclassified entry makes every
     # number below it wrong, so it is worth nothing to discover that at the end.
     kinds = {mid: _classify(mid, rel) for mid, rel, _f, _r, _a in MUTATIONS}
     suites = {mid: _suite_for(rel) for mid, rel, _f, _r, _a in MUTATIONS}
+    stale = stale_anchors(HARNESS, MUTATIONS)
+    if stale:
+        print("STALE OR AMBIGUOUS ANCHORS — these mutations cannot be applied, and a run that "
+              "discovers that on the way past has already spent the hour:")
+        for mid, rel, n in stale:
+            print(f"  {mid} -> {rel} matches {n} time(s), expected exactly 1")
+        return 1
     tmp = Path(tempfile.mkdtemp(prefix="mutate-mcp-"))
     work = tmp / "harness"
     shutil.copytree(HARNESS, work, symlinks=True,

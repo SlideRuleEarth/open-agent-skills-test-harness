@@ -1702,6 +1702,40 @@ check("...and finds nothing in output that is not a check, so the empty parse it
                re.MULTILINE) == [],
       "otherwise the guard's fail-closed branch is unreachable")
 
+# THE ANCHOR VALIDATOR, driven on a synthetic tree rather than on this one. A stale anchor is
+# an entry that cannot be applied, and the runner used to discover that only on reaching it —
+# an hour in, for a list this long. Driven here on three trees whose right answers are known:
+# present once, absent, and present twice. NOT pointed at the real `harness/`, deliberately:
+# under an applied mutation a target legitimately no longer contains its own anchor, so a check
+# that read the live tree would go red for whichever mutation was in flight.
+_anchor_tmp = tempfile.mkdtemp(prefix="verify-anchors-")
+try:
+    _synth = pathlib.Path(_anchor_tmp) / "t.py"
+    _entry = [("X1-example", "t.py", "needle", "haystack", "some arm")]
+    _synth.write_text("before\nneedle\nafter\n")
+    check("an anchor present exactly once is not reported stale",
+          MUT.stale_anchors(_anchor_tmp, _entry) == [], MUT.stale_anchors(_anchor_tmp, _entry))
+    # BOTH WAYS OF NOT BEING APPLICABLE. Zero occurrences is the rewritten line; two is the
+    # anchor that would match the wrong site, which §4 already records as having injected an
+    # `IndentationError` reported as "failed, but NOT via" rather than as a defect found.
+    _synth.write_text("before\nafter\n")
+    check("...an anchor whose text no longer exists is reported, with its count",
+          MUT.stale_anchors(_anchor_tmp, _entry) == [("X1-example", "t.py", 0)],
+          MUT.stale_anchors(_anchor_tmp, _entry))
+    _synth.write_text("needle\nneedle\n")
+    check("...and so is one that matches twice, which would mutate the wrong site",
+          MUT.stale_anchors(_anchor_tmp, _entry) == [("X1-example", "t.py", 2)],
+          MUT.stale_anchors(_anchor_tmp, _entry))
+    # A TUPLE `find` IS TWO ANCHORS, and a defect defended in two places needs both removed —
+    # so a validator reading only the first would clear an entry that cannot be applied.
+    _pair = [("X2-pair", "t.py", ("needle", "gone"), ("a", "b"), "some arm")]
+    check("...and a two-part anchor is checked in both parts, not just the first",
+          MUT.stale_anchors(_anchor_tmp, _pair) == [("X2-pair", "t.py", 2),
+                                                    ("X2-pair", "t.py", 0)],
+          MUT.stale_anchors(_anchor_tmp, _pair))
+finally:
+    shutil.rmtree(_anchor_tmp, ignore_errors=True)
+
 print()
 print("E18. probe_remote_mcp.py's startup path — the copy a fix was left out of")
 
