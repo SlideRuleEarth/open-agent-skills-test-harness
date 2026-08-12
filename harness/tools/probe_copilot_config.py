@@ -84,22 +84,38 @@ def unexpected_keys(config: dict, expected: dict) -> list[str]:
     return sorted(k for k in body if k not in known)
 
 
-def remote_shape(body: Any) -> str:
-    """Whether an entry is really the remote form, or a remote request filed as a local one.
+def remote_shape(body: Any, want_type: str = "http") -> tuple[bool, str]:
+    """(is_the_remote_shape, description) for one entry.
 
     Its own function because the failure it names is silent: `copilot mcp add name -- --url X`
     produces a perfectly well-formed entry whose `command` is `--url`, and a probe reading only
     "did a record appear" reports that as a measured remote spelling. The discriminator is the
     transport field the CLI writes, checked against the presence of a command.
+
+    A BOOLEAN AS WELL AS PROSE, because the prose was all there was and `main` only printed it
+    — the same advertised-fact-with-no-verdict defect the gating probes had twice. And the
+    check is now the FULL shape the gating probe will go on to write by hand: the declared
+    `type`, a `url`, the `headers` the credential travels in, and the `tools` allowlist that is
+    the entire subject of these probes. Confirming `url` alone would leave the other three
+    resting on documentation (review, PR #110).
     """
     if not isinstance(body, dict):
-        return "absent"
+        return False, "absent"
     kind, url, command = body.get("type"), body.get("url"), body.get("command")
     if command is not None and url is None:
-        return f"LOCAL (type={kind!r}, command={command!r}) — the remote add did not take"
+        return False, f"LOCAL (type={kind!r}, command={command!r}) — the remote add did not take"
     if url is None:
-        return f"no url and no command (type={kind!r}) — unreadable"
-    return f"remote: type={kind!r}, url key present, headers={'headers' in body}"
+        return False, f"no url and no command (type={kind!r}) — unreadable"
+    missing = [k for k in ("headers", "tools") if k not in body]
+    if kind != want_type:
+        return False, (f"url present but type={kind!r}, not {want_type!r} — the transport "
+                       f"discriminator is what the gating probe writes, so a different one "
+                       f"means it is writing a config copilot does not produce")
+    if missing:
+        return False, (f"remote type={kind!r} with a url, but no {missing} — the credential "
+                       f"and the allowlist are the two things §8's pattern is made of")
+    return True, (f"remote: type={kind!r}, url present, headers present, tools present "
+                  f"({body.get('tools')!r})")
 
 
 def classify_keys(config: dict, expected: dict) -> dict[str, str]:
@@ -140,11 +156,47 @@ def add_server(home: str, name: str, argv_tail: list[str]) -> tuple[int, str]:
     return done.returncode, (done.stdout or "") + (done.stderr or "")
 
 
+def exit_code(differs: list, surprises: list, remote_ok: bool) -> int:
+    """The probe's verdict over its three findings, as a function rather than an expression.
+
+    EXTRACTED SO IT CAN BE DRIVEN. `remote_shape` was already a named function and already had
+    a mutation, and neither established that `main` ACTED on what it returned — the exit status
+    read the stdio half alone, so a remote add that silently filed a LOCAL entry left the probe
+    green. Testing a classifier proves the classifier; the verdict is a separate claim and needs
+    a separate one (review, PR #110).
+
+    A CONJUNCTION OVER EVERY FINDING, not a lookup on the most recent: a differing key, a key
+    nobody planned for, and an unconfirmed remote shape are three independent ways this probe's
+    answer is not the one the design assumed, and all three are true of the same run.
+    """
+    return 1 if (differs or surprises or not remote_ok) else 0
+
+
+def cli_version() -> str:
+    """`copilot --version`, printed with every result.
+
+    A result qualified by a version has to carry it: §9 records these spellings as copilot
+    1.0.79 and nothing in the output said so, leaving a rerun unable to establish which build
+    it read (review, PR #110). `probe_remote_mcp.py` has done this for claude all along.
+    """
+    try:
+        done = subprocess.run(["copilot", "--version"], capture_output=True, text=True,
+                              timeout=30)
+        return done.stdout.strip() or done.stderr.strip() or "(version unreadable)"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"(version unreadable: {exc!r})"
+
+
 def main() -> int:
     home = tempfile.mkdtemp(prefix="probe-copilot-home-")
     try:
+        print(f"copilot: {cli_version()}")
+        # AN ENV VAR IS SET ON THE STDIO ADD, so `env` is exercised rather than reported
+        # `unexercised` — the PR body claimed every listed spelling was confirmed while this
+        # run never gave copilot an env var to write (review, PR #110).
         rc, out = add_server(home, "probe_stdio",
-                             ["--", sys.executable, "-c", "pass"])
+                             ["--env", "PROBE_KEY=PROBE_VALUE",
+                              "--", sys.executable, "-c", "pass"])
         print(f"`copilot mcp add` (stdio): rc={rc}")
         if rc != 0:
             print("  " + out.strip()[:800].replace("\n", "\n  "))
@@ -187,26 +239,51 @@ def main() -> int:
         # `--url`, producing a `"type": "local"` entry that looked like a remote one had been
         # written. An instrument that files a malformed request under a plausible answer is
         # worse than one that fails (§4), which is what `remote_shape` below is for.
-        rc2, out2 = add_server(home, "probe_remote",
-                               ["--transport", "http", "https://example.invalid/mcp",
-                                "--header", "Authorization: Bearer PROBE_SENTINEL",
-                                "--env", "PROBE_KEY=PROBE_VALUE", "--tools", "echo,add"])
-        print(f"`copilot mcp add` (remote attempt): rc={rc2}")
-        remote_path = find_config(home)
-        if rc2 == 0 and remote_path:
+        # BOTH REMOTE TRANSPORTS, because the schema admits both and the gating probe writes
+        # whichever the harness's server needs. Measuring only Streamable HTTP and reporting
+        # "the remote spelling" is §4's promise-wider-than-the-mechanism, in an instrument.
+        remote_ok, remote_seen = True, []
+        for kind in ("http", "sse"):
+            rc2, out2 = add_server(home, f"probe_remote_{kind}",
+                                   ["--transport", kind, "https://example.invalid/mcp",
+                                    "--header", "Authorization: Bearer PROBE_SENTINEL",
+                                    "--env", "PROBE_KEY=PROBE_VALUE", "--tools", "echo,add"])
+            print(f"`copilot mcp add --transport {kind}`: rc={rc2}")
+            remote_path = find_config(home)
+            if rc2 != 0 or not remote_path:
+                print("  " + out2.strip()[:500].replace("\n", "\n  "))
+                print(f"  -> the {kind} spelling is UNMEASURED by this route, which is a "
+                      f"finding about the subcommand and not a measurement")
+                remote_ok = False
+                continue
             try:
                 with open(remote_path, encoding="utf-8") as handle:
                     after = json.load(handle)
-                body = (after.get("mcpServers") or {}).get("probe_remote")
-                print(f"  probe_remote entry: {json.dumps(body)[:400]}")
-                print(f"  remote shape: {remote_shape(body)}")
+                body = (after.get("mcpServers") or {}).get(f"probe_remote_{kind}")
             except (OSError, ValueError) as exc:
-                print(f"  unreadable after the remote add: {exc}")
-        else:
-            print("  " + out2.strip()[:500].replace("\n", "\n  "))
-            print("  -> remote spelling UNMEASURED by this route; `copilot mcp add --help` "
-                  "is the next step and the gating probe does not depend on it")
-        return 1 if (differs or surprises) else 0
+                print(f"  unreadable after the {kind} add: {exc}")
+                remote_ok = False
+                continue
+            shaped, why = remote_shape(body, want_type=kind)
+            print(f"  entry: {json.dumps(body)[:400]}")
+            print(f"  shape: {why}")
+            remote_seen.append(kind)
+            remote_ok = remote_ok and shaped
+            # THE KEYS THE GATING PROBE WRITES BY HAND, checked against what copilot writes
+            # for itself. Those two disagreeing is precisely how a gating run measures a
+            # config the CLI would never produce and reports the result as copilot's.
+            for surprise in unexpected_keys({"mcpServers": {"x": body or {}}}, EXPECTED):
+                print(f"  key copilot wrote that the adapter does NOT know about: {surprise}")
+                surprises = sorted(set(surprises) | {surprise})
+        # `remote_ok` JOINS THE VERDICT rather than being printed beside it. `remote_shape`
+        # was prose in a `print` and the exit status read only the stdio half, so a remote add
+        # that silently filed a LOCAL entry left this probe green — the same defect the two
+        # gating probes carried, in the third file (review, PR #110).
+        if not remote_ok:
+            print("  REMOTE SPELLING UNCONFIRMED: the entries above are not the shape §8's "
+                  "pattern needs, so the gating probes' hand-written config is not backed by "
+                  "anything copilot produced")
+        return exit_code(differs, surprises, remote_ok)
     finally:
         shutil.rmtree(home, ignore_errors=True)
 

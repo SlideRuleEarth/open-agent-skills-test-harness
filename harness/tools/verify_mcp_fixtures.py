@@ -1832,6 +1832,14 @@ try:
           "a client that sends the credential once and drops it is a different animal")
     check("...and a run with no requests at all does not count as the bearer having arrived",
           not CRG.credential_arrived([{"kind": "listening"}], _bearer))
+    # INTACT, NOT MERELY CONTAINING. `sentinel in value` is true of `Bearer <sentinel>-altered`
+    # and of anything that wraps or re-encodes the declared header, so containment would pass a
+    # client that sent the server something the harness never declared (review, PR #110).
+    check("...and a bearer the client altered around the token does not count as arrival",
+          not CRG.credential_arrived(
+              [{"kind": "request", "headers": {"authorization": f"Bearer {_bearer}-altered"}}],
+              _bearer),
+          "containment accepts a value that is not the one declared")
 
     # -- every verdict of both gating classifiers -------------------------------------------
     def _arms(probe, *tools):
@@ -1845,35 +1853,80 @@ try:
         _both, _echo, _add, _none = (_arms(_p, "echo", "add"), _arms(_p, "echo"),
                                      _arms(_p, "add"), _arms(_p))
         check(f"{_name}: the off-list tool blocked while the on-list one arrives is ENFORCED",
-              _p.classify(_echo, _both)[0] == _p.ENFORCED, _p.classify(_echo, _both))
+              _p.classify(_echo, _both, True)[0] == _p.ENFORCED,
+              _p.classify(_echo, _both, True))
         check(f"{_name}: the off-list tool arriving under the allowlist is LEAKED",
-              _p.classify(_both, _both)[0] == _p.LEAKED, _p.classify(_both, _both))
+              _p.classify(_both, _both, True)[0] == _p.LEAKED,
+              _p.classify(_both, _both, True))
         # THE BRANCH THE ORIGINAL PROBES DID NOT HAVE, and the pair is the check: these two
         # arms differ in exactly one fact — whether the ALLOWED tool arrived — and the first
         # version scored both of them ENFORCED. An allowlist admitting nothing is not a
         # boundary; it is a server that does not work.
         check(f"{_name}: NEITHER tool arriving under the allowlist is SUPPRESSES_ALL, not a filter",
-              _p.classify(_none, _both)[0] == _p.SUPPRESSES_ALL, _p.classify(_none, _both))
+              _p.classify(_none, _both, True)[0] == _p.SUPPRESSES_ALL,
+              _p.classify(_none, _both, True))
         check(f"{_name}: ...and that verdict differs from ENFORCED by the on-list call alone",
-              _p.classify(_none, _both)[0] != _p.classify(_echo, _both)[0]
+              _p.classify(_none, _both, True)[0] != _p.classify(_echo, _both, True)[0]
               and _none == [r for r in _echo if r.get("tool") != "echo"])
+        # ARRIVING IS NOT WORKING, and this pair is that distinction: identical receipts, one
+        # bit apart. Everything the classifier reads comes from the server's record of what
+        # came IN, so without this clause a client that forwards the call and drops the reply
+        # scores ENFORCED and the harness gates onto a tool that returns nothing.
+        check(f"{_name}: an on-list call whose reply never came back is ANSWER_LOST, not ENFORCED",
+              _p.classify(_echo, _both, False)[0] == _p.ANSWER_LOST,
+              _p.classify(_echo, _both, False))
+        check(f"{_name}: ...and the receipts alone cannot tell those two apart",
+              _p.classify(_echo, _both, False)[0] != _p.classify(_echo, _both, True)[0])
+        # THE PERMISSIVE VALUE IS NOT A DEFAULT. A caller that omitted `answered` would be
+        # handed ENFORCED, which is the clause opening the hole it was added to close.
+        check(f"{_name}: the round-trip fact is required rather than defaulted",
+              isinstance(survives(_p.classify, _echo, _both), TypeError),
+              survives(_p.classify, _echo, _both))
         # UNMEASURED IN BOTH DIRECTIONS. The gated arm is read for two facts of opposite sign,
         # so a control that skipped either tool leaves the reading for that one to the model.
         check(f"{_name}: a control that never called the off-list tool measures nothing",
-              _p.classify(_echo, _echo)[0] == _p.UNMEASURED, _p.classify(_echo, _echo))
+              _p.classify(_echo, _echo, True)[0] == _p.UNMEASURED,
+              _p.classify(_echo, _echo, True))
         check(f"{_name}: ...and neither does one that never called the on-list tool",
-              _p.classify(_add, _add)[0] == _p.UNMEASURED, _p.classify(_add, _add))
+              _p.classify(_add, _add, True)[0] == _p.UNMEASURED,
+              _p.classify(_add, _add, True))
         check(f"{_name}: a server that never started is an instrument failure, not a result",
-              _p.classify(_echo, [])[0] == _p.INSTRUMENT_FAILED
-              and _p.classify([], _both)[0] == _p.INSTRUMENT_FAILED)
+              _p.classify(_echo, [], True)[0] == _p.INSTRUMENT_FAILED
+              and _p.classify([], _both, True)[0] == _p.INSTRUMENT_FAILED)
+
+    # -- and the VERDICTS, which are a separate claim from the classifiers -------------------
+    # A classifier proven correct says nothing about whether `main` acted on it. `remote_shape`
+    # had its own function and its own mutation while the exit status read only the stdio half,
+    # so a remote add that filed a LOCAL entry left the probe green — the finding is the shape
+    # of the gap, not the helper (review, PR #110). These three are the extracted verdicts.
+    check("a settled filter question exits 0 whichever way it settled",
+          all(CG.run_ok(v) for v in (CG.ENFORCED, CG.LEAKED, CG.SUPPRESSES_ALL, CG.ANSWER_LOST)),
+          "LEAKED and its siblings are answers, not errors")
+    check("...while a run that measured nothing does not",
+          not CG.run_ok(CG.UNMEASURED) and not CG.run_ok(CG.INSTRUMENT_FAILED))
+    # THE BEARER IS AN INDEPENDENT AXIS, so the remote verdict is a conjunction over both. A
+    # lookup on the verdict alone is exactly the state that shipped: green ENFORCED with the
+    # credential half of §8's pattern unproven.
+    check("the remote verdict fails when the credential did not arrive, whatever the filter did",
+          CRG.run_ok(CRG.ENFORCED, True) and not CRG.run_ok(CRG.ENFORCED, False)
+          and not CRG.run_ok(CRG.UNMEASURED, True),
+          "both halves of §8's pattern have to hold for the run to have settled it")
+    # The config probe's three findings, likewise a conjunction and not a lookup on the last.
+    check("the config probe fails on ANY of its three findings, not just the stdio ones",
+          CFG.exit_code([], [], True) == 0
+          and all(CFG.exit_code(d, s, r) == 1 for d, s, r in
+                  ((["k"], [], True), ([], ["k"], True), ([], [], False))),
+          [CFG.exit_code(d, s, r) for d, s, r in
+           (([], [], True), (["k"], [], True), ([], ["k"], True), ([], [], False))])
 
     # THE TWO VOCABULARIES ARE ONE VOCABULARY, asserted rather than assumed. Neither probe can
     # import the other (each is a standalone opt-in tool), so this is §4's duplicated-rule rule:
     # pin the copy to the original on the cases that distinguish them. A probe that renamed a
     # verdict would otherwise report a word no reader of the other one recognises.
     check("both gating probes spell the shared verdicts identically",
-          (CG.ENFORCED, CG.LEAKED, CG.UNMEASURED, CG.SUPPRESSES_ALL, CG.INSTRUMENT_FAILED)
-          == (CRG.ENFORCED, CRG.LEAKED, CRG.UNMEASURED, CRG.SUPPRESSES_ALL,
+          (CG.ENFORCED, CG.LEAKED, CG.UNMEASURED, CG.SUPPRESSES_ALL, CG.ANSWER_LOST,
+           CG.INSTRUMENT_FAILED)
+          == (CRG.ENFORCED, CRG.LEAKED, CRG.UNMEASURED, CRG.SUPPRESSES_ALL, CRG.ANSWER_LOST,
               CRG.INSTRUMENT_FAILED))
 
     # -- `read_receipts`: a partial line is an ending, not a crash --------------------------
@@ -1908,12 +1961,28 @@ try:
                               CFG.EXPECTED) == [])
     # THE SILENT ONE: `copilot mcp add name -- --url X` writes a well-formed LOCAL entry whose
     # command is `--url`. A probe reading only "did a record appear" calls that a remote result.
+    _full = {"type": "http", "url": "u", "headers": {"Authorization": "Bearer x"},
+             "tools": ["echo"]}
     check("a remote add filed as a local entry is named, not counted as the remote spelling",
-          CFG.remote_shape({"type": "local", "command": "--url"}).startswith("LOCAL"),
+          CFG.remote_shape({"type": "local", "command": "--url"})[0] is False
+          and CFG.remote_shape({"type": "local", "command": "--url"})[1].startswith("LOCAL"),
           CFG.remote_shape({"type": "local", "command": "--url"}))
     check("...and the true remote shape is not mistaken for it",
-          CFG.remote_shape({"type": "http", "url": "u", "headers": {}}).startswith("remote:"),
-          CFG.remote_shape({"type": "http", "url": "u", "headers": {}}))
+          CFG.remote_shape(_full) == (True, CFG.remote_shape(_full)[1])
+          and CFG.remote_shape(_full)[1].startswith("remote:"), CFG.remote_shape(_full))
+    # THE FULL SHAPE, not just a `url`. The gating probes write `type`/`url`/`headers`/`tools`
+    # by hand, and this is what says copilot writes the same four — confirming the url alone
+    # would leave the credential and the allowlist resting on documentation.
+    check("a remote entry missing the credential or the allowlist is not the shape §8 needs",
+          all(CFG.remote_shape({k: v for k, v in _full.items() if k != drop})[0] is False
+              for drop in ("headers", "tools")),
+          [CFG.remote_shape({k: v for k, v in _full.items() if k != d}) for d in
+           ("headers", "tools")])
+    check("...and a transport discriminator that is not the one asked for is refused",
+          CFG.remote_shape(_full, want_type="sse")[0] is False
+          and CFG.remote_shape({**_full, "type": "sse"}, want_type="sse")[0] is True,
+          (CFG.remote_shape(_full, want_type="sse"),
+           CFG.remote_shape({**_full, "type": "sse"}, want_type="sse")))
 finally:
     shutil.rmtree(_e19, ignore_errors=True)
 

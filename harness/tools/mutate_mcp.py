@@ -2837,6 +2837,50 @@ MUTATIONS = [
      "    if command is not None and url is None:",
      "    if False:",
      "a remote add filed as a local entry is named, not counted as the remote spelling"),
+    # ARRIVING IS NOT WORKING. Receipts record a request coming IN; nothing in them can see the
+    # answer going OUT, so without this clause a client that forwards the call and drops the
+    # reply scores ENFORCED and the harness gates onto a tool that returns nothing.
+    ("F45-a-call-that-arrives-need-not-have-answered", CGATE,
+     "    if not answered:",
+     "    if False:",
+     "stdio: an on-list call whose reply never came back is ANSWER_LOST, not ENFORCED"),
+    ("F46-a-remote-call-that-arrives-need-not-have-answered", CGATE_REMOTE,
+     "    if not answered:",
+     "    if False:",
+     "remote: an on-list call whose reply never came back is ANSWER_LOST, not ENFORCED"),
+    # THE PERMISSIVE DEFAULT, which is the only default that would keep the older calls working
+    # — and hands ENFORCED to any caller that forgets the argument.
+    ("F47-the-round-trip-fact-gets-a-permissive-default", CGATE,
+     "def classify(gated: list[dict], control: list[dict], answered: bool) -> tuple[str, str]:",
+     "def classify(gated: list[dict], control: list[dict], answered: bool = True):",
+     "stdio: the round-trip fact is required rather than defaulted"),
+    # CONTAINMENT ACCEPTS A VALUE THAT IS NOT THE ONE DECLARED — `Bearer <sentinel>-altered`
+    # passes, and the server then received something the harness never sent.
+    ("F48-the-bearer-need-only-contain-the-token", CGATE_REMOTE,
+     '    return all((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
+     '    return all(sentinel in (r.get("headers") or {}).get("authorization", "") for r in seen)',
+     "...and a bearer the client altered around the token does not count as arrival"),
+    # A `url` IS NOT THE SHAPE. The gating probes write four keys by hand; confirming one of
+    # them leaves the credential and the allowlist resting on documentation.
+    ("F49-a-remote-entry-needs-only-a-url", CCONFIG,
+     '    missing = [k for k in ("headers", "tools") if k not in body]',
+     "    missing = []",
+     "a remote entry missing the credential or the allowlist is not the shape §8 needs"),
+    ("F50-the-transport-discriminator-is-not-checked", CCONFIG,
+     "    if kind != want_type:",
+     "    if False:",
+     "...and a transport discriminator that is not the one asked for is refused"),
+    # THE VERDICT, NOT THE CLASSIFIER. Each of these leaves its named function correct and stops
+    # `main` from acting on it — the exact gap that let `remote_shape` be right while the exit
+    # status ignored it, and the reason the verdicts were extracted at all.
+    ("F51-the-remote-verdict-ignores-the-credential", CGATE_REMOTE,
+     "    return verdict in (ENFORCED, LEAKED, SUPPRESSES_ALL, ANSWER_LOST) and bearer_ok",
+     "    return verdict in (ENFORCED, LEAKED, SUPPRESSES_ALL, ANSWER_LOST)",
+     "the remote verdict fails when the credential did not arrive, whatever the filter did"),
+    ("F52-the-config-verdict-ignores-the-remote-shape", CCONFIG,
+     "    return 1 if (differs or surprises or not remote_ok) else 0",
+     "    return 1 if (differs or surprises) else 0",
+     "the config probe fails on ANY of its three findings, not just the stdio ones"),
     ("F36-the-child-reports-no-environment-at-all", TARGET,
      '"pgid": os.getpgid(0), "env_seen": sorted(set(seen))}',
      '"pgid": os.getpgid(0), "env_seen": []}',

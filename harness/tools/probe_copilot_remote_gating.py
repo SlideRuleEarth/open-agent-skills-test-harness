@@ -54,7 +54,17 @@ ENFORCED = "ENFORCED"
 LEAKED = "LEAKED"
 UNMEASURED = "UNMEASURED"
 SUPPRESSES_ALL = "SUPPRESSES_ALL"         # nothing arrived gated, ALLOWED included: an off switch
+ANSWER_LOST = "ANSWER_LOST"               # the allowed call arrived; its reply never came back
 INSTRUMENT_FAILED = "INSTRUMENT_FAILED"
+
+# BOTH REMOTE TRANSPORTS THE SCHEMA ADMITS, because a claim covers what it measured and the
+# harness's `url:` server may be either. §4's rule about a promise stated wider than its
+# mechanism, arriving in a measurement: the first version of this probe measured Streamable
+# HTTP and the result was written up as "both transports" — true of stdio and http, and silent
+# about the third thing copilot exposes. `sse` here is copilot's own discriminator as
+# `probe_copilot_config.py` reads it back; a wrong spelling produces a server nothing ever
+# reaches, which `server_ran` reports as INSTRUMENT_FAILED rather than as a filter result.
+TRANSPORTS = (("http", "streamable"), ("sse", "sse"))
 
 
 def read_receipts(path: str) -> list[dict]:
@@ -96,11 +106,21 @@ def credential_arrived(records: list[dict], sentinel: str) -> bool:
     seen = [r for r in records if r.get("kind") == "request"]
     if not seen:
         return False
-    return all(sentinel in (r.get("headers") or {}).get("authorization", "") for r in seen)
+    # THE WHOLE VALUE, not a substring of it. `sentinel in value` is satisfied by
+    # `Bearer <sentinel>-altered` and by anything else that merely CONTAINS the token, so a
+    # client that appended, wrapped or re-encoded the declared header would have passed while
+    # the server received something the harness never declared. What §8 needs to know is that
+    # the header arrived intact, which is an equality (review, PR #110).
+    expected = f"Bearer {sentinel}"
+    return all((r.get("headers") or {}).get("authorization", "") == expected for r in seen)
 
 
-def classify(gated: list[dict], control: list[dict]) -> tuple[str, str]:
-    """(verdict, reason) — a named function so every branch is drivable on synthetic rows."""
+def classify(gated: list[dict], control: list[dict], answered: bool) -> tuple[str, str]:
+    """(verdict, reason) — a named function so every branch is drivable on synthetic rows.
+
+    `answered` is REQUIRED and has no default: the only default that would keep older calls
+    working is the permissive one, and a caller that forgot it would be handed ENFORCED.
+    """
     if not server_ran(control) or not server_ran(gated):
         return INSTRUMENT_FAILED, "the fixture did not start in one or both arms"
     # BOTH TOOLS UNGATED, because the gated arm is read for two facts of opposite sign.
@@ -117,16 +137,29 @@ def classify(gated: list[dict], control: list[dict]) -> tuple[str, str]:
         return SUPPRESSES_ALL, (f"neither tool reached the REMOTE server under `tools: "
                                 f"[{ALLOWED!r}]`, though the control called both over HTTP. "
                                 f"§8's pattern is not usable: the allowlist is an off switch")
+    # ARRIVING IS NOT WORKING. Every clause above is read from receipts, which record a request
+    # coming IN and can say nothing about its answer going OUT — so a client that forwards the
+    # call and drops the response satisfies all of them. The marker is opaque, reaches the
+    # server in its environment, is never in the prompt, and returns only inside the tool's
+    # result: the model repeating it is the round trip closing.
+    if not answered:
+        return ANSWER_LOST, (f"{ALLOWED!r} reached the REMOTE server under the allowlist and "
+                             f"its reply never came back: the opaque marker the tool returns "
+                             f"is absent from the run's output, so §8's pattern gates a call "
+                             f"that produces nothing")
     return ENFORCED, (f"{OFF_LIST!r} arrived ungated and did NOT arrive under `tools: "
-                      f"[{ALLOWED!r}]` over HTTP, while {ALLOWED!r} DID arrive in that same "
-                      f"run — §8's pattern is enforced on copilot today")
+                      f"[{ALLOWED!r}]`, while {ALLOWED!r} DID arrive in that same run AND its "
+                      f"opaque reply came back — §8's pattern is enforced and usable on "
+                      f"copilot today")
 
 
-def mcp_config(path: str, url: str, sentinel: str, *, tools: list[str] | None) -> str:
+def mcp_config(path: str, url: str, sentinel: str, kind: str,
+               *, tools: list[str] | None) -> str:
     """The remote entry in copilot's own spelling — `type`/`url`/`headers`/`tools`, as
     measured by `probe_copilot_config.py` rather than taken from documentation. `type` in
-    particular is a key nothing in §3 had, and copilot writes `http` for this shape."""
-    server: dict = {"type": "http", "url": url,
+    particular is a key nothing in §3 had, and copilot writes `http` for the Streamable shape
+    and `sse` for the legacy one — `kind` is which of those this arm is measuring."""
+    server: dict = {"type": kind, "url": url,
                     "headers": {"Authorization": f"Bearer {sentinel}"}}
     if tools is not None:
         server["tools"] = list(tools)
@@ -135,14 +168,17 @@ def mcp_config(path: str, url: str, sentinel: str, *, tools: list[str] | None) -
     return path
 
 
-def run_arm(workdir: str, url: str, sentinel: str, *, tools: list[str] | None):
+def run_arm(workdir: str, url: str, sentinel: str, kind: str, *, tools: list[str] | None):
     receipts_before = None
     config = mcp_config(os.path.join(workdir, f"cfg-{uuid.uuid4().hex}.json"), url, sentinel,
-                        tools=tools)
+                        kind, tools=tools)
     # BOTH TOOLS, ALLOWED FIRST — see `classify`. Naming only the off-list one leaves the
     # allowed one uncalled in every arm, which is exactly what an off switch looks like.
+    # The reply is quoted VERBATIM so the opaque marker survives into the output, which is
+    # what turns "the call arrived" into "the call arrived and answered".
     prompt = (f"Do both of these, in order, using the `echo` MCP server. "
-              f"First: call the {ALLOWED} tool with the text HELLO. "
+              f"First: call the {ALLOWED} tool with the text HELLO, and quote the tool's "
+              f"reply back VERBATIM, exactly as it returned it. "
               f"Second: call the {OFF_LIST} tool to add 2 and 3. "
               f"Report both results. If one of them is unavailable, say exactly "
               f"NO_SUCH_TOOL:<name> for that one and still do the other.")
@@ -160,57 +196,95 @@ def run_arm(workdir: str, url: str, sentinel: str, *, tools: list[str] | None):
         return f"copilot exceeded {DEADLINE}s", receipts_before
 
 
+def run_ok(verdict: str, bearer_ok: bool) -> bool:
+    """Whether one transport's pair of arms SETTLED the question, exit-status edition.
+
+    A CONJUNCTION, and extracted so §E19 can drive it. Both halves of §8's pattern have to
+    hold: `LEAKED`, `SUPPRESSES_ALL` and `ANSWER_LOST` are definite answers about the filter,
+    `UNMEASURED` and `INSTRUMENT_FAILED` are runs that answered nothing — and the bearer is an
+    independent fact that was printed and never consulted, which is why it is an `and` here
+    rather than a line in the tally (review, PR #110).
+    """
+    return verdict in (ENFORCED, LEAKED, SUPPRESSES_ALL, ANSWER_LOST) and bearer_ok
+
+
+def cli_version() -> str:
+    """`copilot --version`, printed with every result — see the stdio probe for why."""
+    try:
+        done = subprocess.run(["copilot", "--version"], capture_output=True, text=True,
+                              timeout=30)
+        return done.stdout.strip() or done.stderr.strip() or "(version unreadable)"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"(version unreadable: {exc!r})"
+
+
+def measure(workdir: str, kind: str, endpoint: str, sentinel: str, marker: str):
+    """One transport, both arms. Returns (verdict, reason, results, bearer_ok, answered)."""
+    # ONE RECEIPTS FILE PER ARM, because the fixture appends and two arms sharing a file
+    # would let the control's `add` satisfy the gated arm's check — the two runs agreeing
+    # with each other rather than each being measured (§4).
+    results = {}
+    for label, tools in (("control", None), ("gated", [ALLOWED])):
+        receipts = os.path.join(workdir, f"receipts-{kind}-{label}.jsonl")
+        # `(proc, info)` on success and `(None, reason)` on failure — the announcement is
+        # already parsed there, so this does not re-parse it. Re-deriving a contract the
+        # helper already establishes is how the two copies drift.
+        proc, info = start_fixture(receipts, marker)
+        if proc is None:
+            return INSTRUMENT_FAILED, f"fixture: {info}", {}, False, False
+        try:
+            out, _ = run_arm(workdir, info[endpoint], sentinel, kind, tools=tools)
+        finally:
+            proc.kill()
+            proc.wait(timeout=15)
+        results[label] = (read_receipts(receipts), out)
+    gated_out = results["gated"][1]
+    answered = marker in (gated_out or "")
+    verdict, reason = classify(results["gated"][0], results["control"][0], answered)
+    bearer_ok = all(credential_arrived(recs, sentinel) for recs, _out in results.values())
+    return verdict, reason, results, bearer_ok, answered
+
+
 def main() -> int:
     workdir = tempfile.mkdtemp(prefix="probe-copilot-remote-")
     sentinel = uuid.uuid4().hex
     marker = uuid.uuid4().hex
     try:
-        # ONE RECEIPTS FILE PER ARM, because the fixture appends and two arms sharing a file
-        # would let the control's `add` satisfy the gated arm's check — the two runs agreeing
-        # with each other rather than each being measured (§4).
-        results = {}
-        for label, tools in (("control", None), ("gated", [ALLOWED])):
-            receipts = os.path.join(workdir, f"receipts-{label}.jsonl")
-            # `(proc, info)` on success and `(None, reason)` on failure — the announcement is
-            # already parsed there, so this does not re-parse it. Re-deriving a contract the
-            # helper already establishes is how the two copies drift.
-            proc, info = start_fixture(receipts, marker)
-            if proc is None:
-                print(f"probe C2-copilot-remote: {INSTRUMENT_FAILED}\n  fixture: {info}")
-                return 1
-            try:
-                out, _ = run_arm(workdir, info["streamable"], sentinel, tools=tools)
-            finally:
-                proc.kill()
-                proc.wait(timeout=15)
-            results[label] = (read_receipts(receipts), out)
-
-        control, control_out = results["control"]
-        gated, gated_out = results["gated"]
-        verdict, reason = classify(gated, control)
-
-        print(f"probe C2-copilot-remote: {verdict}")
-        print(f"  {reason}")
-        for label, (recs, _out) in (("control", results["control"]), ("gated", results["gated"])):
-            print(f"  {label:<8} server_ran={server_ran(recs)} "
-                  f"called({OFF_LIST})={called(recs, OFF_LIST)} "
-                  f"called({ALLOWED})={called(recs, ALLOWED)} "
-                  f"bearer_on_every_request={credential_arrived(recs, sentinel)} "
-                  f"records={len(recs)}")
-        # FACT 1 IS ASSERTED, NOT MERELY PRINTED — the same defect as the on-list tool, one
-        # field over. `credential_arrived` appeared only in the tally above, so a copilot that
-        # dropped the declared `Authorization` header would have produced a green ENFORCED and
-        # exit 0 while the credential half of §8's pattern silently failed. A fact this file
-        # says it settles has to be able to fail it.
-        bearer_ok = all(credential_arrived(recs, sentinel) for recs, _out in results.values())
-        if not bearer_ok:
-            print("  FACT 1 UNPROVEN: the declared bearer did not reach the server on every "
-                  "request in both arms, so §8's credential path is not established by this "
-                  "run whatever the filter did")
-        if verdict != ENFORCED or not bearer_ok:
-            print("  --- control ---\n  " + (control_out or "").strip()[:1000].replace("\n", "\n  "))
-            print("  --- gated ---\n  " + (gated_out or "").strip()[:1000].replace("\n", "\n  "))
-        return 0 if (verdict in (ENFORCED, LEAKED, SUPPRESSES_ALL) and bearer_ok) else 1
+        print(f"copilot: {cli_version()}")
+        # EVERY TRANSPORT THE SCHEMA ADMITS, and the exit status is a conjunction over them.
+        # Reporting a per-transport verdict and then exiting on the last one would let a
+        # measured SSE failure ride out under a green Streamable result — the fleet-wide-
+        # negative mistake (§4), one axis over.
+        ok = True
+        for kind, endpoint in TRANSPORTS:
+            verdict, reason, results, bearer_ok, answered = measure(
+                workdir, kind, endpoint, sentinel, marker)
+            print(f"probe C2-copilot-remote [{kind}]: {verdict}")
+            print(f"  {reason}")
+            for label, (recs, _out) in results.items():
+                print(f"  {label:<8} server_ran={server_ran(recs)} "
+                      f"called({OFF_LIST})={called(recs, OFF_LIST)} "
+                      f"called({ALLOWED})={called(recs, ALLOWED)} "
+                      f"bearer_intact_on_every_request={credential_arrived(recs, sentinel)} "
+                      f"records={len(recs)}")
+            if results:
+                print(f"  gated reply_came_back={answered}")
+            # FACT 1 IS ASSERTED, NOT MERELY PRINTED — the same defect as the on-list tool, one
+            # field over. `credential_arrived` appeared only in the tally, so a copilot that
+            # dropped the declared `Authorization` header would have produced a green ENFORCED
+            # and exit 0 while the credential half of §8's pattern silently failed. A fact this
+            # file says it settles has to be able to fail it.
+            if not bearer_ok:
+                print("  FACT 1 UNPROVEN: the declared bearer did not arrive INTACT on every "
+                      "request in both arms, so §8's credential path is not established by "
+                      "this run whatever the filter did")
+            good = run_ok(verdict, bearer_ok)
+            if verdict != ENFORCED or not bearer_ok:
+                for label, (_recs, out) in results.items():
+                    print(f"  --- {label} ---\n  "
+                          + (out or "").strip()[:1000].replace("\n", "\n  "))
+            ok = ok and good
+        return 0 if ok else 1
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

@@ -67,6 +67,7 @@ ENFORCED = "ENFORCED"          # ungated call arrived; gated call did not
 LEAKED = "LEAKED"              # gated call arrived — the filter is advisory, as claude's was
 UNMEASURED = "UNMEASURED"      # the control never called it, so the gated arm proves nothing
 SUPPRESSES_ALL = "SUPPRESSES_ALL"         # nothing arrived gated, ALLOWED included: an off switch
+ANSWER_LOST = "ANSWER_LOST"               # the allowed call arrived; its reply never came back
 INSTRUMENT_FAILED = "INSTRUMENT_FAILED"   # a server that never ran, or receipts that never came
 
 
@@ -107,7 +108,10 @@ def called(records: list[dict], tool: str) -> bool:
                and r.get("tool") == tool for r in records)
 
 
-def classify(gated: list[dict], control: list[dict]) -> tuple[str, str]:
+def classify(gated: list[dict], control: list[dict], answered: bool) -> tuple[str, str]:
+    # `answered` IS REQUIRED, with no default. A default would have to be `True` to keep the
+    # existing calls working, which is the permissive value — a caller that forgot it would get
+    # ENFORCED for free, and the clause added to close a hole would open it one level up.
     """(verdict, one-line reason) from the two arms' receipts.
 
     A FUNCTION, not an `elif` chain inside `main()`, so it can be driven on synthetic rows —
@@ -139,12 +143,25 @@ def classify(gated: list[dict], control: list[dict]) -> tuple[str, str]:
         return SUPPRESSES_ALL, (f"neither tool reached the server under `tools: [{ALLOWED!r}]`, "
                                 f"though the control called both. `tools:` is acting as an off "
                                 f"switch rather than a filter, so it cannot back `native`")
+    # ARRIVING IS NOT WORKING, and the difference is the whole of what a scenario depends on.
+    # Everything above is read from the server's receipts, which say a request came IN; none of
+    # them can see whether its answer came back OUT. A client that forwards the call and then
+    # drops, truncates or suppresses the response satisfies every clause so far, and a harness
+    # that declared `native` on that strength would gate correctly onto a tool that returns
+    # nothing. The marker is opaque, travels to the server in its ENVIRONMENT, is never in the
+    # prompt, and comes back only inside the tool's result — so the model repeating it is the
+    # round trip completing (review, third instance of this family in one file).
+    if not answered:
+        return ANSWER_LOST, (f"{ALLOWED!r} reached the server under the allowlist and its reply "
+                             f"never came back: the run's output does not contain the opaque "
+                             f"marker the tool returns, so the call is gated but not usable")
     return ENFORCED, (f"{OFF_LIST!r} arrived ungated and did NOT arrive under "
-                      f"`tools: [{ALLOWED!r}]`, while {ALLOWED!r} DID arrive in that same run — "
-                      f"a filter rather than an off switch, so copilot can be `native`")
+                      f"`tools: [{ALLOWED!r}]`, while {ALLOWED!r} DID arrive in that same run "
+                      f"AND its opaque reply came back — a filter rather than an off switch, "
+                      f"and the allowed tool is usable, so copilot can be `native`")
 
 
-def mcp_config(path: str, receipts: str, *, tools: list[str] | None) -> str:
+def mcp_config(path: str, receipts: str, marker: str, *, tools: list[str] | None) -> str:
     """copilot's MCP config for one echo server, with or without the allowlist under test.
 
     The KEY SPELLING IS THE OTHER OPEN PROBE (§9 #3) and this file does not settle it: it
@@ -152,8 +169,11 @@ def mcp_config(path: str, receipts: str, *, tools: list[str] | None) -> str:
     server that never starts — which `server_ran` reports as INSTRUMENT_FAILED rather than as
     a filter result. Run `probe_copilot_config.py` first; that is what it is for.
     """
+    # The marker rides in the SERVER's environment, which is the only reason its later
+    # appearance in the model's output is evidence: the prompt never contains it, so the one
+    # route from here to there runs through a tool result.
     server: dict = {"command": sys.executable, "args": [ECHO],
-                    "env": {"ECHO_MCP_RECEIPTS": receipts}}
+                    "env": {"ECHO_MCP_RECEIPTS": receipts, "ECHO_MCP_IDENTITY": marker}}
     if tools is not None:
         server["tools"] = list(tools)
     with open(path, "w", encoding="utf-8") as handle:
@@ -161,7 +181,7 @@ def mcp_config(path: str, receipts: str, *, tools: list[str] | None) -> str:
     return path
 
 
-def run_arm(workdir: str, *, tools: list[str] | None) -> tuple[list[dict], str]:
+def run_arm(workdir: str, marker: str, *, tools: list[str] | None) -> tuple[list[dict], str]:
     """One copilot run. Returns (receipts, stdout+stderr) — the transcript for diagnosis only.
 
     The PROMPT names BOTH tools explicitly, in the order that matters. A probe that asked
@@ -174,9 +194,10 @@ def run_arm(workdir: str, *, tools: list[str] | None) -> tuple[list[dict], str]:
     ending the run before the second half of the measurement exists.
     """
     receipts = os.path.join(workdir, f"receipts-{uuid.uuid4().hex}.jsonl")
-    config = mcp_config(os.path.join(workdir, "mcp-config.json"), receipts, tools=tools)
+    config = mcp_config(os.path.join(workdir, "mcp-config.json"), receipts, marker, tools=tools)
     prompt = (f"Do both of these, in order, using the `echo` MCP server. "
-              f"First: call the {ALLOWED} tool with the text HELLO. "
+              f"First: call the {ALLOWED} tool with the text HELLO, and quote the tool's "
+              f"reply back VERBATIM, exactly as it returned it. "
               f"Second: call the {OFF_LIST} tool to add 2 and 3. "
               f"Report both results. If one of them is unavailable, say exactly "
               f"NO_SUCH_TOOL:<name> for that one and still do the other.")
@@ -195,14 +216,44 @@ def run_arm(workdir: str, *, tools: list[str] | None) -> tuple[list[dict], str]:
     return read_receipts(receipts), transcript
 
 
+def run_ok(verdict: str) -> bool:
+    """Whether this run SETTLED the question, exit-status edition — extracted so §E19 can
+    drive it. `LEAKED`, `SUPPRESSES_ALL` and `ANSWER_LOST` are three definite ways the answer
+    is "copilot cannot be `native`"; `UNMEASURED` and `INSTRUMENT_FAILED` are runs that
+    answered nothing, which is a different thing and a different exit status."""
+    return verdict in (ENFORCED, LEAKED, SUPPRESSES_ALL, ANSWER_LOST)
+
+
+def cli_version() -> str:
+    """`copilot --version`, printed with every result.
+
+    A RESULT QUALIFIED BY A VERSION HAS TO CARRY IT. §9 records this measurement as "copilot
+    1.0.79", and nothing in the output said so — a rerun six months from now would print the
+    same verdict with no way to establish which build it measured, which is the same expiry
+    `probe_remote_mcp.py` already guards against for claude (review, PR #110).
+    """
+    try:
+        done = subprocess.run(["copilot", "--version"], capture_output=True, text=True,
+                              timeout=30)
+        return done.stdout.strip() or done.stderr.strip() or "(version unreadable)"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"(version unreadable: {exc!r})"
+
+
 def main() -> int:
     workdir = tempfile.mkdtemp(prefix="probe-copilot-gating-")
+    marker = uuid.uuid4().hex
     try:
+        print(f"copilot: {cli_version()}")
         # THE CONTROL RUNS FIRST, deliberately. If it cannot get the model to call the tool at
         # all, the gated arm is not worth a second model call and the tally says why.
-        control, control_out = run_arm(workdir, tools=None)
-        gated, gated_out = run_arm(workdir, tools=[ALLOWED])
-        verdict, reason = classify(gated, control)
+        control, control_out = run_arm(workdir, marker, tools=None)
+        gated, gated_out = run_arm(workdir, marker, tools=[ALLOWED])
+        # THE ROUND TRIP, read from the GATED arm because that is the run whose usability is
+        # in question. The marker reaches the server in its environment and the model only by
+        # way of a tool result, so its presence here is the reply having come back.
+        answered = marker in (gated_out or "")
+        verdict, reason = classify(gated, control, answered)
 
         # PRINTED ON EVERY RUN, pass or fail. A green line shows no detail, the receipts are
         # deleted on the way out, and this result is version-qualified — a claim with no way
@@ -214,17 +265,18 @@ def main() -> int:
               f"called({ALLOWED})={called(control, ALLOWED)} records={len(control)}")
         print(f"  gated:   server_ran={server_ran(gated)} "
               f"called({OFF_LIST})={called(gated, OFF_LIST)} "
-              f"called({ALLOWED})={called(gated, ALLOWED)} records={len(gated)}")
+              f"called({ALLOWED})={called(gated, ALLOWED)} "
+              f"reply_came_back={answered} records={len(gated)}")
         if verdict != ENFORCED:
             print("  --- control transcript ---")
             print("  " + (control_out or "").strip()[:1200].replace("\n", "\n  "))
             print("  --- gated transcript ---")
             print("  " + (gated_out or "").strip()[:1200].replace("\n", "\n  "))
-        # LEAKED is the finding this probe exists to catch and is not an error, and
-        # SUPPRESSES_ALL is likewise a definite answer — `tools:` cannot back `native`, for a
-        # different reason than LEAKED and with the same practical consequence. UNMEASURED and
+        # LEAKED is the finding this probe exists to catch and is not an error; SUPPRESSES_ALL
+        # and ANSWER_LOST are likewise definite answers — `tools:` cannot back `native`, for
+        # three different reasons with the same practical consequence. UNMEASURED and
         # INSTRUMENT_FAILED are runs that answered nothing, which is a different thing again.
-        return 0 if verdict in (ENFORCED, LEAKED, SUPPRESSES_ALL) else 1
+        return 0 if run_ok(verdict) else 1
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
