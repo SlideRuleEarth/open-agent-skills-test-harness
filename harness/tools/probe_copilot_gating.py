@@ -169,11 +169,14 @@ def mcp_config(path: str, receipts: str, marker: str, *, tools: list[str] | None
     server that never starts — which `server_ran` reports as INSTRUMENT_FAILED rather than as
     a filter result. Run `probe_copilot_config.py` first; that is what it is for.
     """
-    # The marker rides in the SERVER's environment, which is the only reason its later
-    # appearance in the model's output is evidence: the prompt never contains it, so the one
-    # route from here to there runs through a tool result.
+    # THE MARKER IS NOT IN HERE, and that is the point. It reaches the echo server by
+    # INHERITANCE from copilot's own environment (see `run_arm`), never through this file —
+    # because this file is one copilot reads, and a CLI that echoed its server config into its
+    # transcript would put the marker in the output with no tool call having returned. The
+    # remote probe never had this hole: there the marker is set on the FIXTURE's process, which
+    # copilot cannot see. `answered` has to be evidence about a reply, not about a config.
     server: dict = {"command": sys.executable, "args": [ECHO],
-                    "env": {"ECHO_MCP_RECEIPTS": receipts, "ECHO_MCP_IDENTITY": marker}}
+                    "env": {"ECHO_MCP_RECEIPTS": receipts}}
     if tools is not None:
         server["tools"] = list(tools)
     with open(path, "w", encoding="utf-8") as handle:
@@ -206,8 +209,13 @@ def run_arm(workdir: str, marker: str, *, tools: list[str] | None) -> tuple[list
             "--additional-mcp-config", f"@{config}",
             "--output-format", "json", "--allow-all"]
     try:
+        # THE MARKER TRAVELS HERE, in copilot's environment, which the stdio server inherits.
+        # If copilot sanitised its child's environment instead, the marker would never reach
+        # `echo`, no reply would carry it, and this reports ANSWER_LOST — a loud failure rather
+        # than a quiet one, which is the right way round for an assumption about a CLI.
         done = subprocess.run(argv, cwd=workdir, capture_output=True, text=True,
-                              timeout=DEADLINE)
+                              timeout=DEADLINE,
+                              env={**os.environ, "ECHO_MCP_IDENTITY": marker})
         transcript = (done.stdout or "") + (done.stderr or "")
     except FileNotFoundError:
         return [], "copilot is not on PATH"

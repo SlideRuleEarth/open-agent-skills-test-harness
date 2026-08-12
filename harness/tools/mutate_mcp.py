@@ -2901,6 +2901,13 @@ MUTATIONS = [
      "            if n != 1:\n                out.append((mid, rel, n))",
      "            if n == 0:\n                out.append((mid, rel, n))",
      "...and so is one that matches twice, which would mutate the wrong site"),
+    # THE MARKER BACK IN THE FILE THE CLI READS. `answered` is evidence about a reply only while
+    # the CLI holds no other copy of the marker; with it in the config's `env` map, a CLI that
+    # echoed its server config would satisfy the round-trip clause having returned nothing.
+    ("F55-the-round-trip-marker-is-put-where-the-cli-can-read-it", CGATE,
+     '                    "env": {"ECHO_MCP_RECEIPTS": receipts}}',
+     '                    "env": {"ECHO_MCP_RECEIPTS": receipts, "ECHO_MCP_IDENTITY": marker}}',
+     "the config handed to the CLI does not carry the round-trip marker"),
     ("F36-the-child-reports-no-environment-at-all", TARGET,
      '"pgid": os.getpgid(0), "env_seen": sorted(set(seen))}',
      '"pgid": os.getpgid(0), "env_seen": []}',

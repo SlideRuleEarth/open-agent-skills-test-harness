@@ -1928,6 +1928,27 @@ try:
               _p.classify(_echo, [], True)[0] == _p.INSTRUMENT_FAILED
               and _p.classify([], _both, True)[0] == _p.INSTRUMENT_FAILED)
 
+    # -- the marker must not be reachable except through a tool result ----------------------
+    # `answered` is "the opaque marker appeared in the CLI's output", which is evidence about a
+    # reply only while the CLI has no other copy of it. The stdio probe used to write the marker
+    # into the `env` map of the config file copilot READS, so a CLI that echoed its server
+    # config would have satisfied the round-trip clause with nothing having returned. It now
+    # travels by inheritance instead, and this is what holds that: the config text this probe
+    # hands to copilot must not contain the marker anywhere.
+    _cfg_probe_marker = "marker-that-must-not-appear"
+    _cfg_written = CG.mcp_config(os.path.join(_e19, "cfg.json"),
+                                 os.path.join(_e19, "receipts.jsonl"),
+                                 _cfg_probe_marker, tools=["echo"])
+    with open(_cfg_written, encoding="utf-8") as _fh:
+        _cfg_text = _fh.read()
+    check("the config handed to the CLI does not carry the round-trip marker",
+          _cfg_probe_marker not in _cfg_text, _cfg_text)
+    # ...and the structural clause, so the check above is not passing over an empty file: the
+    # config must really be the one under test, allowlist and receipts path and all.
+    check("...though it is otherwise the config under test, so that absence means something",
+          '"tools": ["echo"]' in _cfg_text.replace("'", '"') and "receipts.jsonl" in _cfg_text,
+          _cfg_text)
+
     # -- and the VERDICTS, which are a separate claim from the classifiers -------------------
     # A classifier proven correct says nothing about whether `main` acted on it. `remote_shape`
     # had its own function and its own mutation while the exit status read only the stdio half,
