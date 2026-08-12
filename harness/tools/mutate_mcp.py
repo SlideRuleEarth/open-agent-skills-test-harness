@@ -113,6 +113,11 @@ HTTPFIX = "fixtures/http_mcp_server.py"
 # startup path is driven offline by `verify_mcp_fixtures.py` §E18, precisely because "nothing
 # routine runs it" is what let a fix land in one copy and not this one.
 PROBE1 = "tools/probe_remote_mcp.py"
+# The three copilot probes, same category and same reason: opt-in, never run by the block, and
+# about to have an adapter decision rest on the word they print. §E19 drives their classifiers.
+CCONFIG = "tools/probe_copilot_config.py"
+CGATE = "tools/probe_copilot_gating.py"
+CGATE_REMOTE = "tools/probe_copilot_remote_gating.py"
 # The proxy's I/O half and the awkward server it is driven against. PRODUCTION code that no
 # selftest arm can reach — it is only executed by running the real program over real pipes —
 # so it is `M*` like any other production target, proven by a THIRD suite. The classification
@@ -2775,6 +2780,63 @@ MUTATIONS = [
     # strip works, when the environment never arrived, and when this reporter is broken — so
     # the case asserts a variable it must see, and this is the mutation proving that clause can
     # fail. Without it the leak check passes against a fixture that answers nothing.
+    # ---- the copilot probes, whose verdict an adapter decision is about to rest on --------
+    # THE READER READS THE OTHER FIXTURE'S SPELLING. The echo server writes `kind="request"`
+    # with the JSON-RPC method; the HTTP server writes `kind="rpc"` for that and uses
+    # `kind="request"` for the HTTP verb. A probe holding the wrong one finds nothing, forever,
+    # and reports a perfect filter — which is why §E19 pins each reader to rows its own fixture
+    # wrote rather than to a dict typed next to the assertion.
+    ("F37-the-stdio-probe-reads-the-http-fixtures-spelling", CGATE,
+     '    return any(r.get("kind") == "request" and r.get("method") == "tools/call"',
+     '    return any(r.get("kind") == "rpc" and r.get("method") == "tools/call"',
+     "the stdio probe's reader agrees with the receipt the echo fixture actually writes"),
+    # THE DEFECT AS IT SHIPPED, in both probes: no on-list clause, so a `tools:` that suppresses
+    # the whole server scores ENFORCED. It printed exactly that over a real run before the
+    # prompt was fixed, which is why the branch is driven rather than merely present.
+    ("F38-the-allowlist-need-not-admit-anything", CGATE,
+     "    if not called(gated, ALLOWED):",
+     "    if False:",
+     "stdio: NEITHER tool arriving under the allowlist is SUPPRESSES_ALL, not a filter"),
+    ("F39-the-remote-allowlist-need-not-admit-anything", CGATE_REMOTE,
+     "    if not called(gated, ALLOWED):",
+     "    if False:",
+     "remote: NEITHER tool arriving under the allowlist is SUPPRESSES_ALL, not a filter"),
+    # ...and the control's half of the same rule. The gated arm is read for two facts of
+    # opposite sign, so a control that exercised only one of them leaves the other to the model.
+    ("F40-the-control-need-only-have-called-the-off-list-tool", CGATE,
+     "    if not called(control, OFF_LIST) or not called(control, ALLOWED):",
+     "    if not called(control, OFF_LIST):",
+     "stdio: ...and neither does one that never called the on-list tool"),
+    # A CREDENTIAL SENT ONCE AND DROPPED is a different animal from one sent always, and this
+    # is the weakening probe #1 already had to repair once (PR #106). Now that the bearer gates
+    # the exit status rather than only the tally, the weakening has somewhere to hide.
+    ("F41-the-bearer-need-only-arrive-once", CGATE_REMOTE,
+     "    return all(sentinel in (r.get(\"headers\") or {}).get(\"authorization\", \"\") for r in seen)",
+     "    return any(sentinel in (r.get(\"headers\") or {}).get(\"authorization\", \"\") for r in seen)",
+     "the bearer counts only when it is on EVERY request that carried headers"),
+    # "copilot wrote it differently" and "copilot never wrote it" lead to different work — one
+    # is an adapter change, the other is another probe run. Collapsing them reports work that
+    # does not exist, or hides work that does.
+    ("F42-a-differently-named-container-reads-as-unexercised", CCONFIG,
+     ('    out["servers_container"] = (CONFIRMED if found_container == container\n'
+      '                                else f"differs:{found_container}")'),
+     ('    out["servers_container"] = (CONFIRMED if found_container == container\n'
+      '                                else UNEXERCISED)'),
+     "a differently-named container is reported as `differs`, naming what was found"),
+    # THE SET CLOSED IN ONE DIRECTION ONLY, which is the state that actually shipped: the first
+    # run reported "keys that DIFFER: none" while copilot was writing a `type` discriminator
+    # nothing in §3 mentions. Checking only the keys you thought of cannot report the one you
+    # did not.
+    ("F43-only-the-expected-keys-are-looked-for", CCONFIG,
+     "    return sorted(k for k in body if k not in known)",
+     "    return sorted(k for k in body if k in known and k not in known)",
+     "a key the adapter has no plan for is reported, since that is the one nobody sees"),
+    # `copilot mcp add name -- --url X` writes a well-formed LOCAL entry whose command is
+    # `--url`. A probe reading only "did a record appear" calls that a measured remote spelling.
+    ("F44-a-local-entry-passes-as-the-remote-shape", CCONFIG,
+     "    if command is not None and url is None:",
+     "    if False:",
+     "a remote add filed as a local entry is named, not counted as the remote spelling"),
     ("F36-the-child-reports-no-environment-at-all", TARGET,
      '"pgid": os.getpgid(0), "env_seen": sorted(set(seen))}',
      '"pgid": os.getpgid(0), "env_seen": []}',

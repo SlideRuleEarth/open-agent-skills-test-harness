@@ -1772,5 +1772,151 @@ for _desc, _body in _FAKES.items():
 shutil.rmtree(_startup_tmp, ignore_errors=True)
 
 print()
+print("E19. the three copilot probes' classifiers, driven without a copilot install")
+# THE VERDICT IS THE PRODUCT. These probes exist to answer one question — can copilot's
+# `tools:` back `mcp_tool_filter = "native"` — and an adapter decision is about to rest on the
+# word they print. §4's rule for probes applies with the weight of that decision behind it.
+#
+# WHAT THIS SECTION IS ACTUALLY GUARDING, and it is not the `if` chain. Both gating probes
+# printed ENFORCED over a run in which the ALLOWED tool was never called in any arm, because
+# the prompt named only the off-list one — so a `tools:` that suppressed the server wholesale
+# was indistinguishable from a filter, and the verdict was right by luck. The repair added the
+# `SUPPRESSES_ALL` branch; what keeps it honest is that the branch is DRIVEN here, and that
+# the readers underneath it are pinned to the fixtures that author the rows they read.
+import probe_copilot_config as CFG              # noqa: E402 — after the path bootstrap at E14
+import probe_copilot_gating as CG               # noqa: E402
+import probe_copilot_remote_gating as CRG       # noqa: E402
+import http_mcp_server as HTTPF                 # noqa: E402
+
+_e19 = tempfile.mkdtemp(prefix="verify-copilot-")
+try:
+    # -- the readers, against rows their own fixtures wrote ---------------------------------
+    # NOT HAND-TYPED DICTS, which is the whole point. Each probe's `called`/`server_ran` is a
+    # private copy of its fixture's receipt spelling, and the two fixtures do NOT agree: the
+    # echo server writes `kind="request"` with the JSON-RPC method, while the HTTP server
+    # writes `kind="request"` for the HTTP verb and a separate `kind="rpc"` row for the
+    # message. A probe reading the other one's spelling finds nothing, forever, and reports a
+    # perfect filter. Synthetic rows would agree with whatever the probe expects and could
+    # never catch it — so the fixtures author these.
+    _stdio_receipts = os.path.join(_e19, "echo-receipts.jsonl")
+    run([{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+          "params": {"name": "echo", "arguments": {"text": "HI"}}}],
+        server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": _stdio_receipts})
+    _stdio_rows = CG.read_receipts(_stdio_receipts)
+    check("the stdio probe's reader agrees with the receipt the echo fixture actually writes",
+          CG.server_ran(_stdio_rows) and CG.called(_stdio_rows, "echo"), _stdio_rows)
+    check("...and reports nothing for a tool that was never called",
+          not CG.called(_stdio_rows, "add"), _stdio_rows)
+
+    # The HTTP fixture's own writer, its own `dispatch`, pointed at a file read back here.
+    _http_receipts = os.path.join(_e19, "http-receipts.jsonl")
+    HTTPF.RECEIPTS = HTTPF.Receipts(_http_receipts)
+    HTTPF.dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "echo", "arguments": {"text": "HI"}}})
+    _http_rows = CRG.read_receipts(_http_receipts)
+    check("the remote probe's reader agrees with the row the HTTP fixture actually writes",
+          CRG.called(_http_rows, "echo") and not CRG.called(_http_rows, "add"), _http_rows)
+    check("...and the two probes' readers are NOT interchangeable, which is why each is pinned",
+          not CRG.called(_stdio_rows, "echo") or not CG.called(_http_rows, "echo"),
+          (_stdio_rows, _http_rows))
+
+    # -- `credential_arrived`: every request, not one of them -------------------------------
+    _bearer = "sentinel-for-this-check"
+
+    def _hdr(tok):
+        return {"kind": "request", "headers": {"authorization": f"Bearer {tok}"}}
+
+    check("the bearer counts only when it is on EVERY request that carried headers",
+          CRG.credential_arrived([_hdr(_bearer), _hdr(_bearer)], _bearer)
+          and not CRG.credential_arrived([_hdr(_bearer), _hdr("other")], _bearer),
+          "a client that sends the credential once and drops it is a different animal")
+    check("...and a run with no requests at all does not count as the bearer having arrived",
+          not CRG.credential_arrived([{"kind": "listening"}], _bearer))
+
+    # -- every verdict of both gating classifiers -------------------------------------------
+    def _arms(probe, *tools):
+        """Receipt rows in `probe`'s own spelling — read off the reader under test, so the
+        helper cannot disagree with it about `kind` while the checks below still pass."""
+        kind = "rpc" if probe is CRG else "request"
+        return [{"kind": "listening"}] + [{"kind": kind, "method": "tools/call", "tool": t}
+                                          for t in tools]
+
+    for _p, _name in ((CG, "stdio"), (CRG, "remote")):
+        _both, _echo, _add, _none = (_arms(_p, "echo", "add"), _arms(_p, "echo"),
+                                     _arms(_p, "add"), _arms(_p))
+        check(f"{_name}: the off-list tool blocked while the on-list one arrives is ENFORCED",
+              _p.classify(_echo, _both)[0] == _p.ENFORCED, _p.classify(_echo, _both))
+        check(f"{_name}: the off-list tool arriving under the allowlist is LEAKED",
+              _p.classify(_both, _both)[0] == _p.LEAKED, _p.classify(_both, _both))
+        # THE BRANCH THE ORIGINAL PROBES DID NOT HAVE, and the pair is the check: these two
+        # arms differ in exactly one fact — whether the ALLOWED tool arrived — and the first
+        # version scored both of them ENFORCED. An allowlist admitting nothing is not a
+        # boundary; it is a server that does not work.
+        check(f"{_name}: NEITHER tool arriving under the allowlist is SUPPRESSES_ALL, not a filter",
+              _p.classify(_none, _both)[0] == _p.SUPPRESSES_ALL, _p.classify(_none, _both))
+        check(f"{_name}: ...and that verdict differs from ENFORCED by the on-list call alone",
+              _p.classify(_none, _both)[0] != _p.classify(_echo, _both)[0]
+              and _none == [r for r in _echo if r.get("tool") != "echo"])
+        # UNMEASURED IN BOTH DIRECTIONS. The gated arm is read for two facts of opposite sign,
+        # so a control that skipped either tool leaves the reading for that one to the model.
+        check(f"{_name}: a control that never called the off-list tool measures nothing",
+              _p.classify(_echo, _echo)[0] == _p.UNMEASURED, _p.classify(_echo, _echo))
+        check(f"{_name}: ...and neither does one that never called the on-list tool",
+              _p.classify(_add, _add)[0] == _p.UNMEASURED, _p.classify(_add, _add))
+        check(f"{_name}: a server that never started is an instrument failure, not a result",
+              _p.classify(_echo, [])[0] == _p.INSTRUMENT_FAILED
+              and _p.classify([], _both)[0] == _p.INSTRUMENT_FAILED)
+
+    # THE TWO VOCABULARIES ARE ONE VOCABULARY, asserted rather than assumed. Neither probe can
+    # import the other (each is a standalone opt-in tool), so this is §4's duplicated-rule rule:
+    # pin the copy to the original on the cases that distinguish them. A probe that renamed a
+    # verdict would otherwise report a word no reader of the other one recognises.
+    check("both gating probes spell the shared verdicts identically",
+          (CG.ENFORCED, CG.LEAKED, CG.UNMEASURED, CG.SUPPRESSES_ALL, CG.INSTRUMENT_FAILED)
+          == (CRG.ENFORCED, CRG.LEAKED, CRG.UNMEASURED, CRG.SUPPRESSES_ALL,
+              CRG.INSTRUMENT_FAILED))
+
+    # -- `read_receipts`: a partial line is an ending, not a crash --------------------------
+    _torn = os.path.join(_e19, "torn.jsonl")
+    with open(_torn, "w", encoding="utf-8") as _fh:
+        _fh.write('{"kind":"listening"}\n\n{"kind":"request","meth')
+    check("a receipts file whose last line was cut mid-write yields the records before it",
+          CG.read_receipts(_torn) == [{"kind": "listening"}], CG.read_receipts(_torn))
+    check("...and a receipts file that never appeared is empty rather than an exception",
+          CG.read_receipts(os.path.join(_e19, "nope.jsonl")) == [])
+
+    # -- probe_copilot_config.py: three states, and the key nobody thought of ---------------
+    _intended = {"mcpServers": {"echo": {"command": "python", "args": [], "env": {},
+                                         "tools": ["echo"], "url": "u", "headers": {}}}}
+    check("a config in the intended spelling reports every key confirmed",
+          set(CFG.classify_keys(_intended, CFG.EXPECTED).values()) == {CFG.CONFIRMED},
+          CFG.classify_keys(_intended, CFG.EXPECTED))
+    # `differs` AND `unexercised` ARE NOT ONE STATE. "copilot wrote it differently" is an
+    # adapter change; "copilot never wrote it" is another probe run. Collapsing them would
+    # report work that does not exist, or hide work that does.
+    _renamed = {"mcp_servers": _intended["mcpServers"]}
+    check("a differently-named container is reported as `differs`, naming what was found",
+          CFG.classify_keys(_renamed, CFG.EXPECTED)["servers_container"] == "differs:mcp_servers",
+          CFG.classify_keys(_renamed, CFG.EXPECTED))
+    check("...while a config with no container at all leaves every key UNEXERCISED",
+          set(CFG.classify_keys({}, CFG.EXPECTED).values()) == {CFG.UNEXERCISED})
+    check("a key the adapter has no plan for is reported, since that is the one nobody sees",
+          CFG.unexpected_keys({"mcpServers": {"e": {"command": "x", "type": "local"}}},
+                              CFG.EXPECTED) == ["type"])
+    check("...and a body holding only known keys reports none, so the finding means something",
+          CFG.unexpected_keys({"mcpServers": {"e": {"command": "x", "args": []}}},
+                              CFG.EXPECTED) == [])
+    # THE SILENT ONE: `copilot mcp add name -- --url X` writes a well-formed LOCAL entry whose
+    # command is `--url`. A probe reading only "did a record appear" calls that a remote result.
+    check("a remote add filed as a local entry is named, not counted as the remote spelling",
+          CFG.remote_shape({"type": "local", "command": "--url"}).startswith("LOCAL"),
+          CFG.remote_shape({"type": "local", "command": "--url"}))
+    check("...and the true remote shape is not mistaken for it",
+          CFG.remote_shape({"type": "http", "url": "u", "headers": {}}).startswith("remote:"),
+          CFG.remote_shape({"type": "http", "url": "u", "headers": {}}))
+finally:
+    shutil.rmtree(_e19, ignore_errors=True)
+
+print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")
 sys.exit(1 if fails else 0)

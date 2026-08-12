@@ -197,10 +197,20 @@ def main() -> int:
                   f"called({ALLOWED})={called(recs, ALLOWED)} "
                   f"bearer_on_every_request={credential_arrived(recs, sentinel)} "
                   f"records={len(recs)}")
-        if verdict != ENFORCED:
+        # FACT 1 IS ASSERTED, NOT MERELY PRINTED — the same defect as the on-list tool, one
+        # field over. `credential_arrived` appeared only in the tally above, so a copilot that
+        # dropped the declared `Authorization` header would have produced a green ENFORCED and
+        # exit 0 while the credential half of §8's pattern silently failed. A fact this file
+        # says it settles has to be able to fail it.
+        bearer_ok = all(credential_arrived(recs, sentinel) for recs, _out in results.values())
+        if not bearer_ok:
+            print("  FACT 1 UNPROVEN: the declared bearer did not reach the server on every "
+                  "request in both arms, so §8's credential path is not established by this "
+                  "run whatever the filter did")
+        if verdict != ENFORCED or not bearer_ok:
             print("  --- control ---\n  " + (control_out or "").strip()[:1000].replace("\n", "\n  "))
             print("  --- gated ---\n  " + (gated_out or "").strip()[:1000].replace("\n", "\n  "))
-        return 0 if verdict in (ENFORCED, LEAKED, SUPPRESSES_ALL) else 1
+        return 0 if (verdict in (ENFORCED, LEAKED, SUPPRESSES_ALL) and bearer_ok) else 1
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
