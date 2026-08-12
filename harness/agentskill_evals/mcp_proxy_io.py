@@ -73,6 +73,22 @@ FAULT_ENV = "ASE_MCP_FAULT_SUPPRESS"     # PRESENCE arms it; the value names the
 INHERIT_ENV = "ASE_MCP_INHERIT_FDS"      # fds to hand the child and then close (§10.9)
 GRACE_ENV = "ASE_MCP_GRACE"              # seconds; scales every bound below
 GUARDIAN_ENV = "ASE_MCP_GUARDIAN"        # how to break the guardian, for §10.9's cases
+# A driver-supplied nonce the `mute` guardian echoes on stderr immediately before it starts
+# waiting. It exists so a case can observe that the window it needs was actually ENTERED rather
+# than inferring it from elapsed time — an assumption that fails under startup load in the one
+# direction that matters, delivering a signal before the handlers are installed and killing the
+# proxy under the default disposition (review, PR #109). Nonce-bound so the line cannot be
+# satisfied by anything but this invocation.
+PHASE_NONCE_ENV = "ASE_MCP_PHASE_NONCE"
+
+# EVERY VAR ABOVE, AS ONE SET, because the rule is about the category and not about the members:
+# what the proxy reads to configure ITSELF is never the declared server's business, so the child's
+# environment is built by subtracting this set rather than by subtracting a list someone remembered
+# to extend. `PHASE_NONCE_ENV` is why it exists — it was added as a fifth control var and the strip
+# site kept naming four, so a driver-set var reached the child (review, PR #109). A sixth added
+# below is stripped by having been declared here, and `verify_mcp_proxy.py` asserts over this same
+# tuple rather than over a copy of it, so the check widens with the set.
+CONTROL_ENV = (FAULT_ENV, INHERIT_ENV, GRACE_ENV, GUARDIAN_ENV, PHASE_NONCE_ENV)
 
 DEFAULT_GRACE = 5.0
 
@@ -101,6 +117,11 @@ GROUP_GONE = "gone"
 GROUP_PRESENT = "present"
 
 _READ_CHUNK = 65536
+# How long §10.9's `mute` guardian stays alive saying nothing. A CEILING rather than a wait on
+# anything: the point is to outlast the proxy's readiness deadline so the wait ends on the
+# deadline instead of on EOF, and the proxy has already gone by the time this returns. Bounded
+# so a driver that crashes mid-case cannot leave one of these behind.
+_MUTE_CEILING = 30.0
 
 # The client's own descriptors, by number rather than through `sys.stdin`/`sys.stdout`. Those
 # are buffered wrappers this program must not use — a line left in a userspace buffer is a line
@@ -536,6 +557,24 @@ class Guardian:
         """
         if self.knob == audit.GUARDIAN_SILENT:
             return False
+        if self.knob == audit.GUARDIAN_MUTE:
+            # ALIVE AND SILENT, which is what `silent` is not: that one exits, the report pipe
+            # reaches EOF, and `_read_report` returns at once. Here the pipe stays open, so the
+            # proxy waits out its whole `grace` — the only window in this program during which
+            # establishment is still failing and an external event can land.
+            #
+            # IT WAITS ON THE LIFELINE, and the first version slept on a timer instead. That is
+            # the leak this whole file exists to prevent, introduced by a test knob: the proxy
+            # gave up after its grace, closed the lifeline and exited, and this process carried
+            # on sleeping with `PPID 1` for the rest of the ceiling — reproduced by review as a
+            # survivor still running after the verifier had printed ALL PASS. The ceiling is a
+            # backstop for a proxy that dies without closing anything, never the normal path.
+            self._phase(f"mute-waiting {os.environ.get(PHASE_NONCE_ENV, '')}")
+            deadline = time.monotonic() + _MUTE_CEILING
+            while time.monotonic() < deadline:
+                if _readable(self.lifeline, GUARDIAN_POLL):
+                    break            # readable in this mode means EOF: the proxy is gone
+            return False
         mine = os.getpid() + 1 if self.knob == audit.GUARDIAN_IMPOSTER else os.getpid()
         self.report(guardian_pid=mine)
         return True
@@ -948,8 +987,11 @@ class Instance:
         env = dict(os.environ)
         env.update(self.cfg.env)
         # The proxy's own control vars are not the child's business, and one of them names
-        # descriptors the child is about to be handed by inheritance rather than by name.
-        for key in (FAULT_ENV, INHERIT_ENV, GRACE_ENV, GUARDIAN_ENV):
+        # descriptors the child is about to be handed by inheritance rather than by name. The
+        # SET is the authority (see `CONTROL_ENV`): naming the members here is what let a fifth
+        # one through. The guardian is unaffected — it inherits this process's environment
+        # rather than this dict, which is how it still reads `PHASE_NONCE_ENV` for its marker.
+        for key in CONTROL_ENV:
             env.pop(key, None)
         inherit = _inherit_fds()
         child_in_r, child_in_w = os.pipe()

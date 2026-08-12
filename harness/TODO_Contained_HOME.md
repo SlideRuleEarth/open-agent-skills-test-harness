@@ -289,12 +289,12 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 577 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 578 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py                        # 327/327 production + 2/2 instrument + 35/35 fixture
+python3 -u harness/tools/mutate_mcp.py                        # 333/333 production + 2/2 instrument + 36/36 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 322 checks
-harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 80 here
+harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 88 here
 git diff --check
 
 # OPT-IN, not part of the block above: needs `claude` on PATH and spends an API call.
@@ -1453,13 +1453,24 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   which triggers count — a `SIGTERM` may latch while the connection fails microseconds later —
   so the biconditional belongs over **membership** in the trigger list. Writing it over the
   latch made a legal ordering illegal.
-  Fixing it surfaced the sharper question, which is not remote-specific: `not_applicable` is
-  licensed by the latch today, on the argument that a later trigger arrives during teardown
-  when the step has already had its chance. That is sound only for triggers that can *only*
-  arrive during a teardown, and `spawn_failed`/`connect_failed` are the opposite — they can
-  only arrive before their phase exists. **A licence belongs to a trigger that can only occur
-  before its step's phase, wherever it sits in the list**; latch position was standing in for
-  that property. The stdio half has the same race today.
+  Fixing it raised a second question and I answered it from the shape of the rule instead of
+  from the code, which is its own lesson. `not_applicable` is licensed by the LATCH, and I
+  argued that a signal could latch ahead of a failed spawn, making the check a false anomaly in
+  shipped code and requiring the licence to be loosened to list membership. **Reading the path
+  says otherwise, and says it structurally.** The signal handler does nothing; `set_wakeup_fd`
+  writes a byte drained only by `_on_signal`, which runs only inside `_pump`'s loop; and `run()`
+  is `if self._spawn(): … self._pump(…)`, so a failed spawn returns without ever entering the
+  loop and the byte is never read. `spawn_failed` is alone in the list every time —
+  `_spawn_partition`'s own docstring had said so, and I contradicted it. **A claim that shipped
+  code has a race is a claim about control flow, so it has to be traced rather than argued
+  from the shape of the predicate**; the general form is the one this file already carries about
+  the guardian and about the pipe topology, arriving a third time (review, PR #108).
+  The decision that follows is the opposite of the one I proposed: keep the latch key, require
+  the bridge to preserve the property by construction, and add the arms nobody had written —
+  one on the reader (a `[signal_term, spawn_failed]` record with blanks must be refused) and one
+  on the writer (a signal during a failing spawn never reaches the trigger list). Weakening a
+  rule to tolerate a state that cannot occur would also have accepted a blank in some future
+  arrangement where the phase really had run.
 - **A UNIVERSAL WRITTEN TO CLOSE ONE LOOPHOLE CONTRADICTS THE RULE IT WAS CARVED OUT OF.**
   Having established that a server declining a capability must not blank a completion fact, the
   next sentence said `streams_closed` is "never `not_applicable`" — flatly, three paragraphs
@@ -1498,6 +1509,27 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   the giveaway is different. There the instrument generated the value; here it fills in a
   default so ordinary that nobody reads the line. **Before asserting a peer sends X, check
   what the test client does with X when nobody asks it to** (review, PR #108).
+- **AN OBSERVER THAT FAILS OPEN CERTIFIES WHATEVER IT CANNOT SEE.** `guardian_pids()` read `ps`
+  and returned an empty set on any error, ignoring the return code — so "no guardian survived"
+  and "the instrument did not run" were the same answer, and review reproduced a green
+  `ALL PASS` with `ps` denied at rc 127. Every reading a check makes *from absence* needs its
+  channel to have said something positive first: `ps` that cannot see **this** process has not
+  enumerated the machine whatever it exited with, and the survivor claim is now conjoined with
+  having watched that same guardian be found while the case held it alive. A verifier cannot be
+  a mutation target, so the failure paths are proved by driving them on a scratch copy — the
+  three here are `ps` missing, `ps` exiting non-zero, and `ps` answering blind (PR #109).
+- **A CHECK THAT ASKS ITS QUESTION WITH THE DEFINITION UNDER TEST CANNOT SEE THAT DEFINITION
+  SHRINK.** "Where import is possible, import" is the right rule and it has an edge: the
+  control-var leak check imported `CONTROL_ENV`, built the list of names to look for from it,
+  and asserted the child saw none of them. Reads perfectly; cannot fail. The mutation that
+  removes a name from the tuple removes the *question* about that name in the same stroke, so
+  the leaked variable is the one nobody asks about — driven by hand and returned MISSED before
+  the suite ever ran it (PR #109). The rule is not "stop importing"; it is that **the query and
+  the answer must not come from the same expression**. Ask by a property the members share (a
+  prefix, a shape, a directory) so a member leaving the set does not leave the question, and
+  pin the case to the declaration with a separate equality check — which is what then catches a
+  member being *added* and left unexercised. The tell is a comprehension over the imported
+  collection sitting on both sides of the assertion.
 - **A PROMISE STATED WIDER THAN THE MECHANISM IS THE §10.6 DEFECT, NOW IN A DESIGN DOC.** The
   bridge was specified for Streamable HTTP and its adapter step described as "stops refusing a
   remote server" — but the schema admits two remote transports, and the deprecated `2024-11-05`

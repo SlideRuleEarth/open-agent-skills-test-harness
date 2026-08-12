@@ -10072,6 +10072,36 @@ def _check_mcp_audit_verdict(failures, verbose):
            f"close: unlicensed={probs(na_unlicensed)} intake={probs(na_intake)}",
            failures, verbose)
 
+    # ...and it reads the LATCH, not the trigger list — which needs a record with a runner-up,
+    # since every single-trigger record above satisfies both rules identically.
+    #
+    # BOTH ORDERINGS, because only one of them is what the writer actually emits and the other
+    # is what the rule is about. `run()` drains the signal wakeup pipe AFTER the teardown,
+    # unconditionally, so a signal arriving while a spawn is failing lands as a runner-up and
+    # the producible list is `[spawn_failed, signal_term]` — which must be ACCEPTED, blanks and
+    # all. The reverse order licenses nothing, because a blank says the step never applied and
+    # only the event that ENDED the instance can establish that.
+    #
+    # PR #109 first justified this arm by claiming the writer could not produce either list at
+    # all — that a failed spawn never enters `_pump` and so never latches a signal. That was
+    # false, and a reader-only arm could not have shown it: `verify_mcp_proxy.py` now drives the
+    # writer against a `mute` guardian and asserts the ordering directly.
+    na_runner_up = rec(triggers=({"reason": A.SIGNAL_TERM}, {"reason": A.SPAWN_FAILED}),
+                       fact_map={A.INTAKE_CLOSED: {"state": A.DONE},
+                                 **{k: {"state": A.NOT_APPLICABLE} for k in A.FACTS[1:]}})
+    na_latched = rec(triggers=({"reason": A.SPAWN_FAILED}, {"reason": A.SIGNAL_TERM}),
+                     fact_map={A.INTAKE_CLOSED: {"state": A.DONE},
+                               **{k: {"state": A.NOT_APPLICABLE} for k in A.FACTS[1:]}})
+    _check("audit.the_licence_reads_the_latch_and_not_the_trigger_list",
+           (all(f"not_applicable_unlicensed:{k}" in probs(na_runner_up) for k in A.FACTS[1:])
+            and len(A.FACTS[1:]) == 4
+            and not any(p.startswith("not_applicable_unlicensed") for p in probs(na_latched))),
+           f"`spawn_failed` FIRST licenses the blanks and a trailing signal does not revoke "
+           f"them — that pair is what the writer really emits; `spawn_failed` behind a signal "
+           f"licenses nothing. The structural clause is the arity, since an `all()` over an "
+           f"empty tail would pass while checking nothing: runner_up={probs(na_runner_up)} "
+           f"latched={probs(na_latched)}", failures, verbose)
+
     # ---- structural: `failed` names ONE cause, and the record must bear it ------------
     unpaired = rec(fact_map=facts(**{A.CHILD_REAPED: failed(A.SHUTDOWN_REAP_FAILED)}))
     orphan_outcome = rec(outcomes=({"kind": A.SHUTDOWN_REAP_FAILED},))

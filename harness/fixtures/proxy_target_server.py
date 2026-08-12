@@ -37,6 +37,11 @@ to its child verbatim, which is the only channel the driver has to this process.
                       the driver sees that one was forwarded rather than answered
     PT_FAREWELL       a JSON line to write when stdin reaches EOF, i.e. during the proxy's
                       step-2 drain rather than during ordinary forwarding
+    PT_REPORT_ENV     comma-separated variable NAMES, each optionally ending in `*` to mean
+                      "every name with this prefix"; the announcement reports which of them
+                      this process can see. A prefix is what lets the driver ask "did ANY of
+                      the proxy's own knobs arrive" without naming them — a question phrased
+                      as a list of names cannot notice a name that left the list
 """
 from __future__ import annotations
 
@@ -60,8 +65,18 @@ TOOLS = [
 
 def announce(fd: int, role: str) -> None:
     """Nonce-bound readiness, then silence for the rest of this process's life."""
+    # NAMES IN, NAMES OUT — never values, and never the whole environment. What the driver
+    # needs to know is whether a variable ARRIVED, and a child that shipped its environment
+    # down a pipe would be putting the interpolated secrets of `env:` into an artifact for the
+    # scrubber to catch, which is the one thing this program must never do.
+    seen = []
+    for pattern in (p for p in os.environ.get("PT_REPORT_ENV", "").split(",") if p):
+        if pattern.endswith("*"):
+            seen += [name for name in os.environ if name.startswith(pattern[:-1])]
+        elif pattern in os.environ:
+            seen.append(pattern)
     record = {"role": role, "nonce": os.environ.get("PT_NONCE", ""),
-              "pid": os.getpid(), "pgid": os.getpgid(0)}
+              "pid": os.getpid(), "pgid": os.getpgid(0), "env_seen": sorted(set(seen))}
     os.write(fd, (json.dumps(record) + "\n").encode("utf-8"))
 
 

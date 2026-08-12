@@ -2351,6 +2351,67 @@ MUTATIONS = [
      "self.sink.write(audit.LINE_EVENT, event=audit.MESSAGE_DROPPED, reason=action.code)",
      "self.sink.write(audit.LINE_EVENT, event=audit.MESSAGE_DROPPED, reason=action.detail)",
      "a late response to a cancelled request is dropped, and recorded as a CODE"),
+    # THE LOOSENING THAT WAS PROPOSED AND REJECTED (PR #108). Licensing off the trigger LIST
+    # accepts a blank behind any runner-up, which is only sound while no arrangement can put a
+    # pre-phase trigger behind an ending that did enter the phase — a premise the reader would
+    # then be resting on without checking.
+    ("M334-the-licence-reads-the-trigger-list-instead-of-the-latch", AUDIT,
+     "                and record.latch not in _NOT_APPLICABLE_LICENSED_BY[key]):",
+     ("                and not ({t.reason for t in record.triggers}\n"
+      "                         & _NOT_APPLICABLE_LICENSED_BY[key])):"),
+     "audit.the_licence_reads_the_latch_and_not_the_trigger_list"),
+    # THE INSTRUMENT'S OWN LEAK, reintroduced. Sleeping the ceiling instead of waiting on the
+    # lifeline is what the first `mute` did, and it left a guardian running with `PPID 1` after
+    # the verifier printed ALL PASS — found by review, not by the suite, because nothing looked.
+    ("M337-the-mute-guardian-sleeps-instead-of-watching-its-lifeline", PROXY_IO,
+     ("            deadline = time.monotonic() + _MUTE_CEILING\n"
+      "            while time.monotonic() < deadline:\n"
+      "                if _readable(self.lifeline, GUARDIAN_POLL):\n"
+      "                    break"),
+     "            time.sleep(_MUTE_CEILING)",
+     "the `mute` guardian goes when its proxy goes, rather than sleeping out its ceiling"),
+    # NO MUTATION FOR "spawn_failed IS FIRST", and the reason is worth more than a mutation.
+    # The obvious one — drain the wakeup pipe before `_spawn()` — was written, driven, and came
+    # back MISSED, correctly: there is no window between `signal.signal()` and `_spawn()` in
+    # which a signal can arrive, so an earlier drain finds an empty pipe and changes nothing.
+    # Displacing `spawn_failed` would require latching a signal from INSIDE `_spawn()`, where
+    # the wakeup fd is a local of `run()` and not in scope. The first position is therefore
+    # structural at a level this file cannot perturb, which is a stronger guarantee than a
+    # caught mutation and a weaker one than it looks: it holds because of a scope boundary, so
+    # a refactor that threads the fd into `_spawn()` would end it silently. That is what the
+    # writer check in `verify_mcp_proxy.py` stands guard over, mutation or no mutation.
+    #
+    # What IS producible is the other half: dropping the post-teardown drain loses a signal the
+    # log is written to carry. The pair matters — an arm asserting only "spawn_failed is first"
+    # is equally satisfied by a proxy that never records a signal at all.
+    ("M336-a-signal-arriving-during-teardown-is-dropped", PROXY_IO,
+     "            self._on_signal(wake_r)\n        finally:",
+     "            pass\n        finally:",
+     "...and the signal IS recorded behind it, rather than being lost"),
+    # THE WITNESS ITSELF, removed. The nonce marker is what says the case's window was entered,
+    # and while its absence was a printed NOTE the run carried on and the case was scored over a
+    # window that never opened. This is the mutation that would have reported MISSED then: it
+    # takes the marker away and nothing else, so what catches it is the witness being an
+    # assertion rather than a remark (review, PR #109).
+    ("M338-the-phase-marker-is-never-written", PROXY_IO,
+     "            self._phase(f\"mute-waiting {os.environ.get(PHASE_NONCE_ENV, '')}\")\n",
+     "",
+     "the awaited phase marker appears, so the case below measures its own window"),
+    # THE DEFECT THIS BRANCH SHIPPED: a fifth control var was declared and the strip site kept
+    # naming four, so `ASE_MCP_PHASE_NONCE` was handed to the declared server. Removing it from
+    # the set is that state exactly, and the check reads the set rather than a copy of it, so
+    # the mutation is caught by the same clause a sixth var would be covered by.
+    ("M339-a-control-var-is-left-out-of-the-strip-set", PROXY_IO,
+     "CONTROL_ENV = (FAULT_ENV, INHERIT_ENV, GRACE_ENV, GUARDIAN_ENV, PHASE_NONCE_ENV)",
+     "CONTROL_ENV = (FAULT_ENV, INHERIT_ENV, GRACE_ENV, GUARDIAN_ENV)",
+     "...and no variable the proxy reads for itself is in it"),
+    # ...and the site as well as the declaration. M339 perturbs WHAT is declared a control var
+    # and this perturbs whether the declaration is acted on, which are two different edits a
+    # refactor can make. The pair is what says the tuple and the loop are load-bearing together.
+    ("M340-the-child-inherits-the-proxys-control-vars", PROXY_IO,
+     "        for key in CONTROL_ENV:\n            env.pop(key, None)\n",
+     "",
+     "...and no variable the proxy reads for itself is in it"),
     ("M293-a-drop-reason-may-be-any-string", AUDIT,
      "            if not isinstance(reason, str) or reason not in DROP_REASONS:",
      "            if not isinstance(reason, str) or not reason:",
@@ -2710,6 +2771,14 @@ MUTATIONS = [
      "            self._refuse(refusal)",
      ("...while the refused POST is still RECORDED, so a credential sent to a rejected origin "
       "is not invisible")),
+    # THE POSITIVE CONTROL'S OWN CONTROL. `env_seen: []` is what the child reports when the
+    # strip works, when the environment never arrived, and when this reporter is broken — so
+    # the case asserts a variable it must see, and this is the mutation proving that clause can
+    # fail. Without it the leak check passes against a fixture that answers nothing.
+    ("F36-the-child-reports-no-environment-at-all", TARGET,
+     '"pgid": os.getpgid(0), "env_seen": sorted(set(seen))}',
+     '"pgid": os.getpgid(0), "env_seen": []}',
+     "the child's environment arrives by the route a control var would take"),
 
 ]
 
