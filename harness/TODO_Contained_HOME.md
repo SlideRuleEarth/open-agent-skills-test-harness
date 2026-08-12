@@ -1518,6 +1518,18 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   having watched that same guardian be found while the case held it alive. A verifier cannot be
   a mutation target, so the failure paths are proved by driving them on a scratch copy — the
   three here are `ps` missing, `ps` exiting non-zero, and `ps` answering blind (PR #109).
+- **A MUTATION CAN GO STALE WITHOUT ITS ANCHOR GOING STALE, AND ONLY A FULL RUN SEES IT.**
+  `F49` perturbed a `missing` list in `remote_shape`. A later round added type checks below it
+  that refuse an absent value just as they refuse a wrong one — which made the `missing` clause
+  able to change the failure MESSAGE and never the verdict. The mutation stopped producing a
+  defect, and reported **MISSED**. Nothing cheap could have caught it: the anchor still matched
+  exactly once, so `stale_anchors` was silent; and the entry was not one of the ones that round
+  touched, so driving the touched mutations was silent too. **What changed was the code
+  UNDERNEATH an untouched entry.** Two lessons. First, when a new check subsumes an older one,
+  the older one is now dead code that reads like a defence — delete it, or a reader will believe
+  the case is defended where it is not. Second, this is the class of failure that justifies the
+  full suite existing at all: cheap preflights catch what *you* broke, and only a complete run
+  catches what your change made *harmless somewhere else*.
 - **A CHECK THAT ASKS ITS QUESTION WITH THE DEFINITION UNDER TEST CANNOT SEE THAT DEFINITION
   SHRINK.** "Where import is possible, import" is the right rule and it has an edge: the
   control-var leak check imported `CONTROL_ENV`, built the list of names to look for from it,

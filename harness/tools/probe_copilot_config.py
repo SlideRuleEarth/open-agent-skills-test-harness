@@ -119,21 +119,26 @@ def remote_shape(body: Any, want_type: str = "http") -> tuple[bool, str]:
         return False, f"LOCAL (type={kind!r}, command={command!r}) — the remote add did not take"
     if url is None:
         return False, f"no url and no command (type={kind!r}) — unreadable"
-    missing = [k for k in ("headers", "tools") if k not in body]
     if kind != want_type:
         return False, (f"url present but type={kind!r}, not {want_type!r} — the transport "
                        f"discriminator is what the gating probe writes, so a different one "
                        f"means it is writing a config copilot does not produce")
-    if missing:
-        return False, (f"remote type={kind!r} with a url, but no {missing} — the credential "
-                       f"and the allowlist are the two things §8's pattern is made of")
     # PRESENCE IS NOT SHAPE, and checking only presence passed `headers: []` and
     # `tools: "wrong"` — two values §8's pattern cannot be built from, filed as confirmation
     # that it can (review, PR #110). What the gating probes write by hand is a header MAPPING
     # carrying a bearer and a LIST of tool names, so that is what has to come back.
+    #
+    # AND THESE SUBSUME THE ABSENT CASE, which is why there is no separate one. A `missing`
+    # list checked the two keys for presence and stood immediately above these — it could only
+    # ever change the MESSAGE, never the verdict, since an absent value fails the type check
+    # below just as a wrong one does. `F49` perturbed it and the full suite reported MISSED:
+    # a clause that cannot change an outcome is not a defence, and leaving it in place tells a
+    # reader the absent case is defended somewhere it is not (full run, PR #110).
     headers, tools = body.get("headers"), body.get("tools")
     if not isinstance(headers, dict):
-        return False, f"headers is {type(headers).__name__}, not a mapping: {headers!r}"
+        return False, (f"headers is {'absent' if headers is None else type(headers).__name__}, "
+                       f"not a mapping: {headers!r} — the credential half of §8's pattern has "
+                       f"nowhere to travel")
     auth = next((v for k, v in headers.items() if k.lower() == "authorization"), None)
     if not (isinstance(auth, str) and auth.startswith("Bearer ") and auth[7:].strip()):
         return False, (f"headers carries no usable `Authorization: Bearer <token>` — the "
@@ -141,8 +146,9 @@ def remote_shape(body: Any, want_type: str = "http") -> tuple[bool, str]:
                        f"{sorted(headers)!r}")
     if not (isinstance(tools, list) and tools
             and all(isinstance(t, str) and t for t in tools)):
-        return False, (f"tools is {tools!r}, not a non-empty list of tool names — an allowlist "
-                       f"that is not a list of names is not the thing under test")
+        return False, (f"tools is {'absent' if tools is None else repr(tools)}, not a "
+                       f"non-empty list of tool names — an allowlist that is not a list of "
+                       f"names is not the thing under test")
     return True, (f"remote: type={kind!r}, url present, bearer in headers, tools present "
                   f"({tools!r})")
 

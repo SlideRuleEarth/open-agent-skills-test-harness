@@ -2869,9 +2869,18 @@ MUTATIONS = [
      "...and a bearer the client altered around the token does not count as arrival"),
     # A `url` IS NOT THE SHAPE. The gating probes write four keys by hand; confirming one of
     # them leaves the credential and the allowlist resting on documentation.
-    ("F49-a-remote-entry-needs-only-a-url", CCONFIG,
-     '    missing = [k for k in ("headers", "tools") if k not in body]',
-     "    missing = []",
+    #
+    # RE-AIMED after the full suite reported MISSED. This perturbed a `missing` list that only
+    # ever changed the failure MESSAGE — the absent case was already refused by the type checks
+    # added a round later, so the mutation produced no defect. That clause is gone and this now
+    # perturbs the guard that actually refuses an absent `headers`. The MISS is the interesting
+    # part: the anchor never went stale, so the preflight could not see it, and driving only
+    # the mutations I had TOUCHED could not either — what changed was the code underneath an
+    # untouched entry (full run, PR #110).
+    ("F49-an-absent-headers-map-is-treated-as-a-present-one", CCONFIG,
+     "    headers, tools = body.get(\"headers\"), body.get(\"tools\")",
+     ('    headers, tools = body.get("headers") or {"Authorization": "Bearer x"}, '
+      'body.get("tools")'),
      "a remote entry missing the credential or the allowlist is not the shape §8 needs"),
     ("F50-the-transport-discriminator-is-not-checked", CCONFIG,
      "    if kind != want_type:",
