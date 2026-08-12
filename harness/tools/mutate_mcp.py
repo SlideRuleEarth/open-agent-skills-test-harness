@@ -113,6 +113,11 @@ HTTPFIX = "fixtures/http_mcp_server.py"
 # startup path is driven offline by `verify_mcp_fixtures.py` §E18, precisely because "nothing
 # routine runs it" is what let a fix land in one copy and not this one.
 PROBE1 = "tools/probe_remote_mcp.py"
+# The three copilot probes, same category and same reason: opt-in, never run by the block, and
+# about to have an adapter decision rest on the word they print. §E19 drives their classifiers.
+CCONFIG = "tools/probe_copilot_config.py"
+CGATE = "tools/probe_copilot_gating.py"
+CGATE_REMOTE = "tools/probe_copilot_remote_gating.py"
 # The proxy's I/O half and the awkward server it is driven against. PRODUCTION code that no
 # selftest arm can reach — it is only executed by running the real program over real pipes —
 # so it is `M*` like any other production target, proven by a THIRD suite. The classification
@@ -2775,6 +2780,272 @@ MUTATIONS = [
     # strip works, when the environment never arrived, and when this reporter is broken — so
     # the case asserts a variable it must see, and this is the mutation proving that clause can
     # fail. Without it the leak check passes against a fixture that answers nothing.
+    # ---- the copilot probes, whose verdict an adapter decision is about to rest on --------
+    # THE READER READS THE OTHER FIXTURE'S SPELLING. The echo server writes `kind="request"`
+    # with the JSON-RPC method; the HTTP server writes `kind="rpc"` for that and uses
+    # `kind="request"` for the HTTP verb. A probe holding the wrong one finds nothing, forever,
+    # and reports a perfect filter — which is why §E19 pins each reader to rows its own fixture
+    # wrote rather than to a dict typed next to the assertion.
+    ("F37-the-stdio-probe-reads-the-http-fixtures-spelling", CGATE,
+     '    return any(r.get("kind") == "request" and r.get("method") == "tools/call"',
+     '    return any(r.get("kind") == "rpc" and r.get("method") == "tools/call"',
+     "the stdio probe's reader agrees with the receipt the echo fixture actually writes"),
+    # THE DEFECT AS IT SHIPPED, in both probes: no on-list clause, so a `tools:` that suppresses
+    # the whole server scores ENFORCED. It printed exactly that over a real run before the
+    # prompt was fixed, which is why the branch is driven rather than merely present.
+    ("F38-the-allowlist-need-not-admit-anything", CGATE,
+     "    if not called(gated, ALLOWED):",
+     "    if False:",
+     "stdio: NEITHER tool arriving under the allowlist is SUPPRESSES_ALL, not a filter"),
+    ("F39-the-remote-allowlist-need-not-admit-anything", CGATE_REMOTE,
+     "    if not called(gated, ALLOWED):",
+     "    if False:",
+     "remote: NEITHER tool arriving under the allowlist is SUPPRESSES_ALL, not a filter"),
+    # ...and the control's half of the same rule. The gated arm is read for two facts of
+    # opposite sign, so a control that exercised only one of them leaves the other to the model.
+    ("F40-the-control-need-only-have-called-the-off-list-tool", CGATE,
+     "    if not called(control, OFF_LIST) or not called(control, ALLOWED):",
+     "    if not called(control, OFF_LIST):",
+     "stdio: ...and neither does one that never called the on-list tool"),
+    # A CREDENTIAL SENT ONCE AND DROPPED is a different animal from one sent always, and this
+    # is the weakening probe #1 already had to repair once (PR #106). Now that the bearer gates
+    # the exit status rather than only the tally, the weakening has somewhere to hide.
+    # RE-ANCHORED, and the reason is worth more than the entry. This pointed at the containment
+    # form of `credential_arrived`; the equality fix rewrote that line, so the anchor went stale
+    # and the every-vs-any property lost its mutation — while `F48`, added in the same round,
+    # covers intact-vs-containing and looks like a replacement without being one. The full suite
+    # reported STALE ANCHOR and refused to claim 52/52; driving only the NEW mutations, which is
+    # what I did, could not have found it. Changing a line invalidates every mutation aimed at
+    # it, and the two axes over one expression are still two axes (review, PR #110).
+    ("F41-the-bearer-need-only-arrive-once", CGATE_REMOTE,
+     '    return all((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
+     '    return any((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
+     "the bearer counts only when it is on EVERY request that carried headers"),
+    # "copilot wrote it differently" and "copilot never wrote it" lead to different work — one
+    # is an adapter change, the other is another probe run. Collapsing them reports work that
+    # does not exist, or hides work that does.
+    ("F42-a-differently-named-container-reads-as-unexercised", CCONFIG,
+     ('    out["servers_container"] = (CONFIRMED if found_container == container\n'
+      '                                else f"differs:{found_container}")'),
+     ('    out["servers_container"] = (CONFIRMED if found_container == container\n'
+      '                                else UNEXERCISED)'),
+     "a differently-named container is reported as `differs`, naming what was found"),
+    # THE SET CLOSED IN ONE DIRECTION ONLY, which is the state that actually shipped: the first
+    # run reported "keys that DIFFER: none" while copilot was writing a `type` discriminator
+    # nothing in §3 mentions. Checking only the keys you thought of cannot report the one you
+    # did not.
+    ("F43-only-the-expected-keys-are-looked-for", CCONFIG,
+     "    return sorted(k for k in body if k not in known)",
+     "    return sorted(k for k in body if k in known and k not in known)",
+     "a key the adapter has no plan for is reported, since that is the one nobody sees"),
+    # `copilot mcp add name -- --url X` writes a well-formed LOCAL entry whose command is
+    # `--url`. A probe reading only "did a record appear" calls that a measured remote spelling.
+    ("F44-a-local-entry-passes-as-the-remote-shape", CCONFIG,
+     "    if command is not None and url is None:",
+     "    if False:",
+     "a remote add filed as a local entry is named, not counted as the remote spelling"),
+    # ARRIVING IS NOT WORKING. Receipts record a request coming IN; nothing in them can see the
+    # answer going OUT, so without this clause a client that forwards the call and drops the
+    # reply scores ENFORCED and the harness gates onto a tool that returns nothing.
+    ("F45-a-call-that-arrives-need-not-have-answered", CGATE,
+     "    if not answered:",
+     "    if False:",
+     "stdio: an on-list call whose reply never came back is ANSWER_LOST, not ENFORCED"),
+    ("F46-a-remote-call-that-arrives-need-not-have-answered", CGATE_REMOTE,
+     "    if not answered:",
+     "    if False:",
+     "remote: an on-list call whose reply never came back is ANSWER_LOST, not ENFORCED"),
+    # THE PERMISSIVE DEFAULT, which is the only default that would keep the older calls working
+    # — and hands ENFORCED to any caller that forgets the argument.
+    ("F47-the-round-trip-fact-gets-a-permissive-default", CGATE,
+     "def classify(gated: list[dict], control: list[dict], answered: bool) -> tuple[str, str]:",
+     "def classify(gated: list[dict], control: list[dict], answered: bool = True):",
+     "stdio: the round-trip fact is required rather than defaulted"),
+    # CONTAINMENT ACCEPTS A VALUE THAT IS NOT THE ONE DECLARED — `Bearer <sentinel>-altered`
+    # passes, and the server then received something the harness never sent.
+    ("F48-the-bearer-need-only-contain-the-token", CGATE_REMOTE,
+     '    return all((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
+     '    return all(sentinel in (r.get("headers") or {}).get("authorization", "") for r in seen)',
+     "...and a bearer the client altered around the token does not count as arrival"),
+    # A `url` IS NOT THE SHAPE. The gating probes write four keys by hand; confirming one of
+    # them leaves the credential and the allowlist resting on documentation.
+    #
+    # RE-AIMED after the full suite reported MISSED. This perturbed a `missing` list that only
+    # ever changed the failure MESSAGE — the absent case was already refused by the type checks
+    # added a round later, so the mutation produced no defect. That clause is gone and this now
+    # perturbs the guard that actually refuses an absent `headers`. The MISS is the interesting
+    # part: the anchor never went stale, so the preflight could not see it, and driving only
+    # the mutations I had TOUCHED could not either — what changed was the code underneath an
+    # untouched entry (full run, PR #110).
+    ("F49-an-absent-headers-map-is-treated-as-a-present-one", CCONFIG,
+     "    headers, tools = body.get(\"headers\"), body.get(\"tools\")",
+     ('    headers, tools = body.get("headers") or {"Authorization": "Bearer x"}, '
+      'body.get("tools")'),
+     "a remote entry missing the credential or the allowlist is not the shape §8 needs"),
+    ("F50-the-transport-discriminator-is-not-checked", CCONFIG,
+     "    if kind != want_type:",
+     "    if False:",
+     "...and a transport discriminator that is not the one asked for is refused"),
+    # THE VERDICT, NOT THE CLASSIFIER. Each of these leaves its named function correct and stops
+    # `main` from acting on it — the exact gap that let `remote_shape` be right while the exit
+    # status ignored it, and the reason the verdicts were extracted at all.
+    # RE-ANCHORED when `run_ok` became `certifies_native`. Caught by `stale_anchors` in a
+    # second, which is the entire argument for putting it before the baselines.
+    ("F51-the-remote-verdict-ignores-the-credential", CGATE_REMOTE,
+     "    return verdict == ENFORCED and bearer_ok and version_ok",
+     "    return verdict == ENFORCED and version_ok",
+     "remote: ...and the same, per transport, over bearer and version too"),
+    ("F52-the-config-verdict-ignores-the-remote-shape", CCONFIG,
+     "    return 1 if (differs or surprises or not remote_ok) else 0",
+     "    return 1 if (differs or surprises) else 0",
+     "the config probe fails on ANY of its three findings, not just the stdio ones"),
+    # THE ANCHOR VALIDATOR'S OWN TWO WAYS OF BEING WRONG. It exists because a stale anchor cost
+    # a 77-minute run to discover; a validator that reads one half of a two-part `find`, or that
+    # treats "matches twice" as fine, would hand back the same silence for the same money.
+    ("F53-the-validator-reads-only-the-first-anchor", SELF,
+     ("        for f in (find if isinstance(find, tuple) else (find,)):\n"
+      "            n = text.count(f)"),
+     ("        for f in (find[:1] if isinstance(find, tuple) else (find,)):\n"
+      "            n = text.count(f)"),
+     "...and a two-part anchor is checked in both parts, not just the first"),
+    ("F54-an-anchor-matching-twice-is-accepted", SELF,
+     "            if n != 1:\n                out.append((mid, rel, n))",
+     "            if n == 0:\n                out.append((mid, rel, n))",
+     "...and so is one that matches twice, which would mutate the wrong site"),
+    # THE MARKER BACK WHERE THE CLI CAN READ IT. `answered` is evidence about a reply only
+    # while the CLI holds no other copy; a driver-chosen marker in the config satisfies the
+    # round-trip clause with nothing having returned. Two versions of this line shipped wrong.
+    ("F55-the-round-trip-marker-is-put-where-the-cli-can-read-it", CGATE,
+     '                            "ECHO_MCP_IDENTITY": IDENTITY_GENERATE}}',
+     '                            "ECHO_MCP_IDENTITY": "a-marker-the-driver-chose"}}',
+     "the config asks the server to MINT a marker rather than carrying one"),
+    # THE SERVER STOPS MINTING and treats the sentinel as a literal marker, which makes every
+    # reply "contain the marker" for free — the unfalsifiable form of the same clause.
+    ("F56-the-generate-sentinel-is-used-as-the-marker", ECHO,
+     'if IDENTITY == IDENTITY_GENERATE:\n    IDENTITY = uuid.uuid4().hex',
+     'if False:\n    IDENTITY = uuid.uuid4().hex',
+     "the digest reported is not the sentinel's, so the server minted rather than echoed"),
+    # ...and the route back to the driver that does not pass through the CLI.
+    ("F57-the-minted-marker-is-not-reported-to-the-driver", ECHO,
+     "             identity_digest=identity_digest())",
+     '             identity_digest="")',
+     "the receipts carry a DIGEST, and that marker VALUE appears nowhere in them"),
+    # A RECEIPT THAT DISAGREES WITH THE REPLY makes `answered` unfalsifiable in the other
+    # direction: the driver looks for a value the tool never emits.
+    ("F58-the-reported-identity-is-not-the-one-the-reply-carries", ECHO,
+     '        return _text(f"{IDENTITY}:{text}" if IDENTITY else text)',
+     '        return _text(text)',
+     "...and the reply carries a token whose digest is the one reported"),
+    # THE KNOB STOPS BEING OPT-IN, which silently changes what every verbatim-echo check means.
+    ("F59-every-server-mints-a-marker-whether-asked-or-not", ECHO,
+     'IDENTITY = os.environ.get("ECHO_MCP_IDENTITY") or ""',
+     'IDENTITY = os.environ.get("ECHO_MCP_IDENTITY") or "a-marker-nobody-asked-for"',
+     "...while a server not asked for a marker reports none, so the knob stays opt-in"),
+    # THE NAME AND THE MEANING PULLED APART AGAIN: certification widened back to "settled", so
+    # LEAKED — the finding these probes exist to catch — would exit 0 as permission.
+    ("F60-a-settled-negative-certifies-native", CGATE,
+     "    return verdict == ENFORCED and version_ok",
+     "    return settled(verdict) and version_ok",
+     "stdio: a settled negative does NOT certify `native`, which is what exit 0 claims"),
+    ("F61-a-leaked-transport-still-certifies-native", CGATE_REMOTE,
+     "    return verdict == ENFORCED and bearer_ok and version_ok",
+     "    return settled(verdict) and bearer_ok and version_ok",
+     "remote: ...and the same, per transport, over bearer and version too"),
+    # THE VERSION GATE, in each of the three. A run that cannot say which build it measured
+    # certifies nothing, and this used to be a string in a `print`.
+    ("F62-an-unreadable-version-is-usable-anyway", CGATE,
+     ('    if rc != 0:\n        return (text or f"exit {rc}"), False\n'
+      "    return (text, bool(_VERSION_RE.search(text)))"),
+     ('    if rc != 0:\n        return (text or f"exit {rc}"), False\n'
+      "    return (text, bool(text))"),
+     "stdio: a preflight version must LOOK like a version, not merely be output"),
+    ("F64-the-measured-discriminator-goes-back-to-being-a-surprise", CCONFIG,
+     '    "type": "type",\n}',
+     "}",
+     "the discriminator copilot actually writes is a known key, not a permanent surprise"),
+    # PRESENCE IS NOT SHAPE: `headers: []` and `tools: "wrong"` are values §8's pattern cannot
+    # be built from, filed as confirmation that it can.
+    ("F65-a-headers-value-need-not-carry-a-bearer", CCONFIG,
+     "    if not (isinstance(auth, str) and auth.startswith(\"Bearer \") and auth[7:].strip()):",
+     "    if False:",
+     "a headers value that is not a mapping is not the credential half of §8's pattern"),
+    ("F66-an-allowlist-need-not-be-a-list-of-names", CCONFIG,
+     ("    if not (isinstance(tools, list) and tools\n"
+      "            and all(isinstance(t, str) and t for t in tools)):"),
+     "    if False:",
+     "...and an allowlist that is not a non-empty list of names is not one either"),
+    # THE RECEIPTS BECOME A ROUTE TO THE MARKER AGAIN. The path is in the config the CLI reads
+    # and the file is in its working directory under `--allow-all`, so a plaintext marker there
+    # is readable without any reply having returned.
+    ("F67-the-receipts-carry-the-marker-in-plaintext", ECHO,
+     "    return hashlib.sha256(IDENTITY.encode(\"utf-8\")).hexdigest() if IDENTITY else \"\"",
+     '    return IDENTITY',
+     "the receipts carry a DIGEST, and that marker VALUE appears nowhere in them"),
+    # THE LIVE PROBE FAILS OPEN on a receipt that reports the sentinel — the exact state a
+    # broken mint produces, and a transcript containing that word then scored ENFORCED.
+    ("F68-any-string-counts-as-a-minted-marker", CGATE,
+     "            return digest if isinstance(digest, str) and _DIGEST_RE.match(digest) else \"\"",
+     '            return digest if isinstance(digest, str) else ""',
+     "a receipt whose identity is the generation sentinel is not a minted marker"),
+    ("F69-an-empty-digest-is-satisfied-by-anything", CGATE,
+     "    if not digest:\n        return False",
+     "    if not digest:\n        return True",
+     "...and an empty digest is never satisfied by any transcript"),
+    # THE VERSION IDENTIFIES A DIFFERENT EXECUTION. copilot's launcher can resolve different
+    # cached code between two invocations, which is why the adapter reads it in-band.
+    ("F70-an-arm-with-no-witness-is-treated-as-witnessed", CGATE,
+     "    if any(f is None for f in found):",
+     "    if False:",
+     "stdio: an executed arm with no witness leaves the run UNVERIFIED"),
+    ("F71-the-arms-need-not-have-run-the-same-build", CGATE,
+     "    if len(set(found)) != 1:",
+     "    if False:",
+     "stdio: ...and arms that ran different builds do not agree on one"),
+    ("F73-the-remote-arms-need-not-agree-on-a-build", CGATE_REMOTE,
+     "    if len(set(found)) != 1:",
+     "    if False:",
+     "remote: ...and arms that ran different builds do not agree on one"),
+    ("F74-a-remote-arm-with-no-witness-is-treated-as-witnessed", CGATE_REMOTE,
+     "    if any(f is None for f in found):",
+     "    if False:",
+     "remote: an executed arm with no witness leaves the run UNVERIFIED"),
+    # THE CONTROL STOPS DECIDING ALONE, so the second model call runs for a number that cannot
+    # move the verdict — and `classify` and `main` stop agreeing about what a run means.
+    ("F72-the-control-never-decides-on-its-own", CGATE,
+     ("    if not called(control, OFF_LIST) or not called(control, ALLOWED):\n"
+      "        return UNMEASURED, (f\"the CONTROL called {OFF_LIST}={called(control, OFF_LIST)} \""),
+     ("    if False:\n"
+      "        return UNMEASURED, (f\"the CONTROL called {OFF_LIST}={called(control, OFF_LIST)} \""),
+     "stdio: ...and one that skipped a tool decides UNMEASURED, so no second call"),
+    # THE CONSUMER, not the rule. F72 perturbs `control_verdict`; these perturb whether `main`
+    # and `measure` ACT on it — and removing either left every check green until §E19 started
+    # counting calls with a fake runner (review, PR #110).
+    ("F75-stdio-main-runs-the-gated-arm-anyway", CGATE,
+     "        decided = control_verdict(control)\n        if decided is not None:",
+     "        decided = control_verdict(control)\n        if False:",
+     "stdio main does NOT run the gated arm once the control has decided"),
+    ("F76-remote-measure-runs-the-gated-arm-anyway", CGATE_REMOTE,
+     '        if label == "gated" and control_verdict(results["control"][0]) is not None:',
+     "        if False:",
+     "remote measure does NOT run the gated arm once the control has decided"),
+    # THE PLAINTEXT BACK IN THE RECEIPTS, in a field the schema check would not have noticed.
+    ("F77-a-receipt-field-leaks-the-marker-beside-the-digest", ECHO,
+     "             identity_digest=identity_digest())",
+     "             identity_digest=identity_digest(), leaked_plaintext=IDENTITY)",
+     "the receipts carry a DIGEST, and that marker VALUE appears nowhere in them"),
+    # A CONSTANT IS NOT A MINT. Every digest/reply/receipt check above passes on a fixed
+    # 32-hex marker, and a constant in this file's SOURCE is readable by a CLI that can read
+    # files — which restores the non-reply route the digest was introduced to close.
+    ("F78-the-minted-marker-is-a-constant", ECHO,
+     "    IDENTITY = uuid.uuid4().hex",
+     '    IDENTITY = "a" * 32',
+     "two `@generate` instances mint DIFFERENT markers, so it is not a constant"),
+    # AND THE POOLED VERSION AGREEMENT: per-transport singletons let two builds each enforce
+    # one transport and report as one build enforcing both.
+    ("F79-each-transport-certifies-against-its-own-build", CGATE_REMOTE,
+     "        return 0 if (ok and pooled_ok) else 1",
+     "        return 0 if ok else 1",
+     "remote: every arm of every transport names ONE build, not one per transport"),
     ("F36-the-child-reports-no-environment-at-all", TARGET,
      '"pgid": os.getpgid(0), "env_seen": sorted(set(seen))}',
      '"pgid": os.getpgid(0), "env_seen": []}',
@@ -2946,12 +3217,45 @@ def _classify(mid, rel):
     return kind
 
 
+def stale_anchors(root, mutations):
+    """Every `(id, target, occurrences)` whose `find` text is not in its target exactly once.
+
+    THE SAME ARGUMENT AS `_classify`, and it was learned the expensive way. A stale anchor was
+    already detected — but only when the loop REACHED that mutation, which for an entry two
+    thirds of the way down a 387-mutation list is 60 minutes in. Worse, the failure it reports
+    is silent about its own cause: `credential_arrived` was rewritten from containment to
+    equality, `F41` still pointed at the line that no longer existed, and a NEW mutation added
+    in the same round covered a DIFFERENT axis over the same expression — so the list looked
+    like it had gained coverage while it had lost some. Driving only the new mutations, which
+    is the natural thing to do, cannot find that (review, PR #110).
+
+    A FUNCTION OVER A ROOT so §E17 can drive it on a synthetic tree, and never called from
+    inside a mutated copy: under an applied mutation the target legitimately no longer contains
+    its own anchor, so this belongs before the run and not during it.
+    """
+    out = []
+    for mid, rel, find, _repl, _arm in mutations:
+        text = (Path(root) / rel).read_text()
+        for f in (find if isinstance(find, tuple) else (find,)):
+            n = text.count(f)
+            if n != 1:
+                out.append((mid, rel, n))
+    return out
+
+
 def main():
     started = time.monotonic()
     # Before the baseline, which costs a selftest run: a misclassified entry makes every
     # number below it wrong, so it is worth nothing to discover that at the end.
     kinds = {mid: _classify(mid, rel) for mid, rel, _f, _r, _a in MUTATIONS}
     suites = {mid: _suite_for(rel) for mid, rel, _f, _r, _a in MUTATIONS}
+    stale = stale_anchors(HARNESS, MUTATIONS)
+    if stale:
+        print("STALE OR AMBIGUOUS ANCHORS — these mutations cannot be applied, and a run that "
+              "discovers that on the way past has already spent the hour:")
+        for mid, rel, n in stale:
+            print(f"  {mid} -> {rel} matches {n} time(s), expected exactly 1")
+        return 1
     tmp = Path(tempfile.mkdtemp(prefix="mutate-mcp-"))
     work = tmp / "harness"
     shutil.copytree(HARNESS, work, symlinks=True,

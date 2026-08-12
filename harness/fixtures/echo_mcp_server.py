@@ -54,7 +54,10 @@ Two environment knobs, both off by default so the shape every existing check ass
 one it gets: `ECHO_MCP_SERVER_NAME` sets the advertised `serverInfo.name`, and
 `ECHO_MCP_IDENTITY=<marker>` puts that marker in front of `echo`'s reply. The second exists
 because the first is invisible in a RESULT, and it takes a value rather than a flag so the
-marker can be one nothing else in the run knows — see `IDENTITY` below.
+marker can be one nothing else in the run knows — see `IDENTITY` below. `ECHO_MCP_IDENTITY=
+@generate` mints the marker HERE instead, after the CLI has started this process, and reports
+it in the `listening` receipt: a marker the driver chose has to travel through the CLI to get
+here, so the CLI holds it before any tool runs.
 
 No third-party imports, by rule: this runs as a subprocess of an agent CLI, inside a
 per-cell tempdir, on whatever interpreter `command:` resolves to. A dependency here would
@@ -62,9 +65,11 @@ be a dependency of every scenario that uses it.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
+import uuid
 
 # The legacy revisions this fixture actually implements — the two the shipped fleet was
 # measured speaking (§9: claude and copilot 2025-11-25, codex 2025-06-18). An earlier
@@ -106,6 +111,51 @@ SERVER_NAME = os.environ.get("ECHO_MCP_SERVER_NAME", "echo")
 # second round). Off by default: the verbatim contract is what every other check and both
 # `mcp_echo_*` scenarios assert against.
 IDENTITY = os.environ.get("ECHO_MCP_IDENTITY") or ""
+# `@generate` MEANS THE SERVER MINTS IT, and that is a different security property from a
+# marker the driver chose. A supplied marker has to reach this process somehow, and every route
+# runs through the CLI under test — its config file, or its environment — so the CLI holds a
+# copy before any tool is called, and a diagnostic dump or an `env` in a shell tool satisfies
+# "the marker appeared in the output" with nothing having returned. Minted here, after the CLI
+# has started us, the value exists in this process and in the replies `echo` emits, and NOWHERE
+# ELSE: the receipts carry only its digest, because that file's path is in the CLI's own config
+# and the file lands in the CLI's working directory (review, PR #110, four rounds on this one
+# clause, each moving the marker one hop rather than changing what could reach it).
+IDENTITY_GENERATE = "@generate"
+if IDENTITY == IDENTITY_GENERATE:
+    IDENTITY = uuid.uuid4().hex
+
+
+def identity_digest() -> str:
+    """sha256 of the marker, or "" when there is no marker. Never the marker itself."""
+    return hashlib.sha256(IDENTITY.encode("utf-8")).hexdigest() if IDENTITY else ""
+
+# Opt-in receipts, for the one question no reply can answer: what did the CLIENT actually
+# send? `IDENTITY` proves an answer travelled back; this proves a request arrived. Measuring
+# whether a CLI's own `tools:` filter is a real boundary needs exactly that and nothing else —
+# §6-C2 measured claude's flag NOT stopping the call, which is the finding C3 exists because
+# of, and it is a fact about arrival rather than about the model's account of itself.
+#
+# ONE LINE OF JSON PER REQUEST, FLUSHED, and a `listening` record at startup — the same shape
+# as `http_mcp_server.py`, deliberately, because an observation channel that was never
+# connected reports the same silence as one reporting a clean run (§4). The startup record is
+# what lets a reader tell "the filter stopped it" from "the server never ran".
+#
+# It records the METHOD and, for `tools/call`, the tool name. Not the arguments: they are
+# chosen by a model and this file is archived.
+RECEIPTS = os.environ.get("ECHO_MCP_RECEIPTS") or ""
+
+
+def _receipt(**fields) -> None:
+    """Append one record. Never raises: an instrument that can kill the subject it observes
+    turns a measurement into a different measurement."""
+    if not RECEIPTS:
+        return
+    try:
+        with open(RECEIPTS, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(fields) + "\n")
+            handle.flush()
+    except OSError:
+        pass
 
 # Set by an accepted `initialize`, and the only state carried across requests. Modern
 # supplies its context per request; legacy semantics exist only once initialize selects
@@ -333,6 +383,21 @@ def _call_tool(params: dict) -> dict:
 
 
 def main() -> int:
+    # THE POSITIVE FACT, written before a single request is read. Absence of a `tools/call`
+    # receipt is the whole finding a gating measurement rests on, and absence is also what a
+    # server that never started produces — so the reader checks this record first and calls
+    # the run unmeasured without it, rather than reading silence as a filter working.
+    # A DIGEST, NEVER THE MARKER. The receipts path is handed to the CLI in its own config —
+    # it has to be, that is how the server is told where to write — and the file lands in the
+    # CLI's working directory under `--allow-all`, so a shell or file-read tool can print it.
+    # Minting moved the secret out of the config and left it readable one hop away: the plain
+    # marker in this record is a second route to the value the round-trip clause exists to
+    # prove only a REPLY can carry. A sha256 is not invertible, so the driver can still
+    # recognise the marker when it sees it and the CLI cannot produce it from this file
+    # (review, PR #110). The marker itself now exists only in this process's memory and in the
+    # replies `echo` emits.
+    _receipt(kind="listening", server=SERVER_NAME, tools=[t["name"] for t in TOOLS],
+             identity_digest=identity_digest())
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -349,6 +414,14 @@ def main() -> int:
         method = msg.get("method")
         req_id = msg.get("id")
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+
+        # BEFORE `_reject`, and before the notification check below. What a measurement of a
+        # client's filter needs is what the client SENT, which is not the same set as what
+        # this server chose to answer — a request refused here still arrived, and a filter
+        # that let it through has already failed whether or not it got a reply.
+        _receipt(kind="request", method=method if isinstance(method, str) else None,
+                 tool=(params.get("name") if method == "tools/call"
+                       and isinstance(params.get("name"), str) else None))
 
         # A NOTIFICATION carries no id and must never be answered — `notifications/
         # initialized` is the one every client sends, and replying to it is a protocol

@@ -466,9 +466,13 @@ def main() -> int:
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     server.daemon_threads = True
     actual = server.server_address[1]
+    # ECHO'S IDENTITY, AS A DIGEST — see the stdio fixture. The receipts file is the route
+    # back to the driver that does not pass through the client, and it must not also be a
+    # route from the client to the marker.
     RECEIPTS.write("listening", port=actual,
                    streamable=f"http://127.0.0.1:{actual}{PATH_STREAMABLE}",
-                   sse=f"http://127.0.0.1:{actual}{PATH_SSE}")
+                   sse=f"http://127.0.0.1:{actual}{PATH_SSE}",
+                   identity_digest=echo.identity_digest())
     # STDOUT, ONE LINE, FLUSHED: the caller needs the port before it can write a config
     # naming it, and an ephemeral port is the only kind that cannot collide with whatever
     # else is running on a developer machine or a CI box.

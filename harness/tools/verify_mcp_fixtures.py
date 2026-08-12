@@ -28,6 +28,8 @@ most likely to produce.
 """
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
 import os
 import pathlib
@@ -1702,6 +1704,40 @@ check("...and finds nothing in output that is not a check, so the empty parse it
                re.MULTILINE) == [],
       "otherwise the guard's fail-closed branch is unreachable")
 
+# THE ANCHOR VALIDATOR, driven on a synthetic tree rather than on this one. A stale anchor is
+# an entry that cannot be applied, and the runner used to discover that only on reaching it —
+# an hour in, for a list this long. Driven here on three trees whose right answers are known:
+# present once, absent, and present twice. NOT pointed at the real `harness/`, deliberately:
+# under an applied mutation a target legitimately no longer contains its own anchor, so a check
+# that read the live tree would go red for whichever mutation was in flight.
+_anchor_tmp = tempfile.mkdtemp(prefix="verify-anchors-")
+try:
+    _synth = pathlib.Path(_anchor_tmp) / "t.py"
+    _entry = [("X1-example", "t.py", "needle", "haystack", "some arm")]
+    _synth.write_text("before\nneedle\nafter\n")
+    check("an anchor present exactly once is not reported stale",
+          MUT.stale_anchors(_anchor_tmp, _entry) == [], MUT.stale_anchors(_anchor_tmp, _entry))
+    # BOTH WAYS OF NOT BEING APPLICABLE. Zero occurrences is the rewritten line; two is the
+    # anchor that would match the wrong site, which §4 already records as having injected an
+    # `IndentationError` reported as "failed, but NOT via" rather than as a defect found.
+    _synth.write_text("before\nafter\n")
+    check("...an anchor whose text no longer exists is reported, with its count",
+          MUT.stale_anchors(_anchor_tmp, _entry) == [("X1-example", "t.py", 0)],
+          MUT.stale_anchors(_anchor_tmp, _entry))
+    _synth.write_text("needle\nneedle\n")
+    check("...and so is one that matches twice, which would mutate the wrong site",
+          MUT.stale_anchors(_anchor_tmp, _entry) == [("X1-example", "t.py", 2)],
+          MUT.stale_anchors(_anchor_tmp, _entry))
+    # A TUPLE `find` IS TWO ANCHORS, and a defect defended in two places needs both removed —
+    # so a validator reading only the first would clear an entry that cannot be applied.
+    _pair = [("X2-pair", "t.py", ("needle", "gone"), ("a", "b"), "some arm")]
+    check("...and a two-part anchor is checked in both parts, not just the first",
+          MUT.stale_anchors(_anchor_tmp, _pair) == [("X2-pair", "t.py", 2),
+                                                    ("X2-pair", "t.py", 0)],
+          MUT.stale_anchors(_anchor_tmp, _pair))
+finally:
+    shutil.rmtree(_anchor_tmp, ignore_errors=True)
+
 print()
 print("E18. probe_remote_mcp.py's startup path — the copy a fix was left out of")
 
@@ -1770,6 +1806,538 @@ for _desc, _body in _FAKES.items():
         _p.kill()
         _p.wait(timeout=DEADLINE)
 shutil.rmtree(_startup_tmp, ignore_errors=True)
+
+print()
+print("E19. the three copilot probes' classifiers, driven without a copilot install")
+# THE VERDICT IS THE PRODUCT. These probes exist to answer one question — can copilot's
+# `tools:` back `mcp_tool_filter = "native"` — and an adapter decision is about to rest on the
+# word they print. §4's rule for probes applies with the weight of that decision behind it.
+#
+# WHAT THIS SECTION IS ACTUALLY GUARDING, and it is not the `if` chain. Both gating probes
+# printed ENFORCED over a run in which the ALLOWED tool was never called in any arm, because
+# the prompt named only the off-list one — so a `tools:` that suppressed the server wholesale
+# was indistinguishable from a filter, and the verdict was right by luck. The repair added the
+# `SUPPRESSES_ALL` branch; what keeps it honest is that the branch is DRIVEN here, and that
+# the readers underneath it are pinned to the fixtures that author the rows they read.
+import probe_copilot_config as CFG              # noqa: E402 — after the path bootstrap at E14
+import probe_copilot_gating as CG               # noqa: E402
+import probe_copilot_remote_gating as CRG       # noqa: E402
+import http_mcp_server as HTTPF                 # noqa: E402
+import echo_mcp_server as ECHOMOD               # noqa: E402 — the original the probes import
+
+_e19 = tempfile.mkdtemp(prefix="verify-copilot-")
+try:
+    # -- the readers, against rows their own fixtures wrote ---------------------------------
+    # NOT HAND-TYPED DICTS, which is the whole point. Each probe's `called`/`server_ran` is a
+    # private copy of its fixture's receipt spelling, and the two fixtures do NOT agree: the
+    # echo server writes `kind="request"` with the JSON-RPC method, while the HTTP server
+    # writes `kind="request"` for the HTTP verb and a separate `kind="rpc"` row for the
+    # message. A probe reading the other one's spelling finds nothing, forever, and reports a
+    # perfect filter. Synthetic rows would agree with whatever the probe expects and could
+    # never catch it — so the fixtures author these.
+    _stdio_receipts = os.path.join(_e19, "echo-receipts.jsonl")
+    run([{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+          "params": {"name": "echo", "arguments": {"text": "HI"}}}],
+        server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": _stdio_receipts})
+    _stdio_rows = CG.read_receipts(_stdio_receipts)
+    check("the stdio probe's reader agrees with the receipt the echo fixture actually writes",
+          CG.server_ran(_stdio_rows) and CG.called(_stdio_rows, "echo"), _stdio_rows)
+    check("...and reports nothing for a tool that was never called",
+          not CG.called(_stdio_rows, "add"), _stdio_rows)
+
+    # The HTTP fixture's own writer, its own `dispatch`, pointed at a file read back here.
+    _http_receipts = os.path.join(_e19, "http-receipts.jsonl")
+    HTTPF.RECEIPTS = HTTPF.Receipts(_http_receipts)
+    HTTPF.dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "echo", "arguments": {"text": "HI"}}})
+    _http_rows = CRG.read_receipts(_http_receipts)
+    check("the remote probe's reader agrees with the row the HTTP fixture actually writes",
+          CRG.called(_http_rows, "echo") and not CRG.called(_http_rows, "add"), _http_rows)
+    check("...and the two probes' readers are NOT interchangeable, which is why each is pinned",
+          not CRG.called(_stdio_rows, "echo") or not CG.called(_http_rows, "echo"),
+          (_stdio_rows, _http_rows))
+
+    # -- `credential_arrived`: every request, not one of them -------------------------------
+    _bearer = "sentinel-for-this-check"
+
+    def _hdr(tok):
+        return {"kind": "request", "headers": {"authorization": f"Bearer {tok}"}}
+
+    check("the bearer counts only when it is on EVERY request that carried headers",
+          CRG.credential_arrived([_hdr(_bearer), _hdr(_bearer)], _bearer)
+          and not CRG.credential_arrived([_hdr(_bearer), _hdr("other")], _bearer),
+          "a client that sends the credential once and drops it is a different animal")
+    check("...and a run with no requests at all does not count as the bearer having arrived",
+          not CRG.credential_arrived([{"kind": "listening"}], _bearer))
+    # INTACT, NOT MERELY CONTAINING. `sentinel in value` is true of `Bearer <sentinel>-altered`
+    # and of anything that wraps or re-encodes the declared header, so containment would pass a
+    # client that sent the server something the harness never declared (review, PR #110).
+    check("...and a bearer the client altered around the token does not count as arrival",
+          not CRG.credential_arrived(
+              [{"kind": "request", "headers": {"authorization": f"Bearer {_bearer}-altered"}}],
+              _bearer),
+          "containment accepts a value that is not the one declared")
+
+    # -- every verdict of both gating classifiers -------------------------------------------
+    def _arms(probe, *tools):
+        """Receipt rows in `probe`'s own spelling — read off the reader under test, so the
+        helper cannot disagree with it about `kind` while the checks below still pass."""
+        kind = "rpc" if probe is CRG else "request"
+        return [{"kind": "listening"}] + [{"kind": kind, "method": "tools/call", "tool": t}
+                                          for t in tools]
+
+    for _p, _name in ((CG, "stdio"), (CRG, "remote")):
+        _both, _echo, _add, _none = (_arms(_p, "echo", "add"), _arms(_p, "echo"),
+                                     _arms(_p, "add"), _arms(_p))
+        check(f"{_name}: the off-list tool blocked while the on-list one arrives is ENFORCED",
+              _p.classify(_echo, _both, True)[0] == _p.ENFORCED,
+              _p.classify(_echo, _both, True))
+        check(f"{_name}: the off-list tool arriving under the allowlist is LEAKED",
+              _p.classify(_both, _both, True)[0] == _p.LEAKED,
+              _p.classify(_both, _both, True))
+        # THE BRANCH THE ORIGINAL PROBES DID NOT HAVE, and the pair is the check: these two
+        # arms differ in exactly one fact — whether the ALLOWED tool arrived — and the first
+        # version scored both of them ENFORCED. An allowlist admitting nothing is not a
+        # boundary; it is a server that does not work.
+        check(f"{_name}: NEITHER tool arriving under the allowlist is SUPPRESSES_ALL, not a filter",
+              _p.classify(_none, _both, True)[0] == _p.SUPPRESSES_ALL,
+              _p.classify(_none, _both, True))
+        check(f"{_name}: ...and that verdict differs from ENFORCED by the on-list call alone",
+              _p.classify(_none, _both, True)[0] != _p.classify(_echo, _both, True)[0]
+              and _none == [r for r in _echo if r.get("tool") != "echo"])
+        # ARRIVING IS NOT WORKING, and this pair is that distinction: identical receipts, one
+        # bit apart. Everything the classifier reads comes from the server's record of what
+        # came IN, so without this clause a client that forwards the call and drops the reply
+        # scores ENFORCED and the harness gates onto a tool that returns nothing.
+        check(f"{_name}: an on-list call whose reply never came back is ANSWER_LOST, not ENFORCED",
+              _p.classify(_echo, _both, False)[0] == _p.ANSWER_LOST,
+              _p.classify(_echo, _both, False))
+        check(f"{_name}: ...and the receipts alone cannot tell those two apart",
+              _p.classify(_echo, _both, False)[0] != _p.classify(_echo, _both, True)[0])
+        # THE PERMISSIVE VALUE IS NOT A DEFAULT. A caller that omitted `answered` would be
+        # handed ENFORCED, which is the clause opening the hole it was added to close.
+        check(f"{_name}: the round-trip fact is required rather than defaulted",
+              isinstance(survives(_p.classify, _echo, _both), TypeError),
+              survives(_p.classify, _echo, _both))
+        # UNMEASURED IN BOTH DIRECTIONS. The gated arm is read for two facts of opposite sign,
+        # so a control that skipped either tool leaves the reading for that one to the model.
+        check(f"{_name}: a control that never called the off-list tool measures nothing",
+              _p.classify(_echo, _echo, True)[0] == _p.UNMEASURED,
+              _p.classify(_echo, _echo, True))
+        check(f"{_name}: ...and neither does one that never called the on-list tool",
+              _p.classify(_add, _add, True)[0] == _p.UNMEASURED,
+              _p.classify(_add, _add, True))
+        check(f"{_name}: a server that never started is an instrument failure, not a result",
+              _p.classify(_echo, [], True)[0] == _p.INSTRUMENT_FAILED
+              and _p.classify([], _both, True)[0] == _p.INSTRUMENT_FAILED)
+
+    # -- the marker must be unreachable except through a tool result -----------------------
+    # `answered` is "the marker appeared in the CLI's output", which is evidence about a reply
+    # only while the CLI has no other copy. Three revisions put one where it could: the config
+    # file copilot reads, then copilot's own environment, then the receipts file — whose path
+    # is in that same config and which lands in copilot's working directory under `--allow-all`.
+    # The receipts now carry a sha256 and never the marker, so recognition travels without the
+    # secret, and the plaintext exists only in the server's memory and its replies.
+    _cfg_written = CG.mcp_config(os.path.join(_e19, "cfg.json"),
+                                 os.path.join(_e19, "receipts.jsonl"), tools=["echo"])
+    with open(_cfg_written, encoding="utf-8") as _fh:
+        _cfg_text = _fh.read()
+    check("the config asks the server to MINT a marker rather than carrying one",
+          CG.IDENTITY_GENERATE in _cfg_text
+          and '"tools": ["echo"]' in _cfg_text.replace("'", '"'), _cfg_text)
+    # ONE IMPLEMENTATION, NOT TWO. These were duplicated, and every offline check drove the
+    # stdio copy — so a fix applied to one would have shipped with everything green.
+    check("both probes share ONE digest reader, so a fix cannot land in only one of them",
+          CRG.minted_digest is CG.minted_digest
+          and CRG.reply_carried_marker is CG.reply_carried_marker,
+          (CRG.minted_digest, CG.minted_digest))
+    check("...and that sentinel is the fixture's own, not a second spelling of it",
+          CG.IDENTITY_GENERATE == ECHOMOD.IDENTITY_GENERATE == CRG.IDENTITY_GENERATE,
+          (CG.IDENTITY_GENERATE, ECHOMOD.IDENTITY_GENERATE))
+    # DRIVEN THROUGH THE FIXTURE ITSELF, so the digest is the server's and not a claim about it.
+    _mint_receipts = os.path.join(_e19, "minted.jsonl")
+    _replies, _n, _r, _stream = run(
+        [legacy_init(1),
+         {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+          "params": {"name": "echo", "arguments": {"text": "PAYLOAD"}}}],
+        server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": _mint_receipts,
+                                "ECHO_MCP_IDENTITY": ECHOMOD.IDENTITY_GENERATE})
+    _rows = CG.read_receipts(_mint_receipts)
+    _digest = CG.minted_digest(_rows)
+    _reply_text = json.dumps(_replies)
+    # THE SERVER REALLY MINTED, asserted directly rather than inferred from the marker's shape.
+    # Under a broken mint `IDENTITY` stays the sentinel, whose digest is a perfectly well-formed
+    # 64-hex string — so every structural check passes and only this one notices.
+    check("the digest reported is not the sentinel's, so the server minted rather than echoed",
+          bool(_digest) and _digest != hashlib.sha256(
+              ECHOMOD.IDENTITY_GENERATE.encode("utf-8")).hexdigest(),
+          _digest)
+    # THE TOKEN THE REPLY CARRIED, recovered and then looked for in the serialized receipts.
+    # Checking that no KEY is named "identity" tests the schema and not the values — a record
+    # carrying the right digest plus `"leaked_plaintext": <marker>` passed it (review, PR #110).
+    # The marker is whichever candidate in the reply hashes to the reported digest, so this
+    # searches for the real value rather than for a field name.
+    _marker_in_reply = next((tok for tok in set(CG._CANDIDATE_RE.findall(_reply_text))
+                             if hashlib.sha256(tok.encode()).hexdigest() == _digest), "")
+    check("the marker is recoverable from the reply, which is what makes the next check real",
+          bool(_marker_in_reply), (_digest, _reply_text[:200]))
+    check("the receipts carry a DIGEST, and that marker VALUE appears nowhere in them",
+          bool(_digest) and len(_digest) == 64 and bool(_marker_in_reply)
+          and _marker_in_reply not in json.dumps(_rows),
+          _rows)
+    # THE PAIR THAT MAKES IT A MEASUREMENT: the reply carries a token matching that digest, and
+    # the receipts do not. Without the second half the digest could simply be of something the
+    # file already contains.
+    check("...and the reply carries a token whose digest is the one reported",
+          CG.reply_carried_marker(_reply_text, _digest), (_digest, _reply_text[:300]))
+    check("...while the receipts themselves do not satisfy it, so the file is not a route",
+          not CG.reply_carried_marker(json.dumps(_rows), _digest), _rows)
+    # THE SENTINEL IS NOT A MARKER. A receipt reporting `@generate` is exactly what a broken
+    # mint produces, and the live probe used to accept it — a transcript containing that word
+    # then scored ENFORCED. Shape-validation is what refuses it.
+    # TWO INSTANCES, AND THEY MUST DIFFER. Excluding the sentinel says the value is not THAT
+    # constant; it says nothing about any other. `IDENTITY = "a" * 32` satisfies every digest,
+    # reply and receipt check above — and a constant in the fixture SOURCE is readable by a CLI
+    # that can read files, which is the non-reply route this whole clause exists to close. Only
+    # comparing two independent instances distinguishes "minted" from "hard-coded" (review, PR
+    # #110). The reply tokens are compared, not just the digests, so a fixture that varied the
+    # digest while emitting a constant marker would fail too.
+    _second = os.path.join(_e19, "minted2.jsonl")
+    _replies2, _n2, _r2, _s2 = run(
+        [legacy_init(1),
+         {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+          "params": {"name": "echo", "arguments": {"text": "PAYLOAD"}}}],
+        server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": _second,
+                                "ECHO_MCP_IDENTITY": ECHOMOD.IDENTITY_GENERATE})
+    _digest2 = CG.minted_digest(CG.read_receipts(_second))
+    _marker2 = next((tok for tok in set(CG._CANDIDATE_RE.findall(json.dumps(_replies2)))
+                     if hashlib.sha256(tok.encode()).hexdigest() == _digest2), "")
+    check("two `@generate` instances mint DIFFERENT markers, so it is not a constant",
+          bool(_marker_in_reply) and bool(_marker2) and _marker_in_reply != _marker2
+          and _digest != _digest2,
+          (_marker_in_reply, _marker2))
+    check("a receipt whose identity is the generation sentinel is not a minted marker",
+          CG.minted_digest([{"kind": "listening", "identity_digest": ECHOMOD.IDENTITY_GENERATE}])
+          == "" and CG.minted_digest([{"kind": "listening", "identity_digest": "nope"}]) == ""
+          and CG.minted_digest([{"kind": "listening", "identity_digest": 7}]) == "",
+          "only a 64-hex digest is a digest")
+    check("...and an empty digest is never satisfied by any transcript",
+          not CG.reply_carried_marker("@generate anything at all", ""),
+          "a server that minted nothing cannot have answered")
+    # A run that did NOT ask for a marker must not gain one — the knob stays opt-in, or every
+    # existing verbatim-echo check changes meaning. `server_ran` first: a fixture that never
+    # started writes no receipts, and the claim would pass on that absence.
+    _plain = os.path.join(_e19, "plain.jsonl")
+    run([{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+          "params": {"name": "echo", "arguments": {"text": "HI"}}}],
+        server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": _plain})
+    check("...while a server not asked for a marker reports none, so the knob stays opt-in",
+          CG.server_ran(CG.read_receipts(_plain))
+          and CG.minted_digest(CG.read_receipts(_plain)) == "",
+          CG.read_receipts(_plain))
+
+    # -- and the VERDICTS, which are a separate claim from the classifiers -------------------
+    # A classifier proven correct says nothing about whether `main` acted on it. `remote_shape`
+    # had its own function and its own mutation while the exit status read only the stdio half,
+    # so a remote add that filed a LOCAL entry left the probe green — the finding is the shape
+    # of the gap, not the helper (review, PR #110).
+    #
+    # AND THE VERDICT MUST MEAN WHAT ITS NAME SAYS. The exit status was wired to "the question
+    # was settled", under comments claiming it certified the filter — so `LEAKED`, the finding
+    # these probes exist to catch, exited 0 beside `ENFORCED`. The two are separate functions
+    # now, and this is the pair that holds them apart.
+    for _p, _n in ((CG, "stdio"), (CRG, "remote")):
+        check(f"{_n}: every definite answer counts as the question having been settled",
+              all(_p.settled(v) for v in (_p.ENFORCED, _p.LEAKED, _p.SUPPRESSES_ALL,
+                                          _p.ANSWER_LOST))
+              and not _p.settled(_p.UNMEASURED) and not _p.settled(_p.INSTRUMENT_FAILED))
+    # THE DISTINCTION ITSELF: settled and certifying are not the same set, and the gap is
+    # exactly the verdicts that say NO.
+    check("stdio: a settled negative does NOT certify `native`, which is what exit 0 claims",
+          CG.certifies_native(CG.ENFORCED, True)
+          and not any(CG.certifies_native(v, True) for v in (CG.LEAKED, CG.SUPPRESSES_ALL,
+                                                             CG.ANSWER_LOST))
+          and all(CG.settled(v) for v in (CG.LEAKED, CG.SUPPRESSES_ALL, CG.ANSWER_LOST)),
+          "LEAKED is an answer; it is not permission")
+    check("remote: ...and the same, per transport, over bearer and version too",
+          CRG.certifies_native(CRG.ENFORCED, True, True)
+          and not CRG.certifies_native(CRG.LEAKED, True, True)
+          and not CRG.certifies_native(CRG.ENFORCED, False, True)
+          and not CRG.certifies_native(CRG.ENFORCED, True, False),
+          "an SSE leak beside a green Streamable result used to exit 0")
+    # THE VERSION GATE. A result written up as "at 1.0.79" is worth nothing from a run that
+    # could not read a version, and this used to be a string in a `print`.
+    for _p, _n in ((CG, "stdio"), (CRG, "remote"), (CFG, "config")):
+        check(f"{_n}: a preflight version must LOOK like a version, not merely be output",
+              _p.version_verdict(0, "GitHub Copilot CLI 1.0.79", "")[1] is True
+              and _p.version_verdict(0, "warning only", "")[1] is False
+              and _p.version_verdict(1, "", "boom")[1] is False
+              and _p.version_verdict(0, "", "")[1] is False,
+              [_p.version_verdict(0, s, e) for s, e in
+               (("GitHub Copilot CLI 1.0.79", ""), ("warning only", ""), ("", ""))])
+    check("...and the text is carried through so the failure names what it saw",
+          CG.version_verdict(1, "", "not found")[0] == "not found"
+          and CG.version_verdict(0, "1.0.79", "")[0] == "1.0.79",
+          [CG.version_verdict(1, "", "not found"), CG.version_verdict(0, "1.0.79", "")])
+    # THE GATING PROBES USE THE RUN'S OWN WITNESS, not a second execution: copilot's launcher
+    # can resolve different cached code between two invocations, which is why the adapter reads
+    # the version out of `session.skills_loaded` and why that reader is imported rather than
+    # reimplemented here.
+    _skills = json.dumps({"type": "session.skills_loaded", "data": {"skills": [
+        {"source": "builtin", "path": "/x/pkg/darwin-arm64/1.0.79/builtin/s/SKILL.md"}]}})
+    _skills99 = _skills.replace("1.0.79", "9.9.9")
+    for _p, _n in ((CG, "stdio"), (CRG, "remote")):
+        check(f"{_n}: the version is recovered from the run's own stream",
+              _p.agreed_version([_skills]) == ("1.0.79", True), _p.agreed_version([_skills]))
+        # EVERY EXECUTED ARM MUST WITNESS. One witnessed arm beside one silent arm reads as
+        # witnessed under any rule that concatenates or samples — and the silent arm is exactly
+        # the one that could have been a different build.
+        check(f"{_n}: an executed arm with no witness leaves the run UNVERIFIED",
+              _p.agreed_version([_skills, ""])[1] is False
+              and _p.agreed_version([""])[1] is False
+              and _p.agreed_version([])[1] is False,
+              [_p.agreed_version([_skills, ""]), _p.agreed_version([])])
+        # ...AND THEY MUST AGREE. The decisive arm is not the one the version came from unless
+        # they are the same build: control at 1.0.79 with a gated arm at 9.9.9 exited 0
+        # reporting 1.0.79.
+        check(f"{_n}: ...and arms that ran different builds do not agree on one",
+              _p.agreed_version([_skills, _skills99])[1] is False
+              and _p.agreed_version([_skills, _skills])[1] is True,
+              _p.agreed_version([_skills, _skills99]))
+        # MODEL-CONTROLLED TEXT MUST NOT FORGE IT — the reasoning the adapter already carries,
+        # asserted here because these probes now depend on it.
+        check(f"{_n}: ...and prose naming an app root does not count as a witness",
+              _p.agreed_version(
+                  ['{"type":"assistant","text":"pkg/darwin-arm64/9.9.9/builtin/"}'])[1]
+              is False, "only builtin skill paths are structural")
+    # The config probe's three findings, a conjunction and not a lookup on the last. The
+    # VERSION IS DELIBERATELY ABSENT: `copilot mcp add` emits no in-band witness, so a version
+    # term there is unverifiable by construction — always-false (exit 1 on every run, the state
+    # `type` used to create) or always-true (a check that cannot fail). It reports shape, and
+    # the two gating probes carry the version-qualified claims.
+    check("the config probe fails on ANY of its three findings, not just the stdio ones",
+          CFG.exit_code([], [], True) == 0
+          and all(CFG.exit_code(d, s, r) == 1 for d, s, r in
+                  ((["k"], [], True), ([], ["k"], True), ([], [], False))),
+          [CFG.exit_code(d, s, r) for d, s, r in
+           (([], [], True), (["k"], [], True), ([], ["k"], True), ([], [], False))])
+    check("...and it takes no version argument at all, so it cannot pretend to be qualified",
+          "version" not in inspect.signature(CFG.exit_code).parameters,
+          inspect.signature(CFG.exit_code))
+    # AND THE STATE THAT MADE `remote_ok` UNREACHABLE. `type` was a permanent surprise, so the
+    # exit status was 1 on every real run and no other term could move it — a conjunction whose
+    # terms cannot vary is a constant. This is the measured 1.0.79 body; it must surprise nobody.
+    check("the discriminator copilot actually writes is a known key, not a permanent surprise",
+          CFG.unexpected_keys({"mcpServers": {"e": {"type": "local", "command": "x",
+                                                    "args": [], "env": {}, "tools": ["*"]}}},
+                              CFG.EXPECTED) == [],
+          "while it was unknown, `surprises` was never empty and `remote_ok` could not matter")
+    check("...while a key nobody has measured yet is still reported",
+          CFG.unexpected_keys({"mcpServers": {"e": {"type": "local", "wat": 1}}},
+                              CFG.EXPECTED) == ["wat"])
+
+    # THE CONTROL DECIDES ALONE, or it does not — and `main` reads the same function
+    # `classify` does, so the short-circuit cannot drift from the verdict it is short-cutting.
+    for _p, _n in ((CG, "stdio"), (CRG, "remote")):
+        _both = _arms(_p, "echo", "add")
+        check(f"{_n}: a control that exercised both tools does NOT decide alone",
+              _p.control_verdict(_both) is None, _p.control_verdict(_both))
+        check(f"{_n}: ...a control that never started decides INSTRUMENT_FAILED",
+              (_p.control_verdict([]) or ("", ""))[0] == _p.INSTRUMENT_FAILED)
+        check(f"{_n}: ...and one that skipped a tool decides UNMEASURED, so no second call",
+              (_p.control_verdict(_arms(_p, "echo")) or ("", ""))[0] == _p.UNMEASURED
+              and (_p.control_verdict(_arms(_p, "add")) or ("", ""))[0] == _p.UNMEASURED)
+        # AND `classify` MUST AGREE WITH IT, since the whole point is one authority.
+        check(f"{_n}: ...and classify returns exactly what the control decided",
+              _p.classify(_both, _arms(_p, "echo"), True) ==
+              _p.control_verdict(_arms(_p, "echo")))
+
+    # -- and the SHORT-CIRCUIT is proved by counting calls, not by reading the condition ----
+    # `control_verdict` agreeing with `classify` says the RULE is right; it says nothing about
+    # whether `main` obeys it. Removing the actual short-circuit left every check above green
+    # and F72 green with it, because nothing here had ever invoked the consumer (review, PR
+    # #110). So: a fake runner, and the claim is a CALL COUNT.
+    _calls: list = []
+
+    def _fake_arm(_workdir, *, tools):
+        _calls.append(tools)
+        # `listening` plus whichever tools this canned control "called".
+        rows = [{"kind": "listening"}] + [
+            {"kind": "request", "method": "tools/call", "tool": name}
+            for name in _fake_arm.tools_called]
+        return rows, _fake_arm.transcript
+
+    _real_arm, _real_version = CG.run_arm, CG.agreed_version
+    try:
+        CG.run_arm = _fake_arm
+        CG.agreed_version = lambda streams: ("1.0.79", True)
+        # A control that skipped the on-list tool decides UNMEASURED on its own.
+        _fake_arm.tools_called, _fake_arm.transcript = ["add"], ""
+        _calls.clear()
+        _rc_short = CG.main()
+        check("stdio main does NOT run the gated arm once the control has decided",
+              len(_calls) == 1 and _calls == [None] and _rc_short == 1, _calls)
+        # ...and the positive control, or the check above is satisfied by a main that never
+        # runs anything at all.
+        _fake_arm.tools_called, _fake_arm.transcript = ["add", "echo"], ""
+        _calls.clear()
+        CG.main()
+        check("...while a control that decided nothing DOES run it, so the skip is conditional",
+              len(_calls) == 2 and _calls[1] == [CG.ALLOWED], _calls)
+    finally:
+        CG.run_arm, CG.agreed_version = _real_arm, _real_version
+
+    # The remote probe's `measure` has the same consumer, one layer in.
+    _rcalls: list = []
+
+    def _fake_start(receipts, _marker):
+        rows = [{"kind": "listening"}] + [
+            {"kind": "rpc", "method": "tools/call", "tool": name}
+            for name in _fake_remote.tools_called]
+        with open(receipts, "w", encoding="utf-8") as fh:
+            fh.writelines(json.dumps(r) + "\n" for r in rows)
+
+        class _P:
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                pass
+        return _P(), {"streamable": "http://x/mcp", "sse": "http://x/sse"}
+
+    def _fake_remote(_workdir, _url, _sentinel, _kind, *, tools):
+        _rcalls.append(tools)
+        return "", None
+
+    _real = (CRG.start_fixture, CRG.run_arm)
+    _remote_tmp = tempfile.mkdtemp(prefix="verify-shortcircuit-")
+    try:
+        CRG.start_fixture, CRG.run_arm = _fake_start, _fake_remote
+        _fake_remote.tools_called = ["add"]
+        _rcalls.clear()
+        CRG.measure(_remote_tmp, "http", "streamable", "sentinel")
+        check("remote measure does NOT run the gated arm once the control has decided",
+              len(_rcalls) == 1 and _rcalls == [None], _rcalls)
+        _fake_remote.tools_called = ["add", "echo"]
+        _rcalls.clear()
+        CRG.measure(_remote_tmp, "http", "streamable", "sentinel")
+        check("...while a control that decided nothing DOES run it, so the skip is conditional",
+              len(_rcalls) == 2 and _rcalls[1] == [CRG.ALLOWED], _rcalls)
+    finally:
+        CRG.start_fixture, CRG.run_arm = _real
+        shutil.rmtree(_remote_tmp, ignore_errors=True)
+
+    # THE POOLED VERSION, driven through the consumer rather than read off the helper. Each
+    # transport agreeing with ITSELF is not one build enforcing both: review drove HTTP at
+    # 1.0.79 and SSE at 9.9.9 and got exit 0, two builds reported as one.
+    def _streams_for(version):
+        line = json.dumps({"type": "session.skills_loaded", "data": {"skills": [
+            {"source": "builtin",
+             "path": f"/x/pkg/darwin-arm64/{version}/builtin/s/SKILL.md"}]}})
+        rows = [{"kind": "listening"}] + [
+            {"kind": "rpc", "method": "tools/call", "tool": n} for n in ("echo", "add")]
+        return {"control": (rows, line), "gated": (rows, line)}
+
+    _per_transport: list = []
+
+    def _fake_measure(_workdir, kind, _endpoint, _sentinel):
+        return (CRG.ENFORCED, "canned", _streams_for(_per_transport.pop(0)), True, True)
+
+    _real_measure = CRG.measure
+    _mt = tempfile.mkdtemp(prefix="verify-pooled-")
+    try:
+        CRG.measure = _fake_measure
+        _per_transport[:] = ["1.0.79", "1.0.79"]
+        _same = CRG.main()
+        _per_transport[:] = ["1.0.79", "9.9.9"]
+        _split = CRG.main()
+        check("remote: every arm of every transport names ONE build, not one per transport",
+              _same == 0 and _split == 1, (_same, _split))
+    finally:
+        CRG.measure = _real_measure
+        shutil.rmtree(_mt, ignore_errors=True)
+
+    # THE TWO VOCABULARIES ARE ONE VOCABULARY, asserted rather than assumed. Neither probe can
+    # import the other (each is a standalone opt-in tool), so this is §4's duplicated-rule rule:
+    # pin the copy to the original on the cases that distinguish them. A probe that renamed a
+    # verdict would otherwise report a word no reader of the other one recognises.
+    check("both gating probes spell the shared verdicts identically",
+          (CG.ENFORCED, CG.LEAKED, CG.UNMEASURED, CG.SUPPRESSES_ALL, CG.ANSWER_LOST,
+           CG.INSTRUMENT_FAILED)
+          == (CRG.ENFORCED, CRG.LEAKED, CRG.UNMEASURED, CRG.SUPPRESSES_ALL, CRG.ANSWER_LOST,
+              CRG.INSTRUMENT_FAILED))
+
+    # -- `read_receipts`: a partial line is an ending, not a crash --------------------------
+    _torn = os.path.join(_e19, "torn.jsonl")
+    with open(_torn, "w", encoding="utf-8") as _fh:
+        _fh.write('{"kind":"listening"}\n\n{"kind":"request","meth')
+    check("a receipts file whose last line was cut mid-write yields the records before it",
+          CG.read_receipts(_torn) == [{"kind": "listening"}], CG.read_receipts(_torn))
+    check("...and a receipts file that never appeared is empty rather than an exception",
+          CG.read_receipts(os.path.join(_e19, "nope.jsonl")) == [])
+
+    # -- probe_copilot_config.py: three states, and the key nobody thought of ---------------
+    _intended = {"mcpServers": {"echo": {"command": "python", "args": [], "env": {},
+                                         "tools": ["echo"], "url": "u", "headers": {},
+                                         "type": "http"}}}
+    check("a config in the intended spelling reports every key confirmed",
+          set(CFG.classify_keys(_intended, CFG.EXPECTED).values()) == {CFG.CONFIRMED},
+          CFG.classify_keys(_intended, CFG.EXPECTED))
+    # `differs` AND `unexercised` ARE NOT ONE STATE. "copilot wrote it differently" is an
+    # adapter change; "copilot never wrote it" is another probe run. Collapsing them would
+    # report work that does not exist, or hide work that does.
+    _renamed = {"mcp_servers": _intended["mcpServers"]}
+    check("a differently-named container is reported as `differs`, naming what was found",
+          CFG.classify_keys(_renamed, CFG.EXPECTED)["servers_container"] == "differs:mcp_servers",
+          CFG.classify_keys(_renamed, CFG.EXPECTED))
+    check("...while a config with no container at all leaves every key UNEXERCISED",
+          set(CFG.classify_keys({}, CFG.EXPECTED).values()) == {CFG.UNEXERCISED})
+    check("a key the adapter has no plan for is reported, since that is the one nobody sees",
+          CFG.unexpected_keys({"mcpServers": {"e": {"command": "x", "gateway": "z"}}},
+                              CFG.EXPECTED) == ["gateway"])
+    check("...and a body holding only known keys reports none, so the finding means something",
+          CFG.unexpected_keys({"mcpServers": {"e": {"command": "x", "args": []}}},
+                              CFG.EXPECTED) == [])
+    # THE SILENT ONE: `copilot mcp add name -- --url X` writes a well-formed LOCAL entry whose
+    # command is `--url`. A probe reading only "did a record appear" calls that a remote result.
+    _full = {"type": "http", "url": "u", "headers": {"Authorization": "Bearer x"},
+             "tools": ["echo"]}
+    check("a remote add filed as a local entry is named, not counted as the remote spelling",
+          CFG.remote_shape({"type": "local", "command": "--url"})[0] is False
+          and CFG.remote_shape({"type": "local", "command": "--url"})[1].startswith("LOCAL"),
+          CFG.remote_shape({"type": "local", "command": "--url"}))
+    check("...and the true remote shape is not mistaken for it",
+          CFG.remote_shape(_full) == (True, CFG.remote_shape(_full)[1])
+          and CFG.remote_shape(_full)[1].startswith("remote:"), CFG.remote_shape(_full))
+    # THE FULL SHAPE, not just a `url`. The gating probes write `type`/`url`/`headers`/`tools`
+    # by hand, and this is what says copilot writes the same four — confirming the url alone
+    # would leave the credential and the allowlist resting on documentation.
+    check("a remote entry missing the credential or the allowlist is not the shape §8 needs",
+          all(CFG.remote_shape({k: v for k, v in _full.items() if k != drop})[0] is False
+              for drop in ("headers", "tools")),
+          [CFG.remote_shape({k: v for k, v in _full.items() if k != d}) for d in
+           ("headers", "tools")])
+    # PRESENCE IS NOT SHAPE. `headers: []` and `tools: "wrong"` are values §8's pattern cannot
+    # be built from, and key-presence alone filed both as confirmation that it can.
+    check("a headers value that is not a mapping is not the credential half of §8's pattern",
+          CFG.remote_shape({**_full, "headers": []})[0] is False
+          and CFG.remote_shape({**_full, "headers": {"X": "y"}})[0] is False
+          and CFG.remote_shape({**_full, "headers": {"Authorization": "Basic zzz"}})[0] is False
+          and CFG.remote_shape({**_full, "headers": {"authorization": "Bearer t"}})[0] is True,
+          [CFG.remote_shape({**_full, "headers": h}) for h in
+           ([], {"X": "y"}, {"Authorization": "Basic zzz"}, {"authorization": "Bearer t"})])
+    check("...and an allowlist that is not a non-empty list of names is not one either",
+          all(CFG.remote_shape({**_full, "tools": v})[0] is False
+              for v in ("wrong", [], [""], [1], {"echo": True})),
+          [CFG.remote_shape({**_full, "tools": v}) for v in
+           ("wrong", [], [""], [1], {"echo": True})])
+    check("...and a transport discriminator that is not the one asked for is refused",
+          CFG.remote_shape(_full, want_type="sse")[0] is False
+          and CFG.remote_shape({**_full, "type": "sse"}, want_type="sse")[0] is True,
+          (CFG.remote_shape(_full, want_type="sse"),
+           CFG.remote_shape({**_full, "type": "sse"}, want_type="sse")))
+finally:
+    shutil.rmtree(_e19, ignore_errors=True)
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")
