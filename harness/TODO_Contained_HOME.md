@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 578 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 102/102 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 444 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 108/108 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 454 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 git diff --check
 
@@ -1638,6 +1638,28 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
      around it, so that the mutant is contained too. And the guard itself is not a mutation
      target: a mutation may perturb which processes are chosen, never the check that decides
      whether a chosen thing is a process at all. Establish that one by driving the values.
+- **An observation channel needs the SAME treatment wherever it appears, and the second copy
+  had none of it.** `verify_mcp_proxy.py` learned in PR #109 that a denied `ps` prints ALL PASS:
+  its `process_table()` raises on three modes — missing/denied, non-zero exit, and the
+  self-witness (`ps` that cannot see its own caller has not enumerated the machine). Then
+  `mutate_mcp.py` grew a SECOND process observer for the timeout sweep with none of them, and a
+  reviewer reproduced all three against it (PR #111). Two copies of a rule about trusting an
+  instrument is §4's duplicated-rule problem aimed squarely at the place absence is read as
+  proof, so there is now ONE observer and the proxy verifier imports it.
+
+  Two further things fell out, and both are the aimed-beside-it shape:
+
+  - **Availability and containment are different failures.** Losing the descendants is a
+    containment failure that must be NAMED — an empty leftover with no fault certifies a tree
+    nobody enumerated. Losing the ROOT is a hang: before the reap moved into a `finally`, a
+    raise out of the sweep left the suite process neither signalled nor waited for, and the
+    runner blocked forever on `wait4` with one worker gone and nothing saying why.
+  - **A `finally` beside an `except` for the expected failure is exercised by neither.**
+    `ObserverFailed` is caught, so the blind-`ps` case reaches the reap through the `except`
+    and would with no `finally` at all — the mutation that dedented it came back MISSED. What
+    the `finally` buys is every OTHER exit from the sweep, and testing it means injecting one.
+    Likewise a failing `ps` that prints NOTHING is answered by the self-witness clause, so the
+    exit-status clause goes untested unless the fake `ps` emits a valid row for the caller.
 - **A single-line anchor aimed at `mutate_mcp.py` itself matches TWICE**, and one of the two is
   the mutation entry quoting it. It is refused up front by `stale_anchors` rather than silently
   mutating the list instead of the code, but the fix is not obvious from the message: pin it

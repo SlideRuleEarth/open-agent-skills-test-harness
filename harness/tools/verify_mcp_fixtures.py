@@ -1870,6 +1870,96 @@ try:
 finally:
     shutil.rmtree(_edit_tmp, ignore_errors=True)
 
+# THE OBSERVER THE WHOLE SWEEP READS ABSENCE THROUGH. Everything below decides it is finished
+# when it sees no owned processes, so a `ps` that cannot answer reports the same silence as one
+# reporting success — and the timeout path would certify a tree it never looked at. This file's
+# sibling learned that with `ps` denied, printing ALL PASS including "the mute guardian goes"
+# (PR #109); this observer was then written without the rule and a reviewer reproduced all three
+# modes against it (PR #111). Driven here against a real broken `ps` on PATH, one mode each.
+
+
+def _with_ps_kill(body):
+    """What `kill_owned` does when the observer is broken — asked with NO root, deliberately.
+
+    Root `None` means the sweep signals nothing before it looks, so this isolates one question:
+    does a blind observer come back as a failure, or as "nothing left behind"? A root pid here
+    would add a real process to a case that is not about one.
+    """
+    tmp = tempfile.mkdtemp(prefix="verify-ps-kill-")
+    saved = os.environ["PATH"]
+    try:
+        fake = pathlib.Path(tmp) / "ps"
+        fake.write_text(body)
+        fake.chmod(0o755)
+        os.environ["PATH"] = f"{tmp}{os.pathsep}{saved}"
+        return survives(MUT.kill_owned, None, "a-marker-matching-nothing")
+    finally:
+        os.environ["PATH"] = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _with_ps(body, mode=0o755, only=False):
+    """`process_tree()`'s answer with `body` installed as `ps`, or the exception it raised.
+
+    A REAL EXECUTABLE ON PATH rather than a patched function: what is under test is how this
+    code treats a `ps` that is missing, refused, failing or lying, and a stub standing in for
+    the subprocess would be testing the stub. `only` drops the real PATH so nothing resolves.
+    """
+    tmp = tempfile.mkdtemp(prefix="verify-ps-")
+    saved = os.environ["PATH"]
+    try:
+        if body is not None:
+            fake = pathlib.Path(tmp) / "ps"
+            fake.write_text(body)
+            fake.chmod(mode)
+        os.environ["PATH"] = tmp if only else f"{tmp}{os.pathsep}{saved}"
+        return survives(MUT.process_tree)
+    finally:
+        os.environ["PATH"] = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# THE POSITIVE CONTROL FIRST, so the refusals below are a narrowing of an instrument that works
+# rather than a function that never answers. It also proves the self-witness clause is satisfied
+# by the real `ps`, which is what makes its absence meaningful in the blind case.
+_real_tree = survives(MUT.process_tree)
+check("the process observer answers, and lists this very process",
+      isinstance(_real_tree, dict) and os.getpid() in _real_tree and len(_real_tree) > 5,
+      f"got {type(_real_tree).__name__}: {_real_tree if not isinstance(_real_tree, dict) else len(_real_tree)}")
+check("a `ps` that is not there at all is a named failure, not an empty machine",
+      isinstance(_with_ps(None, only=True), MUT.ObserverFailed), _with_ps(None, only=True))
+# `only=True` IS THE WHOLE ARRANGEMENT HERE, and the first version of this check failed for
+# want of it — usefully. `execvp` keeps searching PATH after an `EACCES`, so a non-executable
+# `ps` with the real PATH still behind it resolves to the real one and the case tests nothing.
+# Denial has to be the only answer available, which is also what it looks like under a sandbox.
+check("...and one that cannot be executed is too, which is how a sandbox denies it",
+      isinstance(_with_ps("#!/bin/sh\nexit 0\n", mode=0o644, only=True), MUT.ObserverFailed),
+      _with_ps("#!/bin/sh\nexit 0\n", mode=0o644, only=True))
+# THE ONE THAT LOOKS LIKE AN ANSWER. Non-zero with output parses as a plausible machine, which
+# reads as "nothing more to sweep" and certifies every descendant gone.
+#
+# IT MUST STILL LIST US, or this case is answered by the WRONG CLAUSE. A failing `ps` that
+# printed nothing is also a `ps` that cannot see this process, so the self-witness catches it
+# and the exit-status clause goes untested — the mutation that deletes the status check came
+# back MISSED for exactly that reason, and this is the shape §4 calls a check aimed beside the
+# thing that matters. Emitting our own row leaves the status as the only thing wrong.
+_failing_ps = (f'#!/bin/sh\necho "  {os.getpid()} 1 S /the/verifier"\n'
+               f'echo "ps: bad flag" >&2\nexit 3\n')
+check("...and one that exits non-zero is a failure even though its output parses fine",
+      isinstance(_with_ps(_failing_ps), MUT.ObserverFailed), _with_ps(_failing_ps))
+# AND THE ONE THAT LOOKS LIKE A GOOD ANSWER: exit 0, well-formed rows, simply not the machine.
+# Nothing about the exit status can catch this; only asking whether the observer can see the
+# one process it is certainly running inside.
+check("...and one that succeeds without listing THIS process has not enumerated the machine",
+      isinstance(_with_ps('#!/bin/sh\necho "  99998 1 S /usr/bin/somethingelse"\n'
+                          'echo "  99999 99998 S /usr/bin/another"\n'), MUT.ObserverFailed),
+      _with_ps('#!/bin/sh\necho "  99998 1 S /usr/bin/somethingelse"\n'))
+# AND THE SWEEP PROPAGATES IT RATHER THAN REPORTING A CLEAN TREE. `kill_owned` returning `()`
+# under a blind observer is the precise reading this whole section exists to refuse.
+_kill_blind = _with_ps_kill("#!/bin/sh\nexit 3\n")
+check("...and the sweep raises it rather than answering 'nothing left behind'",
+      isinstance(_kill_blind, MUT.ObserverFailed), _kill_blind)
+
 # THE CHEAP, CONTAINED CHECKS RUN FIRST, and the ordering is load-bearing rather than
 # tidy. These are driven on a synthetic table and cannot leak or signal anything; the
 # live probes below start real processes and sweep them. A mutation that breaks the
@@ -1940,10 +2030,10 @@ check("...and the driver is never in its own sweep, on either arm",
 # happened to finish inside the same window. That mistake is invisible at `--jobs 1`, where the
 # two agree, which is exactly why it needs a check rather than a reading.
 _burn = subprocess.Popen([sys.executable, "-c", "sum(range(4_000_000))"])
-_burn_status, _burn_cpu, _burn_left = MUT._await(_burn, 60.0)
+_burn_status, _burn_cpu, _burn_left, _burn_fault = MUT._await(_burn, 60.0)
 check("a child's CPU is measured from the wait that reaps THAT child",
       _burn_status is not None and _burn.returncode == 0 and _burn_cpu > 0.0
-      and _burn_left == (),
+      and _burn_left == () and _burn_fault == "",
       f"status={_burn_status} rc={_burn.returncode} cpu={_burn_cpu} left={_burn_left}")
 check("...and an exit status is read the way subprocess spells it, signals negative",
       (MUT._exit_code(0) == 0 and MUT._exit_code(3 << 8) == 3
@@ -1954,12 +2044,65 @@ check("...and an exit status is read the way subprocess spells it, signals negat
 # would leave the suite running beside every mutation after it; one that killed without waiting
 # would leave a zombie and, on the next mutation, a `wait4` on a pid nothing can wait for.
 _sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-_slept_status, _slept_cpu, _slept_left = MUT._await(_sleeper, 0.5)
+_slept_status, _slept_cpu, _slept_left, _slept_fault = MUT._await(_sleeper, 0.5)
 check("a child that outlives its bound is reported as such, killed, and reaped",
       (_slept_status is None and _sleeper.returncode == -signal.SIGKILL
        and isinstance(survives(os.waitpid, _sleeper.pid, 0), ChildProcessError)
-       and _slept_left == ()),
-      f"status={_slept_status} rc={_sleeper.returncode} cpu={_slept_cpu} left={_slept_left}")
+       and _slept_left == () and _slept_fault == ""),
+      f"status={_slept_status} rc={_sleeper.returncode} cpu={_slept_cpu} left={_slept_left} "
+      f"fault={_slept_fault!r}")
+
+# LOSING THE DESCENDANTS IS A CONTAINMENT FAILURE; LOSING THE ROOT AS WELL IS A HANG. With the
+# observer broken, the sweep raises — and before this was in a `finally` the suite process was
+# then neither signalled nor waited for, so the runner blocked forever on a `wait4` for a child
+# still happily running, one worker down and nothing saying why (review, PR #111). The reap has
+# to survive the sweep failing, and the failure has to be NAMED rather than read as a clean
+# tree. Both halves are asserted here, against a real denied `ps`.
+_blind_sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+_saved_path = os.environ["PATH"]
+_blind_dir = tempfile.mkdtemp(prefix="verify-ps-await-")
+try:
+    os.environ["PATH"] = _blind_dir                      # nothing named `ps` resolves at all
+    _bs, _bc, _bl, _bfault = MUT._await(_blind_sleeper, 0.5)
+finally:
+    os.environ["PATH"] = _saved_path
+    shutil.rmtree(_blind_dir, ignore_errors=True)
+check("a blind observer does not stop the suite process being killed and reaped",
+      (_bs is None and _blind_sleeper.returncode == -signal.SIGKILL
+       and isinstance(survives(os.waitpid, _blind_sleeper.pid, 0), ChildProcessError)),
+      f"status={_bs} rc={_blind_sleeper.returncode}; without the reap the runner blocks here "
+      f"forever on a child that is still running")
+check("...and the descendants are reported UNACCOUNTED FOR rather than certified gone",
+      _bfault != "" and _bl == () and "ps" in _bfault,
+      f"fault={_bfault!r} leftover={_bl!r} — an empty leftover with no fault would certify a "
+      f"process tree nobody enumerated")
+# AND THE `finally` IS FOR THE FAILURE NOBODY ANTICIPATED, which is a different case from the
+# one above and the reason the mutation that dedents it came back MISSED. `ObserverFailed` is
+# CAUGHT, so the blind-`ps` case reaches the reap through the `except` and would reach it just
+# as well with no `finally` at all. What the `finally` actually buys is every OTHER way out of
+# the sweep — a bad root refused by `owned_pids`, a `_signal` that raises, a bug — and the only
+# way to test that is to put one there. Without it the exception escapes with the suite process
+# alive and unwaited, and the runner blocks forever on `wait4`.
+_unexpected = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+_real_kill_owned = MUT.kill_owned
+try:
+    def _exploding_sweep(root, marker=None, deadline=5.0):
+        raise RuntimeError("something no caller predicted")
+
+    MUT.kill_owned = _exploding_sweep
+    _boom = survives(MUT._await, _unexpected, 0.5)
+finally:
+    MUT.kill_owned = _real_kill_owned
+check("...and an UNEXPECTED failure in the sweep still leaves the suite killed and reaped",
+      (isinstance(_boom, RuntimeError) and _unexpected.returncode == -signal.SIGKILL
+       and isinstance(survives(os.waitpid, _unexpected.pid, 0), ChildProcessError)),
+      f"raised={_boom!r} rc={_unexpected.returncode}; an escape here leaves the runner waiting "
+      f"forever on a child nothing killed")
+
+_blind_line = MUT.result_line("M1", "proxy", "a",
+                              MUT.Outcome(124, MUT._TIMEOUT_OUTPUT, 9.0, 1.0, (), "ps died"), [])
+check("...and the TIMEOUT line says so, since a fact that reaches no output is a fact nobody has",
+      "CONTAINMENT NOT ESTABLISHED" in _blind_line and "ps died" in _blind_line, _blind_line)
 
 # THE CONTAINMENT GAP, REPRODUCED AND THEN CLOSED. Killing only the process the waiter holds a
 # handle on left every proxy, guardian, fixture server and helper a hung suite had started —
@@ -2000,14 +2143,14 @@ check("the descendant of a suite is alive and observable before the bound is rea
       _alive(_descendant) and _alive(_tree_probe.pid) and _descendant != _tree_probe.pid,
       f"suite={_tree_probe.pid} descendant={_descendant}; without this, the sweep below is "
       f"certified by an instrument that saw nothing in the first place")
-_tree_status, _tree_cpu, _tree_left = MUT._await(_tree_probe, 0.5)
+_tree_status, _tree_cpu, _tree_left, _tree_fault = MUT._await(_tree_probe, 0.5)
 for _settle in range(40):                       # init reaps the orphan; it is not instant
     if not _alive(_descendant) and not _alive(_tree_probe.pid):
         break
     time.sleep(0.05)
 check("...and a hung suite takes its whole process tree with it, `setsid` and all",
       (_tree_status is None and not _alive(_descendant) and not _alive(_tree_probe.pid)
-       and _tree_left == ()),
+       and _tree_left == () and _tree_fault == ""),
       f"suite={_tree_probe.pid} alive={_alive(_tree_probe.pid)} descendant={_descendant} "
       f"alive={_alive(_descendant)} leftover={_tree_left} — a survivor here outlives the "
       f"deletion of the work tree it was launched from and runs beside the other workers")

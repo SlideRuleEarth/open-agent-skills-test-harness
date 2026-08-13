@@ -60,6 +60,15 @@ sys.path.insert(0, HARNESS)
 from agentskill_evals import mcp_audit as A       # noqa: E402 — after the path bootstrap
 from agentskill_evals import mcp_proxy_io as IO   # noqa: E402
 
+# THE PROCESS OBSERVER IS IMPORTED, NOT RESTATED. This file had the rule first — `ps` denied
+# once produced ALL PASS including "the mute guardian goes" (PR #109) — and `mutate_mcp.py`
+# then grew a SECOND observer without it, which a reviewer reproduced all three modes against
+# (PR #111). Two copies of a rule about trusting an instrument is §4's duplicated-rule problem
+# aimed at the one place absence is read as proof, so there is now one implementation and this
+# reads it. Same directory, so the import needs no bootstrap of its own.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mutate_mcp as MUT                          # noqa: E402 — after the path bootstrap
+
 PROXY = os.path.join(HARNESS, "agentskill_evals", "mcp_proxy_io.py")
 ECHO = os.path.join(HARNESS, "fixtures", "echo_mcp_server.py")
 TARGET = os.path.join(HARNESS, "fixtures", "proxy_target_server.py")
@@ -1188,14 +1197,9 @@ for _knob, _how in ((A.GUARDIAN_MISSING, "the guardian's program is not there"),
     finally:
         _un_chan.close()
 
-class ObserverFailed(Exception):
-    """`ps` did not answer. NOT the same fact as `ps` answering "nothing", and the whole
-    reason this is an exception rather than an empty set: the survivor check reads absence as
-    proof, so an observation channel that was never connected would report the same silence as
-    one reporting success — and the suite would certify a leak it never looked for. Reproduced
-    by review with `ps` denied: rc 127, and the verifier printed ALL PASS including "the mute
-    guardian goes" (PR #109).
-    """
+# The rule and its exception both come from the one implementation, so an `except` here cannot
+# stop matching what the observer raises.
+ObserverFailed = MUT.ObserverFailed
 
 
 def process_table() -> dict[int, str]:
@@ -1205,28 +1209,13 @@ def process_table() -> dict[int, str]:
     driver has stopped tracking is still alive — precisely the question a process cannot answer
     about itself.
 
-    THREE WAYS IT CAN FAIL AND ALL THREE RAISE, including the one that looks like an answer:
-    a non-zero exit with output on stderr used to be read as an empty process table. The third
-    is the self-witness — `ps -e` that cannot see THIS process has not enumerated the machine,
-    whatever it exited with, and what it says about any other pid is not evidence. That is a
-    positive fact about the channel, obtained before any conclusion is drawn from its silence.
+    A PROJECTION OF THE SHARED OBSERVER rather than a second call to `ps`. What this file needs
+    is the command line; what the sweep needs is the parent as well; what BOTH need is that a
+    missing, failed or blind `ps` raises instead of answering "nothing", and that requirement
+    now has one implementation to be right in. Zombies are excluded there, which is if anything
+    more correct here: a guardian awaiting its reap is not a survivor either.
     """
-    try:
-        done = subprocess.run(["ps", "-eo", "pid=,command="], capture_output=True, text=True,
-                              timeout=10)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ObserverFailed(f"`ps` did not run: {exc!r}") from exc
-    if done.returncode != 0:
-        raise ObserverFailed(f"`ps` exited {done.returncode}: {done.stderr.strip()[:200]!r}")
-    table = {}
-    for line in done.stdout.splitlines():
-        pid, _, command = line.strip().partition(" ")
-        if pid.isdigit():
-            table[int(pid)] = command
-    if os.getpid() not in table:
-        raise ObserverFailed(f"`ps` answered without listing this process ({os.getpid()}) among "
-                             f"its {len(table)} row(s), so it did not enumerate the machine")
-    return table
+    return {pid: command for pid, (_ppid, command) in MUT.process_tree().items()}
 
 
 def guardian_pids() -> set[int]:

@@ -3191,11 +3191,11 @@ MUTATIONS = [
      "\n    return os.WEXITSTATUS(status)",
      "...and an exit status is read the way subprocess spells it, signals negative"),
     ("F95-a-timed-out-suite-is-killed-but-never-reaped", SELF,
-     ("    _pid, status, usage = os.wait4(proc.pid, 0)\n"
-      "    proc.returncode = _exit_code(status)\n"
-      "    return None, usage.ru_utime + usage.ru_stime"),
-     ("    proc.returncode = -signal.SIGKILL\n"
-      "    return None, 0.0"),
+     ("        _signal(proc.pid)\n"
+      "        _pid, status, usage = os.wait4(proc.pid, 0)\n"
+      "        proc.returncode = _exit_code(status)"),
+     ("        _signal(proc.pid)\n"
+      "        proc.returncode = -signal.SIGKILL"),
      "a child that outlives its bound is reported as such, killed, and reaped"),
     ("F96-cpu-is-never-actually-read-off-the-wait", SELF,
      ("            proc.returncode = _exit_code(status)\n"
@@ -3208,9 +3208,9 @@ MUTATIONS = [
     # helper a hung suite started outlives it, outlives the `rmtree` of the tree they were
     # launched from, and runs beside the workers still going (review, PR #111).
     ("F97-a-timed-out-suite-is-killed-without-its-descendants", SELF,
-     "\n    leftover = kill_owned(proc.pid, marker)",
-     ("\n    leftover = ()\n"
-      "    _signal(proc.pid)"),
+     "\n        leftover = kill_owned(proc.pid, marker)",
+     ("\n        leftover = ()\n"
+      "        _signal(proc.pid)"),
      "...and a hung suite takes its whole process tree with it, `setsid` and all"),
     # AND THE ORDER, which is the mechanism rather than a detail. Signal first and the parentage
     # arm has nothing left to read: every descendant is reparented to init the instant the root
@@ -3271,6 +3271,47 @@ MUTATIONS = [
     # version of this file that can take the host down existing on disk for eleven minutes.
     # The rule generalizes: a mutation may perturb WHICH processes are chosen, never the guard
     # that decides whether a chosen thing is a process at all.
+    # THE OBSERVER, BROKEN ONE CLAUSE AT A TIME. Everything the sweep concludes is read off an
+    # absence, so each of these turns a channel that could not answer into a machine with
+    # nothing on it — and the timeout path then certifies a tree it never looked at.
+    ("F104-a-ps-that-cannot-run-escapes-as-a-raw-OSError", SELF,
+     ("    except (OSError, subprocess.SubprocessError) as exc:\n"
+      '        raise ObserverFailed(f"`ps` did not run: {exc!r}") from exc'),
+     ("    except (KeyboardInterrupt,) as exc:\n"
+      '        raise ObserverFailed(f"`ps` did not run: {exc!r}") from exc'),
+     "a `ps` that is not there at all is a named failure, not an empty machine"),
+    ("F105-a-failing-ps-is-read-as-an-empty-machine", SELF,
+     ("    if done.returncode != 0:\n"
+      '        raise ObserverFailed(f"`ps` exited {done.returncode}: '
+      '{done.stderr.strip()[:200]!r}")'),
+     "    if False:\n        raise ObserverFailed(\"\")",
+     "...and one that exits non-zero is a failure even though its output parses fine"),
+    ("F106-the-observer-never-witnesses-itself", SELF,
+     "\n    if os.getpid() not in seen:",
+     "\n    if False and os.getpid() not in seen:",
+     "...and one that succeeds without listing THIS process has not enumerated the machine"),
+    # AND THE TWO HALVES OF WHAT A FAILED OBSERVER MUST NOT COST. Losing the descendants is a
+    # containment failure that has to be NAMED; losing the root as well is a hang, because the
+    # runner then waits forever on a child nothing killed.
+    ("F107-a-blind-sweep-is-reported-as-a-clean-one", SELF,
+     ("    except ObserverFailed as exc:\n"
+      "        fault = str(exc)"),
+     ("    except ObserverFailed:\n"
+      '        fault = ""'),
+     "...and the descendants are reported UNACCOUNTED FOR rather than certified gone"),
+    ("F108-a-failed-sweep-takes-the-reap-down-with-it", SELF,
+     ("    finally:\n"
+      "        _signal(proc.pid)\n"
+      "        _pid, status, usage = os.wait4(proc.pid, 0)\n"
+      "        proc.returncode = _exit_code(status)"),
+     ("    _signal(proc.pid)\n"
+      "    _pid, status, usage = os.wait4(proc.pid, 0)\n"
+      "    proc.returncode = _exit_code(status)"),
+     "...and an UNEXPECTED failure in the sweep still leaves the suite killed and reaped"),
+    ("F109-a-containment-failure-reaches-no-output", SELF,
+     ('\n                 f"{outcome.observer}" if outcome.observer else "")'),
+     ('\n                 f"{outcome.observer}" if False else "")'),
+     "...and the TIMEOUT line says so, since a fact that reaches no output is a fact nobody has"),
     ("F103-a-sweep-that-left-something-behind-says-nothing", SELF,
      '\n                 f"{list(outcome.leftover)}" if outcome.leftover else "")',
      '\n                 f"{list(outcome.leftover)}" if False else "")',
@@ -3394,6 +3435,11 @@ class Outcome(NamedTuple):
     # and empty on almost all that did — a non-empty one is a leak the run should say out loud
     # rather than a detail, because the next mutation to draw this tree inherits it.
     leftover: tuple = ()
+    # ...and why the sweep could not be trusted, "" when the observer answered. A SECOND FIELD
+    # because it is a second fact: "nothing was left behind" and "nothing could be looked at"
+    # are both compatible with an empty `leftover`, and collapsing them would let a blind `ps`
+    # certify a process tree nobody enumerated.
+    observer: str = ""
 
 
 def _exit_code(status):
@@ -3401,23 +3447,57 @@ def _exit_code(status):
     return -os.WTERMSIG(status) if os.WIFSIGNALED(status) else os.WEXITSTATUS(status)
 
 
-def process_tree():
-    """Every live pid, with its parent and command line. Zombies excluded, and that is a fact.
+class ObserverFailed(Exception):
+    """`ps` did not answer, or answered without having enumerated the machine.
 
-    A DEAD PROCESS AWAITING ITS REAP IS NOT SOMETHING THAT CAN CONTAMINATE A WORKER: it holds
-    no descriptors, spawns nothing, and its children were reparented when it died. Counting one
-    as a survivor would make the timeout path report a leak it had actually cleaned up, and
-    make it wait out its whole deadline doing it.
+    NOT THE SAME FACT AS `ps` ANSWERING "NOTHING", and that is the whole reason this is an
+    exception rather than an empty table. Everything downstream reads absence as proof — the
+    sweep decides it is finished when it sees no owned processes — so an observation channel
+    that was never connected reports the same silence as one reporting success, and the
+    timeout path would certify a tree it never looked at.
+
+    `verify_mcp_proxy.py` learned this in PR #109, with `ps` denied: rc 127, and the verifier
+    printed ALL PASS including "the mute guardian goes". This file then grew a SECOND process
+    observer without the rule, and a reviewer reproduced all three modes against it (PR #111).
+    There is now one observer and one rule; the proxy verifier reads this function rather than
+    keeping a copy that can drift from it.
     """
-    done = subprocess.run(["ps", "-eo", "pid=,ppid=,stat=,command="],   # noqa: S607 — on PATH
-                          capture_output=True, text=True, timeout=30)
-    table = {}
+
+
+def process_tree():
+    """Every live pid, with its parent and command line. Raises rather than answering blind.
+
+    THREE WAYS IT CAN FAIL AND ALL THREE RAISE, including the two that look like answers. `ps`
+    missing or denied is an `OSError` and would otherwise escape from the middle of a teardown;
+    a non-zero exit with empty stdout parses as an empty machine, which reads as "nothing to
+    sweep"; and a `ps` that cannot see THIS process has not enumerated the machine whatever it
+    exited with, so what it says about any other pid is not evidence. That last one is a
+    POSITIVE fact about the channel, obtained before any conclusion is drawn from its silence.
+
+    ZOMBIES ARE EXCLUDED, AND THAT IS A FACT RATHER THAN A FILTER. A dead process awaiting its
+    reap holds no descriptors, spawns nothing, and its children were reparented when it died.
+    Counting one as a survivor would make the timeout path report a leak it had actually
+    cleaned up, and spend its whole deadline doing it. The self-witness is checked BEFORE that
+    exclusion, since this process is not a zombie and must be visible either way.
+    """
+    try:
+        done = subprocess.run(["ps", "-eo", "pid=,ppid=,stat=,command="],  # noqa: S607 — PATH
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ObserverFailed(f"`ps` did not run: {exc!r}") from exc
+    if done.returncode != 0:
+        raise ObserverFailed(f"`ps` exited {done.returncode}: {done.stderr.strip()[:200]!r}")
+    table, seen = {}, set()
     for line in done.stdout.splitlines():
         parts = line.split(None, 3)
         if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
             pid, ppid, state, command = int(parts[0]), int(parts[1]), parts[2], parts[3]
+            seen.add(pid)
             if not state.startswith("Z"):
                 table[pid] = (ppid, command)
+    if os.getpid() not in seen:
+        raise ObserverFailed(f"`ps` answered without listing this process ({os.getpid()}) among "
+                             f"its {len(seen)} row(s), so it did not enumerate the machine")
     return table
 
 
@@ -3561,7 +3641,7 @@ def _await(proc, timeout, marker=None):
         pid, status, usage = os.wait4(proc.pid, os.WNOHANG)
         if pid == proc.pid:
             proc.returncode = _exit_code(status)
-            return status, usage.ru_utime + usage.ru_stime, ()
+            return status, usage.ru_utime + usage.ru_stime, (), ""
         if time.monotonic() >= deadline:
             break
         time.sleep(_POLL)
@@ -3571,10 +3651,28 @@ def _await(proc, timeout, marker=None):
     # of them running — outliving the `rmtree` of the tree they were launched from, and alive
     # beside the workers still running (review, PR #111). Reproduced directly: a suite that
     # spawned a 60s child and timed out was reaped at `-SIGKILL` with the child still alive.
-    leftover = kill_owned(proc.pid, marker)
-    _pid, status, usage = os.wait4(proc.pid, 0)
-    proc.returncode = _exit_code(status)
-    return None, usage.ru_utime + usage.ru_stime, leftover
+    #
+    # THE ROOT DIES AND IS REAPED WHATEVER HAPPENS TO THE SWEEP, which is what the `finally` is
+    # for and not tidiness. A denied `ps` raises out of the sweep, and without this the suite
+    # process was never signalled and never waited for: the runner would then block forever on
+    # a `wait4` for a child still happily running, one worker down, with no output saying why
+    # (review, PR #111). Losing the descendants is a containment failure; losing the ROOT as
+    # well would be a hang, and the whole point of `_SUITE_TIMEOUT` is that nothing hangs.
+    #
+    # AND THE FAILURE IS CARRIED SEPARATELY FROM THE RESULT. "No leftovers" and "could not
+    # look" are different facts about the same ending, so they get different fields — an empty
+    # `leftover` under a blind observer would certify a tree nobody enumerated, which is the
+    # exact reading this whole function exists to refuse.
+    leftover, fault = (), ""
+    try:
+        leftover = kill_owned(proc.pid, marker)
+    except ObserverFailed as exc:
+        fault = str(exc)
+    finally:
+        _signal(proc.pid)
+        _pid, status, usage = os.wait4(proc.pid, 0)
+        proc.returncode = _exit_code(status)
+    return None, usage.ru_utime + usage.ru_stime, leftover, fault
 
 
 def run(cwd, suite):
@@ -3596,10 +3694,10 @@ def run(cwd, suite):
         # suite starts is launched by absolute path out of this directory, and the directory is
         # a fresh `mkdtemp` belonging to one worker — so it names this run's descendants and
         # cannot name a sibling worker's.
-        status, cpu, leftover = _await(proc, _SUITE_TIMEOUT, str(cwd))
+        status, cpu, leftover, fault = _await(proc, _SUITE_TIMEOUT, str(cwd))
         wall = time.monotonic() - t0
         if status is None:
-            return Outcome(124, _TIMEOUT_OUTPUT, wall, cpu, leftover)
+            return Outcome(124, _TIMEOUT_OUTPUT, wall, cpu, leftover, fault)
         sink.seek(0)
         return Outcome(proc.returncode, sink.read(), wall, cpu)
 
@@ -3665,8 +3763,14 @@ def result_line(mid, suite, arm, outcome, failed):
         # and the next mutation to draw that tree runs beside it.
         stuck = (f" — {len(outcome.leftover)} descendant(s) SURVIVED the sweep: "
                  f"{list(outcome.leftover)}" if outcome.leftover else "")
+        # AND A SWEEP THAT COULD NOT LOOK IS NOT A SWEEP THAT FOUND NOTHING. Printed on its own
+        # terms, because the difference is the whole content of the containment claim: with a
+        # blind observer the descendants of this hung suite are unaccounted for rather than
+        # gone, and the work tree is about to be deleted out from under them.
+        blind = (f" — CONTAINMENT NOT ESTABLISHED, descendants unaccounted for: "
+                 f"{outcome.observer}" if outcome.observer else "")
         return (f"{mid}: *** TIMEOUT *** {suite} exceeded {_SUITE_TIMEOUT}s — the defect hangs "
-                f"rather than reddening {arm} {took}{stuck}")
+                f"rather than reddening {arm} {took}{stuck}{blind}")
     if kind == CAUGHT:
         return f"{mid}: CAUGHT by {arm} {took}"
     if kind == NOT_VIA:
