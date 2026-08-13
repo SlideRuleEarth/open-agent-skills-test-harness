@@ -43,6 +43,7 @@ truncated final line.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import selectors
@@ -59,6 +60,15 @@ sys.path.insert(0, HARNESS)
 
 from agentskill_evals import mcp_audit as A       # noqa: E402 — after the path bootstrap
 from agentskill_evals import mcp_proxy_io as IO   # noqa: E402
+
+# THE PROCESS OBSERVER IS IMPORTED, NOT RESTATED. This file had the rule first — `ps` denied
+# once produced ALL PASS including "the mute guardian goes" (PR #109) — and `mutate_mcp.py`
+# then grew a SECOND observer without it, which a reviewer reproduced all three modes against
+# (PR #111). Two copies of a rule about trusting an instrument is §4's duplicated-rule problem
+# aimed at the one place absence is read as proof, so there is now one implementation and this
+# reads it. Same directory, so the import needs no bootstrap of its own.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mutate_mcp as MUT                          # noqa: E402 — after the path bootstrap
 
 PROXY = os.path.join(HARNESS, "agentskill_evals", "mcp_proxy_io.py")
 ECHO = os.path.join(HARNESS, "fixtures", "echo_mcp_server.py")
@@ -1188,14 +1198,9 @@ for _knob, _how in ((A.GUARDIAN_MISSING, "the guardian's program is not there"),
     finally:
         _un_chan.close()
 
-class ObserverFailed(Exception):
-    """`ps` did not answer. NOT the same fact as `ps` answering "nothing", and the whole
-    reason this is an exception rather than an empty set: the survivor check reads absence as
-    proof, so an observation channel that was never connected would report the same silence as
-    one reporting success — and the suite would certify a leak it never looked for. Reproduced
-    by review with `ps` denied: rc 127, and the verifier printed ALL PASS including "the mute
-    guardian goes" (PR #109).
-    """
+# The rule and its exception both come from the one implementation, so an `except` here cannot
+# stop matching what the observer raises.
+ObserverFailed = MUT.ObserverFailed
 
 
 def process_table() -> dict[int, str]:
@@ -1205,43 +1210,58 @@ def process_table() -> dict[int, str]:
     driver has stopped tracking is still alive — precisely the question a process cannot answer
     about itself.
 
-    THREE WAYS IT CAN FAIL AND ALL THREE RAISE, including the one that looks like an answer:
-    a non-zero exit with output on stderr used to be read as an empty process table. The third
-    is the self-witness — `ps -e` that cannot see THIS process has not enumerated the machine,
-    whatever it exited with, and what it says about any other pid is not evidence. That is a
-    positive fact about the channel, obtained before any conclusion is drawn from its silence.
+    A PROJECTION OF THE SHARED OBSERVER rather than a second call to `ps`. What this file needs
+    is the command line; what the sweep needs is the parent as well; what BOTH need is that a
+    missing, failed or blind `ps` raises instead of answering "nothing", and that requirement
+    now has one implementation to be right in. Zombies are excluded there, which is if anything
+    more correct here: a guardian awaiting its reap is not a survivor either.
     """
-    try:
-        done = subprocess.run(["ps", "-eo", "pid=,command="], capture_output=True, text=True,
-                              timeout=10)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ObserverFailed(f"`ps` did not run: {exc!r}") from exc
-    if done.returncode != 0:
-        raise ObserverFailed(f"`ps` exited {done.returncode}: {done.stderr.strip()[:200]!r}")
-    table = {}
-    for line in done.stdout.splitlines():
-        pid, _, command = line.strip().partition(" ")
-        if pid.isdigit():
-            table[int(pid)] = command
-    if os.getpid() not in table:
-        raise ObserverFailed(f"`ps` answered without listing this process ({os.getpid()}) among "
-                             f"its {len(table)} row(s), so it did not enumerate the machine")
-    return table
+    return {pid: proc.command for pid, proc in MUT.process_tree().items()}
 
 
 def guardian_pids() -> set[int]:
-    """Every live guardian's pid.
+    """Every live guardian belonging to THIS tree, by pid.
 
     PIDS RATHER THAN A COUNT, so the check below can name the survivors it means. A count made
     the check read every guardian on the machine, including one a PREVIOUS mutation deliberately
     leaked: `M337` reintroduces the sleep and leaves a guardian running for its ceiling, so the
     next mutation's verifier would have seen it and failed for the previous mutation's reason.
     Identity removes that coupling without the driver deciding which processes "look like" ours —
-    a pid absent before the case and present after it appeared during the case, and the suite is
-    serial.
+    a pid absent before the case and present after it appeared during the case.
+
+    AND PID IDENTITY ALONE STOPPED BEING ENOUGH when the suite stopped being serial. `M337`'s
+    leak is a hazard from the PAST, which "absent before, present during" excludes; a concurrent
+    worker's guardian is a hazard from the SIDE, which it does not — it is genuinely absent
+    before this case and genuinely present during it, so it lands in `_guardians_during` and
+    outlives it for the previous reason under a new name. Scoping by tree closes that, and the
+    recogniser is imported rather than restated here: it is defined next to the argv it has to
+    match (§4's duplicated-rule rule, satisfied by import).
     """
-    return {pid for pid, command in process_table().items()
-            if IO.GUARDIAN_FLAG in command and "mcp_proxy_io" in command}
+    return {pid for pid, command in process_table().items() if IO.is_guardian_command(command)}
+
+
+# WHAT THE RECOGNISER IS FOR, driven on synthetic argv rather than on the machine. The live
+# positive control below says it finds our own guardian; nothing there can say it DOESN'T find
+# someone else's, because a serial run has no someone else — the case that matters is the one
+# `--jobs N` creates and this file cannot arrange. Synthetic command lines can: the same argv
+# with a different tree in it is exactly a concurrent worker's guardian.
+_other_tree = os.path.join(os.sep, "elsewhere", "harness", "agentskill_evals", "mcp_proxy_io.py")
+_ours = " ".join(IO.guardian_argv(sys.executable, 7))
+_theirs = f"{sys.executable} {_other_tree} {IO.GUARDIAN_FLAG} 7"
+check("a guardian launched from this tree is recognised as one",
+      IO.is_guardian_command(_ours),
+      f"the survivor check reads absence as proof, so a recogniser that matches nothing "
+      f"certifies every leak there is: {_ours!r}")
+check("...and one launched from another copy of the tree is NOT, which is what makes a "
+      "parallel run's survivor check scoped to its own worker",
+      not IO.is_guardian_command(_theirs),
+      f"under `mutate_mcp.py --jobs N` this argv belongs to a sibling worker, absent before "
+      f"this case and present during it: {_theirs!r}")
+_parent = f"{sys.executable} {PROXY} /tmp/proxy.json"
+check("...and the proxy itself is not, though its argv names this same file",
+      not IO.is_guardian_command(_parent),
+      f"the flag is what separates the guardian from its parent, and dropping it would count "
+      f"every proxy on the machine as a survivor: {_parent!r}")
 
 
 # THE WRITER SIDE OF THE LATCH RULE, and the case whose absence let a false claim reach a PR.
@@ -1568,10 +1588,18 @@ for _label, _fault, _extra, _watch in (
               f"first, so an EOF here is a termination rather than a channel nobody took: "
               f"{_kept_recs} {_kept}")
     finally:
+        # EVERY HOLDER, EVEN AFTER ONE OF THEM RAISES, and every channel after that. A teardown
+        # loop that stops at its first failure abandons the rest of what it was written to clean
+        # up — which here is credential-bearing groups this file deliberately left alive. It is
+        # the same rule as the paragraph below about the guardian's own sweep, and the same one
+        # `_kill_all` exists for in `mutate_mcp.py` (review, PR #111).
         for _who, _rec in _kept_recs.items():
-            reap_group(_rec if isinstance(_rec, dict) else None, _kept_nonce, _kept_chans[_who])
+            with contextlib.suppress(Exception):
+                reap_group(_rec if isinstance(_rec, dict) else None, _kept_nonce,
+                           _kept_chans[_who])
         for _chan in _kept_chans.values():
-            _chan.close()
+            with contextlib.suppress(Exception):
+                _chan.close()
 
 # A DEAD DIAGNOSTIC CHANNEL MUST NOT BE ABLE TO STOP A TEARDOWN, and the guardian is where that
 # mattered: its sweep announced itself before signalling anything, so with the CLI's end of

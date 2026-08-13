@@ -292,10 +292,19 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 578 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py                        # 333/333 production + 2/2 instrument + 78/78 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 412 checks
-harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 88 here
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 134/134 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 479 checks
+harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 git diff --check
+
+# AFTER the mutation run, because what it should have left behind is nothing, and "the
+# suite was green" is a different fact from "the machine is as it was". A run that could
+# not establish containment KEEPS its work trees on purpose and says so — the first line
+# is what then reports them. The `[.]` is not a typo: `pgrep -f` matches this command's
+# own argv, so a plain pattern finds itself and reports a guardian that is the search.
+ls -d "${TMPDIR%/}"/mutate-mcp-*                # no work trees
+pgrep -f 'mcp_proxy_io[.]py --guardian'         # no stray guardians
+ps -eo stat= | grep -c '^[Tt]'                  # 0 — nothing left SIGSTOPped by a sweep
 
 # OPT-IN, not part of the block above: needs `claude` on PATH and spends an API call.
 # Run it when the CLI updates — §9's probe-#1 result is version-qualified, and this is
@@ -304,6 +313,39 @@ git diff --check
 # because "nothing routine runs it" is exactly how a fix lands in one copy and not the other.
 harness/.venv/bin/python harness/tools/probe_remote_mcp.py    # 19 checks; claude 2.1.113 (http asserts 2 more than sse)
 ```
+
+**`--jobs 8` is the recommended way to run it and `--jobs 1` is what it means.** The suite is
+mostly WAITING — the proxy arms are ~43s of settles and grace periods on ~5s of CPU, which is
+why a serial run leaves the machine ~90% idle — so N mutations at once is close to an N-fold
+saving in wall clock. Nothing that decides a verdict moved: the anchor guards, the arm guards
+and the class check still run serially before any tree is mutated, each worker mutates only its
+own copy of the tree, the baselines are measured one at a time on an unloaded machine because
+they are the REFERENCE every per-mutation number is read against, and results print in list
+order however they finish. Pick N from the performance cores, not the core count.
+
+Two things changed underneath so that this is true rather than merely fast, and both are the
+same shape — a rule that was right while there was one of something:
+
+- **The proxy verifier's survivor check is scoped by TREE, not by pid identity alone.** Pid
+  scoping excludes a guardian leaked by a PREVIOUS mutation, which is a hazard from the past;
+  a concurrent worker's guardian is a hazard from the SIDE, genuinely absent before the case
+  and genuinely present during it. `mcp_proxy_io.is_guardian_command` now matches the argv
+  `guardian_argv` builds, from this copy of the module. Measured during a `--jobs 8` run: 70%
+  of `ps` samples had a live guardian in more than one work tree, and 25% had one in all eight.
+  It was NOT possible to make the old predicate produce a red check — ~50 concurrent proxy
+  suites, including three with the deliberate 30s leak (`M337`), all passed — because
+  `_guardians_before` is sampled immediately before the case rather than at startup, leaving
+  only a ~1s window for a foreign guardian to be born in. So the fix is a narrowing that is
+  correct and cheap rather than one with a reproduction behind it; say so rather than implying
+  the run was broken.
+- **Per-mutation CPU is read from the `wait4` that reaps THAT child**, not from a
+  `getrusage(RUSAGE_CHILDREN)` delta. The delta is a running total for the whole process, so
+  under `--jobs N` it collects whatever the other N−1 workers finished inside the same window.
+  It is exactly right at `--jobs 1`, which is the only configuration anyone would have driven
+  it at — a measurement whose error is invisible in its own test conditions. The two clocks are
+  reported separately because they answer different questions: wall is what `_SUITE_TIMEOUT`
+  bounds, CPU is what survives a loaded machine, and the M65 early warning below needs the CPU
+  one now that wall time under load is a statement about the scheduler.
 
 **The mutation suite now runs THREE suites, and which one runs is a different question from
 which total a mutation counts in.** The suite is chosen by the file: `agentskill_evals/` is
@@ -1573,9 +1615,196 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   small contained-home fixtures only. `mutate_mcp.py` now also bounds each selftest with a
   `timeout` (reported as `TIMEOUT`, counted as *uncaught*), so a looping mutation is a finding
   rather than an infinite hang — but it is a backstop, not a licence to hang. Each result line
-  also carries its selftest's wall time, and the summary names the slowest; read them against
-  the `baseline:` line. A mutation at several times baseline is already the M65 shape, just not
-  yet past the timeout, and that gap is the only warning anyone gets before it becomes a hang.
+  carries TWO clocks and the summary names the slowest **by CPU**; read them against the
+  `baseline:` line, which carries both for the same reason. A mutation at several times its
+  suite's CPU baseline is already the M65 shape, just not yet past the timeout, and that gap is
+  the only warning anyone gets before it becomes a hang. Read the CPU figure and not the wall
+  one: under `--jobs N` every suite takes longer without any of them being wrong, and the
+  loudest wall number names whichever mutation was unluckiest with the scheduler.
+- **THE WORST ONE SO FAR: a mutation closed every application on the machine (2026-08-12).**
+  `mutate_mcp.py` grew a process-tree sweep for the timeout path. A check called it with no
+  parentage root, spelled `-1` — no process has that parent, so it read as a harmless "match
+  nothing". Mutation `F98` moved the kill ahead of the enumeration as a bare
+  `os.kill(root, SIGKILL)`, and **POSIX defines `kill(-1, …)` as every process the calling user
+  may signal**; `kill(0, …)` is the caller's whole process group. Eleven minutes into a full
+  run, the mutant executed it. No panic, no crash reports, nothing in the log — SIGKILL leaves
+  none of those — just every user process gone while the root-owned ones stayed up, which is
+  the signature to recognise it by.
+
+  Three rules come out of it, and the third is the one that generalizes furthest:
+
+  1. **A sentinel must be a value the dangerous call cannot accept.** `None` is right because
+     `os.kill(None, …)` raises; `-1` and `0` are wrong because they are *valid and mean
+     something enormous*. The marker on the same function had already been moved from `""` to
+     `None` for exactly this reason, with a docstring about it — and the root sentinel beside
+     it was left as `-1`. Getting the argument right about one parameter is not getting it
+     right about the function.
+  2. **One place signals, and it validates.** `_signal()` refuses anything that is not a
+     positive int. Containment in the callers is not containment.
+  3. **A mutation suite runs deliberately broken code by design, so a destructive call is only
+     as contained as its WORST REACHABLE VARIANT.** Any mutation touching a kill, a delete or a
+     write outside the work tree has to be written *through* the guarded primitive rather than
+     around it, so that the mutant is contained too. And the guard itself is not a mutation
+     target: a mutation may perturb which processes are chosen, never the check that decides
+     whether a chosen thing is a process at all. Establish that one by driving the values.
+- **An observation channel needs the SAME treatment wherever it appears, and the second copy
+  had none of it.** `verify_mcp_proxy.py` learned in PR #109 that a denied `ps` prints ALL PASS:
+  its `process_table()` raises on three modes — missing/denied, non-zero exit, and the
+  self-witness (`ps` that cannot see its own caller has not enumerated the machine). Then
+  `mutate_mcp.py` grew a SECOND process observer for the timeout sweep with none of them, and a
+  reviewer reproduced all three against it (PR #111). Two copies of a rule about trusting an
+  instrument is §4's duplicated-rule problem aimed squarely at the place absence is read as
+  proof, so there is now ONE observer and the proxy verifier imports it.
+
+  Two further things fell out, and both are the aimed-beside-it shape:
+
+  - **Availability and containment are different failures.** Losing the descendants is a
+    containment failure that must be NAMED — an empty leftover with no fault certifies a tree
+    nobody enumerated. Losing the ROOT is a hang: before the reap moved into a `finally`, a
+    raise out of the sweep left the suite process neither signalled nor waited for, and the
+    runner blocked forever on `wait4` with one worker gone and nothing saying why.
+  - **A `finally` beside an `except` for the expected failure is exercised by neither.**
+    `ObserverFailed` is caught, so the blind-`ps` case reaches the reap through the `except`
+    and would with no `finally` at all — the mutation that dedented it came back MISSED. What
+    the `finally` buys is every OTHER exit from the sweep, and testing it means injecting one.
+    Likewise a failing `ps` that prints NOTHING is answered by the self-witness clause, so the
+    exit-status clause goes untested unless the fake `ps` emits a valid row for the caller.
+- **A LIVE case proves the mechanism works; only a SCRIPTED one proves a given interleaving is
+  handled — and the difference showed up three times in one review round.** The timeout sweep's
+  live probes are real: they spawn real descendants, `setsid` and all, and they caught most of
+  what was aimed at them. What they could not do is arrange a *specific* ordering on demand:
+
+  - The one-round-freeze mutation needs a child born between the snapshot and its parent's
+    `SIGSTOP`. The root has the lowest pid so it is stopped first, within milliseconds, and the
+    spawner emitted every 50ms — so the case was hit perhaps one run in fifteen. It came back
+    CAUGHT on a targeted drive and MISSED on the full run fifteen minutes later. **A flake in a
+    mutation suite is worse than a failure**: every time it passes it certifies coverage that
+    is not there. Scripted — a `process_tree` whose second generation appears only on the
+    second look — it is 10/10.
+  - The report-what-we-froze mutation only matters when a sweep leaves something behind, and
+    SIGKILL works, so a survivor is by definition the thing that did not happen. It came back
+    MISSED until the leftover computation was pulled out into `survivors()` and driven on a
+    table.
+  - The three observer failure modes are the same shape: a real `ps` does not fail on request.
+
+  The rule: **if the property is about an ORDER or an ABSENCE, write the case that scripts it.**
+  Keep the live one too — it is what proves the scripted one is describing the real mechanism —
+  but do not let it be the only evidence, because the run where it passes by luck is
+  indistinguishable from the run where it passes for the reason you meant.
+- **A TEST DOUBLE THAT CANNOT EXPRESS THE DEFECT IS A CHECK THAT CANNOT FAIL, and it looks
+  exactly like a check that passes.** Twice in one review round, on the same function. The
+  freeze's scripted machine stopped a process the instant `_signal` was called — so it was
+  proving the code correct against a machine where the bug is impossible. Real `os.kill`
+  returns when the signal is QUEUED; the target keeps running until the kernel delivers it, and
+  a target still running can still fork. A fixed point over pids SIGNALLED is therefore not a
+  fixed point over pids STOPPED, and the gap is exactly wide enough for one more child to be
+  born, orphaned by the kill that follows, and carry no argv anyone can find it by.
+
+  The fix is to settle on OBSERVED state — `ps` already reports `T`, which this code parsed and
+  discarded after the zombie test — and never to conclude on the same snapshot in which it
+  signalled. The double now models delivery LAG, and models a process killed while still
+  running getting one last child out first.
+
+  **The question to ask of a double is not "does it stand in for the real thing" but "can the
+  defect I am testing for occur in it".** A synchronous mock of an asynchronous mechanism
+  answers no, silently, forever.
+- **"Gone" is not an answer, and a set intersection is where that gets forgotten.** The freeze
+  waited for every signalled pid to be observed stopped — by intersecting the signalled set with
+  the live process table. A pid that DISAPPEARED therefore dropped out of the wait and read as
+  settled. But a process that exits may have forked on the way out, and that child is reparented
+  with no link to anything and possibly nothing in its argv to name it. Presence and confirmation
+  are different facts: once a pid has been SEEN stopped it is safe to lose, and before that its
+  absence is unaccounted for and no amount of looping resolves it. Track them apart.
+
+  The general form, which is the same shape as the trustworthy-predicate rule one level up:
+  **an intersection with "what is still there" silently reclassifies everything that left.**
+  Before writing one, ask what it means for a member to vanish — if the answer is "we do not
+  know", it does not belong on the satisfied side of a fixed point.
+- **A registry cleanup reads must be written BEFORE the act, and the cleanup must reach every
+  member.** One rule seen from each end, and the sweep got both wrong. `frozen` is the only set
+  the `finally` can kill, and it was updated after a whole batch of `SIGSTOP`s — so a failure
+  partway through that batch left the pids already stopped unregistered, and therefore unkilled,
+  by the very block written to guarantee they would be. The cleanup loop then abandoned the rest
+  of the set at its own first failure. Both leave the same wreckage, and it is worse than a leak:
+  a stopped process never exits, so the `wait4` the teardown exists to make safe blocks forever.
+
+  The tell for the first half is a `finally` whose reachability argument depends on a variable
+  assigned after the thing it protects against. The tell for the second is a bare `for` in a
+  teardown. This program had already paid for the second once — the guardian's `sweep()`
+  announced itself before signalling, a `BrokenPipeError` from the announcement left a
+  credential-bearing group alive (PR #103) — so the rule was already written down and was
+  applied only where it had been reproduced. Every teardown loop in the tree is now best-effort
+  per member: `_kill_all` in `mutate_mcp.py`, the startup-probe reap in `verify_mcp_fixtures.py`,
+  the held-group teardown in `verify_mcp_proxy.py`. The production paths already had it, and
+  `exec.py` says why in a comment — which is what "state the rule, not the reproduction" buys.
+- **A resource goes back into a pool only if it is known CLEAN, and "the run finished" is not
+  that knowledge.** The timeout path already said out loud when its sweep had left a descendant
+  alive or could not establish that it hadn't — and the work tree went back into the queue on
+  exactly that path, because the `finally` that returns it was written when the only failure it
+  could imagine was a worker keeping one. So the next mutation drew a directory with a live
+  process executing out of it and the pre-revert code still resident, and every verdict after
+  that was a fact about two runs at once. Then `rmtree` deleted the directory from under it,
+  which loses what the process was and where it came from while doing nothing about the process.
+
+  Three parts, and each is separately the whole defect: **contamination is a property of the
+  ENDING, not of the verdict** (so it travels on the record); **deleting the container is not
+  dealing with the tenant** (so a poisoned run keeps its trees and prints where they are, and
+  the leftover glob in the block above then reports them, which is correct rather than a
+  nuisance); and **the run stops** — there is no reading under which the remaining mutations are
+  worth their twelve minutes once a process nobody can account for is running on the machine.
+  An exception counts as contamination too: a sweep that RAISED is precisely the case where what
+  survived is unknown, so the default has to be the careful one.
+- **A rule about a shared resource belongs at the boundary that OWNS it, not in each producer
+  that touches it.** "An exception counts as contamination" went into the mutation worker,
+  because that is where the reproduction was. A BASELINE that raised then walked straight past
+  it: the exception reached the frame holding the tmpdir with the run still unpoisoned, and the
+  `finally` deleted every work tree out from under whatever the baseline had left running. Same
+  rule, second spawner, one review round later — which is the third time in this PR that a fix
+  stopped exactly where its reproduction did.
+
+  **The sharper form of "fix the principle, not the reproduction", and the one that would have
+  caught all three: a guard written inside one of N producers has to be REMEMBERED by producer
+  N+1.** Written at the boundary — the frame that creates the resource and destroys it — it
+  quantifies over every producer there will ever be. Here that is one `try/except BaseException`
+  around everything between the `mkdtemp` and the delete, which covers the baseline, the
+  workers, `worktree_binds`, and a `KeyboardInterrupt` (the likeliest of the four, and the one
+  no per-producer guard would ever have been written for). The tell is a guard whose correctness
+  argument mentions a specific caller.
+- **A cleanup that suppresses its own errors must not then report success — and its caller must
+  ask.** `shutil.rmtree(tmp, ignore_errors=True)` followed by `return True`: a clean run could
+  leave every work tree on disk and still exit 0, and the caller dropped the answer anyway, so
+  neither half was load-bearing. The flag stays — a teardown that raises partway through is
+  worse than one that does what it can — but the claim afterwards now comes from `os.path.exists`.
+  This is the errno rule from §10.3 one layer up: **a return value from a call you made is a
+  fact about the call, and the question was about the world.** Two tells, and both are cheap to
+  grep for: a suppressed-error call adjacent to a success return, and a function returning a
+  status nothing reads.
+- **Stopping a parallel run is not instantaneous, and the work already in flight is a THIRD
+  state.** The pre-draw refusal stops every mutation not yet started; the seven siblings already
+  inside their suites finish and used to hand back ordinary verdicts, which were counted and
+  printed as results — measured on a machine that by then had an unknown extra tenant competing
+  for the cores, ports and fixture servers those suites bind. They are neither "ran" (their
+  conditions cannot be stated) nor "did not run" (they did), so they get their own verdict,
+  `INCONCLUSIVE`, keep their original line for whoever reads the wreckage, and count towards
+  nothing. **A stop condition in a concurrent program needs a disposition for the work that
+  overlapped it, not only for the work that follows it** — and the two are told apart by asking
+  before the `finally` that sets the flag, so a worker never reads its own poisoning as
+  somebody else's.
+- **A `pgrep -f` finds itself, and answers about the search rather than the machine.** The
+  after-run leftover check reported three stray guardians immediately after a clean run that had
+  left none: the pattern appears in the argv of the pipeline doing the searching, which `ps` and
+  `pgrep -f` both enumerate. `[.]` in the pattern fixes it — the bracket matches the literal dot
+  and makes the pattern text differ from what it matches. This is the probe rule from CLAUDE.md
+  arriving one layer lower than usual: the instrument was inside the population it measured, so
+  the reading was about the instrument. The direction of the error is the dangerous one, because
+  a false POSITIVE here sends the next reader hunting a leak that is not there — and the same
+  mistake in the other direction, a filter that excludes too much, would hide a real one.
+- **A single-line anchor aimed at `mutate_mcp.py` itself matches TWICE**, and one of the two is
+  the mutation entry quoting it. It is refused up front by `stale_anchors` rather than silently
+  mutating the list instead of the code, but the fix is not obvious from the message: pin it
+  with a leading `\n`, which is a real newline in the source and an escape sequence in the
+  entry, so the entry cannot match itself. Every `F*` aimed at `SELF` is written that way or
+  spans several lines, which has the same effect for the same reason.
 
 ---
 
