@@ -917,7 +917,7 @@ def cmd_verify_copilot_channels(args) -> int:
     """
     from .adapters.copilot import (
         _MCP_CHANNEL_MARKERS, _SCANNED_SUFFIXES, _VERIFIED_ON, _VERIFIED_VERSIONS,
-        MARKER_NOT_SEARCHED, audit_channel_markers, find_cli_bundles,
+        MARKER_INCOMPLETE, MARKER_NOT_SEARCHED, audit_channel_markers, find_cli_bundles,
     )
 
     bundles = find_cli_bundles()
@@ -953,12 +953,34 @@ def cmd_verify_copilot_channels(args) -> int:
         print(f"  searched {len(audit.searched)} file(s) "
               f"({', '.join(_SCANNED_SUFFIXES)}); a marker compiled into a native "
               f"module would not be visible here")
+        # Partial blindness is the same argument as total blindness, and it is the case
+        # the first cut got wrong: one unreadable file beside one readable one produced a
+        # confident MISSING for every marker. A marker may be sitting in the file that
+        # would not open, so the run cannot call it absent.
+        if audit.verdict() == MARKER_INCOMPLETE:
+            worst = max(worst, 2)
+            print(f"  INSTRUMENT  {len(audit.unreadable)} file(s) could not be read "
+                  f"({', '.join(audit.unreadable[:3])}"
+                  f"{', …' if len(audit.unreadable) > 3 else ''}), and "
+                  f"{len(audit.missing)} marker(s) were not found in the rest.\n"
+                  "  => a marker may be in a file this scan could not open, so this is "
+                  "NOT a finding about the build. Fix the read, then re-run.\n")
+            continue
         # Found, but no longer in app.js. copilot 1.0.75 moved the agent frontmatter
         # schema out of the bundle's main file, and a one-file scan called that a
         # removed channel — the same words used for a channel that really went away.
         if audit.relocated:
+            # Raises the exit status, and the reason is not tidiness. Before the scan was
+            # widened, a marker that left app.js exited 2 and got looked at. If relocation
+            # printed a line and exited 0, the widening would have turned a loud finding
+            # into a quiet one — and the loudest case is a marker deleted from the RUNTIME
+            # bundle while surviving in `sdk/index.d.ts` or a JSON schema, which are
+            # typings and documentation rather than code that runs (review).
+            worst = max(worst, 1)
             for m, whereat in sorted(audit.relocated.items()):
-                print(f"  moved    {m}  — now in {whereat}, not app.js")
+                print(f"  moved    {m}  — now in {whereat}, not app.js; a typings or "
+                      f"schema file is not executed code, so confirm the channel is "
+                      f"still live rather than merely still described")
         if missing:
             worst = max(worst, 2)
             for m in missing:

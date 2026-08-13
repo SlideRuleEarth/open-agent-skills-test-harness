@@ -904,6 +904,33 @@ MUTATIONS = [
      "\n        if not self.searched:\n            return MARKER_NOT_SEARCHED",
      "\n        if False:\n            return MARKER_NOT_SEARCHED",
      "copilot.channel_markers_scan_the_bundle"),
+    # PARTIAL blindness reports as a confident finding about the build — the defect the
+    # first cut of this fix shipped with, one file short of the empty case M347 covers.
+    ("M348-a-blind-spot-still-licenses-a-confident-missing", COPILOT,
+     "\n        if self.unreadable:\n            return MARKER_INCOMPLETE",
+     "\n        if False:\n            return MARKER_INCOMPLETE",
+     "copilot.channel_markers_scan_the_bundle"),
+    # The file that would not open is dropped instead of recorded, so nothing downstream
+    # can know the scan had a hole in it.
+    ("M349-an-unreadable-file-leaves-no-trace", COPILOT,
+     "\n        else:\n            unreadable.append(rel)",
+     "\n        else:\n            pass",
+     "copilot.channel_markers_scan_the_bundle"),
+    # THE READ OVERLAP, which had no mutation at all until the straddle arm was given a
+    # directory of its own: while it shared one with bundles holding every marker, the
+    # assertion passed with the overlap deleted (review).
+    ("M350-the-chunk-overlap-is-dropped", COPILOT,
+     "\n            tail = buf[-longest:]",
+     "\n            tail = b\"\"",
+     "copilot.channel_bundle_audit"),
+    # One file, two spellings: the biggest file in the bundle is scanned twice. Aimed at
+    # the WALK side, which is where the two spellings meet — normalising only the `app_js`
+    # side is a no-op whenever it is already normalised, which it is for the bare relative
+    # path the case is about, so a mutation there changes nothing and reports MISSED.
+    ("M351-a-relative-app-js-is-scanned-twice", COPILOT,
+     "\n            if os.path.normpath(full) in seen_paths or not name.endswith(_SCANNED_SUFFIXES):",
+     "\n            if full in seen_paths or not name.endswith(_SCANNED_SUFFIXES):",
+     "copilot.channel_markers_scan_the_bundle"),
     # The check is simply gone. Measured live before it existed: the cell spends a model
     # call and comes back `exited with code 1`, with "Not logged in" buried in a truncated
     # JSON blob inside an assertion message.

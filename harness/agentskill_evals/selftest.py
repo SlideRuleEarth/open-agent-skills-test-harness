@@ -5341,8 +5341,16 @@ def _check_copilot_version_provenance(failures, verbose):
         full_verdict = full_audit.verdict()
         gapped_audit = _cop.audit_channel_markers(os.path.join(root, "2.0.0", "app.js"))
         missing = gapped_audit.missing
-        # a marker straddling the 1 MiB read boundary must still be found
-        straddle = os.path.join(tmp, "straddle.js")
+        # A marker straddling the 1 MiB read boundary must still be found — and the file
+        # needs a directory of its OWN, because the scan now walks the whole bundle: while
+        # `straddle.js` sat directly in `tmp`, the walk also reached the fixture bundles
+        # under `pkg/darwin-arm64/`, every one of which holds every marker. Deleting the
+        # read overlap left this assertion still True, so it had stopped testing the
+        # overlap at all and no mutation covered `tail = buf[-longest:]` (review). An arm
+        # whose subject can be satisfied by something other than its subject is not an arm.
+        straddle_dir = os.path.join(tmp, "straddle-only")
+        os.makedirs(straddle_dir)
+        straddle = os.path.join(straddle_dir, "straddle.js")
         pad = (1 << 20) - (len(markers[0]) // 2)
         with open(straddle, "w") as f:
             f.write("." * pad + " ".join(markers))
@@ -5394,6 +5402,38 @@ def _check_copilot_version_provenance(failures, verbose):
         wasm_unread = not any(s.endswith(".wasm") for s in moved.searched)
         app_first = moved.searched[0] == "app.js"
 
+        # PARTIAL blindness, which is where the first cut of this fix went wrong: one
+        # unreadable file beside one readable one gave a non-empty `searched` and
+        # therefore a confident MISSING for every marker — the audit blaming the build
+        # for its own blind spot, one file short of the empty case below. The scan must
+        # refuse to call a marker absent while a file it meant to read would not open.
+        # Arranged without a permission the sandbox may deny: the walk lists the file,
+        # and it is unlinked before the read reaches it.
+        blind_root = os.path.join(tmp, "partial")
+        os.makedirs(blind_root)
+        with open(os.path.join(blind_root, "app.js"), "w") as f:
+            f.write(" ".join(markers[:-1]))          # every marker but the last
+        vanishing = os.path.join(blind_root, "zz-vanishes.json")
+        with open(vanishing, "w") as f:
+            f.write("{}")
+        _orig_isfile = os.path.isfile
+
+        def _isfile_once(path, _seen={}):            # noqa: B006 — deliberate call-count state
+            if os.path.normpath(path) == os.path.normpath(vanishing):
+                os.unlink(vanishing) if _orig_isfile(vanishing) else None
+                return True                          # the walk saw it; the read will not
+            return _orig_isfile(path)
+
+        os.path.isfile = _isfile_once
+        try:
+            partial = _cop.audit_channel_markers(os.path.join(blind_root, "app.js"))
+        finally:
+            os.path.isfile = _orig_isfile
+        partial_ok = (partial.verdict() == _cop.MARKER_INCOMPLETE
+                      and partial.missing == [markers[-1]]
+                      and "zz-vanishes.json" in partial.unreadable
+                      and "zz-vanishes.json" not in partial.searched)
+
         # A scan that read nothing reports every marker absent — byte-identical to a
         # build that dropped every channel, and the opposite finding. An empty bundle
         # dir produces that state without needing a permission the sandbox may refuse
@@ -5417,9 +5457,20 @@ def _check_copilot_version_provenance(failures, verbose):
             [m.encode() for m, _w in _cop._MCP_CHANNEL_MARKERS],
             [None] * len(_cop._MCP_CHANNEL_MARKERS), "no-such-file.json", 64) is False
 
+        # A bare relative app.js must not be scanned twice: `root` becomes "." and the
+        # walk re-derives the same file as "./app.js" — a different string for one file.
+        _cwd = os.getcwd()
+        os.chdir(moved_root)
+        try:
+            relative = _cop.audit_channel_markers("app.js")
+        finally:
+            os.chdir(_cwd)
+        no_double_scan = relative.searched.count("app.js") == 1
+
         _check("copilot.channel_markers_scan_the_bundle",
                rel_ok and still_missing and wasm_unread and app_first
-               and blind and verdicts_split and unread_licence,
+               and blind and verdicts_split and unread_licence and partial_ok
+               and no_double_scan,
                f"a marker that MOVED inside the bundle is found and reported as moved "
                f"rather than missing (copilot 1.0.75 did exactly this to `mcp-servers`), "
                f"while a marker in no scanned file is still reported MISSING, a marker "
@@ -5428,7 +5479,8 @@ def _check_copilot_version_provenance(failures, verbose):
                f"relocated={moved.relocated} missing={moved.missing} "
                f"searched_head={moved.searched[:3]} wasm_unread={wasm_unread} "
                f"blind_verdict={nothing.verdict()} moved_verdict={moved.verdict()} "
-               f"unread_licence={unread_licence}",
+               f"unread_licence={unread_licence} partial={partial.verdict()}/"
+               f"{partial.unreadable} double_scan={relative.searched}",
                failures, verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

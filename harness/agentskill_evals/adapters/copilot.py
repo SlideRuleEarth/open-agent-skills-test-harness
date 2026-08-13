@@ -551,19 +551,33 @@ _SCANNED_SUFFIXES = (".js", ".mjs", ".cjs", ".json", ".ts")
 MARKER_INTACT = "INTACT"
 MARKER_MISSING = "MISSING"
 MARKER_NOT_SEARCHED = "NOT_SEARCHED"
+MARKER_INCOMPLETE = "INCOMPLETE"
 
 
 class MarkerAudit(NamedTuple):
-    """What one bundle scan found, and — as a peer fact — where it looked.
+    """What one bundle scan found, and — as peer facts — where it looked and where it could not.
 
     An audit that read nothing reports every marker absent, which is bit-for-bit the
-    output of a build that dropped every channel. Those are opposite findings, so
-    `searched` is part of the result rather than a detail: absence is only evidence
-    once something says the search happened.
+    output of a build that dropped every channel. Those are opposite findings, so the
+    scope is part of the result rather than a detail: absence is only evidence once
+    something says the search actually covered the places the string could be.
+
+    `unreadable` is the second half of that, and the FIRST cut of this type shipped
+    without it — which reproduced the very defect the type was introduced to fix, one file
+    short of the empty case. An `app.js` that could not be opened beside one readable
+    sibling gave `searched=('package.json',)`, a non-empty scope, and therefore a
+    confident `MISSING` for all 11 markers: the audit blaming the build for its own
+    blind spot (review). A file that could not be read is not a file that ruled anything
+    out, so it is carried and `verdict()` consults it.
+
+    `where` may name a file that is in `unreadable` rather than `searched`: a read that
+    died partway still FOUND what it found before it died, and a string that was seen is
+    present whatever happened next. Presence survives a truncated read; absence does not.
     """
 
     where: dict[str, str | None]      # marker -> bundle-relative file it was found in
-    searched: tuple[str, ...]         # bundle-relative files actually read, in scan order
+    searched: tuple[str, ...]         # bundle-relative files read to completion, in scan order
+    unreadable: tuple[str, ...] = ()  # files that could not be opened, or died mid-read
 
     @property
     def present(self) -> dict[str, bool]:
@@ -580,9 +594,24 @@ class MarkerAudit(NamedTuple):
                 if p is not None and p != "app.js"}
 
     def verdict(self) -> str:
+        """The one function every consumer reads, over every fact that bears on trust.
+
+        The order is a conjunction rather than a lookup on whichever fact arrived last:
+        a scan that read nothing concludes nothing at all; a scan with ANY blind spot
+        cannot call a marker absent, because the marker may be in the file it could not
+        open; only a scan that both read something and read everything it meant to may
+        report `MISSING`. Markers all found is `INTACT` regardless of blind spots — a
+        string that was seen is seen, and no unread file can retract it.
+        """
+        if not self.missing:
+            # Nothing to conclude about absence, so the only question left is whether
+            # anything was examined at all.
+            return MARKER_INTACT if (self.searched or self.unreadable) else MARKER_NOT_SEARCHED
         if not self.searched:
             return MARKER_NOT_SEARCHED
-        return MARKER_MISSING if self.missing else MARKER_INTACT
+        if self.unreadable:
+            return MARKER_INCOMPLETE
+        return MARKER_MISSING
 
 
 def _scan_file(path: str, needles: list[bytes], hits: list[str | None],
@@ -635,29 +664,41 @@ def audit_channel_markers(app_js: str) -> MarkerAudit:
     longest = max(len(n) for n in needles)
     root = os.path.dirname(app_js) or "."
     searched: list[str] = []
+    unreadable: list[str] = []
 
     ordered: list[tuple[str, str]] = []
+    seen_paths: set[str] = set()
     if os.path.isfile(app_js):
         ordered.append((app_js, os.path.basename(app_js)))
+        # Normalised, because the walk below re-derives this path by joining and would
+        # otherwise emit `./app.js` for a bare relative `app.js` — a different STRING for
+        # the same file, so the biggest file in the bundle got scanned twice and `searched`
+        # reported it twice (review). Identity here is the path, not the spelling.
+        seen_paths.add(os.path.normpath(app_js))
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
         for name in sorted(filenames):
             full = os.path.join(dirpath, name)
-            if full == app_js or not name.endswith(_SCANNED_SUFFIXES):
+            if os.path.normpath(full) in seen_paths or not name.endswith(_SCANNED_SUFFIXES):
                 continue
+            seen_paths.add(os.path.normpath(full))
             ordered.append((full, os.path.relpath(full, root)))
 
     for full, rel in ordered:
         if all(h is not None for h in hits):
             break
+        # A path that vanished between the walk and the read is a blind spot exactly like
+        # one that would not open: it was meant to be read and was not.
         if not os.path.isfile(full):
-            continue
-        if _scan_file(full, needles, hits, rel, longest):
+            unreadable.append(rel)
+        elif _scan_file(full, needles, hits, rel, longest):
             searched.append(rel)
+        else:
+            unreadable.append(rel)
 
     return MarkerAudit(
         where={m: hits[i] for i, (m, _why) in enumerate(_MCP_CHANNEL_MARKERS)},
-        searched=tuple(searched))
+        searched=tuple(searched), unreadable=tuple(unreadable))
 
 
 # The built-in server a hermetic invocation always CONFIGURES and always disables:
