@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 344/344 production + 2/2 instrument + 135/135 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 481 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 345/345 production + 2/2 instrument + 136/136 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 482 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 git diff --check
 
@@ -1962,8 +1962,13 @@ ABA fix and its route to `parallel_safe_config = True`.
   C3-2 says the refusal costs the fleet nothing today. It needed a new
   shim mode (`PROBE_MCP_INIT_DELAY_MS`) *and* a raw-fd read path in the shim, because
   `sys.stdin.readline()` buffers a chunk rather than a line and would have hidden exactly the
-  bytes being measured. claude is free to probe (`claude mcp list` health-checks stdio
-  servers with a full handshake); the other three cost one cheap model call each.
+  bytes being measured. claude was free to probe at 2.1.113 (`claude mcp list` health-checks
+  stdio servers with a full handshake); the other three cost one cheap model call each.
+  **That stopped being true at 2.1.231**: `claude mcp list` takes no options there, so the
+  global `--mcp-config`/`--strict-mcp-config` do not scope it and it health-checks the USER's
+  servers instead of the supplied one; the `.mcp.json` route needs an interactive approval.
+  All four now cost a call. A procedure is version-qualified exactly as a reading is, and
+  nothing reports its decay except trying to use it (`DESIGN_MCP_Support.md` §9).
 
   **Both gating probes resolved 2026-07-29** (`fixtures/probe_era_mcp_server.py`, results in
   `DESIGN_MCP_Support.md` §9). Three findings changed the build:

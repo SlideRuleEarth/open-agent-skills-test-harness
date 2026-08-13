@@ -538,12 +538,22 @@ def _safe_listdir(path: str) -> list[str]:
 # as a channel assumption that no longer holds, which is the same words this command uses
 # for a channel that was genuinely REMOVED, and the two want opposite responses.
 #
-# Extensions rather than "every file": a bundle is ~173 MB, of which these are ~18 MB, and
-# the rest is wasm blobs, prebuilt binaries and a vendored ripgrep. That is a REAL limit on
-# what the audit can conclude and it is reported rather than hidden — a string compiled into
-# a native module is invisible here, so `MarkerAudit.searched` names what was actually read
-# and the command prints it. A narrowed claim beats a wide one nobody can check.
-_SCANNED_SUFFIXES = (".js", ".mjs", ".cjs", ".json", ".ts")
+# EVERY REGULAR FILE, and the first cut of this fix got that wrong in the most instructive
+# way available. It scanned `.js/.json/.ts` only — ~18 MB of a ~173 MB bundle — and printed
+# a caveat saying a string compiled into a native module would be invisible. That caveat
+# then CAME TRUE and was read straight past: `mcp-servers` is in
+# `prebuilds/darwin-arm64/runtime.node` in every build measured, 1.0.64 through 1.0.79, and
+# its occurrences GROW (1, 9, 10, 11) beside `mcp-servers: Expected object` and Rust
+# config-loader paths. The agent frontmatter loader moved into the native runtime; the key
+# never went anywhere. The audit reported MISSING, a finding about the build, on the
+# strength of a file it had declined to open (external review).
+#
+# So the scope limit is deleted rather than documented. A limit a reader must remember to
+# apply is a limit that will be forgotten exactly when it matters, and the whole purpose of
+# this audit is to be believed about an absence. Text files are ordered FIRST so the common
+# case still short-circuits in milliseconds; the binaries are only reached when a marker
+# has not been found anywhere else, which is precisely when the question is live.
+_TEXT_FIRST_SUFFIXES = (".js", ".mjs", ".cjs", ".json", ".ts")
 
 # Verdicts. `verdict()` is the ONE function every consumer reads, because "did the scan
 # look anywhere at all" is a fact about whether the answer is trustworthy and so belongs
@@ -666,23 +676,42 @@ def audit_channel_markers(app_js: str) -> MarkerAudit:
     searched: list[str] = []
     unreadable: list[str] = []
 
-    ordered: list[tuple[str, str]] = []
+    text_files: list[tuple[str, str]] = []
+    other_files: list[tuple[str, str]] = []
     seen_paths: set[str] = set()
     if os.path.isfile(app_js):
-        ordered.append((app_js, os.path.basename(app_js)))
+        text_files.append((app_js, os.path.basename(app_js)))
         # Normalised, because the walk below re-derives this path by joining and would
         # otherwise emit `./app.js` for a bare relative `app.js` — a different STRING for
         # the same file, so the biggest file in the bundle got scanned twice and `searched`
         # reported it twice (review). Identity here is the path, not the spelling.
         seen_paths.add(os.path.normpath(app_js))
-    for dirpath, dirnames, filenames in os.walk(root):
+
+    # A directory that cannot be listed is a blind spot of exactly the kind `unreadable`
+    # exists for, and `os.walk` swallows it by default: the subtree simply does not appear,
+    # so a marker living only inside it reads as absent with an empty `unreadable` and a
+    # confident MISSING (external review). The error is recorded instead.
+    walk_failures: list[str] = []
+
+    def _on_walk_error(err: OSError) -> None:
+        target = getattr(err, "filename", None) or root
+        try:
+            walk_failures.append(os.path.relpath(target, root))
+        except ValueError:                      # different drive on win32
+            walk_failures.append(str(target))
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_on_walk_error):
         dirnames.sort()
         for name in sorted(filenames):
             full = os.path.join(dirpath, name)
-            if os.path.normpath(full) in seen_paths or not name.endswith(_SCANNED_SUFFIXES):
+            norm = os.path.normpath(full)
+            if norm in seen_paths:
                 continue
-            seen_paths.add(os.path.normpath(full))
-            ordered.append((full, os.path.relpath(full, root)))
+            seen_paths.add(norm)
+            entry = (full, os.path.relpath(full, root))
+            (text_files if name.endswith(_TEXT_FIRST_SUFFIXES) else other_files).append(entry)
+
+    ordered = text_files + other_files
 
     for full, rel in ordered:
         if all(h is not None for h in hits):
@@ -698,7 +727,7 @@ def audit_channel_markers(app_js: str) -> MarkerAudit:
 
     return MarkerAudit(
         where={m: hits[i] for i, (m, _why) in enumerate(_MCP_CHANNEL_MARKERS)},
-        searched=tuple(searched), unreadable=tuple(unreadable))
+        searched=tuple(searched), unreadable=tuple(unreadable) + tuple(walk_failures))
 
 
 # The built-in server a hermetic invocation always CONFIGURES and always disables:

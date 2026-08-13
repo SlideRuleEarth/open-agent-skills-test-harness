@@ -364,7 +364,7 @@ CLI-native keeps values off disk but is inconsistent (copilot/agy have nothing).
 
    | CLI | era / version | behaviour while the `initialize` response was held 1200 ms | cost |
    |---|---|---|---|
-   | claude 2.1.113 | legacy `2025-11-25` | nothing sent; `notifications/initialized` followed the response | **free** (`claude mcp list`) |
+   | claude 2.1.113 | legacy `2025-11-25` | nothing sent; `notifications/initialized` followed the response | free at 2.1.113 (`claude mcp list`); **1 call from 2.1.231** — see below |
    | codex 0.140.0 | legacy `2025-06-18` | nothing sent; then `initialized` + `tools/list` back to back | 1 call (gpt-5.4-mini) |
    | copilot 1.0.75 | legacy `2025-11-25` | nothing sent; then `initialized`, then `tools/list` **twice** | 1 call (claude-haiku-4.5) |
    | agy 1.1.9 | **modern `2026-07-28`** | **n/a — sends no `initialize` at all** | 1 call (gemini-3.5-flash-low) |
@@ -868,7 +868,7 @@ Three arms deserve naming because each pins a rule that a plausible implementati
 
 `fixtures/probe_era_mcp_server.py` is the working model for that: it already serves both eras and carries a `PROBE_MCP_MODE` switch that forces the legacy-refusal path on demand. It is a measuring instrument rather than a test double, so it is not the fixture — but the era handling can be lifted rather than rediscovered.
 
-Live verification against all four CLIs comes after the offline arms, and the C3-1 finding gives it a specific target: codex and copilot exercise the `SIGTERM` terminator path that claude and agy never will, so a proxy validated only against claude would have a completely untested shutdown path on half the fleet.
+Live verification against all four CLIs comes after the offline arms, and the C3-1 finding gives it a specific target: the signalled terminator path is exercised by codex and copilot — **and, since 2.1.231, by claude too, which now sends `SIGINT` where it used to close stdin** (§9 C3-1). Only agy still ends a server by EOF alone. A proxy validated against one CLI would have an untested shutdown path on the rest of the fleet, and the mapping of which CLI exercises which path is itself a measurement with an expiry date — this sentence named claude on the EOF side for two weeks after it stopped being true.
 
 **A second live target, now measured: probe C3-2** (§9). §10.2's era rule REFUSES a request pipelined behind an unanswered `initialize`, and the measurement says no shipped CLI is refused by it — three legacy CLIs wait, and agy has no handshake to pipeline behind. `tools/probe_mcp_pipelining.py` re-runs it; three of the four cost one cheap model call each, and claude is free because `claude mcp list` health-checks stdio servers with a full handshake. The instrument has its own regression in `verify_mcp_fixtures.py` (E13), checked in **both** directions — an instrument that reports pipelining for everything is as useless as one that reports it for nothing, and the second is the plausible failure, being what a buffered read path produces. The probe that *reads* the instrument has its own (E14), because it is a different program: E13's checks all stayed green over a classifier that would have reported a CLI which died before handshaking as "modern `n/a`", and the classification — not the log — is what a design decision gets justified by (review, third round on PR #100). `classify`, `unmeasured` and `summary` are functions rather than an `elif` chain inside `main()` for exactly that reason.
 

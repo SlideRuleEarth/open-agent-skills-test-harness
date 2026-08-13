@@ -916,7 +916,7 @@ def cmd_verify_copilot_channels(args) -> int:
     a substitute for that reading.
     """
     from .adapters.copilot import (
-        _MCP_CHANNEL_MARKERS, _SCANNED_SUFFIXES, _VERIFIED_ON, _VERIFIED_VERSIONS,
+        _MCP_CHANNEL_MARKERS, _VERIFIED_ON, _VERIFIED_VERSIONS,
         MARKER_INCOMPLETE, MARKER_NOT_SEARCHED, audit_channel_markers, find_cli_bundles,
     )
 
@@ -950,9 +950,8 @@ def cmd_verify_copilot_channels(args) -> int:
                   "ruled out.\n  => this is a finding about the audit, not about the "
                   "build. Check the path and permissions above.\n")
             continue
-        print(f"  searched {len(audit.searched)} file(s) "
-              f"({', '.join(_SCANNED_SUFFIXES)}); a marker compiled into a native "
-              f"module would not be visible here")
+        print(f"  searched {len(audit.searched)} file(s) — every regular file in the "
+              f"bundle, binaries included")
         # Partial blindness is the same argument as total blindness, and it is the case
         # the first cut got wrong: one unreadable file beside one readable one produced a
         # confident MISSING for every marker. A marker may be sitting in the file that
@@ -978,9 +977,10 @@ def cmd_verify_copilot_channels(args) -> int:
             # typings and documentation rather than code that runs (review).
             worst = max(worst, 1)
             for m, whereat in sorted(audit.relocated.items()):
-                print(f"  moved    {m}  — now in {whereat}, not app.js; a typings or "
-                      f"schema file is not executed code, so confirm the channel is "
-                      f"still live rather than merely still described")
+                print(f"  moved    {m}  — now in {whereat}, not app.js. Confirm the "
+                      f"channel is still LIVE rather than merely still named: a native "
+                      f"module is executed code and a typings or schema file is not, and "
+                      f"the string alone does not say which kind of file this is")
         if missing:
             worst = max(worst, 2)
             for m in missing:

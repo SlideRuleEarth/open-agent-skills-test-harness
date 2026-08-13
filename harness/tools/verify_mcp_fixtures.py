@@ -1808,15 +1808,25 @@ check("...and every way of asking for it wrongly is refused rather than rounded 
 # produced it. The live table must therefore be clean, and the predicate must be able to SAY
 # a table is dirty — a guard asserted only against the real table passes for as long as
 # nobody makes the mistake, which is the state this repo was already in.
-_dup_a = ("M1-x", "agentskill_evals/runner.py", "a", "b", "arm")
-_dup_b = ("M1-y", "agentskill_evals/runner.py", "c", "d", "arm")
+_dup_a = ("M338-marker-scan-narrows-back-to-one-file", "agentskill_evals/runner.py", "a", "b", "arm")
+_dup_b = ("M338-the-phase-marker-is-never-written", "agentskill_evals/runner.py", "c", "d", "arm")
+_dup_c = ("M339-something-else", "agentskill_evals/runner.py", "e", "f", "arm")
 check("no mutation id names two entries in the live table",
       MUT.duplicate_ids(MUT.MUTATIONS) == [],
       MUT.duplicate_ids(MUT.MUTATIONS))
-check("...and the guard reports a repeat rather than reading a clean table off any input",
-      (MUT.duplicate_ids([_dup_a, _dup_a, _dup_b]) == [("M1-x", 2)]
-       and MUT.duplicate_ids([_dup_a, _dup_b]) == []),
-      [MUT.duplicate_ids([_dup_a, _dup_a, _dup_b]), MUT.duplicate_ids([_dup_a, _dup_b])])
+# THE HISTORICAL COLLISION VERBATIM, because the first version of this check used `M1-x`
+# and `M1-y` and called them DISTINCT — blessing the exact shape it was written to catch,
+# since the real collision was four entries reusing M338-M341 under different descriptions
+# (external review). The id is the number; the rest of the string is prose.
+check("...and two entries sharing a NUMBER collide however differently they are described",
+      (MUT.duplicate_ids([_dup_a, _dup_b]) == [("M338", 2)]
+       and MUT.duplicate_ids([_dup_a, _dup_c]) == []),
+      [MUT.duplicate_ids([_dup_a, _dup_b]), MUT.duplicate_ids([_dup_a, _dup_c])])
+check("...and the canonical id is the class letter and number, not the description",
+      (MUT._canonical_mid("M338-anything") == "M338"
+       and MUT._canonical_mid("F12-x") == "F12"
+       and MUT._canonical_mid("Z1-not-a-real-mutation") == "Z1-not-a-real-mutation"),
+      [MUT._canonical_mid(s) for s in ("M338-anything", "F12-x", "Z1-not-a-real-mutation")])
 
 # THE SLOWEST-MUTATION WARNING, which §4 reads as the only notice before a defect that loops
 # becomes a defect that hangs. It has to rank on CPU: under `--jobs N` the loudest WALL figure

@@ -881,15 +881,21 @@ MUTATIONS = [
     # REMOVED — and nobody noticed for three releases. Deleting the walk restores exactly
     # that: the bundle's sibling files stop being read.
     ("M344-marker-scan-narrows-back-to-one-file", COPILOT,
-     "\n    for dirpath, dirnames, filenames in os.walk(root):",
+     "\n    for dirpath, dirnames, filenames in os.walk(root, onerror=_on_walk_error):",
      "\n    for dirpath, dirnames, filenames in []:",
      "copilot.channel_markers_scan_the_bundle"),
     # The opposite failure, and the one a widening invites: the scan reads everything,
     # including the wasm blobs and prebuilt binaries it cannot honestly claim to have
     # examined, so `searched` overstates what was ruled out.
-    ("M345-marker-scan-claims-files-it-does-not-read", COPILOT,
-     '\n_SCANNED_SUFFIXES = (".js", ".mjs", ".cjs", ".json", ".ts")',
-     '\n_SCANNED_SUFFIXES = (".js", ".mjs", ".cjs", ".json", ".ts", ".wasm")',
+    ("M345-the-scan-skips-what-is-not-a-text-file-again", COPILOT,
+     "\n            (text_files if name.endswith(_TEXT_FIRST_SUFFIXES) else other_files).append(entry)",
+     "\n            text_files.append(entry) if name.endswith(_TEXT_FIRST_SUFFIXES) else None",
+     "copilot.channel_markers_scan_the_bundle"),
+    # A directory that cannot be listed vanishes silently, so a marker inside it reads as
+    # absent with nothing recording the hole (external review).
+    ("M352-a-denied-directory-leaves-no-trace", COPILOT,
+     "\n    for dirpath, dirnames, filenames in os.walk(root, onerror=_on_walk_error):",
+     "\n    for dirpath, dirnames, filenames in os.walk(root):",
      "copilot.channel_markers_scan_the_bundle"),
     # A file that could not be opened counts as searched, so an unreadable bundle reports
     # "absent" about files nothing ever read — the audit's own version of the defect it
@@ -928,8 +934,8 @@ MUTATIONS = [
     # side is a no-op whenever it is already normalised, which it is for the bare relative
     # path the case is about, so a mutation there changes nothing and reports MISSED.
     ("M351-a-relative-app-js-is-scanned-twice", COPILOT,
-     "\n            if os.path.normpath(full) in seen_paths or not name.endswith(_SCANNED_SUFFIXES):",
-     "\n            if full in seen_paths or not name.endswith(_SCANNED_SUFFIXES):",
+     "\n            norm = os.path.normpath(full)",
+     "\n            norm = full",
      "copilot.channel_markers_scan_the_bundle"),
     # The check is simply gone. Measured live before it existed: the cell spends a model
     # call and comes back `exited with code 1`, with "Not logged in" buried in a truncated
@@ -3196,10 +3202,14 @@ MUTATIONS = [
      "...and every way of asking for it wrongly is refused rather than rounded to 1"),
     # A repeated id stops being reported, which is the state this runner shipped in until an
     # id collision produced eight mutations under four names and a green run either way.
+    ("F137-the-id-comparison-includes-the-description-again", SELF,
+     "\n    head = mid.split(\"-\", 1)[0]",
+     "\n    head = mid",
+     "...and two entries sharing a NUMBER collide however differently they are described"),
     ("F136-a-repeated-mutation-id-reports-as-a-clean-table", SELF,
-     "\n        seen[mid] = seen.get(mid, 0) + 1",
-     "\n        seen[mid] = 1",
-     "...and the guard reports a repeat rather than reading a clean table off any input"),
+     "\n        seen[_canonical_mid(mid)] = seen.get(_canonical_mid(mid), 0) + 1",
+     "\n        seen[_canonical_mid(mid)] = 1",
+     "...and two entries sharing a NUMBER collide however differently they are described"),
     # THE SLOWEST-MUTATION WARNING, on the axis that stops meaning anything under load and on
     # the entries that never ran.
     ("F87-the-slowest-mutation-is-picked-by-wall-clock", SELF,
@@ -4372,6 +4382,20 @@ def _classify(mid, rel):
     return kind
 
 
+def _canonical_mid(mid):
+    """The identifying part of a mutation id: its class letter and number, e.g. `M338`.
+
+    The rest of the string is a description, and comparing it is what let the FIRST cut of
+    this guard miss the exact collision it was written for: `M338-marker-scan-narrows...`
+    and `M338-the-phase-marker-is-never-written` are different strings, so a whole-string
+    compare called them distinct and reported a clean table (external review). The number
+    is the name — it is what a result line carries, what `stale_anchors` prints, and what
+    anyone types to talk about one entry.
+    """
+    head = mid.split("-", 1)[0]
+    return head if head[:1] in "MIF" and head[1:].isdigit() else mid
+
+
 def duplicate_ids(mutations):
     """Every `(id, count)` used by more than one entry, worst first.
 
@@ -4389,7 +4413,7 @@ def duplicate_ids(mutations):
     """
     seen = {}
     for mid, *_rest in mutations:
-        seen[mid] = seen.get(mid, 0) + 1
+        seen[_canonical_mid(mid)] = seen.get(_canonical_mid(mid), 0) + 1
     return sorted(((mid, n) for mid, n in seen.items() if n > 1),
                   key=lambda pair: (-pair[1], pair[0]))
 

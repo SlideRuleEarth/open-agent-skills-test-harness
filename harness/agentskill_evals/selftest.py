@@ -5392,14 +5392,18 @@ def _check_copilot_version_provenance(failures, verbose):
         # ...one of which reappears in a sibling schema file (the 1.0.75 shape)...
         with open(os.path.join(moved_root, "schemas", "api.schema.json"), "w") as f:
             f.write('{"x": "' + markers[-2] + '"}')
-        # ...and the other only inside a file the scan does not read.
+        # ...and the other ONLY inside a binary, which must now be found: the scope limit
+        # that made a native module invisible is gone, because it came true in the field
+        # (`mcp-servers` lives in runtime.node) and was read straight past as a finding
+        # about the build.
         with open(os.path.join(moved_root, "blob.wasm"), "w") as f:
             f.write(markers[-1])
         moved = _cop.audit_channel_markers(os.path.join(moved_root, "app.js"))
         rel_ok = moved.relocated == {markers[-2]: os.path.join("schemas",
-                                                              "api.schema.json")}
-        still_missing = moved.missing == [markers[-1]]
-        wasm_unread = not any(s.endswith(".wasm") for s in moved.searched)
+                                                              "api.schema.json"),
+                                     markers[-1]: "blob.wasm"}
+        still_missing = moved.missing == []
+        binary_scanned = moved.where[markers[-1]] == "blob.wasm"
         app_first = moved.searched[0] == "app.js"
 
         # PARTIAL blindness, which is where the first cut of this fix went wrong: one
@@ -5434,6 +5438,34 @@ def _check_copilot_version_provenance(failures, verbose):
                       and "zz-vanishes.json" in partial.unreadable
                       and "zz-vanishes.json" not in partial.searched)
 
+        # A DIRECTORY that cannot be listed is the same blind spot as a file that cannot
+        # be read, and `os.walk` hides it by default — the subtree just does not appear,
+        # so a marker living only inside it read as absent with an empty `unreadable`
+        # (external review). Driven through `onerror` directly rather than by chmod,
+        # because a permission the sandbox may refuse is a case that will one day be
+        # skipped rather than run (§4).
+        walk_root = os.path.join(tmp, "walkfail")
+        os.makedirs(os.path.join(walk_root, "denied"))
+        with open(os.path.join(walk_root, "app.js"), "w") as f:
+            f.write(" ".join(markers[:-1]))
+        _orig_walk = os.walk
+
+        def _walk_with_error(top, *a, **kw):
+            onerror = kw.get("onerror")
+            yield from _orig_walk(top, *a, **kw)
+            if onerror is not None:
+                err = OSError(13, "Permission denied")
+                err.filename = os.path.join(walk_root, "denied")
+                onerror(err)
+
+        os.walk = _walk_with_error
+        try:
+            denied = _cop.audit_channel_markers(os.path.join(walk_root, "app.js"))
+        finally:
+            os.walk = _orig_walk
+        walk_err_ok = (denied.verdict() == _cop.MARKER_INCOMPLETE
+                       and "denied" in denied.unreadable)
+
         # A scan that read nothing reports every marker absent — byte-identical to a
         # build that dropped every channel, and the opposite finding. An empty bundle
         # dir produces that state without needing a permission the sandbox may refuse
@@ -5445,8 +5477,12 @@ def _check_copilot_version_provenance(failures, verbose):
         blind = (nothing.verdict() == _cop.MARKER_NOT_SEARCHED
                  and nothing.searched == () and not nothing.present[markers[0]])
         # ...and the two states must not collide: a real removal is still MISSING.
-        verdicts_split = (moved.verdict() == _cop.MARKER_MISSING
-                          and full_verdict == _cop.MARKER_INTACT)
+        # A real removal must still be reportable — a widening that can no longer say
+        # MISSING has destroyed the instrument rather than fixed it. `gapped_audit` is the
+        # bundle with a marker in NO file at all.
+        verdicts_split = (gapped_audit.verdict() == _cop.MARKER_MISSING
+                          and full_verdict == _cop.MARKER_INTACT
+                          and moved.verdict() == _cop.MARKER_INTACT)
 
         # The licence for the word "searched", asserted where it is decided rather than
         # through the walk: a file that could not be opened has ruled nothing out. The
@@ -5468,16 +5504,17 @@ def _check_copilot_version_provenance(failures, verbose):
         no_double_scan = relative.searched.count("app.js") == 1
 
         _check("copilot.channel_markers_scan_the_bundle",
-               rel_ok and still_missing and wasm_unread and app_first
+               rel_ok and still_missing and binary_scanned and app_first
                and blind and verdicts_split and unread_licence and partial_ok
-               and no_double_scan,
+               and no_double_scan and walk_err_ok,
                f"a marker that MOVED inside the bundle is found and reported as moved "
                f"rather than missing (copilot 1.0.75 did exactly this to `mcp-servers`), "
                f"while a marker in no scanned file is still reported MISSING, a marker "
                f"only in an unscanned binary is not claimed, and a scan that read nothing "
                f"is its own verdict instead of 'every channel vanished': "
                f"relocated={moved.relocated} missing={moved.missing} "
-               f"searched_head={moved.searched[:3]} wasm_unread={wasm_unread} "
+               f"gapped={gapped_audit.verdict()} "
+               f"searched_head={moved.searched[:3]} binary_scanned={binary_scanned} "
                f"blind_verdict={nothing.verdict()} moved_verdict={moved.verdict()} "
                f"unread_licence={unread_licence} partial={partial.verdict()}/"
                f"{partial.unreadable} double_scan={relative.searched}",

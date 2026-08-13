@@ -120,9 +120,17 @@ _PROVENANCE = VersionProvenance(
         "to emit its init event, which is allowed but proves nothing about its MCP host. "
         "So --strict-mcp-config was NOT confirmed effective here."),
     clear_hint=(
-        "To clear it: confirm `claude --help` still documents --strict-mcp-config as "
-        "ignoring all MCP configuration outside --mcp-config, then add the version to "
-        "_VERIFIED_VERSIONS in adapters/claude.py."),
+        "To clear it, MEASURE the flag rather than reading about it — reading `--help` was "
+        "this hint's whole procedure until 2026-08-13, and a documented flag that stopped "
+        "working would pass it unchanged. Run the declared-server pair: `claude -p ... "
+        "--mcp-config <file> --output-format stream-json --verbose` once WITH "
+        "--strict-mcp-config and once without, and read the init event's mcp_servers list. "
+        "The run without the flag is the control and it is what makes the other one mean "
+        "anything: it must name the ambient servers the flag is supposed to exclude, while "
+        "the strict run names only the declared one. (Measured so on 2.1.231: 7 servers "
+        "against 1.) Then confirm the result event carries no key outside "
+        "_KNOWN_RESULT_KEYS, reading a COMPLETE event rather than a tail, and add the "
+        "version to _VERIFIED_VERSIONS in adapters/claude.py."),
 )
 
 
@@ -322,12 +330,18 @@ class ClaudeAdapter(Adapter):
     # still the whole server set under `isolated: false`, which is why such a run is allowed
     # rather than refused (see Adapter.mcp_off_mechanism).
     #
-    # This is a REVIEWED ASSERTION about that flag, not a verified one. _PROVENANCE is an
-    # audit trail plus a drift warning: a build outside _VERIFIED_VERSIONS warns and still
-    # runs, and the witness text above says outright that an empty server list cannot
-    # distinguish "the flag worked" from "a newer build grew a server source outside the
-    # flag's reach". Nothing here would catch a wrong value; what the provenance machinery
-    # buys is that an unaudited build is visible, and that re-establishing the claim has a
+    # THIS WAS A REVIEWED ASSERTION UNTIL 2026-08-13 AND IS NOW MEASURED, on 2.1.231, by
+    # the paired run `clear_hint` below describes: without the flag the init event named
+    # seven servers (the declared one plus six real user connectors), with it exactly one.
+    # The control arm is what upgraded it — the runtime witness alone reads an EMPTY list,
+    # which cannot distinguish "the flag worked" from "a newer build grew a server source
+    # outside the flag's reach", and that limit is still real for any source appearing in
+    # NEITHER arm. What the measurement settles is the sources it named.
+    #
+    # _PROVENANCE remains an audit trail plus a drift warning: a build outside
+    # _VERIFIED_VERSIONS warns and still runs. Nothing here would catch a wrong value; what
+    # the provenance machinery buys is that an unaudited build is visible, and that
+    # re-establishing the claim has a
     # documented procedure (clear_hint).
     mcp_off_mechanism = MCPOffMechanism.CLI
     # Per-server `tools:` is enforced BY THE HARNESS, not by claude. No claude mechanism can
