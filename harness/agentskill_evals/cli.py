@@ -950,8 +950,18 @@ def cmd_verify_copilot_channels(args) -> int:
                   "ruled out.\n  => this is a finding about the audit, not about the "
                   "build. Check the path and permissions above.\n")
             continue
-        print(f"  searched {len(audit.searched)} file(s) — every regular file in the "
-              f"bundle, binaries included")
+        # Says what was READ, not what was eligible to be read. The scan stops as soon as
+        # every marker is found, so a clean bundle is answered after a fraction of its
+        # files — and "every regular file in the bundle, binaries included" was printed
+        # over 189 of 240 (review). The completeness claim is made only where it is true,
+        # which is exactly the MISSING case: an absence cannot be reached early.
+        if audit.scanned_everything:
+            print(f"  searched all {len(audit.searched)} readable file(s) of "
+                  f"{audit.eligible} — every regular file, binaries included")
+        else:
+            print(f"  searched {len(audit.searched)} of {audit.eligible} regular file(s) "
+                  f"(binaries included) and stopped early, every marker having been "
+                  f"found; an absence would have required reading all of them")
         # Partial blindness is the same argument as total blindness, and it is the case
         # the first cut got wrong: one unreadable file beside one readable one produced a
         # confident MISSING for every marker. A marker may be sitting in the file that

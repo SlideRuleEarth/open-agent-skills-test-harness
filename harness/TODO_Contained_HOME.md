@@ -292,7 +292,7 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 345/345 production + 2/2 instrument + 136/136 fixture
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 347/347 production + 2/2 instrument + 136/136 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 482 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 git diff --check
@@ -2014,8 +2014,11 @@ Smaller, unblocked:
   no `global_plugin_registry_subpaths` root are materialized nowhere. Aggregate sufficiency
   is not enough — antigravity declares both kinds of mask, so losing its registry root left
   its direct mask satisfying a "does it have masks" test while the plugin channel went
-  uncovered. The two `CLI` declarations are reviewed assertions, not
-  verified ones — see §4's note on what provenance does and does not buy.
+  uncovered. The two `CLI` declarations are no longer one kind of claim: claude's is
+  **measured** at 2.1.231 (a paired run with and without `--strict-mcp-config` named seven
+  servers against one), codex's is still a **reviewed assertion** and unmeasured — see §4's
+  note on what provenance does and does not buy, which still applies to codex and to any
+  claude build outside `_VERIFIED_VERSIONS`.
   **Latent until an adapter is both** — the mask-dependent adapters are exactly the ones
   that cannot inject, so `validate_mcp_support` refuses them first. It arms itself the day
   copilot or agy gains injection, which is why it went in before that rather than after.

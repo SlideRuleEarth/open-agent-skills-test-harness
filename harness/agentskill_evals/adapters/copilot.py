@@ -588,6 +588,20 @@ class MarkerAudit(NamedTuple):
     where: dict[str, str | None]      # marker -> bundle-relative file it was found in
     searched: tuple[str, ...]         # bundle-relative files read to completion, in scan order
     unreadable: tuple[str, ...] = ()  # files that could not be opened, or died mid-read
+    eligible: int = 0                 # regular files the scan WOULD have read, had it needed to
+
+    @property
+    def scanned_everything(self) -> bool:
+        """Whether the scan actually read every file it was willing to read.
+
+        The scan stops as soon as every marker is found, so a clean bundle is answered
+        after a fraction of it — 189 of 240 files on copilot 1.0.79. That is sound for the
+        VERDICT (a `MISSING` cannot be reached without reading everything) and unsound for
+        any sentence claiming complete coverage, which is what the command printed until
+        this was pointed out. The two are different claims and only this one is about
+        coverage.
+        """
+        return len(self.searched) + len(self.unreadable) >= self.eligible
 
     @property
     def present(self) -> dict[str, bool]:
@@ -727,7 +741,8 @@ def audit_channel_markers(app_js: str) -> MarkerAudit:
 
     return MarkerAudit(
         where={m: hits[i] for i, (m, _why) in enumerate(_MCP_CHANNEL_MARKERS)},
-        searched=tuple(searched), unreadable=tuple(unreadable) + tuple(walk_failures))
+        searched=tuple(searched), unreadable=tuple(unreadable) + tuple(walk_failures),
+        eligible=len(ordered) + len(walk_failures))
 
 
 # The built-in server a hermetic invocation always CONFIGURES and always disables:

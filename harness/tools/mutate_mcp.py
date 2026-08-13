@@ -891,6 +891,18 @@ MUTATIONS = [
      "\n            (text_files if name.endswith(_TEXT_FIRST_SUFFIXES) else other_files).append(entry)",
      "\n            text_files.append(entry) if name.endswith(_TEXT_FIRST_SUFFIXES) else None",
      "copilot.channel_markers_scan_the_bundle"),
+    # The command claims complete coverage over a scan that stopped early — 189 of 240
+    # files on the real 1.0.79 (external review, second round).
+    ("M353-the-command-claims-coverage-it-did-not-have", "agentskill_evals/cli.py",
+     "\n        if audit.scanned_everything:",
+     "\n        if True:",
+     "copilot.channel_markers_scan_the_bundle"),
+    # ...and the denominator that claim is measured against is never collected, so
+    # `scanned_everything` is true of every scan including the ones that stopped early.
+    ("M354-eligible-files-are-never-counted", COPILOT,
+     "\n        eligible=len(ordered) + len(walk_failures))",
+     "\n        eligible=0)",
+     "copilot.channel_markers_scan_the_bundle"),
     # A directory that cannot be listed vanishes silently, so a marker inside it reads as
     # absent with nothing recording the hole (external review).
     ("M352-a-denied-directory-leaves-no-trace", COPILOT,

@@ -5503,10 +5503,72 @@ def _check_copilot_version_provenance(failures, verbose):
             os.chdir(_cwd)
         no_double_scan = relative.searched.count("app.js") == 1
 
+        # THE COMMAND ITSELF, driven end to end — the gap the reviewer asked to have
+        # closed rather than deferred, and it had already cost twice in one review cycle:
+        # a rename crashed `cmd_verify_copilot_channels` on import with every arm green,
+        # and then the command printed a coverage claim ("every regular file") that its own
+        # short-circuit made false. Both are defects of the COMMAND, which nothing drove.
+        # This is the `cmd_run` coverage gap one command over, and the fix is the same
+        # shape: build a fake bundle, run the real function, read what it printed.
+        import argparse as _argparse
+        import io as _io
+        from contextlib import redirect_stdout as _redirect_stdout
+        from . import cli as _cli
+
+        cmd_root = os.path.join(tmp, "cmdcache", "pkg", "darwin-arm64")
+        os.makedirs(os.path.join(cmd_root, "9.9.9"))
+        with open(os.path.join(cmd_root, "9.9.9", "app.js"), "w") as f:
+            f.write(" ".join(markers[:-1]))          # one marker missing -> full scan
+        with open(os.path.join(cmd_root, "9.9.9", "extra.bin"), "wb") as f:
+            f.write(b"padding, holds no marker")
+        _saved = dict(os.environ)
+        os.environ["COPILOT_CACHE_HOME"] = os.path.join(tmp, "cmdcache")
+        buf = _io.StringIO()
+        try:
+            with _redirect_stdout(buf):
+                rc = _cli.cmd_verify_copilot_channels(
+                    _argparse.Namespace(only_version="9.9.9"))
+        finally:
+            os.environ.clear()
+            os.environ.update(_saved)
+        out = buf.getvalue()
+        # It ran, it found the planted bundle, it reported the dropped marker, and it said
+        # so in its exit status. A command that raises is a crash; one that prints nothing
+        # about a build it audited is worse, because it reads as a clean result.
+        cmd_ran = (rc == 2 and "9.9.9" in out and markers[-1] in out
+                   and "MISSING" in out)
+        # ...and the coverage sentence matches what the scan actually did. This bundle has
+        # a marker in NO file, so the scan cannot stop early and the strong claim is true.
+        cmd_claim_ok = "every regular file" in out
+
+        # THE OTHER HALF, and the one the review actually found: a bundle whose markers are
+        # ALL present is answered early, so most of it is never read — 189 of 240 files on
+        # the real 1.0.79 — and the command must not then claim it read everything. Without
+        # this case the assertion above passes whatever the code prints, because a full scan
+        # makes both branches say the same thing.
+        os.makedirs(os.path.join(cmd_root, "9.9.8"))
+        with open(os.path.join(cmd_root, "9.9.8", "app.js"), "w") as f:
+            f.write(" ".join(markers))               # every marker: stops after this file
+        with open(os.path.join(cmd_root, "9.9.8", "zz-never-read.bin"), "wb") as f:
+            f.write(b"never reached, and must not be claimed")
+        buf_short = _io.StringIO()
+        os.environ["COPILOT_CACHE_HOME"] = os.path.join(tmp, "cmdcache")
+        try:
+            with _redirect_stdout(buf_short):
+                _cli.cmd_verify_copilot_channels(
+                    _argparse.Namespace(only_version="9.9.8"))
+        finally:
+            os.environ.clear()
+            os.environ.update(_saved)
+        short_out = buf_short.getvalue()
+        cmd_claim_ok = (cmd_claim_ok
+                        and "every regular file" not in short_out
+                        and "stopped early" in short_out)
+
         _check("copilot.channel_markers_scan_the_bundle",
                rel_ok and still_missing and binary_scanned and app_first
                and blind and verdicts_split and unread_licence and partial_ok
-               and no_double_scan and walk_err_ok,
+               and no_double_scan and walk_err_ok and cmd_ran and cmd_claim_ok,
                f"a marker that MOVED inside the bundle is found and reported as moved "
                f"rather than missing (copilot 1.0.75 did exactly this to `mcp-servers`), "
                f"while a marker in no scanned file is still reported MISSING, a marker "
@@ -5516,7 +5578,7 @@ def _check_copilot_version_provenance(failures, verbose):
                f"gapped={gapped_audit.verdict()} "
                f"searched_head={moved.searched[:3]} binary_scanned={binary_scanned} "
                f"blind_verdict={nothing.verdict()} moved_verdict={moved.verdict()} "
-               f"unread_licence={unread_licence} partial={partial.verdict()}/"
+               f"unread_licence={unread_licence} cmd_rc={rc} partial={partial.verdict()}/"
                f"{partial.unreadable} double_scan={relative.searched}",
                failures, verbose)
     finally:
@@ -10459,8 +10521,8 @@ def _check_mcp_audit_verdict(failures, verbose):
     _check("audit.two_clean_triggers_do_not_compose_into_a_failure",
            A.verdict(escalated).clean,
            f"EOF followed by signal escalation is ordinary CLI behaviour — C3-1 measured "
-           f"claude and agy closing stdin and codex and copilot signalling, and a client may "
-           f"do both. The latch decides which trigger stopped forwarding, not which triggers "
+           f"codex and copilot signalling, claude signalling too since 2.1.231 (it closed "
+           f"stdin at 2.1.113), agy alone closing stdin, and a client may do both. The latch decides which trigger stopped forwarding, not which triggers "
            f"COUNT, so runners-up are appended to the same list and classified the same way: "
            f"{A.verdict(escalated)}", failures, verbose)
 
