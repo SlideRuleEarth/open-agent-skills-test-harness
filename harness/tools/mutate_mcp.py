@@ -903,6 +903,20 @@ MUTATIONS = [
      "\n        eligible=len(ordered), unenumerated=tuple(walk_failures))",
      "\n        eligible=0, unenumerated=tuple(walk_failures))",
      "copilot.channel_markers_scan_the_bundle"),
+    # THE CONTRADICTION, restored verbatim: the coverage line makes a marker claim, which
+    # the marker line below also makes, and with 10 of 11 markers beside an unlistable
+    # directory the command printed both "Every marker was found" and "1 marker(s) were
+    # not found in the rest" (external review, fourth round).
+    ("M358-the-coverage-line-states-the-marker-result-too", "agentskill_evals/cli.py",
+     '\n                  f"bundle exists is unknown and this run supports no claim about coverage")',
+     '\n                  f"bundle exists is unknown. Every marker was found, which no unread "\n                  f"path can retract — but this run supports no claim about coverage")',
+     "copilot.channel_markers_scan_the_bundle"),
+    # ...and the branch that refuses to quantify coverage over an unenumerated bundle is
+    # skipped, so one of the two quantified lines is printed instead.
+    ("M359-an-unlistable-bundle-gets-a-quantified-coverage-line", "agentskill_evals/cli.py",
+     "\n        elif audit.unenumerated:",
+     "\n        elif False:",
+     "copilot.channel_markers_scan_the_bundle"),
     # A failed traversal counted as exactly ONE eligible file, so `searched + unreadable
     # >= eligible` came out true over a subtree nobody enumerated and the command printed
     # a complete-coverage line (external review, third round).

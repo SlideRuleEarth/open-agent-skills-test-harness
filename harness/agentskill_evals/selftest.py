@@ -5602,10 +5602,59 @@ def _check_copilot_version_provenance(failures, verbose):
                         and "every regular file" not in short_out
                         and "stopped early" in short_out)
 
+        # BOTH UNENUMERATED STATES, driven through the command, because the coverage line
+        # and the marker line are printed by different branches and only a run that
+        # produces both can catch them contradicting each other. With 10 of 11 markers
+        # beside an unlistable directory this block printed "Every marker was found" and
+        # "1 marker(s) were not found in the rest" in consecutive lines (external review).
+        def _blind_bundle(ver, marks):
+            os.makedirs(os.path.join(cmd_root, ver))
+            with open(os.path.join(cmd_root, ver, "app.js"), "w") as f:
+                f.write(" ".join(marks))
+            os.makedirs(os.path.join(cmd_root, ver, "denied"))
+            buf_v = _io.StringIO()
+            _real_walk = os.walk
+
+            def _walk_err(top, *a, **kw):
+                onerror = kw.get("onerror")
+                yield from _real_walk(top, *a, **kw)
+                if onerror is not None:
+                    e = OSError(13, "Permission denied")
+                    e.filename = os.path.join(cmd_root, ver, "denied")
+                    onerror(e)
+
+            os.environ["COPILOT_CACHE_HOME"] = os.path.join(tmp, "cmdcache")
+            os.walk = _walk_err
+            try:
+                with _redirect_stdout(buf_v):
+                    code = _cli.cmd_verify_copilot_channels(
+                        _argparse.Namespace(only_version=ver))
+            finally:
+                os.walk = _real_walk
+                os.environ.clear()
+                os.environ.update(_saved)
+            return code, buf_v.getvalue()
+
+        rc_all, out_all = _blind_bundle("9.9.7", markers)           # every marker found
+        rc_gap, out_gap = _blind_bundle("9.9.6", markers[:-1])      # one marker missing
+        # Neither may claim coverage; and the marker story must be told ONCE, by the
+        # branch that owns it, so the two lines cannot disagree.
+        blind_cmd_ok = (
+            "no claim about coverage" in out_all
+            and "no claim about coverage" in out_gap
+            and "every regular file" not in out_all
+            and "every regular file" not in out_gap
+            # the all-found run must not report anything missing...
+            and "were not found" not in out_all and rc_all in (0, 1)
+            # ...and the run with a gap must not claim everything was found.
+            and "Every marker was found" not in out_gap
+            and "were not found" in out_gap and rc_gap == 2)
+
         _check("copilot.channel_markers_scan_the_bundle",
                rel_ok and still_missing and binary_scanned and app_first
                and blind and verdicts_split and unread_licence and partial_ok
                and no_double_scan and walk_err_ok and cmd_ran and cmd_claim_ok
+               and blind_cmd_ok
                and coverage_unknowable,
                f"a marker that MOVED inside the bundle is found and reported as moved "
                f"rather than missing (copilot 1.0.75 did exactly this to `mcp-servers`), "

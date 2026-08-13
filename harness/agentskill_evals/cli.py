@@ -950,27 +950,29 @@ def cmd_verify_copilot_channels(args) -> int:
                   "ruled out.\n  => this is a finding about the audit, not about the "
                   "build. Check the path and permissions above.\n")
             continue
-        # Says what was READ, not what was eligible to be read. The scan stops as soon as
-        # every marker is found, so a clean bundle is answered after a fraction of its
-        # files — and "every regular file in the bundle, binaries included" was printed
-        # over 189 of 240 (review). The completeness claim is made only where it is true,
-        # which is exactly the MISSING case: an absence cannot be reached early.
+        # Says what was READ, and NOTHING about markers. That separation is the fix for a
+        # contradiction rather than a matter of taste: this block used to end "Every marker
+        # was found", the marker result is also reported below, and with 10 of 11 markers
+        # beside an unlistable directory the command printed both that sentence and "1
+        # marker(s) were not found in the rest" (external review). One fact stated in two
+        # places is free to disagree with itself, and the exit status being right does not
+        # help a reader deciding which of the two lines to believe. Coverage here, markers
+        # below, each said once.
         if audit.scanned_everything:
             print(f"  searched all {len(audit.searched)} readable file(s) of "
                   f"{audit.eligible} — every regular file, binaries included")
         elif audit.unenumerated:
             # No denominator exists: the files under a directory that would not list were
             # never enumerated, so neither "all of them" nor "N of M" can be said.
-            print(f"  searched {len(audit.searched)} file(s), and "
+            print(f"  searched {len(audit.searched)} file(s); "
                   f"{len(audit.unenumerated)} director(y/ies) could not be listed "
                   f"({', '.join(audit.unenumerated[:3])}"
                   f"{', …' if len(audit.unenumerated) > 3 else ''}), so how much of this "
-                  f"bundle exists is unknown. Every marker was found, which no unread "
-                  f"path can retract — but this run supports no claim about coverage")
+                  f"bundle exists is unknown and this run supports no claim about coverage")
         else:
             print(f"  searched {len(audit.searched)} of {audit.eligible} regular file(s) "
-                  f"(binaries included) and stopped early, every marker having been "
-                  f"found; an absence would have required reading all of them")
+                  f"(binaries included) and stopped early; an absence would have required "
+                  f"reading all of them")
         # Partial blindness is the same argument as total blindness, and it is the case
         # the first cut got wrong: one unreadable file beside one readable one produced a
         # confident MISSING for every marker. A marker may be sitting in the file that
