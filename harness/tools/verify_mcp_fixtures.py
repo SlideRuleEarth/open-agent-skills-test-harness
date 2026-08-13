@@ -2520,13 +2520,18 @@ _POOL_ENTRY = ("Z1-not-a-real-mutation", "tools/mutate_mcp.py", "a", "b", "an ar
 _POOL_TREE = pathlib.Path("/x/w0/harness")
 
 
-def _drew(record=None, raises=False, prepoisoned=False, holding=_POOL_TREE):
+def _drew(record=None, raises=False, prepoisoned=False, holding=_POOL_TREE, sibling=False):
     """Drive `_draw_and_run` over a stubbed run: (result, what the pool holds, poisoned, calls).
 
     The stub is what makes this affordable — a real draw costs a whole suite — and it is also
     what makes "the mutation never ran" checkable at all. It records its own calls, so the two
     refusal cases below rest on a positive fact about a thing that demonstrably CAN be called
     (the clean case calls it) rather than on nothing having happened.
+
+    `sibling` is the overlap: the run is poisoned by ANOTHER worker while this one is inside its
+    suite. Poisoning from within the stub is what puts it in the window that matters — after the
+    pre-draw check, before the record comes back — which is the window no amount of checking
+    earlier can close, and where an ordinary verdict used to be produced and counted.
     """
     trees, poisoned, calls = queue.Queue(), threading.Event(), []
     trees.put(holding)
@@ -2535,6 +2540,8 @@ def _drew(record=None, raises=False, prepoisoned=False, holding=_POOL_TREE):
 
     def _stub(work, entry, suite, kind):
         calls.append(work)
+        if sibling:
+            poisoned.set()
         if raises:
             raise RuntimeError("the sweep blew up")
         return record
@@ -2586,6 +2593,25 @@ check("...and a worker already inside `get()` draws the pill instead of waiting 
       f"got={_pill_got} pool={_pill_held} ran={_pill_calls} — an event cannot reach a thread "
       f"already blocked on the queue; only something being PUT there wakes it")
 
+# THE WINDOW NO PRE-DRAW CHECK CAN CLOSE. Stopping the run reaches everything not yet started;
+# the seven siblings already inside their suites finish, and their verdicts used to be counted
+# and printed as results — measured on a machine with an unknown extra tenant competing for the
+# cores, ports and fixture servers those suites bind (review, PR #111).
+_lap_got, _lap_held, _lap_poison, _lap_calls = _drew(_rec(False), sibling=True)
+check("a verdict produced while ANOTHER worker's tree went unaccounted for is INCONCLUSIVE",
+      (isinstance(_lap_got, MUT.Record) and _lap_got.verdict == MUT.INCONCLUSIVE
+       and "INCONCLUSIVE" in _lap_got.line and "a line" in _lap_got.line
+       and _lap_calls == [_POOL_TREE]),
+      f"got={_lap_got} — it ran, so it is not ABANDONED; it was measured beside something "
+      f"nobody could name, so it is not a result; and what its arm did is still worth reading")
+# ...AND THE ONE RECORD THAT KEEPS ITS OWN LINE is the one that caused the stop. Relabelling it
+# would lose the verdict that explains every other line in the run.
+_own_got, _own_held, _own_poison, _own_calls = _drew(_rec(True), sibling=True)
+check("...while the record that caused the stop keeps its own report rather than being relabelled",
+      (isinstance(_own_got, MUT.Record) and _own_got.verdict == MUT.TIMEOUT
+       and "INCONCLUSIVE" not in _own_got.line and _POOL_TREE not in _own_held),
+      f"got={_own_got} pool={_own_held}")
+
 # AND THE DELETION AT THE END, which is the second half of the same leak: `rmtree` removes the
 # directory a survivor is executing out of, which loses what it was and where it came from while
 # doing nothing whatever about the process itself.
@@ -2603,6 +2629,75 @@ check("a work tree with something still running out of it is KEPT, and its path 
       f"kept={_kept_ok} still there={_keep_tmp.is_dir()} clean one deleted={not _gone_tmp.exists()} "
       f"said={_discard_say.getvalue()!r}")
 shutil.rmtree(_keep_tmp, ignore_errors=True)
+
+
+class _NoRmtree:
+    """A `shutil` whose `rmtree` quietly does nothing — which is what `ignore_errors` looks like.
+
+    Patched onto `MUT.shutil` rather than onto `shutil.rmtree`, so it is one module's view of
+    the name that changes and not every other user of the real one in this process.
+    """
+
+    def rmtree(self, path, ignore_errors=False):
+        """Accepts the call and declines to do the work, exactly as a suppressed error would."""
+
+
+# `ignore_errors=True` NEXT TO `return True` is a function suppressing its own failures and then
+# reporting success. A clean run could leave every tree on disk and still exit 0 (PR #111). Same
+# rule as `probe_group_empty`: an errno from a call you made is a fact about the call, and the
+# question was about the world.
+_stuck_tmp = pathlib.Path(tempfile.mkdtemp(prefix="verify-discard-"))
+_stuck_say, _real_shutil = io.StringIO(), MUT.shutil
+try:
+    MUT.shutil = _NoRmtree()
+    with contextlib.redirect_stdout(_stuck_say):
+        _stuck_ok = survives(MUT.discard, _stuck_tmp, threading.Event())
+finally:
+    MUT.shutil = _real_shutil
+check("...and a deletion that silently did nothing is reported, not claimed as success",
+      _stuck_ok is False and _stuck_tmp.is_dir() and str(_stuck_tmp) in _stuck_say.getvalue(),
+      f"discard={_stuck_ok} still there={_stuck_tmp.is_dir()} said={_stuck_say.getvalue()!r}")
+shutil.rmtree(_stuck_tmp, ignore_errors=True)
+
+# THE RULE AT THE BOUNDARY THAT OWNS THE TREES, not at each place that spawns into one. Written
+# per-spawner it has to be remembered by the next spawner, and it was not: the first cut put it
+# in `_draw_and_run`, where the reproduction was, so a BASELINE that raised reached the delete
+# with the run unpoisoned and the trees went out from under whatever it had left (PR #111).
+
+
+def _ran_main(boom=False, swept=True):
+    """Drive `main` over a stubbed `_run_suite`/`discard`: (result, what `discard` was told)."""
+    seen = []
+    _real_suite, _real_discard = MUT._run_suite, MUT.discard
+
+    def _suite(tmp, jobs, kinds, suites, started, poisoned):
+        if boom:
+            raise RuntimeError("the baseline blew up after spawning")
+        return 0
+
+    def _discard(tmp, poisoned):
+        seen.append((pathlib.Path(tmp).is_dir(), poisoned.is_set()))
+        shutil.rmtree(tmp, ignore_errors=True)
+        return swept
+
+    try:
+        MUT._run_suite, MUT.discard = _suite, _discard
+        return survives(MUT.main, ["--jobs", "1"]), seen
+    finally:
+        MUT._run_suite, MUT.discard = _real_suite, _real_discard
+
+
+_boom_got, _boom_seen = _ran_main(boom=True)
+_calm_got, _calm_seen = _ran_main()
+check("a run that ends by RAISING marks its trees unaccounted for, wherever it raised",
+      (isinstance(_boom_got, RuntimeError) and _boom_seen == [(True, True)]
+       and _calm_got == 0 and _calm_seen == [(True, False)]),
+      f"raised -> discard saw {_boom_seen}; returned -> discard saw {_calm_seen} — the second is "
+      f"the control: without it, a `poisoned.set()` on every path would pass the first")
+_unswept_got, _unswept_seen = _ran_main(swept=False)
+check("...and a run whose trees would not go is red, however green its mutations were",
+      _unswept_got == 1 and _unswept_seen == [(True, False)],
+      f"main={_unswept_got} — `_run_suite` returned 0 and the trees are still on disk")
 
 # THE BASELINE TIMEOUT, WHICH IS THE ONE THAT SAID LEAST. It ends the run before any mutation has
 # run, in a tree that is already in the pool — and it printed "the suite hung" and dropped both

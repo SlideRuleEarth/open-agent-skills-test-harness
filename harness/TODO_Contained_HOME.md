@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 578 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 129/129 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 474 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 134/134 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 479 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 git diff --check
 
@@ -1754,6 +1754,42 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   worth their twelve minutes once a process nobody can account for is running on the machine.
   An exception counts as contamination too: a sweep that RAISED is precisely the case where what
   survived is unknown, so the default has to be the careful one.
+- **A rule about a shared resource belongs at the boundary that OWNS it, not in each producer
+  that touches it.** "An exception counts as contamination" went into the mutation worker,
+  because that is where the reproduction was. A BASELINE that raised then walked straight past
+  it: the exception reached the frame holding the tmpdir with the run still unpoisoned, and the
+  `finally` deleted every work tree out from under whatever the baseline had left running. Same
+  rule, second spawner, one review round later — which is the third time in this PR that a fix
+  stopped exactly where its reproduction did.
+
+  **The sharper form of "fix the principle, not the reproduction", and the one that would have
+  caught all three: a guard written inside one of N producers has to be REMEMBERED by producer
+  N+1.** Written at the boundary — the frame that creates the resource and destroys it — it
+  quantifies over every producer there will ever be. Here that is one `try/except BaseException`
+  around everything between the `mkdtemp` and the delete, which covers the baseline, the
+  workers, `worktree_binds`, and a `KeyboardInterrupt` (the likeliest of the four, and the one
+  no per-producer guard would ever have been written for). The tell is a guard whose correctness
+  argument mentions a specific caller.
+- **A cleanup that suppresses its own errors must not then report success — and its caller must
+  ask.** `shutil.rmtree(tmp, ignore_errors=True)` followed by `return True`: a clean run could
+  leave every work tree on disk and still exit 0, and the caller dropped the answer anyway, so
+  neither half was load-bearing. The flag stays — a teardown that raises partway through is
+  worse than one that does what it can — but the claim afterwards now comes from `os.path.exists`.
+  This is the errno rule from §10.3 one layer up: **a return value from a call you made is a
+  fact about the call, and the question was about the world.** Two tells, and both are cheap to
+  grep for: a suppressed-error call adjacent to a success return, and a function returning a
+  status nothing reads.
+- **Stopping a parallel run is not instantaneous, and the work already in flight is a THIRD
+  state.** The pre-draw refusal stops every mutation not yet started; the seven siblings already
+  inside their suites finish and used to hand back ordinary verdicts, which were counted and
+  printed as results — measured on a machine that by then had an unknown extra tenant competing
+  for the cores, ports and fixture servers those suites bind. They are neither "ran" (their
+  conditions cannot be stated) nor "did not run" (they did), so they get their own verdict,
+  `INCONCLUSIVE`, keep their original line for whoever reads the wreckage, and count towards
+  nothing. **A stop condition in a concurrent program needs a disposition for the work that
+  overlapped it, not only for the work that follows it** — and the two are told apart by asking
+  before the `finally` that sets the flag, so a worker never reads its own poisoning as
+  somebody else's.
 - **A `pgrep -f` finds itself, and answers about the search rather than the machine.** The
   after-run leftover check reported three stray guardians immediately after a clean run that had
   left none: the pattern appears in the argv of the pipeline doing the searching, which `ps` and

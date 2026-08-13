@@ -3464,6 +3464,40 @@ MUTATIONS = [
      "\n            if contaminated(base):\n                poisoned.set()",
      "\n            if False:\n                poisoned.set()",
      "a BASELINE that times out reports what its sweep left, and keeps the tree it left it in"),
+    # THE RULE AT THE BOUNDARY THAT OWNS THE TREES. Written per-spawner it has to be remembered
+    # by the next spawner, and it was not: the first cut of "an exception counts as
+    # contamination" lived in `_draw_and_run`, where the reproduction was, and a BASELINE that
+    # raised walked past it into the delete (review, PR #111).
+    ("F131-only-a-mutation-worker-can-poison-the-run", SELF,
+     "\n    except BaseException:\n        poisoned.set()\n        raise",
+     "\n    except BaseException:\n        raise",
+     "a run that ends by RAISING marks its trees unaccounted for, wherever it raised"),
+    # AND THE TWO WAYS A TEARDOWN REPORTS SUCCESS IT DOES NOT HAVE: not looking, and not being
+    # asked. `ignore_errors=True` beside `return True` is a function suppressing its own
+    # failures and then certifying the outcome; a caller that drops the answer is the same
+    # silence one frame up.
+    ("F132-the-answer-from-the-teardown-is-not-read", SELF,
+     "\n    return rc if swept else 1",
+     "\n    return rc",
+     "...and a run whose trees would not go is red, however green its mutations were"),
+    ("F133-a-deletion-is-certified-without-being-observed", SELF,
+     '\n    if os.path.exists(tmp):\n        print(f"WORK TREES NOT DELETED',
+     '\n    if False:\n        print(f"WORK TREES NOT DELETED',
+     "...and a deletion that silently did nothing is reported, not claimed as success"),
+    # THE WINDOW NO PRE-DRAW CHECK CAN CLOSE. Stopping the run reaches everything not yet
+    # started; a sibling already inside its suite finishes and used to hand back an ordinary
+    # verdict, counted and printed as a result. The second mutation is the other half of the
+    # same condition: relabelling EVERYTHING loses the one report that explains the run.
+    ("F134-a-verdict-measured-beside-the-unknown-tenant-still-counts", SELF,
+     ("\n        if not record.contaminated and poisoned.is_set():\n            record = "
+      "_overlapped(record)"),
+     "\n        if False:\n            record = _overlapped(record)",
+     "a verdict produced while ANOTHER worker's tree went unaccounted for is INCONCLUSIVE"),
+    ("F135-the-record-that-stopped-the-run-is-relabelled-too", SELF,
+     ("\n        if not record.contaminated and poisoned.is_set():\n            record = "
+      "_overlapped(record)"),
+     "\n        if poisoned.is_set():\n            record = _overlapped(record)",
+     "...while the record that caused the stop keeps its own report rather than being relabelled"),
 
 ]
 
@@ -4069,6 +4103,9 @@ TIMEOUT = "TIMEOUT"
 UNAPPLIED = "UNAPPLIED"        # stale or ambiguous anchor: the suite never ran
 ABANDONED = "ABANDONED"        # the run had already stopped: the suite never ran, for a reason
                                # that is about an earlier mutation rather than about this one
+INCONCLUSIVE = "INCONCLUSIVE"  # ...and this one DID run, but overlapped that reason: the suite
+                               # executed beside a tree nobody could account for, so whatever
+                               # it reported is a measurement rather than a result
 
 
 def verdict(outcome, arm, failed):
@@ -4389,6 +4426,31 @@ def _abandoned(entry, kind):
     return Record(entry[0], kind, ABANDONED, f"{entry[0]}: NOT RUN — {_STOPPED}", 0.0, 0.0)
 
 
+def _overlapped(record):
+    """The same record, relabelled: it ran, but beside a tree nobody could account for.
+
+    THE PRE-DRAW CHECK CANNOT REACH A WORKER THAT HAS ALREADY DRAWN. Stopping the run stops
+    everything not yet started; the seven siblings already inside `apply_and_run` run to
+    completion and used to hand back ordinary verdicts, which were counted and printed as
+    results (review, PR #111). Their suites executed on a machine with an unknown extra tenant
+    on it — competing for cores, ports and the fixture servers these suites bind — so what they
+    report is a measurement taken under conditions nobody can state, which is not the same thing
+    as a result and must not be added to a total.
+
+    THE ORIGINAL LINE IS KEPT AND ANNOTATED rather than replaced. What the arm did is still the
+    most useful thing to know when reading the wreckage afterwards; what must not survive is its
+    standing as evidence.
+
+    ITS OWN TREE IS CLEAN AND GOES BACK, which is not a contradiction: the unaccounted-for
+    process is in a SIBLING's tree, and nothing can draw this one anyway, because every mutation
+    after the poisoning refuses before it draws.
+    """
+    return record._replace(
+        verdict=INCONCLUSIVE,
+        line=f"{record.line} — INCONCLUSIVE: another worker's tree went unaccounted for while "
+             f"this ran, so this was measured beside it and is not evidence either way")
+
+
 def _draw_and_run(trees, entry, suite, kind, poisoned):
     """One mutation, in whichever tree is free — and the tree goes back only if it is CLEAN.
 
@@ -4407,6 +4469,12 @@ def _draw_and_run(trees, entry, suite, kind, poisoned):
     the remaining mutations are worth their twelve minutes: the run has already failed, a
     process nobody can account for is executing out of a directory this program made, and every
     later verdict is measured on a machine that now has an unknown extra tenant.
+
+    STOPPING IS NOT INSTANT, THOUGH, AND THAT IS THE SECOND HALF. It reaches everything not yet
+    started; the siblings already inside `apply_and_run` finish, and their results were counted
+    (review, PR #111). They are relabelled — see `_overlapped` — because "the run stopped" and
+    "this particular result is untrustworthy" are different facts about different mutations, and
+    only the first of them is what the pre-draw check above expresses.
 
     AN EXCEPTION COUNTS AS CONTAMINATION, because `clean` is only ever set by getting to the end
     of a run that said it was clean. A sweep that raised is precisely the case where what is
@@ -4427,6 +4495,12 @@ def _draw_and_run(trees, entry, suite, kind, poisoned):
     try:
         record = apply_and_run(work, entry, suite, kind)
         clean = not record.contaminated
+        # ASKED BEFORE THE `finally` SETS IT, so what this sees is a SIBLING's poisoning and
+        # never this worker's own. A record that is itself contaminated keeps its own line: it
+        # is the report of the thing that stopped the run, and relabelling it inconclusive would
+        # lose the one verdict that explains all the others.
+        if not record.contaminated and poisoned.is_set():
+            record = _overlapped(record)
         return record
     finally:
         if clean:
@@ -4481,16 +4555,32 @@ def main(argv=None):
     # that print a refusal are also the three anyone is most likely to hit twice in a row while
     # fixing what they refuse over. One tree was a leak worth half a gigabyte and nobody's
     # attention. Eight is the same leak eight times, which is how it was finally noticed.
+    # AND THE POISON-ON-EXCEPTION RULE LIVES HERE, at the boundary that owns the trees, rather
+    # than at each place that spawns something into one. The first cut put it in `_draw_and_run`
+    # — where the reproduction was — so a BASELINE that raised reached this `finally` with
+    # `poisoned` still false and the trees were deleted out from under whatever it had left
+    # running (review, PR #111). Written per-spawner, the rule has to be remembered by the next
+    # spawner; written here it quantifies over everything between the `mkdtemp` and the delete,
+    # including `worktree_binds`, including a `KeyboardInterrupt`, and including whatever runs
+    # in there next year. `BaseException` on purpose: a Ctrl-C during a mutation run leaves
+    # suites running exactly as an unexpected error does, and it is the likelier of the two.
     tmp = Path(tempfile.mkdtemp(prefix="mutate-mcp-"))
     poisoned = threading.Event()
+    swept = False
     try:
-        return _run_suite(tmp, jobs, kinds, suites, started, poisoned)
+        rc = _run_suite(tmp, jobs, kinds, suites, started, poisoned)
+    except BaseException:
+        poisoned.set()
+        raise
     finally:
-        discard(tmp, poisoned)
+        swept = discard(tmp, poisoned)
+    # AND ITS ANSWER IS READ. A `discard` nobody asks is a `discard` that can quietly fail and
+    # leave every tree on disk behind a run that exits 0.
+    return rc if swept else 1
 
 
 def discard(tmp, poisoned):
-    """Delete the work trees — unless something is still running out of one of them. True iff gone.
+    """Delete the work trees, unless something may still be running out of one. True iff GONE.
 
     DELETING A TREE WITH A LIVE PROCESS IN IT IS THE SECOND HALF OF THE SAME LEAK. The sweep
     already says when it left a descendant alive or could not look; `rmtree` then removes the
@@ -4501,6 +4591,17 @@ def discard(tmp, poisoned):
     exactly this prefix afterwards and will report them, which is the correct outcome rather
     than a nuisance: the tree is the evidence, and the glob is the only thing that would
     otherwise notice.
+
+    AND THE ANSWER IS OBSERVED, NEVER ASSUMED. `ignore_errors=True` next to `return True` is a
+    function suppressing its own failures and then reporting success — a clean run could leave
+    every tree on disk and still exit 0 (review, PR #111). The flag stays, because a teardown
+    that raises partway through is worse than one that does what it can; what changes is that
+    the claim afterwards comes from looking. It is the same rule `probe_group_empty` follows in
+    `mcp_proxy_io.py`: an errno from a call you made is a fact about the call, and the question
+    was about the world.
+
+    ONE FACT, TWO REASONS. `False` means the trees are still there, and the message above says
+    which of "kept on purpose" and "would not go" it was. Every caller wants the fact.
     """
     if poisoned.is_set():
         print(f"WORK TREES KEPT at {tmp} — a run ended without establishing that nothing is "
@@ -4509,6 +4610,10 @@ def discard(tmp, poisoned):
               f"`ps -ef | grep {tmp}`, kill whatever is there, then remove the tree by hand.")
         return False
     shutil.rmtree(tmp, ignore_errors=True)
+    if os.path.exists(tmp):
+        print(f"WORK TREES NOT DELETED — {tmp} is still on disk after `rmtree`, which suppressed "
+              f"whatever stopped it. Half a gigabyte per run accumulates in silence otherwise.")
+        return False
     return True
 
 
@@ -4661,8 +4766,9 @@ def _run_suite(tmp, jobs, kinds, suites, started, poisoned):
     if poisoned.is_set():
         print(f"\n*** RUN STOPPED *** a sweep left a process alive in a work tree, could not "
               f"establish that it had not, or the mutation itself failed before it could say — "
-              f"see the last line above that is not a NOT RUN. Everything after that point was "
-              f"abandoned rather than run: {_STOPPED}.")
+              f"see the last line above that is neither NOT RUN nor INCONCLUSIVE. Nothing after "
+              f"that point was run, and whatever was ALREADY running when it happened is marked "
+              f"INCONCLUSIVE rather than counted: {_STOPPED}.")
     print(f"\n{caught['M']}/{totals['M']} production mutations caught by the intended arm")
     if totals["I"]:
         print(f"{caught['I']}/{totals['I']} instrument mutation(s) caught — these perturb "
