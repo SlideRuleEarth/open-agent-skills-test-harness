@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 578 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 113/113 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 460 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 115/115 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 461 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 git diff --check
 
@@ -1699,6 +1699,18 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   **The question to ask of a double is not "does it stand in for the real thing" but "can the
   defect I am testing for occur in it".** A synchronous mock of an asynchronous mechanism
   answers no, silently, forever.
+- **"Gone" is not an answer, and a set intersection is where that gets forgotten.** The freeze
+  waited for every signalled pid to be observed stopped — by intersecting the signalled set with
+  the live process table. A pid that DISAPPEARED therefore dropped out of the wait and read as
+  settled. But a process that exits may have forked on the way out, and that child is reparented
+  with no link to anything and possibly nothing in its argv to name it. Presence and confirmation
+  are different facts: once a pid has been SEEN stopped it is safe to lose, and before that its
+  absence is unaccounted for and no amount of looping resolves it. Track them apart.
+
+  The general form, which is the same shape as the trustworthy-predicate rule one level up:
+  **an intersection with "what is still there" silently reclassifies everything that left.**
+  Before writing one, ask what it means for a member to vanish — if the answer is "we do not
+  know", it does not belong on the satisfied side of a fixed point.
 - **A single-line anchor aimed at `mutate_mcp.py` itself matches TWICE**, and one of the two is
   the mutation entry quoting it. It is refused up front by `stale_anchors` rather than silently
   mutating the list instead of the code, but the fix is not obvious from the message: pin it

@@ -3299,10 +3299,12 @@ MUTATIONS = [
      "\n    return True",
      "the freeze waits for SIGSTOP to be OBSERVED, not merely sent"),
     ("F114-a-freeze-that-never-settled-still-reports-a-clean-sweep", SELF,
-     ('\n    fault = ("" if quiesced else\n'
-      '             f"the process tree did not stop spawning within {deadline:.0f}s: "'),
-     ('\n    fault = ("" if True else\n'
-      '             f"the process tree did not stop spawning within {deadline:.0f}s: "'),
+     ("\n    if not quiesced:\n"
+      '        reasons.append(f"the process tree did not stop spawning within '
+      '{deadline:.0f}s: "'),
+     ("\n    if False:\n"
+      '        reasons.append(f"the process tree did not stop spawning within '
+      '{deadline:.0f}s: "'),
      "...and a stop that never lands is a named failure, not a clean sweep"),
     # AND WHAT IS REPORTED AFTERWARDS. Re-enumerating asks the machine about orphans it can no
     # longer reach by parentage and may not name by marker — so it answers "clean" about
@@ -3311,6 +3313,22 @@ MUTATIONS = [
      "\n    return tuple(sorted(pid for pid in frozen if pid in table))",
      "\n    return tuple(sorted(owned_pids(table, root, marker)))",
      "the survivors reported are the ones we froze, not whatever the machine still admits to"),
+    # PRESENCE IS NOT CONFIRMATION. Both mutations collapse the two: the first drops the record
+    # of what was actually seen stopped, the second treats a pid that disappeared before it
+    # could be confirmed as one that settled. Each turns a process that exited — possibly after
+    # forking — into evidence of a clean tree.
+    ("F115-a-pid-that-vanished-before-confirmation-counts-as-settled", SELF,
+     "\n            lost |= (frozen - confirmed) - table.keys()",
+     "\n            lost |= set()",
+     "a pid that vanishes before its stop is CONFIRMED leaves containment unestablished"),
+    ("F116-an-unconfirmed-disappearance-reaches-no-output", SELF,
+     ("\n    if lost:\n"
+      '        reasons.append(f"{sorted(lost)} vanished before being observed stopped, '
+      'so anything "'),
+     ("\n    if False:\n"
+      '        reasons.append(f"{sorted(lost)} vanished before being observed stopped, '
+      'so anything "'),
+     "a pid that vanishes before its stop is CONFIRMED leaves containment unestablished"),
     # THE OBSERVER, BROKEN ONE CLAUSE AT A TIME. Everything the sweep concludes is read off an
     # absence, so each of these turns a channel that could not answer into a machine with
     # nothing on it — and the timeout path then certifies a tree it never looked at.
@@ -3627,12 +3645,18 @@ def owned_pids(table, root=None, marker=None):
     on purpose, and the escaping helper in §10.9 calls `setsid` on purpose, so a `killpg` aimed
     at the suite misses precisely the two processes this exists to catch.
 
-    The MARKER is what survives the chain being cut. The instant the root is signalled its
-    descendants are reparented to init and every link above them is gone, so anything not
-    enumerated BEFORE the first signal is unreachable by parentage forever after. Every process
-    a suite starts carries its work tree's absolute path in its argv — the proxy is launched by
-    script path, the guardian names this module, the fixtures name themselves — and that path
-    is a fresh `mkdtemp` no other process on the machine can be carrying.
+    The MARKER IS SUPPLEMENTARY EVIDENCE, and nothing rests on it. It recovers SOME of what
+    the chain no longer reaches — the instant the root is signalled its descendants are
+    reparented and every link above them is gone — and where it does, the work tree's path is a
+    fresh `mkdtemp` no other process on the machine can be carrying, so a match is conclusive.
+
+    A MISS IS NOT, AND THE EARLIER CONTRACT CLAIMED OTHERWISE. It said every process a suite
+    starts carries that path. Measured over one run of each suite, 5 of 7 selftest descendants,
+    35 of 49 fixture descendants and 67 of 169 proxy descendants did not: `node`, `git`, and
+    above all processes caught BETWEEN FORK AND EXEC, which `ps` shows as a bare `(python3.10)`
+    with no argv at all — the state a just-forked child is in, which is exactly the child a
+    race produces. Containment therefore rests on `kill_owned` freezing the tree while
+    parentage still connects it, and this arm only adds to what that already reached.
 
     "NO MARKER" IS `None`, AND THE EMPTY STRING IS REFUSED. `"" in command` is true of every
     process alive, so a marker arm switched off by falsiness puts one boolean between this
@@ -3724,7 +3748,9 @@ def kill_owned(root, marker=None, deadline=5.0):
     suite would then certify a leak this function had quietly cleaned up on its behalf.
     """
     end = time.monotonic() + deadline
-    frozen: set[int] = set()
+    frozen: set[int] = set()      # signalled with SIGSTOP
+    confirmed: set[int] = set()   # ...and since SEEN stopped, so safe to lose
+    lost: set[int] = set()        # ...but gone before that, so unaccounted for
     quiesced = False
     try:
         while True:
@@ -3737,7 +3763,23 @@ def kill_owned(root, marker=None, deadline=5.0):
             # one more child — orphaned by the kill that followed, markerless, and invisible to
             # every later scan (review, PR #111). So the loop also requires every pid it has
             # signalled to be OBSERVED stopped, from the same `ps` state it already reads.
-            pending = {pid for pid in frozen & table.keys() if not is_stopped(table[pid])}
+            #
+            # CONFIRMATION IS TRACKED SEPARATELY FROM PRESENCE, because "gone" is not an answer.
+            # Intersecting `frozen` with the live table made a pid that DISAPPEARED satisfy the
+            # fixed point: signalled, then exited before the next look — and a process that
+            # exits may have forked on the way out, reparenting a child that no longer has a
+            # link to anything and may carry nothing in its argv to name it. Driven by review:
+            # snapshot root, SIGSTOP, next snapshot holds only orphan 101, and the sweep
+            # returned a clean `Sweep` having never signalled it (PR #111).
+            #
+            # Once a pid has been SEEN stopped it is safe to lose: it cannot have forked after
+            # the observation, and anything it forked before appears as `fresh` on this or a
+            # later look. Before that, its disappearance is simply unaccounted for, and no
+            # amount of looping can resolve it — the process is gone. So it is terminal, and it
+            # is reported rather than waited on.
+            confirmed |= {pid for pid in frozen & table.keys() if is_stopped(table[pid])}
+            lost |= (frozen - confirmed) - table.keys()
+            pending = (frozen & table.keys()) - confirmed
             if not fresh and not pending:
                 quiesced = True
                 break
@@ -3760,11 +3802,15 @@ def kill_owned(root, marker=None, deadline=5.0):
         for pid in left:
             _signal(pid, signal.SIGKILL)
         time.sleep(_POLL)
-    fault = ("" if quiesced else
-             f"the process tree did not stop spawning within {deadline:.0f}s: "
-             f"{len(frozen)} frozen and killed, but something in it was still creating "
-             f"children, so descendants may remain unaccounted for")
-    return Sweep(tuple(left), fault)
+    reasons = []
+    if not quiesced:
+        reasons.append(f"the process tree did not stop spawning within {deadline:.0f}s: "
+                       f"{len(frozen)} frozen and killed, but something in it was still "
+                       f"creating children")
+    if lost:
+        reasons.append(f"{sorted(lost)} vanished before being observed stopped, so anything "
+                       f"forked between the signal and the exit is reparented and unnamed")
+    return Sweep(tuple(left), "; ".join(reasons))
 
 
 def _await(proc, timeout, marker=None):

@@ -2135,6 +2135,51 @@ check("the freeze waits for SIGSTOP to be OBSERVED, not merely sent",
       f"swept={_scripted} still alive={_machine.procs} escaped={_machine.escaped} — with the "
       f"fixed point taken over SIGNALLED pids the root is killed while still running, and the "
       f"child it gets out on the way is an orphan nothing can name")
+# AND THE OTHER WAY A STOP IS NEVER CONFIRMED: the pid does not stay to be confirmed. A process
+# signalled and then EXITING before the next look disappears from the table, and intersecting
+# `frozen` with the live table made that satisfy the fixed point — "not pending, therefore
+# settled". But a process that exits may have forked on the way out, and that child is
+# reparented, possibly markerless, and reachable by nothing. Presence and confirmation are
+# different facts and the sweep now keeps them apart (review, PR #111).
+
+
+class _VanishMachine:
+    """The root exits after being signalled, before its stop is ever observed, leaving a child.
+
+    Deliberately NOT a variant of `_FakeMachine`: that one models a stop that lands late, and
+    the defect here is a stop that never lands because there is no longer anything to land on.
+    Both are "never confirmed", and only one of them is fixable by waiting.
+    """
+
+    def __init__(self):
+        self.procs = {100: MUT.Proc(1, "S", "/x/w0/root")}
+        self.signalled = []
+
+    def look(self):
+        if self.signalled:                    # exited between the signal and this look
+            self.procs = {101: MUT.Proc(1, "S", "/bin/sh -c sleep 30")}
+        return dict(self.procs)
+
+    def signal(self, pid, sig=signal.SIGKILL):
+        if not isinstance(pid, int) or pid <= 0:
+            raise ValueError(f"refusing to signal {pid!r}")
+        self.signalled.append((pid, sig))
+        if sig == signal.SIGKILL:
+            self.procs.pop(pid, None)
+
+
+_vanish = _VanishMachine()
+try:
+    MUT.process_tree, MUT._signal = _vanish.look, _vanish.signal
+    _vanish_sweep = survives(MUT.kill_owned, 100, None, 0.3)
+finally:
+    MUT.process_tree, MUT._signal = _real_tree_fn, _real_signal_fn
+check("a pid that vanishes before its stop is CONFIRMED leaves containment unestablished",
+      isinstance(_vanish_sweep, MUT.Sweep) and _vanish_sweep.fault != ""
+      and "100" in _vanish_sweep.fault,
+      f"swept={_vanish_sweep} still alive={_vanish.procs} — 100 was signalled and then gone, "
+      f"and 101 is what it got out on the way; absence is not confirmation")
+
 # AND THE WAIT IS BOUNDED. A stop that never lands must end as a NAMED containment failure
 # rather than a loop that spins out the deadline and then reports a clean sweep.
 _stuck = _FakeMachine(lag=10 ** 6)
