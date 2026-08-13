@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 578 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 95/95 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 431 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 102/102 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 444 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 git diff --check
 
@@ -1612,6 +1612,32 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   the only warning anyone gets before it becomes a hang. Read the CPU figure and not the wall
   one: under `--jobs N` every suite takes longer without any of them being wrong, and the
   loudest wall number names whichever mutation was unluckiest with the scheduler.
+- **THE WORST ONE SO FAR: a mutation closed every application on the machine (2026-08-12).**
+  `mutate_mcp.py` grew a process-tree sweep for the timeout path. A check called it with no
+  parentage root, spelled `-1` — no process has that parent, so it read as a harmless "match
+  nothing". Mutation `F98` moved the kill ahead of the enumeration as a bare
+  `os.kill(root, SIGKILL)`, and **POSIX defines `kill(-1, …)` as every process the calling user
+  may signal**; `kill(0, …)` is the caller's whole process group. Eleven minutes into a full
+  run, the mutant executed it. No panic, no crash reports, nothing in the log — SIGKILL leaves
+  none of those — just every user process gone while the root-owned ones stayed up, which is
+  the signature to recognise it by.
+
+  Three rules come out of it, and the third is the one that generalizes furthest:
+
+  1. **A sentinel must be a value the dangerous call cannot accept.** `None` is right because
+     `os.kill(None, …)` raises; `-1` and `0` are wrong because they are *valid and mean
+     something enormous*. The marker on the same function had already been moved from `""` to
+     `None` for exactly this reason, with a docstring about it — and the root sentinel beside
+     it was left as `-1`. Getting the argument right about one parameter is not getting it
+     right about the function.
+  2. **One place signals, and it validates.** `_signal()` refuses anything that is not a
+     positive int. Containment in the callers is not containment.
+  3. **A mutation suite runs deliberately broken code by design, so a destructive call is only
+     as contained as its WORST REACHABLE VARIANT.** Any mutation touching a kill, a delete or a
+     write outside the work tree has to be written *through* the guarded primitive rather than
+     around it, so that the mutant is contained too. And the guard itself is not a mutation
+     target: a mutation may perturb which processes are chosen, never the check that decides
+     whether a chosen thing is a process at all. Establish that one by driving the values.
 - **A single-line anchor aimed at `mutate_mcp.py` itself matches TWICE**, and one of the two is
   the mutation entry quoting it. It is refused up front by `stale_anchors` rather than silently
   mutating the list instead of the code, but the fix is not obvious from the message: pin it

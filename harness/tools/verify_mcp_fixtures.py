@@ -45,6 +45,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURES = os.path.join(os.path.dirname(HERE), "fixtures")
@@ -1774,6 +1775,16 @@ check("the printed line carries the verdict, the arm and BOTH clocks",
 check("...and it says MISSED exactly when the verdict does",
       "MISSED" in MUT.result_line("M1", "proxy", "a", _outcome(0, "ALL PASS"), [])
       and "MISSED" not in _caught_line, _caught_line)
+# A SWEEP THAT DID NOT FINISH IS A LEAK, AND HAS TO REACH THE OUTPUT. Whatever is still alive
+# was launched out of a tree about to be deleted, and the next mutation to draw that tree runs
+# beside it — a fact that reaching only a return value nobody prints is a fact nobody has.
+_stuck_line = MUT.result_line("M1", "proxy", "a",
+                              MUT.Outcome(124, MUT._TIMEOUT_OUTPUT, 9.0, 1.0, (4242, 4243)), [])
+check("...and a timeout whose sweep left something behind names the pids in its line",
+      "SURVIVED" in _stuck_line and "4242" in _stuck_line and "4243" in _stuck_line
+      and "SURVIVED" not in MUT.result_line("M1", "proxy", "a",
+                                            _outcome(124, MUT._TIMEOUT_OUTPUT), []),
+      _stuck_line)
 
 # THE ARGUMENT THE PARALLELISM IS ASKED FOR WITH. A typo'd `--job 8` that silently ran serially
 # would look exactly like a machine that did not speed up, which is why an unknown argument is
@@ -1859,16 +1870,81 @@ try:
 finally:
     shutil.rmtree(_edit_tmp, ignore_errors=True)
 
+# THE CHEAP, CONTAINED CHECKS RUN FIRST, and the ordering is load-bearing rather than
+# tidy. These are driven on a synthetic table and cannot leak or signal anything; the
+# live probes below start real processes and sweep them. A mutation that breaks the
+# enumeration makes the LIVE call raise, so with the order reversed the verifier died
+# mid-file and F100 reported `failed, but NOT via ... -> []` — the parse found no red
+# check because no check had run yet — while leaking the probes it had already started
+# (full run, 2026-08-12). Named arms have to get their line out before the code that
+# raises is reached.
+# THE ENUMERATION ITSELF, on a table rather than on the machine — where the answers are known
+# and where the case that must NEVER occur can be arranged.
+_synth_table = {10: (1, "/x/w0/harness/suite.py"), 11: (10, "/x/w0/harness/proxy.py"),
+                12: (11, "/x/w0/harness/guardian.py"), 13: (1, "/x/w0/harness/orphan.py"),
+                14: (1, "/other/thing.py"), 15: (14, "/other/child.py")}
+# `survives` ON THE `None` CASES, because the deletion that makes `None` load-bearing is one
+# that RAISES: without the guard, `None in command` is a `TypeError`, which is the whole point
+# of choosing `None` over a falsy string — and evaluated inside a `check(...)` argument it would
+# end the verifier instead of reddening the line that names the property.
+check("the sweep walks the whole chain, not just the immediate children",
+      survives(MUT.owned_pids, _synth_table, 10, None) == {10, 11, 12},
+      survives(MUT.owned_pids, _synth_table, 10, None))
+check("...and the marker adds what the chain no longer reaches, without the chain's help",
+      MUT.owned_pids(_synth_table, 10, "/x/w0/harness") == {10, 11, 12, 13}
+      and MUT.owned_pids(_synth_table, None, "/x/w0/harness") == {10, 11, 12, 13},
+      MUT.owned_pids(_synth_table, None, "/x/w0/harness"))
+# THE LANDMINE, AND WHY IT IS A `None` RATHER THAN A FALSY STRING. `"" in command` is true of
+# every process on the machine, so a marker arm switched off by falsiness would put one boolean
+# between this and SIGKILLing the host — inside the one program whose job is to run versions of
+# itself with a line removed. `None` cannot be an `in` operand at all, so the same deletion
+# raises and kills nothing. Driven on a synthetic table, where being wrong is free.
+check("no marker is `None`, and it sweeps by parentage alone",
+      survives(MUT.owned_pids, _synth_table, 14, None) == {14, 15}
+      and survives(MUT.owned_pids, _synth_table, None, None) == set(),
+      survives(MUT.owned_pids, _synth_table, None, None))
+check("...and an empty marker is REFUSED rather than quietly matching every process alive",
+      isinstance(survives(MUT.owned_pids, _synth_table, None, ""), ValueError),
+      survives(MUT.owned_pids, _synth_table, None, ""))
+# THE ONE THAT ACTUALLY HAPPENED, and the reason `-1` is gone from this file. `kill(-1, ...)`
+# is POSIX for "every process this user may signal" and `kill(0, ...)` for "this whole process
+# group"; neither is a sentinel, and the kernel does not ask whether one was meant. A `-1`
+# passed here as a harmless-looking "no parentage root" reached `os.kill` under mutation F98 and
+# closed every application on the machine (2026-08-12). Both selectors are now `None`, which is
+# not a pid, not an `in` operand, and not something `os.kill` will accept — and the refusals
+# below are asked of the exact values that did it.
+check("a sweep rooted at a broadcast pid is REFUSED, not performed",
+      all(isinstance(survives(MUT.owned_pids, _synth_table, bad, None), ValueError)
+          for bad in (-1, 0, -2)),
+      [survives(MUT.owned_pids, _synth_table, bad, None) for bad in (-1, 0, -2)])
+check("...and no non-process ever reaches the one function that signals",
+      all(isinstance(survives(MUT._signal, bad), ValueError)
+          for bad in (-1, 0, None, "1234")),
+      [survives(MUT._signal, bad) for bad in (-1, 0, None, "1234")])
+# AND THE GUARD IS NOT A NO-OP: the same function really does kill a real process, so the
+# refusals above are a narrowing of something that works rather than a function that never
+# signals anything at all.
+_victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+MUT._signal(_victim.pid)
+_victim.wait(timeout=10)
+check("...while a real pid is still signalled, so those refusals narrow a live mechanism",
+      _victim.returncode == -signal.SIGKILL, _victim.returncode)
+check("...and the driver is never in its own sweep, on either arm",
+      (os.getpid() not in MUT.owned_pids({**_synth_table, os.getpid(): (10, "/x/w0/harness/me")},
+                                         10, "/x/w0/harness")),
+      "the cost of being wrong about that once is the run killing the process doing the killing")
+
 # THE TWO CLOCKS, AT THE ONE PLACE THEY ARE READ OFF THE KERNEL. `wait4` rather than a delta of
 # `getrusage(RUSAGE_CHILDREN)`, because the latter is a running total for the whole process and
 # under `--jobs N` a delta around one suite would include whatever the other seven workers
 # happened to finish inside the same window. That mistake is invisible at `--jobs 1`, where the
 # two agree, which is exactly why it needs a check rather than a reading.
 _burn = subprocess.Popen([sys.executable, "-c", "sum(range(4_000_000))"])
-_burn_status, _burn_cpu = MUT._await(_burn, 60.0)
+_burn_status, _burn_cpu, _burn_left = MUT._await(_burn, 60.0)
 check("a child's CPU is measured from the wait that reaps THAT child",
-      _burn_status is not None and _burn.returncode == 0 and _burn_cpu > 0.0,
-      f"status={_burn_status} rc={_burn.returncode} cpu={_burn_cpu}")
+      _burn_status is not None and _burn.returncode == 0 and _burn_cpu > 0.0
+      and _burn_left == (),
+      f"status={_burn_status} rc={_burn.returncode} cpu={_burn_cpu} left={_burn_left}")
 check("...and an exit status is read the way subprocess spells it, signals negative",
       (MUT._exit_code(0) == 0 and MUT._exit_code(3 << 8) == 3
        and MUT._exit_code(signal.SIGKILL) == -signal.SIGKILL),
@@ -1877,12 +1953,86 @@ check("...and an exit status is read the way subprocess spells it, signals negat
 # THE TIMEOUT PATH, WHICH IS THE ONE THAT HAS TO REAP. A waiter that returned without killing
 # would leave the suite running beside every mutation after it; one that killed without waiting
 # would leave a zombie and, on the next mutation, a `wait4` on a pid nothing can wait for.
-_sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
-_slept_status, _slept_cpu = MUT._await(_sleeper, 0.5)
+_sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+_slept_status, _slept_cpu, _slept_left = MUT._await(_sleeper, 0.5)
 check("a child that outlives its bound is reported as such, killed, and reaped",
       (_slept_status is None and _sleeper.returncode == -signal.SIGKILL
-       and isinstance(survives(os.waitpid, _sleeper.pid, 0), ChildProcessError)),
-      f"status={_slept_status} rc={_sleeper.returncode} cpu={_slept_cpu}")
+       and isinstance(survives(os.waitpid, _sleeper.pid, 0), ChildProcessError)
+       and _slept_left == ()),
+      f"status={_slept_status} rc={_sleeper.returncode} cpu={_slept_cpu} left={_slept_left}")
+
+# THE CONTAINMENT GAP, REPRODUCED AND THEN CLOSED. Killing only the process the waiter holds a
+# handle on left every proxy, guardian, fixture server and helper a hung suite had started —
+# outliving the `rmtree` of the tree that launched them and running beside the workers still
+# going (review, PR #111). The descendant here calls `setsid`, which is not decoration: it is
+# what the proxy's guardian does deliberately, and it is the reason a `killpg` aimed at the
+# suite is not the fix. `setsid` changes the session, never the parent, so the parentage arm
+# still reaches it — provided the table is read BEFORE the first signal.
+_SPAWNER = ("import subprocess, sys, time\n"
+            "kid = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+            "                       start_new_session=True)\n"
+            "print(kid.pid, flush=True)\n"
+            "time.sleep(30)\n")
+_tree_probe = subprocess.Popen([sys.executable, "-c", _SPAWNER],
+                               stdout=subprocess.PIPE, text=True)
+_descendant = int(_tree_probe.stdout.readline().strip())
+
+
+def _alive(pid):
+    """True while `pid` names something that is not a zombie — asked of `ps`, not of a signal.
+
+    `os.kill(pid, 0)` succeeds against a ZOMBIE, which is exactly the state a just-killed
+    descendant passes through, so a check written on it would fail intermittently for a
+    process that is already dead. The table this asks is the one the sweep itself reads.
+
+    An observer that cannot answer reports "not alive", which is the wrong direction on its
+    own — it would make every absence below free. The positive control ahead of them is what
+    makes that safe: a broken `ps` fails there, before any absence is read as evidence.
+    """
+    table = survives(MUT.process_tree)
+    return isinstance(table, dict) and pid in table
+
+
+# THE POSITIVE CONTROL, and it is the whole reason the check below means anything. "The
+# descendant is gone" is read off an absence, so it is satisfied by a descendant that never
+# started, by one that exited on its own, and by an observer that cannot see processes at all.
+check("the descendant of a suite is alive and observable before the bound is reached",
+      _alive(_descendant) and _alive(_tree_probe.pid) and _descendant != _tree_probe.pid,
+      f"suite={_tree_probe.pid} descendant={_descendant}; without this, the sweep below is "
+      f"certified by an instrument that saw nothing in the first place")
+_tree_status, _tree_cpu, _tree_left = MUT._await(_tree_probe, 0.5)
+for _settle in range(40):                       # init reaps the orphan; it is not instant
+    if not _alive(_descendant) and not _alive(_tree_probe.pid):
+        break
+    time.sleep(0.05)
+check("...and a hung suite takes its whole process tree with it, `setsid` and all",
+      (_tree_status is None and not _alive(_descendant) and not _alive(_tree_probe.pid)
+       and _tree_left == ()),
+      f"suite={_tree_probe.pid} alive={_alive(_tree_probe.pid)} descendant={_descendant} "
+      f"alive={_alive(_descendant)} leftover={_tree_left} — a survivor here outlives the "
+      f"deletion of the work tree it was launched from and runs beside the other workers")
+survives(os.waitpid, _tree_probe.pid, os.WNOHANG)
+_tree_probe.stdout.close()
+
+# THE MARKER ARM, ON A PROCESS WITH NO PARENTAGE LINK AT ALL. It is what closes the window
+# between reading the table and acting on it: a process spawned in that gap is reparented the
+# instant the root dies, and only its argv still says whose it was. Driven against a real
+# process rather than a table, because the argv `ps` reports is not obviously the argv passed.
+_orphan_mark = f"ase-sweep-{uuid.uuid4().hex}"
+_orphan = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", _orphan_mark])
+check("a process nothing links to us is still ours if its argv names our work tree",
+      _alive(_orphan.pid) and _orphan.pid in MUT.owned_pids(MUT.process_tree(), None, _orphan_mark),
+      f"{_orphan_mark} -> pid {_orphan.pid}")
+_orphan_left = MUT.kill_owned(None, _orphan_mark)
+for _settle in range(40):
+    if not _alive(_orphan.pid):
+        break
+    time.sleep(0.05)
+check("...and the sweep reaches it by that name alone",
+      not _alive(_orphan.pid) and _orphan_left == (),
+      f"pid {_orphan.pid} survived a sweep for {_orphan_mark!r}; leftover={_orphan_left}")
+survives(os.waitpid, _orphan.pid, os.WNOHANG)
+
 
 # THE WORK TREE, AND THE ONE THING IT HAS TO DO. The venv is 520MB of a 531MB tree and is now
 # SHARED rather than copied — which is safe only because nothing resolves through it: its

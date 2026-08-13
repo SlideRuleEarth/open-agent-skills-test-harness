@@ -3203,6 +3203,78 @@ MUTATIONS = [
      ("            proc.returncode = _exit_code(status)\n"
       "            return status, 0.0"),
      "a child's CPU is measured from the wait that reaps THAT child"),
+    # THE CONTAINMENT GAP ITSELF, restored exactly as it shipped: the timeout path kills the
+    # process it holds a handle on and nothing else. Every proxy, guardian, fixture server and
+    # helper a hung suite started outlives it, outlives the `rmtree` of the tree they were
+    # launched from, and runs beside the workers still going (review, PR #111).
+    ("F97-a-timed-out-suite-is-killed-without-its-descendants", SELF,
+     "\n    leftover = kill_owned(proc.pid, marker)",
+     ("\n    leftover = ()\n"
+      "    _signal(proc.pid)"),
+     "...and a hung suite takes its whole process tree with it, `setsid` and all"),
+    # AND THE ORDER, which is the mechanism rather than a detail. Signal first and the parentage
+    # arm has nothing left to read: every descendant is reparented to init the instant the root
+    # dies, and with no marker there is no second way to find them.
+    # WRITTEN THROUGH `_signal`, NOT AROUND IT, and that is not a style note. The first version
+    # of this entry spelled the premature kill as a bare `os.kill(root, signal.SIGKILL)`. The
+    # verifier calls `kill_owned` once with no parentage root, which was then spelled `-1` — so
+    # the mutant executed `os.kill(-1, SIGKILL)`, which POSIX defines as every process the user
+    # may signal, and it closed every application on the machine (2026-08-12). A mutation suite
+    # runs deliberately broken code by design, so a destructive call is only as contained as its
+    # worst reachable variant: the guard has to be in the primitive, and the mutation has to go
+    # through it.
+    ("F98-the-tree-is-signalled-before-it-is-enumerated", SELF,
+     ("        table = process_tree()\n"
+      "        doomed = owned_pids(table, root, marker)"),
+     ("        if root is not None:\n"
+      "            _signal(root)\n"
+      "        table = process_tree()\n"
+      "        doomed = owned_pids(table, root, marker)"),
+     "...and a hung suite takes its whole process tree with it, `setsid` and all"),
+    ("F99-the-sweep-reaches-only-the-immediate-children", SELF,
+     ("    owned, frontier = set(), [root]\n"
+      "    while frontier:\n"
+      "        pid = frontier.pop()\n"
+      "        for kid in children.get(pid, ()):\n"
+      "            if kid not in owned:\n"
+      "                owned.add(kid)\n"
+      "                frontier.append(kid)"),
+     "    owned = set(children.get(root, ()))",
+     "the sweep walks the whole chain, not just the immediate children"),
+    # THE `None` GUARD. This is the mutation the sentinel was CHOSEN for: with a falsy string it
+    # would have swept every process on the machine from inside the mutation runner, and with
+    # `None` it raises before signalling anything. What reddens is the parentage-only case,
+    # which is why that one is driven through `survives`.
+    ("F100-the-marker-arm-is-not-guarded-at-all", SELF,
+     "\n    if marker is not None:",
+     "\n    if True:",
+     "the sweep walks the whole chain, not just the immediate children"),
+    ("F101-an-empty-marker-is-accepted-instead-of-refused", SELF,
+     ('    if marker == "":\n'
+      '        raise ValueError('),
+     ("    if False:\n"
+      "        raise ValueError("),
+     "...and an empty marker is REFUSED rather than quietly matching every process alive"),
+    # A ZOMBIE IS NOT A SURVIVOR. Counting one makes the sweep spin out its whole deadline over
+    # a process that is already dead and then report it as a leak — the reaped suite itself,
+    # every time, which would make a real leftover unreadable among the noise.
+    ("F102-a-zombie-counts-as-a-live-descendant", SELF,
+     ('            if not state.startswith("Z"):\n'
+      "                table[pid] = (ppid, command)"),
+     "            table[pid] = (ppid, command)",
+     "a child that outlives its bound is reported as such, killed, and reaped"),
+    # NO MUTATION REMOVES `_signal`'s OWN GUARD, and the refusal is the finding rather than a
+    # gap. Every other entry here reintroduces a defect and asks whether an arm notices; that
+    # one would reintroduce the ability to broadcast a SIGKILL and then ask the machine. The
+    # check that covers it (`no non-process ever reaches the one function that signals`) is
+    # driven directly on the values instead, which establishes the same property without a
+    # version of this file that can take the host down existing on disk for eleven minutes.
+    # The rule generalizes: a mutation may perturb WHICH processes are chosen, never the guard
+    # that decides whether a chosen thing is a process at all.
+    ("F103-a-sweep-that-left-something-behind-says-nothing", SELF,
+     '\n                 f"{list(outcome.leftover)}" if outcome.leftover else "")',
+     '\n                 f"{list(outcome.leftover)}" if False else "")',
+     "...and a timeout whose sweep left something behind names the pids in its line"),
 
 ]
 
@@ -3318,6 +3390,10 @@ class Outcome(NamedTuple):
     output: str
     wall: float
     cpu: float
+    # Pids the timeout path could not get rid of. Empty on every path that did not time out,
+    # and empty on almost all that did — a non-empty one is a leak the run should say out loud
+    # rather than a detail, because the next mutation to draw this tree inherits it.
+    leftover: tuple = ()
 
 
 def _exit_code(status):
@@ -3325,8 +3401,144 @@ def _exit_code(status):
     return -os.WTERMSIG(status) if os.WIFSIGNALED(status) else os.WEXITSTATUS(status)
 
 
-def _await(proc, timeout):
-    """Reap `proc`, returning (status_or_None, cpu_seconds). None means it outlived `timeout`.
+def process_tree():
+    """Every live pid, with its parent and command line. Zombies excluded, and that is a fact.
+
+    A DEAD PROCESS AWAITING ITS REAP IS NOT SOMETHING THAT CAN CONTAMINATE A WORKER: it holds
+    no descriptors, spawns nothing, and its children were reparented when it died. Counting one
+    as a survivor would make the timeout path report a leak it had actually cleaned up, and
+    make it wait out its whole deadline doing it.
+    """
+    done = subprocess.run(["ps", "-eo", "pid=,ppid=,stat=,command="],   # noqa: S607 — on PATH
+                          capture_output=True, text=True, timeout=30)
+    table = {}
+    for line in done.stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
+            pid, ppid, state, command = int(parts[0]), int(parts[1]), parts[2], parts[3]
+            if not state.startswith("Z"):
+                table[pid] = (ppid, command)
+    return table
+
+
+def _signal(pid):
+    """SIGKILL one process. THE ONLY PLACE THIS FILE SIGNALS ANYTHING, and it refuses a pid
+    that is not a process.
+
+    `kill(-1, ...)` IS DEFINED AS "EVERY PROCESS THIS USER MAY SIGNAL", and `kill(0, ...)` as
+    "this process's whole group". Neither is a sentinel; both are broadcasts, and the operating
+    system will not ask whether one was meant. This function exists because a `-1` used
+    elsewhere as a harmless-looking "no root" placeholder reached `os.kill` under a mutation and
+    took down every application the user had open (2026-08-12).
+
+    IT IS THE PRIMITIVE THE MUTATIONS GO THROUGH TOO. A mutation suite runs deliberately broken
+    versions of this file, so a destructive call is only as contained as its WORST reachable
+    variant — which means the containment cannot live in the callers, and a mutation aimed at a
+    kill path has to be written through this function rather than around it.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        raise ValueError(f"refusing to signal {pid!r}: a pid must be positive, and a "
+                         f"non-positive one is a broadcast rather than a process")
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass                         # already gone, or never ours to begin with
+
+
+def owned_pids(table, root=None, marker=None):
+    """Everything one suite run owns: the `root`'s descendants, plus anything naming `marker`.
+
+    NEITHER SELECTOR HAS A MAGIC NUMBER. "No root" is `None`, exactly as "no marker" is — a
+    value that cannot be a pid, cannot be an `in` operand, and cannot be handed to `os.kill`.
+    An earlier version used `-1` for it, on the reasoning that no process has that parent. That
+    is true and it is not the point: the value did not stay inside the lookup it was invented
+    for, and `kill(-1)` is the most destructive call on the system.
+
+    TWO INDEPENDENT REASONS FOR MEMBERSHIP, because each is blind exactly where the other sees.
+
+    The PPID CHAIN is the complete answer while the chain exists, and it is the only one that
+    reaches a process whose argv says nothing about us. It reaches through a `setsid` — a new
+    session changes the group, never the parent — which is what makes it, and not a process
+    group, the right instrument here: the proxy's guardian is spawned `start_new_session=True`
+    on purpose, and the escaping helper in §10.9 calls `setsid` on purpose, so a `killpg` aimed
+    at the suite misses precisely the two processes this exists to catch.
+
+    The MARKER is what survives the chain being cut. The instant the root is signalled its
+    descendants are reparented to init and every link above them is gone, so anything not
+    enumerated BEFORE the first signal is unreachable by parentage forever after. Every process
+    a suite starts carries its work tree's absolute path in its argv — the proxy is launched by
+    script path, the guardian names this module, the fixtures name themselves — and that path
+    is a fresh `mkdtemp` no other process on the machine can be carrying.
+
+    "NO MARKER" IS `None`, AND THE EMPTY STRING IS REFUSED. `"" in command` is true of every
+    process alive, so a marker arm switched off by falsiness puts one boolean between this
+    function and SIGKILLing the machine — and this file's whole purpose is to run versions of
+    itself with a line removed. `None` is not a boolean weaker than that; it is a value `in`
+    cannot accept, so the mutation that deletes the guard raises `TypeError` and kills nothing,
+    where the mutation that deletes a `if marker:` would have swept the host. The empty string
+    is then refused outright rather than treated as `None`, because a caller that computed one
+    by accident meant a path and got nothing.
+    """
+    if marker == "":
+        raise ValueError("an empty marker matches every process alive, not none of them; pass "
+                         "None to sweep by parentage only")
+    if root is not None and (not isinstance(root, int) or root <= 0):
+        raise ValueError(f"refusing to sweep from root {root!r}: pass None for no root, never "
+                         f"a non-positive pid, which every signalling call reads as a broadcast")
+    children = {}
+    for pid, (ppid, _command) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    owned, frontier = set(), [root]
+    while frontier:
+        pid = frontier.pop()
+        for kid in children.get(pid, ()):
+            if kid not in owned:
+                owned.add(kid)
+                frontier.append(kid)
+    if marker is not None:
+        owned |= {pid for pid, (_ppid, command) in table.items() if marker in command}
+    if root in table:
+        owned.add(root)
+    # NEVER OURSELVES, on either arm. The driver is not in the tree it sweeps and its argv does
+    # not name a work tree, so this cannot fire today — it is here because the cost of being
+    # wrong about that once is the run killing the process doing the killing.
+    owned.discard(os.getpid())
+    return owned
+
+
+def kill_owned(root, marker=None, deadline=5.0):
+    """SIGKILL everything one suite run owns. Returns the pids that would not go.
+
+    ENUMERATE, THEN SIGNAL, THEN RE-ENUMERATE. The order is the whole mechanism: the parentage
+    arm is only readable before the first signal, and the marker arm is what closes the window
+    between reading the table and acting on it — a process spawned in that gap has no surviving
+    link to the root but does carry the tree path. Iterating until the answer is empty is what
+    makes that convergent rather than a single hopeful second pass, and it terminates because
+    the root dies first and nothing else in the tree starts suites.
+
+    ON THE TIMEOUT PATH ONLY, and never after a run that finished. A sweep after a clean run
+    would be tidying away exactly the survivors the proxy verifier exists to notice, and a green
+    suite would then certify a leak this function had quietly cleaned up on its behalf.
+    """
+    end = time.monotonic() + deadline
+    while True:
+        table = process_tree()
+        doomed = owned_pids(table, root, marker)
+        if not doomed:
+            return ()
+        for pid in doomed:
+            _signal(pid)
+        if time.monotonic() >= end:
+            return tuple(sorted(owned_pids(process_tree(), root, marker)))
+        time.sleep(_POLL)
+
+
+def _await(proc, timeout, marker=None):
+    """Reap `proc` and everything it owns, as (status_or_None, cpu, leftover).
+
+    A `None` status means it outlived `timeout`; `leftover` is what the sweep could not kill,
+    and is empty on every path that did not time out. `marker` scopes the sweep to one work
+    tree — see `owned_pids`, where `None` sweeps by parentage only and `""` is refused.
 
     `os.wait4` RATHER THAN `subprocess.run`, and the reason is arithmetic rather than taste.
     Per-child CPU has to come from the wait that reaps THAT child: `getrusage(RUSAGE_CHILDREN)`
@@ -3349,17 +3561,20 @@ def _await(proc, timeout):
         pid, status, usage = os.wait4(proc.pid, os.WNOHANG)
         if pid == proc.pid:
             proc.returncode = _exit_code(status)
-            return status, usage.ru_utime + usage.ru_stime
+            return status, usage.ru_utime + usage.ru_stime, ()
         if time.monotonic() >= deadline:
             break
         time.sleep(_POLL)
-    try:
-        os.kill(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass                       # exited between the last poll and the signal; still to reap
+    # THE WHOLE TREE, NOT THE PROCESS WE HAPPEN TO HOLD A HANDLE ON. Killing only the suite was
+    # a containment gap with teeth under `--jobs N`: these suites spawn proxies, guardians,
+    # fixture servers and helpers, and a mutation that hangs before its cleanup left every one
+    # of them running — outliving the `rmtree` of the tree they were launched from, and alive
+    # beside the workers still running (review, PR #111). Reproduced directly: a suite that
+    # spawned a 60s child and timed out was reaped at `-SIGKILL` with the child still alive.
+    leftover = kill_owned(proc.pid, marker)
     _pid, status, usage = os.wait4(proc.pid, 0)
     proc.returncode = _exit_code(status)
-    return None, usage.ru_utime + usage.ru_stime
+    return None, usage.ru_utime + usage.ru_stime, leftover
 
 
 def run(cwd, suite):
@@ -3377,10 +3592,14 @@ def run(cwd, suite):
         t0 = time.monotonic()
         proc = subprocess.Popen(command_for(cwd, suite), cwd=cwd,   # noqa: S603 — our own venv
                                 stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT)
-        status, cpu = _await(proc, _SUITE_TIMEOUT)
+        # The work tree's own path is what scopes the sweep if this times out. Every process a
+        # suite starts is launched by absolute path out of this directory, and the directory is
+        # a fresh `mkdtemp` belonging to one worker — so it names this run's descendants and
+        # cannot name a sibling worker's.
+        status, cpu, leftover = _await(proc, _SUITE_TIMEOUT, str(cwd))
         wall = time.monotonic() - t0
         if status is None:
-            return Outcome(124, _TIMEOUT_OUTPUT, wall, cpu)
+            return Outcome(124, _TIMEOUT_OUTPUT, wall, cpu, leftover)
         sink.seek(0)
         return Outcome(proc.returncode, sink.read(), wall, cpu)
 
@@ -3439,8 +3658,15 @@ def result_line(mid, suite, arm, outcome, failed):
         # whose defect is an infinite loop must be caught by an arm that BOUNDS the work (a
         # thread + join), not by the suite's own timeout — so this counts as uncaught and fails
         # the run, forcing a real fix rather than masking the hang.
+        #
+        # AND A SWEEP THAT DID NOT FINISH IS SAID OUT LOUD. "Killed the tree" is a claim read
+        # off an absence, so the case where the absence is not there has to be printed rather
+        # than swallowed: whatever is still alive was launched from a tree about to be deleted,
+        # and the next mutation to draw that tree runs beside it.
+        stuck = (f" — {len(outcome.leftover)} descendant(s) SURVIVED the sweep: "
+                 f"{list(outcome.leftover)}" if outcome.leftover else "")
         return (f"{mid}: *** TIMEOUT *** {suite} exceeded {_SUITE_TIMEOUT}s — the defect hangs "
-                f"rather than reddening {arm} {took}")
+                f"rather than reddening {arm} {took}{stuck}")
     if kind == CAUGHT:
         return f"{mid}: CAUGHT by {arm} {took}"
     if kind == NOT_VIA:
