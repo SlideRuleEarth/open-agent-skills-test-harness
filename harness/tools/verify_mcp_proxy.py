@@ -1215,7 +1215,7 @@ def process_table() -> dict[int, str]:
     now has one implementation to be right in. Zombies are excluded there, which is if anything
     more correct here: a guardian awaiting its reap is not a survivor either.
     """
-    return {pid: command for pid, (_ppid, command) in MUT.process_tree().items()}
+    return {pid: proc.command for pid, proc in MUT.process_tree().items()}
 
 
 def guardian_pids() -> set[int]:

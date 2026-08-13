@@ -292,7 +292,7 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 578 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 111/111 fixture
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 113/113 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 460 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 git diff --check
@@ -1682,6 +1682,23 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   Keep the live one too — it is what proves the scripted one is describing the real mechanism —
   but do not let it be the only evidence, because the run where it passes by luck is
   indistinguishable from the run where it passes for the reason you meant.
+- **A TEST DOUBLE THAT CANNOT EXPRESS THE DEFECT IS A CHECK THAT CANNOT FAIL, and it looks
+  exactly like a check that passes.** Twice in one review round, on the same function. The
+  freeze's scripted machine stopped a process the instant `_signal` was called — so it was
+  proving the code correct against a machine where the bug is impossible. Real `os.kill`
+  returns when the signal is QUEUED; the target keeps running until the kernel delivers it, and
+  a target still running can still fork. A fixed point over pids SIGNALLED is therefore not a
+  fixed point over pids STOPPED, and the gap is exactly wide enough for one more child to be
+  born, orphaned by the kill that follows, and carry no argv anyone can find it by.
+
+  The fix is to settle on OBSERVED state — `ps` already reports `T`, which this code parsed and
+  discarded after the zombie test — and never to conclude on the same snapshot in which it
+  signalled. The double now models delivery LAG, and models a process killed while still
+  running getting one last child out first.
+
+  **The question to ask of a double is not "does it stand in for the real thing" but "can the
+  defect I am testing for occur in it".** A synchronous mock of an asynchronous mechanism
+  answers no, silently, forever.
 - **A single-line anchor aimed at `mutate_mcp.py` itself matches TWICE**, and one of the two is
   the mutation entry quoting it. It is refused up front by `stale_anchors` rather than silently
   mutating the list instead of the code, but the fix is not obvious from the message: pin it

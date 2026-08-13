@@ -3225,11 +3225,11 @@ MUTATIONS = [
     # through it.
     ("F98-the-tree-is-signalled-before-it-is-enumerated", SELF,
      ("        while True:\n"
-      "            fresh = owned_pids(process_tree(), root, marker) - frozen"),
+      "            table = process_tree()"),
      ("        while True:\n"
       "            if root is not None:\n"
       "                _signal(root)\n"
-      "            fresh = owned_pids(process_tree(), root, marker) - frozen"),
+      "            table = process_tree()"),
      "...and a hung suite takes its whole process tree with it, `setsid` and all"),
     ("F99-the-sweep-reaches-only-the-immediate-children", SELF,
      ("    owned, frontier = set(), [root]\n"
@@ -3260,8 +3260,8 @@ MUTATIONS = [
     # every time, which would make a real leftover unreadable among the noise.
     ("F102-a-zombie-counts-as-a-live-descendant", SELF,
      ('            if not state.startswith("Z"):\n'
-      "                table[pid] = (ppid, command)"),
-     "            table[pid] = (ppid, command)",
+      "                table[pid] = Proc(ppid, state, command)"),
+     "            table[pid] = Proc(ppid, state, command)",
      "a child that outlives its bound is reported as such, killed, and reaped"),
     # NO MUTATION REMOVES `_signal`'s OWN GUARD, and the refusal is the finding rather than a
     # gap. Every other entry here reintroduces a defect and asks whether an arm notices; that
@@ -3284,16 +3284,26 @@ MUTATIONS = [
     # the next catches what those had already forked. Stopping once and killing is the same
     # race one generation deeper.
     ("F111-the-freeze-does-not-iterate-to-a-fixed-point", SELF,
-     ("            fresh = owned_pids(process_tree(), root, marker) - frozen\n"
-      "            if not fresh:\n"
+     ("            if not fresh and not pending:\n"
       "                quiesced = True\n"
       "                break"),
-     ("            fresh = owned_pids(process_tree(), root, marker) - frozen\n"
-      "            quiesced = True\n"
-      "            if not fresh or frozen:\n"
+     ("            if not fresh:\n"
+      "                quiesced = True\n"
       "                break"),
-     ("the freeze iterates to a fixed point, so a child forked before its parent stopped is "
-      "still caught")),
+     "the freeze waits for SIGSTOP to be OBSERVED, not merely sent"),
+    # AND THE PREDICATE THE WAIT TURNS ON. A state test that answers "stopped" for a running
+    # process is the same defect one layer down, and it is the layer where the platform's
+    # spelling lives.
+    ("F113-a-running-process-reads-as-a-stopped-one", SELF,
+     '\n    return proc.state[:1] in ("T", "t")',
+     "\n    return True",
+     "the freeze waits for SIGSTOP to be OBSERVED, not merely sent"),
+    ("F114-a-freeze-that-never-settled-still-reports-a-clean-sweep", SELF,
+     ('\n    fault = ("" if quiesced else\n'
+      '             f"the process tree did not stop spawning within {deadline:.0f}s: "'),
+     ('\n    fault = ("" if True else\n'
+      '             f"the process tree did not stop spawning within {deadline:.0f}s: "'),
+     "...and a stop that never lands is a named failure, not a clean sweep"),
     # AND WHAT IS REPORTED AFTERWARDS. Re-enumerating asks the machine about orphans it can no
     # longer reach by parentage and may not name by marker — so it answers "clean" about
     # precisely the processes that got away. The frozen set is the only honest population.
@@ -3477,6 +3487,35 @@ def _exit_code(status):
     return -os.WTERMSIG(status) if os.WIFSIGNALED(status) else os.WEXITSTATUS(status)
 
 
+class Proc(NamedTuple):
+    """One row of the process table.
+
+    A NAMED RECORD RATHER THAN A BARE TUPLE, for the reason `_Suite` gives further down: the
+    `state` field arrived late, three readers had to agree about the new shape, and a positional
+    row is one every reader re-derives independently. It is also the field the freeze turns on —
+    dropped after the zombie test until a reviewer showed the fixed point needed it.
+    """
+
+    ppid: int
+    state: str
+    command: str
+
+
+def is_stopped(proc):
+    """Whether `ps` says this process is actually stopped, rather than merely signalled.
+
+    THE DIFFERENCE IS THE WHOLE RACE. `os.kill` returns when the signal is QUEUED; the target
+    keeps running until the kernel delivers it, and a target that is still running can still
+    fork. A fixed point over pids we have SIGNALLED is therefore not a fixed point over pids
+    that have STOPPED, and the gap between them is exactly wide enough for a late child to be
+    born, be orphaned by the kill, and carry no argv anyone can find it by (review, PR #111).
+
+    `T` is stopped on both supported platforms; Linux additionally spells a traced stop `t`.
+    Flags may follow the letter (`T+`, `TN`), so this reads the first character only.
+    """
+    return proc.state[:1] in ("T", "t")
+
+
 class ObserverFailed(Exception):
     """`ps` did not answer, or answered without having enumerated the machine.
 
@@ -3526,7 +3565,7 @@ def process_tree():
                 continue        # macOS lists kernel_task as pid 0; `_signal` would refuse it
             seen.add(pid)
             if not state.startswith("Z"):
-                table[pid] = (ppid, command)
+                table[pid] = Proc(ppid, state, command)
     if os.getpid() not in seen:
         raise ObserverFailed(f"`ps` answered without listing this process ({os.getpid()}) among "
                              f"its {len(seen)} row(s), so it did not enumerate the machine")
@@ -3611,8 +3650,8 @@ def owned_pids(table, root=None, marker=None):
         raise ValueError(f"refusing to sweep from root {root!r}: pass None for no root, never "
                          f"a non-positive pid, which every signalling call reads as a broadcast")
     children = {}
-    for pid, (ppid, _command) in table.items():
-        children.setdefault(ppid, []).append(pid)
+    for pid, proc in table.items():
+        children.setdefault(proc.ppid, []).append(pid)
     owned, frontier = set(), [root]
     while frontier:
         pid = frontier.pop()
@@ -3621,7 +3660,7 @@ def owned_pids(table, root=None, marker=None):
                 owned.add(kid)
                 frontier.append(kid)
     if marker is not None:
-        owned |= {pid for pid, (_ppid, command) in table.items() if marker in command}
+        owned |= {pid for pid, proc in table.items() if marker in proc.command}
     if root in table:
         owned.add(root)
     # NEVER OURSELVES, on either arm. The driver is not in the tree it sweeps and its argv does
@@ -3689,15 +3728,27 @@ def kill_owned(root, marker=None, deadline=5.0):
     quiesced = False
     try:
         while True:
-            fresh = owned_pids(process_tree(), root, marker) - frozen
-            if not fresh:
+            table = process_tree()
+            fresh = owned_pids(table, root, marker) - frozen
+            # SIGNALLED IS NOT STOPPED, and a fixed point over the wrong one of those is not a
+            # fixed point at all. `os.kill` returns once the signal is queued; until the kernel
+            # delivers it the target is still running and can still fork. Concluding on "no new
+            # pids" therefore concluded on a snapshot taken while the root was free to produce
+            # one more child — orphaned by the kill that followed, markerless, and invisible to
+            # every later scan (review, PR #111). So the loop also requires every pid it has
+            # signalled to be OBSERVED stopped, from the same `ps` state it already reads.
+            pending = {pid for pid in frozen & table.keys() if not is_stopped(table[pid])}
+            if not fresh and not pending:
                 quiesced = True
                 break
-            for pid in sorted(fresh):
+            # Re-signalling a pending one is free and covers a signal that was lost to a race
+            # with its own exec; a stop delivered twice is still one stop.
+            for pid in sorted(fresh | pending):
                 _signal(pid, signal.SIGSTOP)
             frozen |= fresh
             if time.monotonic() >= end:
                 break
+            time.sleep(_POLL)
     finally:
         for pid in sorted(frozen):
             _signal(pid, signal.SIGKILL)

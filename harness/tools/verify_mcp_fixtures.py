@@ -1970,9 +1970,10 @@ check("...and the sweep raises it rather than answering 'nothing left behind'",
 # raises is reached.
 # THE ENUMERATION ITSELF, on a table rather than on the machine — where the answers are known
 # and where the case that must NEVER occur can be arranged.
-_synth_table = {10: (1, "/x/w0/harness/suite.py"), 11: (10, "/x/w0/harness/proxy.py"),
-                12: (11, "/x/w0/harness/guardian.py"), 13: (1, "/x/w0/harness/orphan.py"),
-                14: (1, "/other/thing.py"), 15: (14, "/other/child.py")}
+_P = MUT.Proc
+_synth_table = {10: _P(1, "S", "/x/w0/harness/suite.py"), 11: _P(10, "S", "/x/w0/harness/proxy.py"),
+                12: _P(11, "S", "/x/w0/harness/guardian.py"), 13: _P(1, "S", "/x/w0/harness/orphan.py"),
+                14: _P(1, "S", "/other/thing.py"), 15: _P(14, "S", "/other/child.py")}
 # `survives` ON THE `None` CASES, because the deletion that makes `None` load-bearing is one
 # that RAISES: without the guard, `None in command` is a `TypeError`, which is the whole point
 # of choosing `None` over a falsy string — and evaluated inside a `check(...)` argument it would
@@ -2020,7 +2021,7 @@ _victim.wait(timeout=10)
 check("...while a real pid is still signalled, so those refusals narrow a live mechanism",
       _victim.returncode == -signal.SIGKILL, _victim.returncode)
 check("...and the driver is never in its own sweep, on either arm",
-      (os.getpid() not in MUT.owned_pids({**_synth_table, os.getpid(): (10, "/x/w0/harness/me")},
+      (os.getpid() not in MUT.owned_pids({**_synth_table, os.getpid(): _P(10, "S", "/x/w0/harness/me")},
                                          10, "/x/w0/harness")),
       "the cost of being wrong about that once is the run killing the process doing the killing")
 
@@ -2077,34 +2078,75 @@ def _alive(pid):
 #
 # A SCRIPTED `process_tree` MAKES THE INTERLEAVING THE POINT rather than the luck. Generation
 # two appears only on the second look, which is exactly the process a single round cannot see.
-_gen1 = {100: (1, "/x/w0/root"), 101: (100, "/x/w0/child")}
-_gen2 = {**_gen1, 102: (101, "/bin/sh -c sleep")}     # forked before 101 was stopped
-_looks, _sent = [], []
+class _FakeMachine:
+    """A process table where SIGSTOP LANDS LATE and a process that is still running forks.
+
+    THE DELAY IS THE POINT, and a mock that stops on the call cannot express the defect. Real
+    `os.kill` returns when the signal is queued; the target keeps running until the kernel
+    delivers it. So here a stop takes `lag` looks to take effect, and a process killed while it
+    has not yet actually stopped gets one last child out first — which is exactly the sequence a
+    reviewer drove by hand: snapshot, signal, snapshot showing nothing new, "quiescent", and
+    then a markerless orphan produced between that conclusion and the kill (PR #111).
+
+    `forks` bounds it so a correct implementation terminates: the root has only so many children
+    in it, and once it is genuinely stopped it has none.
+    """
+
+    def __init__(self, lag=2, forks=3):
+        self.procs = {100: ["S", 1, "/x/w0/root"]}     # [state, ppid, command]
+        self.lag, self.forks, self.next_pid = lag, forks, 101
+        self.pending, self.escaped = {}, []
+
+    def look(self):
+        for pid, due in list(self.pending.items()):
+            if due <= 0 and pid in self.procs:
+                self.procs[pid][0] = "T"
+                del self.pending[pid]
+            else:
+                self.pending[pid] = due - 1
+        return {pid: MUT.Proc(p[1], p[0], p[2]) for pid, p in self.procs.items()}
+
+    def signal(self, pid, sig=signal.SIGKILL):
+        if not isinstance(pid, int) or pid <= 0:       # the real guard, kept honest
+            raise ValueError(f"refusing to signal {pid!r}")
+        if sig == signal.SIGSTOP:
+            self.pending.setdefault(pid, self.lag)
+        elif sig == signal.SIGKILL and pid in self.procs:
+            # STILL RUNNING WHEN KILLED: it gets one more child out first, and that child is
+            # orphaned, markerless, and unreachable by every later scan.
+            if self.procs[pid][0] != "T" and self.forks > 0:
+                self.procs[self.next_pid] = ["S", pid, "/bin/sh -c sleep 30"]
+                self.escaped.append(self.next_pid)
+                self.next_pid += 1
+                self.forks -= 1
+            del self.procs[pid]
 
 
-def _scripted_tree():
-    _looks.append(len(_looks))
-    return (_gen1, _gen2, _gen2, {})[min(len(_looks) - 1, 3)]
-
-
+_machine = _FakeMachine()
 _real_tree_fn, _real_signal_fn = MUT.process_tree, MUT._signal
 try:
-    MUT.process_tree = _scripted_tree
-    MUT._signal = lambda pid, sig=signal.SIGKILL: _sent.append((pid, sig))
+    MUT.process_tree, MUT._signal = _machine.look, _machine.signal
     _scripted = survives(MUT.kill_owned, 100, None)
 finally:
     MUT.process_tree, MUT._signal = _real_tree_fn, _real_signal_fn
-_stopped = {pid for pid, sig in _sent if sig == signal.SIGSTOP}
-check("the freeze iterates to a fixed point, so a child forked before its parent stopped is "
-      "still caught",
-      _stopped == {100, 101, 102} and isinstance(_scripted, MUT.Sweep)
-      and _scripted.fault == "" and _scripted.leftover == (),
-      f"stopped={sorted(_stopped)} swept={_scripted} — 102 appears only on the second look, "
-      f"which is the whole reason the freeze is a loop rather than a pass")
-check("...and everything it froze is then killed, none of it left stopped",
-      {pid for pid, sig in _sent if sig == signal.SIGKILL} >= {100, 101, 102},
-      f"signals={_sent} — a process left SIGSTOPped never exits, and the `wait4` above would "
-      f"block on it forever")
+check("the freeze waits for SIGSTOP to be OBSERVED, not merely sent",
+      isinstance(_scripted, MUT.Sweep) and _scripted.fault == "" and _scripted.leftover == ()
+      and not _machine.procs and not _machine.escaped,
+      f"swept={_scripted} still alive={_machine.procs} escaped={_machine.escaped} — with the "
+      f"fixed point taken over SIGNALLED pids the root is killed while still running, and the "
+      f"child it gets out on the way is an orphan nothing can name")
+# AND THE WAIT IS BOUNDED. A stop that never lands must end as a NAMED containment failure
+# rather than a loop that spins out the deadline and then reports a clean sweep.
+_stuck = _FakeMachine(lag=10 ** 6)
+try:
+    MUT.process_tree, MUT._signal = _stuck.look, _stuck.signal
+    _stuck_sweep = survives(MUT.kill_owned, 100, None, 0.3)
+finally:
+    MUT.process_tree, MUT._signal = _real_tree_fn, _real_signal_fn
+check("...and a stop that never lands is a named failure, not a clean sweep",
+      isinstance(_stuck_sweep, MUT.Sweep) and _stuck_sweep.fault != "",
+      f"swept={_stuck_sweep} — never observing the stop is the one case where containment "
+      f"genuinely cannot be established, and it has to say so")
 
 # WHAT IS REPORTED WHEN A SWEEP DOES LEAVE SOMETHING BEHIND. This cannot be arranged live —
 # SIGKILL works, so a survivor is by definition the thing that did not happen — and driving it
@@ -2112,7 +2154,8 @@ check("...and everything it froze is then killed, none of it left stopped",
 # root is gone so parentage reaches nothing, and the marker may never have named them, so
 # re-enumerating answers "clean" about exactly the processes that got away.
 _frozen_set = {10, 11, 12}
-_still_there = {10: (1, "/x/w0/harness/a.py"), 12: (1, "/bin/sh -c sleep"), 20: (1, "/other")}
+_still_there = {10: _P(1, "S", "/x/w0/harness/a.py"), 12: _P(1, "S", "/bin/sh -c sleep"),
+                20: _P(1, "S", "/other")}
 check("the survivors reported are the ones we froze, not whatever the machine still admits to",
       survives(MUT.survivors, _frozen_set, _still_there, None, "/x/w0/harness") == (10, 12),
       survives(MUT.survivors, _frozen_set, _still_there, None, "/x/w0/harness"))
@@ -2155,8 +2198,8 @@ def _nonce_alive():
     """
     table = survives(MUT.process_tree)
     return () if not isinstance(table, dict) else tuple(
-        sorted(pid for pid, (_p, cmd) in table.items()
-               if _race_nonce in cmd and pid != _racer.pid))
+        sorted(pid for pid, proc in table.items()
+               if _race_nonce in proc.command and pid != _racer.pid))
 
 
 for _spin in range(60):                      # let the loop get some children out
@@ -2166,7 +2209,7 @@ for _spin in range(60):                      # let the loop get some children ou
 _race_before = _nonce_alive()
 check("a suite that keeps spawning MARKERLESS children really is producing them",
       len(_race_before) >= 3 and all(
-          str(MUT.HARNESS) not in survives(MUT.process_tree).get(p, (0, ""))[1]
+          str(MUT.HARNESS) not in survives(MUT.process_tree).get(p, _P(0, "S", "")).command
           for p in _race_before),
       f"{len(_race_before)} nonce children; without this the sweep below is certified against "
       f"a spawner that never spawned")
