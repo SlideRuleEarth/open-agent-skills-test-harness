@@ -916,8 +916,8 @@ def cmd_verify_copilot_channels(args) -> int:
     a substitute for that reading.
     """
     from .adapters.copilot import (
-        _MCP_CHANNEL_MARKERS, _VERIFIED_ON, _VERIFIED_VERSIONS, audit_channel_markers,
-        find_cli_bundles,
+        _MCP_CHANNEL_MARKERS, _SCANNED_SUFFIXES, _VERIFIED_ON, _VERIFIED_VERSIONS,
+        MARKER_NOT_SEARCHED, audit_channel_markers, find_cli_bundles,
     )
 
     bundles = find_cli_bundles()
@@ -936,10 +936,29 @@ def cmd_verify_copilot_channels(args) -> int:
     worst = 0
     for version, app_js in bundles:
         known = version in _VERIFIED_VERSIONS
-        results = audit_channel_markers(app_js)
-        missing = [m for m, present in results.items() if not present]
+        audit = audit_channel_markers(app_js)
+        results = audit.present
+        missing = audit.missing
         tag = "verified" if known else "NOT in _VERIFIED_VERSIONS"
         print(f"copilot {version}  [{tag}]\n  {app_js}")
+        # A scan that read nothing reports every marker absent — the same output a build
+        # that dropped every channel produces. Say so instead, and never as a finding
+        # about copilot: this one is about the audit.
+        if audit.verdict() == MARKER_NOT_SEARCHED:
+            worst = max(worst, 2)
+            print("  INSTRUMENT  no file in this bundle could be read, so NOTHING was "
+                  "ruled out.\n  => this is a finding about the audit, not about the "
+                  "build. Check the path and permissions above.\n")
+            continue
+        print(f"  searched {len(audit.searched)} file(s) "
+              f"({', '.join(_SCANNED_SUFFIXES)}); a marker compiled into a native "
+              f"module would not be visible here")
+        # Found, but no longer in app.js. copilot 1.0.75 moved the agent frontmatter
+        # schema out of the bundle's main file, and a one-file scan called that a
+        # removed channel — the same words used for a channel that really went away.
+        if audit.relocated:
+            for m, whereat in sorted(audit.relocated.items()):
+                print(f"  moved    {m}  — now in {whereat}, not app.js")
         if missing:
             worst = max(worst, 2)
             for m in missing:

@@ -47,7 +47,7 @@ import ntpath
 import os
 import re
 import sys
-from typing import Any
+from typing import Any, NamedTuple
 from collections.abc import Mapping
 
 from ..schema import EventKind, NormalizedEvent
@@ -530,30 +530,134 @@ def _safe_listdir(path: str) -> list[str]:
         return []
 
 
-def audit_channel_markers(app_js: str) -> dict[str, bool]:
-    """Which ``_MCP_CHANNEL_MARKERS`` are still present in one CLI bundle.
+# The bundle files a marker can legitimately live in. The audit scanned `app.js` ALONE
+# until 2026-08-13, and copilot 1.0.75 is what proved that wrong: `mcp-servers` — the
+# custom-agent frontmatter key — left `app.js` while its siblings `user-invocable` and
+# `disable-model-invocation` turned up in `schemas/*.json` and `sdk/index.d.ts`, i.e. the
+# agent schema moved WITHIN the bundle rather than going away. A one-file scan reports that
+# as a channel assumption that no longer holds, which is the same words this command uses
+# for a channel that was genuinely REMOVED, and the two want opposite responses.
+#
+# Extensions rather than "every file": a bundle is ~173 MB, of which these are ~18 MB, and
+# the rest is wasm blobs, prebuilt binaries and a vendored ripgrep. That is a REAL limit on
+# what the audit can conclude and it is reported rather than hidden — a string compiled into
+# a native module is invisible here, so `MarkerAudit.searched` names what was actually read
+# and the command prints it. A narrowed claim beats a wide one nobody can check.
+_SCANNED_SUFFIXES = (".js", ".mjs", ".cjs", ".json", ".ts")
 
-    Substring search over the raw bundle, streamed in chunks with an overlap so a marker
-    straddling a chunk boundary is not missed. Deliberately crude: the bundle is minified
-    JS, so anything cleverer would be brittle, and the question being asked is only
-    "does this string still occur anywhere" — a marker that has VANISHED is the signal."""
-    needles = [m.encode() for m, _why in _MCP_CHANNEL_MARKERS]
-    hits = [False] * len(needles)
-    longest = max(len(n) for n in needles)
-    with open(app_js, "rb") as f:
+# Verdicts. `verdict()` is the ONE function every consumer reads, because "did the scan
+# look anywhere at all" is a fact about whether the answer is trustworthy and so belongs
+# with the other such facts rather than as a flag one caller remembers to check.
+MARKER_INTACT = "INTACT"
+MARKER_MISSING = "MISSING"
+MARKER_NOT_SEARCHED = "NOT_SEARCHED"
+
+
+class MarkerAudit(NamedTuple):
+    """What one bundle scan found, and — as a peer fact — where it looked.
+
+    An audit that read nothing reports every marker absent, which is bit-for-bit the
+    output of a build that dropped every channel. Those are opposite findings, so
+    `searched` is part of the result rather than a detail: absence is only evidence
+    once something says the search happened.
+    """
+
+    where: dict[str, str | None]      # marker -> bundle-relative file it was found in
+    searched: tuple[str, ...]         # bundle-relative files actually read, in scan order
+
+    @property
+    def present(self) -> dict[str, bool]:
+        return {m: p is not None for m, p in self.where.items()}
+
+    @property
+    def missing(self) -> list[str]:
+        return sorted(m for m, p in self.where.items() if p is None)
+
+    @property
+    def relocated(self) -> dict[str, str]:
+        """Markers found somewhere OTHER than `app.js` — the 1.0.75 case, by name."""
+        return {m: p for m, p in self.where.items()
+                if p is not None and p != "app.js"}
+
+    def verdict(self) -> str:
+        if not self.searched:
+            return MARKER_NOT_SEARCHED
+        return MARKER_MISSING if self.missing else MARKER_INTACT
+
+
+def _scan_file(path: str, needles: list[bytes], hits: list[str | None],
+               rel: str, longest: int) -> bool:
+    """Record `rel` for every needle this file contains and that has no hit yet.
+
+    Returns whether the file was actually READ, which is the caller's licence to count it
+    as searched. A file that could not be opened, or that died mid-read, has not ruled
+    anything out — counting it would put an unexamined file behind the word "searched",
+    which is the same defect one level down as the one this whole audit was fixed for.
+
+    Chunked with an overlap so a marker straddling a read boundary is still found.
+    """
+    try:
+        f = open(path, "rb")
+    except OSError:
+        return False
+    with f:
         tail = b""
         while True:
-            chunk = f.read(1 << 20)
+            try:
+                chunk = f.read(1 << 20)
+            except OSError:
+                return False
             if not chunk:
-                break
+                return True
             buf = tail + chunk
             for i, needle in enumerate(needles):
-                if not hits[i] and needle in buf:
-                    hits[i] = True
-            if all(hits):
-                break
+                if hits[i] is None and needle in buf:
+                    hits[i] = rel
+            if all(h is not None for h in hits):
+                return True
             tail = buf[-longest:]
-    return {m: hits[i] for i, (m, _why) in enumerate(_MCP_CHANNEL_MARKERS)}
+
+
+def audit_channel_markers(app_js: str) -> MarkerAudit:
+    """Which ``_MCP_CHANNEL_MARKERS`` are still present in one CLI BUNDLE.
+
+    Substring search, deliberately crude: the bundle is minified JS, so anything cleverer
+    would be brittle, and the question is only "does this string still occur anywhere in
+    this build". What changed on 2026-08-13 is the scope of "anywhere" — the unit is the
+    bundle directory, not `app.js`, because a marker that moved to a sibling file is not a
+    channel that went away (see `_SCANNED_SUFFIXES`).
+
+    `app.js` is scanned FIRST so the common case short-circuits on the biggest file, and so
+    `MarkerAudit.relocated` means what it says: found, but no longer where it used to be.
+    """
+    needles = [m.encode() for m, _why in _MCP_CHANNEL_MARKERS]
+    hits: list[str | None] = [None] * len(needles)
+    longest = max(len(n) for n in needles)
+    root = os.path.dirname(app_js) or "."
+    searched: list[str] = []
+
+    ordered: list[tuple[str, str]] = []
+    if os.path.isfile(app_js):
+        ordered.append((app_js, os.path.basename(app_js)))
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for name in sorted(filenames):
+            full = os.path.join(dirpath, name)
+            if full == app_js or not name.endswith(_SCANNED_SUFFIXES):
+                continue
+            ordered.append((full, os.path.relpath(full, root)))
+
+    for full, rel in ordered:
+        if all(h is not None for h in hits):
+            break
+        if not os.path.isfile(full):
+            continue
+        if _scan_file(full, needles, hits, rel, longest):
+            searched.append(rel)
+
+    return MarkerAudit(
+        where={m: hits[i] for i, (m, _why) in enumerate(_MCP_CHANNEL_MARKERS)},
+        searched=tuple(searched))
 
 
 # The built-in server a hermetic invocation always CONFIGURES and always disables:

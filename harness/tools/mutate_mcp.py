@@ -875,6 +875,35 @@ MUTATIONS = [
     ("M111-antigravity-stops-declaring-its-overlay-dependence", AGY,
      "\n    mcp_off_mechanism = MCPOffMechanism.OVERLAY_MASKS", "",
      "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # The regression that shipped for real. copilot 1.0.75 moved the agent frontmatter
+    # schema out of app.js into schemas/ and the SDK typings; a scan of app.js alone then
+    # reported `mcp-servers` MISSING — the wording reserved for a channel that was
+    # REMOVED — and nobody noticed for three releases. Deleting the walk restores exactly
+    # that: the bundle's sibling files stop being read.
+    ("M338-marker-scan-narrows-back-to-one-file", COPILOT,
+     "\n    for dirpath, dirnames, filenames in os.walk(root):",
+     "\n    for dirpath, dirnames, filenames in []:",
+     "copilot.channel_markers_scan_the_bundle"),
+    # The opposite failure, and the one a widening invites: the scan reads everything,
+    # including the wasm blobs and prebuilt binaries it cannot honestly claim to have
+    # examined, so `searched` overstates what was ruled out.
+    ("M339-marker-scan-claims-files-it-does-not-read", COPILOT,
+     '\n_SCANNED_SUFFIXES = (".js", ".mjs", ".cjs", ".json", ".ts")',
+     '\n_SCANNED_SUFFIXES = (".js", ".mjs", ".cjs", ".json", ".ts", ".wasm")',
+     "copilot.channel_markers_scan_the_bundle"),
+    # A file that could not be opened counts as searched, so an unreadable bundle reports
+    # "absent" about files nothing ever read — the audit's own version of the defect it
+    # exists to catch, one level down.
+    ("M340-unread-file-still-licenses-the-word-searched", COPILOT,
+     "\n    except OSError:\n        return False",
+     "\n    except OSError:\n        return True",
+     "copilot.channel_markers_scan_the_bundle"),
+    # A scan that read nothing goes back to reporting every marker absent, which is
+    # bit-for-bit what a build that dropped every channel produces.
+    ("M341-blind-scan-reports-every-channel-vanished", COPILOT,
+     "\n        if not self.searched:\n            return MARKER_NOT_SEARCHED",
+     "\n        if False:\n            return MARKER_NOT_SEARCHED",
+     "copilot.channel_markers_scan_the_bundle"),
     # The check is simply gone. Measured live before it existed: the cell spends a model
     # call and comes back `exited with code 1`, with "Not logged in" buried in a truncated
     # JSON blob inside an assertion message.

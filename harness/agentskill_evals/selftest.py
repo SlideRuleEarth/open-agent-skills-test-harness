@@ -5336,15 +5336,17 @@ def _check_copilot_version_provenance(failures, verbose):
         # the command), so this host's own bundles legitimately show up — restrict to the
         # fixture to keep the assertion independent of what is installed here.
         versions = [v for v, p in found if p.startswith(tmp)]
-        full = _cop.audit_channel_markers(os.path.join(root, "1.0.72", "app.js"))
-        gapped = _cop.audit_channel_markers(os.path.join(root, "2.0.0", "app.js"))
-        missing = sorted(m for m, ok in gapped.items() if not ok)
+        full_audit = _cop.audit_channel_markers(os.path.join(root, "1.0.72", "app.js"))
+        full = full_audit.present
+        full_verdict = full_audit.verdict()
+        gapped_audit = _cop.audit_channel_markers(os.path.join(root, "2.0.0", "app.js"))
+        missing = gapped_audit.missing
         # a marker straddling the 1 MiB read boundary must still be found
         straddle = os.path.join(tmp, "straddle.js")
         pad = (1 << 20) - (len(markers[0]) // 2)
         with open(straddle, "w") as f:
             f.write("." * pad + " ".join(markers))
-        straddled = _cop.audit_channel_markers(straddle)
+        straddled = _cop.audit_channel_markers(straddle).present
         # Ordered by the loader's own comparator, not by semver: an unparseable name sorts
         # below everything, `-` anywhere means prerelease, and the raw name breaks ties.
         expect = ["nonsense", "1.0.72", "1.0.73-", "1.0.73-beta.1", "1.0.73foo", "2.0.0"]
@@ -5363,6 +5365,71 @@ def _check_copilot_version_provenance(failures, verbose):
                f"all_present={all(full.values())} missing={missing} "
                f"straddle_ok={all(straddled.values())} xdg={covers_xdg} "
                f"localappdata={covers_localappdata}", failures, verbose)
+
+        # The scan is over the BUNDLE, not app.js — copilot 1.0.75 moved the agent
+        # frontmatter schema into sibling files, and a one-file scan called that a
+        # removed channel, which is the wording reserved for a channel that really
+        # went away. Three facts have to hold at once, and the middle one is the
+        # reason this arm is not just "the marker is found":
+        #   1. a marker living only in a SIBLING file is found, and named as moved;
+        #   2. a marker in NO file is still MISSING — a widened search that can no
+        #      longer report a removal has destroyed the instrument, not fixed it;
+        #   3. a marker only inside an unscanned binary is NOT claimed as found,
+        #      because `searched` is what licenses the word "absent".
+        moved_root = os.path.join(tmp, "moved")
+        os.makedirs(os.path.join(moved_root, "schemas"))
+        # app.js keeps everything except the last two markers.
+        with open(os.path.join(moved_root, "app.js"), "w") as f:
+            f.write(" ".join(markers[:-2]))
+        # ...one of which reappears in a sibling schema file (the 1.0.75 shape)...
+        with open(os.path.join(moved_root, "schemas", "api.schema.json"), "w") as f:
+            f.write('{"x": "' + markers[-2] + '"}')
+        # ...and the other only inside a file the scan does not read.
+        with open(os.path.join(moved_root, "blob.wasm"), "w") as f:
+            f.write(markers[-1])
+        moved = _cop.audit_channel_markers(os.path.join(moved_root, "app.js"))
+        rel_ok = moved.relocated == {markers[-2]: os.path.join("schemas",
+                                                              "api.schema.json")}
+        still_missing = moved.missing == [markers[-1]]
+        wasm_unread = not any(s.endswith(".wasm") for s in moved.searched)
+        app_first = moved.searched[0] == "app.js"
+
+        # A scan that read nothing reports every marker absent — byte-identical to a
+        # build that dropped every channel, and the opposite finding. An empty bundle
+        # dir produces that state without needing a permission the sandbox may refuse
+        # (§4: a case whose arrangement the environment can deny is a case that will
+        # one day be skipped rather than run).
+        empty_root = os.path.join(tmp, "empty")
+        os.makedirs(empty_root)
+        nothing = _cop.audit_channel_markers(os.path.join(empty_root, "app.js"))
+        blind = (nothing.verdict() == _cop.MARKER_NOT_SEARCHED
+                 and nothing.searched == () and not nothing.present[markers[0]])
+        # ...and the two states must not collide: a real removal is still MISSING.
+        verdicts_split = (moved.verdict() == _cop.MARKER_MISSING
+                          and full_verdict == _cop.MARKER_INTACT)
+
+        # The licence for the word "searched", asserted where it is decided rather than
+        # through the walk: a file that could not be opened has ruled nothing out. The
+        # walk cannot reach this case without a permission the sandbox may deny, so it is
+        # driven directly — the predicate is extracted precisely so it can be.
+        unread_licence = _cop._scan_file(
+            os.path.join(tmp, "no-such-file.json"),
+            [m.encode() for m, _w in _cop._MCP_CHANNEL_MARKERS],
+            [None] * len(_cop._MCP_CHANNEL_MARKERS), "no-such-file.json", 64) is False
+
+        _check("copilot.channel_markers_scan_the_bundle",
+               rel_ok and still_missing and wasm_unread and app_first
+               and blind and verdicts_split and unread_licence,
+               f"a marker that MOVED inside the bundle is found and reported as moved "
+               f"rather than missing (copilot 1.0.75 did exactly this to `mcp-servers`), "
+               f"while a marker in no scanned file is still reported MISSING, a marker "
+               f"only in an unscanned binary is not claimed, and a scan that read nothing "
+               f"is its own verdict instead of 'every channel vanished': "
+               f"relocated={moved.relocated} missing={moved.missing} "
+               f"searched_head={moved.searched[:3]} wasm_unread={wasm_unread} "
+               f"blind_verdict={nothing.verdict()} moved_verdict={moved.verdict()} "
+               f"unread_licence={unread_licence}",
+               failures, verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
