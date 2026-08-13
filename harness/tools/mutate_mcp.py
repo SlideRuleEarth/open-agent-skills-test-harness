@@ -900,8 +900,28 @@ MUTATIONS = [
     # ...and the denominator that claim is measured against is never collected, so
     # `scanned_everything` is true of every scan including the ones that stopped early.
     ("M354-eligible-files-are-never-counted", COPILOT,
-     "\n        eligible=len(ordered) + len(walk_failures))",
-     "\n        eligible=0)",
+     "\n        eligible=len(ordered), unenumerated=tuple(walk_failures))",
+     "\n        eligible=0, unenumerated=tuple(walk_failures))",
+     "copilot.channel_markers_scan_the_bundle"),
+    # A failed traversal counted as exactly ONE eligible file, so `searched + unreadable
+    # >= eligible` came out true over a subtree nobody enumerated and the command printed
+    # a complete-coverage line (external review, third round).
+    ("M355-an-unlistable-directory-counts-as-one-file", COPILOT,
+     "\n        eligible=len(ordered), unenumerated=tuple(walk_failures))",
+     "\n        eligible=len(ordered) + len(walk_failures), unenumerated=tuple(walk_failures))",
+     "copilot.channel_markers_scan_the_bundle"),
+    # ...and the guard that makes coverage UNANSWERABLE rather than false when a directory
+    # would not list: without it the denominator is compared against anyway.
+    ("M356-an-unlistable-directory-still-permits-a-coverage-claim", COPILOT,
+     "\n        if self.unenumerated:\n            return False",
+     "\n        if False:\n            return False",
+     "copilot.channel_markers_scan_the_bundle"),
+    # ...and the two kinds of ignorance are folded back together: an unreadable FILE is one
+    # known unit, an unlistable DIRECTORY is an unknown quantity, and counting them alike
+    # is what made the denominator wrong in the first place.
+    ("M357-a-directory-failure-is-recorded-as-a-file-failure", COPILOT,
+     "\n        searched=tuple(searched), unreadable=tuple(unreadable),",
+     "\n        searched=tuple(searched), unreadable=tuple(unreadable) + tuple(walk_failures),",
      "copilot.channel_markers_scan_the_bundle"),
     # A directory that cannot be listed vanishes silently, so a marker inside it reads as
     # absent with nothing recording the hole (external review).
@@ -925,7 +945,7 @@ MUTATIONS = [
     # PARTIAL blindness reports as a confident finding about the build — the defect the
     # first cut of this fix shipped with, one file short of the empty case M347 covers.
     ("M348-a-blind-spot-still-licenses-a-confident-missing", COPILOT,
-     "\n        if self.unreadable:\n            return MARKER_INCOMPLETE",
+     "\n        if blind:\n            return MARKER_INCOMPLETE",
      "\n        if False:\n            return MARKER_INCOMPLETE",
      "copilot.channel_markers_scan_the_bundle"),
     # The file that would not open is dropped instead of recorded, so nothing downstream

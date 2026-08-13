@@ -589,6 +589,14 @@ class MarkerAudit(NamedTuple):
     searched: tuple[str, ...]         # bundle-relative files read to completion, in scan order
     unreadable: tuple[str, ...] = ()  # files that could not be opened, or died mid-read
     eligible: int = 0                 # regular files the scan WOULD have read, had it needed to
+    # Directories that could not be LISTED, which is a different kind of ignorance from a
+    # file that could not be read and was folded in with it until this was measured. An
+    # unreadable file is one known unit: it is counted in `eligible` and skipping it costs
+    # a countable amount. An unlistable directory has an UNKNOWN number of files under it,
+    # so it makes the denominator itself unknowable — counting it as one eligible file, as
+    # the first cut did, let `searched + unreadable >= eligible` come out true and printed
+    # a complete-coverage line over a subtree nobody enumerated (external review).
+    unenumerated: tuple[str, ...] = ()
 
     @property
     def scanned_everything(self) -> bool:
@@ -600,7 +608,14 @@ class MarkerAudit(NamedTuple):
         any sentence claiming complete coverage, which is what the command printed until
         this was pointed out. The two are different claims and only this one is about
         coverage.
+
+        A directory that could not be listed makes this UNANSWERABLE rather than false:
+        `eligible` counts what was enumerated, and the files under an unlistable directory
+        were never enumerated to be counted. So any such directory forbids the claim
+        outright — there is no denominator to compare against.
         """
+        if self.unenumerated:
+            return False
         return len(self.searched) + len(self.unreadable) >= self.eligible
 
     @property
@@ -627,13 +642,14 @@ class MarkerAudit(NamedTuple):
         report `MISSING`. Markers all found is `INTACT` regardless of blind spots — a
         string that was seen is seen, and no unread file can retract it.
         """
+        blind = bool(self.unreadable) or bool(self.unenumerated)
         if not self.missing:
-            # Nothing to conclude about absence, so the only question left is whether
-            # anything was examined at all.
-            return MARKER_INTACT if (self.searched or self.unreadable) else MARKER_NOT_SEARCHED
+            # Every marker was POSITIVELY found, and a blind spot cannot retract a string
+            # that was seen — so this stays INTACT however much went unread.
+            return MARKER_INTACT if (self.searched or blind) else MARKER_NOT_SEARCHED
         if not self.searched:
             return MARKER_NOT_SEARCHED
-        if self.unreadable:
+        if blind:
             return MARKER_INCOMPLETE
         return MARKER_MISSING
 
@@ -741,8 +757,8 @@ def audit_channel_markers(app_js: str) -> MarkerAudit:
 
     return MarkerAudit(
         where={m: hits[i] for i, (m, _why) in enumerate(_MCP_CHANNEL_MARKERS)},
-        searched=tuple(searched), unreadable=tuple(unreadable) + tuple(walk_failures),
-        eligible=len(ordered) + len(walk_failures))
+        searched=tuple(searched), unreadable=tuple(unreadable),
+        eligible=len(ordered), unenumerated=tuple(walk_failures))
 
 
 # The built-in server a hermetic invocation always CONFIGURES and always disables:

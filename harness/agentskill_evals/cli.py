@@ -958,6 +958,15 @@ def cmd_verify_copilot_channels(args) -> int:
         if audit.scanned_everything:
             print(f"  searched all {len(audit.searched)} readable file(s) of "
                   f"{audit.eligible} — every regular file, binaries included")
+        elif audit.unenumerated:
+            # No denominator exists: the files under a directory that would not list were
+            # never enumerated, so neither "all of them" nor "N of M" can be said.
+            print(f"  searched {len(audit.searched)} file(s), and "
+                  f"{len(audit.unenumerated)} director(y/ies) could not be listed "
+                  f"({', '.join(audit.unenumerated[:3])}"
+                  f"{', …' if len(audit.unenumerated) > 3 else ''}), so how much of this "
+                  f"bundle exists is unknown. Every marker was found, which no unread "
+                  f"path can retract — but this run supports no claim about coverage")
         else:
             print(f"  searched {len(audit.searched)} of {audit.eligible} regular file(s) "
                   f"(binaries included) and stopped early, every marker having been "
@@ -968,11 +977,13 @@ def cmd_verify_copilot_channels(args) -> int:
         # would not open, so the run cannot call it absent.
         if audit.verdict() == MARKER_INCOMPLETE:
             worst = max(worst, 2)
-            print(f"  INSTRUMENT  {len(audit.unreadable)} file(s) could not be read "
-                  f"({', '.join(audit.unreadable[:3])}"
-                  f"{', …' if len(audit.unreadable) > 3 else ''}), and "
+            blind = list(audit.unreadable) + [f"{d}/ (not listable)"
+                                              for d in audit.unenumerated]
+            print(f"  INSTRUMENT  {len(blind)} path(s) could not be read "
+                  f"({', '.join(blind[:3])}"
+                  f"{', …' if len(blind) > 3 else ''}), and "
                   f"{len(audit.missing)} marker(s) were not found in the rest.\n"
-                  "  => a marker may be in a file this scan could not open, so this is "
+                  "  => a marker may be in a path this scan could not open, so this is "
                   "NOT a finding about the build. Fix the read, then re-run.\n")
             continue
         # Found, but no longer in app.js. copilot 1.0.75 moved the agent frontmatter

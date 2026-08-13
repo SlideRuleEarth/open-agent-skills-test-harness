@@ -5464,7 +5464,44 @@ def _check_copilot_version_provenance(failures, verbose):
         finally:
             os.walk = _orig_walk
         walk_err_ok = (denied.verdict() == _cop.MARKER_INCOMPLETE
-                       and "denied" in denied.unreadable)
+                       and "denied" in denied.unenumerated
+                       and "denied" not in denied.unreadable)
+
+        # THE SAME BLIND SPOT WITH EVERY MARKER FOUND, which is where counting a failed
+        # traversal as ONE eligible file went wrong: `searched + unreadable >= eligible`
+        # came out true and the command printed a complete-coverage line over a subtree
+        # nobody had enumerated (external review). The verdict is rightly INTACT — every
+        # marker was positively found and no unread path can retract a string that was
+        # seen — but the COVERAGE claim is unanswerable, because the files under a
+        # directory that would not list were never counted to be compared against.
+        whole_root = os.path.join(tmp, "walkfail-intact")
+        os.makedirs(os.path.join(whole_root, "denied"))
+        with open(os.path.join(whole_root, "app.js"), "w") as f:
+            f.write(" ".join(markers))
+        _orig_walk2 = os.walk
+
+        def _walk_with_error2(top, *a, **kw):
+            onerror = kw.get("onerror")
+            yield from _orig_walk2(top, *a, **kw)
+            if onerror is not None:
+                err = OSError(13, "Permission denied")
+                err.filename = os.path.join(whole_root, "denied")
+                onerror(err)
+
+        os.walk = _walk_with_error2
+        try:
+            blind_intact = _cop.audit_channel_markers(os.path.join(whole_root, "app.js"))
+        finally:
+            os.walk = _orig_walk2
+        coverage_unknowable = (blind_intact.verdict() == _cop.MARKER_INTACT
+                               and blind_intact.scanned_everything is False
+                               and blind_intact.unenumerated == ("denied",)
+                               # `eligible` counts what was ENUMERATED, and an unlistable
+                               # directory contributes an unknown number of files rather
+                               # than one. Pinned here because the guard above short-
+                               # circuits before the count is read, so nothing else can
+                               # tell a right denominator from a wrong one.
+                               and blind_intact.eligible == 1)
 
         # A scan that read nothing reports every marker absent — byte-identical to a
         # build that dropped every channel, and the opposite finding. An empty bundle
@@ -5568,7 +5605,8 @@ def _check_copilot_version_provenance(failures, verbose):
         _check("copilot.channel_markers_scan_the_bundle",
                rel_ok and still_missing and binary_scanned and app_first
                and blind and verdicts_split and unread_licence and partial_ok
-               and no_double_scan and walk_err_ok and cmd_ran and cmd_claim_ok,
+               and no_double_scan and walk_err_ok and cmd_ran and cmd_claim_ok
+               and coverage_unknowable,
                f"a marker that MOVED inside the bundle is found and reported as moved "
                f"rather than missing (copilot 1.0.75 did exactly this to `mcp-servers`), "
                f"while a marker in no scanned file is still reported MISSING, a marker "
