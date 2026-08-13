@@ -368,11 +368,17 @@ cd harness && make dev && . .venv/bin/activate
 # the self-test — no agent CLIs or API keys needed, runs in seconds
 python3 -m agentskill_evals selftest
 
-# mutation-test the checks themselves — VERY SLOW: budget an hour, not a coffee break.
-# (It runs a whole suite per mutation, and there are hundreds. It prints its own elapsed
-# time at the end, plus the slowest single mutation, so read those rather than this note.)
-# Run it whenever you add or change a check; it is not wired into the pre-push hook.
+# mutation-test the checks themselves — SLOW: it runs a whole suite per mutation, and there
+# are hundreds. It prints its own elapsed time at the end, plus the slowest single mutation,
+# so read those rather than this note. Run it whenever you add or change a check; it is not
+# wired into the pre-push hook.
 make mutation
+
+# ...but prefer this. The suite is mostly WAITING (the proxy cases spend their time on
+# shutdown grace periods rather than on a core), so running N mutations at once — each in its
+# own copy of the tree — is close to an N-fold saving in wall clock. Pick N from your
+# performance cores. Nothing that decides a pass/fail moved to make this faster.
+python3 -u tools/mutate_mcp.py --jobs 8
 
 # see what would run, and which skills the model would see — spends nothing
 agentskill-evals run --agent claude --skill sliderule-region-picker --dry-run
@@ -428,8 +434,18 @@ audit log that says what it did. Split into three files by how testable each par
   credential-bearing server running loose. This is the only part that needs real processes
   to test, which is why it has a verifier of its own rather than self-test arms.
 
-Nothing routes traffic through it yet — the adapter integration is the next piece of work,
-and until it lands the `tools:` field is still refused.
+This carries real traffic today, for **stdio** servers on `claude`: an eval that declares
+`tools:` gets the proxy written into the CLI's MCP config in place of the server it named,
+and the cell's verdict includes what the audit log says happened. A **remote** (`url:`)
+server with `tools:` is still refused, and the refusal names the transport — the proxy talks
+to a child process over pipes, so it has nothing to connect to. The bridge that would give it
+one (stdio in, HTTP out) is designed and not built.
+
+Worth knowing that this whole subsystem exists because of *one measurement*: `claude`'s
+`--allowedTools` turns out not to gate MCP tools at all. Where a CLI does gate them, the
+harness should get out of the way — `copilot`'s own per-server filter was measured working on
+every transport it offers, so the plan there is to let copilot do it and write no proxy into
+the picture at all.
 
 **Understand the output**
 - **[`schema.py`](agentskill_evals/schema.py)** — `NormalizedEvent` + `RunResult`, the common shape.
@@ -447,6 +463,8 @@ and until it lands the `tools:` field is still refused.
 - [`tools/probe_contained_home.py`](tools/probe_contained_home.py) — measures what a CLI *actually* needs from your real home, by driving the harness's own launch path against a progressively emptier HOME. This is how each adapter's credential surface was determined; it answers questions no amount of reading the source can.
 - [`fixtures/probe_era_mcp_server.py`](fixtures/probe_era_mcp_server.py) — the same idea aimed at the wire: an MCP server that measures the *CLI on the other end* — which version of the protocol it speaks, and how it shuts a server down. This is how we learned the four CLIs are not all speaking the same protocol, which a reasonable person would have assumed.
 - [`tools/verify_mcp_fixtures.py`](tools/verify_mcp_fixtures.py) — drives both stdio fixtures against a scripted client, because a measurement is only as good as the thing that took it, and a test double only as good as its resemblance to a real server.
+- [`fixtures/http_mcp_server.py`](fixtures/http_mcp_server.py) — the same idea for *remote* servers: a small MCP server that speaks both HTTP flavours, runs offline, and writes down every request it received including the headers. That last part is what makes it evidence — "did the agent's credential actually reach the server?" is a question only the server can answer, and asking the agent is asking the thing under test.
+- [`tools/probe_remote_mcp.py`](tools/probe_remote_mcp.py) and the three `tools/probe_copilot_*.py` — **opt-in** probes that need a real CLI installed, and all but one of them spend real API calls, so nothing routine runs them. They exist because a claim like "this CLI's tool allowlist really blocks tools" expires the next time that CLI updates, and a claim nobody can re-run expires silently — so each is a procedure you can run again rather than a paragraph someone wrote once. Their *decision logic* is exercised offline by `verify_mcp_fixtures.py`, because otherwise a fix lands in one copy and not the other.
 - [`tools/verify_mcp_proxy.py`](tools/verify_mcp_proxy.py) — the third suite: it runs the real proxy over real pipes, with a real child process, and checks what actually happened to that process afterwards. Some things cannot be established from inside the program under test — "the server it was fronting is really gone" is a claim about the operating system, and a program asserting it about itself is the one witness you cannot trust. Its awkward counterpart is [`fixtures/proxy_target_server.py`](fixtures/proxy_target_server.py), a deliberately badly-behaved MCP server that ignores signals, lingers, and spawns helpers that escape their process group.
 
 ---
