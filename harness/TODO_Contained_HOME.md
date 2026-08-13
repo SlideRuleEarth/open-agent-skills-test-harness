@@ -1830,6 +1830,38 @@ ABA fix and its route to `parallel_safe_config = True`.
 - ~~**codex cannot run a cell at all — fix the trust gate first.**~~ **Done (2026-07-27)** —
   `--skip-git-repo-check` on the cell and probe argv; see §0b for the reasoning and for why
   it is the flag rather than `git init`.
+- **Land the parked CI workflow — it is what stops §4 depending on somebody remembering it.**
+  `harness/ci-selftest-mutation` (`3f38219`, 2026-07-25) has never run. It was parked because
+  the mutation suite took ~80 minutes, and PR #111 is what unblocks it. Do not merge it as
+  written; four things are wrong with it, and the first is the one that matters.
+
+  **It could report success over a failing suite.** The mutation step is
+  `python3 -u harness/tools/mutate_mcp.py | tee mutate.out`, and a `run:` block with no
+  explicit `shell:` gets GitHub's default `bash -e`, which does **not** set `pipefail`. The
+  pipeline's status is `tee`'s, so a run reporting MISSED would exit non-zero into a pipe and
+  the job would go green. This is the §4 trustworthy-predicate rule arriving in YAML: the exit
+  status and the output are two readers of one fact, and here the reader that gates the build
+  is looking at the wrong process. Fix it with `set -o pipefail` in the step, an explicit
+  `shell: bash` (which sets `-eo pipefail`), or redirect and `cat` afterwards rather than pipe.
+  **Whichever is chosen, prove it fails**: point the step at a deliberately broken run once and
+  watch the job go red, because a gate nobody has seen fail is a gate nobody has tested.
+
+  **It would never have got that far anyway.** `timeout-minutes: 60` against a suite that took
+  ~80 serial: the nightly job would have been cancelled every night. With `--jobs` this becomes
+  workable, but N is not copyable from §4 — GitHub's macOS runners have a fraction of the cores
+  of the machine that block was measured on (3 at time of writing, against 8 performance cores
+  locally). Measure N and the timeout on the runner; do not port the numbers.
+
+  **Its comment is already false.** "dev install (mutate_mcp copies harness/.venv into each work
+  tree)" — since #111 the venv is SHARED by symlink, which is what took a work tree from 520MB
+  to 11MB. The reasoning for why that is safe is in `make_worktree`.
+
+  **It runs less than half of §4.** Present: the selftest, `compileall`, `git diff --check`, the
+  mutation suite. Absent: `make -C harness lint`, `verify_mcp_fixtures.py`,
+  `verify_mcp_proxy.py` — which between them hold most of the checks in that block — and the
+  after-run leftover checks, which did not exist when the workflow was written. A CI that runs
+  the mutation suite but not the two verifiers is running the instrument without the things that
+  prove the instrument.
 - **Map the FILE-based contained surfaces on Linux — but not before the selftest passes
   there, and not before someone actually needs it.** Deliberately not scheduled; the trigger
   is a real Linux cell run or Linux CI, not tidiness.
