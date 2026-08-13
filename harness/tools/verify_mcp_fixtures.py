@@ -2052,6 +2052,139 @@ check("a child that outlives its bound is reported as such, killed, and reaped",
       f"status={_slept_status} rc={_sleeper.returncode} cpu={_slept_cpu} left={_slept_left} "
       f"fault={_slept_fault!r}")
 
+def _alive(pid):
+    """True while `pid` names something that is not a zombie — asked of `ps`, not of a signal.
+
+    `os.kill(pid, 0)` succeeds against a ZOMBIE, which is exactly the state a just-killed
+    descendant passes through, so a check written on it would fail intermittently for a
+    process that is already dead. The table this asks is the one the sweep itself reads.
+
+    An observer that cannot answer reports "not alive", which is the wrong direction on its
+    own — it would make every absence below free. The positive control ahead of them is what
+    makes that safe: a broken `ps` fails there, before any absence is read as evidence.
+    """
+    table = survives(MUT.process_tree)
+    return isinstance(table, dict) and pid in table
+
+
+# THE FIXED POINT, ON A SCRIPTED MACHINE. The freeze has to iterate: one round stops what
+# parentage reaches now, and the next catches what those had already forked before they stopped.
+# The live case below cannot pin that down — the root has the lowest pid so it is stopped first,
+# within a few milliseconds of the snapshot, and whether a child is born in that window is
+# chance. It caught the one-round mutation on a targeted drive and MISSED it on the full run
+# fifteen minutes later, which is a flake, and a flake in a mutation suite is worse than a
+# failure: it certifies coverage that is not there whenever it happens to pass (PR #111).
+#
+# A SCRIPTED `process_tree` MAKES THE INTERLEAVING THE POINT rather than the luck. Generation
+# two appears only on the second look, which is exactly the process a single round cannot see.
+_gen1 = {100: (1, "/x/w0/root"), 101: (100, "/x/w0/child")}
+_gen2 = {**_gen1, 102: (101, "/bin/sh -c sleep")}     # forked before 101 was stopped
+_looks, _sent = [], []
+
+
+def _scripted_tree():
+    _looks.append(len(_looks))
+    return (_gen1, _gen2, _gen2, {})[min(len(_looks) - 1, 3)]
+
+
+_real_tree_fn, _real_signal_fn = MUT.process_tree, MUT._signal
+try:
+    MUT.process_tree = _scripted_tree
+    MUT._signal = lambda pid, sig=signal.SIGKILL: _sent.append((pid, sig))
+    _scripted = survives(MUT.kill_owned, 100, None)
+finally:
+    MUT.process_tree, MUT._signal = _real_tree_fn, _real_signal_fn
+_stopped = {pid for pid, sig in _sent if sig == signal.SIGSTOP}
+check("the freeze iterates to a fixed point, so a child forked before its parent stopped is "
+      "still caught",
+      _stopped == {100, 101, 102} and isinstance(_scripted, MUT.Sweep)
+      and _scripted.fault == "" and _scripted.leftover == (),
+      f"stopped={sorted(_stopped)} swept={_scripted} — 102 appears only on the second look, "
+      f"which is the whole reason the freeze is a loop rather than a pass")
+check("...and everything it froze is then killed, none of it left stopped",
+      {pid for pid, sig in _sent if sig == signal.SIGKILL} >= {100, 101, 102},
+      f"signals={_sent} — a process left SIGSTOPped never exits, and the `wait4` above would "
+      f"block on it forever")
+
+# WHAT IS REPORTED WHEN A SWEEP DOES LEAVE SOMETHING BEHIND. This cannot be arranged live —
+# SIGKILL works, so a survivor is by definition the thing that did not happen — and driving it
+# on a table is what makes the difference visible. After a kill the survivors are ORPHANS: the
+# root is gone so parentage reaches nothing, and the marker may never have named them, so
+# re-enumerating answers "clean" about exactly the processes that got away.
+_frozen_set = {10, 11, 12}
+_still_there = {10: (1, "/x/w0/harness/a.py"), 12: (1, "/bin/sh -c sleep"), 20: (1, "/other")}
+check("the survivors reported are the ones we froze, not whatever the machine still admits to",
+      survives(MUT.survivors, _frozen_set, _still_there, None, "/x/w0/harness") == (10, 12),
+      survives(MUT.survivors, _frozen_set, _still_there, None, "/x/w0/harness"))
+check("...so a survivor with nothing in its argv to name it is still reported",
+      12 in survives(MUT.survivors, _frozen_set, _still_there, None, "/x/w0/harness")
+      and 12 not in MUT.owned_pids(_still_there, None, "/x/w0/harness"),
+      "pid 12 is an orphaned `/bin/sh` the marker cannot reach — the exact shape a "
+      "re-enumeration would drop")
+
+# THE RACE THE MARKER DOES NOT CLOSE, which is the case both live probes above miss: one makes
+# its descendant BEFORE the enumeration (parentage covers it) and the other hands an unrelated
+# process the marker explicitly. Neither has a child that appears AFTER the first snapshot and
+# is orphaned before the next, with nothing in its argv to recover it by.
+#
+# THE ARGV CLAIM WAS MEASURABLY FALSE. Over one run of each suite: 5 of 7 selftest descendants,
+# 35 of 49 fixture descendants and 67 of 169 proxy descendants carried no work-tree path —
+# `node`, `git`, and above all processes caught BETWEEN FORK AND EXEC, which `ps` renders as a
+# bare `(python3.10)` with no argv at all. The marker is blindest at exactly the moment the race
+# happens, which is why the sweep freezes the tree instead of trying to name it (PR #111).
+#
+# `/bin/sh` HOLDING A NONCE is deliberately not a Python child: `sys.executable` inside a work
+# tree IS under the work tree, so a `python -c` child would carry the marker by accident and the
+# case would pass without testing anything. The nonce is how THIS FILE counts them; it is not in
+# the sweep's marker, so the sweep must find them by having frozen their parent.
+_race_nonce = f"ase-race-{uuid.uuid4().hex}"
+_SPAWNER_LOOP = ("import subprocess, sys, time\n"
+                 "for _ in range(60):\n"
+                 "    subprocess.Popen(['/bin/sh', '-c', 'sleep 30; :', sys.argv[1]])\n"
+                 "    time.sleep(0.05)\n"
+                 "time.sleep(30)\n")
+_racer = subprocess.Popen([sys.executable, "-c", _SPAWNER_LOOP, _race_nonce])
+
+
+def _nonce_alive():
+    """The spawner's CHILDREN carrying the nonce — never the spawner itself.
+
+    It carries the nonce too (as `sys.argv[1]`), and its argv begins with the interpreter path,
+    which inside a work tree is under the work tree. Counting it would put a MARKED process in
+    the set the case calls markerless — which is exactly what the control below caught.
+    """
+    table = survives(MUT.process_tree)
+    return () if not isinstance(table, dict) else tuple(
+        sorted(pid for pid, (_p, cmd) in table.items()
+               if _race_nonce in cmd and pid != _racer.pid))
+
+
+for _spin in range(60):                      # let the loop get some children out
+    if len(_nonce_alive()) >= 3:
+        break
+    time.sleep(0.05)
+_race_before = _nonce_alive()
+check("a suite that keeps spawning MARKERLESS children really is producing them",
+      len(_race_before) >= 3 and all(
+          str(MUT.HARNESS) not in survives(MUT.process_tree).get(p, (0, ""))[1]
+          for p in _race_before),
+      f"{len(_race_before)} nonce children; without this the sweep below is certified against "
+      f"a spawner that never spawned")
+_race_status, _race_cpu, _race_left, _race_fault = MUT._await(_racer, 0.5, str(MUT.HARNESS))
+for _settle in range(60):
+    if not _nonce_alive():
+        break
+    time.sleep(0.05)
+_race_after = _nonce_alive()
+check("...and every one of them is gone, including those spawned after the first snapshot",
+      (_race_status is None and not _race_after and _race_fault == ""
+       and not _alive(_racer.pid)),
+      f"before={len(_race_before)} after={list(_race_after)} fault={_race_fault!r} — these are "
+      f"orphans with no work-tree path in their argv, so nothing but freezing the tree while "
+      f"parentage still connected it could have reached them")
+for _stray in _race_after:                   # never leak out of a failing check
+    survives(MUT._signal, _stray)
+
 # LOSING THE DESCENDANTS IS A CONTAINMENT FAILURE; LOSING THE ROOT AS WELL IS A HANG. With the
 # observer broken, the sweep raises — and before this was in a `finally` the suite process was
 # then neither signalled nor waited for, so the runner blocked forever on a `wait4` for a child
@@ -2121,21 +2254,6 @@ _tree_probe = subprocess.Popen([sys.executable, "-c", _SPAWNER],
 _descendant = int(_tree_probe.stdout.readline().strip())
 
 
-def _alive(pid):
-    """True while `pid` names something that is not a zombie — asked of `ps`, not of a signal.
-
-    `os.kill(pid, 0)` succeeds against a ZOMBIE, which is exactly the state a just-killed
-    descendant passes through, so a check written on it would fail intermittently for a
-    process that is already dead. The table this asks is the one the sweep itself reads.
-
-    An observer that cannot answer reports "not alive", which is the wrong direction on its
-    own — it would make every absence below free. The positive control ahead of them is what
-    makes that safe: a broken `ps` fails there, before any absence is read as evidence.
-    """
-    table = survives(MUT.process_tree)
-    return isinstance(table, dict) and pid in table
-
-
 # THE POSITIVE CONTROL, and it is the whole reason the check below means anything. "The
 # descendant is gone" is read off an absence, so it is satisfied by a descendant that never
 # started, by one that exited on its own, and by an observer that cannot see processes at all.
@@ -2166,14 +2284,14 @@ _orphan = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)",
 check("a process nothing links to us is still ours if its argv names our work tree",
       _alive(_orphan.pid) and _orphan.pid in MUT.owned_pids(MUT.process_tree(), None, _orphan_mark),
       f"{_orphan_mark} -> pid {_orphan.pid}")
-_orphan_left = MUT.kill_owned(None, _orphan_mark)
+_orphan_swept = MUT.kill_owned(None, _orphan_mark)
 for _settle in range(40):
     if not _alive(_orphan.pid):
         break
     time.sleep(0.05)
 check("...and the sweep reaches it by that name alone",
-      not _alive(_orphan.pid) and _orphan_left == (),
-      f"pid {_orphan.pid} survived a sweep for {_orphan_mark!r}; leftover={_orphan_left}")
+      not _alive(_orphan.pid) and _orphan_swept.leftover == () and _orphan_swept.fault == "",
+      f"pid {_orphan.pid} survived a sweep for {_orphan_mark!r}; swept={_orphan_swept}")
 survives(os.waitpid, _orphan.pid, os.WNOHANG)
 
 

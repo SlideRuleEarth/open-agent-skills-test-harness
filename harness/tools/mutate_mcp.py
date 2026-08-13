@@ -3208,9 +3208,9 @@ MUTATIONS = [
     # helper a hung suite started outlives it, outlives the `rmtree` of the tree they were
     # launched from, and runs beside the workers still going (review, PR #111).
     ("F97-a-timed-out-suite-is-killed-without-its-descendants", SELF,
-     "\n        leftover = kill_owned(proc.pid, marker)",
-     ("\n        leftover = ()\n"
-      "        _signal(proc.pid)"),
+     ("\n        swept = kill_owned(proc.pid, marker)\n"
+      "        leftover, fault = swept.leftover, swept.fault"),
+     "\n        _signal(proc.pid)",
      "...and a hung suite takes its whole process tree with it, `setsid` and all"),
     # AND THE ORDER, which is the mechanism rather than a detail. Signal first and the parentage
     # arm has nothing left to read: every descendant is reparented to init the instant the root
@@ -3224,12 +3224,12 @@ MUTATIONS = [
     # worst reachable variant: the guard has to be in the primitive, and the mutation has to go
     # through it.
     ("F98-the-tree-is-signalled-before-it-is-enumerated", SELF,
-     ("        table = process_tree()\n"
-      "        doomed = owned_pids(table, root, marker)"),
-     ("        if root is not None:\n"
-      "            _signal(root)\n"
-      "        table = process_tree()\n"
-      "        doomed = owned_pids(table, root, marker)"),
+     ("        while True:\n"
+      "            fresh = owned_pids(process_tree(), root, marker) - frozen"),
+     ("        while True:\n"
+      "            if root is not None:\n"
+      "                _signal(root)\n"
+      "            fresh = owned_pids(process_tree(), root, marker) - frozen"),
      "...and a hung suite takes its whole process tree with it, `setsid` and all"),
     ("F99-the-sweep-reaches-only-the-immediate-children", SELF,
      ("    owned, frontier = set(), [root]\n"
@@ -3271,6 +3271,36 @@ MUTATIONS = [
     # version of this file that can take the host down existing on disk for eleven minutes.
     # The rule generalizes: a mutation may perturb WHICH processes are chosen, never the guard
     # that decides whether a chosen thing is a process at all.
+    # THE FREEZE, WHICH IS THE ONLY THING THAT CLOSES THE RACE. `SIGSTOP` becomes `SIGCONT` —
+    # still a signal, still delivered to exactly the same set, and completely unable to stop a
+    # tree from spawning while it is being enumerated. That is the version this replaced, whose
+    # backstop was the claim that every descendant's argv names the work tree; measured, more
+    # than a third of them do not, and the ones caught between fork and exec have no argv at all.
+    ("F110-the-tree-is-enumerated-without-being-stopped", SELF,
+     "\n                _signal(pid, signal.SIGSTOP)",
+     "\n                _signal(pid, signal.SIGCONT)",
+     "...and every one of them is gone, including those spawned after the first snapshot"),
+    # AND THE PART THAT MAKES FREEZING CONVERGE. One round stops what parentage reaches now;
+    # the next catches what those had already forked. Stopping once and killing is the same
+    # race one generation deeper.
+    ("F111-the-freeze-does-not-iterate-to-a-fixed-point", SELF,
+     ("            fresh = owned_pids(process_tree(), root, marker) - frozen\n"
+      "            if not fresh:\n"
+      "                quiesced = True\n"
+      "                break"),
+     ("            fresh = owned_pids(process_tree(), root, marker) - frozen\n"
+      "            quiesced = True\n"
+      "            if not fresh or frozen:\n"
+      "                break"),
+     ("the freeze iterates to a fixed point, so a child forked before its parent stopped is "
+      "still caught")),
+    # AND WHAT IS REPORTED AFTERWARDS. Re-enumerating asks the machine about orphans it can no
+    # longer reach by parentage and may not name by marker — so it answers "clean" about
+    # precisely the processes that got away. The frozen set is the only honest population.
+    ("F112-survivors-are-looked-for-by-asking-the-machine-again", SELF,
+     "\n    return tuple(sorted(pid for pid in frozen if pid in table))",
+     "\n    return tuple(sorted(owned_pids(table, root, marker)))",
+     "the survivors reported are the ones we froze, not whatever the machine still admits to"),
     # THE OBSERVER, BROKEN ONE CLAUSE AT A TIME. Everything the sweep concludes is read off an
     # absence, so each of these turns a channel that could not answer into a machine with
     # nothing on it — and the timeout path then certifies a tree it never looked at.
@@ -3309,8 +3339,8 @@ MUTATIONS = [
       "    proc.returncode = _exit_code(status)"),
      "...and an UNEXPECTED failure in the sweep still leaves the suite killed and reaped"),
     ("F109-a-containment-failure-reaches-no-output", SELF,
-     ('\n                 f"{outcome.observer}" if outcome.observer else "")'),
-     ('\n                 f"{outcome.observer}" if False else "")'),
+     ('\n                 f"{outcome.containment}" if outcome.containment else "")'),
+     ('\n                 f"{outcome.containment}" if False else "")'),
      "...and the TIMEOUT line says so, since a fact that reaches no output is a fact nobody has"),
     ("F103-a-sweep-that-left-something-behind-says-nothing", SELF,
      '\n                 f"{list(outcome.leftover)}" if outcome.leftover else "")',
@@ -3439,7 +3469,7 @@ class Outcome(NamedTuple):
     # because it is a second fact: "nothing was left behind" and "nothing could be looked at"
     # are both compatible with an empty `leftover`, and collapsing them would let a blind `ps`
     # certify a process tree nobody enumerated.
-    observer: str = ""
+    containment: str = ""
 
 
 def _exit_code(status):
@@ -3492,6 +3522,8 @@ def process_tree():
         parts = line.split(None, 3)
         if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
             pid, ppid, state, command = int(parts[0]), int(parts[1]), parts[2], parts[3]
+            if pid <= 0:
+                continue        # macOS lists kernel_task as pid 0; `_signal` would refuse it
             seen.add(pid)
             if not state.startswith("Z"):
                 table[pid] = (ppid, command)
@@ -3501,8 +3533,21 @@ def process_tree():
     return table
 
 
-def _signal(pid):
-    """SIGKILL one process. THE ONLY PLACE THIS FILE SIGNALS ANYTHING, and it refuses a pid
+class Sweep(NamedTuple):
+    """What one sweep achieved, as two facts rather than one.
+
+    `leftover` is what was still alive when it gave up; `fault` is why the sweep could not be
+    trusted at all — a broken observer, or a tree that would not stop spawning. They are not
+    alternatives: an empty `leftover` means "nothing survived" only when `fault` is empty too,
+    and the reading that collapses them is the one that certifies a tree nobody enumerated.
+    """
+
+    leftover: tuple = ()
+    fault: str = ""
+
+
+def _signal(pid, sig=signal.SIGKILL):
+    """Signal one process. THE ONLY PLACE THIS FILE SIGNALS ANYTHING, and it refuses a pid
     that is not a process.
 
     `kill(-1, ...)` IS DEFINED AS "EVERY PROCESS THIS USER MAY SIGNAL", and `kill(0, ...)` as
@@ -3520,7 +3565,7 @@ def _signal(pid):
         raise ValueError(f"refusing to signal {pid!r}: a pid must be positive, and a "
                          f"non-positive one is a broadcast rather than a process")
     try:
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, sig)
     except (ProcessLookupError, PermissionError):
         pass                         # already gone, or never ours to begin with
 
@@ -3586,31 +3631,89 @@ def owned_pids(table, root=None, marker=None):
     return owned
 
 
-def kill_owned(root, marker=None, deadline=5.0):
-    """SIGKILL everything one suite run owns. Returns the pids that would not go.
+def survivors(frozen, table, root=None, marker=None):
+    """Which of the pids we FROZE are still alive — asked of the set, never of the machine.
 
-    ENUMERATE, THEN SIGNAL, THEN RE-ENUMERATE. The order is the whole mechanism: the parentage
-    arm is only readable before the first signal, and the marker arm is what closes the window
-    between reading the table and acting on it — a process spawned in that gap has no surviving
-    link to the root but does carry the tree path. Iterating until the answer is empty is what
-    makes that convergent rather than a single hopeful second pass, and it terminates because
-    the root dies first and nothing else in the tree starts suites.
+    A NAMED FUNCTION so the case that distinguishes it can be driven synthetically. It only
+    ever matters when a sweep has actually left something behind, which no live case can
+    arrange on demand: SIGKILL works, and a survivor is by definition the thing that did not
+    happen. Driven on a table it is trivial, and the mutation that re-enumerates comes back
+    CAUGHT instead of MISSED (review, PR #111).
+
+    RE-ENUMERATING IS THE DEFECT. After the kill the survivors are orphans: parentage no longer
+    reaches them because the root is gone, and the marker may never have named them — more than
+    a third of real descendants carry no work-tree path, and one caught between fork and exec
+    carries no argv at all. So asking the machine again answers "clean" about exactly the
+    processes that got away, which is the one answer this must not be able to give.
+
+    `root` and `marker` are accepted and unused for that reason: they are what a re-enumeration
+    would need, and their presence in the signature is what lets the mutation be written.
+    """
+    return tuple(sorted(pid for pid in frozen if pid in table))
+
+
+def kill_owned(root, marker=None, deadline=5.0):
+    """Stop everything one suite run owns, then kill it. Returns a `Sweep`.
+
+    FREEZE FIRST, KILL SECOND, and the order is the whole mechanism. An earlier version
+    enumerated and killed in one pass, trusting the marker to recover anything spawned in
+    between — on the claim that every process a suite starts carries its work tree's path in
+    its argv. THAT CLAIM IS FALSE, and measurably so: over one run of each suite, 5 of 7
+    selftest descendants, 35 of 49 fixture descendants and 67 of 169 proxy descendants had no
+    such path — `node`, `git`, and above all processes caught BETWEEN FORK AND EXEC, which
+    `ps` shows as a bare `(python3.10)` with no argv at all (review, PR #111).
+
+    That last case is what makes the marker not merely incomplete but backwards: the processes
+    it cannot name are exactly the just-forked ones, which are exactly the ones the race is
+    about. So this no longer races. `SIGSTOP` is unblockable and a stopped process cannot
+    fork, so each round freezes what parentage can still reach and the next round catches only
+    what those had already forked before they stopped. The set therefore shrinks to nothing,
+    and once it does, NOTHING IN THE TREE CAN CREATE ANYTHING — the kill that follows is
+    against a fixed population rather than a moving one.
+
+    WHAT IS REPORTED IS THE SET THIS FUNCTION FROZE, not a re-enumeration. After the kill the
+    survivors are orphans, unreachable by parentage and possibly unnamed by the marker, so
+    asking the machine again would answer "clean" about exactly the processes that got away.
+
+    A TREE THAT WILL NOT QUIESCE IS A NAMED FAILURE, not a silent one. Everything frozen is
+    killed on every path, including that one and including an exception, because a process left
+    stopped is worse than one left running: it never exits, and the `wait4` above would block
+    on it forever.
 
     ON THE TIMEOUT PATH ONLY, and never after a run that finished. A sweep after a clean run
     would be tidying away exactly the survivors the proxy verifier exists to notice, and a green
     suite would then certify a leak this function had quietly cleaned up on its behalf.
     """
     end = time.monotonic() + deadline
-    while True:
-        table = process_tree()
-        doomed = owned_pids(table, root, marker)
-        if not doomed:
-            return ()
-        for pid in doomed:
-            _signal(pid)
-        if time.monotonic() >= end:
-            return tuple(sorted(owned_pids(process_tree(), root, marker)))
+    frozen: set[int] = set()
+    quiesced = False
+    try:
+        while True:
+            fresh = owned_pids(process_tree(), root, marker) - frozen
+            if not fresh:
+                quiesced = True
+                break
+            for pid in sorted(fresh):
+                _signal(pid, signal.SIGSTOP)
+            frozen |= fresh
+            if time.monotonic() >= end:
+                break
+    finally:
+        for pid in sorted(frozen):
+            _signal(pid, signal.SIGKILL)
+    left = tuple(sorted(frozen))
+    while left:
+        left = survivors(frozen, process_tree(), root, marker)
+        if not left or time.monotonic() >= end + deadline:
+            break
+        for pid in left:
+            _signal(pid, signal.SIGKILL)
         time.sleep(_POLL)
+    fault = ("" if quiesced else
+             f"the process tree did not stop spawning within {deadline:.0f}s: "
+             f"{len(frozen)} frozen and killed, but something in it was still creating "
+             f"children, so descendants may remain unaccounted for")
+    return Sweep(tuple(left), fault)
 
 
 def _await(proc, timeout, marker=None):
@@ -3665,7 +3768,8 @@ def _await(proc, timeout, marker=None):
     # exact reading this whole function exists to refuse.
     leftover, fault = (), ""
     try:
-        leftover = kill_owned(proc.pid, marker)
+        swept = kill_owned(proc.pid, marker)
+        leftover, fault = swept.leftover, swept.fault
     except ObserverFailed as exc:
         fault = str(exc)
     finally:
@@ -3768,7 +3872,7 @@ def result_line(mid, suite, arm, outcome, failed):
         # blind observer the descendants of this hung suite are unaccounted for rather than
         # gone, and the work tree is about to be deleted out from under them.
         blind = (f" — CONTAINMENT NOT ESTABLISHED, descendants unaccounted for: "
-                 f"{outcome.observer}" if outcome.observer else "")
+                 f"{outcome.containment}" if outcome.containment else "")
         return (f"{mid}: *** TIMEOUT *** {suite} exceeded {_SUITE_TIMEOUT}s — the defect hangs "
                 f"rather than reddening {arm} {took}{stuck}{blind}")
     if kind == CAUGHT:

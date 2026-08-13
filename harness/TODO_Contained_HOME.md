@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 578 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 108/108 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 454 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 111/111 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 460 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 git diff --check
 
@@ -1660,6 +1660,28 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
     the `finally` buys is every OTHER exit from the sweep, and testing it means injecting one.
     Likewise a failing `ps` that prints NOTHING is answered by the self-witness clause, so the
     exit-status clause goes untested unless the fake `ps` emits a valid row for the caller.
+- **A LIVE case proves the mechanism works; only a SCRIPTED one proves a given interleaving is
+  handled — and the difference showed up three times in one review round.** The timeout sweep's
+  live probes are real: they spawn real descendants, `setsid` and all, and they caught most of
+  what was aimed at them. What they could not do is arrange a *specific* ordering on demand:
+
+  - The one-round-freeze mutation needs a child born between the snapshot and its parent's
+    `SIGSTOP`. The root has the lowest pid so it is stopped first, within milliseconds, and the
+    spawner emitted every 50ms — so the case was hit perhaps one run in fifteen. It came back
+    CAUGHT on a targeted drive and MISSED on the full run fifteen minutes later. **A flake in a
+    mutation suite is worse than a failure**: every time it passes it certifies coverage that
+    is not there. Scripted — a `process_tree` whose second generation appears only on the
+    second look — it is 10/10.
+  - The report-what-we-froze mutation only matters when a sweep leaves something behind, and
+    SIGKILL works, so a survivor is by definition the thing that did not happen. It came back
+    MISSED until the leftover computation was pulled out into `survivors()` and driven on a
+    table.
+  - The three observer failure modes are the same shape: a real `ps` does not fail on request.
+
+  The rule: **if the property is about an ORDER or an ABSENCE, write the case that scripts it.**
+  Keep the live one too — it is what proves the scripted one is describing the real mechanism —
+  but do not let it be the only evidence, because the run where it passes by luck is
+  indistinguishable from the run where it passes for the reason you meant.
 - **A single-line anchor aimed at `mutate_mcp.py` itself matches TWICE**, and one of the two is
   the mutation entry quoting it. It is refused up front by `stale_anchors` rather than silently
   mutating the list instead of the code, but the fix is not obvious from the message: pin it
