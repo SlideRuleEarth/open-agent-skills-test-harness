@@ -1898,7 +1898,12 @@ ABA fix and its route to `parallel_safe_config = True`.
 - **Phase 1b codex** — `-c` mapping + canonical `mcp__server__tool` naming in its parser.
   Blocked on §9 probe #2 (whether TOML array/inline-table values survive `-c`). Pairs with
   `$CODEX_HOME` materialization, above.
-- **Phase 2 copilot** — `--additional-mcp-config @file`, per-server `tools`, `--secret-env-vars`.
+- **Phase 2 copilot** — `--additional-mcp-config @file`, per-server `tools`, `--secret-env-vars`, plus the
+  `type` discriminator the config probe turned up (`local`/`http`/`sse`). **Unblocked 2026-08-12 and
+  now the shortest route to the motivating use case**: copilot's `tools:` is measured a hard filter on
+  stdio, `http` and `sse` at 1.0.79, with the declared bearer arriving intact, so §8's remote pattern
+  needs no proxy and no transport bridge on this adapter — only injection. See `DESIGN_MCP_Support.md`
+  §9 probe #3 and §2. The bridge stays required for claude and for agy.
 - **Phase 3 antigravity** — MCP injection.
 - **C3 harness-owned filtering proxy** — required before any scenario points `tools:` at a
   server its author does not control, and required for agy tool gating regardless.
@@ -2028,6 +2033,10 @@ Smaller, unblocked:
   rule with no arm to keep it honest. The blocker is the missing `cmd_run` harness, not the
   check — build that first, or this lands decorative.
 
-Still open in `DESIGN_MCP_Support.md` §9: claude's `mcpServers` http/sse JSON shape; copilot's
-MCP tool-name format and plugin-declared server reach; agy's transcript tool-name format and
-`url` vs `serverUrl`.
+Still open in `DESIGN_MCP_Support.md` §9 — **and this list is a pointer, not a copy: read §9.** It has
+twice gone stale here while §9 was current, which is the same drift the counts in §4 are kept in one
+place to avoid. As of 2026-08-12: codex's TOML arrays/inline tables via `-c` (probe #2); copilot's MCP
+tool-name format **in its own events** and plugin-declared server reach (the two halves probe #3 did not
+answer — its gating and config halves are resolved); agy's transcript tool-name format and `url` vs
+`serverUrl` (probe #4); C3-3, deliberately unpriced; and C3-4, which needs the SlideRule endpoint.
+claude's `mcpServers` http/sse shape was resolved by #106 and sat here as open for two merges after that.
