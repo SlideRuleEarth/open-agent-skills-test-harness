@@ -93,6 +93,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -3144,7 +3145,7 @@ MUTATIONS = [
      "\n    return max(ran, key=lambda r: r.wall, default=None)",
      "the slowest mutation is the one that spent the most CPU, not the most wall clock"),
     ("F88-a-mutation-that-never-ran-is-ranked-among-those-that-did", SELF,
-     "\n    ran = [r for r in records if r.verdict != UNAPPLIED]",
+     "\n    ran = [r for r in records if r.verdict not in (UNAPPLIED, ABANDONED)]",
      "\n    ran = list(records)",
      "...and a mutation that never ran is not ranked at all, nor mistaken for 'nothing ran'"),
     # APPLY / RUN / REVERT. The first is the mutation never reaching the file the suite reads;
@@ -3191,10 +3192,10 @@ MUTATIONS = [
      "\n    return os.WEXITSTATUS(status)",
      "...and an exit status is read the way subprocess spells it, signals negative"),
     ("F95-a-timed-out-suite-is-killed-but-never-reaped", SELF,
-     ("        _signal(proc.pid)\n"
+     ("        _kill_all([proc.pid])\n"
       "        _pid, status, usage = os.wait4(proc.pid, 0)\n"
       "        proc.returncode = _exit_code(status)"),
-     ("        _signal(proc.pid)\n"
+     ("        _kill_all([proc.pid])\n"
       "        proc.returncode = -signal.SIGKILL"),
      "a child that outlives its bound is reported as such, killed, and reaped"),
     ("F96-cpu-is-never-actually-read-off-the-wait", SELF,
@@ -3359,21 +3360,110 @@ MUTATIONS = [
      "...and the descendants are reported UNACCOUNTED FOR rather than certified gone"),
     ("F108-a-failed-sweep-takes-the-reap-down-with-it", SELF,
      ("    finally:\n"
-      "        _signal(proc.pid)\n"
+      "        _kill_all([proc.pid])\n"
       "        _pid, status, usage = os.wait4(proc.pid, 0)\n"
       "        proc.returncode = _exit_code(status)"),
-     ("    _signal(proc.pid)\n"
+     ("    _kill_all([proc.pid])\n"
       "    _pid, status, usage = os.wait4(proc.pid, 0)\n"
       "    proc.returncode = _exit_code(status)"),
      "...and an UNEXPECTED failure in the sweep still leaves the suite killed and reaped"),
     ("F109-a-containment-failure-reaches-no-output", SELF,
-     ('\n                 f"{outcome.containment}" if outcome.containment else "")'),
-     ('\n                 f"{outcome.containment}" if False else "")'),
+     ('\n             f"{outcome.containment}" if outcome.containment else "")'),
+     ('\n             f"{outcome.containment}" if False else "")'),
      "...and the TIMEOUT line says so, since a fact that reaches no output is a fact nobody has"),
     ("F103-a-sweep-that-left-something-behind-says-nothing", SELF,
-     '\n                 f"{list(outcome.leftover)}" if outcome.leftover else "")',
-     '\n                 f"{list(outcome.leftover)}" if False else "")',
+     '\n             f"{list(outcome.leftover)}" if outcome.leftover else "")',
+     '\n             f"{list(outcome.leftover)}" if False else "")',
      "...and a timeout whose sweep left something behind names the pids in its line"),
+    # THE TEARDOWN'S TWO HALVES, which are one rule from each end: the registry cleanup reads is
+    # written BEFORE the act, and the cleanup that reads it reaches every member. Both were
+    # wrong, and both leave the same wreckage — a process SIGSTOPped and never killed, which
+    # never exits and which `wait4` then waits on forever (review, PR #111).
+    ("F117-the-registry-is-written-after-the-batch-it-must-cover", SELF,
+     ("\n            frozen |= fresh\n"
+      "            # Re-signalling a pending one is free and covers a signal that was lost to "
+      "a race\n"
+      "            # with its own exec; a stop delivered twice is still one stop.\n"
+      "            for pid in sorted(fresh | pending):\n"
+      "                _signal(pid, signal.SIGSTOP)"),
+     ("\n            # Re-signalling a pending one is free and covers a signal that was lost to "
+      "a race\n"
+      "            # with its own exec; a stop delivered twice is still one stop.\n"
+      "            for pid in sorted(fresh | pending):\n"
+      "                _signal(pid, signal.SIGSTOP)\n"
+      "            frozen |= fresh"),
+     "a pid stopped before the batch failed is still killed, so nothing is left SIGSTOPped"),
+    ("F118-a-cleanup-loop-gives-up-at-its-first-failure", SELF,
+     ("\n        except (ValueError, OSError):\n"
+      "            unreachable.append(pid)"),
+     ("\n        except (ValueError, OSError):\n"
+      "            unreachable.append(pid)\n"
+      "            break"),
+     "...and one cleanup signal failing does not abandon the rest of the set"),
+    ("F119-a-pid-nothing-can-signal-is-not-worth-mentioning", SELF,
+     ("\n    if unreachable:\n"
+      '        reasons.append(f"{sorted(set(unreachable))} could not be signalled at all, '
+      'so they are "'),
+     ("\n    if False:\n"
+      '        reasons.append(f"{sorted(set(unreachable))} could not be signalled at all, '
+      'so they are "'),
+     "...and a pid that cannot be signalled at all is a NAMED containment failure"),
+    # WHETHER THE TREE CAN BE HANDED ON, BROKEN ONE FACT AT A TIME. The predicate is a
+    # disjunction over two independent facts, so each half has its own mutation: an `or` read as
+    # either of its operands is the precedence trap §4 names, and it passes every case where the
+    # two happen to agree.
+    ("F120-a-tree-nobody-could-enumerate-counts-as-clean", SELF,
+     "\n    return bool(outcome.leftover) or bool(outcome.containment)",
+     "\n    return bool(outcome.leftover)",
+     "a work tree is contaminated by EITHER survivors or a sweep that could not look"),
+    ("F121-a-tree-with-a-survivor-in-it-counts-as-clean", SELF,
+     "\n    return bool(outcome.leftover) or bool(outcome.containment)",
+     "\n    return bool(outcome.containment)",
+     "a work tree is contaminated by EITHER survivors or a sweep that could not look"),
+    # AND WHAT IS DONE WITH THE ANSWER. Four sites act on it, and each of them was the whole
+    # defect on its own: the tree going back into the pool, the run carrying on beside whatever
+    # is in it, the `rmtree` at the end, and the exit status.
+    ("F122-a-contaminated-tree-goes-back-into-the-pool", SELF,
+     "\n        clean = not record.contaminated",
+     "\n        clean = True",
+     "...and one whose sweep could not be cleared never does, nor runs anything beside it"),
+    ("F123-a-sweep-that-raised-leaves-the-tree-reusable", SELF,
+     "\n    clean = False\n    try:\n        record = apply_and_run(work, entry, suite, kind)",
+     "\n    clean = True\n    try:\n        record = apply_and_run(work, entry, suite, kind)",
+     "...and a run that RAISED contaminates too, since what survived it is exactly unknown"),
+    ("F124-the-run-carries-on-past-a-containment-failure", SELF,
+     "\n    if poisoned.is_set():\n        return _abandoned(entry, kind)",
+     "\n    if False:\n        return _abandoned(entry, kind)",
+     "...and once the run has stopped the rest are ABANDONED without drawing a tree at all"),
+    ("F125-a-worker-waiting-on-the-pool-waits-on-the-pill", SELF,
+     ("\n    if work is None:\n"
+      "        trees.put(work)\n"
+      "        return _abandoned(entry, kind)"),
+     "\n    if work is None:\n        pass",
+     "...and a worker already inside `get()` draws the pill instead of waiting forever"),
+    ("F126-the-tree-a-survivor-is-running-in-is-deleted-anyway", SELF,
+     '\n    if poisoned.is_set():\n        print(f"WORK TREES KEPT at {tmp}',
+     '\n    if False:\n        print(f"WORK TREES KEPT at {tmp}',
+     "a work tree with something still running out of it is KEPT, and its path is printed"),
+    ("F127-a-poisoned-run-still-exits-0", SELF,
+     "\n    return 0 if caught == totals and not poisoned.is_set() else 1",
+     "\n    return 0 if caught == totals else 1",
+     "a run that caught everything exits 0 only if nothing poisoned it along the way"),
+    ("F128-an-abandoned-mutation-is-ranked-as-the-slowest-run", SELF,
+     "\n    ran = [r for r in records if r.verdict not in (UNAPPLIED, ABANDONED)]",
+     "\n    ran = [r for r in records if r.verdict != UNAPPLIED]",
+     "...and a mutation that never ran is not ranked at all, nor mistaken for 'nothing ran'"),
+    # THE BASELINE, WHICH IS THE TIMEOUT THAT SAID LEAST. It ends the run before any mutation has
+    # run, in a tree already in the pool, and it reported neither what its sweep left nor that
+    # the tree must be kept.
+    ("F129-a-baseline-timeout-drops-what-its-sweep-left", SELF,
+     '\n                  f"hung, so nothing below would prove anything.{containment_note(base)}")',
+     '\n                  f"hung, so nothing below would prove anything.")',
+     "a BASELINE that times out reports what its sweep left, and keeps the tree it left it in"),
+    ("F130-a-baseline-timeout-leaves-the-run-unpoisoned", SELF,
+     "\n            if contaminated(base):\n                poisoned.set()",
+     "\n            if False:\n                poisoned.set()",
+     "a BASELINE that times out reports what its sweep left, and keeps the tree it left it in"),
 
 ]
 
@@ -3489,14 +3579,18 @@ class Outcome(NamedTuple):
     output: str
     wall: float
     cpu: float
-    # Pids the timeout path could not get rid of. Empty on every path that did not time out,
-    # and empty on almost all that did — a non-empty one is a leak the run should say out loud
-    # rather than a detail, because the next mutation to draw this tree inherits it.
+    # Pids the timeout path could not get rid of. Empty on every path that did not time out, and
+    # empty on almost all that did — a non-empty one is a leak the run says out loud rather than
+    # notes, because a process is executing out of a directory this program is about to hand to
+    # the next mutation and then delete. Neither of those now happens: see `contaminated`, which
+    # is the one predicate every reader of these two fields asks, and `discard`. This comment
+    # described the consequence for a while after the sweep had learned to report it and before
+    # anything acted on it, which is the state a contract is least useful in.
     leftover: tuple = ()
     # ...and why the sweep could not be trusted, "" when the observer answered. A SECOND FIELD
     # because it is a second fact: "nothing was left behind" and "nothing could be looked at"
     # are both compatible with an empty `leftover`, and collapsing them would let a blind `ps`
-    # certify a process tree nobody enumerated.
+    # certify a process tree nobody enumerated. Each is separately enough to condemn the tree.
     containment: str = ""
 
 
@@ -3627,6 +3721,35 @@ def _signal(pid, sig=signal.SIGKILL):
         pass                         # already gone, or never ours to begin with
 
 
+def _kill_all(pids, sig=signal.SIGKILL):
+    """Signal every one of `pids`. Returns the ones that could not be signalled at all.
+
+    EVERY MEMBER IS ATTEMPTED, INCLUDING AFTER ONE OF THEM RAISES, which a plain loop does not
+    do: the first failure abandons the rest of the set. In a teardown that is the whole point of
+    the teardown being lost, and here it is worse than a leak — everything this sweep reaches
+    has been SIGSTOPped, and a stopped process nobody kills never exits, so the `wait4` the
+    teardown exists to make safe would block on it forever (review, PR #111).
+
+    THE SAME SHAPE HAS COST THIS PROGRAM A GUARDIAN. `sweep()` in `mcp_proxy_io.py` announced
+    itself before signalling; with the CLI's end of stderr closed the announcement raised
+    `BrokenPipeError` and a credential-bearing group was left alive by its own log line
+    (PR #103). One step of a cleanup failing is not permission to skip the next.
+
+    NOTHING IS RAISED OUT OF HERE, for the same reason: this runs while something else may
+    already be unwinding, and an exception from a cleanup path replaces the failure that caused
+    it. `_signal` already treats a process that is gone or was never ours as done, so what
+    reaches these handlers is a pid it REFUSED — a broadcast target, see its docstring — or an
+    errno nobody expected. Both are facts the caller reports rather than trips over.
+    """
+    unreachable = []
+    for pid in sorted(pids):
+        try:
+            _signal(pid, sig)
+        except (ValueError, OSError):
+            unreachable.append(pid)
+    return tuple(unreachable)
+
+
 def owned_pids(table, root=None, marker=None):
     """Everything one suite run owns: the `root`'s descendants, plus anything naming `marker`.
 
@@ -3741,16 +3864,20 @@ def kill_owned(root, marker=None, deadline=5.0):
     A TREE THAT WILL NOT QUIESCE IS A NAMED FAILURE, not a silent one. Everything frozen is
     killed on every path, including that one and including an exception, because a process left
     stopped is worse than one left running: it never exits, and the `wait4` above would block
-    on it forever.
+    on it forever. That sentence rests entirely on WHEN `frozen` is written and on `_kill_all`
+    finishing its loop — a registry updated after the act names nothing the act already touched,
+    and a cleanup that stops at its first failure abandons the rest of what it was registered
+    for. Both were true here, and the second is why the kills go through `_kill_all`.
 
     ON THE TIMEOUT PATH ONLY, and never after a run that finished. A sweep after a clean run
     would be tidying away exactly the survivors the proxy verifier exists to notice, and a green
     suite would then certify a leak this function had quietly cleaned up on its behalf.
     """
     end = time.monotonic() + deadline
-    frozen: set[int] = set()      # signalled with SIGSTOP
+    frozen: set[int] = set()      # ours, and registered for the kill below BEFORE being stopped
     confirmed: set[int] = set()   # ...and since SEEN stopped, so safe to lose
     lost: set[int] = set()        # ...but gone before that, so unaccounted for
+    unreachable: tuple = ()       # ...and refused by `_signal`, so stopped and unkillable
     quiesced = False
     try:
         while True:
@@ -3783,24 +3910,30 @@ def kill_owned(root, marker=None, deadline=5.0):
             if not fresh and not pending:
                 quiesced = True
                 break
+            # REGISTERED BEFORE IT IS SIGNALLED, never after. `frozen` is the only thing the
+            # `finally` below can reach, so it has to name a process from before the moment that
+            # process becomes stopped — not from after the whole batch is. Updating it after the
+            # loop meant a failure partway through left everything already SIGSTOPped in this
+            # round unregistered, and therefore unkilled: two pids stopped, one raise, and a
+            # cleanup that ran over an empty set (review, PR #111). A pid registered and then
+            # never signalled costs a SIGKILL against something that was ours anyway; a pid
+            # signalled and never registered is stopped forever, and `wait4` blocks on it.
+            frozen |= fresh
             # Re-signalling a pending one is free and covers a signal that was lost to a race
             # with its own exec; a stop delivered twice is still one stop.
             for pid in sorted(fresh | pending):
                 _signal(pid, signal.SIGSTOP)
-            frozen |= fresh
             if time.monotonic() >= end:
                 break
             time.sleep(_POLL)
     finally:
-        for pid in sorted(frozen):
-            _signal(pid, signal.SIGKILL)
+        unreachable = _kill_all(frozen)
     left = tuple(sorted(frozen))
     while left:
         left = survivors(frozen, process_tree(), root, marker)
         if not left or time.monotonic() >= end + deadline:
             break
-        for pid in left:
-            _signal(pid, signal.SIGKILL)
+        unreachable += _kill_all(left)
         time.sleep(_POLL)
     reasons = []
     if not quiesced:
@@ -3810,6 +3943,9 @@ def kill_owned(root, marker=None, deadline=5.0):
     if lost:
         reasons.append(f"{sorted(lost)} vanished before being observed stopped, so anything "
                        f"forked between the signal and the exit is reparented and unnamed")
+    if unreachable:
+        reasons.append(f"{sorted(set(unreachable))} could not be signalled at all, so they are "
+                       f"stopped rather than killed and will never exit on their own")
     return Sweep(tuple(left), "; ".join(reasons))
 
 
@@ -3863,6 +3999,14 @@ def _await(proc, timeout, marker=None):
     # look" are different facts about the same ending, so they get different fields — an empty
     # `leftover` under a blind observer would certify a tree nobody enumerated, which is the
     # exact reading this whole function exists to refuse.
+    #
+    # AND THE KILL GOES THROUGH `_kill_all` SO THE REAP CANNOT BE SKIPPED. These are two
+    # independent cleanups of one child, and a raise from the first took the second with it —
+    # leaving a process nothing waits for and a `returncode` nothing sets, which surfaces as
+    # `Popen.__del__` complaining rather than as a run reporting anything. Its answer is not
+    # consulted on purpose: a pid that cannot be signalled is one `wait4` never returns for, so
+    # a fault built from it would never reach a printer. The call is here for the property, not
+    # for the value.
     leftover, fault = (), ""
     try:
         swept = kill_owned(proc.pid, marker)
@@ -3870,7 +4014,7 @@ def _await(proc, timeout, marker=None):
     except ObserverFailed as exc:
         fault = str(exc)
     finally:
-        _signal(proc.pid)
+        _kill_all([proc.pid])
         _pid, status, usage = os.wait4(proc.pid, 0)
         proc.returncode = _exit_code(status)
     return None, usage.ru_utime + usage.ru_stime, leftover, fault
@@ -3913,14 +4057,18 @@ def failed_checks(suite, out):
     return re.findall(_SUITES[suite].failed, out, re.MULTILINE)
 
 
-# The five ways one mutation can end. Named rather than spelled into the printed line at each
-# site, because the exit status and the output are two readers of the same fact and a run that
-# prints MISSED while returning 0 is the disagreement §4's trustworthy-predicate rule is about.
+# The ways one mutation can end. Named rather than spelled into the printed line at each site,
+# because the exit status and the output are two readers of the same fact and a run that prints
+# MISSED while returning 0 is the disagreement §4's trustworthy-predicate rule is about. Only
+# CAUGHT counts, and everything else therefore fails the run — including the two that are not
+# statements about the mutation at all.
 CAUGHT = "CAUGHT"
 MISSED = "MISSED"
 NOT_VIA = "NOT-via"
 TIMEOUT = "TIMEOUT"
 UNAPPLIED = "UNAPPLIED"        # stale or ambiguous anchor: the suite never ran
+ABANDONED = "ABANDONED"        # the run had already stopped: the suite never ran, for a reason
+                               # that is about an earlier mutation rather than about this one
 
 
 def verdict(outcome, arm, failed):
@@ -3944,6 +4092,48 @@ def verdict(outcome, arm, failed):
     return CAUGHT if arm in failed else NOT_VIA
 
 
+def containment_note(outcome):
+    """What a timed-out sweep left behind, as text. "" when it left nothing and could look.
+
+    ONE TEXT WITH TWO READERS, and until this was extracted the second read nothing. The
+    per-mutation line said what survived and what could not be looked at; the BASELINE timeout
+    printed "the suite hung" and dropped both — so the one timeout that ends a run before any
+    mutation has run was the one that said least about what it left running (review, PR #111).
+
+    BOTH FACTS, NEVER WHICHEVER IS SET. A sweep that did not finish and a sweep that could not
+    look are true of the same ending, so they concatenate rather than choose: a lookup on
+    whichever matched first would drop the other, which is the reading `Sweep` exists to refuse.
+    """
+    # "Killed the tree" is a claim read off an absence, so the case where the absence is not
+    # there has to be printed rather than swallowed: whatever is still alive was launched from
+    # a work tree, and that tree is neither reusable nor deletable while it is.
+    stuck = (f" — {len(outcome.leftover)} descendant(s) SURVIVED the sweep: "
+             f"{list(outcome.leftover)}" if outcome.leftover else "")
+    # AND A SWEEP THAT COULD NOT LOOK IS NOT A SWEEP THAT FOUND NOTHING. Printed on its own
+    # terms, because the difference is the whole content of the containment claim: with a blind
+    # observer the descendants of this hung suite are unaccounted for rather than gone.
+    blind = (f" — CONTAINMENT NOT ESTABLISHED, descendants unaccounted for: "
+             f"{outcome.containment}" if outcome.containment else "")
+    return f"{stuck}{blind}"
+
+
+def contaminated(outcome):
+    """Whether this run left its work tree unsafe to hand to the next mutation.
+
+    THE ONE PREDICATE EVERY READER ASKS, because there are now three of them and they were
+    about to disagree. `Outcome` carries two independent facts — pids the sweep could not kill,
+    and a reason the sweep could not be believed — and each is separately enough to mean a live
+    process is executing out of that directory. A caller that consulted one would hand the tree
+    back on the other (review, PR #111), which is §4's rule about a new way of being
+    untrustworthy joining the existing predicate rather than becoming a second flag.
+
+    A DISJUNCTION, WHICH IS THE SAME SHAPE AS THE CONJUNCTION IT MIRRORS: "safe" needs both
+    facts absent, so "unsafe" needs only one present. Reading `leftover` alone is the tempting
+    half, and it is the half that certifies a tree nobody was able to enumerate.
+    """
+    return bool(outcome.leftover) or bool(outcome.containment)
+
+
 def result_line(mid, suite, arm, outcome, failed):
     """The line one finished mutation prints, verdict included.
 
@@ -3957,21 +4147,8 @@ def result_line(mid, suite, arm, outcome, failed):
         # whose defect is an infinite loop must be caught by an arm that BOUNDS the work (a
         # thread + join), not by the suite's own timeout — so this counts as uncaught and fails
         # the run, forcing a real fix rather than masking the hang.
-        #
-        # AND A SWEEP THAT DID NOT FINISH IS SAID OUT LOUD. "Killed the tree" is a claim read
-        # off an absence, so the case where the absence is not there has to be printed rather
-        # than swallowed: whatever is still alive was launched from a tree about to be deleted,
-        # and the next mutation to draw that tree runs beside it.
-        stuck = (f" — {len(outcome.leftover)} descendant(s) SURVIVED the sweep: "
-                 f"{list(outcome.leftover)}" if outcome.leftover else "")
-        # AND A SWEEP THAT COULD NOT LOOK IS NOT A SWEEP THAT FOUND NOTHING. Printed on its own
-        # terms, because the difference is the whole content of the containment claim: with a
-        # blind observer the descendants of this hung suite are unaccounted for rather than
-        # gone, and the work tree is about to be deleted out from under them.
-        blind = (f" — CONTAINMENT NOT ESTABLISHED, descendants unaccounted for: "
-                 f"{outcome.containment}" if outcome.containment else "")
         return (f"{mid}: *** TIMEOUT *** {suite} exceeded {_SUITE_TIMEOUT}s — the defect hangs "
-                f"rather than reddening {arm} {took}{stuck}{blind}")
+                f"rather than reddening {arm} {took}{containment_note(outcome)}")
     if kind == CAUGHT:
         return f"{mid}: CAUGHT by {arm} {took}"
     if kind == NOT_VIA:
@@ -4138,6 +4315,11 @@ class Record(NamedTuple):
     line: str
     wall: float
     cpu: float
+    # Whether the work tree this ran in is still safe to hand to the next mutation. It travels
+    # here because `Outcome` does not leave `apply_and_run`, and the alternative — a caller
+    # re-deriving it by reading the printed line — is a second reader of a fact, spelled as
+    # prose, which is how the line and the verdict came to disagree before `result_line`.
+    contaminated: bool = False
 
 
 def apply_and_run(work, entry, suite, kind):
@@ -4185,21 +4367,75 @@ def apply_and_run(work, entry, suite, kind):
         path.write_text(original)
     failed = failed_checks(suite, outcome.output)
     return Record(mid, kind, verdict(outcome, arm, failed),
-                  result_line(mid, suite, arm, outcome, failed), outcome.wall, outcome.cpu)
+                  result_line(mid, suite, arm, outcome, failed), outcome.wall, outcome.cpu,
+                  contaminated(outcome))
 
 
-def _draw_and_run(trees, entry, suite, kind):
-    """One mutation, in whichever tree is free — and the tree goes back on every path.
+# PHRASED OVER THE DISJUNCTION IT ACTUALLY COVERS. Two things poison a run — a sweep that
+# reported a failure, and a run that raised before it could report anything — and only the first
+# is a containment failure. A message asserting the first would be false of the second, which is
+# the same overclaim §4's note about a contract outliving its evidence is about.
+_STOPPED = ("the run stopped after a work tree could not be established as safe to reuse, and a "
+            "verdict produced beside a live process out of that tree is not a verdict")
 
-    The `finally` is what keeps the pool from draining. A worker that returned without putting
+
+def _abandoned(entry, kind):
+    """The record a mutation gets when the run stopped before it could be drawn.
+
+    A VERDICT OF ITS OWN rather than a MISSED or a silence. Silence would leave the totals
+    short with nothing saying why; MISSED would assert that the suite ran and passed with the
+    defect present, which is a claim about an arm nobody exercised.
+    """
+    return Record(entry[0], kind, ABANDONED, f"{entry[0]}: NOT RUN — {_STOPPED}", 0.0, 0.0)
+
+
+def _draw_and_run(trees, entry, suite, kind, poisoned):
+    """One mutation, in whichever tree is free — and the tree goes back only if it is CLEAN.
+
+    THE `finally` IS WHAT KEEPS THE POOL FROM DRAINING. A worker that returned without putting
     its tree back would take one thread's worth of parallelism with it, and eight such would
     leave the run wedged on an empty queue with no output and nothing to say why.
+
+    A CONTAMINATED TREE IS NEVER HANDED BACK, which is the hole that sentence used to have.
+    `Outcome.leftover` already said "the next mutation to draw this tree inherits it" — and the
+    tree went back on exactly that path, so the next mutation ran beside a live process out of
+    the same directory, with the pre-revert code still resident in it, and every verdict after
+    that was a fact about two runs at once. The tree was then deleted from under it at the end
+    (review, PR #111).
+
+    AND THE RUN STOPS, rather than continuing one tree short. There is no reading under which
+    the remaining mutations are worth their twelve minutes: the run has already failed, a
+    process nobody can account for is executing out of a directory this program made, and every
+    later verdict is measured on a machine that now has an unknown extra tenant.
+
+    AN EXCEPTION COUNTS AS CONTAMINATION, because `clean` is only ever set by getting to the end
+    of a run that said it was clean. A sweep that raised is precisely the case where what is
+    still running is unknown, so the default has to be the careful one.
+
+    THE PILL IS WHAT THE POOL GETS INSTEAD. A thread that passed the check above and is already
+    blocked in `get()` cannot see the event; putting `None` in the quarantined tree's place is
+    what wakes it. It is checked the instant it is drawn and never used as a path — the sentinel
+    rule from `_signal` applies here too, one accident smaller.
     """
+    if poisoned.is_set():
+        return _abandoned(entry, kind)
     work = trees.get()
-    try:
-        return apply_and_run(work, entry, suite, kind)
-    finally:
+    if work is None:
         trees.put(work)
+        return _abandoned(entry, kind)
+    clean = False
+    try:
+        record = apply_and_run(work, entry, suite, kind)
+        clean = not record.contaminated
+        return record
+    finally:
+        if clean:
+            trees.put(work)
+        else:
+            # THE FLAG BEFORE THE QUEUE, for the reason `sweep()` in `mcp_proxy_io.py` learned
+            # in PR #103: whatever can fail goes after whatever must not be lost.
+            poisoned.set()
+            trees.put(None)
 
 
 def slowest(records):
@@ -4213,9 +4449,11 @@ def slowest(records):
     unluckiest with the scheduler.
 
     Mutations that never ran are excluded rather than ranked at 0.0, so "the slowest" is always
-    a statement about a suite that executed.
+    a statement about a suite that executed. BOTH KINDS OF NEVER-RAN: a stale anchor and an
+    abandoned run are different reasons for the same 0.0, and a `max` over nothing but those
+    would name one of them as the slowest suite in the run.
     """
-    ran = [r for r in records if r.verdict != UNAPPLIED]
+    ran = [r for r in records if r.verdict not in (UNAPPLIED, ABANDONED)]
     return max(ran, key=lambda r: r.cpu, default=None)
 
 
@@ -4244,13 +4482,55 @@ def main(argv=None):
     # fixing what they refuse over. One tree was a leak worth half a gigabyte and nobody's
     # attention. Eight is the same leak eight times, which is how it was finally noticed.
     tmp = Path(tempfile.mkdtemp(prefix="mutate-mcp-"))
+    poisoned = threading.Event()
     try:
-        return _run_suite(tmp, jobs, kinds, suites, started)
+        return _run_suite(tmp, jobs, kinds, suites, started, poisoned)
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        discard(tmp, poisoned)
 
 
-def _run_suite(tmp, jobs, kinds, suites, started):
+def discard(tmp, poisoned):
+    """Delete the work trees — unless something is still running out of one of them. True iff gone.
+
+    DELETING A TREE WITH A LIVE PROCESS IN IT IS THE SECOND HALF OF THE SAME LEAK. The sweep
+    already says when it left a descendant alive or could not look; `rmtree` then removes the
+    directory that process is executing out of, which destroys the only evidence of what it was
+    and where it came from while doing nothing whatever about the process (review, PR #111).
+
+    SO A POISONED RUN KEEPS ITS TREES AND SAYS WHERE THEY ARE. §4's verification block globs for
+    exactly this prefix afterwards and will report them, which is the correct outcome rather
+    than a nuisance: the tree is the evidence, and the glob is the only thing that would
+    otherwise notice.
+    """
+    if poisoned.is_set():
+        print(f"WORK TREES KEPT at {tmp} — a run ended without establishing that nothing is "
+              f"still executing out of them, and deleting a directory a process is running "
+              f"from would lose what it was while doing nothing about it. Look with "
+              f"`ps -ef | grep {tmp}`, kill whatever is there, then remove the tree by hand.")
+        return False
+    shutil.rmtree(tmp, ignore_errors=True)
+    return True
+
+
+def run_verdict(caught, totals, poisoned):
+    """The exit status one whole run earns. 0 only when there is nothing to say against it.
+
+    BOTH TOTALS MUST BE CLEAN: an instrument mutation surviving means the arm guarding the
+    selftest's own reporting is decorative, which is the same failure as any other MISSED.
+
+    AND THE POISON JOINS THE PREDICATE rather than being left to the totals to notice on its
+    behalf. They would notice, today, because the only thing that poisons a run is a TIMEOUT and
+    a TIMEOUT is never a CAUGHT — but that is a coupling between two facts nothing states, and
+    §4's rule is that a new way of being untrustworthy goes where the existing reasons already
+    live, not into a second flag one caller happens to read.
+
+    A FUNCTION so it can be driven: the alternative is reachable only by paying for a whole run
+    that fails, which is the one case nobody arranges twice.
+    """
+    return 0 if caught == totals and not poisoned.is_set() else 1
+
+
+def _run_suite(tmp, jobs, kinds, suites, started, poisoned):
     # ONE TREE PER WORKER, never one tree shared: a mutation is a write to a file the next
     # mutation reads, so two workers in one tree would be testing each other's defects. Never
     # more trees than mutations either — the pool would hold a copy nothing ever draws.
@@ -4281,8 +4561,13 @@ def _run_suite(tmp, jobs, kinds, suites, started):
     for suite in sorted(set(suites.values())):
         base = run(work, suite)
         if base.output == _TIMEOUT_OUTPUT:
+            # THE FLAG BEFORE THE MESSAGE. This tree is one of the ones in the pool, so a
+            # baseline whose sweep left something behind poisons the run exactly as a mutation
+            # would — and setting it first means a `print` that fails cannot be what loses it.
+            if contaminated(base):
+                poisoned.set()
             print(f"BASELINE TIMED OUT after {_SUITE_TIMEOUT}s — the unmutated {suite} suite "
-                  f"hung, so nothing below would prove anything.")
+                  f"hung, so nothing below would prove anything.{containment_note(base)}")
             return 1
         if base.returncode != 0:
             print(f"BASELINE FAILED ({suite}) — mutations prove nothing:")
@@ -4365,14 +4650,19 @@ def _run_suite(tmp, jobs, kinds, suites, started):
     # against the last run.
     records = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(made)) as pool:
-        futures = [pool.submit(_draw_and_run, trees, entry, suites[entry[0]], kinds[entry[0]])
-                   for entry in MUTATIONS]
+        futures = [pool.submit(_draw_and_run, trees, entry, suites[entry[0]], kinds[entry[0]],
+                               poisoned) for entry in MUTATIONS]
         for future in futures:
             record = future.result()
             records.append(record)
             print(record.line, flush=True)
             if record.verdict == CAUGHT:
                 caught[record.kind] += 1
+    if poisoned.is_set():
+        print(f"\n*** RUN STOPPED *** a sweep left a process alive in a work tree, could not "
+              f"establish that it had not, or the mutation itself failed before it could say — "
+              f"see the last line above that is not a NOT RUN. Everything after that point was "
+              f"abandoned rather than run: {_STOPPED}.")
     print(f"\n{caught['M']}/{totals['M']} production mutations caught by the intended arm")
     if totals["I"]:
         print(f"{caught['I']}/{totals['I']} instrument mutation(s) caught — these perturb "
@@ -4389,9 +4679,7 @@ def _run_suite(tmp, jobs, kinds, suites, started):
     bases = ", ".join(f"{s} baseline {w:.1f}s wall / {c:.1f}s cpu"
                       for s, (w, c) in sorted(baseline.items()))
     print(f"elapsed: {total / 60:.1f} min total across {len(made)} tree(s), {bases}, {slow}")
-    # Both must be clean: an instrument mutation surviving means the arm guarding the
-    # selftest's own reporting is decorative, which is the same failure as any other MISSED.
-    return 0 if caught == totals else 1
+    return run_verdict(caught, totals, poisoned)
 
 
 if __name__ == "__main__":

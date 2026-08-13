@@ -28,8 +28,10 @@ most likely to produce.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import inspect
+import io
 import json
 import os
 import pathlib
@@ -1805,12 +1807,29 @@ check("...and every way of asking for it wrongly is refused rather than rounded 
 # its ~43 seconds waiting, so wall time there is a statement about sleep.
 _recs = [MUT.Record("slow-wall", "M", MUT.CAUGHT, "", wall=90.0, cpu=2.0),
          MUT.Record("slow-cpu", "M", MUT.CAUGHT, "", wall=10.0, cpu=40.0),
-         MUT.Record("never-ran", "M", MUT.UNAPPLIED, "", wall=0.0, cpu=0.0)]
+         MUT.Record("never-ran", "M", MUT.UNAPPLIED, "", wall=0.0, cpu=0.0),
+         MUT.Record("never-drawn", "M", MUT.ABANDONED, "", wall=0.0, cpu=0.0)]
 check("the slowest mutation is the one that spent the most CPU, not the most wall clock",
       MUT.slowest(_recs).mid == "slow-cpu", [(r.mid, r.wall, r.cpu) for r in _recs])
+# BOTH KINDS OF NEVER-RAN. A stale anchor and a mutation the run stopped before reaching are
+# different reasons for the same 0.0, and a `max` over nothing but those names one of them as
+# the slowest suite in the run — a statement about a suite that did not execute.
 check("...and a mutation that never ran is not ranked at all, nor mistaken for 'nothing ran'",
-      MUT.slowest([_recs[2]]) is None and MUT.slowest([]) is None,
+      (MUT.slowest([_recs[2]]) is None and MUT.slowest([_recs[3]]) is None
+       and MUT.slowest([]) is None),
       "0.0s would read as a suite that finished instantly rather than one that never started")
+
+# THE EXIT STATUS, WHICH IS THE OTHER READER OF EVERYTHING ABOVE. A run whose output says a
+# containment failure stopped it and whose status says 0 is the disagreement §4's
+# trustworthy-predicate rule is about, one level up from a single mutation.
+_ALL_CAUGHT = ({"M": 3, "F": 1}, {"M": 3, "F": 1})
+_SOME_MISSED = ({"M": 2, "F": 1}, {"M": 3, "F": 1})
+_QUIET, _POISON = threading.Event(), threading.Event()
+_POISON.set()
+check("a run that caught everything exits 0 only if nothing poisoned it along the way",
+      (MUT.run_verdict(*_ALL_CAUGHT, _QUIET) == 0 and MUT.run_verdict(*_ALL_CAUGHT, _POISON) == 1
+       and MUT.run_verdict(*_SOME_MISSED, _QUIET) == 1),
+      "a containment failure is a fact about the run, and the totals are not asked to carry it")
 
 # APPLY / RUN / REVERT, with the run itself faked. The revert moved into a `finally` when the
 # trees became shared property: serially, an exception between the two writes ended the run
@@ -2210,6 +2229,98 @@ check("...so a survivor with nothing in its argv to name it is still reported",
       "pid 12 is an orphaned `/bin/sh` the marker cannot reach — the exact shape a "
       "re-enumeration would drop")
 
+# THE TEARDOWN'S OWN TWO RULES, which are one rule seen from each end: a registry that cleanup
+# reads must be written BEFORE the act it will have to undo, and the cleanup that reads it must
+# reach every member however many of them fail. `frozen` is the only set the `finally` can kill,
+# and it was updated after a whole batch of SIGSTOPs — so a failure partway through that batch
+# left the pids already stopped unregistered and therefore unkilled. A stopped process nobody
+# kills never exits, and the `wait4` this teardown exists to make safe blocks on it forever
+# (review, PR #111).
+
+
+class _BrittleMachine:
+    """A process table where signalling ONE pid fails, in the middle of a batch of three.
+
+    THE FAILURE IS MID-BATCH ON PURPOSE, which is what separates the two rules. With it on the
+    first pid the registry order is invisible (nothing was signalled yet) and with it on the
+    last, the loop has already done its work. On the middle one, a cleanup reading a registry
+    written afterwards reaches nothing at all, and a cleanup that stops at its own first failure
+    reaches only what precedes it.
+    """
+
+    def __init__(self, bad, bad_sig=signal.SIGSTOP):
+        self.procs = {100: MUT.Proc(1, "S", "/x/w0/root"),
+                      101: MUT.Proc(100, "S", "/x/w0/a"), 102: MUT.Proc(100, "S", "/x/w0/b")}
+        self.bad, self.bad_sig, self.sent = bad, bad_sig, []
+
+    def look(self):
+        return dict(self.procs)
+
+    def signal(self, pid, sig=signal.SIGKILL):
+        if not isinstance(pid, int) or pid <= 0:       # the real guard, kept honest
+            raise ValueError(f"refusing to signal {pid!r}")
+        self.sent.append((pid, sig))
+        if pid == self.bad and sig == self.bad_sig:
+            raise OSError(f"signalling {pid} failed")
+        if sig == signal.SIGKILL:
+            self.procs.pop(pid, None)
+
+
+_brittle_stop = _BrittleMachine(102, signal.SIGSTOP)
+try:
+    MUT.process_tree, MUT._signal = _brittle_stop.look, _brittle_stop.signal
+    _brittle_sweep = survives(MUT.kill_owned, 100, None, 0.3)
+finally:
+    MUT.process_tree, MUT._signal = _real_tree_fn, _real_signal_fn
+check("a pid stopped before the batch failed is still killed, so nothing is left SIGSTOPped",
+      (isinstance(_brittle_sweep, OSError) and not _brittle_stop.procs
+       and {p for p, s in _brittle_stop.sent if s == signal.SIGKILL} == {100, 101, 102}),
+      f"raised={_brittle_sweep!r} still alive={_brittle_stop.procs} sent={_brittle_stop.sent} — "
+      f"100 and 101 were stopped before 102 raised, and a registry written after the batch "
+      f"names neither of them")
+
+_brittle_kill = _BrittleMachine(101, signal.SIGKILL)
+try:
+    MUT._signal = _brittle_kill.signal
+    _unreachable = survives(MUT._kill_all, [100, 101, 102])
+finally:
+    MUT._signal = _real_signal_fn
+check("...and one cleanup signal failing does not abandon the rest of the set",
+      (_unreachable == (101,) and [p for p, _s in _brittle_kill.sent] == [100, 101, 102]
+       and set(_brittle_kill.procs) == {101}),
+      f"unreachable={_unreachable} sent={_brittle_kill.sent} alive={_brittle_kill.procs} — 102 "
+      f"is the member a loop that stops at 101 never reaches")
+
+_brittle_both = _BrittleMachine(101, signal.SIGKILL)
+try:
+    MUT.process_tree, MUT._signal = _brittle_both.look, _brittle_both.signal
+    _brittle_left = survives(MUT.kill_owned, 100, None, 0.3)
+finally:
+    MUT.process_tree, MUT._signal = _real_tree_fn, _real_signal_fn
+check("...and a pid that cannot be signalled at all is a NAMED containment failure",
+      (isinstance(_brittle_left, MUT.Sweep) and _brittle_left.leftover == (101,)
+       and "101" in _brittle_left.fault),
+      f"swept={_brittle_left} — a pid nothing can signal is stopped rather than killed, which "
+      f"is the one state worse than left running: it never exits on its own")
+
+# WHETHER THE WORK TREE CAN BE HANDED ON, ASKED IN ONE PLACE. `Outcome` carries two independent
+# facts and either alone means a live process is executing out of that directory, so a caller
+# consulting one of them hands the tree back on the other. Both combinations are driven, and the
+# printed text is pinned to the predicate rather than left to agree with it by habit.
+_CONTAM = [(MUT.Outcome(124, MUT._TIMEOUT_OUTPUT, 1.0, 1.0), False),
+           (MUT.Outcome(124, MUT._TIMEOUT_OUTPUT, 1.0, 1.0, (4242,), ""), True),
+           (MUT.Outcome(124, MUT._TIMEOUT_OUTPUT, 1.0, 1.0, (), "`ps` exited 127"), True),
+           (MUT.Outcome(124, MUT._TIMEOUT_OUTPUT, 1.0, 1.0, (4242,), "`ps` exited 127"), True)]
+check("a work tree is contaminated by EITHER survivors or a sweep that could not look",
+      len(_CONTAM) == 4 and all(MUT.contaminated(o) is want for o, want in _CONTAM),
+      [(o.leftover, o.containment, MUT.contaminated(o)) for o, _w in _CONTAM])
+check("...and the note printed for one carries both facts, not whichever was set first",
+      (len(_CONTAM) == 4
+       and all(MUT.contaminated(o) is bool(MUT.containment_note(o)) for o, _w in _CONTAM)
+       and "SURVIVED" in MUT.containment_note(_CONTAM[3][0])
+       and "NOT ESTABLISHED" in MUT.containment_note(_CONTAM[3][0])),
+      [MUT.containment_note(o) for o, _w in _CONTAM])
+
 # THE RACE THE MARKER DOES NOT CLOSE, which is the case both live probes above miss: one makes
 # its descendant BEFORE the enumeration (parentage covers it) and the other hands an unrelated
 # process the marker explicitly. Neither has a child that appears AFTER the first snapshot and
@@ -2400,6 +2511,119 @@ try:
 finally:
     shutil.rmtree(_tree_tmp, ignore_errors=True)
 
+# AND THE POOL IT GOES BACK INTO — except for the one tree that must not. `Outcome.leftover`
+# said "the next mutation to draw this tree inherits it", and the tree was handed back on
+# exactly that path: the next mutation then ran beside a live process out of the same directory,
+# with the pre-revert code still resident in it, and every verdict after that was a fact about
+# two runs at once (review, PR #111).
+_POOL_ENTRY = ("Z1-not-a-real-mutation", "tools/mutate_mcp.py", "a", "b", "an arm")
+_POOL_TREE = pathlib.Path("/x/w0/harness")
+
+
+def _drew(record=None, raises=False, prepoisoned=False, holding=_POOL_TREE):
+    """Drive `_draw_and_run` over a stubbed run: (result, what the pool holds, poisoned, calls).
+
+    The stub is what makes this affordable — a real draw costs a whole suite — and it is also
+    what makes "the mutation never ran" checkable at all. It records its own calls, so the two
+    refusal cases below rest on a positive fact about a thing that demonstrably CAN be called
+    (the clean case calls it) rather than on nothing having happened.
+    """
+    trees, poisoned, calls = queue.Queue(), threading.Event(), []
+    trees.put(holding)
+    if prepoisoned:
+        poisoned.set()
+
+    def _stub(work, entry, suite, kind):
+        calls.append(work)
+        if raises:
+            raise RuntimeError("the sweep blew up")
+        return record
+
+    _real_apply = MUT.apply_and_run
+    try:
+        MUT.apply_and_run = _stub
+        got = survives(MUT._draw_and_run, trees, _POOL_ENTRY, "fixtures", "F", poisoned)
+    finally:
+        MUT.apply_and_run = _real_apply
+    held = []
+    while not trees.empty():
+        held.append(trees.get_nowait())
+    return got, held, poisoned.is_set(), calls
+
+
+def _rec(dirty):
+    """A finished `Record` that either did or did not leave its work tree unsafe."""
+    return MUT.Record("Z1-not-a-real-mutation", "F", MUT.TIMEOUT, "a line", 1.0, 1.0, dirty)
+
+
+_clean_got, _clean_held, _clean_poison, _clean_calls = _drew(_rec(False))
+check("a work tree a mutation finished cleanly in goes back into the pool",
+      (_clean_got == _rec(False) and _clean_held == [_POOL_TREE] and not _clean_poison
+       and _clean_calls == [_POOL_TREE]),
+      f"got={_clean_got} pool={_clean_held} poisoned={_clean_poison} ran={_clean_calls} — a "
+      f"worker that kept its tree would take a thread's worth of parallelism with it")
+_dirty_got, _dirty_held, _dirty_poison, _dirty_calls = _drew(_rec(True))
+check("...and one whose sweep could not be cleared never does, nor runs anything beside it",
+      (_dirty_got == _rec(True) and _POOL_TREE not in _dirty_held and _dirty_poison
+       and _dirty_calls == [_POOL_TREE]),
+      f"got={_dirty_got} pool={_dirty_held} poisoned={_dirty_poison} — that tree is about to be "
+      f"drawn by the next mutation and deleted at the end, with a process still inside it")
+_raised_got, _raised_held, _raised_poison, _raised_calls = _drew(raises=True)
+check("...and a run that RAISED contaminates too, since what survived it is exactly unknown",
+      (isinstance(_raised_got, RuntimeError) and _POOL_TREE not in _raised_held
+       and _raised_poison and _raised_calls == [_POOL_TREE]),
+      f"got={_raised_got!r} pool={_raised_held} poisoned={_raised_poison} — the careful default "
+      f"is the one that holds when the sweep is the thing that broke")
+_stop_got, _stop_held, _stop_poison, _stop_calls = _drew(_rec(False), prepoisoned=True)
+check("...and once the run has stopped the rest are ABANDONED without drawing a tree at all",
+      (isinstance(_stop_got, MUT.Record) and _stop_got.verdict == MUT.ABANDONED
+       and _stop_held == [_POOL_TREE] and _stop_calls == []),
+      f"got={_stop_got} pool={_stop_held} ran={_stop_calls}")
+_pill_got, _pill_held, _pill_poison, _pill_calls = _drew(_rec(False), holding=None)
+check("...and a worker already inside `get()` draws the pill instead of waiting forever",
+      (isinstance(_pill_got, MUT.Record) and _pill_got.verdict == MUT.ABANDONED
+       and _pill_held == [None] and _pill_calls == []),
+      f"got={_pill_got} pool={_pill_held} ran={_pill_calls} — an event cannot reach a thread "
+      f"already blocked on the queue; only something being PUT there wakes it")
+
+# AND THE DELETION AT THE END, which is the second half of the same leak: `rmtree` removes the
+# directory a survivor is executing out of, which loses what it was and where it came from while
+# doing nothing whatever about the process itself.
+_keep_tmp = pathlib.Path(tempfile.mkdtemp(prefix="verify-discard-"))
+_gone_tmp = pathlib.Path(tempfile.mkdtemp(prefix="verify-discard-"))
+_kept_ev = threading.Event()
+_kept_ev.set()
+_discard_say = io.StringIO()
+with contextlib.redirect_stdout(_discard_say):
+    _kept_ok = survives(MUT.discard, _keep_tmp, _kept_ev)
+    _gone_ok = survives(MUT.discard, _gone_tmp, threading.Event())
+check("a work tree with something still running out of it is KEPT, and its path is printed",
+      (_kept_ok is False and _keep_tmp.is_dir() and str(_keep_tmp) in _discard_say.getvalue()
+       and _gone_ok is True and not _gone_tmp.exists()),
+      f"kept={_kept_ok} still there={_keep_tmp.is_dir()} clean one deleted={not _gone_tmp.exists()} "
+      f"said={_discard_say.getvalue()!r}")
+shutil.rmtree(_keep_tmp, ignore_errors=True)
+
+# THE BASELINE TIMEOUT, WHICH IS THE ONE THAT SAID LEAST. It ends the run before any mutation has
+# run, in a tree that is already in the pool — and it printed "the suite hung" and dropped both
+# containment facts. `run` is stubbed, so this costs one work tree rather than a suite.
+_base_tmp = pathlib.Path(tempfile.mkdtemp(prefix="verify-baseline-"))
+_base_say, _base_ev = io.StringIO(), threading.Event()
+_real_run_fn = MUT.run
+try:
+    MUT.run = lambda cwd, suite: MUT.Outcome(124, MUT._TIMEOUT_OUTPUT, 1.0, 1.0, (4242,),
+                                             "`ps` exited 127")
+    with contextlib.redirect_stdout(_base_say):
+        _base_rc = survives(MUT._run_suite, _base_tmp, 1, {}, {"Z1": "fixtures"},
+                            time.monotonic(), _base_ev)
+finally:
+    MUT.run = _real_run_fn
+shutil.rmtree(_base_tmp, ignore_errors=True)
+check("a BASELINE that times out reports what its sweep left, and keeps the tree it left it in",
+      (_base_rc == 1 and _base_ev.is_set() and "4242" in _base_say.getvalue()
+       and "127" in _base_say.getvalue()),
+      f"rc={_base_rc} poisoned={_base_ev.is_set()} said={_base_say.getvalue()!r}")
+
 print()
 print("E18. probe_remote_mcp.py's startup path — the copy a fix was left out of")
 
@@ -2464,9 +2688,12 @@ for _desc, _body in _FAKES.items():
     # text, and three checks sharing one make the report unable to say which case broke.
     check(f"...and the child of the one that {_desc} is reaped, leaking no listening server",
           _reaped, [(p.pid, p.poll()) for p in _watch.started])
+    # EVERY ONE OF THEM, even after one refuses to go. A `wait` that times out here abandoned
+    # the rest of the list, leaving a listening server behind for the remainder of the run — the
+    # same shape `_kill_all` exists for in `mutate_mcp.py` (review, PR #111).
     for _p in _watch.started:                    # so a MUTANT that leaks does not leak for 5m
-        _p.kill()
-        _p.wait(timeout=DEADLINE)
+        survives(_p.kill)
+        survives(_p.wait, timeout=DEADLINE)
 shutil.rmtree(_startup_tmp, ignore_errors=True)
 
 print()

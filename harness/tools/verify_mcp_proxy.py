@@ -43,6 +43,7 @@ truncated final line.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import selectors
@@ -1587,10 +1588,18 @@ for _label, _fault, _extra, _watch in (
               f"first, so an EOF here is a termination rather than a channel nobody took: "
               f"{_kept_recs} {_kept}")
     finally:
+        # EVERY HOLDER, EVEN AFTER ONE OF THEM RAISES, and every channel after that. A teardown
+        # loop that stops at its first failure abandons the rest of what it was written to clean
+        # up — which here is credential-bearing groups this file deliberately left alive. It is
+        # the same rule as the paragraph below about the guardian's own sweep, and the same one
+        # `_kill_all` exists for in `mutate_mcp.py` (review, PR #111).
         for _who, _rec in _kept_recs.items():
-            reap_group(_rec if isinstance(_rec, dict) else None, _kept_nonce, _kept_chans[_who])
+            with contextlib.suppress(Exception):
+                reap_group(_rec if isinstance(_rec, dict) else None, _kept_nonce,
+                           _kept_chans[_who])
         for _chan in _kept_chans.values():
-            _chan.close()
+            with contextlib.suppress(Exception):
+                _chan.close()
 
 # A DEAD DIAGNOSTIC CHANNEL MUST NOT BE ABLE TO STOP A TEARDOWN, and the guardian is where that
 # mattered: its sweep announced itself before signalling anything, so with the CLI's end of

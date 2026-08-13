@@ -292,10 +292,19 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 578 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 115/115 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 461 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 336/336 production + 2/2 instrument + 129/129 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 474 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 git diff --check
+
+# AFTER the mutation run, because what it should have left behind is nothing, and "the
+# suite was green" is a different fact from "the machine is as it was". A run that could
+# not establish containment KEEPS its work trees on purpose and says so — the first line
+# is what then reports them. The `[.]` is not a typo: `pgrep -f` matches this command's
+# own argv, so a plain pattern finds itself and reports a guardian that is the search.
+ls -d "${TMPDIR%/}"/mutate-mcp-*                # no work trees
+pgrep -f 'mcp_proxy_io[.]py --guardian'         # no stray guardians
+ps -eo stat= | grep -c '^[Tt]'                  # 0 — nothing left SIGSTOPped by a sweep
 
 # OPT-IN, not part of the block above: needs `claude` on PATH and spends an API call.
 # Run it when the CLI updates — §9's probe-#1 result is version-qualified, and this is
@@ -1711,6 +1720,49 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   **an intersection with "what is still there" silently reclassifies everything that left.**
   Before writing one, ask what it means for a member to vanish — if the answer is "we do not
   know", it does not belong on the satisfied side of a fixed point.
+- **A registry cleanup reads must be written BEFORE the act, and the cleanup must reach every
+  member.** One rule seen from each end, and the sweep got both wrong. `frozen` is the only set
+  the `finally` can kill, and it was updated after a whole batch of `SIGSTOP`s — so a failure
+  partway through that batch left the pids already stopped unregistered, and therefore unkilled,
+  by the very block written to guarantee they would be. The cleanup loop then abandoned the rest
+  of the set at its own first failure. Both leave the same wreckage, and it is worse than a leak:
+  a stopped process never exits, so the `wait4` the teardown exists to make safe blocks forever.
+
+  The tell for the first half is a `finally` whose reachability argument depends on a variable
+  assigned after the thing it protects against. The tell for the second is a bare `for` in a
+  teardown. This program had already paid for the second once — the guardian's `sweep()`
+  announced itself before signalling, a `BrokenPipeError` from the announcement left a
+  credential-bearing group alive (PR #103) — so the rule was already written down and was
+  applied only where it had been reproduced. Every teardown loop in the tree is now best-effort
+  per member: `_kill_all` in `mutate_mcp.py`, the startup-probe reap in `verify_mcp_fixtures.py`,
+  the held-group teardown in `verify_mcp_proxy.py`. The production paths already had it, and
+  `exec.py` says why in a comment — which is what "state the rule, not the reproduction" buys.
+- **A resource goes back into a pool only if it is known CLEAN, and "the run finished" is not
+  that knowledge.** The timeout path already said out loud when its sweep had left a descendant
+  alive or could not establish that it hadn't — and the work tree went back into the queue on
+  exactly that path, because the `finally` that returns it was written when the only failure it
+  could imagine was a worker keeping one. So the next mutation drew a directory with a live
+  process executing out of it and the pre-revert code still resident, and every verdict after
+  that was a fact about two runs at once. Then `rmtree` deleted the directory from under it,
+  which loses what the process was and where it came from while doing nothing about the process.
+
+  Three parts, and each is separately the whole defect: **contamination is a property of the
+  ENDING, not of the verdict** (so it travels on the record); **deleting the container is not
+  dealing with the tenant** (so a poisoned run keeps its trees and prints where they are, and
+  the leftover glob in the block above then reports them, which is correct rather than a
+  nuisance); and **the run stops** — there is no reading under which the remaining mutations are
+  worth their twelve minutes once a process nobody can account for is running on the machine.
+  An exception counts as contamination too: a sweep that RAISED is precisely the case where what
+  survived is unknown, so the default has to be the careful one.
+- **A `pgrep -f` finds itself, and answers about the search rather than the machine.** The
+  after-run leftover check reported three stray guardians immediately after a clean run that had
+  left none: the pattern appears in the argv of the pipeline doing the searching, which `ps` and
+  `pgrep -f` both enumerate. `[.]` in the pattern fixes it — the bracket matches the literal dot
+  and makes the pattern text differ from what it matches. This is the probe rule from CLAUDE.md
+  arriving one layer lower than usual: the instrument was inside the population it measured, so
+  the reading was about the instrument. The direction of the error is the dangerous one, because
+  a false POSITIVE here sends the next reader hunting a leak that is not there — and the same
+  mistake in the other direction, a filter that excludes too much, would hide a real one.
 - **A single-line anchor aimed at `mutate_mcp.py` itself matches TWICE**, and one of the two is
   the mutation entry quoting it. It is refused up front by `stale_anchors` rather than silently
   mutating the list instead of the code, but the fix is not obvious from the message: pin it
