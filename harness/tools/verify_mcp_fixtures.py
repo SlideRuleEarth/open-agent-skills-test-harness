@@ -1801,6 +1801,23 @@ check("...and every way of asking for it wrongly is refused rather than rounded 
       [survives(MUT.parse_jobs, a) for a in (["--jobs"], ["--jobs", "0"], ["--jobs", "x"],
                                              ["--jobs", "-2"], ["-j", "8"], ["--job", "8"])])
 
+# AN ID IS A NAME, AND A NAME THAT MEANS TWO THINGS IS NOT A REPORT. Four entries were once
+# added as M338-M341 beside an existing M338-M341: all eight ran, all eight were CAUGHT, both
+# totals were right and the suite exited 0 — the arithmetic never noticed, because there is
+# nothing wrong with it. What broke is the path from a result line back to the entry that
+# produced it. The live table must therefore be clean, and the predicate must be able to SAY
+# a table is dirty — a guard asserted only against the real table passes for as long as
+# nobody makes the mistake, which is the state this repo was already in.
+_dup_a = ("M1-x", "agentskill_evals/runner.py", "a", "b", "arm")
+_dup_b = ("M1-y", "agentskill_evals/runner.py", "c", "d", "arm")
+check("no mutation id names two entries in the live table",
+      MUT.duplicate_ids(MUT.MUTATIONS) == [],
+      MUT.duplicate_ids(MUT.MUTATIONS))
+check("...and the guard reports a repeat rather than reading a clean table off any input",
+      (MUT.duplicate_ids([_dup_a, _dup_a, _dup_b]) == [("M1-x", 2)]
+       and MUT.duplicate_ids([_dup_a, _dup_b]) == []),
+      [MUT.duplicate_ids([_dup_a, _dup_a, _dup_b]), MUT.duplicate_ids([_dup_a, _dup_b])])
+
 # THE SLOWEST-MUTATION WARNING, which §4 reads as the only notice before a defect that loops
 # becomes a defect that hangs. It has to rank on CPU: under `--jobs N` the loudest WALL figure
 # names whichever mutation was unluckiest with the scheduler, and the proxy suite spends ~40 of

@@ -880,27 +880,27 @@ MUTATIONS = [
     # reported `mcp-servers` MISSING — the wording reserved for a channel that was
     # REMOVED — and nobody noticed for three releases. Deleting the walk restores exactly
     # that: the bundle's sibling files stop being read.
-    ("M338-marker-scan-narrows-back-to-one-file", COPILOT,
+    ("M344-marker-scan-narrows-back-to-one-file", COPILOT,
      "\n    for dirpath, dirnames, filenames in os.walk(root):",
      "\n    for dirpath, dirnames, filenames in []:",
      "copilot.channel_markers_scan_the_bundle"),
     # The opposite failure, and the one a widening invites: the scan reads everything,
     # including the wasm blobs and prebuilt binaries it cannot honestly claim to have
     # examined, so `searched` overstates what was ruled out.
-    ("M339-marker-scan-claims-files-it-does-not-read", COPILOT,
+    ("M345-marker-scan-claims-files-it-does-not-read", COPILOT,
      '\n_SCANNED_SUFFIXES = (".js", ".mjs", ".cjs", ".json", ".ts")',
      '\n_SCANNED_SUFFIXES = (".js", ".mjs", ".cjs", ".json", ".ts", ".wasm")',
      "copilot.channel_markers_scan_the_bundle"),
     # A file that could not be opened counts as searched, so an unreadable bundle reports
     # "absent" about files nothing ever read — the audit's own version of the defect it
     # exists to catch, one level down.
-    ("M340-unread-file-still-licenses-the-word-searched", COPILOT,
+    ("M346-unread-file-still-licenses-the-word-searched", COPILOT,
      "\n    except OSError:\n        return False",
      "\n    except OSError:\n        return True",
      "copilot.channel_markers_scan_the_bundle"),
     # A scan that read nothing goes back to reporting every marker absent, which is
     # bit-for-bit what a build that dropped every channel produces.
-    ("M341-blind-scan-reports-every-channel-vanished", COPILOT,
+    ("M347-blind-scan-reports-every-channel-vanished", COPILOT,
      "\n        if not self.searched:\n            return MARKER_NOT_SEARCHED",
      "\n        if False:\n            return MARKER_NOT_SEARCHED",
      "copilot.channel_markers_scan_the_bundle"),
@@ -3167,6 +3167,12 @@ MUTATIONS = [
      "\n    if not text.isdigit() or int(text) < 1:",
      "\n    if not text.isdigit():",
      "...and every way of asking for it wrongly is refused rather than rounded to 1"),
+    # A repeated id stops being reported, which is the state this runner shipped in until an
+    # id collision produced eight mutations under four names and a green run either way.
+    ("F136-a-repeated-mutation-id-reports-as-a-clean-table", SELF,
+     "\n        seen[mid] = seen.get(mid, 0) + 1",
+     "\n        seen[mid] = 1",
+     "...and the guard reports a repeat rather than reading a clean table off any input"),
     # THE SLOWEST-MUTATION WARNING, on the axis that stops meaning anything under load and on
     # the entries that never ran.
     ("F87-the-slowest-mutation-is-picked-by-wall-clock", SELF,
@@ -4339,6 +4345,28 @@ def _classify(mid, rel):
     return kind
 
 
+def duplicate_ids(mutations):
+    """Every `(id, count)` used by more than one entry, worst first.
+
+    THE SAME ARGUMENT AS `stale_anchors`, one field over, and it was learned the same way:
+    four entries were added as M338-M341 while M338-M341 already existed against the proxy.
+    Every one of the eight ran and every one was CAUGHT, so both totals were right and the
+    suite exited 0 — the failure is not in the arithmetic. It is that "M340: CAUGHT by ..."
+    now names two different defects, so a reader cannot get from a result line back to the
+    entry that produced it, and `--only M340` would silently mean one of them. An id is a
+    NAME; the anchor guard exists because a mutation that could match two sites is not a
+    measurement, and an id that can mean two mutations is not a report.
+
+    Cheap enough to run before the baseline, like every other refusal here, because
+    discovering it after the fact costs the whole run — which is exactly what it cost.
+    """
+    seen = {}
+    for mid, *_rest in mutations:
+        seen[mid] = seen.get(mid, 0) + 1
+    return sorted(((mid, n) for mid, n in seen.items() if n > 1),
+                  key=lambda pair: (-pair[1], pair[0]))
+
+
 def stale_anchors(root, mutations):
     """Every `(id, target, occurrences)` whose `find` text is not in its target exactly once.
 
@@ -4571,6 +4599,13 @@ def main(argv=None):
     # number below it wrong, so it is worth nothing to discover that at the end.
     kinds = {mid: _classify(mid, rel) for mid, rel, _f, _r, _a in MUTATIONS}
     suites = {mid: _suite_for(rel) for mid, rel, _f, _r, _a in MUTATIONS}
+    dupes = duplicate_ids(MUTATIONS)
+    if dupes:
+        print("DUPLICATE MUTATION IDS — an id that names two mutations makes every line "
+              "reporting it ambiguous, and the totals stop being readable back to entries:")
+        for mid, n in dupes:
+            print(f"  {mid} is used {n} times")
+        return 1
     stale = stale_anchors(HARNESS, MUTATIONS)
     if stale:
         print("STALE OR AMBIGUOUS ANCHORS — these mutations cannot be applied, and a run that "
