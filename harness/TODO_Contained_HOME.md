@@ -344,30 +344,54 @@ printed under an `INCOMPLETE` heading, and the summary line refuses the word. Th
 discrimination is what makes it honest — loopback *denied* is a skip; loopback available and a
 fixture that still will not start is a defect, and stays red.
 
-**Reproduce a restricted environment here rather than trusting that it works there.** Both
-denials are one line each, and the second reaches child processes because the fixtures are
-subprocesses:
+**Reproduce a restricted environment here rather than trusting that it works there.** Each
+denial is one line, and the `bind()` one reaches child processes through `PYTHONPATH`, which
+is the only reason it touches the fixtures at all — they are subprocesses.
 
 ```sh
+# PRIVATE DIRECTORIES, because both are WRITTEN THROUGH. A predictable /tmp/<known-name> that
+# already exists — a directory someone else owns, or a symlink — redirects the redirection
+# into whatever it points at. `mktemp -d` creates 0700 under the caller's own TMPDIR and
+# cannot collide; the paths are quoted everywhere for the same reason (external review).
+nops="$(mktemp -d)"; nobind="$(mktemp -d)"
+
 # Deny `ps`: the fake must be the ONLY thing on PATH, since execvp keeps searching after
 # EACCES. Hence the absolute interpreter — PATH no longer resolves `python3` either.
-mkdir -p /tmp/nops && printf '#!/bin/sh\nexit 0\n' > /tmp/nops/ps && chmod 0644 /tmp/nops/ps
-PATH=/tmp/nops harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
+printf '#!/bin/sh\nexit 0\n' > "$nops/ps" && chmod 0644 "$nops/ps"
 
 # Deny bind(), inherited by every child through PYTHONPATH.
-mkdir -p /tmp/nobind && cat > /tmp/nobind/sitecustomize.py <<'EOF'
+cat > "$nobind/sitecustomize.py" <<'EOF'
 import socket
 def _denied(self, addr):
     raise PermissionError(1, "Operation not permitted")
 socket.socket.bind = _denied
 EOF
-PYTHONPATH=/tmp/nobind harness/.venv/bin/python -m agentskill_evals.cli selftest
+
+# THE VERIFIER UNDER EACH DENIAL, AND UNDER BOTH. The `bind()` case belongs here and not only
+# on the selftest: E16's two transports are what it exercises, and pointing it at the selftest
+# alone demonstrates the FIFO replacement and nothing else (external review).
+PATH="$nops" harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
+PYTHONPATH="$nobind" harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
+PATH="$nops" PYTHONPATH="$nobind" harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
+
+# ...and the selftest separately, which is the arm the `mkfifo` replacement is for.
+PYTHONPATH="$nobind" harness/.venv/bin/python -m agentskill_evals.cli selftest
+
+rm -rf "$nops" "$nobind"
 ```
 
-Under both at once the verifier runs to E20 with **no traceback, no false failures, seven
-recorded skips and exit 1**; the selftest passes all 579 arms. The counts in the block above
-are the UNRESTRICTED ones — a restricted run reports fewer checks and says so, which is the
-point.
+Measured here, and each number is a different question answered:
+
+| Run | checks | skips | fails | exit |
+| --- | --- | --- | --- | --- |
+| verifier, `ps` denied | 551 | 5 (E17 live arms) | 0 | 1 |
+| verifier, `bind()` denied | 527 | 2 (E16 http + sse) | 0 | 1 |
+| verifier, both denied | 519 | 7 | 0 | 1 |
+| selftest, `bind()` denied | 579 arms | — | 0 | 0 |
+
+Every restricted run reaches **E20 with no traceback and no false failures**. The counts in the
+block above are the UNRESTRICTED ones — a restricted run reports fewer checks and says which
+ones it could not ask, which is the whole point.
 
 **The FIFO carries a hazard the socket did not, and it is bounded rather than avoided.** `M37`
 makes the scrub treat every non-directory as a regular file, so it `open()`s the FIFO and never
