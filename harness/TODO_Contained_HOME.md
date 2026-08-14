@@ -292,7 +292,7 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 2/2 instrument + 169/169 fixture
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 169/169 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 probes; 559 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 git diff --check
@@ -319,6 +319,62 @@ harness/.venv/bin/python harness/tools/probe_remote_mcp.py    # 19 checks; claud
 # --skip-survival for the rest in about 20s. Its classifiers are driven offline at §E20.
 harness/.venv/bin/python harness/tools/probe_session_mcp.py   # C3-4; NASA Earthdata by default, --url for another
 ```
+
+### Running the block where the OS says no
+
+**The block used to be unrunnable under a restricted environment, and the way it failed was
+worse than failing.** `verify_mcp_fixtures.py` is a linear script: an unhandled raise ends it
+where it stands. A reviewer running it in a sandbox that denies process enumeration got **376
+of 559 checks, the last of them green, a traceback, and no line anywhere saying that E18, E19
+and E20 never executed** (external review, PR #115). Absence of a result, read as a result, in
+the file whose whole job is refusing that reading.
+
+**Three capabilities are involved, and only one of them ever stopped the run:**
+
+| Capability | Used by | What it did |
+| --- | --- | --- |
+| `ps -eo …` (process enumeration) | `mutate_mcp.process_tree`, via every LIVE containment arm in §E17 | **Aborted the script.** `kill_owned` raises `ObserverFailed` rather than reporting a clean tree — deliberately, and a check exists to keep it that way — so the verifier is what had to stop treating a denied capability as a crash. |
+| `bind()` on loopback | the `http_mcp_server.py` fixtures in §E16 | Two red checks, then ~36 arms silently not run, because the body is already behind `if _rm.up:`. |
+| `socket(AF_UNIX)` + `bind()` | one selftest fixture | One red arm out of 579. **Now uses `os.mkfifo`**, which needs no socket privileges. |
+
+**What replaced them is a third result state.** Each capability is probed once, and a section
+that cannot run is recorded by `skip()` rather than crashed on or quietly passed over. A
+skipped section is **not a pass**: `skipped` joins `fails` in the exit status, the reasons are
+printed under an `INCOMPLETE` heading, and the summary line refuses the word. The
+discrimination is what makes it honest — loopback *denied* is a skip; loopback available and a
+fixture that still will not start is a defect, and stays red.
+
+**Reproduce a restricted environment here rather than trusting that it works there.** Both
+denials are one line each, and the second reaches child processes because the fixtures are
+subprocesses:
+
+```sh
+# Deny `ps`: the fake must be the ONLY thing on PATH, since execvp keeps searching after
+# EACCES. Hence the absolute interpreter — PATH no longer resolves `python3` either.
+mkdir -p /tmp/nops && printf '#!/bin/sh\nexit 0\n' > /tmp/nops/ps && chmod 0644 /tmp/nops/ps
+PATH=/tmp/nops harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
+
+# Deny bind(), inherited by every child through PYTHONPATH.
+mkdir -p /tmp/nobind && cat > /tmp/nobind/sitecustomize.py <<'EOF'
+import socket
+def _denied(self, addr):
+    raise PermissionError(1, "Operation not permitted")
+socket.socket.bind = _denied
+EOF
+PYTHONPATH=/tmp/nobind harness/.venv/bin/python -m agentskill_evals.cli selftest
+```
+
+Under both at once the verifier runs to E20 with **no traceback, no false failures, seven
+recorded skips and exit 1**; the selftest passes all 579 arms. The counts in the block above
+are the UNRESTRICTED ones — a restricted run reports fewer checks and says so, which is the
+point.
+
+**The FIFO carries a hazard the socket did not, and it is bounded rather than avoided.** `M37`
+makes the scrub treat every non-directory as a regular file, so it `open()`s the FIFO and never
+returns. The relocation arm therefore runs its cell on a **bounded thread** and asserts
+`not t15.is_alive()`, exactly as `mcp.special_files_are_removed_rather_than_read` already did —
+removing the join re-arms the trap, so `I3` exists to catch that. Verified by hand-applying M37:
+the suite finishes in 47s and reports two failing arms rather than wedging.
 
 **`--jobs 8` is the recommended way to run it and `--jobs 1` is what it means.** The suite is
 mostly WAITING — the proxy arms are ~43s of settles and grace periods on ~5s of CPU, which is
