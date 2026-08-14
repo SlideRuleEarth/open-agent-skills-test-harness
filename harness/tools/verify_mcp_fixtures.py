@@ -3630,19 +3630,31 @@ check("an out-of-band error message is readable though its id matches nothing we
 _sid_seq = itertools.count(1)
 
 
-def _fake_mcp(initialized_status=202, version="2025-11-25"):
+def _fake_mcp(initialized_status=202, version="2025-11-25", err_init=False, drift=None,
+              seen=None):
     """A minimal Streamable-HTTP MCP server as `urlopen` sees it.
 
     IT HONOURS ITS OWN DELETE, which is not decoration: a fake that answers `tools/list`
     whatever has happened can never produce a RELEASE, so the positive control below could
     only ever have read RETAINED and the two checks it licenses would have rested on a driver
-    incapable of the good outcome. `initialized_status` is the knob the handshake cases turn.
+    incapable of the good outcome.
+
+    The knobs are the three failure shapes the third review round turned up: an `initialize`
+    that ERRORS (`err_init`), a later session negotiating a DIFFERENT revision (`drift`), and a
+    refused `notifications/initialized` (`initialized_status`). `seen`, when given, collects
+    `(method, sid, protocol-version-header)` for every request — which is how cleanup's choice
+    of revision becomes observable rather than inferred.
     """
     terminated = set()
+    opened = itertools.count(0)
 
     def opener(req, timeout=None):
         payload = json.loads(req.data) if req.data else {}
         sid = req.get_header("Mcp-session-id")
+        if seen is not None:
+            seen.append((req.get_method() if req.get_method() == "DELETE"
+                         else payload.get("method"), sid,
+                         req.get_header("Mcp-protocol-version")))
         if req.get_method() == "DELETE":
             terminated.add(sid)
             return _FakeResp(200, {"content-type": "application/json"}, b"")
@@ -3653,9 +3665,15 @@ def _fake_mcp(initialized_status=202, version="2025-11-25"):
                            b'"error":{"code":-32600,"message":"Session has been terminated"}}'))
         method = payload.get("method")
         if method == "initialize":
-            body = {"jsonrpc": "2.0", "id": payload["id"],
-                    "result": {"protocolVersion": version, "capabilities": {},
-                               "serverInfo": {"name": "fake", "version": "1"}}}
+            nth = next(opened)
+            if err_init:
+                body = {"jsonrpc": "2.0", "id": payload["id"],
+                        "error": {"code": -32602, "message": "bad params"}}
+            else:
+                declared = drift if (drift and nth > 0) else version
+                body = {"jsonrpc": "2.0", "id": payload["id"],
+                        "result": {"protocolVersion": declared, "capabilities": {},
+                                   "serverInfo": {"name": "fake", "version": "1"}}}
             return _FakeResp(200, {"content-type": "application/json",
                                    "mcp-session-id": f"sid-{next(_sid_seq)}"},
                              json.dumps(body).encode())
@@ -3705,15 +3723,15 @@ check("driven against a fake server that completes the handshake, every sampled 
       len(_good_rows) == 2 and all(r["disposition"] == SESS.RELEASED for r in _good_rows)
       and _good_fail == [],
       ([r.get("disposition") for r in _good_rows], _good_fail))
-check("Q3: EVERY sampled session completed its handshake — a row measured through an "
-      "incomplete one is a reading of a different state, not a weaker reading of this one",
+check("Q3: EVERY sampled session was measurable — a row taken through an incomplete "
+      "handshake, or a different revision, is a reading of another quantity entirely",
       len(_bad_rows) == 2
       and all(r["disposition"] == SESS.INDETERMINATE for r in _bad_rows)
       and all(r["handshake"] is False for r in _bad_rows)
-      and any("completed its handshake" in f for f in _bad_fail),
+      and any("was measurable" in f for f in _bad_fail),
       ([r.get("disposition") for r in _bad_rows], _bad_fail))
 check("...and the excluded row SAYS why, rather than vanishing from a smaller sample",
-      "handshake did NOT complete" in _bad_out and "excluded from the sample" in _bad_out,
+      "NOT MEASURABLE" in _bad_out and "excluded from the sample" in _bad_out,
       _bad_out[:300])
 check("Q4: every cohort completed its handshake and negotiated the same revision — an "
       "idle session that never entered normal operation is a different quantity",
@@ -3721,6 +3739,80 @@ check("Q4: every cohort completed its handshake and negotiated the same revision
       and _bad_cohorts[0]["state"] is None
       and any("cohort completed its handshake" in f for f in _bad_cohort_fail),
       ([(c["handshake"], c["state"]) for c in _bad_cohorts], _bad_cohort_fail))
+
+# --- ELIGIBILITY IS A GATE, NOT A REPORT. Each case below reached the measurement before. ---
+_saved_urlopen4 = urllib.request.urlopen
+try:
+    urllib.request.urlopen = _fake_mcp(err_init=True)
+    _err_session = SESS.open_session("http://probe.invalid", SESS.SessionLedger())
+    _err_rows, _err_fail, _err_out = _drive(SESS.probe_release, "http://probe.invalid", 2,
+                                            "2025-11-25", SESS.SessionLedger())
+    urllib.request.urlopen = _fake_mcp(version="2025-11-25", drift="2026-07-28")
+    _drift_rows, _drift_fail, _drift_out = _drive(SESS.probe_release, "http://probe.invalid", 2,
+                                                  "2025-11-25", SESS.SessionLedger())
+    urllib.request.urlopen = _fake_mcp(version="2025-11-25", drift="2026-07-28")
+    _drift_cohorts, _, _ = _drive(SESS.probe_survival, "http://probe.invalid", [1, 1], 1,
+                                  "2025-11-25", SESS.SessionLedger())
+    # Cleanup's choice of revision, made observable: two sessions on different revisions, both
+    # left outstanding, then released — and the fake records what each DELETE actually carried.
+    _seen = []
+    urllib.request.urlopen = _fake_mcp(version="2025-11-25", drift="2026-07-28", seen=_seen)
+    _mixed = SESS.SessionLedger()
+    _s1 = SESS.open_session("http://probe.invalid", _mixed)
+    _s2 = SESS.open_session("http://probe.invalid", _mixed)
+    _clean_rows = SESS.release_all("http://probe.invalid", "2025-11-25", _mixed)
+finally:
+    urllib.request.urlopen = _saved_urlopen4
+# AN ERROR IS NOT A HANDSHAKE, and the notification must not follow one: sending it announces
+# normal operation for a session that never began, and the server's 202 then made the handshake
+# look complete with `version=None` (external review).
+check("an `initialize` that ERRORS is not a completed handshake, and no `initialized` is sent "
+      "after it — a correlated response is not a successful one",
+      SESS.handshake_complete(_err_session) is False
+      and _err_session["version"] is None and _err_session["ack"] is None
+      and SESS.session_eligible(_err_session, "2025-11-25")[0] is False
+      and "-32602" in SESS.session_eligible(_err_session, "2025-11-25")[1],
+      (_err_session["version"], _err_session["ack"],
+       SESS.session_eligible(_err_session, "2025-11-25")))
+# THE EXCLUSION IS REAL, NOT PRINTED. Two failed handshakes used to publish
+# `2 of 2 answered alike: indeterminate` beside a line claiming they were excluded.
+check("rows that fail the gate are excluded from the SAMPLE, not merely announced — a verdict "
+      "over rows that measured nothing is agreement about nothing",
+      len(_err_rows) == 2
+      and all(r["disposition"] == SESS.INDETERMINATE for r in _err_rows)
+      and "over 0 of 2 sessions, 2 excluded" in _err_out
+      and "establishes nothing" in _err_out
+      and any("was measurable" in f for f in _err_fail),
+      (_err_out[-400:], _err_fail))
+# A DIFFERENT REVISION IS A DIFFERENT QUANTITY, and the gate runs BEFORE the request that would
+# have carried the wrong one.
+check("a session negotiating another revision is excluded from Q3 before it is measured, and "
+      "the reason names both revisions",
+      len(_drift_rows) == 2
+      and _drift_rows[0]["disposition"] == SESS.RELEASED
+      and _drift_rows[1]["disposition"] == SESS.INDETERMINATE
+      and "2026-07-28" in _drift_rows[1]["why"] and "2025-11-25" in _drift_rows[1]["why"]
+      and "over 1 of 2 sessions, 1 excluded" in _drift_out,
+      ([r["disposition"] for r in _drift_rows], _drift_rows[1].get("why")))
+check("...and Q4's early return carries the SAME predicate, so a drifted cohort is never "
+      "observed rather than being observed and reported as a survival",
+      len(_drift_cohorts) == 2 and _drift_cohorts[1]["eligible"] is False
+      and all(c["state"] is None for c in _drift_cohorts),
+      [(c["eligible"], c["state"]) for c in _drift_cohorts])
+# THE LEDGER'S VERSION PROVENANCE, checked at the wire rather than in the dict: what did each
+# DELETE actually carry? Cleanup used the run's revision for every session, so the session on
+# the other revision was asked to go under one it never agreed to.
+_deletes = {sid: ver for meth, sid, ver in _seen if meth == "DELETE"}
+check("the ledger records each session's OWN negotiated revision",
+      (_mixed.version_for(_s1["sid"]), _mixed.version_for(_s2["sid"]))
+      == ("2025-11-25", "2026-07-28"),
+      [(s[:8], _mixed.version_for(s)) for s in _mixed.issued])
+check("...and cleanup releases each session UNDER that revision — read from what the DELETE "
+      "carried, not from what the ledger was asked for",
+      _deletes.get(_s1["sid"]) == "2025-11-25"
+      and _deletes.get(_s2["sid"]) == "2026-07-28"
+      and len(_clean_rows) == 2,
+      _deletes)
 
 # --- W is DERIVED. §4: where import is possible, import; this checks the derivation's source. ---
 # --- The one transport line every classification downstream depends on. ---
@@ -3801,16 +3893,21 @@ check("every frame the PROXY classifies malformed is refused here too — the pr
       [(classify_envelope(m), SESS.rpc_response((m,), 7)) for m in _malformed])
 
 # --- Every session's handshake, not only the first. ---
-check("a handshake is complete only with BOTH a correlated response and an accepted "
-      "`initialized` — either half missing is an incomplete handshake",
-      SESS.handshake_complete({"response": _ok_result, "initialized": True}) is True
-      and SESS.handshake_complete({"response": _ok_result, "initialized": False}) is False
-      and SESS.handshake_complete({"response": None, "initialized": True}) is False
+# THREE HALVES, not two: a successful result, a declared version, and an accepted
+# notification. The version joined the predicate when an errored `initialize` was found
+# passing it with `version=None` (external review).
+_hs_ok = {"response": _ok_result, "version": "2025-11-25", "initialized": True}
+check("a handshake is complete only with a SUCCESSFUL result, a declared version AND an "
+      "accepted `initialized` — any one missing is an incomplete handshake",
+      SESS.handshake_complete(_hs_ok) is True
+      and SESS.handshake_complete({**_hs_ok, "initialized": False}) is False
+      and SESS.handshake_complete({**_hs_ok, "version": None}) is False
+      and SESS.handshake_complete({**_hs_ok, "response": _ok_error}) is False
+      and SESS.handshake_complete({**_hs_ok, "response": None}) is False
       and SESS.handshake_complete({}) is False,
       [SESS.handshake_complete(d) for d in
-       ({"response": _ok_result, "initialized": True},
-        {"response": _ok_result, "initialized": False},
-        {"response": None, "initialized": True}, {})])
+       (_hs_ok, {**_hs_ok, "initialized": False}, {**_hs_ok, "version": None},
+        {**_hs_ok, "response": _ok_error}, {**_hs_ok, "response": None}, {})])
 
 # --- The lifecycle. A handshake is not complete until the client says so. ---
 # `notifications/initialized` has no response by definition, so the only available evidence is

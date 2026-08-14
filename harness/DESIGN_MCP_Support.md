@@ -427,13 +427,31 @@ Three rounds of external review changed what the probe *does* without changing w
 *said*, which is the outcome worth recording precisely because nothing in the earlier runs
 would have announced it had the answers differed:
 
-   - **The handshake was incomplete.** The first cut never sent `notifications/initialized`,
-     which `2025-11-25` requires before normal operation, so it measured this server's
-     *tolerance* of an incomplete handshake rather than the lifecycle the bridge executes —
-     two different server behaviours wearing the same numbers. Then only the *first* session's
-     handshake was checked, so a sampled session could be measured through a handshake that
-     never completed. Every sampled and cohort session must now complete one, and must
-     negotiate the same revision, or its row is INDETERMINATE and excluded.
+   - **The handshake was incomplete, three ways, each found after the last was fixed.** The
+     first cut never sent `notifications/initialized`, which `2025-11-25` requires before
+     normal operation, so it measured this server's *tolerance* of an incomplete handshake
+     rather than the lifecycle the bridge executes — two different server behaviours wearing
+     the same numbers. Then only the *first* session's handshake was checked, so a sampled
+     session could be measured through one that never completed. Then `handshake_complete`
+     asked only that the `initialize` response *exist* — and `rpc_response` returns errors
+     too, deliberately, because for LIVENESS an error is the server talking to us. For a
+     HANDSHAKE it is the opposite: `initialize` answered `-32602` is a session that never
+     began, and it was reading complete with `version: null` while the notification announcing
+     normal operation had already been sent. **The same envelope answers the two questions
+     oppositely**, which is why they are now separate predicates rather than one reused.
+   - **The eligibility rules reported rather than gated, which is not the same thing.** For one
+     round the checks existed but ran *after* the sample was taken: Q3 queried and deleted
+     under the run's revision and noticed a mismatch afterwards, and the "excluded" it printed
+     excluded the row from nothing — `sample_verdict` still saw it, so two failed handshakes
+     published *"2 of 2 answered alike: indeterminate"*. **A gate that runs after the thing it
+     gates is a report.** One predicate, `session_eligible`, now runs before any request that
+     would carry the wrong revision, and the sample is the eligible rows with its denominator
+     stated: *"5 of 5 answered alike: released — over 5 of 5 sessions"*.
+   - **The negotiated revision is per-session provenance, not a run-wide constant.** The ledger
+     recorded ids alone, so cleanup released every session under the *first* handshake's
+     revision — leaving alive precisely the session whose correct revision was known, one
+     frame away. It now carries the pair, and the check reads what each `DELETE` actually put
+     on the wire rather than what the ledger was asked for.
    - **The probe leaked sessions while measuring session cleanliness.** The handshake session
      was never released, and Q4 released only cohorts it could still *read* — leaving
      UNREADABLE ones, the state that explicitly does not mean *gone*, running. Every id is now

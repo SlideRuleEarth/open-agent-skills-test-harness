@@ -3714,22 +3714,48 @@ MUTATIONS = [
      "a STRING id does not answer a NUMBER id — different domains per JSON-RPC"),
     # PER-SESSION HANDSHAKE, dropped: a sampled session that never entered normal operation is
     # measured as though it had.
-    ("F162-only-the-first-sessions-handshake-is-required", SESSPROBE,
-     "        if not handshake_complete(s):",
-     "        if False:",
-     ("Q3: EVERY sampled session completed its handshake — a row measured through an "
-      "incomplete one is a reading of a different state, not a weaker reading of this one")),
+    ("F162-the-eligibility-gate-does-not-gate", SESSPROBE,
+     "        eligible, why = session_eligible(s, version)\n        if not eligible:",
+     "        eligible, why = session_eligible(s, version)\n        if False:",
+     ("Q3: EVERY sampled session was measurable — a row taken through an incomplete "
+      "handshake, or a different revision, is a reading of another quantity entirely")),
+    # THE EXCLUSION MADE COSMETIC AGAIN: the row is announced excluded and still enters the
+    # verdict, which is what published `2 of 2 answered alike: indeterminate`.
+    ("F165-excluded-rows-still-enter-the-sample", SESSPROBE,
+     "    measurable = [r for r in rows if r.get(\"eligible\")]",
+     "    measurable = list(rows)",
+     ("rows that fail the gate are excluded from the SAMPLE, not merely announced — a verdict "
+      "over rows that measured nothing is agreement about nothing")),
+    # An errored `initialize` readmitted: a correlated response taken for a successful one.
+    ("F166-an-errored-initialize-is-a-completed-handshake", SESSPROBE,
+     "    if isinstance(response.get(\"error\"), dict):",
+     "    if False:",
+     ("an `initialize` that ERRORS is not a completed handshake, and no `initialized` is sent "
+      "after it — a correlated response is not a successful one")),
+    # The revision dropped from the gate, so a drifted session is measured after all.
+    ("F167-a-drifted-revision-passes-the-gate", SESSPROBE,
+     "    if expected_version is not None and session[\"version\"] != expected_version:",
+     "    if False:",
+     ("a session negotiating another revision is excluded from Q3 before it is measured, and "
+      "the reason names both revisions")),
+    # Cleanup back on the run's revision rather than each session's own.
+    ("F168-cleanup-releases-every-session-under-one-revision", SESSPROBE,
+     "        per_session = ledger.version_for(sid) or version",
+     "        per_session = version",
+     ("...and cleanup releases each session UNDER that revision — read from what the DELETE "
+      "carried, not from what the ledger was asked for")),
     # ...and the half of it that is the notification rather than the response.
     ("F163-an-incomplete-handshake-passes-on-the-response-alone", SESSPROBE,
-     "    return session.get(\"response\") is not None and bool(session.get(\"initialized\"))",
-     "    return session.get(\"response\") is not None",
-     ("a handshake is complete only with BOTH a correlated response and an accepted "
-      "`initialized` — either half missing is an incomplete handshake")),
+     ("    return (isinstance(response, dict) and isinstance(response.get(\"result\"), dict)\n"
+      "            and bool(session.get(\"version\")) and bool(session.get(\"initialized\")))"),
+     ("    return (isinstance(response, dict) and isinstance(response.get(\"result\"), dict)\n"
+      "            and bool(session.get(\"version\")))"),
+     ("a handshake is complete only with a SUCCESSFUL result, a declared version AND an "
+      "accepted `initialized` — any one missing is an incomplete handshake")),
     # A cohort whose handshake never completed still contributes a survival reading.
     ("F164-a-cohort-is-measured-through-an-incomplete-handshake", SESSPROBE,
-     ("          bool(cohorts) and all(c[\"handshake\"] for c in cohorts)\n"
-      "          and {c[\"version\"] for c in cohorts} == {version},"),
-     "          bool(cohorts) and {c[\"version\"] for c in cohorts} == {version},",
+     "    if _ineligible:\n        for c in _ineligible:",
+     "    if []:\n        for c in _ineligible:",
      ("Q4: every cohort completed its handshake and negotiated the same revision — an "
       "idle session that never entered normal operation is a different quantity")),
     # An unset credential variable silently produces no header, so the failure surfaces as an

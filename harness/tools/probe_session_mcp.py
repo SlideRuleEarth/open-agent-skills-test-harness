@@ -471,16 +471,32 @@ class SessionLedger:
     Registration happens the moment an id is seen, BEFORE any question is asked of it, so an
     exception between issue and use cannot lose it. That ordering is the same one §10.10
     requires of the bridge's connect record, and for the same reason.
+
+    THE NEGOTIATED VERSION IS PART OF THE PROVENANCE, not a run-wide constant (external
+    review). Cleanup used the FIRST handshake's revision for every session, so a session that
+    negotiated a different one was sent a `DELETE` under a revision it never agreed to and
+    could survive — with its correct revision sitting in a variable one frame away. **A session
+    id without the revision it was issued under is not enough to release it**, so the ledger
+    carries both and `release_all` reads the pair.
     """
 
     def __init__(self):
         self.issued: list[str] = []
+        self.versions: dict[str, str | None] = {}
         self.released: set[str] = set()
 
-    def note(self, sid):
-        if sid and sid not in self.issued:
+    def note(self, sid, version=None):
+        if not sid:
+            return sid
+        if sid not in self.issued:
             self.issued.append(sid)
+            self.versions[sid] = version
+        elif version is not None:
+            self.versions[sid] = version
         return sid
+
+    def version_for(self, sid):
+        return self.versions.get(sid)
 
     def mark_released(self, sid) -> None:
         if sid:
@@ -542,8 +558,8 @@ def collect_headers(header_args, header_env_args, environ) -> tuple[dict, list[s
 
 
 def handshake_complete(session) -> bool:
-    """Did THIS session's handshake finish — correlated `InitializeResult` and accepted
-    `notifications/initialized`?
+    """Did THIS session's handshake finish — a successful `InitializeResult` that declared a
+    protocol version, followed by an accepted `notifications/initialized`?
 
     **Asked of every session, not only the first** (external review). `probe_handshake` checked
     the one session it opened and every later `open_session` was read for its `sid` alone — so
@@ -551,8 +567,54 @@ def handshake_complete(session) -> bool:
     with `initialized=False` was published as `released` with no finding. A measurement taken
     through a handshake that did not happen is not a weaker measurement; it is a measurement of
     something else, and the sample cannot tell the two apart afterwards.
+
+    **A CORRELATED RESPONSE IS NOT A SUCCESSFUL ONE** (external review, second round). This
+    asked only that the response *exist*, and `rpc_response` returns errors too — deliberately,
+    because for LIVENESS an error is the server talking to us. For a HANDSHAKE it is the
+    opposite: `initialize` answered `-32602` is a session that never began, and the first cut
+    read `handshake_complete=True` with `version=None` for exactly that. The two questions want
+    opposite things from the same envelope, which is why this is a separate predicate rather
+    than a reuse of the liveness one.
     """
-    return session.get("response") is not None and bool(session.get("initialized"))
+    response = session.get("response")
+    return (isinstance(response, dict) and isinstance(response.get("result"), dict)
+            and bool(session.get("version")) and bool(session.get("initialized")))
+
+
+def session_eligible(session, expected_version) -> tuple[bool, str]:
+    """May this session's readings enter the measurement — and if not, in what words?
+
+    ONE PREDICATE, CONSULTED BEFORE THE MEASUREMENT RATHER THAN REPORTED AFTER IT (external
+    review). The previous cut checked handshakes and revisions in `check()` calls that ran once
+    the sample was already taken: Q3 queried and deleted using the FIRST session's revision,
+    then noticed the mismatch afterwards, and the "excluded" it printed was not excluded from
+    anything — `sample_verdict` still saw the row. A gate that runs after the thing it gates is
+    a report, and §4's rule is that a new fact about whether something is trustworthy joins the
+    existing predicate rather than becoming a parallel flag one caller reads.
+
+    The revision is part of it because a session that negotiated a different one is not a
+    weaker sample of the same quantity — it is a sample of a different one, and averaging the
+    two produces a number that describes neither.
+    """
+    response = session.get("response")
+    if response is None:
+        return False, "no correlated initialize response"
+    if isinstance(response.get("error"), dict):
+        err = response["error"]
+        return False, (f"initialize returned an error: {err.get('code')!r} "
+                       f"{str(err.get('message'))[:60]!r}")
+    if not isinstance(response.get("result"), dict):
+        return False, "initialize response carried no result object"
+    if not session.get("version"):
+        return False, "the initialize result declared no protocolVersion"
+    if not session.get("initialized"):
+        return False, "notifications/initialized was not accepted"
+    if not session.get("sid"):
+        return False, "no session id was issued"
+    if expected_version is not None and session["version"] != expected_version:
+        return False, (f"negotiated {session['version']!r}, not the run's "
+                       f"{expected_version!r} — a different revision is a different quantity")
+    return True, ""
 
 
 def initialized_accepted(ack) -> bool:
@@ -580,17 +642,25 @@ def open_session(url: str, ledger: SessionLedger, headers=None) -> dict:
         "jsonrpc": "2.0", "id": rid, "method": "initialize",
         "params": {"protocolVersion": LEGACY_VERSIONS[0], "capabilities": {},
                    "clientInfo": {"name": CLIENT_NAME, "version": "1"}}}, headers=headers)
-    # NOTED BEFORE ANYTHING ELSE HAPPENS — see SessionLedger.
-    sid = ledger.note(reply.headers.get("mcp-session-id"))
     response = reply.rpc(rid)
-    result = (response or {}).get("result") or {}
+    result = response.get("result") if isinstance(response, dict) else None
+    result = result if isinstance(result, dict) else {}
     version = result.get("protocolVersion")
+    version = version if isinstance(version, str) and version else None
+    # NOTED BEFORE ANYTHING ELSE HAPPENS, and noted WITH ITS REVISION — a failed handshake may
+    # still have been issued an id, and an id whose revision is unknown is one cleanup cannot
+    # address correctly. See SessionLedger.
+    sid = ledger.note(reply.headers.get("mcp-session-id"), version)
+    # THE NOTIFICATION FOLLOWS A SUCCESSFUL INITIALIZE, NOT MERELY A CORRELATED ONE. Sending it
+    # after an error announces normal operation for a session that never began — and then the
+    # server's 202 made the handshake look complete (external review).
     ack = None
-    if response is not None:
+    if version:
         ack = _send(url, "POST", {"jsonrpc": "2.0", "method": "notifications/initialized"},
                     sid=sid, version=version, headers=headers)
     return {"reply": reply, "sid": sid, "version": version,
             "response": response, "ack": ack, "initialized": initialized_accepted(ack),
+            "error": response.get("error") if isinstance(response, dict) else None,
             "server_info": result.get("serverInfo") or {},
             "capabilities": result.get("capabilities") or {},
             "framing": reply.headers.get("content-type", "")}
@@ -624,8 +694,12 @@ def release_all(url: str, version: str, ledger: SessionLedger, headers=None) -> 
     """
     rows = []
     for sid in ledger.outstanding():
-        delete = release_session(url, sid, version, headers)
-        state, reply = session_alive(url, sid, version, headers)
+        # EACH SESSION'S OWN REVISION, from the ledger. `version` is the run's, and using it
+        # here sent a `DELETE` under a revision the session never agreed to — leaving alive
+        # precisely the session whose correct revision was known (external review).
+        per_session = ledger.version_for(sid) or version
+        delete = release_session(url, sid, per_session, headers)
+        state, reply = session_alive(url, sid, per_session, headers)
         if state == DEAD:
             ledger.mark_released(sid)
         rows.append({"sid": sid, "delete_status": delete.status, "after": state,
@@ -719,29 +793,29 @@ def probe_release(url: str, n: int, version: str, ledger: SessionLedger,
     rows = []
     for i in range(n):
         s = open_session(url, ledger, headers)
-        # A ROW IS ONLY MEASURABLE THROUGH A COMPLETED HANDSHAKE. An incomplete one is not a
-        # weaker reading of the release question — it is a reading of a different state — so it
-        # is classified INDETERMINATE and excluded from the sample rather than averaged into it.
-        if not handshake_complete(s):
+        # THE GATE RUNS BEFORE THE MEASUREMENT, which is the whole of the fix. It used to run
+        # after: the row was queried and deleted under the RUN's revision, and the mismatch was
+        # noticed by a `check()` once the sample had already been taken (external review).
+        eligible, why = session_eligible(s, version)
+        if not eligible:
             rows.append({"i": i, "sid": s["sid"], "disposition": INDETERMINATE,
-                         "before": None, "after": None, "handshake": False,
-                         "version": s["version"]})
-            print(f"       session {i}: handshake did NOT complete "
-                  f"(response={s['response'] is not None}, initialized={s['initialized']}) "
-                  f"-> {INDETERMINATE}, excluded from the sample")
+                         "before": None, "after": None,
+                         "handshake": handshake_complete(s), "eligible": False,
+                         "why": why, "version": s["version"]})
+            print(f"       session {i}: NOT MEASURABLE — {why}")
+            print(f"                  -> {INDETERMINATE}, excluded from the sample")
             continue
-        if not s["sid"]:
-            rows.append({"i": i, "disposition": NOT_APPLICABLE, "before": None, "after": None,
-                         "handshake": True, "version": s["version"]})
-            continue
-        before, _ = session_alive(url, s["sid"], version, headers)
-        delete = release_session(url, s["sid"], version, headers)
-        after, after_reply = session_alive(url, s["sid"], version, headers)
+        # THIS SESSION'S OWN REVISION on this session's requests. Identical to `version` while
+        # the gate holds, and written this way so it stays correct if the gate ever loosens.
+        vs = s["version"]
+        before, _ = session_alive(url, s["sid"], vs, headers)
+        delete = release_session(url, s["sid"], vs, headers)
+        after, after_reply = session_alive(url, s["sid"], vs, headers)
         if after == DEAD:
             ledger.mark_released(s["sid"])
         rows.append({"i": i, "sid": s["sid"], "before": before, "after": after,
-                     "delete_status": delete.status, "handshake": True,
-                     "version": s["version"],
+                     "delete_status": delete.status, "handshake": True, "eligible": True,
+                     "why": "", "version": vs,
                      "disposition": classify_release(delete, before, after),
                      "after_message": any_error_message(after_reply.events)})
         print(f"       session {i}: alive_before={before} DELETE={delete.status} "
@@ -751,30 +825,34 @@ def probe_release(url: str, n: int, version: str, ledger: SessionLedger,
     # was ever opened satisfies the two `all()`s below and publishes uniform agreement.
     check(f"Q3: {n} sessions were actually opened and read — the sample exists",
           len(rows) == n and all(r.get("sid") for r in rows), rows)
-    # EVERY sampled handshake, not just the first. Ahead of the release checks because a row
-    # taken through an incomplete handshake is not evidence about release at all.
-    check("Q3: EVERY sampled session completed its handshake — a row measured through an "
-          "incomplete one is a reading of a different state, not a weaker reading of this one",
-          bool(rows) and all(r.get("handshake") for r in rows),
-          [(r["i"], r.get("handshake")) for r in rows])
-    # And every one negotiated the SAME revision. A server that switches mid-sample makes the
-    # sample two measurements wearing one number — the §4 lesson about a count that spans
-    # things it does not distinguish.
-    _versions = {r.get("version") for r in rows}
-    check("Q3: ...and every one negotiated the SAME protocol revision, so the sample is one "
-          "measurement rather than several averaged together",
+    # THE SAMPLE IS THE ELIGIBLE ROWS, and this is where "excluded" becomes true rather than
+    # printed. The previous cut computed the verdict over EVERY row, so two failed handshakes
+    # published `2 of 2 answered alike: indeterminate` — an agreement among rows that had
+    # measured nothing, next to a line claiming they were excluded (external review).
+    measurable = [r for r in rows if r.get("eligible")]
+    excluded = [r for r in rows if not r.get("eligible")]
+    check("Q3: EVERY sampled session was measurable — a row taken through an incomplete "
+          "handshake, or a different revision, is a reading of another quantity entirely",
+          bool(rows) and not excluded,
+          [(r["i"], r.get("why")) for r in excluded])
+    # Kept explicit rather than left implied by the gate: this is the sentence §9 publishes,
+    # and a check that restates it fails loudly if the gate is ever loosened underneath it.
+    _versions = {r.get("version") for r in measurable}
+    check("Q3: ...and every MEASURED session negotiated the same protocol revision, so the "
+          "sample is one measurement rather than several averaged together",
           len(_versions) == 1 and _versions == {version}, sorted(map(str, _versions)))
-    check("Q3: every session was demonstrably ALIVE before it was asked to terminate — the "
-          "positive control, without which `gone afterwards` is not attributable to the DELETE",
-          bool(rows) and all(r["before"] == ALIVE for r in rows),
-          [r["before"] for r in rows])
-    dispositions = [r["disposition"] for r in rows]
+    check("Q3: every measured session was demonstrably ALIVE before it was asked to terminate "
+          "— the positive control, without which `gone afterwards` is not attributable to it",
+          bool(measurable) and all(r["before"] == ALIVE for r in measurable),
+          [r["before"] for r in measurable])
+    dispositions = [r["disposition"] for r in measurable]
     phrase, uniform = sample_verdict(dispositions)
-    print(f"       SAMPLE: {phrase}")
+    print(f"       SAMPLE: {phrase} — over {len(measurable)} of {n} sessions"
+          + (f", {len(excluded)} excluded" if excluded else ""))
     check("Q3: the sample is uniform — a split sample is the interesting result and means the "
           "verdict must be recorded per run rather than fixed as a constant",
           uniform, dispositions)
-    check("Q3: no session's reading was INDETERMINATE — an unreadable session is the "
+    check("Q3: no measured session's reading was INDETERMINATE — an unreadable session is the "
           "instrument failing, and it must not be counted as a server behaviour",
           bool(dispositions) and INDETERMINATE not in dispositions, dispositions)
     return rows
@@ -827,22 +905,29 @@ def probe_survival(url: str, horizons, w: int, version: str, ledger: SessionLedg
     cohorts = []
     for h in horizons:
         s = open_session(url, ledger, headers)
+        eligible, why = session_eligible(s, version)
         cohorts.append({"horizon": h, "sid": s["sid"], "opened_at": time.time(),
                         "handshake": handshake_complete(s), "version": s["version"],
-                        "state": None, "phrase": None})
+                        "eligible": eligible, "why": why, "state": None, "phrase": None})
     check("Q4: every cohort session was opened — an unopened cohort observes nothing, and a "
           "silent nothing is indistinguishable from an expiry",
           bool(cohorts) and all(c["sid"] for c in cohorts),
           [(c["horizon"], bool(c["sid"])) for c in cohorts])
     # A COHORT IS A SESSION IN NORMAL OPERATION, or it is not a cohort. An idle-lifetime
-    # reading taken on a half-initialized session measures the server's treatment of THAT,
-    # which is a different quantity wearing this one's units.
+    # reading taken on a half-initialized session, or on one that negotiated a different
+    # revision, measures the server's treatment of THAT — a different quantity wearing this
+    # one's units. ONE PREDICATE, the same one Q3 uses.
+    _ineligible = [c for c in cohorts if not c["eligible"]]
     check("Q4: every cohort completed its handshake and negotiated the same revision — an "
           "idle session that never entered normal operation is a different quantity",
-          bool(cohorts) and all(c["handshake"] for c in cohorts)
-          and {c["version"] for c in cohorts} == {version},
-          [(c["horizon"], c["handshake"], c["version"]) for c in cohorts])
-    if not all(c["sid"] and c["handshake"] for c in cohorts):
+          bool(cohorts) and not _ineligible,
+          [(c["horizon"], c["why"]) for c in _ineligible])
+    # THE EARLY RETURN CARRIES THE SAME PREDICATE. It used to test `sid and handshake`, which
+    # omitted the revision — so a cohort that negotiated a different one went on to be observed
+    # and reported as a survival (external review).
+    if _ineligible:
+        for c in _ineligible:
+            print(f"       idle {c['horizon']:>4}s: NOT MEASURABLE — {c['why']}")
         return cohorts
 
     results: dict[int, dict] = {}
@@ -852,7 +937,8 @@ def probe_survival(url: str, horizons, w: int, version: str, ledger: SessionLedg
         delay = c["opened_at"] + c["horizon"] - time.time()
         if delay > 0:
             time.sleep(delay)
-        state, reply = session_alive(url, c["sid"], version, headers)
+        # THIS COHORT'S OWN REVISION, for the same reason Q3 uses the row's.
+        state, reply = session_alive(url, c["sid"], c["version"], headers)
         c["state"] = state
         c["phrase"] = survival_phrase(c["horizon"], state, w)
         c["http"] = reply.status
