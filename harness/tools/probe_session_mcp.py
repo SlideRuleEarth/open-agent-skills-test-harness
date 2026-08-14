@@ -18,13 +18,21 @@ Streamable HTTP directly, because the questions are about what the *server* does
     SLIDERULE_TOKEN=... python3 tools/probe_session_mcp.py \
         --url URL --header-env 'Authorization=SLIDERULE_TOKEN'
 
-**A CREDENTIAL GOES IN THE ENVIRONMENT, NEVER IN ARGV.** `--header-env NAME=VAR` names the
-variable holding the value, so the token reaches neither the command line nor shell history;
-`--header` is REFUSED outright for credential-bearing header names rather than warned about,
-because a warning arrives after the secret has already been typed. This file recommended the
-argv form until external review pointed out that §10.7 already treats argv as world-readable
-and that this repo's own containment sweep reads `ps -eo command=` — the exposure was
-demonstrated by neighbouring code, not hypothetical.
+**NO HEADER VALUE IS READ FROM THE COMMAND LINE.** `--header-env NAME=VAR` names the variable
+holding the value, so only the variable's NAME reaches argv; the variable must hold the
+**complete** header value including any scheme (`TOK='Bearer eyJ…'`, not the bare token —
+nothing here synthesizes a scheme, because guessing one would send `Bearer <something-else>`
+for anybody not using it). `--header` always refuses, and exists only so the error names the
+flag that works.
+
+The property is STRUCTURAL rather than enumerated, and that is the second correction it took.
+This file first recommended `--header 'Authorization: Bearer …'`, which §10.7 already treats as
+world-readable and which this repo's own containment sweep can read via `ps -eo command=`. The
+fix after that was a denylist of credential-bearing header names — which passed
+`X-SlideRule-Token`, `X-Goog-Api-Key` and `Api-Key` straight through, the motivating server's
+own header shape among them (external review, both rounds). **A list of which names are secret
+can always be one name short, and a guarantee resting on such a list is not one**; refusing
+every command-line value is the version that can actually be checked.
 
 **A READING IS ABOUT THE SERVER IT WAS TAKEN FROM.** C3-4 is named for the SlideRule server and
 §8's motivating pattern is a bearer token against it; the default target here is NASA's public
@@ -132,7 +140,8 @@ sys.path.insert(0, HARNESS)
 # refuse. The same argument covers W below: it is the harness's own cell cap, read from the
 # field that sets it.
 from agentskill_evals.mcp_proxy import (  # noqa: E402 — after the path bootstrap
-    IMPLEMENTED_VERSIONS, LEGACY_VERSIONS, MODERN_VERSIONS,
+    ERROR, IMPLEMENTED_VERSIONS, LEGACY_VERSIONS, MODERN_VERSIONS, RESULT,
+    classify_envelope, request_id_key,
 )
 from agentskill_evals.spec import EvalSpec  # noqa: E402
 
@@ -176,12 +185,6 @@ W_DEFAULT = _cell_cap()
 # Request ids, unique for the life of the process. Correlation is only as good as the id being
 # unrepeatable: a fixed id lets a response to an earlier question satisfy a later one.
 _IDS = itertools.count(1)
-
-# Headers whose VALUE is a credential and must never be supplied where the process table can
-# read it. `--header` puts its argument in argv; this repo runs `ps -eo command=` itself, so
-# that exposure is demonstrated rather than theoretical (external review).
-_SECRET_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie",
-                             "x-api-key", "x-auth-token"})
 
 findings: list[str] = []
 
@@ -262,18 +265,34 @@ def parse_events(content_type: str, raw: str) -> tuple:
 def rpc_response(events, want_id):
     """The JSON-RPC response to `want_id`, or None — the only thing a verdict may read.
 
-    A response is an object carrying `jsonrpc` and an `id` equal to the one sent, with either
-    a `result` or an `error`. Both count as the session answering: "method not found" is a
-    server talking to us, which is what liveness asks. What does NOT count is a notification,
-    someone else's response, or a 200 with no JSON-RPC in it at all.
+    **BOTH HALVES ARE IMPORTED RATHER THAN RE-DERIVED** (§4: where import is possible, import).
+    The first cut hand-rolled them and got both wrong in ways that only a written-down rule
+    catches (external review):
+
+      * *Shape.* It required only that `jsonrpc` be PRESENT, so `"jsonrpc": "1.0"` passed, and
+        an envelope carrying **both** `result` and `error` passed. `classify_envelope` is the
+        function that already decides this, checks the fields the schema makes mandatory, and
+        is what the proxy itself enforces — so a probe re-deriving it could accept a frame the
+        proxy would refuse, and report a live session on it.
+      * *Identity.* It compared with `==`, under which **`True == 1` and `False == 0`** in
+        Python — so a response id of `true` answered a request on id `1`. `request_id_key` is
+        the repo's own answer, and it is public precisely so a probe measures the identity the
+        proxy enforces rather than one adjacent to it. It also makes `1` and `1.0` the same id,
+        which is correct: a peer may echo either spelling of one JSON number.
+
+    A `result` and an `error` both count as the session answering — "method not found" is a
+    server talking to us, which is what liveness asks. An `error` with no `id` is schema-valid
+    but uncorrelatable, so it is not an answer to us; `any_error_message` reads those instead.
     """
+    want = request_id_key(want_id)
     for ev in events or ():
-        if not isinstance(ev, dict) or "jsonrpc" not in ev:
+        if not isinstance(ev, dict):
             continue
-        if ev.get("id") != want_id:
+        if classify_envelope(ev) not in (RESULT, ERROR):
+            continue                       # malformed, a request, or a notification
+        if "id" not in ev or request_id_key(ev["id"]) != want:
             continue
-        if "result" in ev or "error" in ev:
-            return ev
+        return ev
     return None
 
 
@@ -472,32 +491,38 @@ class SessionLedger:
 
 
 def collect_headers(header_args, header_env_args, environ) -> tuple[dict, list[str]]:
-    """Extra request headers, with credential values taken from the ENVIRONMENT, not argv.
+    """Extra request headers. EVERY value comes from the environment; none from argv.
 
-    **A `--header 'Authorization: Bearer …'` puts the token in the process command line and in
-    shell history** (external review). §10.7 already treats argv as world-readable, and this
-    repo's own containment sweep reads `ps -eo command=`, so the exposure is demonstrated
-    rather than argued. `--header` is therefore REFUSED for any header whose value is a
-    credential, and `--header-env NAME=VAR` supplies those by naming the variable that holds
-    the value — the name is what reaches argv, the value never does.
+    **A denylist of credential-bearing header names cannot establish "credentials never reach
+    argv"** (external review). The first cut refused `Authorization`, `Cookie` and a few
+    others — and passed `X-SlideRule-Token`, `X-Goog-Api-Key` and `Api-Key` straight through
+    with their values, which is the motivating server's own header shape among them. The list
+    can always be one name short, and the name it is short of is the one nobody thought of;
+    a guarantee that depends on enumerating every future credential header is not a guarantee.
 
-    Refused rather than warned: a warning on a credential that has already been typed is
-    advice after the fact, and the whole point is that it should not have been typed there.
-    Returns the headers and the list of reasons it would not build them.
+    So the property is made STRUCTURAL rather than enumerated: **no header value is ever read
+    from the command line at all.** `--header-env NAME=VAR` names the variable holding the
+    value, so only the variable's NAME reaches argv. §10.7 already treats argv as
+    world-readable and this repo's own containment sweep runs `ps -eo command=`, so the
+    exposure was demonstrated by neighbouring code rather than argued.
+
+    `--header` still exists, and always refuses, pointing at the flag that works — a directed
+    error for anyone porting a `curl` line, which is better than argparse's "unrecognized
+    argument" and costs no exception to the rule above.
+
+    THE VARIABLE HOLDS THE COMPLETE HEADER VALUE, scheme included: `Authorization=TOK` with
+    `TOK='Bearer eyJ…'`, not the bare token. This function does not synthesize a scheme,
+    because guessing one would silently send `Bearer <basic-credential>` for anybody using a
+    different scheme.
     """
     headers, errors = {}, []
     for raw in header_args or ():
-        name, sep, value = raw.partition(":")
-        name, value = name.strip(), value.strip()
-        if not sep or not name or not value:
-            errors.append(f"--header needs 'Name: value', got {raw!r}")
-            continue
-        if name.lower() in _SECRET_HEADERS:
-            errors.append(
-                f"--header will not carry {name!r}: its value is a credential and argv is "
-                f"world-readable. Use --header-env '{name}=VAR_NAME' instead.")
-            continue
-        headers[name] = value
+        name = (raw.partition(":")[0] or raw).strip() or "that header"
+        errors.append(
+            f"--header will not carry a value from the command line ({name!r}): argv is "
+            f"world-readable, and a list of which header names are secret can always be one "
+            f"name short. Use --header-env '{name}=VAR_NAME', with the variable holding the "
+            f"COMPLETE value including any scheme, e.g. VAR_NAME='Bearer eyJ…'.")
     for raw in header_env_args or ():
         name, sep, var = raw.partition("=")
         name, var = name.strip(), var.strip()
@@ -514,6 +539,20 @@ def collect_headers(header_args, header_env_args, environ) -> tuple[dict, list[s
             continue
         headers[name] = environ[var]
     return headers, errors
+
+
+def handshake_complete(session) -> bool:
+    """Did THIS session's handshake finish — correlated `InitializeResult` and accepted
+    `notifications/initialized`?
+
+    **Asked of every session, not only the first** (external review). `probe_handshake` checked
+    the one session it opened and every later `open_session` was read for its `sid` alone — so
+    a sampled session whose handshake never completed was measured as though it had, and a row
+    with `initialized=False` was published as `released` with no finding. A measurement taken
+    through a handshake that did not happen is not a weaker measurement; it is a measurement of
+    something else, and the sample cannot tell the two apart afterwards.
+    """
+    return session.get("response") is not None and bool(session.get("initialized"))
 
 
 def initialized_accepted(ack) -> bool:
@@ -680,8 +719,20 @@ def probe_release(url: str, n: int, version: str, ledger: SessionLedger,
     rows = []
     for i in range(n):
         s = open_session(url, ledger, headers)
+        # A ROW IS ONLY MEASURABLE THROUGH A COMPLETED HANDSHAKE. An incomplete one is not a
+        # weaker reading of the release question — it is a reading of a different state — so it
+        # is classified INDETERMINATE and excluded from the sample rather than averaged into it.
+        if not handshake_complete(s):
+            rows.append({"i": i, "sid": s["sid"], "disposition": INDETERMINATE,
+                         "before": None, "after": None, "handshake": False,
+                         "version": s["version"]})
+            print(f"       session {i}: handshake did NOT complete "
+                  f"(response={s['response'] is not None}, initialized={s['initialized']}) "
+                  f"-> {INDETERMINATE}, excluded from the sample")
+            continue
         if not s["sid"]:
-            rows.append({"i": i, "disposition": NOT_APPLICABLE, "before": None, "after": None})
+            rows.append({"i": i, "disposition": NOT_APPLICABLE, "before": None, "after": None,
+                         "handshake": True, "version": s["version"]})
             continue
         before, _ = session_alive(url, s["sid"], version, headers)
         delete = release_session(url, s["sid"], version, headers)
@@ -689,7 +740,8 @@ def probe_release(url: str, n: int, version: str, ledger: SessionLedger,
         if after == DEAD:
             ledger.mark_released(s["sid"])
         rows.append({"i": i, "sid": s["sid"], "before": before, "after": after,
-                     "delete_status": delete.status,
+                     "delete_status": delete.status, "handshake": True,
+                     "version": s["version"],
                      "disposition": classify_release(delete, before, after),
                      "after_message": any_error_message(after_reply.events)})
         print(f"       session {i}: alive_before={before} DELETE={delete.status} "
@@ -699,6 +751,19 @@ def probe_release(url: str, n: int, version: str, ledger: SessionLedger,
     # was ever opened satisfies the two `all()`s below and publishes uniform agreement.
     check(f"Q3: {n} sessions were actually opened and read — the sample exists",
           len(rows) == n and all(r.get("sid") for r in rows), rows)
+    # EVERY sampled handshake, not just the first. Ahead of the release checks because a row
+    # taken through an incomplete handshake is not evidence about release at all.
+    check("Q3: EVERY sampled session completed its handshake — a row measured through an "
+          "incomplete one is a reading of a different state, not a weaker reading of this one",
+          bool(rows) and all(r.get("handshake") for r in rows),
+          [(r["i"], r.get("handshake")) for r in rows])
+    # And every one negotiated the SAME revision. A server that switches mid-sample makes the
+    # sample two measurements wearing one number — the §4 lesson about a count that spans
+    # things it does not distinguish.
+    _versions = {r.get("version") for r in rows}
+    check("Q3: ...and every one negotiated the SAME protocol revision, so the sample is one "
+          "measurement rather than several averaged together",
+          len(_versions) == 1 and _versions == {version}, sorted(map(str, _versions)))
     check("Q3: every session was demonstrably ALIVE before it was asked to terminate — the "
           "positive control, without which `gone afterwards` is not attributable to the DELETE",
           bool(rows) and all(r["before"] == ALIVE for r in rows),
@@ -763,12 +828,21 @@ def probe_survival(url: str, horizons, w: int, version: str, ledger: SessionLedg
     for h in horizons:
         s = open_session(url, ledger, headers)
         cohorts.append({"horizon": h, "sid": s["sid"], "opened_at": time.time(),
+                        "handshake": handshake_complete(s), "version": s["version"],
                         "state": None, "phrase": None})
     check("Q4: every cohort session was opened — an unopened cohort observes nothing, and a "
           "silent nothing is indistinguishable from an expiry",
           bool(cohorts) and all(c["sid"] for c in cohorts),
           [(c["horizon"], bool(c["sid"])) for c in cohorts])
-    if not all(c["sid"] for c in cohorts):
+    # A COHORT IS A SESSION IN NORMAL OPERATION, or it is not a cohort. An idle-lifetime
+    # reading taken on a half-initialized session measures the server's treatment of THAT,
+    # which is a different quantity wearing this one's units.
+    check("Q4: every cohort completed its handshake and negotiated the same revision — an "
+          "idle session that never entered normal operation is a different quantity",
+          bool(cohorts) and all(c["handshake"] for c in cohorts)
+          and {c["version"] for c in cohorts} == {version},
+          [(c["horizon"], c["handshake"], c["version"]) for c in cohorts])
+    if not all(c["sid"] and c["handshake"] for c in cohorts):
         return cohorts
 
     results: dict[int, dict] = {}
@@ -826,11 +900,12 @@ def main() -> int:
     ap.add_argument("--skip-survival", action="store_true",
                     help="Q1-Q3 only — skips the timed hold, which takes W seconds")
     ap.add_argument("--header", action="append", default=[], metavar="'Name: value'",
-                    help="extra request header, repeatable. REFUSED for credential headers — "
-                         "argv is world-readable; use --header-env for those")
+                    help="ALWAYS REFUSED — no header value is read from the command line. "
+                         "Kept so the error names --header-env instead of argparse's")
     ap.add_argument("--header-env", action="append", default=[], metavar="'Name=ENV_VAR'",
-                    help="header whose VALUE is read from the named environment variable, so "
-                         "the credential never reaches argv or shell history")
+                    help="header whose VALUE is read from the named environment variable, "
+                         "which must hold the COMPLETE value including any scheme (e.g. "
+                         "'Bearer eyJ...'). Only the variable name reaches argv")
     args = ap.parse_args()
 
     headers, header_errors = collect_headers(args.header, args.header_env, os.environ)

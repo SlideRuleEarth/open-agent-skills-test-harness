@@ -422,19 +422,32 @@ CLI-native keeps values off disk but is inconsistent (copilot/agy have nothing).
 
    **Two findings came free from the same requests, both of which the bridge has to survive.** The server answers **ordinary POSTs with `text/event-stream` framing**, which the Streamable HTTP binding permits and which a reader assuming `application/json` would parse as malformed — reporting a broken server where there is a conformant one. And the endpoint sits behind **CloudFront**, so there is an intermediary in the path that §10.10 was written without contemplating; nothing here was upset by it, which is itself the reading.
 
-   **The reading was taken twice, and the first one was through an incomplete handshake.** The
-first cut never sent `notifications/initialized`, which the `2025-11-25` lifecycle requires
-before normal operation — so it measured this server's *tolerance* of an incomplete handshake
-rather than the lifecycle the bridge will execute, and the two are different server behaviours
-wearing the same numbers (external review). Re-run with the notification sent and accepted, and
-**every answer above is unchanged**. That is worth recording rather than quietly overwriting:
-the conclusions survived, but nothing in the first run would have said so if they had not, and
-"the server tolerated it" is exactly why nothing noticed — a server that refused would have
-failed loudly. The same round found the probe **leaking sessions while measuring session
-cleanliness**: the handshake session was never released and Q4 released only cohorts it could
-still read, so an UNREADABLE session — the state that explicitly does not mean *gone* — was
-left running. Every id is now tracked from the moment it is issued and released in a `finally`,
-verified rather than assumed, and the corrected run reports 9 of 9 released and observed gone.
+   **The reading was re-taken after every correction to the instrument, and it never moved.**
+Three rounds of external review changed what the probe *does* without changing what the server
+*said*, which is the outcome worth recording precisely because nothing in the earlier runs
+would have announced it had the answers differed:
+
+   - **The handshake was incomplete.** The first cut never sent `notifications/initialized`,
+     which `2025-11-25` requires before normal operation, so it measured this server's
+     *tolerance* of an incomplete handshake rather than the lifecycle the bridge executes —
+     two different server behaviours wearing the same numbers. Then only the *first* session's
+     handshake was checked, so a sampled session could be measured through a handshake that
+     never completed. Every sampled and cohort session must now complete one, and must
+     negotiate the same revision, or its row is INDETERMINATE and excluded.
+   - **The probe leaked sessions while measuring session cleanliness.** The handshake session
+     was never released, and Q4 released only cohorts it could still *read* — leaving
+     UNREADABLE ones, the state that explicitly does not mean *gone*, running. Every id is now
+     tracked from the moment it is issued and released in a `finally`, verified rather than
+     assumed: **9 of 9 released and observed gone**.
+   - **The credential route promised a property it could not keep.** It first recommended
+     passing a bearer token in argv; the fix after that was a denylist of credential-bearing
+     header names, which passed `X-SlideRule-Token` and `X-Goog-Api-Key` — §8's own header
+     shape among them. **A list of which names are secret can always be one name short**, so
+     no header value is read from the command line at all; `--header-env` names the variable.
+
+   That last one is the §4 lesson in its sharpest form: the first fix addressed the
+reproduction (`Authorization`) rather than the principle (*a credential must not reach argv*),
+and the principle quantified over every header name there will ever be.
 
    **The probe's own classification is under test, because that is what the decision rests on** (§E20 in `verify_mcp_fixtures.py`, driven on synthetic rows, and mutation-tested as `F138`–`F149`). Liveness is tri-state — ALIVE, DEAD, **UNREADABLE** — and never a bool: a connection reset is the absence of a reading, and collapsing it into "dead" would publish the instrument's own failure as the server's cleanest possible behaviour, which is C3-1's swallowed `OSError` in a third place. Every release reads liveness **before** as well as after, because "gone" needs something to be gone relative to. And `urllib` raises on 4xx, so the one answer this probe exists to read arrives as an exception — a `_send` that filed it as a transport failure would report every released session as unmeasurable, from a server answering perfectly. That line has its own check and its own mutation.
 

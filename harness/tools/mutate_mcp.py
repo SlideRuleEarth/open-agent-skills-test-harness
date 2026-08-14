@@ -3641,18 +3641,20 @@ MUTATIONS = [
      "        return ALIVE",
      ("a 2xx with NO JSON-RPC answer in it is UNREADABLE, not ALIVE — an empty body, a CDN "
       "interstitial and an unparseable one are transport successes carrying no MCP evidence")),
-    # Correlation dropped: someone else's response, or a replayed one, answers our question.
+    # Correlation dropped entirely: someone else's response, or a replayed one, answers us.
     ("F151-a-response-to-another-request-answers-ours", SESSPROBE,
-     "        if ev.get(\"id\") != want_id:\n            continue",
+     "        if \"id\" not in ev or request_id_key(ev[\"id\"]) != want:\n            continue",
      "        if False:\n            continue",
      "...and a JSON-RPC response to a DIFFERENT id does not answer ours"),
-    # A notification has no result and no error. Accepting one as a response means a server
-    # that merely said something counts as a server that answered.
-    ("F152-a-notification-counts-as-a-response", SESSPROBE,
-     "        if \"result\" in ev or \"error\" in ev:\n            return ev",
-     "        return ev",
-     ("...and a notification is not a response, however well-formed — nor is an envelope "
-      "with our own id that carries NEITHER a result nor an error")),
+    # An ERROR response dropped from the accepted shapes. "Method not found" is the server
+    # talking to us — refusing to count it reports a live session as unreadable on a
+    # technicality, which is the false negative that matches the wrong direction of the
+    # tri-state.
+    ("F152-an-error-response-is-not-counted-as-the-server-answering", SESSPROBE,
+     "        if classify_envelope(ev) not in (RESULT, ERROR):\n            continue",
+     "        if classify_envelope(ev) not in (RESULT,):\n            continue",
+     ("a well-formed result and a well-formed error both answer our id — an error is the "
+      "server talking to us, which is what liveness asks")),
     # THE PRIMING-EVENT BUG, restored: keep only the first event and the probe reads whatever
     # arrived first as its answer.
     ("F153-only-the-first-sse-event-is-kept", SESSPROBE,
@@ -3680,12 +3682,56 @@ MUTATIONS = [
      "        ledger.mark_released(sid)",
      ("a session whose post-DELETE read is UNREADABLE stays OUTSTANDING — cleanup keyed on "
       "readability would walk past exactly the sessions most likely to still be alive")),
-    # The credential goes back into argv.
-    ("F157-a-credential-header-is-accepted-from-argv", SESSPROBE,
-     "        if name.lower() in _SECRET_HEADERS:",
+    # THE CREDENTIAL GOES BACK INTO ARGV. Not a denylist any more — the refusal is the whole
+    # loop, so re-admitting command-line values is the mutation.
+    ("F157-a-header-value-is-accepted-from-argv-again", SESSPROBE,
+     "    for raw in header_args or ():\n        name = (raw.partition(\":\")[0] or raw).strip()",
+     "    for raw in [] or ():\n        name = (raw.partition(\":\")[0] or raw).strip()",
+     ("NO header value is accepted from the command line, whatever the header is called, and "
+      "each one is REFUSED rather than silently dropped — a list of which names are secret can "
+      "always be one name short, so the rule is the flag")),
+    # The refusal stops naming the flag that works, so the caller is stuck.
+    ("F159-the-refusal-does-not-name-the-working-flag", SESSPROBE,
+     ("            f\"world-readable, and a list of which header names are secret can always be one \"\n"
+      "            f\"name short. Use --header-env '{name}=VAR_NAME', with the variable holding the \"\n"
+      "            f\"COMPLETE value including any scheme, e.g. VAR_NAME='Bearer eyJ…'.\")"),
+     "            f\"world-readable.\")",
+     ("...and each refusal NAMES the flag that works, so the error is directed rather than a "
+      "bare rejection")),
+    # ENVELOPE RIGOUR, un-delegated. Each of these re-derives a rule the proxy already owns.
+    ("F160-envelope-shape-is-not-checked-against-the-proxys-rule", SESSPROBE,
+     "        if classify_envelope(ev) not in (RESULT, ERROR):\n            continue",
+     "        if \"jsonrpc\" not in ev:\n            continue",
+     ("every frame the PROXY classifies malformed is refused here too — the probe inherits the "
+      "rule rather than agreeing with it by coincidence")),
+    # Identity by STRING, which collapses the two domains JSON-RPC keeps apart: `"1"` and `1`
+    # are different ids, and `str()` makes them one. Plain `==` is NOT the mutation here — the
+    # shape gate rejects boolean ids before the comparison runs, so `==` is equivalent past it
+    # and an equivalent mutant proves nothing (found by the suite reporting it uncaught).
+    ("F161-request-id-domains-are-collapsed-by-stringifying", SESSPROBE,
+     "        if \"id\" not in ev or request_id_key(ev[\"id\"]) != want:\n            continue",
+     "        if \"id\" not in ev or str(ev[\"id\"]) != str(want_id):\n            continue",
+     "a STRING id does not answer a NUMBER id — different domains per JSON-RPC"),
+    # PER-SESSION HANDSHAKE, dropped: a sampled session that never entered normal operation is
+    # measured as though it had.
+    ("F162-only-the-first-sessions-handshake-is-required", SESSPROBE,
+     "        if not handshake_complete(s):",
      "        if False:",
-     ("a CREDENTIAL header is REFUSED from --header, by name, with the safe route named — "
-      "argv is world-readable and this repo's own sweep reads `ps -eo command=`")),
+     ("Q3: EVERY sampled session completed its handshake — a row measured through an "
+      "incomplete one is a reading of a different state, not a weaker reading of this one")),
+    # ...and the half of it that is the notification rather than the response.
+    ("F163-an-incomplete-handshake-passes-on-the-response-alone", SESSPROBE,
+     "    return session.get(\"response\") is not None and bool(session.get(\"initialized\"))",
+     "    return session.get(\"response\") is not None",
+     ("a handshake is complete only with BOTH a correlated response and an accepted "
+      "`initialized` — either half missing is an incomplete handshake")),
+    # A cohort whose handshake never completed still contributes a survival reading.
+    ("F164-a-cohort-is-measured-through-an-incomplete-handshake", SESSPROBE,
+     ("          bool(cohorts) and all(c[\"handshake\"] for c in cohorts)\n"
+      "          and {c[\"version\"] for c in cohorts} == {version},"),
+     "          bool(cohorts) and {c[\"version\"] for c in cohorts} == {version},",
+     ("Q4: every cohort completed its handshake and negotiated the same revision — an "
+      "idle session that never entered normal operation is a different quantity")),
     # An unset credential variable silently produces no header, so the failure surfaces as an
     # auth error far from its cause.
     ("F158-an-unset-credential-variable-is-skipped-in-silence", SESSPROBE,

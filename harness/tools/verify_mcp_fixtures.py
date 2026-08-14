@@ -3359,12 +3359,32 @@ print("E20. C3-4: probe_session_mcp.py's classification, which is where the §10
 # `elif` chain decided the published result and had no check at all, so every check on the
 # INSTRUMENT could stay green over a classifier that reported a dead CLI as a measurement.
 # Synthetic rows for the same reason: the point is the classification, not another live run.
+import itertools  # noqa: E402 — section-local, beside the fake server that uses it
 import probe_session_mcp as SESS  # noqa: E402 — section-local, after the path bootstrap at E14
 from agentskill_evals.mcp_proxy import IMPLEMENTED_VERSIONS as _IMPL  # noqa: E402
 from agentskill_evals.spec import EvalSpec as _EvalSpec  # noqa: E402
 
 
 _WANT = 7          # the id "we sent"; correlation is what makes a reply a reply
+
+
+# A `urlopen` response as the stdlib hands it over. Defined HERE, ahead of every
+# stub below, because `_send` catches `Exception` broadly: a NameError inside a stub
+# becomes `Reply(error=...)` and the check fails as though the SERVER were
+# unreachable. The instrument's own breakage wearing the subject's failure mode is
+# the thing this file exists to prevent, and it happened here first.
+class _FakeResp:
+    def __init__(self, status, headers, body):
+        self.status, self.headers, self._body = status, headers, body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
 
 
 def _reply(status=None, message=None, *, rid=_WANT, answered=True, events=None):
@@ -3600,6 +3620,108 @@ check("an out-of-band error message is readable though its id matches nothing we
       == "Session has been terminated"
       and SESS.any_error_message(({"jsonrpc": "2.0", "id": 7, "result": {}},)) is None)
 
+# --- The QUESTION FUNCTIONS themselves, driven offline against a fake server. ---
+# Everything above tests a classifier in isolation. What decides whether a row reaches the
+# sample is the CALLER, and nothing offline reached it: `probe_release` and `probe_survival`
+# only run against a live endpoint, which is precisely the "nothing routine runs it" gap E18
+# was written for. Two mutations had no offline check to name because of it. A stubbed opener
+# closes that without a network: the fake answers `initialize` with a correlated result and a
+# session id, and its `notifications/initialized` status is the knob.
+_sid_seq = itertools.count(1)
+
+
+def _fake_mcp(initialized_status=202, version="2025-11-25"):
+    """A minimal Streamable-HTTP MCP server as `urlopen` sees it.
+
+    IT HONOURS ITS OWN DELETE, which is not decoration: a fake that answers `tools/list`
+    whatever has happened can never produce a RELEASE, so the positive control below could
+    only ever have read RETAINED and the two checks it licenses would have rested on a driver
+    incapable of the good outcome. `initialized_status` is the knob the handshake cases turn.
+    """
+    terminated = set()
+
+    def opener(req, timeout=None):
+        payload = json.loads(req.data) if req.data else {}
+        sid = req.get_header("Mcp-session-id")
+        if req.get_method() == "DELETE":
+            terminated.add(sid)
+            return _FakeResp(200, {"content-type": "application/json"}, b"")
+        if sid in terminated:
+            raise urllib.error.HTTPError(
+                "http://probe.invalid", 404, "Not Found", {"content-type": "application/json"},
+                io.BytesIO(b'{"jsonrpc":"2.0","id":"server-error",'
+                           b'"error":{"code":-32600,"message":"Session has been terminated"}}'))
+        method = payload.get("method")
+        if method == "initialize":
+            body = {"jsonrpc": "2.0", "id": payload["id"],
+                    "result": {"protocolVersion": version, "capabilities": {},
+                               "serverInfo": {"name": "fake", "version": "1"}}}
+            return _FakeResp(200, {"content-type": "application/json",
+                                   "mcp-session-id": f"sid-{next(_sid_seq)}"},
+                             json.dumps(body).encode())
+        if method == "notifications/initialized":
+            if initialized_status >= 400:
+                raise urllib.error.HTTPError("http://probe.invalid", initialized_status,
+                                             "refused", {}, io.BytesIO(b""))
+            return _FakeResp(initialized_status, {}, b"")
+        body = {"jsonrpc": "2.0", "id": payload["id"], "result": {"tools": []}}
+        return _FakeResp(200, {"content-type": "application/json"}, json.dumps(body).encode())
+    return opener
+
+
+def _drive(fn, *args, **kwargs):
+    """Run one probe question against the fake, swallowing its output and its findings.
+
+    The probe's `check()` prints and appends to its own `findings`; neither belongs in this
+    verifier's transcript or exit status, so both are captured and restored. What is returned
+    is the rows, which is what a caller's DECISION looks like from outside.
+    """
+    saved_findings = list(SESS.findings)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            rows = fn(*args, **kwargs)
+        return rows, list(SESS.findings)[len(saved_findings):], said.getvalue()
+    finally:
+        SESS.findings[:] = saved_findings
+
+
+_saved_urlopen3 = urllib.request.urlopen
+try:
+    urllib.request.urlopen = _fake_mcp(initialized_status=202)
+    _good_rows, _good_fail, _ = _drive(SESS.probe_release, "http://probe.invalid", 2,
+                                       "2025-11-25", SESS.SessionLedger())
+    urllib.request.urlopen = _fake_mcp(initialized_status=400)
+    _bad_rows, _bad_fail, _bad_out = _drive(SESS.probe_release, "http://probe.invalid", 2,
+                                            "2025-11-25", SESS.SessionLedger())
+    urllib.request.urlopen = _fake_mcp(initialized_status=400)
+    _bad_cohorts, _bad_cohort_fail, _ = _drive(SESS.probe_survival, "http://probe.invalid",
+                                               [1], 1, "2025-11-25", SESS.SessionLedger())
+finally:
+    urllib.request.urlopen = _saved_urlopen3
+# THE CONTROL FIRST: without it, "the bad case fails" is equally the story of a driver that
+# cannot make anything pass.
+check("driven against a fake server that completes the handshake, every sampled row is a "
+      "RELEASE and the sample reports no findings — the positive control for the two below",
+      len(_good_rows) == 2 and all(r["disposition"] == SESS.RELEASED for r in _good_rows)
+      and _good_fail == [],
+      ([r.get("disposition") for r in _good_rows], _good_fail))
+check("Q3: EVERY sampled session completed its handshake — a row measured through an "
+      "incomplete one is a reading of a different state, not a weaker reading of this one",
+      len(_bad_rows) == 2
+      and all(r["disposition"] == SESS.INDETERMINATE for r in _bad_rows)
+      and all(r["handshake"] is False for r in _bad_rows)
+      and any("completed its handshake" in f for f in _bad_fail),
+      ([r.get("disposition") for r in _bad_rows], _bad_fail))
+check("...and the excluded row SAYS why, rather than vanishing from a smaller sample",
+      "handshake did NOT complete" in _bad_out and "excluded from the sample" in _bad_out,
+      _bad_out[:300])
+check("Q4: every cohort completed its handshake and negotiated the same revision — an "
+      "idle session that never entered normal operation is a different quantity",
+      len(_bad_cohorts) == 1 and _bad_cohorts[0]["handshake"] is False
+      and _bad_cohorts[0]["state"] is None
+      and any("cohort completed its handshake" in f for f in _bad_cohort_fail),
+      ([(c["handshake"], c["state"]) for c in _bad_cohorts], _bad_cohort_fail))
+
 # --- W is DERIVED. §4: where import is possible, import; this checks the derivation's source. ---
 # --- The one transport line every classification downstream depends on. ---
 # `urllib` RAISES on 4xx, so the 404 this probe exists to read arrives as an EXCEPTION. Filing
@@ -3635,6 +3757,61 @@ check("...while a genuine transport failure has NO status and reads UNREADABLE, 
       _rerr.status is None and _rerr.error
       and SESS.classify_liveness(_rerr, _WANT) == SESS.UNREADABLE, (_rerr.status, _rerr.error))
 
+# --- Envelope and id rigour, DELEGATED to the proxy's own rules rather than re-derived. ---
+# §4: where import is possible, import. The hand-rolled version required only that `jsonrpc` be
+# PRESENT and compared ids with `==` — under which `True == 1` in Python. Each case below is a
+# frame the PROXY would refuse; a probe that accepted one would report a live session on a
+# message the mechanism it informs would have thrown away (external review).
+_ok_result = {"jsonrpc": "2.0", "id": 7, "result": {"tools": []}}
+_ok_error = {"jsonrpc": "2.0", "id": 7, "error": {"code": -32601, "message": "nope"}}
+check("a well-formed result and a well-formed error both answer our id — an error is the "
+      "server talking to us, which is what liveness asks",
+      SESS.rpc_response((_ok_result,), 7) == _ok_result
+      and SESS.rpc_response((_ok_error,), 7) == _ok_error)
+check("a BOOLEAN id does not answer a numeric one — `True == 1` and `False == 0` in Python, "
+      "which is exactly the alias `valid_request_id` excludes and `==` did not",
+      SESS.rpc_response(({"jsonrpc": "2.0", "id": True, "result": {}},), 1) is None
+      and SESS.rpc_response(({"jsonrpc": "2.0", "id": False, "result": {}},), 0) is None,
+      (SESS.rpc_response(({"jsonrpc": "2.0", "id": True, "result": {}},), 1),
+       SESS.rpc_response(({"jsonrpc": "2.0", "id": False, "result": {}},), 0)))
+check("a wrong `jsonrpc` version is not a response — presence is not the check, the value is",
+      SESS.rpc_response(({"jsonrpc": "1.0", "id": 7, "result": {}},), 7) is None
+      and SESS.rpc_response(({"id": 7, "result": {}},), 7) is None)
+check("an envelope carrying BOTH `result` and `error` is malformed, not an answer",
+      SESS.rpc_response(({"jsonrpc": "2.0", "id": 7, "result": {},
+                          "error": {"code": 1, "message": "x"}},), 7) is None)
+# THE TWO IDENTITY RULES THE PROXY ENFORCES, both inherited rather than restated: strings and
+# numbers are different domains, but within numbers the VALUE is the id.
+check("a STRING id does not answer a NUMBER id — different domains per JSON-RPC",
+      SESS.rpc_response(({"jsonrpc": "2.0", "id": "1", "result": {}},), 1) is None)
+check("...while `1` answered as `1.0` DOES correlate, because they are one JSON number and a "
+      "peer may echo either spelling",
+      SESS.rpc_response(({"jsonrpc": "2.0", "id": 1.0, "result": {}},), 1) is not None)
+# PINNED TO THE ORIGINAL, not merely consistent with it: every frame the proxy calls malformed
+# must be refused here, so the two cannot drift apart if `classify_envelope` gains a rule.
+_malformed = [{"jsonrpc": "2.0", "id": 7, "result": {}, "error": {"code": 1, "message": "x"}},
+              {"jsonrpc": "1.0", "id": 7, "result": {}},
+              {"jsonrpc": "2.0", "id": True, "result": {}},
+              {"jsonrpc": "2.0", "result": {}},
+              {"jsonrpc": "2.0", "id": 7, "method": "x", "result": {}}]
+check("every frame the PROXY classifies malformed is refused here too — the probe inherits the "
+      "rule rather than agreeing with it by coincidence",
+      all(not isinstance(classify_envelope(m), str) for m in _malformed)   # an Anomaly, not a shape
+      and all(SESS.rpc_response((m,), 7) is None for m in _malformed),
+      [(classify_envelope(m), SESS.rpc_response((m,), 7)) for m in _malformed])
+
+# --- Every session's handshake, not only the first. ---
+check("a handshake is complete only with BOTH a correlated response and an accepted "
+      "`initialized` — either half missing is an incomplete handshake",
+      SESS.handshake_complete({"response": _ok_result, "initialized": True}) is True
+      and SESS.handshake_complete({"response": _ok_result, "initialized": False}) is False
+      and SESS.handshake_complete({"response": None, "initialized": True}) is False
+      and SESS.handshake_complete({}) is False,
+      [SESS.handshake_complete(d) for d in
+       ({"response": _ok_result, "initialized": True},
+        {"response": _ok_result, "initialized": False},
+        {"response": None, "initialized": True}, {})])
+
 # --- The lifecycle. A handshake is not complete until the client says so. ---
 # `notifications/initialized` has no response by definition, so the only available evidence is
 # the transport status — treated as the weaker fact it is, and NOT as a correlated answer.
@@ -3666,20 +3843,6 @@ check("...and a ledger nothing was put into has nothing outstanding, which is wh
 # the DELETE is its claim, and the ledger records observations.
 
 
-class _FakeResp:
-    def __init__(self, status, headers, body):
-        self.status, self.headers, self._body = status, headers, body
-
-    def read(self):
-        return self._body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_exc):
-        return False
-
-
 _saved_urlopen2 = urllib.request.urlopen
 try:
     urllib.request.urlopen = lambda req, timeout=None: _FakeResp(
@@ -3703,18 +3866,50 @@ check("...while one OBSERVED gone is marked released, so the check above can act
       _led_gone.outstanding() == [] and _rows_gone[0]["after"] == SESS.DEAD,
       (_led_gone.outstanding(), _rows_gone))
 
-# --- Credentials never reach argv. ---
-check("an ordinary header is accepted from --header",
-      SESS.collect_headers(["X-Trace: abc"], [], {}) == ({"X-Trace": "abc"}, []))
-check("a CREDENTIAL header is REFUSED from --header, by name, with the safe route named — "
-      "argv is world-readable and this repo's own sweep reads `ps -eo command=`",
+# --- Credentials never reach argv, and the property is STRUCTURAL rather than enumerated. ---
+# A DENYLIST OF SECRET-SOUNDING NAMES CANNOT ESTABLISH THIS (external review, second round).
+# The previous cut refused `Authorization` and `Cookie` and passed `X-SlideRule-Token`,
+# `X-Goog-Api-Key` and `Api-Key` — the motivating server's own header shape among them. So the
+# check is no longer "are the secret names refused" but "is ANY command-line value refused",
+# which is a property a finite list cannot fake and a reader can confirm by construction.
+_ARGV_NAMES = ("Authorization", "Cookie", "X-API-Key", "X-SlideRule-Token", "X-Goog-Api-Key",
+               "Api-Key", "X-Amz-Security-Token", "X-Trace", "Accept-Language", "anything")
+# REFUSED, NOT MERELY UNUSED. `headers == {}` alone cannot tell a refusal from a header
+# silently dropped on the floor — and a value the caller believes they set, which never goes
+# out, is its own defect: the request is made without the credential and the failure surfaces
+# as the server's 401. So the check requires the empty result AND a stated reason (F157).
+check("NO header value is accepted from the command line, whatever the header is called, and "
+      "each one is REFUSED rather than silently dropped — a list of which names are secret can "
+      "always be one name short, so the rule is the flag",
       all(SESS.collect_headers([f"{n}: secret"], [], {})[0] == {}
-          and "--header-env" in SESS.collect_headers([f"{n}: secret"], [], {})[1][0]
-          for n in ("Authorization", "authorization", "Cookie", "X-API-Key")),
-      [SESS.collect_headers([f"{n}: s"], [], {}) for n in ("Authorization", "Cookie")])
-check("...and the refusal does not leak the value it refused into its own message",
-      "secret" not in " ".join(SESS.collect_headers(["Authorization: secret"], [], {})[1]),
-      SESS.collect_headers(["Authorization: secret"], [], {})[1])
+          and SESS.collect_headers([f"{n}: secret"], [], {})[1] != [] for n in _ARGV_NAMES),
+      [(n, SESS.collect_headers([f"{n}: secret"], [], {})) for n in _ARGV_NAMES[:3]])
+check("...and each refusal NAMES the flag that works, so the error is directed rather than a "
+      "bare rejection",
+      all(any("--header-env" in e for e in SESS.collect_headers([f"{n}: secret"], [], {})[1])
+          for n in _ARGV_NAMES),
+      [SESS.collect_headers([f"{n}: s"], [], {})[1] for n in _ARGV_NAMES[:3]])
+# A SENTINEL THAT CANNOT COLLIDE WITH THE MESSAGE'S OWN PROSE. Searching for "secret" failed
+# against a refusal that explains which header names are *secret* — the check was right and the
+# probe value was wrong, which is its own small lesson about choosing a needle.
+_SENT = "Zx9Q-sentinel-not-in-any-prose"
+check("...and no refusal echoes the value it refused into its own message",
+      not any(_SENT in " ".join(SESS.collect_headers([f"{n}: {_SENT}"], [], {})[1])
+              for n in _ARGV_NAMES),
+      [SESS.collect_headers([f"Authorization: {_SENT}"], [], {})[1]])
+# THE SCHEME IS THE CALLER'S. Synthesizing `Bearer ` would send it for a caller using Basic or
+# a bare API key, so the variable carries the complete value and the guidance says so.
+check("the variable holds the COMPLETE header value, scheme included, and nothing synthesizes "
+      "one — a guessed scheme would be sent verbatim for anyone not using it",
+      SESS.collect_headers([], ["Authorization=T"], {"T": "Bearer eyJ"})[0]
+      == {"Authorization": "Bearer eyJ"}
+      and SESS.collect_headers([], ["Authorization=T"], {"T": "Basic abc"})[0]
+      == {"Authorization": "Basic abc"},
+      SESS.collect_headers([], ["Authorization=T"], {"T": "Basic abc"}))
+check("...and the refusal message says so, since it is the one instruction a caller gets wrong "
+      "in a way that still sends a request",
+      "Bearer" in " ".join(SESS.collect_headers(["Authorization: x"], [], {})[1]),
+      SESS.collect_headers(["Authorization: x"], [], {})[1])
 check("--header-env takes the value from the environment, so only the VARIABLE NAME is in argv",
       SESS.collect_headers([], ["Authorization=TOK"], {"TOK": "Bearer xyz"})
       == ({"Authorization": "Bearer xyz"}, []))
