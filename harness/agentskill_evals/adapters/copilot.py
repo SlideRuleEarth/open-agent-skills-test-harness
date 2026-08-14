@@ -47,7 +47,7 @@ import ntpath
 import os
 import re
 import sys
-from typing import Any
+from typing import Any, NamedTuple
 from collections.abc import Mapping
 
 from ..schema import EventKind, NormalizedEvent
@@ -530,30 +530,235 @@ def _safe_listdir(path: str) -> list[str]:
         return []
 
 
-def audit_channel_markers(app_js: str) -> dict[str, bool]:
-    """Which ``_MCP_CHANNEL_MARKERS`` are still present in one CLI bundle.
+# The bundle files a marker can legitimately live in. The audit scanned `app.js` ALONE
+# until 2026-08-13, and copilot 1.0.75 is what proved that wrong: `mcp-servers` — the
+# custom-agent frontmatter key — left `app.js` while its siblings `user-invocable` and
+# `disable-model-invocation` turned up in `schemas/*.json` and `sdk/index.d.ts`, i.e. the
+# agent schema moved WITHIN the bundle rather than going away. A one-file scan reports that
+# as a channel assumption that no longer holds, which is the same words this command uses
+# for a channel that was genuinely REMOVED, and the two want opposite responses.
+#
+# EVERY REGULAR FILE, and the first cut of this fix got that wrong in the most instructive
+# way available. It scanned `.js/.json/.ts` only — ~18 MB of a ~173 MB bundle — and printed
+# a caveat saying a string compiled into a native module would be invisible. That caveat
+# then CAME TRUE and was read straight past: `mcp-servers` is in
+# `prebuilds/darwin-arm64/runtime.node` in every build measured, 1.0.64 through 1.0.79, and
+# its occurrences GROW (1, 9, 10, 11) beside `mcp-servers: Expected object` and Rust
+# config-loader paths. The agent frontmatter loader moved into the native runtime; the key
+# never went anywhere. The audit reported MISSING, a finding about the build, on the
+# strength of a file it had declined to open (external review).
+#
+# So the scope limit is deleted rather than documented. A limit a reader must remember to
+# apply is a limit that will be forgotten exactly when it matters, and the whole purpose of
+# this audit is to be believed about an absence. Text files are ordered FIRST so the common
+# case still short-circuits in milliseconds; the binaries are only reached when a marker
+# has not been found anywhere else, which is precisely when the question is live.
+_TEXT_FIRST_SUFFIXES = (".js", ".mjs", ".cjs", ".json", ".ts")
 
-    Substring search over the raw bundle, streamed in chunks with an overlap so a marker
-    straddling a chunk boundary is not missed. Deliberately crude: the bundle is minified
-    JS, so anything cleverer would be brittle, and the question being asked is only
-    "does this string still occur anywhere" — a marker that has VANISHED is the signal."""
-    needles = [m.encode() for m, _why in _MCP_CHANNEL_MARKERS]
-    hits = [False] * len(needles)
-    longest = max(len(n) for n in needles)
-    with open(app_js, "rb") as f:
+# Verdicts. `verdict()` is the ONE function every consumer reads, because "did the scan
+# look anywhere at all" is a fact about whether the answer is trustworthy and so belongs
+# with the other such facts rather than as a flag one caller remembers to check.
+MARKER_INTACT = "INTACT"
+MARKER_MISSING = "MISSING"
+MARKER_NOT_SEARCHED = "NOT_SEARCHED"
+MARKER_INCOMPLETE = "INCOMPLETE"
+
+
+class MarkerAudit(NamedTuple):
+    """What one bundle scan found, and — as peer facts — where it looked and where it could not.
+
+    An audit that read nothing reports every marker absent, which is bit-for-bit the
+    output of a build that dropped every channel. Those are opposite findings, so the
+    scope is part of the result rather than a detail: absence is only evidence once
+    something says the search actually covered the places the string could be.
+
+    `unreadable` is the second half of that, and the FIRST cut of this type shipped
+    without it — which reproduced the very defect the type was introduced to fix, one file
+    short of the empty case. An `app.js` that could not be opened beside one readable
+    sibling gave `searched=('package.json',)`, a non-empty scope, and therefore a
+    confident `MISSING` for all 11 markers: the audit blaming the build for its own
+    blind spot (review). A file that could not be read is not a file that ruled anything
+    out, so it is carried and `verdict()` consults it.
+
+    `where` may name a file that is in `unreadable` rather than `searched`: a read that
+    died partway still FOUND what it found before it died, and a string that was seen is
+    present whatever happened next. Presence survives a truncated read; absence does not.
+    """
+
+    where: dict[str, str | None]      # marker -> bundle-relative file it was found in
+    searched: tuple[str, ...]         # bundle-relative files read to completion, in scan order
+    unreadable: tuple[str, ...] = ()  # files that could not be opened, or died mid-read
+    eligible: int = 0                 # regular files the scan WOULD have read, had it needed to
+    # Directories that could not be LISTED, which is a different kind of ignorance from a
+    # file that could not be read and was folded in with it until this was measured. An
+    # unreadable file is one known unit: it is counted in `eligible` and skipping it costs
+    # a countable amount. An unlistable directory has an UNKNOWN number of files under it,
+    # so it makes the denominator itself unknowable — counting it as one eligible file, as
+    # the first cut did, let `searched + unreadable >= eligible` come out true and printed
+    # a complete-coverage line over a subtree nobody enumerated (external review).
+    unenumerated: tuple[str, ...] = ()
+
+    @property
+    def scanned_everything(self) -> bool:
+        """Whether the scan actually read every file it was willing to read.
+
+        The scan stops as soon as every marker is found, so a clean bundle is answered
+        after a fraction of it — 189 of 240 files on copilot 1.0.79. That is sound for the
+        VERDICT (a `MISSING` cannot be reached without reading everything) and unsound for
+        any sentence claiming complete coverage, which is what the command printed until
+        this was pointed out. The two are different claims and only this one is about
+        coverage.
+
+        A directory that could not be listed makes this UNANSWERABLE rather than false:
+        `eligible` counts what was enumerated, and the files under an unlistable directory
+        were never enumerated to be counted. So any such directory forbids the claim
+        outright — there is no denominator to compare against.
+        """
+        if self.unenumerated:
+            return False
+        return len(self.searched) + len(self.unreadable) >= self.eligible
+
+    @property
+    def present(self) -> dict[str, bool]:
+        return {m: p is not None for m, p in self.where.items()}
+
+    @property
+    def missing(self) -> list[str]:
+        return sorted(m for m, p in self.where.items() if p is None)
+
+    @property
+    def relocated(self) -> dict[str, str]:
+        """Markers found somewhere OTHER than `app.js` — the 1.0.75 case, by name."""
+        return {m: p for m, p in self.where.items()
+                if p is not None and p != "app.js"}
+
+    def verdict(self) -> str:
+        """The one function every consumer reads, over every fact that bears on trust.
+
+        The order is a conjunction rather than a lookup on whichever fact arrived last:
+        a scan that read nothing concludes nothing at all; a scan with ANY blind spot
+        cannot call a marker absent, because the marker may be in the file it could not
+        open; only a scan that both read something and read everything it meant to may
+        report `MISSING`. Markers all found is `INTACT` regardless of blind spots — a
+        string that was seen is seen, and no unread file can retract it.
+        """
+        blind = bool(self.unreadable) or bool(self.unenumerated)
+        if not self.missing:
+            # Every marker was POSITIVELY found, and a blind spot cannot retract a string
+            # that was seen — so this stays INTACT however much went unread.
+            return MARKER_INTACT if (self.searched or blind) else MARKER_NOT_SEARCHED
+        if not self.searched:
+            return MARKER_NOT_SEARCHED
+        if blind:
+            return MARKER_INCOMPLETE
+        return MARKER_MISSING
+
+
+def _scan_file(path: str, needles: list[bytes], hits: list[str | None],
+               rel: str, longest: int) -> bool:
+    """Record `rel` for every needle this file contains and that has no hit yet.
+
+    Returns whether the file was actually READ, which is the caller's licence to count it
+    as searched. A file that could not be opened, or that died mid-read, has not ruled
+    anything out — counting it would put an unexamined file behind the word "searched",
+    which is the same defect one level down as the one this whole audit was fixed for.
+
+    Chunked with an overlap so a marker straddling a read boundary is still found.
+    """
+    try:
+        f = open(path, "rb")
+    except OSError:
+        return False
+    with f:
         tail = b""
         while True:
-            chunk = f.read(1 << 20)
+            try:
+                chunk = f.read(1 << 20)
+            except OSError:
+                return False
             if not chunk:
-                break
+                return True
             buf = tail + chunk
             for i, needle in enumerate(needles):
-                if not hits[i] and needle in buf:
-                    hits[i] = True
-            if all(hits):
-                break
+                if hits[i] is None and needle in buf:
+                    hits[i] = rel
+            if all(h is not None for h in hits):
+                return True
             tail = buf[-longest:]
-    return {m: hits[i] for i, (m, _why) in enumerate(_MCP_CHANNEL_MARKERS)}
+
+
+def audit_channel_markers(app_js: str) -> MarkerAudit:
+    """Which ``_MCP_CHANNEL_MARKERS`` are still present in one CLI BUNDLE.
+
+    Substring search, deliberately crude: the bundle is minified JS, so anything cleverer
+    would be brittle, and the question is only "does this string still occur anywhere in
+    this build". What changed on 2026-08-13 is the scope of "anywhere" — the unit is the
+    bundle directory, not `app.js`, because a marker that moved to a sibling file is not a
+    channel that went away (see `_SCANNED_SUFFIXES`).
+
+    `app.js` is scanned FIRST so the common case short-circuits on the biggest file, and so
+    `MarkerAudit.relocated` means what it says: found, but no longer where it used to be.
+    """
+    needles = [m.encode() for m, _why in _MCP_CHANNEL_MARKERS]
+    hits: list[str | None] = [None] * len(needles)
+    longest = max(len(n) for n in needles)
+    root = os.path.dirname(app_js) or "."
+    searched: list[str] = []
+    unreadable: list[str] = []
+
+    text_files: list[tuple[str, str]] = []
+    other_files: list[tuple[str, str]] = []
+    seen_paths: set[str] = set()
+    if os.path.isfile(app_js):
+        text_files.append((app_js, os.path.basename(app_js)))
+        # Normalised, because the walk below re-derives this path by joining and would
+        # otherwise emit `./app.js` for a bare relative `app.js` — a different STRING for
+        # the same file, so the biggest file in the bundle got scanned twice and `searched`
+        # reported it twice (review). Identity here is the path, not the spelling.
+        seen_paths.add(os.path.normpath(app_js))
+
+    # A directory that cannot be listed is a blind spot of exactly the kind `unreadable`
+    # exists for, and `os.walk` swallows it by default: the subtree simply does not appear,
+    # so a marker living only inside it reads as absent with an empty `unreadable` and a
+    # confident MISSING (external review). The error is recorded instead.
+    walk_failures: list[str] = []
+
+    def _on_walk_error(err: OSError) -> None:
+        target = getattr(err, "filename", None) or root
+        try:
+            walk_failures.append(os.path.relpath(target, root))
+        except ValueError:                      # different drive on win32
+            walk_failures.append(str(target))
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_on_walk_error):
+        dirnames.sort()
+        for name in sorted(filenames):
+            full = os.path.join(dirpath, name)
+            norm = os.path.normpath(full)
+            if norm in seen_paths:
+                continue
+            seen_paths.add(norm)
+            entry = (full, os.path.relpath(full, root))
+            (text_files if name.endswith(_TEXT_FIRST_SUFFIXES) else other_files).append(entry)
+
+    ordered = text_files + other_files
+
+    for full, rel in ordered:
+        if all(h is not None for h in hits):
+            break
+        # A path that vanished between the walk and the read is a blind spot exactly like
+        # one that would not open: it was meant to be read and was not.
+        if not os.path.isfile(full):
+            unreadable.append(rel)
+        elif _scan_file(full, needles, hits, rel, longest):
+            searched.append(rel)
+        else:
+            unreadable.append(rel)
+
+    return MarkerAudit(
+        where={m: hits[i] for i, (m, _why) in enumerate(_MCP_CHANNEL_MARKERS)},
+        searched=tuple(searched), unreadable=tuple(unreadable),
+        eligible=len(ordered), unenumerated=tuple(walk_failures))
 
 
 # The built-in server a hermetic invocation always CONFIGURES and always disables:

@@ -875,6 +875,114 @@ MUTATIONS = [
     ("M111-antigravity-stops-declaring-its-overlay-dependence", AGY,
      "\n    mcp_off_mechanism = MCPOffMechanism.OVERLAY_MASKS", "",
      "mcp.declared_servers_require_isolation_where_mcp_off_is_a_mask"),
+    # The regression that shipped for real. copilot 1.0.75 moved the agent frontmatter
+    # schema out of app.js into schemas/ and the SDK typings; a scan of app.js alone then
+    # reported `mcp-servers` MISSING — the wording reserved for a channel that was
+    # REMOVED — and nobody noticed for three releases. Deleting the walk restores exactly
+    # that: the bundle's sibling files stop being read.
+    ("M344-marker-scan-narrows-back-to-one-file", COPILOT,
+     "\n    for dirpath, dirnames, filenames in os.walk(root, onerror=_on_walk_error):",
+     "\n    for dirpath, dirnames, filenames in []:",
+     "copilot.channel_markers_scan_the_bundle"),
+    # The opposite failure, and the one a widening invites: the scan reads everything,
+    # including the wasm blobs and prebuilt binaries it cannot honestly claim to have
+    # examined, so `searched` overstates what was ruled out.
+    ("M345-the-scan-skips-what-is-not-a-text-file-again", COPILOT,
+     "\n            (text_files if name.endswith(_TEXT_FIRST_SUFFIXES) else other_files).append(entry)",
+     "\n            text_files.append(entry) if name.endswith(_TEXT_FIRST_SUFFIXES) else None",
+     "copilot.channel_markers_scan_the_bundle"),
+    # The command claims complete coverage over a scan that stopped early — 189 of 240
+    # files on the real 1.0.79 (external review, second round).
+    ("M353-the-command-claims-coverage-it-did-not-have", "agentskill_evals/cli.py",
+     "\n        if audit.scanned_everything:",
+     "\n        if True:",
+     "copilot.channel_markers_scan_the_bundle"),
+    # ...and the denominator that claim is measured against is never collected, so
+    # `scanned_everything` is true of every scan including the ones that stopped early.
+    ("M354-eligible-files-are-never-counted", COPILOT,
+     "\n        eligible=len(ordered), unenumerated=tuple(walk_failures))",
+     "\n        eligible=0, unenumerated=tuple(walk_failures))",
+     "copilot.channel_markers_scan_the_bundle"),
+    # THE CONTRADICTION, restored verbatim: the coverage line makes a marker claim, which
+    # the marker line below also makes, and with 10 of 11 markers beside an unlistable
+    # directory the command printed both "Every marker was found" and "1 marker(s) were
+    # not found in the rest" (external review, fourth round).
+    ("M358-the-coverage-line-states-the-marker-result-too", "agentskill_evals/cli.py",
+     '\n                  f"bundle exists is unknown and this run supports no claim about coverage")',
+     '\n                  f"bundle exists is unknown. Every marker was found, which no unread "\n                  f"path can retract — but this run supports no claim about coverage")',
+     "copilot.channel_markers_scan_the_bundle"),
+    # ...and the branch that refuses to quantify coverage over an unenumerated bundle is
+    # skipped, so one of the two quantified lines is printed instead.
+    ("M359-an-unlistable-bundle-gets-a-quantified-coverage-line", "agentskill_evals/cli.py",
+     "\n        elif audit.unenumerated:",
+     "\n        elif False:",
+     "copilot.channel_markers_scan_the_bundle"),
+    # A failed traversal counted as exactly ONE eligible file, so `searched + unreadable
+    # >= eligible` came out true over a subtree nobody enumerated and the command printed
+    # a complete-coverage line (external review, third round).
+    ("M355-an-unlistable-directory-counts-as-one-file", COPILOT,
+     "\n        eligible=len(ordered), unenumerated=tuple(walk_failures))",
+     "\n        eligible=len(ordered) + len(walk_failures), unenumerated=tuple(walk_failures))",
+     "copilot.channel_markers_scan_the_bundle"),
+    # ...and the guard that makes coverage UNANSWERABLE rather than false when a directory
+    # would not list: without it the denominator is compared against anyway.
+    ("M356-an-unlistable-directory-still-permits-a-coverage-claim", COPILOT,
+     "\n        if self.unenumerated:\n            return False",
+     "\n        if False:\n            return False",
+     "copilot.channel_markers_scan_the_bundle"),
+    # ...and the two kinds of ignorance are folded back together: an unreadable FILE is one
+    # known unit, an unlistable DIRECTORY is an unknown quantity, and counting them alike
+    # is what made the denominator wrong in the first place.
+    ("M357-a-directory-failure-is-recorded-as-a-file-failure", COPILOT,
+     "\n        searched=tuple(searched), unreadable=tuple(unreadable),",
+     "\n        searched=tuple(searched), unreadable=tuple(unreadable) + tuple(walk_failures),",
+     "copilot.channel_markers_scan_the_bundle"),
+    # A directory that cannot be listed vanishes silently, so a marker inside it reads as
+    # absent with nothing recording the hole (external review).
+    ("M352-a-denied-directory-leaves-no-trace", COPILOT,
+     "\n    for dirpath, dirnames, filenames in os.walk(root, onerror=_on_walk_error):",
+     "\n    for dirpath, dirnames, filenames in os.walk(root):",
+     "copilot.channel_markers_scan_the_bundle"),
+    # A file that could not be opened counts as searched, so an unreadable bundle reports
+    # "absent" about files nothing ever read — the audit's own version of the defect it
+    # exists to catch, one level down.
+    ("M346-unread-file-still-licenses-the-word-searched", COPILOT,
+     "\n    except OSError:\n        return False",
+     "\n    except OSError:\n        return True",
+     "copilot.channel_markers_scan_the_bundle"),
+    # A scan that read nothing goes back to reporting every marker absent, which is
+    # bit-for-bit what a build that dropped every channel produces.
+    ("M347-blind-scan-reports-every-channel-vanished", COPILOT,
+     "\n        if not self.searched:\n            return MARKER_NOT_SEARCHED",
+     "\n        if False:\n            return MARKER_NOT_SEARCHED",
+     "copilot.channel_markers_scan_the_bundle"),
+    # PARTIAL blindness reports as a confident finding about the build — the defect the
+    # first cut of this fix shipped with, one file short of the empty case M347 covers.
+    ("M348-a-blind-spot-still-licenses-a-confident-missing", COPILOT,
+     "\n        if blind:\n            return MARKER_INCOMPLETE",
+     "\n        if False:\n            return MARKER_INCOMPLETE",
+     "copilot.channel_markers_scan_the_bundle"),
+    # The file that would not open is dropped instead of recorded, so nothing downstream
+    # can know the scan had a hole in it.
+    ("M349-an-unreadable-file-leaves-no-trace", COPILOT,
+     "\n        else:\n            unreadable.append(rel)",
+     "\n        else:\n            pass",
+     "copilot.channel_markers_scan_the_bundle"),
+    # THE READ OVERLAP, which had no mutation at all until the straddle arm was given a
+    # directory of its own: while it shared one with bundles holding every marker, the
+    # assertion passed with the overlap deleted (review).
+    ("M350-the-chunk-overlap-is-dropped", COPILOT,
+     "\n            tail = buf[-longest:]",
+     "\n            tail = b\"\"",
+     "copilot.channel_bundle_audit"),
+    # One file, two spellings: the biggest file in the bundle is scanned twice. Aimed at
+    # the WALK side, which is where the two spellings meet — normalising only the `app_js`
+    # side is a no-op whenever it is already normalised, which it is for the bare relative
+    # path the case is about, so a mutation there changes nothing and reports MISSED.
+    ("M351-a-relative-app-js-is-scanned-twice", COPILOT,
+     "\n            norm = os.path.normpath(full)",
+     "\n            norm = full",
+     "copilot.channel_markers_scan_the_bundle"),
     # The check is simply gone. Measured live before it existed: the cell spends a model
     # call and comes back `exited with code 1`, with "Not logged in" buried in a truncated
     # JSON blob inside an assertion message.
@@ -3138,6 +3246,16 @@ MUTATIONS = [
      "\n    if not text.isdigit() or int(text) < 1:",
      "\n    if not text.isdigit():",
      "...and every way of asking for it wrongly is refused rather than rounded to 1"),
+    # A repeated id stops being reported, which is the state this runner shipped in until an
+    # id collision produced eight mutations under four names and a green run either way.
+    ("F137-the-id-comparison-includes-the-description-again", SELF,
+     "\n    head = mid.split(\"-\", 1)[0]",
+     "\n    head = mid",
+     "...and two entries sharing a NUMBER collide however differently they are described"),
+    ("F136-a-repeated-mutation-id-reports-as-a-clean-table", SELF,
+     "\n        seen[_canonical_mid(mid)] = seen.get(_canonical_mid(mid), 0) + 1",
+     "\n        seen[_canonical_mid(mid)] = 1",
+     "...and two entries sharing a NUMBER collide however differently they are described"),
     # THE SLOWEST-MUTATION WARNING, on the axis that stops meaning anything under load and on
     # the entries that never ran.
     ("F87-the-slowest-mutation-is-picked-by-wall-clock", SELF,
@@ -4310,6 +4428,42 @@ def _classify(mid, rel):
     return kind
 
 
+def _canonical_mid(mid):
+    """The identifying part of a mutation id: its class letter and number, e.g. `M338`.
+
+    The rest of the string is a description, and comparing it is what let the FIRST cut of
+    this guard miss the exact collision it was written for: `M338-marker-scan-narrows...`
+    and `M338-the-phase-marker-is-never-written` are different strings, so a whole-string
+    compare called them distinct and reported a clean table (external review). The number
+    is the name — it is what a result line carries, what `stale_anchors` prints, and what
+    anyone types to talk about one entry.
+    """
+    head = mid.split("-", 1)[0]
+    return head if head[:1] in "MIF" and head[1:].isdigit() else mid
+
+
+def duplicate_ids(mutations):
+    """Every `(id, count)` used by more than one entry, worst first.
+
+    THE SAME ARGUMENT AS `stale_anchors`, one field over, and it was learned the same way:
+    four entries were added as M338-M341 while M338-M341 already existed against the proxy.
+    Every one of the eight ran and every one was CAUGHT, so both totals were right and the
+    suite exited 0 — the failure is not in the arithmetic. It is that "M340: CAUGHT by ..."
+    now names two different defects, so a reader cannot get from a result line back to the
+    entry that produced it, and `--only M340` would silently mean one of them. An id is a
+    NAME; the anchor guard exists because a mutation that could match two sites is not a
+    measurement, and an id that can mean two mutations is not a report.
+
+    Cheap enough to run before the baseline, like every other refusal here, because
+    discovering it after the fact costs the whole run — which is exactly what it cost.
+    """
+    seen = {}
+    for mid, *_rest in mutations:
+        seen[_canonical_mid(mid)] = seen.get(_canonical_mid(mid), 0) + 1
+    return sorted(((mid, n) for mid, n in seen.items() if n > 1),
+                  key=lambda pair: (-pair[1], pair[0]))
+
+
 def stale_anchors(root, mutations):
     """Every `(id, target, occurrences)` whose `find` text is not in its target exactly once.
 
@@ -4542,6 +4696,13 @@ def main(argv=None):
     # number below it wrong, so it is worth nothing to discover that at the end.
     kinds = {mid: _classify(mid, rel) for mid, rel, _f, _r, _a in MUTATIONS}
     suites = {mid: _suite_for(rel) for mid, rel, _f, _r, _a in MUTATIONS}
+    dupes = duplicate_ids(MUTATIONS)
+    if dupes:
+        print("DUPLICATE MUTATION IDS — an id that names two mutations makes every line "
+              "reporting it ambiguous, and the totals stop being readable back to entries:")
+        for mid, n in dupes:
+            print(f"  {mid} is used {n} times")
+        return 1
     stale = stale_anchors(HARNESS, MUTATIONS)
     if stale:
         print("STALE OR AMBIGUOUS ANCHORS — these mutations cannot be applied, and a run that "

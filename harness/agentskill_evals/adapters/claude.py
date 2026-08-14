@@ -49,6 +49,15 @@ _KNOWN_RESULT_KEYS = {
     "session_id", "model", "modelUsage", "usage", "num_turns",
     "permission_denials", "stop_reason", "terminal_reason", "api_error_status",
     "fast_mode_state", "uuid",
+    # 2.1.231 added three latency measures to every result event. They are recorded here
+    # rather than left to warn on every run BECAUSE they were read: all three are timing
+    # telemetry (time to first token, the same on the stream, and time to the request),
+    # and none of them carries cost, usage, turn or error semantics this adapter reads.
+    # That review is the whole purpose of `warn_unknown_usage` — the set exists to make a
+    # shape change visible once, not to be silenced. Captured from a complete 2.1.231
+    # result event, not from a truncated one: the earlier reading came off the tail of a
+    # run and could not have seen a key that sorts before it.
+    "ttft_ms", "ttft_stream_ms", "time_to_request_ms",
 }
 
 
@@ -66,8 +75,30 @@ _KNOWN_RESULT_KEYS = {
 #              `mcp_servers: []` in their init event.
 #            * The parser contract: the `result` events of those same six runs carry no
 #              key outside _KNOWN_RESULT_KEYS.
-_VERIFIED_VERSIONS = ("2.1.113",)
-_VERIFIED_ON = "2026-07-21"
+# 2.1.231: verified 2026-08-13, after the fleet was brought up to date. Four things were
+#          checked, and one of them CHANGED — which is the reason this list is a list of
+#          audited builds rather than a floor:
+#            * `--allowedTools` still does nothing to MCP tools under
+#              --dangerously-skip-permissions (§6-C2), measured against the echo fixture
+#              with a CONTROL arm, because "the off-list tool never arrived" is equally
+#              explained by a model that never tried. Both arms: `add` reached the server.
+#            * `--strict-mcp-config` still excludes everything outside --mcp-config, and
+#              this is now MEASURED rather than reviewed: without the flag the init event
+#              named 7 servers (the declared one plus six real user connectors), with it
+#              exactly 1. The witness text below was written for an EMPTY list, which
+#              could not distinguish a working flag from a build that grew a source
+#              outside its reach; a populated control arm can, for the sources it names.
+#              It still cannot speak for a source that appears in NEITHER arm.
+#            * The parser contract: a complete result event carries three keys 2.1.113
+#              did not (`ttft_ms`, `ttft_stream_ms`, `time_to_request_ms`), all timing
+#              telemetry, now in _KNOWN_RESULT_KEYS above with the reasoning.
+#            * The MCP protocol era is unchanged (`2025-11-25`, legacy, decided by
+#              `initialize`) — but the stdio SHUTDOWN changed: 2.1.113 closed stdin and
+#              2.1.231 sends SIGINT (C3-1, DESIGN_MCP_Support.md §9). The proxy already
+#              handles it, because #96 turned that probe into a requirement for SIGTERM
+#              *and* SIGINT handlers rather than for the one behaviour it observed.
+_VERIFIED_VERSIONS = ("2.1.113", "2.1.231")
+_VERIFIED_ON = "2026-08-13"
 
 # Builds found to actively break an assumption. Empty is the normal state.
 _DENIED_VERSIONS: dict[str, str] = {}
@@ -89,9 +120,17 @@ _PROVENANCE = VersionProvenance(
         "to emit its init event, which is allowed but proves nothing about its MCP host. "
         "So --strict-mcp-config was NOT confirmed effective here."),
     clear_hint=(
-        "To clear it: confirm `claude --help` still documents --strict-mcp-config as "
-        "ignoring all MCP configuration outside --mcp-config, then add the version to "
-        "_VERIFIED_VERSIONS in adapters/claude.py."),
+        "To clear it, MEASURE the flag rather than reading about it — reading `--help` was "
+        "this hint's whole procedure until 2026-08-13, and a documented flag that stopped "
+        "working would pass it unchanged. Run the declared-server pair: `claude -p ... "
+        "--mcp-config <file> --output-format stream-json --verbose` once WITH "
+        "--strict-mcp-config and once without, and read the init event's mcp_servers list. "
+        "The run without the flag is the control and it is what makes the other one mean "
+        "anything: it must name the ambient servers the flag is supposed to exclude, while "
+        "the strict run names only the declared one. (Measured so on 2.1.231: 7 servers "
+        "against 1.) Then confirm the result event carries no key outside "
+        "_KNOWN_RESULT_KEYS, reading a COMPLETE event rather than a tail, and add the "
+        "version to _VERIFIED_VERSIONS in adapters/claude.py."),
 )
 
 
@@ -291,12 +330,18 @@ class ClaudeAdapter(Adapter):
     # still the whole server set under `isolated: false`, which is why such a run is allowed
     # rather than refused (see Adapter.mcp_off_mechanism).
     #
-    # This is a REVIEWED ASSERTION about that flag, not a verified one. _PROVENANCE is an
-    # audit trail plus a drift warning: a build outside _VERIFIED_VERSIONS warns and still
-    # runs, and the witness text above says outright that an empty server list cannot
-    # distinguish "the flag worked" from "a newer build grew a server source outside the
-    # flag's reach". Nothing here would catch a wrong value; what the provenance machinery
-    # buys is that an unaudited build is visible, and that re-establishing the claim has a
+    # THIS WAS A REVIEWED ASSERTION UNTIL 2026-08-13 AND IS NOW MEASURED, on 2.1.231, by
+    # the paired run `clear_hint` below describes: without the flag the init event named
+    # seven servers (the declared one plus six real user connectors), with it exactly one.
+    # The control arm is what upgraded it — the runtime witness alone reads an EMPTY list,
+    # which cannot distinguish "the flag worked" from "a newer build grew a server source
+    # outside the flag's reach", and that limit is still real for any source appearing in
+    # NEITHER arm. What the measurement settles is the sources it named.
+    #
+    # _PROVENANCE remains an audit trail plus a drift warning: a build outside
+    # _VERIFIED_VERSIONS warns and still runs. Nothing here would catch a wrong value; what
+    # the provenance machinery buys is that an unaudited build is visible, and that
+    # re-establishing the claim has a
     # documented procedure (clear_hint).
     mcp_off_mechanism = MCPOffMechanism.CLI
     # Per-server `tools:` is enforced BY THE HARNESS, not by claude. No claude mechanism can

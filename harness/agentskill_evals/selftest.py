@@ -5336,15 +5336,25 @@ def _check_copilot_version_provenance(failures, verbose):
         # the command), so this host's own bundles legitimately show up — restrict to the
         # fixture to keep the assertion independent of what is installed here.
         versions = [v for v, p in found if p.startswith(tmp)]
-        full = _cop.audit_channel_markers(os.path.join(root, "1.0.72", "app.js"))
-        gapped = _cop.audit_channel_markers(os.path.join(root, "2.0.0", "app.js"))
-        missing = sorted(m for m, ok in gapped.items() if not ok)
-        # a marker straddling the 1 MiB read boundary must still be found
-        straddle = os.path.join(tmp, "straddle.js")
+        full_audit = _cop.audit_channel_markers(os.path.join(root, "1.0.72", "app.js"))
+        full = full_audit.present
+        full_verdict = full_audit.verdict()
+        gapped_audit = _cop.audit_channel_markers(os.path.join(root, "2.0.0", "app.js"))
+        missing = gapped_audit.missing
+        # A marker straddling the 1 MiB read boundary must still be found — and the file
+        # needs a directory of its OWN, because the scan now walks the whole bundle: while
+        # `straddle.js` sat directly in `tmp`, the walk also reached the fixture bundles
+        # under `pkg/darwin-arm64/`, every one of which holds every marker. Deleting the
+        # read overlap left this assertion still True, so it had stopped testing the
+        # overlap at all and no mutation covered `tail = buf[-longest:]` (review). An arm
+        # whose subject can be satisfied by something other than its subject is not an arm.
+        straddle_dir = os.path.join(tmp, "straddle-only")
+        os.makedirs(straddle_dir)
+        straddle = os.path.join(straddle_dir, "straddle.js")
         pad = (1 << 20) - (len(markers[0]) // 2)
         with open(straddle, "w") as f:
             f.write("." * pad + " ".join(markers))
-        straddled = _cop.audit_channel_markers(straddle)
+        straddled = _cop.audit_channel_markers(straddle).present
         # Ordered by the loader's own comparator, not by semver: an unparseable name sorts
         # below everything, `-` anywhere means prerelease, and the raw name breaks ties.
         expect = ["nonsense", "1.0.72", "1.0.73-", "1.0.73-beta.1", "1.0.73foo", "2.0.0"]
@@ -5363,6 +5373,301 @@ def _check_copilot_version_provenance(failures, verbose):
                f"all_present={all(full.values())} missing={missing} "
                f"straddle_ok={all(straddled.values())} xdg={covers_xdg} "
                f"localappdata={covers_localappdata}", failures, verbose)
+
+        # The scan is over the BUNDLE, not app.js — copilot 1.0.75 moved the agent
+        # frontmatter schema into sibling files, and a one-file scan called that a
+        # removed channel, which is the wording reserved for a channel that really
+        # went away. Three facts have to hold at once, and the middle one is the
+        # reason this arm is not just "the marker is found":
+        #   1. a marker living only in a SIBLING file is found, and named as moved;
+        #   2. a marker in NO file is still MISSING — a widened search that can no
+        #      longer report a removal has destroyed the instrument, not fixed it;
+        #   3. a marker only inside an unscanned binary is NOT claimed as found,
+        #      because `searched` is what licenses the word "absent".
+        moved_root = os.path.join(tmp, "moved")
+        os.makedirs(os.path.join(moved_root, "schemas"))
+        # app.js keeps everything except the last two markers.
+        with open(os.path.join(moved_root, "app.js"), "w") as f:
+            f.write(" ".join(markers[:-2]))
+        # ...one of which reappears in a sibling schema file (the 1.0.75 shape)...
+        with open(os.path.join(moved_root, "schemas", "api.schema.json"), "w") as f:
+            f.write('{"x": "' + markers[-2] + '"}')
+        # ...and the other ONLY inside a binary, which must now be found: the scope limit
+        # that made a native module invisible is gone, because it came true in the field
+        # (`mcp-servers` lives in runtime.node) and was read straight past as a finding
+        # about the build.
+        with open(os.path.join(moved_root, "blob.wasm"), "w") as f:
+            f.write(markers[-1])
+        moved = _cop.audit_channel_markers(os.path.join(moved_root, "app.js"))
+        rel_ok = moved.relocated == {markers[-2]: os.path.join("schemas",
+                                                              "api.schema.json"),
+                                     markers[-1]: "blob.wasm"}
+        still_missing = moved.missing == []
+        binary_scanned = moved.where[markers[-1]] == "blob.wasm"
+        app_first = moved.searched[0] == "app.js"
+
+        # PARTIAL blindness, which is where the first cut of this fix went wrong: one
+        # unreadable file beside one readable one gave a non-empty `searched` and
+        # therefore a confident MISSING for every marker — the audit blaming the build
+        # for its own blind spot, one file short of the empty case below. The scan must
+        # refuse to call a marker absent while a file it meant to read would not open.
+        # Arranged without a permission the sandbox may deny: the walk lists the file,
+        # and it is unlinked before the read reaches it.
+        blind_root = os.path.join(tmp, "partial")
+        os.makedirs(blind_root)
+        with open(os.path.join(blind_root, "app.js"), "w") as f:
+            f.write(" ".join(markers[:-1]))          # every marker but the last
+        vanishing = os.path.join(blind_root, "zz-vanishes.json")
+        with open(vanishing, "w") as f:
+            f.write("{}")
+        _orig_isfile = os.path.isfile
+
+        def _isfile_once(path, _seen={}):            # noqa: B006 — deliberate call-count state
+            if os.path.normpath(path) == os.path.normpath(vanishing):
+                os.unlink(vanishing) if _orig_isfile(vanishing) else None
+                return True                          # the walk saw it; the read will not
+            return _orig_isfile(path)
+
+        os.path.isfile = _isfile_once
+        try:
+            partial = _cop.audit_channel_markers(os.path.join(blind_root, "app.js"))
+        finally:
+            os.path.isfile = _orig_isfile
+        partial_ok = (partial.verdict() == _cop.MARKER_INCOMPLETE
+                      and partial.missing == [markers[-1]]
+                      and "zz-vanishes.json" in partial.unreadable
+                      and "zz-vanishes.json" not in partial.searched)
+
+        # A DIRECTORY that cannot be listed is the same blind spot as a file that cannot
+        # be read, and `os.walk` hides it by default — the subtree just does not appear,
+        # so a marker living only inside it read as absent with an empty `unreadable`
+        # (external review). Driven through `onerror` directly rather than by chmod,
+        # because a permission the sandbox may refuse is a case that will one day be
+        # skipped rather than run (§4).
+        walk_root = os.path.join(tmp, "walkfail")
+        os.makedirs(os.path.join(walk_root, "denied"))
+        with open(os.path.join(walk_root, "app.js"), "w") as f:
+            f.write(" ".join(markers[:-1]))
+        _orig_walk = os.walk
+
+        def _walk_with_error(top, *a, **kw):
+            onerror = kw.get("onerror")
+            yield from _orig_walk(top, *a, **kw)
+            if onerror is not None:
+                err = OSError(13, "Permission denied")
+                err.filename = os.path.join(walk_root, "denied")
+                onerror(err)
+
+        os.walk = _walk_with_error
+        try:
+            denied = _cop.audit_channel_markers(os.path.join(walk_root, "app.js"))
+        finally:
+            os.walk = _orig_walk
+        walk_err_ok = (denied.verdict() == _cop.MARKER_INCOMPLETE
+                       and "denied" in denied.unenumerated
+                       and "denied" not in denied.unreadable)
+
+        # THE SAME BLIND SPOT WITH EVERY MARKER FOUND, which is where counting a failed
+        # traversal as ONE eligible file went wrong: `searched + unreadable >= eligible`
+        # came out true and the command printed a complete-coverage line over a subtree
+        # nobody had enumerated (external review). The verdict is rightly INTACT — every
+        # marker was positively found and no unread path can retract a string that was
+        # seen — but the COVERAGE claim is unanswerable, because the files under a
+        # directory that would not list were never counted to be compared against.
+        whole_root = os.path.join(tmp, "walkfail-intact")
+        os.makedirs(os.path.join(whole_root, "denied"))
+        with open(os.path.join(whole_root, "app.js"), "w") as f:
+            f.write(" ".join(markers))
+        _orig_walk2 = os.walk
+
+        def _walk_with_error2(top, *a, **kw):
+            onerror = kw.get("onerror")
+            yield from _orig_walk2(top, *a, **kw)
+            if onerror is not None:
+                err = OSError(13, "Permission denied")
+                err.filename = os.path.join(whole_root, "denied")
+                onerror(err)
+
+        os.walk = _walk_with_error2
+        try:
+            blind_intact = _cop.audit_channel_markers(os.path.join(whole_root, "app.js"))
+        finally:
+            os.walk = _orig_walk2
+        coverage_unknowable = (blind_intact.verdict() == _cop.MARKER_INTACT
+                               and blind_intact.scanned_everything is False
+                               and blind_intact.unenumerated == ("denied",)
+                               # `eligible` counts what was ENUMERATED, and an unlistable
+                               # directory contributes an unknown number of files rather
+                               # than one. Pinned here because the guard above short-
+                               # circuits before the count is read, so nothing else can
+                               # tell a right denominator from a wrong one.
+                               and blind_intact.eligible == 1)
+
+        # A scan that read nothing reports every marker absent — byte-identical to a
+        # build that dropped every channel, and the opposite finding. An empty bundle
+        # dir produces that state without needing a permission the sandbox may refuse
+        # (§4: a case whose arrangement the environment can deny is a case that will
+        # one day be skipped rather than run).
+        empty_root = os.path.join(tmp, "empty")
+        os.makedirs(empty_root)
+        nothing = _cop.audit_channel_markers(os.path.join(empty_root, "app.js"))
+        blind = (nothing.verdict() == _cop.MARKER_NOT_SEARCHED
+                 and nothing.searched == () and not nothing.present[markers[0]])
+        # ...and the two states must not collide: a real removal is still MISSING.
+        # A real removal must still be reportable — a widening that can no longer say
+        # MISSING has destroyed the instrument rather than fixed it. `gapped_audit` is the
+        # bundle with a marker in NO file at all.
+        verdicts_split = (gapped_audit.verdict() == _cop.MARKER_MISSING
+                          and full_verdict == _cop.MARKER_INTACT
+                          and moved.verdict() == _cop.MARKER_INTACT)
+
+        # The licence for the word "searched", asserted where it is decided rather than
+        # through the walk: a file that could not be opened has ruled nothing out. The
+        # walk cannot reach this case without a permission the sandbox may deny, so it is
+        # driven directly — the predicate is extracted precisely so it can be.
+        unread_licence = _cop._scan_file(
+            os.path.join(tmp, "no-such-file.json"),
+            [m.encode() for m, _w in _cop._MCP_CHANNEL_MARKERS],
+            [None] * len(_cop._MCP_CHANNEL_MARKERS), "no-such-file.json", 64) is False
+
+        # A bare relative app.js must not be scanned twice: `root` becomes "." and the
+        # walk re-derives the same file as "./app.js" — a different string for one file.
+        _cwd = os.getcwd()
+        os.chdir(moved_root)
+        try:
+            relative = _cop.audit_channel_markers("app.js")
+        finally:
+            os.chdir(_cwd)
+        no_double_scan = relative.searched.count("app.js") == 1
+
+        # THE COMMAND ITSELF, driven end to end — the gap the reviewer asked to have
+        # closed rather than deferred, and it had already cost twice in one review cycle:
+        # a rename crashed `cmd_verify_copilot_channels` on import with every arm green,
+        # and then the command printed a coverage claim ("every regular file") that its own
+        # short-circuit made false. Both are defects of the COMMAND, which nothing drove.
+        # This is the `cmd_run` coverage gap one command over, and the fix is the same
+        # shape: build a fake bundle, run the real function, read what it printed.
+        import argparse as _argparse
+        import io as _io
+        from contextlib import redirect_stdout as _redirect_stdout
+        from . import cli as _cli
+
+        cmd_root = os.path.join(tmp, "cmdcache", "pkg", "darwin-arm64")
+        os.makedirs(os.path.join(cmd_root, "9.9.9"))
+        with open(os.path.join(cmd_root, "9.9.9", "app.js"), "w") as f:
+            f.write(" ".join(markers[:-1]))          # one marker missing -> full scan
+        with open(os.path.join(cmd_root, "9.9.9", "extra.bin"), "wb") as f:
+            f.write(b"padding, holds no marker")
+        _saved = dict(os.environ)
+        os.environ["COPILOT_CACHE_HOME"] = os.path.join(tmp, "cmdcache")
+        buf = _io.StringIO()
+        try:
+            with _redirect_stdout(buf):
+                rc = _cli.cmd_verify_copilot_channels(
+                    _argparse.Namespace(only_version="9.9.9"))
+        finally:
+            os.environ.clear()
+            os.environ.update(_saved)
+        out = buf.getvalue()
+        # It ran, it found the planted bundle, it reported the dropped marker, and it said
+        # so in its exit status. A command that raises is a crash; one that prints nothing
+        # about a build it audited is worse, because it reads as a clean result.
+        cmd_ran = (rc == 2 and "9.9.9" in out and markers[-1] in out
+                   and "MISSING" in out)
+        # ...and the coverage sentence matches what the scan actually did. This bundle has
+        # a marker in NO file, so the scan cannot stop early and the strong claim is true.
+        cmd_claim_ok = "every regular file" in out
+
+        # THE OTHER HALF, and the one the review actually found: a bundle whose markers are
+        # ALL present is answered early, so most of it is never read — 189 of 240 files on
+        # the real 1.0.79 — and the command must not then claim it read everything. Without
+        # this case the assertion above passes whatever the code prints, because a full scan
+        # makes both branches say the same thing.
+        os.makedirs(os.path.join(cmd_root, "9.9.8"))
+        with open(os.path.join(cmd_root, "9.9.8", "app.js"), "w") as f:
+            f.write(" ".join(markers))               # every marker: stops after this file
+        with open(os.path.join(cmd_root, "9.9.8", "zz-never-read.bin"), "wb") as f:
+            f.write(b"never reached, and must not be claimed")
+        buf_short = _io.StringIO()
+        os.environ["COPILOT_CACHE_HOME"] = os.path.join(tmp, "cmdcache")
+        try:
+            with _redirect_stdout(buf_short):
+                _cli.cmd_verify_copilot_channels(
+                    _argparse.Namespace(only_version="9.9.8"))
+        finally:
+            os.environ.clear()
+            os.environ.update(_saved)
+        short_out = buf_short.getvalue()
+        cmd_claim_ok = (cmd_claim_ok
+                        and "every regular file" not in short_out
+                        and "stopped early" in short_out)
+
+        # BOTH UNENUMERATED STATES, driven through the command, because the coverage line
+        # and the marker line are printed by different branches and only a run that
+        # produces both can catch them contradicting each other. With 10 of 11 markers
+        # beside an unlistable directory this block printed "Every marker was found" and
+        # "1 marker(s) were not found in the rest" in consecutive lines (external review).
+        def _blind_bundle(ver, marks):
+            os.makedirs(os.path.join(cmd_root, ver))
+            with open(os.path.join(cmd_root, ver, "app.js"), "w") as f:
+                f.write(" ".join(marks))
+            os.makedirs(os.path.join(cmd_root, ver, "denied"))
+            buf_v = _io.StringIO()
+            _real_walk = os.walk
+
+            def _walk_err(top, *a, **kw):
+                onerror = kw.get("onerror")
+                yield from _real_walk(top, *a, **kw)
+                if onerror is not None:
+                    e = OSError(13, "Permission denied")
+                    e.filename = os.path.join(cmd_root, ver, "denied")
+                    onerror(e)
+
+            os.environ["COPILOT_CACHE_HOME"] = os.path.join(tmp, "cmdcache")
+            os.walk = _walk_err
+            try:
+                with _redirect_stdout(buf_v):
+                    code = _cli.cmd_verify_copilot_channels(
+                        _argparse.Namespace(only_version=ver))
+            finally:
+                os.walk = _real_walk
+                os.environ.clear()
+                os.environ.update(_saved)
+            return code, buf_v.getvalue()
+
+        rc_all, out_all = _blind_bundle("9.9.7", markers)           # every marker found
+        rc_gap, out_gap = _blind_bundle("9.9.6", markers[:-1])      # one marker missing
+        # Neither may claim coverage; and the marker story must be told ONCE, by the
+        # branch that owns it, so the two lines cannot disagree.
+        blind_cmd_ok = (
+            "no claim about coverage" in out_all
+            and "no claim about coverage" in out_gap
+            and "every regular file" not in out_all
+            and "every regular file" not in out_gap
+            # the all-found run must not report anything missing...
+            and "were not found" not in out_all and rc_all in (0, 1)
+            # ...and the run with a gap must not claim everything was found.
+            and "Every marker was found" not in out_gap
+            and "were not found" in out_gap and rc_gap == 2)
+
+        _check("copilot.channel_markers_scan_the_bundle",
+               rel_ok and still_missing and binary_scanned and app_first
+               and blind and verdicts_split and unread_licence and partial_ok
+               and no_double_scan and walk_err_ok and cmd_ran and cmd_claim_ok
+               and blind_cmd_ok
+               and coverage_unknowable,
+               f"a marker that MOVED inside the bundle is found and reported as moved "
+               f"rather than missing (copilot 1.0.75 did exactly this to `mcp-servers`), "
+               f"while a marker in no scanned file is still reported MISSING, a marker "
+               f"only in an unscanned binary is not claimed, and a scan that read nothing "
+               f"is its own verdict instead of 'every channel vanished': "
+               f"relocated={moved.relocated} missing={moved.missing} "
+               f"gapped={gapped_audit.verdict()} "
+               f"searched_head={moved.searched[:3]} binary_scanned={binary_scanned} "
+               f"blind_verdict={nothing.verdict()} moved_verdict={moved.verdict()} "
+               f"unread_licence={unread_licence} cmd_rc={rc} partial={partial.verdict()}/"
+               f"{partial.unreadable} double_scan={relative.searched}",
+               failures, verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -10303,8 +10608,8 @@ def _check_mcp_audit_verdict(failures, verbose):
     _check("audit.two_clean_triggers_do_not_compose_into_a_failure",
            A.verdict(escalated).clean,
            f"EOF followed by signal escalation is ordinary CLI behaviour — C3-1 measured "
-           f"claude and agy closing stdin and codex and copilot signalling, and a client may "
-           f"do both. The latch decides which trigger stopped forwarding, not which triggers "
+           f"codex and copilot signalling, claude signalling too since 2.1.231 (it closed "
+           f"stdin at 2.1.113), agy alone closing stdin, and a client may do both. The latch decides which trigger stopped forwarding, not which triggers "
            f"COUNT, so runners-up are appended to the same list and classified the same way: "
            f"{A.verdict(escalated)}", failures, verbose)
 

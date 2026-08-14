@@ -916,8 +916,8 @@ def cmd_verify_copilot_channels(args) -> int:
     a substitute for that reading.
     """
     from .adapters.copilot import (
-        _MCP_CHANNEL_MARKERS, _VERIFIED_ON, _VERIFIED_VERSIONS, audit_channel_markers,
-        find_cli_bundles,
+        _MCP_CHANNEL_MARKERS, _VERIFIED_ON, _VERIFIED_VERSIONS,
+        MARKER_INCOMPLETE, MARKER_NOT_SEARCHED, audit_channel_markers, find_cli_bundles,
     )
 
     bundles = find_cli_bundles()
@@ -936,10 +936,74 @@ def cmd_verify_copilot_channels(args) -> int:
     worst = 0
     for version, app_js in bundles:
         known = version in _VERIFIED_VERSIONS
-        results = audit_channel_markers(app_js)
-        missing = [m for m, present in results.items() if not present]
+        audit = audit_channel_markers(app_js)
+        results = audit.present
+        missing = audit.missing
         tag = "verified" if known else "NOT in _VERIFIED_VERSIONS"
         print(f"copilot {version}  [{tag}]\n  {app_js}")
+        # A scan that read nothing reports every marker absent — the same output a build
+        # that dropped every channel produces. Say so instead, and never as a finding
+        # about copilot: this one is about the audit.
+        if audit.verdict() == MARKER_NOT_SEARCHED:
+            worst = max(worst, 2)
+            print("  INSTRUMENT  no file in this bundle could be read, so NOTHING was "
+                  "ruled out.\n  => this is a finding about the audit, not about the "
+                  "build. Check the path and permissions above.\n")
+            continue
+        # Says what was READ, and NOTHING about markers. That separation is the fix for a
+        # contradiction rather than a matter of taste: this block used to end "Every marker
+        # was found", the marker result is also reported below, and with 10 of 11 markers
+        # beside an unlistable directory the command printed both that sentence and "1
+        # marker(s) were not found in the rest" (external review). One fact stated in two
+        # places is free to disagree with itself, and the exit status being right does not
+        # help a reader deciding which of the two lines to believe. Coverage here, markers
+        # below, each said once.
+        if audit.scanned_everything:
+            print(f"  searched all {len(audit.searched)} readable file(s) of "
+                  f"{audit.eligible} — every regular file, binaries included")
+        elif audit.unenumerated:
+            # No denominator exists: the files under a directory that would not list were
+            # never enumerated, so neither "all of them" nor "N of M" can be said.
+            print(f"  searched {len(audit.searched)} file(s); "
+                  f"{len(audit.unenumerated)} director(y/ies) could not be listed "
+                  f"({', '.join(audit.unenumerated[:3])}"
+                  f"{', …' if len(audit.unenumerated) > 3 else ''}), so how much of this "
+                  f"bundle exists is unknown and this run supports no claim about coverage")
+        else:
+            print(f"  searched {len(audit.searched)} of {audit.eligible} regular file(s) "
+                  f"(binaries included) and stopped early; an absence would have required "
+                  f"reading all of them")
+        # Partial blindness is the same argument as total blindness, and it is the case
+        # the first cut got wrong: one unreadable file beside one readable one produced a
+        # confident MISSING for every marker. A marker may be sitting in the file that
+        # would not open, so the run cannot call it absent.
+        if audit.verdict() == MARKER_INCOMPLETE:
+            worst = max(worst, 2)
+            blind = list(audit.unreadable) + [f"{d}/ (not listable)"
+                                              for d in audit.unenumerated]
+            print(f"  INSTRUMENT  {len(blind)} path(s) could not be read "
+                  f"({', '.join(blind[:3])}"
+                  f"{', …' if len(blind) > 3 else ''}), and "
+                  f"{len(audit.missing)} marker(s) were not found in the rest.\n"
+                  "  => a marker may be in a path this scan could not open, so this is "
+                  "NOT a finding about the build. Fix the read, then re-run.\n")
+            continue
+        # Found, but no longer in app.js. copilot 1.0.75 moved the agent frontmatter
+        # schema out of the bundle's main file, and a one-file scan called that a
+        # removed channel — the same words used for a channel that really went away.
+        if audit.relocated:
+            # Raises the exit status, and the reason is not tidiness. Before the scan was
+            # widened, a marker that left app.js exited 2 and got looked at. If relocation
+            # printed a line and exited 0, the widening would have turned a loud finding
+            # into a quiet one — and the loudest case is a marker deleted from the RUNTIME
+            # bundle while surviving in `sdk/index.d.ts` or a JSON schema, which are
+            # typings and documentation rather than code that runs (review).
+            worst = max(worst, 1)
+            for m, whereat in sorted(audit.relocated.items()):
+                print(f"  moved    {m}  — now in {whereat}, not app.js. Confirm the "
+                      f"channel is still LIVE rather than merely still named: a native "
+                      f"module is executed code and a typings or schema file is not, and "
+                      f"the string alone does not say which kind of file this is")
         if missing:
             worst = max(worst, 2)
             for m in missing:
