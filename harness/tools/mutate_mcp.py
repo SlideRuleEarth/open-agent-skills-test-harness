@@ -133,6 +133,7 @@ HTTPFIX = "fixtures/http_mcp_server.py"
 PROBE1 = "tools/probe_remote_mcp.py"
 # The three copilot probes, same category and same reason: opt-in, never run by the block, and
 # about to have an adapter decision rest on the word they print. §E19 drives their classifiers.
+SESSPROBE = "tools/probe_session_mcp.py"
 CCONFIG = "tools/probe_copilot_config.py"
 CGATE = "tools/probe_copilot_gating.py"
 CGATE_REMOTE = "tools/probe_copilot_remote_gating.py"
@@ -3616,6 +3617,236 @@ MUTATIONS = [
       "_overlapped(record)"),
      "\n        if poisoned.is_set():\n            record = _overlapped(record)",
      "...while the record that caused the stop keeps its own report rather than being relabelled"),
+
+    # C3-4's probe. Every one of these is a way to make the §10.10 session decision come back
+    # WRONG rather than come back missing — which is the failure mode worth buying arms for,
+    # since a probe that visibly cannot measure gets re-run and one that quietly mismeasures
+    # gets published.
+    ("F138-a-failed-read-counts-as-a-released-session", SESSPROBE,
+     "    if reply.status is None:\n        return UNREADABLE",
+     "    if reply.status is None:\n        return DEAD",
+     "a transport failure is UNREADABLE, never DEAD — a failed read is not a released session"),
+    # The same collapse one door along: a server erroring, or refusing the credential, is not
+    # a session that went away.
+    ("F139-a-server-side-failure-reads-as-a-gone-session", SESSPROBE,
+     ("        return ALIVE if rpc_response(reply.events, want_id) is not None else UNREADABLE"
+      "\n    return UNREADABLE"),
+     ("        return ALIVE if rpc_response(reply.events, want_id) is not None else UNREADABLE"
+      "\n    return DEAD"),
+     "...and neither is a server-side failure, nor an auth refusal"),
+    # A 2xx IS A TRANSPORT FACT. Dropping the correlation makes an empty 200, a CDN
+    # interstitial and a stream carrying only a priming event all read as a live session.
+    ("F150-any-2xx-is-taken-for-a-live-session", SESSPROBE,
+     "        return ALIVE if rpc_response(reply.events, want_id) is not None else UNREADABLE",
+     "        return ALIVE",
+     ("a 2xx with NO JSON-RPC answer in it is UNREADABLE, not ALIVE — an empty body, a CDN "
+      "interstitial and an unparseable one are transport successes carrying no MCP evidence")),
+    # Correlation dropped entirely: someone else's response, or a replayed one, answers us.
+    ("F151-a-response-to-another-request-answers-ours", SESSPROBE,
+     "        if \"id\" not in ev or request_id_key(ev[\"id\"]) != want:\n            continue",
+     "        if False:\n            continue",
+     "...and a JSON-RPC response to a DIFFERENT id does not answer ours"),
+    # An ERROR response dropped from the accepted shapes. "Method not found" is the server
+    # talking to us — refusing to count it reports a live session as unreadable on a
+    # technicality, which is the false negative that matches the wrong direction of the
+    # tri-state.
+    ("F152-an-error-response-is-not-counted-as-the-server-answering", SESSPROBE,
+     "        if classify_envelope(ev) not in (RESULT, ERROR):\n            continue",
+     "        if classify_envelope(ev) not in (RESULT,):\n            continue",
+     ("a well-formed result and a well-formed error both answer our id — an error is the "
+      "server talking to us, which is what liveness asks")),
+    # THE PRIMING-EVENT BUG, restored: keep only the first event and the probe reads whatever
+    # arrived first as its answer.
+    ("F153-only-the-first-sse-event-is-kept", SESSPROBE,
+     "        return tuple(out)",
+     "        return tuple(out[:1])",
+     ("every event in a stream is kept, not just the first — a priming event before the "
+      "response is permitted, and reading position instead of id makes it the answer")),
+    # The out-of-band error reader made id-correlated, which discards the one message worth
+    # reading: the live server answers a dead session with `"id": "server-error"`.
+    ("F154-the-error-message-is-thrown-away-unless-it-correlates", SESSPROBE,
+     "        if isinstance(ev, dict) and isinstance(ev.get(\"error\"), dict):",
+     "        if isinstance(ev, dict) and isinstance(ev.get(\"error\"), dict) and False:",
+     "an out-of-band error message is readable though its id matches nothing we sent"),
+    # THE LIFECYCLE, unmeasured: a handshake the probe never completed reads the same as one
+    # the server accepted.
+    ("F155-an-unsent-initialized-reads-as-an-accepted-one", SESSPROBE,
+     "    return ack is not None and ack.status is not None and 200 <= ack.status < 300",
+     "    return True",
+     ("...and a rejected, failed or NEVER-SENT one is not accepted — a handshake the probe "
+      "skipped must not read the same as one the server took")),
+    # Cleanup that believes the DELETE's 200 instead of observing the session gone — the exact
+    # claim-versus-observation distinction this probe exists to draw.
+    ("F156-a-session-is-marked-released-without-being-observed-gone", SESSPROBE,
+     "        if state == DEAD:\n            ledger.mark_released(sid)",
+     "        ledger.mark_released(sid)",
+     ("a session whose post-DELETE read is UNREADABLE stays OUTSTANDING — cleanup keyed on "
+      "readability would walk past exactly the sessions most likely to still be alive")),
+    # THE CREDENTIAL GOES BACK INTO ARGV. Not a denylist any more — the refusal is the whole
+    # loop, so re-admitting command-line values is the mutation.
+    ("F157-a-header-value-is-accepted-from-argv-again", SESSPROBE,
+     "    for raw in header_args or ():\n        name = (raw.partition(\":\")[0] or raw).strip()",
+     "    for raw in [] or ():\n        name = (raw.partition(\":\")[0] or raw).strip()",
+     ("NO header value is accepted from the command line, whatever the header is called, and "
+      "each one is REFUSED rather than silently dropped — a list of which names are secret can "
+      "always be one name short, so the rule is the flag")),
+    # The refusal stops naming the flag that works, so the caller is stuck.
+    ("F159-the-refusal-does-not-name-the-working-flag", SESSPROBE,
+     ("            f\"world-readable, and a list of which header names are secret can always be one \"\n"
+      "            f\"name short. Use --header-env '{name}=VAR_NAME', with the variable holding the \"\n"
+      "            f\"COMPLETE value including any scheme, e.g. VAR_NAME='Bearer eyJ…'.\")"),
+     "            f\"world-readable.\")",
+     ("...and each refusal NAMES the flag that works, so the error is directed rather than a "
+      "bare rejection")),
+    # ENVELOPE RIGOUR, un-delegated. Each of these re-derives a rule the proxy already owns.
+    ("F160-envelope-shape-is-not-checked-against-the-proxys-rule", SESSPROBE,
+     "        if classify_envelope(ev) not in (RESULT, ERROR):\n            continue",
+     "        if \"jsonrpc\" not in ev:\n            continue",
+     ("every frame the PROXY classifies malformed is refused here too — the probe inherits the "
+      "rule rather than agreeing with it by coincidence")),
+    # Identity by STRING, which collapses the two domains JSON-RPC keeps apart: `"1"` and `1`
+    # are different ids, and `str()` makes them one. Plain `==` is NOT the mutation here — the
+    # shape gate rejects boolean ids before the comparison runs, so `==` is equivalent past it
+    # and an equivalent mutant proves nothing (found by the suite reporting it uncaught).
+    ("F161-request-id-domains-are-collapsed-by-stringifying", SESSPROBE,
+     "        if \"id\" not in ev or request_id_key(ev[\"id\"]) != want:\n            continue",
+     "        if \"id\" not in ev or str(ev[\"id\"]) != str(want_id):\n            continue",
+     "a STRING id does not answer a NUMBER id — different domains per JSON-RPC"),
+    # PER-SESSION HANDSHAKE, dropped: a sampled session that never entered normal operation is
+    # measured as though it had.
+    ("F162-the-eligibility-gate-does-not-gate", SESSPROBE,
+     "        eligible, why = session_eligible(s, version)\n        if not eligible:",
+     "        eligible, why = session_eligible(s, version)\n        if False:",
+     ("Q3: EVERY sampled session was measurable — a row taken through an incomplete "
+      "handshake, or a different revision, is a reading of another quantity entirely")),
+    # THE EXCLUSION MADE COSMETIC AGAIN: the row is announced excluded and still enters the
+    # verdict, which is what published `2 of 2 answered alike: indeterminate`.
+    ("F165-excluded-rows-still-enter-the-sample", SESSPROBE,
+     "    measurable = [r for r in rows if r.get(\"eligible\")]",
+     "    measurable = list(rows)",
+     ("rows that fail the gate are excluded from the SAMPLE, not merely announced — a verdict "
+      "over rows that measured nothing is agreement about nothing")),
+    # An errored `initialize` readmitted: a correlated response taken for a successful one.
+    ("F166-an-errored-initialize-is-a-completed-handshake", SESSPROBE,
+     "    if isinstance(response.get(\"error\"), dict):",
+     "    if False:",
+     ("an `initialize` that ERRORS is not a completed handshake, and no `initialized` is sent "
+      "after it — a correlated response is not a successful one")),
+    # The revision dropped from the gate, so a drifted session is measured after all.
+    ("F167-a-drifted-revision-passes-the-gate", SESSPROBE,
+     "    if expected_version is not None and session[\"version\"] != expected_version:",
+     "    if False:",
+     ("a session negotiating another revision is excluded from Q3 before it is measured, and "
+      "the reason names both revisions")),
+    # THE RUN-LEVEL GATE BACK ON THE WEAKER CONDITION: an errored `initialize` has a
+    # correlated response, so the run continues into Q3, the control and Q4 with no revision.
+    ("F169-the-runs-own-failed-handshake-does-not-stop-it", SESSPROBE,
+     "        if not handshake_complete(s):\n            why = session_eligible(s, None)[1]",
+     "        if s[\"response\"] is None:\n            why = session_eligible(s, None)[1]",
+     ("a run whose OWN handshake failed measures nothing below it — not Q3, not the control, "
+      "not Q4 — because a correlated ERROR is still a failed handshake")),
+    # ...and the far-end precondition removed, so the two can drift apart in silence again.
+    ("F170-a-question-runs-without-a-known-run-revision", SESSPROBE,
+     ("    if not version:\n        check(\"Q3: the run's protocol revision is known before "
+      "any session is sampled — \""),
+     ("    if False:\n        check(\"Q3: the run's protocol revision is known before "
+      "any session is sampled — \""),
+     ("Q3 and Q4 refuse to run without a known run revision, so main()'s gate and their own "
+      "precondition cannot drift apart in silence")),
+    # Cleanup back on the run's revision rather than each session's own.
+    ("F168-cleanup-releases-every-session-under-one-revision", SESSPROBE,
+     "        per_session = ledger.version_for(sid) or version",
+     "        per_session = version",
+     ("...and cleanup releases each session UNDER that revision — read from what the DELETE "
+      "carried, not from what the ledger was asked for")),
+    # ...and the half of it that is the notification rather than the response.
+    ("F163-an-incomplete-handshake-passes-on-the-response-alone", SESSPROBE,
+     ("    return (isinstance(response, dict) and isinstance(response.get(\"result\"), dict)\n"
+      "            and bool(session.get(\"version\")) and bool(session.get(\"initialized\")))"),
+     ("    return (isinstance(response, dict) and isinstance(response.get(\"result\"), dict)\n"
+      "            and bool(session.get(\"version\")))"),
+     ("a handshake is complete only with a SUCCESSFUL result, a declared version AND an "
+      "accepted `initialized` — any one missing is an incomplete handshake")),
+    # A cohort whose handshake never completed still contributes a survival reading.
+    ("F164-a-cohort-is-measured-through-an-incomplete-handshake", SESSPROBE,
+     "    if _ineligible:\n        for c in _ineligible:",
+     "    if []:\n        for c in _ineligible:",
+     ("Q4: every cohort completed its handshake and negotiated the same revision — an "
+      "idle session that never entered normal operation is a different quantity")),
+    # An unset credential variable silently produces no header, so the failure surfaces as an
+    # auth error far from its cause.
+    ("F158-an-unset-credential-variable-is-skipped-in-silence", SESSPROBE,
+     ("            errors.append(f\"--header-env {name!r} names ${var}, which is not set\")\n"
+      "            continue"),
+     "            continue",
+     ("...and an unset or empty variable is a NAMED error, not a silently absent header — a "
+      "credential that quietly fails to be set surfaces as an auth failure far from its cause")),
+    # THE POSITIVE CONTROL, DELETED. Without it a session never shown to exist is credited to
+    # the server as a clean release — the row looks tidiest exactly when it means least.
+    ("F140-a-release-is-certified-without-the-session-ever-being-alive", SESSPROBE,
+     "    if before != ALIVE:\n        return INDETERMINATE",
+     "    if False:\n        return INDETERMINATE",
+     "a session never demonstrably ALIVE is INDETERMINATE however tidy the rest looks"),
+    # `not ALIVE` instead of `DEAD` — the plausible wrong predicate, which folds the
+    # instrument's own silence into the cleanest possible answer.
+    ("F141-anything-but-alive-is-read-as-a-release", SESSPROBE,
+     "    if after == DEAD:\n        return RELEASED",
+     "    if after != ALIVE:\n        return RELEASED",
+     ("an UNREADABLE session after the DELETE is INDETERMINATE, not a release — `not ALIVE` "
+      "would have published the instrument's own silence as the cleanest possible outcome")),
+    # The structural clause §4 asks for ahead of every universal, removed. A run that opened
+    # no session at all then publishes agreement.
+    ("F142-an-empty-sample-reports-as-agreement", SESSPROBE,
+     ('    if not outcomes:\n        return "no sessions were opened, so the sample '
+      'establishes nothing", False'),
+     ('    if False:\n        return "no sessions were opened, so the sample '
+      'establishes nothing", False'),
+     ("an EMPTY sample is not agreement — `all()` over a list nothing was put into is true, "
+      "and this is the function that stands where that would have been published")),
+    # THE C3-3 MISTAKE, WRITTEN OUT. The bound is still censored and still names the horizon,
+    # so the first check stays green; only the forbidden reading is added. If that check were
+    # decorative this mutation would survive, which is exactly what it is here to prove.
+    ("F143-the-censored-bound-also-claims-the-session-never-expires", SESSPROBE,
+     '        bound = f"lifetime > {horizon_s}s, censored"',
+     '        bound = f"lifetime > {horizon_s}s, censored — it does not expire"',
+     "...and never says the session does not expire, which no observation at W supports"),
+    # A cohort that produced NO reading, phrased as a survival: it adds a survivor to the
+    # record on the strength of nothing having been observed.
+    ("F144-an-unreadable-cohort-is-published-as-a-survival", SESSPROBE,
+     '    return f"UNREADABLE at {horizon_s}s — no observation, not a survival"',
+     '    return f"lifetime > {horizon_s}s, censored"',
+     "an UNREADABLE cohort is not a survival and claims no bound"),
+    # A server that answered with a revision we refuse, filed as a server that said nothing.
+    ("F145-an-unimplemented-revision-reads-as-silence", SESSPROBE,
+     "    return ERA_UNKNOWN",
+     "    return ERA_NONE",
+     "a version outside §10.2's allowlist is UNKNOWN, not silence"),
+    # Scope decided on the era alone, so a modern server issuing a session id — the anomaly
+    # worth seeing — is filed as ordinary.
+    ("F146-a-modern-server-issuing-a-session-is-treated-as-ordinary", SESSPROBE,
+     "    return era in (ERA_LEGACY, ERA_UNKNOWN) and bool(session_id)",
+     "    return era in (ERA_LEGACY, ERA_UNKNOWN, ERA_MODERN) and bool(session_id)",
+     ("a MODERN server is out of scope even when it issues an id — that is the anomaly, and "
+      "a lookup on the era alone would call it ordinary")),
+    # Discrimination claimed from an empty record: nothing was compared, and the answer is yes.
+    ("F147-discrimination-is-claimed-with-nothing-to-compare", SESSPROBE,
+     "    return bool(said) and bool(unknown_message) and unknown_message not in said",
+     "    return unknown_message not in said",
+     "...and no recorded messages is not discrimination — the structural clause again"),
+    # The live target answers ordinary POSTs with SSE framing. A reader that assumed JSON
+    # reports a conformant server as malformed — and every session reading with it.
+    ("F148-an-sse-framed-body-is-parsed-as-plain-json", SESSPROBE,
+     '    if "text/event-stream" in (content_type or "") or raw.startswith("event:"):',
+     "    if False:",
+     ("a JSON body parses, and an SSE-framed one parses to the same thing — a reader that "
+      "assumed application/json would report a conformant server as malformed")),
+    # `urllib` raises on 4xx. Losing the status here turns the one answer this probe exists to
+    # read into "the instrument could not tell", from a server that answered perfectly.
+    ("F149-a-404-is-swallowed-as-a-transport-failure", SESSPROBE,
+     "        return Reply(exc.code, dict(exc.headers or {}),",
+     "        return Reply(None, dict(exc.headers or {}),",
+     ("a 404 arrives as a STATUS with its body, not as a transport error — urllib raises on "
+      "4xx, and filing that as a failure reports every released session as unmeasurable")),
 
 ]
 
