@@ -3738,6 +3738,21 @@ MUTATIONS = [
      "    if False:",
      ("a session negotiating another revision is excluded from Q3 before it is measured, and "
       "the reason names both revisions")),
+    # THE RUN-LEVEL GATE BACK ON THE WEAKER CONDITION: an errored `initialize` has a
+    # correlated response, so the run continues into Q3, the control and Q4 with no revision.
+    ("F169-the-runs-own-failed-handshake-does-not-stop-it", SESSPROBE,
+     "        if not handshake_complete(s):\n            why = session_eligible(s, None)[1]",
+     "        if s[\"response\"] is None:\n            why = session_eligible(s, None)[1]",
+     ("a run whose OWN handshake failed measures nothing below it — not Q3, not the control, "
+      "not Q4 — because a correlated ERROR is still a failed handshake")),
+    # ...and the far-end precondition removed, so the two can drift apart in silence again.
+    ("F170-a-question-runs-without-a-known-run-revision", SESSPROBE,
+     ("    if not version:\n        check(\"Q3: the run's protocol revision is known before "
+      "any session is sampled — \""),
+     ("    if False:\n        check(\"Q3: the run's protocol revision is known before "
+      "any session is sampled — \""),
+     ("Q3 and Q4 refuse to run without a known run revision, so main()'s gate and their own "
+      "precondition cannot drift apart in silence")),
     # Cleanup back on the run's revision rather than each session's own.
     ("F168-cleanup-releases-every-session-under-one-revision", SESSPROBE,
      "        per_session = ledger.version_for(sid) or version",

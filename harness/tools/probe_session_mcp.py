@@ -790,6 +790,15 @@ def probe_handshake(url: str, ledger: SessionLedger, headers=None) -> dict:
 def probe_release(url: str, n: int, version: str, ledger: SessionLedger,
                   headers=None) -> list[dict]:
     print(f"\nQ3: does it accept client-driven termination? {n} sessions, stated sample")
+    # THE CALLER'S GUARANTEE, CHECKED RATHER THAN ASSUMED. `session_eligible` skips revision
+    # matching when no run revision is established — correct for the first handshake, and a
+    # silent hole here, which is exactly how a failed handshake reached a published bound.
+    # main() now gates on `handshake_complete`; this is the same fact asserted at the far end,
+    # so the two cannot drift apart without something going red.
+    if not version:
+        check("Q3: the run's protocol revision is known before any session is sampled — "
+              "without it the eligibility gate stops comparing revisions", False, version)
+        return []
     rows = []
     for i in range(n):
         s = open_session(url, ledger, headers)
@@ -902,6 +911,13 @@ def probe_survival(url: str, horizons, w: int, version: str, ledger: SessionLedg
                    headers=None) -> list[dict]:
     print(f"\nQ4: idle lifetime against W={w}s — one session per horizon, each observed ONCE")
     print("       (a session polled repeatedly is not idle; see the module docstring)")
+    # Same guarantee, same check — and this is the question that actually published the bad
+    # reading, so it is the one that must not be reachable without a known revision.
+    if not version:
+        check("Q4: the run's protocol revision is known before any cohort is opened — a "
+              "censored bound taken without one describes no revision in particular", False,
+              version)
+        return []
     cohorts = []
     for h in horizons:
         s = open_session(url, ledger, headers)
@@ -1015,9 +1031,19 @@ def main() -> int:
     version = None
     try:
         s = probe_handshake(args.url, ledger, headers)
-        if s["response"] is None:
-            print("\nFAILED: the endpoint did not complete a handshake — nothing below is "
-                  "readable")
+        # THE RUN-LEVEL GATE IS THE SAME PREDICATE AS THE PER-SESSION ONE (external review).
+        # This stopped only when the response was ABSENT — but an errored `initialize` HAS a
+        # correlated response, so a run whose own handshake failed carried on into Q3, the
+        # unknown-session control and Q4 with `version=None`; and since `session_eligible`
+        # legitimately skips revision matching when no run revision is established yet, Q4 then
+        # accepted a later session and published an ALIVE censored bound. The exit status was 1
+        # throughout, which is precisely why that is not a defence: §9's numbers are read off
+        # the transcript, and a transcript that publishes a bound while the status says failure
+        # is the disagreement §4 exists to prevent.
+        if not handshake_complete(s):
+            why = session_eligible(s, None)[1] or "the handshake did not complete"
+            print(f"\nFAILED: the endpoint did not complete a handshake — {why}.")
+            print("Nothing below is readable, so nothing below runs.")
             return 1
         version = s["version"]
         if not s["sid"]:

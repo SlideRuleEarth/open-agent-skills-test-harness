@@ -3814,6 +3814,45 @@ check("...and cleanup releases each session UNDER that revision — read from wh
       and len(_clean_rows) == 2,
       _deletes)
 
+# --- THE RUN-LEVEL GATE, which is the same predicate one scope out. ---
+# `main()` stopped only when the initialize response was ABSENT — but an errored `initialize`
+# HAS a correlated response, so a run whose own handshake failed carried on into Q3, the
+# control and Q4 with `version=None`, and Q4 published an ALIVE censored bound off a later
+# session (external review). The exit status was 1 the whole time, which is why it is not a
+# defence: §9's numbers are read off the transcript.
+_saved_urlopen5, _saved_argv = urllib.request.urlopen, sys.argv
+try:
+    sys.argv = ["probe", "--sessions", "1", "--horizons", "1", "--window", "1"]
+    urllib.request.urlopen = _fake_mcp(err_init=True)
+    _grc, _gfind, _gout = _drive(SESS.main)
+    urllib.request.urlopen = _fake_mcp(version="2025-11-25")
+    _okrc, _okfind, _okout = _drive(SESS.main)
+finally:
+    urllib.request.urlopen, sys.argv = _saved_urlopen5, _saved_argv
+_SECTIONS = ("Q3: does it accept", "control: a session id", "Q4: idle lifetime")
+check("a run whose OWN handshake failed measures nothing below it — not Q3, not the control, "
+      "not Q4 — because a correlated ERROR is still a failed handshake",
+      _grc == 1 and not any(sec in _gout for sec in _SECTIONS) and "censored" not in _gout,
+      _gout[-300:])
+# THE POSITIVE CONTROL. Without it, "nothing ran" is equally the story of a gate that refuses
+# everything, and the check above would pass over a probe that could no longer measure at all.
+check("...and a run whose handshake SUCCEEDS reaches all three and publishes its bound, so the "
+      "gate is discriminating rather than simply shut",
+      all(sec in _okout for sec in _SECTIONS) and "censored" in _okout, _okout[-300:])
+# THE SAME FACT ASSERTED AT THE FAR END. `session_eligible` legitimately skips revision
+# matching when no run revision is established yet — correct for the first handshake, and the
+# silent hole that let the failed run reach a published bound. Both questions now refuse it.
+_nover_q3, _nover_q3_f, _ = _drive(SESS.probe_release, "http://probe.invalid", 1, None,
+                                   SESS.SessionLedger())
+_nover_q4, _nover_q4_f, _ = _drive(SESS.probe_survival, "http://probe.invalid", [1], 1, None,
+                                   SESS.SessionLedger())
+check("Q3 and Q4 refuse to run without a known run revision, so main()'s gate and their own "
+      "precondition cannot drift apart in silence",
+      _nover_q3 == [] and _nover_q4 == []
+      and any("revision is known" in f for f in _nover_q3_f)
+      and any("revision is known" in f for f in _nover_q4_f),
+      (_nover_q3_f, _nover_q4_f))
+
 # --- W is DERIVED. §4: where import is possible, import; this checks the derivation's source. ---
 # --- The one transport line every classification downstream depends on. ---
 # `urllib` RAISES on 4xx, so the 404 this probe exists to read arrives as an EXCEPTION. Filing
