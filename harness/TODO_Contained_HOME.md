@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 2/2 instrument + 136/136 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3 probe; 482 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 2/2 instrument + 148/148 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 probes; 512 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 git diff --check
 
@@ -312,6 +312,12 @@ ps -eo stat= | grep -c '^[Tt]'                  # 0 — nothing left SIGSTOPped 
 # mutation runner's suite-readers are driven OFFLINE by the fixture verifier (§E17, §E18),
 # because "nothing routine runs it" is exactly how a fix lands in one copy and not the other.
 harness/.venv/bin/python harness/tools/probe_remote_mcp.py    # 19 checks; claude 2.1.113 (http asserts 2 more than sse)
+
+# ALSO OPT-IN, and cheaper: no CLI, no API call, no credential against the default target.
+# Reaches a live remote MCP server, so it is out of the block for that reason alone. Q4 holds
+# sessions idle for W and therefore takes W (default 600s, the harness's own cell cap) — pass
+# --skip-survival for the rest in about 20s. Its classifiers are driven offline at §E20.
+harness/.venv/bin/python harness/tools/probe_session_mcp.py   # C3-4; NASA Earthdata by default, --url for another
 ```
 
 **`--jobs 8` is the recommended way to run it and `--jobs 1` is what it means.** The suite is
@@ -1922,7 +1928,10 @@ ABA fix and its route to `parallel_safe_config = True`.
   own, because the proxy presents *stdio* to the CLI and stdio is symmetric: not opening it
   would turn a bidirectional channel into a half-duplex one with nothing able to notice. Probe **C3-4** decides whether a session the server declines to terminate is clean,
   and asks first whether that server is even in the era this machinery belongs to — modern
-  removed protocol sessions. Build order: ~~probe **C3-0**~~ →
+  removed protocol sessions. **Both are now answered (2026-08-14) against a real remote server,
+  though not the SlideRule one**: legacy `2025-11-25`, a session issued, and 5 of 5 released on
+  request, so §10.10's "a retained session is not clean" is not an outage against a conformant
+  server. Build order: ~~probe **C3-0**~~ →
   ~~probe **C3-1**~~ → ~~a **dual-era mode for `fixtures/echo_mcp_server.py`** (#98)~~ →
   ~~the **decision layer** + its arms, wired to nothing (#100)~~ →
   ~~the **audit record types**, the structural validator and `verdict()`
@@ -2046,5 +2055,8 @@ twice gone stale here while §9 was current, which is the same drift the counts 
 place to avoid. As of 2026-08-12: codex's TOML arrays/inline tables via `-c` (probe #2); copilot's MCP
 tool-name format **in its own events** and plugin-declared server reach (the two halves probe #3 did not
 answer — its gating and config halves are resolved); agy's transcript tool-name format and `url` vs
-`serverUrl` (probe #4); C3-3, deliberately unpriced; and C3-4, which needs the SlideRule endpoint.
+`serverUrl` (probe #4); and C3-3, deliberately unpriced. **C3-4 came off this list on 2026-08-14** —
+it was answered against NASA's public Earthdata endpoint rather than SlideRule's, which settles the
+session-lifecycle question the bridge's ending model needed and leaves SlideRule's own behaviour, and
+§8's credential half, still unmeasured; `tools/probe_session_mcp.py --url --header` re-runs it there.
 claude's `mcpServers` http/sse shape was resolved by #106 and sat here as open for two merges after that.

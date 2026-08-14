@@ -3351,5 +3351,203 @@ finally:
     shutil.rmtree(_e19, ignore_errors=True)
 
 print()
+print("E20. C3-4: probe_session_mcp.py's classification, which is where the §10.10 decision "
+      "lands")
+# The probe itself needs a live remote server, so nothing here runs it. What IS checkable
+# offline is the part a design decision actually rests on — whether a reading gets filed as a
+# server behaviour or as the instrument failing — and E14 is the precedent: the C3-2 probe's
+# `elif` chain decided the published result and had no check at all, so every check on the
+# INSTRUMENT could stay green over a classifier that reported a dead CLI as a measurement.
+# Synthetic rows for the same reason: the point is the classification, not another live run.
+import probe_session_mcp as SESS  # noqa: E402 — section-local, after the path bootstrap at E14
+from agentskill_evals.mcp_proxy import IMPLEMENTED_VERSIONS as _IMPL  # noqa: E402
+from agentskill_evals.spec import EvalSpec as _EvalSpec  # noqa: E402
+
+
+def _reply(status=None, message=None):
+    body = {"error": {"message": message}} if message else None
+    return SESS.Reply(status=status, body=body)
+
+
+# --- Q1's era gate. UNKNOWN and NONE are different answers, and merging them is the bug. ---
+check("a legacy protocolVersion is legacy, and a modern one modern",
+      (SESS.classify_era("2025-11-25"), SESS.classify_era("2026-07-28"))
+      == (SESS.ERA_LEGACY, SESS.ERA_MODERN),
+      (SESS.classify_era("2025-11-25"), SESS.classify_era("2026-07-28")))
+# A version the gate does not implement is §10.2's ANOMALY. Filing it as "no handshake" would
+# report a server that answered — with something we refuse — as a server that said nothing,
+# and those license different actions: one is a bridge we cannot build, the other a dead host.
+check("a version outside §10.2's allowlist is UNKNOWN, not silence",
+      SESS.classify_era("2024-11-05") == SESS.ERA_UNKNOWN, SESS.classify_era("2024-11-05"))
+check("...and silence is silence, whatever shape it arrives in",
+      all(SESS.classify_era(v) == SESS.ERA_NONE for v in (None, "", {}, 20251125, [])),
+      [SESS.classify_era(v) for v in (None, "", {}, 20251125, [])])
+# The allowlist is IMPORTED, so this cannot disagree with the gate — which is the point of
+# importing it. What it can still catch is the constant being emptied or narrowed underneath.
+check("every version the proxy implements classifies as a real era, none as unknown",
+      bool(_IMPL)
+      and all(SESS.classify_era(v) in (SESS.ERA_LEGACY, SESS.ERA_MODERN) for v in _IMPL),
+      [(v, SESS.classify_era(v)) for v in _IMPL])
+
+# --- Q2. Modern removed protocol-level sessions, so the era and the id are a CONJUNCTION. ---
+check("a legacy server that issued an id is in scope; one that issued none is not",
+      SESS.sessions_apply(SESS.ERA_LEGACY, "abc") is True
+      and SESS.sessions_apply(SESS.ERA_LEGACY, None) is False,
+      (SESS.sessions_apply(SESS.ERA_LEGACY, "abc"), SESS.sessions_apply(SESS.ERA_LEGACY, None)))
+check("a MODERN server is out of scope even when it issues an id — that is the anomaly, and "
+      "a lookup on the era alone would call it ordinary",
+      SESS.sessions_apply(SESS.ERA_MODERN, "abc") is False
+      and SESS.sessions_apply(SESS.ERA_MODERN, None) is False,
+      (SESS.sessions_apply(SESS.ERA_MODERN, "abc"),
+       SESS.sessions_apply(SESS.ERA_MODERN, None)))
+
+# --- Liveness. The tri-state is the whole instrument; collapsing it is the C3-1 mistake. ---
+check("200 is alive and 404 is dead",
+      (SESS.classify_liveness(_reply(200)), SESS.classify_liveness(_reply(404)))
+      == (SESS.ALIVE, SESS.DEAD),
+      (SESS.classify_liveness(_reply(200)), SESS.classify_liveness(_reply(404))))
+# THE ARM THAT MATTERS. A transport failure and a 5xx are the absence of a reading. Filing
+# either as DEAD credits the server with the cleanest behaviour it could have had, on evidence
+# that it did anything at all — C3-1's swallowed OSError, in a third place.
+check("a transport failure is UNREADABLE, never DEAD — a failed read is not a released session",
+      SESS.classify_liveness(_reply(None)) == SESS.UNREADABLE,
+      SESS.classify_liveness(_reply(None)))
+check("...and neither is a server-side failure, nor an auth refusal",
+      all(SESS.classify_liveness(_reply(s)) == SESS.UNREADABLE for s in (500, 503, 401, 403)),
+      [(s, SESS.classify_liveness(_reply(s))) for s in (500, 503, 401, 403)])
+
+# --- Q3's disposition. Ordered so the instrument's failures cannot become server behaviour. ---
+check("alive, DELETE accepted, gone afterwards is a RELEASE",
+      SESS.classify_release(_reply(200), SESS.ALIVE, SESS.DEAD) == SESS.RELEASED)
+check("alive, DELETE accepted, still answering is §10.10's RETAINED anomaly",
+      SESS.classify_release(_reply(200), SESS.ALIVE, SESS.ALIVE) == SESS.RETAINED)
+check("a 405 is the server DECLINING termination — a server answer, not a failure, and the "
+      "case §10.10 named as possibly fatal",
+      SESS.classify_release(_reply(405), SESS.ALIVE, SESS.ALIVE) == SESS.DECLINED)
+# THE POSITIVE CONTROL, ENFORCED IN THE CLASSIFIER. Without the `before` clause this row reads
+# as a clean release: the DELETE was accepted and the session is gone afterwards. But it was
+# never established to be there in the first place, so "gone" has nothing to be gone relative
+# to — which is exactly how a server that never had the session gets credited with releasing it.
+check("a session never demonstrably ALIVE is INDETERMINATE however tidy the rest looks",
+      all(SESS.classify_release(_reply(200), before, SESS.DEAD) == SESS.INDETERMINATE
+          for before in (SESS.UNREADABLE, SESS.DEAD, None)),
+      [SESS.classify_release(_reply(200), b, SESS.DEAD)
+       for b in (SESS.UNREADABLE, SESS.DEAD, None)])
+check("an UNREADABLE session after the DELETE is INDETERMINATE, not a release — `not ALIVE` "
+      "would have published the instrument's own silence as the cleanest possible outcome",
+      SESS.classify_release(_reply(200), SESS.ALIVE, SESS.UNREADABLE) == SESS.INDETERMINATE,
+      SESS.classify_release(_reply(200), SESS.ALIVE, SESS.UNREADABLE))
+check("...and a DELETE that never reached the server is INDETERMINATE too",
+      SESS.classify_release(_reply(None), SESS.ALIVE, SESS.DEAD) == SESS.INDETERMINATE,
+      SESS.classify_release(_reply(None), SESS.ALIVE, SESS.DEAD))
+
+# --- The sample verdict. The empty case is the one `all()` gets wrong for free. ---
+_empty_phrase, _empty_uniform = SESS.sample_verdict([])
+check("an EMPTY sample is not agreement — `all()` over a list nothing was put into is true, "
+      "and this is the function that stands where that would have been published",
+      _empty_uniform is False and "establishes nothing" in _empty_phrase,
+      (_empty_phrase, _empty_uniform))
+_uniform_phrase, _uniform_ok = SESS.sample_verdict([SESS.RELEASED] * 5)
+check("five alike is a statement about the sample, and it names N rather than generalising",
+      _uniform_ok is True and "5 of 5" in _uniform_phrase, _uniform_phrase)
+_split_phrase, _split_ok = SESS.sample_verdict([SESS.RELEASED, SESS.RETAINED, SESS.RELEASED])
+check("a SPLIT sample is not uniform, and says the verdict must be per-run — §9 calls "
+      "disagreement inside the sample the interesting result",
+      _split_ok is False and "per-run" in _split_phrase and "released=2" in _split_phrase,
+      _split_phrase)
+
+# --- Q4's reporting rule, which §9 asked for in writing BEFORE the measurement. ---
+_at_w = SESS.survival_phrase(600, SESS.ALIVE, 600)
+check("a session alive at W reports a CENSORED bound, in that word",
+      "censored" in _at_w.lower() and "> 600s" in _at_w, _at_w)
+# THE FORBIDDEN READING, checked as a forbidden STRING. "no expiry observed" read as "no
+# expiry" is the C3-3 mistake by name, and the cheapest place to stop it is the one function
+# allowed to phrase the result.
+check("...and never says the session does not expire, which no observation at W supports",
+      not any(bad in _at_w.lower() for bad in
+              ("does not expire", "no expiry", "never expires", "unbounded", "forever")), _at_w)
+check("a survival short of W says so rather than passing as the bound",
+      "short of W=600s" in SESS.survival_phrase(60, SESS.ALIVE, 600),
+      SESS.survival_phrase(60, SESS.ALIVE, 600))
+check("a dead cohort is an expiry bounded above, not a lifetime",
+      "at or before 300s" in SESS.survival_phrase(300, SESS.DEAD, 600),
+      SESS.survival_phrase(300, SESS.DEAD, 600))
+# An unreadable cohort is NO observation. If it phrased itself as a censored bound it would
+# add a survivor to the record that nothing survived.
+_unread = SESS.survival_phrase(600, SESS.UNREADABLE, 600)
+check("an UNREADABLE cohort is not a survival and claims no bound",
+      "censored" not in _unread.lower() and "no observation" in _unread.lower(), _unread)
+
+# --- The qualifier on how much a post-DELETE 404 says. ---
+check("distinct 404 messages mean the server distinguishes a release from an unknown id",
+      SESS.discriminates_release(["Session has been terminated"], "Session not found") is True)
+check("...the same message for both means it does not, which is the weaker reading",
+      SESS.discriminates_release(["Session not found"], "Session not found") is False)
+check("...and no recorded messages is not discrimination — the structural clause again",
+      SESS.discriminates_release([], "Session not found") is False
+      and SESS.discriminates_release([None, None], "Session not found") is False
+      and SESS.discriminates_release(["Session has been terminated"], None) is False,
+      [SESS.discriminates_release(a, b) for a, b in
+       (([], "x"), ([None, None], "x"), (["t"], None))])
+
+# --- The body reader. SSE framing on an ordinary POST is what the live target actually does. ---
+check("a JSON body parses, and an SSE-framed one parses to the same thing — a reader that "
+      "assumed application/json would report a conformant server as malformed",
+      SESS.parse_body("application/json", '{"a":1}')
+      == SESS.parse_body("text/event-stream", 'event: message\ndata: {"a":1}\n')
+      == {"a": 1},
+      (SESS.parse_body("application/json", '{"a":1}'),
+       SESS.parse_body("text/event-stream", 'event: message\ndata: {"a":1}\n')))
+check("...SSE is recognised by its framing even when the content-type does not say so",
+      SESS.parse_body("", 'event: message\ndata: {"a":1}\n') == {"a": 1})
+check("...and nothing parseable is None rather than a crash or an empty dict",
+      all(SESS.parse_body(ct, raw) is None for ct, raw in
+          (("application/json", ""), ("application/json", "not json"),
+           ("text/event-stream", "event: ping\n"), ("text/event-stream", "data: {oops\n"))),
+      [SESS.parse_body(ct, raw) for ct, raw in
+       (("application/json", ""), ("application/json", "not json"),
+        ("text/event-stream", "event: ping\n"), ("text/event-stream", "data: {oops\n"))])
+
+# --- W is DERIVED. §4: where import is possible, import; this checks the derivation's source. ---
+# --- The one transport line every classification downstream depends on. ---
+# `urllib` RAISES on 4xx, so the 404 this probe exists to read arrives as an EXCEPTION. Filing
+# it as a transport failure would make every released session UNREADABLE — the probe would
+# report that it cannot measure the exact thing it just measured, and the §10.10 decision would
+# come back "indeterminate" from a server that answers perfectly. Driven with a stubbed opener
+# because it is a branch no offline run reaches otherwise, which is E18's argument for driving
+# probe_remote_mcp.py's startup: "nothing routine runs it" is what lets a defect sit there.
+_saved_urlopen = urllib.request.urlopen
+try:
+    def _raises_404(req, timeout=None):
+        raise urllib.error.HTTPError(
+            "http://probe.invalid", 404, "Not Found", {"content-type": "application/json"},
+            io.BytesIO(b'{"error":{"message":"Session has been terminated"}}'))
+
+    def _raises_reset(req, timeout=None):
+        raise OSError("connection reset by peer")
+
+    urllib.request.urlopen = _raises_404
+    _r404 = SESS._send("http://probe.invalid", "POST", {"jsonrpc": "2.0"})
+    urllib.request.urlopen = _raises_reset
+    _rerr = SESS._send("http://probe.invalid", "POST", {"jsonrpc": "2.0"})
+finally:
+    urllib.request.urlopen = _saved_urlopen
+check("a 404 arrives as a STATUS with its body, not as a transport error — urllib raises on "
+      "4xx, and filing that as a failure reports every released session as unmeasurable",
+      _r404.status == 404 and _r404.error is None
+      and SESS.classify_liveness(_r404) == SESS.DEAD
+      and ((_r404.body or {}).get("error") or {}).get("message") == "Session has been terminated",
+      (_r404.status, _r404.error, _r404.body))
+check("...while a genuine transport failure has NO status and reads UNREADABLE, so the two "
+      "cannot be confused in the direction that matters",
+      _rerr.status is None and _rerr.error
+      and SESS.classify_liveness(_rerr) == SESS.UNREADABLE, (_rerr.status, _rerr.error))
+
+_spec_cap = _EvalSpec(name="w-probe", prompt="unused").timeout_sec
+check("W's default is the harness's own per-cell cap, read from the field that sets it — not "
+      "a literal that can drift away from it",
+      SESS.W_DEFAULT == _spec_cap and SESS.W_DEFAULT > 0, (SESS.W_DEFAULT, _spec_cap))
+
+print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")
 sys.exit(1 if fails else 0)

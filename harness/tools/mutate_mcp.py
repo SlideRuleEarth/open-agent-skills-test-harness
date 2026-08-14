@@ -133,6 +133,7 @@ HTTPFIX = "fixtures/http_mcp_server.py"
 PROBE1 = "tools/probe_remote_mcp.py"
 # The three copilot probes, same category and same reason: opt-in, never run by the block, and
 # about to have an adapter decision rest on the word they print. §E19 drives their classifiers.
+SESSPROBE = "tools/probe_session_mcp.py"
 CCONFIG = "tools/probe_copilot_config.py"
 CGATE = "tools/probe_copilot_gating.py"
 CGATE_REMOTE = "tools/probe_copilot_remote_gating.py"
@@ -3616,6 +3617,87 @@ MUTATIONS = [
       "_overlapped(record)"),
      "\n        if poisoned.is_set():\n            record = _overlapped(record)",
      "...while the record that caused the stop keeps its own report rather than being relabelled"),
+
+    # C3-4's probe. Every one of these is a way to make the §10.10 session decision come back
+    # WRONG rather than come back missing — which is the failure mode worth buying arms for,
+    # since a probe that visibly cannot measure gets re-run and one that quietly mismeasures
+    # gets published.
+    ("F138-a-failed-read-counts-as-a-released-session", SESSPROBE,
+     "    if reply.status is None:\n        return UNREADABLE",
+     "    if reply.status is None:\n        return DEAD",
+     "a transport failure is UNREADABLE, never DEAD — a failed read is not a released session"),
+    # The same collapse one door along: a server erroring, or refusing the credential, is not
+    # a session that went away.
+    ("F139-a-server-side-failure-reads-as-a-gone-session", SESSPROBE,
+     "    if reply.status >= 500:\n        return UNREADABLE",
+     "    if reply.status >= 500:\n        return DEAD",
+     "...and neither is a server-side failure, nor an auth refusal"),
+    # THE POSITIVE CONTROL, DELETED. Without it a session never shown to exist is credited to
+    # the server as a clean release — the row looks tidiest exactly when it means least.
+    ("F140-a-release-is-certified-without-the-session-ever-being-alive", SESSPROBE,
+     "    if before != ALIVE:\n        return INDETERMINATE",
+     "    if False:\n        return INDETERMINATE",
+     "a session never demonstrably ALIVE is INDETERMINATE however tidy the rest looks"),
+    # `not ALIVE` instead of `DEAD` — the plausible wrong predicate, which folds the
+    # instrument's own silence into the cleanest possible answer.
+    ("F141-anything-but-alive-is-read-as-a-release", SESSPROBE,
+     "    if after == DEAD:\n        return RELEASED",
+     "    if after != ALIVE:\n        return RELEASED",
+     ("an UNREADABLE session after the DELETE is INDETERMINATE, not a release — `not ALIVE` "
+      "would have published the instrument's own silence as the cleanest possible outcome")),
+    # The structural clause §4 asks for ahead of every universal, removed. A run that opened
+    # no session at all then publishes agreement.
+    ("F142-an-empty-sample-reports-as-agreement", SESSPROBE,
+     ('    if not outcomes:\n        return "no sessions were opened, so the sample '
+      'establishes nothing", False'),
+     ('    if False:\n        return "no sessions were opened, so the sample '
+      'establishes nothing", False'),
+     ("an EMPTY sample is not agreement — `all()` over a list nothing was put into is true, "
+      "and this is the function that stands where that would have been published")),
+    # THE C3-3 MISTAKE, WRITTEN OUT. The bound is still censored and still names the horizon,
+    # so the first check stays green; only the forbidden reading is added. If that check were
+    # decorative this mutation would survive, which is exactly what it is here to prove.
+    ("F143-the-censored-bound-also-claims-the-session-never-expires", SESSPROBE,
+     '        bound = f"lifetime > {horizon_s}s, censored"',
+     '        bound = f"lifetime > {horizon_s}s, censored — it does not expire"',
+     "...and never says the session does not expire, which no observation at W supports"),
+    # A cohort that produced NO reading, phrased as a survival: it adds a survivor to the
+    # record on the strength of nothing having been observed.
+    ("F144-an-unreadable-cohort-is-published-as-a-survival", SESSPROBE,
+     '    return f"UNREADABLE at {horizon_s}s — no observation, not a survival"',
+     '    return f"lifetime > {horizon_s}s, censored"',
+     "an UNREADABLE cohort is not a survival and claims no bound"),
+    # A server that answered with a revision we refuse, filed as a server that said nothing.
+    ("F145-an-unimplemented-revision-reads-as-silence", SESSPROBE,
+     "    return ERA_UNKNOWN",
+     "    return ERA_NONE",
+     "a version outside §10.2's allowlist is UNKNOWN, not silence"),
+    # Scope decided on the era alone, so a modern server issuing a session id — the anomaly
+    # worth seeing — is filed as ordinary.
+    ("F146-a-modern-server-issuing-a-session-is-treated-as-ordinary", SESSPROBE,
+     "    return era in (ERA_LEGACY, ERA_UNKNOWN) and bool(session_id)",
+     "    return era in (ERA_LEGACY, ERA_UNKNOWN, ERA_MODERN) and bool(session_id)",
+     ("a MODERN server is out of scope even when it issues an id — that is the anomaly, and "
+      "a lookup on the era alone would call it ordinary")),
+    # Discrimination claimed from an empty record: nothing was compared, and the answer is yes.
+    ("F147-discrimination-is-claimed-with-nothing-to-compare", SESSPROBE,
+     "    return bool(said) and bool(unknown_message) and unknown_message not in said",
+     "    return unknown_message not in said",
+     "...and no recorded messages is not discrimination — the structural clause again"),
+    # The live target answers ordinary POSTs with SSE framing. A reader that assumed JSON
+    # reports a conformant server as malformed — and every session reading with it.
+    ("F148-an-sse-framed-body-is-parsed-as-plain-json", SESSPROBE,
+     '    if "text/event-stream" in (content_type or "") or raw.startswith("event:"):',
+     "    if False:",
+     ("a JSON body parses, and an SSE-framed one parses to the same thing — a reader that "
+      "assumed application/json would report a conformant server as malformed")),
+    # `urllib` raises on 4xx. Losing the status here turns the one answer this probe exists to
+    # read into "the instrument could not tell", from a server that answered perfectly.
+    ("F149-a-404-is-swallowed-as-a-transport-failure", SESSPROBE,
+     "        return Reply(exc.code, dict(exc.headers or {}),",
+     "        return Reply(None, dict(exc.headers or {}),",
+     ("a 404 arrives as a STATUS with its body, not as a transport error — urllib raises on "
+      "4xx, and filing that as a failure reports every released session as unmeasurable")),
 
 ]
 
