@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 2/2 instrument + 148/148 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 probes; 512 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 2/2 instrument + 157/157 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 probes; 536 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 git diff --check
 
@@ -2058,5 +2058,5 @@ answer — its gating and config halves are resolved); agy's transcript tool-nam
 `serverUrl` (probe #4); and C3-3, deliberately unpriced. **C3-4 came off this list on 2026-08-14** —
 it was answered against NASA's public Earthdata endpoint rather than SlideRule's, which settles the
 session-lifecycle question the bridge's ending model needed and leaves SlideRule's own behaviour, and
-§8's credential half, still unmeasured; `tools/probe_session_mcp.py --url --header` re-runs it there.
+§8's credential half, still unmeasured; `tools/probe_session_mcp.py --url --header-env` re-runs it there (the token named by an env var, never argv).
 claude's `mcpServers` http/sse shape was resolved by #106 and sat here as open for two merges after that.

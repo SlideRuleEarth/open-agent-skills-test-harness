@@ -3629,9 +3629,71 @@ MUTATIONS = [
     # The same collapse one door along: a server erroring, or refusing the credential, is not
     # a session that went away.
     ("F139-a-server-side-failure-reads-as-a-gone-session", SESSPROBE,
-     "    if reply.status >= 500:\n        return UNREADABLE",
-     "    if reply.status >= 500:\n        return DEAD",
+     ("        return ALIVE if rpc_response(reply.events, want_id) is not None else UNREADABLE"
+      "\n    return UNREADABLE"),
+     ("        return ALIVE if rpc_response(reply.events, want_id) is not None else UNREADABLE"
+      "\n    return DEAD"),
      "...and neither is a server-side failure, nor an auth refusal"),
+    # A 2xx IS A TRANSPORT FACT. Dropping the correlation makes an empty 200, a CDN
+    # interstitial and a stream carrying only a priming event all read as a live session.
+    ("F150-any-2xx-is-taken-for-a-live-session", SESSPROBE,
+     "        return ALIVE if rpc_response(reply.events, want_id) is not None else UNREADABLE",
+     "        return ALIVE",
+     ("a 2xx with NO JSON-RPC answer in it is UNREADABLE, not ALIVE — an empty body, a CDN "
+      "interstitial and an unparseable one are transport successes carrying no MCP evidence")),
+    # Correlation dropped: someone else's response, or a replayed one, answers our question.
+    ("F151-a-response-to-another-request-answers-ours", SESSPROBE,
+     "        if ev.get(\"id\") != want_id:\n            continue",
+     "        if False:\n            continue",
+     "...and a JSON-RPC response to a DIFFERENT id does not answer ours"),
+    # A notification has no result and no error. Accepting one as a response means a server
+    # that merely said something counts as a server that answered.
+    ("F152-a-notification-counts-as-a-response", SESSPROBE,
+     "        if \"result\" in ev or \"error\" in ev:\n            return ev",
+     "        return ev",
+     ("...and a notification is not a response, however well-formed — nor is an envelope "
+      "with our own id that carries NEITHER a result nor an error")),
+    # THE PRIMING-EVENT BUG, restored: keep only the first event and the probe reads whatever
+    # arrived first as its answer.
+    ("F153-only-the-first-sse-event-is-kept", SESSPROBE,
+     "        return tuple(out)",
+     "        return tuple(out[:1])",
+     ("every event in a stream is kept, not just the first — a priming event before the "
+      "response is permitted, and reading position instead of id makes it the answer")),
+    # The out-of-band error reader made id-correlated, which discards the one message worth
+    # reading: the live server answers a dead session with `"id": "server-error"`.
+    ("F154-the-error-message-is-thrown-away-unless-it-correlates", SESSPROBE,
+     "        if isinstance(ev, dict) and isinstance(ev.get(\"error\"), dict):",
+     "        if isinstance(ev, dict) and isinstance(ev.get(\"error\"), dict) and False:",
+     "an out-of-band error message is readable though its id matches nothing we sent"),
+    # THE LIFECYCLE, unmeasured: a handshake the probe never completed reads the same as one
+    # the server accepted.
+    ("F155-an-unsent-initialized-reads-as-an-accepted-one", SESSPROBE,
+     "    return ack is not None and ack.status is not None and 200 <= ack.status < 300",
+     "    return True",
+     ("...and a rejected, failed or NEVER-SENT one is not accepted — a handshake the probe "
+      "skipped must not read the same as one the server took")),
+    # Cleanup that believes the DELETE's 200 instead of observing the session gone — the exact
+    # claim-versus-observation distinction this probe exists to draw.
+    ("F156-a-session-is-marked-released-without-being-observed-gone", SESSPROBE,
+     "        if state == DEAD:\n            ledger.mark_released(sid)",
+     "        ledger.mark_released(sid)",
+     ("a session whose post-DELETE read is UNREADABLE stays OUTSTANDING — cleanup keyed on "
+      "readability would walk past exactly the sessions most likely to still be alive")),
+    # The credential goes back into argv.
+    ("F157-a-credential-header-is-accepted-from-argv", SESSPROBE,
+     "        if name.lower() in _SECRET_HEADERS:",
+     "        if False:",
+     ("a CREDENTIAL header is REFUSED from --header, by name, with the safe route named — "
+      "argv is world-readable and this repo's own sweep reads `ps -eo command=`")),
+    # An unset credential variable silently produces no header, so the failure surfaces as an
+    # auth error far from its cause.
+    ("F158-an-unset-credential-variable-is-skipped-in-silence", SESSPROBE,
+     ("            errors.append(f\"--header-env {name!r} names ${var}, which is not set\")\n"
+      "            continue"),
+     "            continue",
+     ("...and an unset or empty variable is a NAMED error, not a silently absent header — a "
+      "credential that quietly fails to be set surfaces as an auth failure far from its cause")),
     # THE POSITIVE CONTROL, DELETED. Without it a session never shown to exist is credited to
     # the server as a clean release — the row looks tidiest exactly when it means least.
     ("F140-a-release-is-certified-without-the-session-ever-being-alive", SESSPROBE,

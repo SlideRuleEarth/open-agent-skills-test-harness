@@ -3364,9 +3364,20 @@ from agentskill_evals.mcp_proxy import IMPLEMENTED_VERSIONS as _IMPL  # noqa: E4
 from agentskill_evals.spec import EvalSpec as _EvalSpec  # noqa: E402
 
 
-def _reply(status=None, message=None):
-    body = {"error": {"message": message}} if message else None
-    return SESS.Reply(status=status, body=body)
+_WANT = 7          # the id "we sent"; correlation is what makes a reply a reply
+
+
+def _reply(status=None, message=None, *, rid=_WANT, answered=True, events=None):
+    """A Reply as `_send` would build one. `answered` controls whether the body carries the
+    JSON-RPC response to `rid` — the difference between a live session and a bare 2xx."""
+    if events is None:
+        events = []
+        if answered:
+            events.append({"jsonrpc": "2.0", "id": rid, "result": {"tools": []}})
+        if message:
+            events.append({"jsonrpc": "2.0", "id": "server-error",
+                           "error": {"code": -32600, "message": message}})
+    return SESS.Reply(status=status, events=tuple(events))
 
 
 # --- Q1's era gate. UNKNOWN and NONE are different answers, and merging them is the bug. ---
@@ -3402,19 +3413,60 @@ check("a MODERN server is out of scope even when it issues an id — that is the
        SESS.sessions_apply(SESS.ERA_MODERN, None)))
 
 # --- Liveness. The tri-state is the whole instrument; collapsing it is the C3-1 mistake. ---
-check("200 is alive and 404 is dead",
-      (SESS.classify_liveness(_reply(200)), SESS.classify_liveness(_reply(404)))
+check("a 200 CARRYING THE ANSWER is alive, and 404 is dead",
+      (SESS.classify_liveness(_reply(200), _WANT), SESS.classify_liveness(_reply(404), _WANT))
       == (SESS.ALIVE, SESS.DEAD),
-      (SESS.classify_liveness(_reply(200)), SESS.classify_liveness(_reply(404))))
+      (SESS.classify_liveness(_reply(200), _WANT), SESS.classify_liveness(_reply(404), _WANT)))
 # THE ARM THAT MATTERS. A transport failure and a 5xx are the absence of a reading. Filing
 # either as DEAD credits the server with the cleanest behaviour it could have had, on evidence
 # that it did anything at all — C3-1's swallowed OSError, in a third place.
 check("a transport failure is UNREADABLE, never DEAD — a failed read is not a released session",
-      SESS.classify_liveness(_reply(None)) == SESS.UNREADABLE,
-      SESS.classify_liveness(_reply(None)))
+      SESS.classify_liveness(_reply(None), _WANT) == SESS.UNREADABLE,
+      SESS.classify_liveness(_reply(None), _WANT))
 check("...and neither is a server-side failure, nor an auth refusal",
-      all(SESS.classify_liveness(_reply(s)) == SESS.UNREADABLE for s in (500, 503, 401, 403)),
-      [(s, SESS.classify_liveness(_reply(s))) for s in (500, 503, 401, 403)])
+      all(SESS.classify_liveness(_reply(s), _WANT) == SESS.UNREADABLE
+          for s in (500, 503, 401, 403)),
+      [(s, SESS.classify_liveness(_reply(s), _WANT)) for s in (500, 503, 401, 403)])
+# A 2xx IS A TRANSPORT FACT, NOT AN MCP FACT (external review). Each of these is a real thing a
+# real deployment emits — an empty 202, a CDN interstitial, a stream that opened and said
+# nothing yet — and every one of them answered ALIVE when the status line was all that was read.
+check("a 2xx with NO JSON-RPC answer in it is UNREADABLE, not ALIVE — an empty body, a CDN "
+      "interstitial and an unparseable one are transport successes carrying no MCP evidence",
+      all(SESS.classify_liveness(r, _WANT) == SESS.UNREADABLE for r in (
+          _reply(200, answered=False),
+          _reply(202, answered=False),
+          SESS.Reply(status=200, events=()),
+          SESS.Reply(status=200, events=({"totally": "unrelated"},)))),
+      [SESS.classify_liveness(r, _WANT) for r in (
+          _reply(200, answered=False), _reply(202, answered=False),
+          SESS.Reply(status=200, events=()),
+          SESS.Reply(status=200, events=({"totally": "unrelated"},)))])
+# CORRELATION, not merely presence. A response to someone else's request is not an answer to
+# ours, and a fresh id per request is what stops a replayed or interleaved one from passing.
+check("...and a JSON-RPC response to a DIFFERENT id does not answer ours",
+      SESS.classify_liveness(_reply(200, rid=_WANT + 1), _WANT) == SESS.UNREADABLE,
+      SESS.classify_liveness(_reply(200, rid=_WANT + 1), _WANT))
+# A JSON-RPC ERROR IS THE SERVER TALKING TO US. "Method not found" means the session works;
+# refusing to count it would report a live session as unreadable on a technicality.
+check("...while an ERROR correlated to our id IS the session answering, so it is ALIVE",
+      SESS.classify_liveness(SESS.Reply(status=200, events=(
+          {"jsonrpc": "2.0", "id": _WANT, "error": {"code": -32601, "message": "nope"}},)),
+          _WANT) == SESS.ALIVE)
+# A notification carries no id and answers nothing; it must not be mistaken for a response.
+# BOTH GUARDS, exercised separately. The notification is rejected by the ID check and never
+# reaches the result/error check — so on its own it left that second guard untested, and a
+# mutation deleting it survived (F152, caught by the suite rather than by this check). The
+# envelope carrying OUR id and neither field is the case that reaches it: a truncated frame, or
+# a server that answered with nothing in it.
+check("...and a notification is not a response, however well-formed — nor is an envelope with "
+      "our own id that carries NEITHER a result nor an error",
+      SESS.classify_liveness(SESS.Reply(status=200, events=(
+          {"jsonrpc": "2.0", "method": "notifications/message", "params": {}},)),
+          _WANT) == SESS.UNREADABLE
+      and SESS.classify_liveness(SESS.Reply(status=200, events=(
+          {"jsonrpc": "2.0", "id": _WANT},)), _WANT) == SESS.UNREADABLE,
+      (SESS.classify_liveness(SESS.Reply(status=200, events=(
+          {"jsonrpc": "2.0", "id": _WANT},)), _WANT),))
 
 # --- Q3's disposition. Ordered so the instrument's failures cannot become server behaviour. ---
 check("alive, DELETE accepted, gone afterwards is a RELEASE",
@@ -3493,20 +3545,60 @@ check("...and no recorded messages is not discrimination — the structural clau
 # --- The body reader. SSE framing on an ordinary POST is what the live target actually does. ---
 check("a JSON body parses, and an SSE-framed one parses to the same thing — a reader that "
       "assumed application/json would report a conformant server as malformed",
-      SESS.parse_body("application/json", '{"a":1}')
-      == SESS.parse_body("text/event-stream", 'event: message\ndata: {"a":1}\n')
-      == {"a": 1},
-      (SESS.parse_body("application/json", '{"a":1}'),
-       SESS.parse_body("text/event-stream", 'event: message\ndata: {"a":1}\n')))
+      SESS.parse_events("application/json", '{"a":1}')
+      == SESS.parse_events("text/event-stream", 'event: message\ndata: {"a":1}\n')
+      == ({"a": 1},),
+      (SESS.parse_events("application/json", '{"a":1}'),
+       SESS.parse_events("text/event-stream", 'event: message\ndata: {"a":1}\n')))
 check("...SSE is recognised by its framing even when the content-type does not say so",
-      SESS.parse_body("", 'event: message\ndata: {"a":1}\n') == {"a": 1})
-check("...and nothing parseable is None rather than a crash or an empty dict",
-      all(SESS.parse_body(ct, raw) is None for ct, raw in
+      SESS.parse_events("", 'event: message\ndata: {"a":1}\n') == ({"a": 1},))
+check("...and nothing parseable is an EMPTY sequence rather than a crash or a false answer",
+      all(SESS.parse_events(ct, raw) == () for ct, raw in
           (("application/json", ""), ("application/json", "not json"),
            ("text/event-stream", "event: ping\n"), ("text/event-stream", "data: {oops\n"))),
-      [SESS.parse_body(ct, raw) for ct, raw in
+      [SESS.parse_events(ct, raw) for ct, raw in
        (("application/json", ""), ("application/json", "not json"),
         ("text/event-stream", "event: ping\n"), ("text/event-stream", "data: {oops\n"))])
+# THE PRIMING-EVENT CASE (external review). The binding permits a server to send events on the
+# stream before the response to the request just sent. Returning the FIRST `data:` line returned
+# whichever arrived first, so the probe read an unrelated event as its answer and called the
+# session ALIVE on it. Every event is kept and the response is chosen by id.
+_primed = ('event: ping\ndata: {"note":"priming"}\n\n'
+           'event: message\ndata: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n'
+           'event: message\ndata: {"jsonrpc":"2.0","id":7,"result":{"tools":[]}}\n')
+check("every event in a stream is kept, not just the first — a priming event before the "
+      "response is permitted, and reading position instead of id makes it the answer",
+      len(SESS.parse_events("text/event-stream", _primed)) == 3
+      and SESS.parse_events("text/event-stream", _primed)[0] == {"note": "priming"},
+      SESS.parse_events("text/event-stream", _primed))
+check("...and the response is picked by ID out of that stream, past the priming event and "
+      "past a notification that carries no id at all",
+      SESS.rpc_response(SESS.parse_events("text/event-stream", _primed), 7)
+      == {"jsonrpc": "2.0", "id": 7, "result": {"tools": []}},
+      SESS.rpc_response(SESS.parse_events("text/event-stream", _primed), 7))
+check("...so a session answering behind a priming event reads ALIVE, and one whose stream "
+      "held ONLY the priming event does not",
+      SESS.classify_liveness(
+          SESS.Reply(status=200, events=SESS.parse_events("text/event-stream", _primed)), 7)
+      == SESS.ALIVE
+      and SESS.classify_liveness(
+          SESS.Reply(status=200, events=SESS.parse_events(
+              "text/event-stream", 'event: ping\ndata: {"note":"priming"}\n')), 7)
+      == SESS.UNREADABLE)
+# A malformed event must not discard the well-formed ones around it: a server that emits one
+# bad frame is not a server that said nothing.
+check("...and one unparseable event does not take the rest of the stream with it",
+      SESS.parse_events("text/event-stream",
+                        'data: {oops\n\ndata: {"jsonrpc":"2.0","id":7,"result":{}}\n')
+      == ({"jsonrpc": "2.0", "id": 7, "result": {}},))
+# The out-of-band error reader is deliberately NOT id-correlated — the live server answers a
+# dead session with `"id":"server-error"`, so correlating here would drop the one message worth
+# reading. Both halves are checked so the asymmetry is deliberate rather than accidental.
+check("an out-of-band error message is readable though its id matches nothing we sent",
+      SESS.any_error_message(({"jsonrpc": "2.0", "id": "server-error",
+                               "error": {"message": "Session has been terminated"}},))
+      == "Session has been terminated"
+      and SESS.any_error_message(({"jsonrpc": "2.0", "id": 7, "result": {}},)) is None)
 
 # --- W is DERIVED. §4: where import is possible, import; this checks the derivation's source. ---
 # --- The one transport line every classification downstream depends on. ---
@@ -3535,13 +3627,114 @@ finally:
 check("a 404 arrives as a STATUS with its body, not as a transport error — urllib raises on "
       "4xx, and filing that as a failure reports every released session as unmeasurable",
       _r404.status == 404 and _r404.error is None
-      and SESS.classify_liveness(_r404) == SESS.DEAD
-      and ((_r404.body or {}).get("error") or {}).get("message") == "Session has been terminated",
-      (_r404.status, _r404.error, _r404.body))
+      and SESS.classify_liveness(_r404, _WANT) == SESS.DEAD
+      and SESS.any_error_message(_r404.events) == "Session has been terminated",
+      (_r404.status, _r404.error, _r404.events))
 check("...while a genuine transport failure has NO status and reads UNREADABLE, so the two "
       "cannot be confused in the direction that matters",
       _rerr.status is None and _rerr.error
-      and SESS.classify_liveness(_rerr) == SESS.UNREADABLE, (_rerr.status, _rerr.error))
+      and SESS.classify_liveness(_rerr, _WANT) == SESS.UNREADABLE, (_rerr.status, _rerr.error))
+
+# --- The lifecycle. A handshake is not complete until the client says so. ---
+# `notifications/initialized` has no response by definition, so the only available evidence is
+# the transport status — treated as the weaker fact it is, and NOT as a correlated answer.
+check("an accepted `notifications/initialized` is any 2xx, 202 included",
+      all(SESS.initialized_accepted(SESS.Reply(status=s)) for s in (200, 202, 204)),
+      [SESS.initialized_accepted(SESS.Reply(status=s)) for s in (200, 202, 204)])
+check("...and a rejected, failed or NEVER-SENT one is not accepted — a handshake the probe "
+      "skipped must not read the same as one the server took",
+      not any(SESS.initialized_accepted(r) for r in
+              (SESS.Reply(status=400), SESS.Reply(status=500), SESS.Reply(error="reset"), None)),
+      [SESS.initialized_accepted(r) for r in
+       (SESS.Reply(status=400), SESS.Reply(status=500), SESS.Reply(error="reset"), None)])
+
+# --- The ledger. A probe about session cleanliness must not leak sessions. ---
+_led = SESS.SessionLedger()
+_led.note("aaa"); _led.note("bbb"); _led.note("aaa"); _led.note(None); _led.note("")
+check("every id is recorded once, and a missing id is not recorded as a session",
+      _led.issued == ["aaa", "bbb"], _led.issued)
+check("...outstanding means issued-and-not-released, so releasing one leaves the other",
+      (_led.outstanding(), (_led.mark_released("aaa"), _led.outstanding())[1])
+      == (["aaa", "bbb"], ["bbb"]))
+check("...and a ledger nothing was put into has nothing outstanding, which is why the run "
+      "PRINTS that case rather than asserting cleanliness over it",
+      SESS.SessionLedger().outstanding() == [] and SESS.SessionLedger().issued == [])
+# THE LEAK THAT WAS THERE, driven through the real function rather than asserted about in the
+# abstract: cleanup that only releases what it can still READ leaves an UNREADABLE session
+# running, and UNREADABLE is precisely the state that does not mean gone. `release_all` is
+# therefore required to mark a session released ONLY on an observed DEAD — the server's 200 to
+# the DELETE is its claim, and the ledger records observations.
+
+
+class _FakeResp:
+    def __init__(self, status, headers, body):
+        self.status, self.headers, self._body = status, headers, body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+_saved_urlopen2 = urllib.request.urlopen
+try:
+    urllib.request.urlopen = lambda req, timeout=None: _FakeResp(
+        200, {"content-type": "application/json"}, b"")     # 200, and no answer in it
+    _led_unread = SESS.SessionLedger()
+    _led_unread.note("ghost")
+    _rows_unread = SESS.release_all("http://probe.invalid", "2025-11-25", _led_unread)
+
+    urllib.request.urlopen = _raises_404                     # released, and observed gone
+    _led_gone = SESS.SessionLedger()
+    _led_gone.note("gone")
+    _rows_gone = SESS.release_all("http://probe.invalid", "2025-11-25", _led_gone)
+finally:
+    urllib.request.urlopen = _saved_urlopen2
+check("a session whose post-DELETE read is UNREADABLE stays OUTSTANDING — cleanup keyed on "
+      "readability would walk past exactly the sessions most likely to still be alive",
+      _led_unread.outstanding() == ["ghost"]
+      and _rows_unread and _rows_unread[0]["after"] == SESS.UNREADABLE,
+      (_led_unread.outstanding(), _rows_unread))
+check("...while one OBSERVED gone is marked released, so the check above can actually pass",
+      _led_gone.outstanding() == [] and _rows_gone[0]["after"] == SESS.DEAD,
+      (_led_gone.outstanding(), _rows_gone))
+
+# --- Credentials never reach argv. ---
+check("an ordinary header is accepted from --header",
+      SESS.collect_headers(["X-Trace: abc"], [], {}) == ({"X-Trace": "abc"}, []))
+check("a CREDENTIAL header is REFUSED from --header, by name, with the safe route named — "
+      "argv is world-readable and this repo's own sweep reads `ps -eo command=`",
+      all(SESS.collect_headers([f"{n}: secret"], [], {})[0] == {}
+          and "--header-env" in SESS.collect_headers([f"{n}: secret"], [], {})[1][0]
+          for n in ("Authorization", "authorization", "Cookie", "X-API-Key")),
+      [SESS.collect_headers([f"{n}: s"], [], {}) for n in ("Authorization", "Cookie")])
+check("...and the refusal does not leak the value it refused into its own message",
+      "secret" not in " ".join(SESS.collect_headers(["Authorization: secret"], [], {})[1]),
+      SESS.collect_headers(["Authorization: secret"], [], {})[1])
+check("--header-env takes the value from the environment, so only the VARIABLE NAME is in argv",
+      SESS.collect_headers([], ["Authorization=TOK"], {"TOK": "Bearer xyz"})
+      == ({"Authorization": "Bearer xyz"}, []))
+# `any(...)` over the reasons, NOT `reasons[0]`. Indexing asserted that a reason exists by
+# raising IndexError when it does not — so the mutation that drops the reason entirely crashed
+# the verifier instead of failing this check, and was reported as "failed, but NOT via" (F158,
+# found by the suite). An assertion that cannot report its own subject's absence is not one.
+_unset_errs = SESS.collect_headers([], ["Authorization=NOPE"], {})[1]
+_empty_errs = SESS.collect_headers([], ["Authorization=E"], {"E": ""})[1]
+check("...and an unset or empty variable is a NAMED error, not a silently absent header — a "
+      "credential that quietly fails to be set surfaces as an auth failure far from its cause",
+      SESS.collect_headers([], ["Authorization=NOPE"], {})[0] == {}
+      and any("not set" in e for e in _unset_errs)
+      and any("empty" in e for e in _empty_errs),
+      (_unset_errs, _empty_errs))
+check("...and a malformed spelling of either flag is refused rather than half-applied",
+      all(SESS.collect_headers(h, e, {"V": "x"})[0] == {} for h, e in
+          ((["nocolon"], []), (["X:"], []), ([": v"], []), ([], ["noequals"]), ([], ["=V"]))),
+      [SESS.collect_headers(h, e, {"V": "x"}) for h, e in
+       ((["nocolon"], []), (["X:"], []), ([], ["noequals"]))])
 
 _spec_cap = _EvalSpec(name="w-probe", prompt="unused").timeout_sec
 check("W's default is the harness's own per-cell cap, read from the field that sets it — not "
