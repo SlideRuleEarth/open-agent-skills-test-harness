@@ -295,7 +295,7 @@ make -C harness lint                                          # ruff; must print
 python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 169/169 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 probes; 559 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
-harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 74 here, over the 5 shells on this machine
+harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 87 here, over the 5 shells on this machine
 git diff --check
 
 # AFTER the mutation run, because what it should have left behind is nothing, and "the
@@ -373,6 +373,18 @@ bought three things a fenced block cannot have:
 - **The failure paths below as CHECKS** rather than as controls run by hand in a scratch
   directory that dies with the session. That is the whole argument: the lessons in this section
   were each paid for once, and until now nothing re-derived them on every run.
+
+**And the script's own exit status was the next instance of the same class.** It discarded every
+phase status and always exited 0, on the stated theory that the suites' reports were the output
+and folding "sections were skipped" into a failure would hide the interesting case. Driving all
+four phases to exit 7 still returned 0 (external review). A denial that silently does not take
+then produces UNRESTRICTED green verifier runs with a green reproduction on top of them — the one
+outcome the script exists to make impossible. Each phase now declares the status **and the
+evidence** it must produce, and **section D** drives that production path against a stub
+interpreter: the reported exit-7 case, a run where the denial did not take, and a half-applied
+denial whose status is correct and whose bind() skip reason never appears. Only the evidence
+catches the last one, which is why a status alone was never going to be enough — and why the
+evidence is the skip REASONS rather than the skip counts, which drift when a section is added.
 
 **THE FAILURE PATHS ARE TESTED, NOT JUST THE HAPPY ONE**, and that is the lesson this script
 cost three review rounds to learn. Each round fixed the step the finding named — `mktemp`, then

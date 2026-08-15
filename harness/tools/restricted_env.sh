@@ -10,11 +10,22 @@
 #   harness/tools/restricted_env.sh --payload CMD    run CMD in each phase instead (the tests)
 #   harness/tools/restricted_env.sh --help
 #
-# EXIT STATUS IS ABOUT THE REPRODUCTION, NOT ABOUT THE SUITES. 0 means every phase was
-# reached and ran; non-zero means construction failed or a signal ended the run. The suites'
-# own statuses are printed per phase and are NOT folded into it -- exit 1 from a verifier run
-# is the EXPECTED result here (INCOMPLETE: sections were skipped), and a script that collapsed
-# "the suite reported skips" into its own failure would make the interesting case unreadable.
+# EXIT STATUS MEANS "THIS WAS A REPRODUCTION", WHICH IS A CLAIM ABOUT THE SUITE RESULTS AND
+# NOT MERELY ABOUT REACHING THEM. 0 means every phase produced the status AND the evidence a
+# denied run must produce; 1 means it did not; 2 is usage; 128+n means a signal ended the run.
+#
+# The first version of this script discarded the phase statuses and always exited 0, on the
+# theory that the suites' own reports were the output and folding "the suite skipped sections"
+# into a failure would hide the interesting case. That reasoning produced a script which
+# reported SUCCESS while every suite result was wrong -- driving all four phases to exit 7
+# still returned 0 (external review). It is the same fail-open class the rest of this file
+# exists to remove, authored deliberately this time: a denial that silently does not take
+# yields UNRESTRICTED green verifier runs and a green reproduction on top of them.
+#
+# So each phase declares what it must produce, and the evidence is the point: a status alone
+# cannot tell "denied" from "the suite failed for another reason", and it cannot tell the
+# ps-denied phase from the bind-denied one. The skip REASONS can, and unlike a skip count they
+# do not drift when a section is added.
 #
 # Rationale for every guard below lives in harness/TODO_Contained_HOME.md section 4; the
 # failure paths are driven by harness/tools/verify_restricted_env.py, which reads THIS FILE
@@ -89,9 +100,10 @@ trap 'exit 131' QUIT    # Ctrl-\ quit from the keyboard (never end a comment wit
 trap 'exit 141' PIPE    # output piped into something that exits first
 trap 'exit 143' TERM    # kill, CI cancellation
 # The rest of the sent set: a resource limit (XCPU, XFSZ), a timeout wrapper (ALRM), an abort,
-# or a human with the wrong pid. 128 rather than 1 ON PURPOSE — exit 1 is a verifier run's
-# EXPECTED status, so reusing it would make a run killed halfway through indistinguishable from
-# one that finished with sections skipped.
+# or a human with the wrong pid. 128 rather than 1 ON PURPOSE — 1 is this script's own "the
+# expectations were not met" status, so reusing it for a signal would make a run KILLED halfway
+# through indistinguishable from a run that finished and found the denial had not taken. Those
+# are opposite problems: one is an interruption, the other is a false reproduction.
 trap 'exit 128' ABRT ALRM USR1 USR2 XCPU XFSZ VTALRM PROF
 
 mkdir "$sandbox/nops" "$sandbox/nobind" || exit 1
@@ -141,27 +153,62 @@ exec_run() {
 # Each phase runs in its own subshell so its denial cannot outlive it. `VAR=value func` is NOT
 # used: POSIX leaves it to the shell whether such an assignment persists after a FUNCTION
 # returns, and a PATH that leaked into the next phase would silently un-deny it.
-report() {
-    printf 'PHASE %-22s exit=%s\n' "$1" "$2"
+#
+# Output is captured and then echoed rather than streamed, because the STATUS has to survive:
+# `cmd | tee` reports tee's status in a POSIX shell, and this script now depends on the real one.
+log="$sandbox/phase.log"
+problems=0
+
+# judge <label> <actual> <expected> [evidence...]
+# Evidence is matched with `grep -F`: these are literal strings the suites print, not patterns.
+judge() {
+    label=$1
+    actual=$2
+    expected=$3
+    shift 3
+    printf 'PHASE %-22s exit=%s\n' "$label" "$actual"
+    if [ -n "$PAYLOAD" ]; then
+        return 0    # payload mode: the caller supplied the command, so the caller judges it
+    fi
+    if [ "$actual" != "$expected" ]; then
+        printf 'PROBLEM %s exited %s, expected %s\n' "$label" "$actual" "$expected"
+        problems=$((problems + 1))
+    fi
+    for want in "$@"; do
+        if ! grep -qF "$want" "$log"; then
+            printf 'PROBLEM %s never reported: %s\n' "$label" "$want"
+            problems=$((problems + 1))
+        fi
+    done
 }
+
+PS_DENIED="the process observer is unavailable here"
+BIND_DENIED="a loopback listener cannot be bound here"
 
 # shellcheck disable=SC2123  # overwriting PATH is the whole point; it is subshell-scoped
 (
     PATH="$sandbox/nops"; export PATH
     exec_run "$PY" harness/tools/verify_mcp_fixtures.py
-); report "ps-denied" "$?"
+) > "$log" 2>&1; status=$?
+cat "$log"
+judge "ps-denied" "$status" 1 "INCOMPLETE" "$PS_DENIED"
 
 (
     PYTHONPATH="$sandbox/nobind"; export PYTHONPATH
     exec_run "$PY" harness/tools/verify_mcp_fixtures.py
-); report "bind-denied" "$?"
+) > "$log" 2>&1; status=$?
+cat "$log"
+judge "bind-denied" "$status" 1 "INCOMPLETE" "$BIND_DENIED"
 
 # shellcheck disable=SC2123  # as above — the denial is the subject, not an accident
 (
     PATH="$sandbox/nops"; export PATH
     PYTHONPATH="$sandbox/nobind"; export PYTHONPATH
     exec_run "$PY" harness/tools/verify_mcp_fixtures.py
-); report "both-denied" "$?"
+) > "$log" 2>&1; status=$?
+cat "$log"
+# BOTH reasons, because one of them is what a half-applied denial looks like.
+judge "both-denied" "$status" 1 "INCOMPLETE" "$PS_DENIED" "$BIND_DENIED"
 
 # The selftest separately, for the arm the `mkfifo` replacement is for. The bind() case belongs
 # on the VERIFIER too and not only here: E16's two transports are what it exercises, and pointing
@@ -169,6 +216,17 @@ report() {
 (
     PYTHONPATH="$sandbox/nobind"; export PYTHONPATH
     exec_run "$PY" -m agentskill_evals.cli selftest
-); report "selftest-bind-denied" "$?"
+) > "$log" 2>&1; status=$?
+cat "$log"
+judge "selftest-bind-denied" "$status" 0 "SELFTEST PASSED"
 
+if [ -n "$PAYLOAD" ]; then
+    echo "payload mode: no expectations applied — this run is NOT a reproduction"
+    exit 0
+fi
+if [ "$problems" -gt 0 ]; then
+    echo "$problems expectation(s) NOT met — this was not a reproduction"
+    exit 1
+fi
+echo "every phase produced the expected status and the evidence that the denial took"
 exit 0
