@@ -349,15 +349,34 @@ denial is one line, and the `bind()` one reaches child processes through `PYTHON
 is the only reason it touches the fixtures at all — they are subprocesses.
 
 ```sh
+# ONE SUBSHELL, so an `exit` on a failed guard below ends the RECIPE and not the reader's
+# interactive shell.
+(
+# FAIL CLOSED ON ALLOCATION. An unchecked `nops="$(mktemp -d)"` leaves the variable EMPTY when
+# allocation fails, and the quoted targets below become `/ps` and `/sitecustomize.py` — the
+# arbitrary write the quoting was added to prevent, now at the filesystem root, and the second
+# of those is EXECUTED by the interpreter on every later run (external review).
+#
+# `|| exit` ON EVERY LINE, and not `set -eu`, which was the first fix here and did not hold:
+# an assignment whose command substitution fails does not reliably trip `set -e`, and `set -u`
+# does not fire on an EMPTY variable because empty is still set. Driven with a stub `mktemp`
+# that exits 1, that version reached the write. The explicit guards below do not.
+nops="$(mktemp -d)" || exit 1
+nobind="$(mktemp -d)" || exit 1
+[ -n "$nops" ] || exit 1
+[ -n "$nobind" ] || exit 1
+[ -d "$nops" ] || exit 1
+[ -d "$nobind" ] || exit 1
+
 # PRIVATE DIRECTORIES, because both are WRITTEN THROUGH. A predictable /tmp/<known-name> that
 # already exists — a directory someone else owns, or a symlink — redirects the redirection
 # into whatever it points at. `mktemp -d` creates 0700 under the caller's own TMPDIR and
 # cannot collide; the paths are quoted everywhere for the same reason (external review).
-nops="$(mktemp -d)"; nobind="$(mktemp -d)"
-
+#
 # Deny `ps`: the fake must be the ONLY thing on PATH, since execvp keeps searching after
 # EACCES. Hence the absolute interpreter — PATH no longer resolves `python3` either.
-printf '#!/bin/sh\nexit 0\n' > "$nops/ps" && chmod 0644 "$nops/ps"
+printf '#!/bin/sh\nexit 0\n' > "$nops/ps"
+chmod 0644 "$nops/ps"
 
 # Deny bind(), inherited by every child through PYTHONPATH.
 cat > "$nobind/sitecustomize.py" <<'EOF'
@@ -366,6 +385,10 @@ def _denied(self, addr):
     raise PermissionError(1, "Operation not permitted")
 socket.socket.bind = _denied
 EOF
+
+# EXIT 1 IS THE EXPECTED RESULT BELOW, not a failure: a skipped section is not a pass. That
+# is why the guards above use `|| exit` on their own lines rather than a blanket `set -e`,
+# which would have ended the recipe on the first denial run.
 
 # THE VERIFIER UNDER EACH DENIAL, AND UNDER BOTH. The `bind()` case belongs here and not only
 # on the selftest: E16's two transports are what it exercises, and pointing it at the selftest
@@ -378,6 +401,7 @@ PATH="$nops" PYTHONPATH="$nobind" harness/.venv/bin/python harness/tools/verify_
 PYTHONPATH="$nobind" harness/.venv/bin/python -m agentskill_evals.cli selftest
 
 rm -rf "$nops" "$nobind"
+)
 ```
 
 Measured here, and each number is a different question answered:
@@ -389,7 +413,7 @@ Measured here, and each number is a different question answered:
 | verifier, both denied | 519 | 7 | 0 | 1 |
 | selftest, `bind()` denied | 579 arms | — | 0 | 0 |
 
-Every restricted run reaches **E20 with no traceback and no false failures**. The counts in the
+Every restricted **verifier** run reaches **E20 with no traceback and no false failures** — the selftest is in the table for the FIFO arm and has no E20 to reach. The counts in the
 block above are the UNRESTRICTED ones — a restricted run reports fewer checks and says which
 ones it could not ask, which is the whole point.
 
