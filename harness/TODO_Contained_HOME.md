@@ -359,9 +359,9 @@ is the only reason it touches the fixtures at all — they are subprocesses.
 sandbox="$(mktemp -d)" || exit 1
 [ -n "$sandbox" ] && [ -d "$sandbox" ] || exit 1
 
-# CLEANUP ON EVERY EXIT PATH, INSTALLED BEFORE ANYTHING IS PUT IN IT. A `rm -rf` at the bottom
-# runs only when the bottom is reached; a trap runs when the guards below fire too. Positional
-# cleanup is what made the leak above possible at all.
+# CLEANUP ON EVERY EXIT PATH THE SHELL CAN CATCH, INSTALLED BEFORE ANYTHING IS PUT IN IT. A
+# `rm -rf` at the bottom runs only when the bottom is reached; a trap runs when the guards below
+# fire too. Positional cleanup is what made the leak above possible at all.
 #
 # THE SIGNAL HANDLERS MUST *EXIT*, NOT MERELY CLEAN UP — and the first version of this trap did
 # not, which made the fix an instance of the very class documented below it. A handler that runs
@@ -370,9 +370,20 @@ sandbox="$(mktemp -d)" || exit 1
 # runs execute with NO DENIAL IN PLACE — reporting a full green pass as though the restricted
 # environment had been exercised. Interruption is fail-OPEN unless the handler ends the recipe
 # (external review). `exit` from the handler still fires the EXIT trap, so cleanup is not lost.
+#
+# EVERY CATCHABLE TERMINATING SIGNAL, NOT THE TWO THAT HAD BEEN TESTED. `INT` and `TERM` alone
+# left Ctrl-\ to kill the shell with the EXIT trap UNRUN and the sandbox behind (external
+# review). The other three are here because the fence says `sh`, and not every `sh` is the one
+# measured: with an EXIT trap that leaves a witness line, bash-3.2 was seen running it on `HUP`,
+# `PIPE` and `TERM` of its own accord — and skipping it on `QUIT` alone. That is an
+# implementation detail of one shell, not a property of the language, so the other three are
+# trapped rather than left to it. `KILL` cannot be trapped by anyone — hence the narrowed claim.
 trap 'rm -rf "$sandbox"' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'exit 129' HUP     # terminal closed, ssh dropped
+trap 'exit 130' INT     # Ctrl-C
+trap 'exit 131' QUIT    # Ctrl-\ quit from the keyboard (no line-end backslash: see below)
+trap 'exit 141' PIPE    # output piped into something that exits first
+trap 'exit 143' TERM    # kill, CI cancellation
 
 mkdir "$sandbox/nops" "$sandbox/nobind" || exit 1
 
@@ -417,7 +428,7 @@ PATH="$sandbox/nops" PYTHONPATH="$sandbox/nobind" \
 
 # ...and the selftest separately, which is the arm the `mkfifo` replacement is for.
 PYTHONPATH="$sandbox/nobind" harness/.venv/bin/python -m agentskill_evals.cli selftest
-)   # the trap removes the sandbox on every path out, including the guarded ones
+)   # the trap removes the sandbox on every path out it can catch — see SIGKILL, below
 ```
 
 **THE FAILURE PATHS ARE TESTED, NOT JUST THE HAPPY ONE**, and that is the lesson this recipe
@@ -446,6 +457,49 @@ returns is such a step. The always-fail stub used in the previous round could on
 exercise the FIRST allocation — the hole it missed and the test that missed it had the same
 shape, which is why the fixture checks below are on the ARTIFACTS rather than on the commands
 that wrote them.
+
+**AND `INT`/`TERM` WERE THE TWO SIGNALS THAT HAD BEEN TESTED, WHICH IS NOT THE SAME SET AS THE
+ONES THAT ARRIVE.** Ctrl-\ sends `QUIT`; untrapped, it killed the shell with the EXIT trap unrun
+and the sandbox left behind (external review). Handling the named signal alone would have been
+the reproduction rather than the principle, so the whole catchable terminating set is trapped —
+and the measurement below says why that is not belt-and-braces. Under bash-3.2 the OLD shape
+survives `HUP`, `PIPE` and `TERM` without leaking; a second control with an EXIT trap that leaves
+a witness line says *why*, which the leak matrix alone cannot: **bash runs the EXIT trap on those
+three itself, and skips it on `QUIT`.** "The sandbox went away" is not "my handler removed it,"
+and only the witness separates them. Leaning on that courtesy would make the recipe correct on
+this machine and silently leaky under any other `sh`. **`KILL` is the honest limit**: it cannot be
+trapped, so `kill -9` and a hard power loss leak the sandbox, and the claim above now says
+"every path the shell can catch" rather than "every path." One typographic hazard, since the
+signal that started this round is spelled with a backslash: **no comment in the block may END in
+one.** POSIX discards a comment to the newline and bash-3.2 was checked doing so, but a shell
+that continued the line instead would swallow the `trap` beneath it — silently, and in the
+direction that removes a handler.
+
+**The control that measured this was itself vacuous on the first run, and said PASS.** It pointed
+`TMPDIR` at a directory of its own and then counted what was left there — but macOS `mktemp -d`
+IGNORES `TMPDIR` and allocates in the per-user Darwin temp dir, so the leak check listed a
+directory the sandbox was never created in and reported every shape, old and new, as clean.
+Nothing was recorded, and nothing-recorded read as nothing-wrong. The fix is the rule from §4
+applied to the instrument: the block now echoes its real `$sandbox` path out, the control asserts
+that path EXISTS before it signals, and only then is a later absence evidence of cleanup. A
+negative control also has to be able to fail — this one now reports how many signals break the
+OLD shape and fails if the answer is zero, because a control that breaks nothing is measuring
+nothing.
+
+Both shapes, every signal delivered to the process GROUP mid-run — which is what a keyboard
+signal does, and what signalling the `sh` pid alone does not reproduce:
+
+| Signal delivered mid-run | old (`INT`/`TERM`) | new (all five) |
+| --- | --- | --- |
+| `HUP` — terminal closed | held (bash ran EXIT) | terminated + cleaned |
+| `INT` — Ctrl-C | held | terminated + cleaned |
+| `QUIT` — Ctrl-\ | **SANDBOX LEAKED** | terminated + cleaned |
+| `PIPE` — `\| head` | held (bash ran EXIT) | terminated + cleaned |
+| `TERM` — kill, CI cancel | held (bash ran EXIT) | terminated + cleaned |
+| `KILL` | leaks — untrappable | leaks — untrappable |
+
+No shape lets a run start after the signal: `runs completed = 1` in all ten trials, which is the
+property the previous round's fix bought and this round must not spend.
 
 Measured here, and each number is a different question answered:
 
