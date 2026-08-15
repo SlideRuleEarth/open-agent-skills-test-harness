@@ -362,7 +362,17 @@ sandbox="$(mktemp -d)" || exit 1
 # CLEANUP ON EVERY EXIT PATH, INSTALLED BEFORE ANYTHING IS PUT IN IT. A `rm -rf` at the bottom
 # runs only when the bottom is reached; a trap runs when the guards below fire too. Positional
 # cleanup is what made the leak above possible at all.
-trap 'rm -rf "$sandbox"' EXIT INT TERM
+#
+# THE SIGNAL HANDLERS MUST *EXIT*, NOT MERELY CLEAN UP — and the first version of this trap did
+# not, which made the fix an instance of the very class documented below it. A handler that runs
+# `rm -rf` and RETURNS leaves the shell to carry on with the next command: the sandbox is gone,
+# so `PATH="$sandbox/nops"` and `PYTHONPATH="$sandbox/nobind"` name nothing, and the remaining
+# runs execute with NO DENIAL IN PLACE — reporting a full green pass as though the restricted
+# environment had been exercised. Interruption is fail-OPEN unless the handler ends the recipe
+# (external review). `exit` from the handler still fires the EXIT trap, so cleanup is not lost.
+trap 'rm -rf "$sandbox"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 mkdir "$sandbox/nops" "$sandbox/nobind" || exit 1
 
@@ -421,7 +431,18 @@ than a failure — strictly worse than crashing.
 So the recipe is driven with each construction step failing in turn (`mktemp`, `mkdir`, `chmod`,
 `cat`, and an unwritable target directory, which no PATH stub can produce), asserting three
 things every time: **the runs are never reached, the exit status is non-zero, and no sandbox is
-left behind.** All five hold. The always-fail stub used in the previous round could only ever
+left behind.** All five hold.
+
+**INTERRUPTION IS A FAILURE PATH TOO, and the first trap here got it exactly backwards.**
+`trap 'rm -rf "$sandbox"' EXIT INT TERM` cleans up and *returns*, so the shell carries on: the
+sandbox is gone, `PATH="$sandbox/nops"` names nothing, and every remaining run executes with no
+denial in place and reports green. Signalling the process group — what Ctrl-C actually does —
+during the first verifier run showed it plainly: **exit 0 and three further runs completed**,
+each of them unrestricted and each of them reported as a pass. The handlers now `exit`, and the
+same control gives one run, exit 130 (SIGINT) or death by signal (SIGTERM), and no leak. That a
+CLEANUP fix introduced a fail-open path is the same lesson one turn later: the class is any step
+whose failure lets a later step run in a state it claims not to be in, and a signal handler that
+returns is such a step. The always-fail stub used in the previous round could only ever
 exercise the FIRST allocation — the hole it missed and the test that missed it had the same
 shape, which is why the fixture checks below are on the ARTIFACTS rather than on the commands
 that wrote them.
