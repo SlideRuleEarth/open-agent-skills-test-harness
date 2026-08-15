@@ -371,26 +371,35 @@ sandbox="$(mktemp -d)" || exit 1
 # environment had been exercised. Interruption is fail-OPEN unless the handler ends the recipe
 # (external review). `exit` from the handler still fires the EXIT trap, so cleanup is not lost.
 #
-# EVERY CATCHABLE TERMINATING SIGNAL, NOT THE TWO THAT HAD BEEN TESTED. `INT` and `TERM` alone
-# left Ctrl-\ to kill the shell with the EXIT trap UNRUN and the sandbox behind (external
-# review). The other three are here because the fence says `sh`, and not every `sh` is the one
-# measured: with an EXIT trap that leaves a witness line, bash-3.2 was seen running it on `HUP`,
-# `PIPE` and `TERM` of its own accord — and skipping it on `QUIT` alone. That is an
-# implementation detail of one shell, not a property of the language, so the other three are
-# trapped rather than left to it. `KILL` cannot be trapped by anyone — hence the narrowed claim.
+# EVERY SIGNAL THAT IS *SENT* TO THE RECIPE, WHICH IS NOT THE SAME AS "the ones I tested".
+# `INT` and `TERM` alone left Ctrl-\ to kill the shell with the EXIT trap UNRUN and the sandbox
+# behind; the five that replaced them still left `ABRT`, `ALRM`, `USR1`, `USR2`, `XCPU`, `XFSZ`
+# (both external review). The line drawn now is not a list but a distinction — see below — and
+# it is drawn where it is because DELEGATING THIS TO THE SHELL DOES NOT WORK. Measured across
+# every shell on this machine, EXIT-trap-runs-anyway is not a property of `sh`: dash runs it for
+# NONE of the twenty, zsh for two, bash for eighteen, ksh for nineteen. A recipe that relies on
+# it is correct under the shell it was written in and silently leaky under the next one.
 trap 'rm -rf "$sandbox"' EXIT
 trap 'exit 129' HUP     # terminal closed, ssh dropped
 trap 'exit 130' INT     # Ctrl-C
 trap 'exit 131' QUIT    # Ctrl-\ quit from the keyboard (no line-end backslash: see below)
 trap 'exit 141' PIPE    # output piped into something that exits first
 trap 'exit 143' TERM    # kill, CI cancellation
+# The rest of the sent set: a resource limit (`XCPU`, `XFSZ`), a timeout wrapper (`ALRM`), an
+# `abort`, or a human with the wrong pid. 128 rather than 1 ON PURPOSE — exit 1 is this recipe's
+# EXPECTED status (INCOMPLETE, below), so reusing it would make a run killed halfway through
+# indistinguishable from a run that finished and skipped a section.
+trap 'exit 128' ABRT ALRM USR1 USR2 XCPU XFSZ VTALRM PROF
 
 mkdir "$sandbox/nops" "$sandbox/nobind" || exit 1
 
 # PRIVATE DIRECTORIES, because both are WRITTEN THROUGH. A predictable /tmp/<known-name> that
 # already exists — a directory someone else owns, or a symlink — redirects the redirection into
-# whatever it points at. `mktemp -d` creates 0700 under the caller's own TMPDIR and cannot
-# collide; the paths are quoted everywhere for the same reason (external review).
+# whatever it points at. `mktemp -d` creates 0700 in the PLATFORM-SELECTED temporary location —
+# which is not necessarily `$TMPDIR`, and on macOS is not: it uses the per-user Darwin temp dir
+# and ignores `TMPDIR` outright, which is what made the first signal control below vacuous. Do
+# not read the sandbox's location off an environment variable; ask the shell where it went. The
+# paths are quoted everywhere for the same reason (external review).
 #
 # Deny `ps`: the fake must be the ONLY thing on PATH, since execvp keeps searching after
 # EACCES. Hence the absolute interpreter — PATH no longer resolves `python3` either.
@@ -428,7 +437,7 @@ PATH="$sandbox/nops" PYTHONPATH="$sandbox/nobind" \
 
 # ...and the selftest separately, which is the arm the `mkfifo` replacement is for.
 PYTHONPATH="$sandbox/nobind" harness/.venv/bin/python -m agentskill_evals.cli selftest
-)   # the trap removes the sandbox on every path out it can catch — see SIGKILL, below
+)   # cleanup on every path out except an uncatchable signal or a fault in the shell — see below
 ```
 
 **THE FAILURE PATHS ARE TESTED, NOT JUST THE HAPPY ONE**, and that is the lesson this recipe
@@ -461,15 +470,30 @@ that wrote them.
 **AND `INT`/`TERM` WERE THE TWO SIGNALS THAT HAD BEEN TESTED, WHICH IS NOT THE SAME SET AS THE
 ONES THAT ARRIVE.** Ctrl-\ sends `QUIT`; untrapped, it killed the shell with the EXIT trap unrun
 and the sandbox left behind (external review). Handling the named signal alone would have been
-the reproduction rather than the principle, so the whole catchable terminating set is trapped —
-and the measurement below says why that is not belt-and-braces. Under bash-3.2 the OLD shape
-survives `HUP`, `PIPE` and `TERM` without leaking; a second control with an EXIT trap that leaves
-a witness line says *why*, which the leak matrix alone cannot: **bash runs the EXIT trap on those
-three itself, and skips it on `QUIT`.** "The sandbox went away" is not "my handler removed it,"
-and only the witness separates them. Leaning on that courtesy would make the recipe correct on
-this machine and silently leaky under any other `sh`. **`KILL` is the honest limit**: it cannot be
-trapped, so `kill -9` and a hard power loss leak the sandbox, and the claim above now says
-"every path the shell can catch" rather than "every path." One typographic hazard, since the
+the reproduction rather than the principle. A second control with an EXIT trap that leaves a
+witness line says *why* the other three held under bash, which the leak matrix alone cannot:
+**bash runs the EXIT trap on `HUP`, `PIPE` and `TERM` itself, and skips it on `QUIT`.** "The
+sandbox went away" is not "my handler removed it," and only the witness separates them.
+
+**Then five handlers were called "every catchable terminating signal," and they are not** —
+`ABRT`, `ALRM`, `USR1`, `USR2`, `XCPU` and `XFSZ` also terminate by default and were also unrun
+(external review). Two rounds in a row the fix stopped at the reproduction, so the third stops
+at a *distinction* instead, with the whole surface measured across every shell on this machine:
+
+**Signals SENT to the recipe are trapped. Signals raised because the shell itself FAULTED are
+not.** A `XCPU` from a CI `ulimit`, an `ALRM` from a timeout wrapper, a human with the wrong pid
+— those arrive at a healthy shell that can be trusted to run `rm -rf "$sandbox"`. `ILL`, `TRAP`,
+`EMT`, `FPE`, `BUS`, `SEGV` and `SYS` mean the shell process is broken, and a destructive command
+issued from a faulted interpreter is a worse bargain than a leaked 0700 directory containing a
+fake `ps`. **That is the residual leak surface: those seven at worst — dash and zsh leak all
+seven, ksh only `SEGV`, bash and `sh` none — plus `KILL`**, which nobody can trap. Not "every
+exit path", and not "every catchable terminating signal" either — this, measured, per shell.
+
+The measurement also killed the argument for leaving any of it to the shell. **EXIT-trap-runs-
+anyway is not a property of `sh`:** dash runs it for NONE of the twenty signals — not `INT`, not
+`TERM`, not `HUP` — zsh for two, bash for eighteen, ksh for nineteen. The doc's fence says `sh`
+and macOS hands an interactive user zsh, so the two shells most likely to meet this recipe are
+the two that clean up least. One typographic hazard, since the
 signal that started this round is spelled with a backslash: **no comment in the block may END in
 one.** POSIX discards a comment to the newline and bash-3.2 was checked doing so, but a shell
 that continued the line instead would swallow the `trap` beneath it — silently, and in the
@@ -486,20 +510,22 @@ negative control also has to be able to fail — this one now reports how many s
 OLD shape and fails if the answer is zero, because a control that breaks nothing is measuring
 nothing.
 
-Both shapes, every signal delivered to the process GROUP mid-run — which is what a keyboard
-signal does, and what signalling the `sh` pid alone does not reproduce:
+Every signal delivered to the process GROUP mid-run — which is what a keyboard signal does, and
+what signalling the `sh` pid alone does not reproduce. **How many of the twenty catchable
+terminating signals leave the sandbox behind**, with only an EXIT trap installed, and with the
+handlers above:
 
-| Signal delivered mid-run | old (`INT`/`TERM`) | new (all five) |
-| --- | --- | --- |
-| `HUP` — terminal closed | held (bash ran EXIT) | terminated + cleaned |
-| `INT` — Ctrl-C | held | terminated + cleaned |
-| `QUIT` — Ctrl-\ | **SANDBOX LEAKED** | terminated + cleaned |
-| `PIPE` — `\| head` | held (bash ran EXIT) | terminated + cleaned |
-| `TERM` — kill, CI cancel | held (bash ran EXIT) | terminated + cleaned |
-| `KILL` | leaks — untrappable | leaks — untrappable |
+| shell | EXIT trap alone | with the handlers | still leaking |
+| --- | --- | --- | --- |
+| `/bin/dash` | **20 of 20 leak** | 7 | the fault signals |
+| `/bin/zsh` (macOS interactive default) | 18 of 20 leak | 7 | the fault signals |
+| `/bin/sh`, `/bin/bash` | 2 of 20 leak (`QUIT`, `PROF`) | **0** | — |
+| `/bin/ksh` | 1 of 20 leak (`SEGV`) | 1 | `SEGV` |
 
-No shape lets a run start after the signal: `runs completed = 1` in all ten trials, which is the
-property the previous round's fix bought and this round must not spend.
+**No signal that is SENT to the recipe leaks under any shell measured**; every survivor is a
+fault signal, which is the line drawn on purpose. And no shape lets a run start after the
+signal — `runs completed = 1` in every trial, the property the previous round's fix bought and
+this round must not spend.
 
 Measured here, and each number is a different question answered:
 
