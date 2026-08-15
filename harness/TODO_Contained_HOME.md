@@ -349,60 +349,82 @@ denial is one line, and the `bind()` one reaches child processes through `PYTHON
 is the only reason it touches the fixtures at all — they are subprocesses.
 
 ```sh
-# ONE SUBSHELL, so an `exit` on a failed guard below ends the RECIPE and not the reader's
-# interactive shell.
+# ONE SUBSHELL, so an `exit` on a failed guard ends the RECIPE and not the reader's shell.
 (
-# FAIL CLOSED ON ALLOCATION. An unchecked `nops="$(mktemp -d)"` leaves the variable EMPTY when
-# allocation fails, and the quoted targets below become `/ps` and `/sitecustomize.py` — the
-# arbitrary write the quoting was added to prevent, now at the filesystem root, and the second
-# of those is EXECUTED by the interpreter on every later run (external review).
-#
-# `|| exit` ON EVERY LINE, and not `set -eu`, which was the first fix here and did not hold:
-# an assignment whose command substitution fails does not reliably trip `set -e`, and `set -u`
-# does not fire on an EMPTY variable because empty is still set. Driven with a stub `mktemp`
-# that exits 1, that version reached the write. The explicit guards below do not.
-nops="$(mktemp -d)" || exit 1
-nobind="$(mktemp -d)" || exit 1
-[ -n "$nops" ] || exit 1
-[ -n "$nobind" ] || exit 1
-[ -d "$nops" ] || exit 1
-[ -d "$nobind" ] || exit 1
+# ONE PARENT DIRECTORY, so there is a single allocation to guard and a single thing to remove.
+# Two independent `mktemp -d` calls meant the second could fail AFTER the first succeeded, and
+# the `exit` on that guard walked straight past the `rm -rf` at the bottom. That leak was only
+# reachable by a stub failing the SECOND call, which an always-fail stub cannot produce — the
+# hole and the test that missed it had the same shape (external review).
+sandbox="$(mktemp -d)" || exit 1
+[ -n "$sandbox" ] && [ -d "$sandbox" ] || exit 1
+
+# CLEANUP ON EVERY EXIT PATH, INSTALLED BEFORE ANYTHING IS PUT IN IT. A `rm -rf` at the bottom
+# runs only when the bottom is reached; a trap runs when the guards below fire too. Positional
+# cleanup is what made the leak above possible at all.
+trap 'rm -rf "$sandbox"' EXIT INT TERM
+
+mkdir "$sandbox/nops" "$sandbox/nobind" || exit 1
 
 # PRIVATE DIRECTORIES, because both are WRITTEN THROUGH. A predictable /tmp/<known-name> that
-# already exists — a directory someone else owns, or a symlink — redirects the redirection
-# into whatever it points at. `mktemp -d` creates 0700 under the caller's own TMPDIR and
-# cannot collide; the paths are quoted everywhere for the same reason (external review).
+# already exists — a directory someone else owns, or a symlink — redirects the redirection into
+# whatever it points at. `mktemp -d` creates 0700 under the caller's own TMPDIR and cannot
+# collide; the paths are quoted everywhere for the same reason (external review).
 #
 # Deny `ps`: the fake must be the ONLY thing on PATH, since execvp keeps searching after
 # EACCES. Hence the absolute interpreter — PATH no longer resolves `python3` either.
-printf '#!/bin/sh\nexit 0\n' > "$nops/ps"
-chmod 0644 "$nops/ps"
+printf '#!/bin/sh\nexit 0\n' > "$sandbox/nops/ps" || exit 1
+chmod 0644 "$sandbox/nops/ps" || exit 1
 
 # Deny bind(), inherited by every child through PYTHONPATH.
-cat > "$nobind/sitecustomize.py" <<'EOF'
+cat > "$sandbox/nobind/sitecustomize.py" <<'PYDENY' || exit 1
 import socket
 def _denied(self, addr):
     raise PermissionError(1, "Operation not permitted")
 socket.socket.bind = _denied
-EOF
+PYDENY
 
-# EXIT 1 IS THE EXPECTED RESULT BELOW, not a failure: a skipped section is not a pass. That
-# is why the guards above use `|| exit` on their own lines rather than a blanket `set -e`,
-# which would have ended the recipe on the first denial run.
+# THE FIXTURES ARE CHECKED, NOT ONLY THE COMMANDS THAT WROTE THEM. Every construction step
+# above carries `|| exit 1`, and that is still not the property the runs depend on: what they
+# need is that `ps` EXISTS and is NOT executable, and that `sitecustomize.py` exists and is
+# non-empty. A missing or truncated denial file does not error — it makes the run below
+# silently UNRESTRICTED, which publishes a false negative instead of a failure (ext. review).
+[ -s "$sandbox/nops/ps" ] || exit 1
+[ ! -x "$sandbox/nops/ps" ] || exit 1
+[ -s "$sandbox/nobind/sitecustomize.py" ] || exit 1
+
+# EXIT 1 IS THE EXPECTED RESULT BELOW, not a failure: a skipped section is not a pass. That is
+# why the guards above use `|| exit 1` on their own lines rather than a blanket `set -e`, which
+# would have ended the recipe on the first denial run.
 
 # THE VERIFIER UNDER EACH DENIAL, AND UNDER BOTH. The `bind()` case belongs here and not only
 # on the selftest: E16's two transports are what it exercises, and pointing it at the selftest
 # alone demonstrates the FIFO replacement and nothing else (external review).
-PATH="$nops" harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
-PYTHONPATH="$nobind" harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
-PATH="$nops" PYTHONPATH="$nobind" harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
+PATH="$sandbox/nops" harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
+PYTHONPATH="$sandbox/nobind" harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
+PATH="$sandbox/nops" PYTHONPATH="$sandbox/nobind" \
+    harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
 
 # ...and the selftest separately, which is the arm the `mkfifo` replacement is for.
-PYTHONPATH="$nobind" harness/.venv/bin/python -m agentskill_evals.cli selftest
-
-rm -rf "$nops" "$nobind"
-)
+PYTHONPATH="$sandbox/nobind" harness/.venv/bin/python -m agentskill_evals.cli selftest
+)   # the trap removes the sandbox on every path out, including the guarded ones
 ```
+
+**THE FAILURE PATHS ARE TESTED, NOT JUST THE HAPPY ONE**, and that is the lesson this recipe
+cost three review rounds to learn. Each round fixed the step the finding named — `mktemp`, then
+its guard, then the writes after it — while the siblings stayed open, because the verification
+was aimed at the finding rather than at the class. The class is: **any step whose failure lets a
+later step run in a state it claims not to be in.** A missing `sitecustomize.py` does not error;
+it makes the "bind denied" run silently UNRESTRICTED, which publishes a false negative rather
+than a failure — strictly worse than crashing.
+
+So the recipe is driven with each construction step failing in turn (`mktemp`, `mkdir`, `chmod`,
+`cat`, and an unwritable target directory, which no PATH stub can produce), asserting three
+things every time: **the runs are never reached, the exit status is non-zero, and no sandbox is
+left behind.** All five hold. The always-fail stub used in the previous round could only ever
+exercise the FIRST allocation — the hole it missed and the test that missed it had the same
+shape, which is why the fixture checks below are on the ARTIFACTS rather than on the commands
+that wrote them.
 
 Measured here, and each number is a different question answered:
 
