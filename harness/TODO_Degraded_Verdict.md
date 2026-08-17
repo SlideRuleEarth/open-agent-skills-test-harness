@@ -37,33 +37,42 @@ new failure detection — see slice 2.
 
 ---
 
-## 1. THE OPEN DECISION — what CI does with a degraded cell
+## 1. DECIDED — a degraded run exits `4`
 
-Yellow is unambiguous to a human reading the matrix under every option. **CI reads one integer**, so
-the only real question is what that integer is. There is no arrangement that is simultaneously "obvious
-in the matrix" and "green in CI" and "blocks the pipeline" — pick two.
+**Resolved 2026-08-17: option D2.** Yellow is unambiguous to a human reading the matrix under every
+option; **CI reads one integer**, so the only real question was what that integer is. There is no
+arrangement that is simultaneously "obvious in the matrix", "green in CI" and "blocks the pipeline" —
+the choice was which two.
 
-| | exit status | consequence |
+| | exit status | verdict |
 | --- | --- | --- |
-| **D1** | `0`, with `--fail-on-degraded` to opt in | non-breaking. Existing pipelines stay green, which is the same false-green this change exists to end — until someone sets the flag |
-| **D2** | a distinct **`4`** | matches the house precedent exactly (below). Any CI doing `rc != 0` treats it as a failure — which is the intent, but it *is* a behaviour change for existing pipelines |
-| **D3** | `0`, no flag, reporting only | cheapest; purely a legibility change. Honest, but automation learns nothing |
+| **D1** | `0`, with `--fail-on-degraded` to opt in | non-breaking, but existing pipelines stay green — the same false-green this change exists to end, until someone sets the flag. **Not taken**; it differs from D2 only in the default, so it remains the fallback if the behaviour change proves unacceptable |
+| **D2** | a distinct **`4`** | **CHOSEN.** Matches the house precedent exactly. Any CI doing `rc != 0` treats it as a failure — which is the intent, and it *is* a behaviour change for existing pipelines |
+| **D3** | `0`, no flag, reporting only | cheapest, purely a legibility change; automation learns nothing. **Rejected** |
 
-**Recommendation: D2.** The precedent is already in the tree and its reasoning is verbatim the argument
-for this whole document — [cli.py:710](agentskill_evals/cli.py#L710):
+The precedent is already in the tree and its reasoning is verbatim the argument for this whole document
+— [cli.py:710](agentskill_evals/cli.py#L710):
 
 > Nothing was graded … exit 3 so CI can tell "no verdict" apart from a real failure (1) without falsely
 > claiming success (0).
 
-### Precedence — required before slice 1, under every option
+"Without falsely claiming success" is the requirement, and **exit 3 earned its own code for a rarer case
+than this one**.
+
+**What D2 costs, stated plainly:** a pipeline that today treats any nonzero status as failure will start
+failing on degraded runs. That is the intended effect rather than a side effect — a degraded run *is* a
+run whose premises differed from what the scenario declared — but it is a change to observable behaviour
+and belongs in slice 4's release note, not discovered by whoever owns the pipeline.
+
+### Precedence — per cell and per run
 
 Degraded is a **second axis** (§3), so `failed + degraded` is a real state and the two axes must be
 ordered explicitly. Left unspecified, an implementation is free to render 🟡 over a genuine assertion
 failure or return the degraded code where it owes a failure — hiding a red behind a yellow, which is
 strictly worse than the false-green this document exists to end.
 
-**The ordering is not a consequence of D1/D2/D3 and does not wait on it.** Only the degraded-only exit
-code is in question; everything else below holds regardless.
+This ordering was written before §1 was settled and deliberately did not depend on it — only the
+degraded-only code was ever in question. It is unchanged by the decision.
 
 **Per cell — the first match wins, and it extends the chain `_cell_mark` already applies:**
 
@@ -81,7 +90,7 @@ code is in question; everything else below holds regardless.
 | --- | --- |
 | any graded cell failed or errored | **`1`** |
 | nothing was graded | **`3`** (unchanged) |
-| every graded cell passed, at least one degraded | **the degraded code — `4` under D2, `0` under D1/D3** |
+| every graded cell passed, at least one degraded | **`4`** (§1) |
 | every graded cell passed, none degraded | **`0`** |
 
 **Ordinary failure always wins visibly and always exits `1`.** Degradation annotates a failure, it never
@@ -91,10 +100,6 @@ failure into the yellow lane would have made the reporting worse than it was.
 The precedence itself is what slice 1's arms must exercise — a `failed + degraded` cell asserted at every
 render site *and* against the exit status, since "does 🟡 hide ❌" is exactly the question a check on
 either one alone cannot answer.
-
-"Without falsely claiming success" is the requirement. Exit 3 earned its own code for a *rarer* case
-than this one. D1 is the fallback if breaking `rc != 0` pipelines is unacceptable; note that D1 and D2
-differ only in the default, so D1 now does not foreclose D2 later.
 
 **Not in question:** a degraded cell stays in the denominator. See §5's first risk.
 
@@ -184,7 +189,7 @@ nothing produces a record until slice 2.
 | [cli.py:661](agentskill_evals/cli.py#L661) | terminal tally | `(n degraded)` |
 | [cli.py:689](agentskill_evals/cli.py#L689) | `--verbose` failure list | degraded cells listed with their reason |
 | [cli.py:701](agentskill_evals/cli.py#L701) | `--reports fail` selection | **include degraded**, or the yellow cell has no report to read |
-| [cli.py:708](agentskill_evals/cli.py#L708) | `failed` → exit status | per §1 |
+| [cli.py:708](agentskill_evals/cli.py#L708) | `failed` → exit status | the per-run table in §1 — `1` outranks `4` |
 
 The last two rows are the ones easiest to miss and the most user-visible: a degraded cell whose report is
 never rendered, or a matrix showing 🟡 while the process exits 0, are both the matrix and the exit status
@@ -202,7 +207,7 @@ Four deliverables, and the first is the one that is expensive to change later:
    anything produces one;
 2. **`cell_verdict()`** and the per-cell/per-run precedence in §1;
 3. **every row in §3 converted**, including the `Progress.done` extension its three spent values force;
-4. **the exit status**, per §1's decision.
+4. **the exit status** — `4` for degraded-only, per §1.
 
 **No condition emits a record yet**, so behaviour is unchanged and the whole slice is provable on
 synthetic `CellResult`s without running an agent.
@@ -213,7 +218,7 @@ Assertions that must be able to fail here:
   check that only exercises `_cell_mark` passes while `summary.json` still says `passed: true`, and
   their agreement is the property under test rather than two separate ones;
 - a **`failed + degraded`** cell, asserting ❌ survives and 🟡 does not replace it, and that the run exits
-  `1` rather than the degraded code. "Does yellow hide red" is unanswerable from either axis alone;
+  `1` rather than `4`. "Does yellow hide red" is unanswerable from either axis alone;
 - a degradation record whose **`kind` is read without touching its message**, since the point of the
   type is that no consumer has to parse the prose.
 
