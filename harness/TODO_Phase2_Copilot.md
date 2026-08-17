@@ -5,7 +5,8 @@ bearer token in `headers` and a per-server `tools:` allowlist that is really enf
 and no transport bridge. Scope is **stdio *and* remote**, not stdio first.
 
 `harness/DESIGN_MCP_Support.md` is authoritative for every fact below; this file is the build order and
-the open decisions. Read §2 (copilot), §5.2, §5.3 and §8 before changing anything. Counts live only in
+the decisions behind it. **No decision here is open** — §1 was the last one and closed on 2026-08-17.
+Read §2 (copilot), §5.2, §5.3 and §8 before changing anything. Counts live only in
 `TODO_Contained_HOME.md` §4 — do not restate them here.
 
 ---
@@ -25,10 +26,13 @@ at 1.0.79" is exactly what would send slice 3 building on a claim nobody made.
 
 ---
 
-## 1. THE OPEN DECISION — a declared server that does not work
+## 1. DECIDED — a declared server that does not work **warns**, as it does on claude
 
-On 2026-08-17 the call was *"a declared server reporting `failed` fails the cell"*. That was made
-without §8's line on claude's Phase 1, which shipped the **opposite** resolution:
+**Resolved 2026-08-17: option A.** copilot matches claude. The history is kept because the decision was
+made twice and reversed once, and the reason it reversed is the useful part.
+
+The first call was *"a declared server reporting `failed` fails the cell"*. That was made without §8's
+line on claude's Phase 1, which shipped the **opposite** resolution:
 
 > `_mcp_witness` now permits the *declared* set and only that … A declared server that does **not**
 > appear **warns** rather than raises: nothing leaked, but the scenario ran without the surface it
@@ -40,21 +44,47 @@ Claude's warnings are **recorded, not printed** (`notices.py` → `RunResult.war
 table). So the existing behaviour is a *recorded* pass, not a silent one — which materially weakens the
 "false green" argument the fail decision rested on.
 
-Three coherent resolutions. **The second is not acceptable**, and is listed only to be ruled out:
+Three coherent resolutions were considered. **B was never acceptable**, and is kept only to stay ruled
+out:
 
-| | behaviour | cost |
+| | behaviour | verdict |
 | --- | --- | --- |
-| **A** | copilot **warns**, matching claude | consistent immediately; a declared-but-dead server still lets the cell pass, with the warning and the health axis carrying it |
-| **B** | copilot **fails**, claude keeps warning | two runners answer "did my declared server work?" differently. A scenario green on claude and red on copilot for a reason that is neither's fault. **Reject.** |
-| **C** | **both fail** — apply the principle everywhere | consistent and stricter, but changes claude's shipped, reviewed behaviour and widens Phase 2 into Phase 1's code with its own arms and mutations |
+| **A** | copilot **warns**, matching claude | **CHOSEN.** Consistent immediately; a declared-but-dead server still lets the cell pass, with the warning and the health axis carrying it |
+| **B** | copilot **fails**, claude keeps warning | two runners answer "did my declared server work?" differently. A scenario green on claude and red on copilot for a reason that is neither's fault. **Rejected.** |
+| **C** | **both fail** — apply the principle everywhere | stricter and still coherent, but it rewrites claude's shipped, reviewed behaviour and widens Phase 2 into Phase 1's code with its own arms and mutations. **Not taken.** Should C ever be revisited it belongs in its own PR, before slice 2, so claude's change is reviewed on claude's own terms. |
 
-**Undeclared servers fail in every option.** That is the kill-switch and it is not in question.
+**Undeclared servers fail under every option.** That is the kill-switch and it was never in question.
+So is an *unavailable* declared set: the witness fails closed there, because a rule that permits the
+declared set must never become a way to switch the audit off.
 
-Recommendation: **A**, unless the failure mode has actually been hit in practice. The warning is already
-recorded in three artifacts and the health axis already publishes `failed` per cell, so the information
-is not lost — and C means rewriting a decision that survived review on the adapter that has been running
-longest. If C is chosen it should be its own PR, before slice 2, so claude's change is reviewed on
-claude's own terms.
+### What A costs, stated plainly
+
+A declared-but-dead server lets the cell pass. The information is not lost — the warning is recorded in
+three artifacts and the health axis publishes `failed` per cell — but nothing *forces* anyone to look.
+That is the whole of the "false green" objection, and it survives the decision rather than being
+answered by it.
+
+**What answers it is not the witness — it is slice 3's acceptance.** The scenario the objection really
+fears is *injection silently not working*: the harness writes no usable config, copilot reports the
+declared server absent, the witness warns, the cell goes green. A witness cannot close that, because the
+witness is downstream of the same broken step. A **live end-to-end case that asserts the bearer arrived
+on every receipt and that both gating signs hold** does close it, and slice 3's acceptance now carries
+exactly that (added in review, PR #118). A is defensible *because* that case exists; without it, C would
+have been the safer call.
+
+### What the decision does and does not unblock
+
+It fixes slice 2's **policy** — every status class now has a verdict, and the change becomes a port of
+claude's resolution rather than a new one. It does **not** unblock slice 2's **implementation**: which
+status string a healthy injected copilot server actually reports is still unmeasured (slice 1, question
+2). A says what to do with each class; it does not say which string is which class.
+
+One structural consequence, and it is the one to get right. Today copilot's question is binary — inert
+or leaked, decided by `_INERT_MCP_STATUSES` alone. Under A it becomes two questions on two axes: *is
+this server declared?* and *what is its health?* Per the repo rule, the declared-set fact **joins the
+existing predicate** — the one function every caller already reads — rather than arriving as a parallel
+flag one call site checks. A second boolean consulted by one caller is how the exit status ends up
+disagreeing with the output.
 
 ---
 
@@ -183,7 +213,7 @@ Mirror of claude's Phase 1 change (§8 line 282), adapted to copilot's event sha
 - permit **exactly** the declared set, and only that
 - **undeclared + any status ⇒ fail the run** — unchanged, this is the kill-switch
 - declared + healthy ⇒ allowed
-- declared + `failed` / unrecognised / absent ⇒ **per §1's decision**
+- declared + `failed` / unrecognised / absent ⇒ **warn, not raise** (§1, decided — matching claude)
 
 Fails closed if the declared set is unavailable: this must never become a way to *disable* the audit.
 Standing rule from §8 applies — *a fact learned from the run may warn; only the runtime contract may
