@@ -18,8 +18,10 @@ entire reason C3 exists). So the pattern this whole design was written for is re
 injection alone. On claude the same pattern still needs §10.10's five bridge slices. Nothing retires
 the bridge: it stays the only route on claude, and the only tool gating agy will ever have (§10.1).
 
-The installed CLI is **1.0.79**, which is exactly the build every measurement below was taken against.
-Nothing needs re-probing before starting.
+The installed CLI is **1.0.79**. That is the build the *behavioural* measurements below were taken
+against, and they carry it from **each run's own stream**. It is not a blanket warrant over §2: one class
+of fact here is attributable to no build at all, by construction, and reading §2 as uniformly "measured
+at 1.0.79" is exactly what would send slice 3 building on a claim nobody made.
 
 ---
 
@@ -56,35 +58,70 @@ claude's own terms.
 
 ---
 
-## 2. What is already measured (do not re-derive)
+## 2. What is already known — and how well
 
-All from §2 unless noted. **Absence in a probe means *not exercised*, never *not supported*.**
+All from `DESIGN_MCP_Support.md` §2 unless noted. **Absence in a probe means *not exercised*, never *not
+supported*.** The four classes below are not interchangeable, and which one a fact belongs to decides
+whether slice 1 still has to measure it. Strongest first.
 
-- `--additional-mcp-config <json>` — a JSON string **or `@file`**, repeatable, augments the user config
-  for the session.
-- Config key spellings confirmed by making copilot write its own config and reading it back
-  (`tools/probe_copilot_config.py`, 1.0.79): `mcpServers`, `command`, `args`, `env`, `tools`, `url`,
-  `headers` — but across **two different adds** (five from a stdio add, `url`/`headers` from the remote
-  ones).
-- **`type` is a transport discriminator the adapter MUST write**: `local` for stdio, `http` and `sse`
-  for the remote pair. Undocumented; nothing in the harness knew about it. Omitting it produces a server
-  that silently never starts and *looks exactly like a server that started with nothing to say*.
-- **`tools: ["*"]` is copilot's spelling of "everything"**, written whenever no allowlist is given. An
-  **absent** `tools` key is therefore not the way to say "no filter".
-- **`tools:` is a hard filter on stdio, `http` and `sse`** (1.0.79) with a control arm on each: an
-  off-list call never reaches the server, an on-list call does and its answer returns. Read from
-  server-side receipts, never the model's account. The gated arm asserts **each sign** — the allowed
-  tool must arrive, the off-list one must not — because a `tools:` that suppressed the server wholesale
-  would otherwise look identical to a working filter (`SUPPRESSES_ALL` is the verdict for that case).
-- The declared `Authorization: Bearer <sentinel>` reached the server on **every** request of both arms,
-  value intact.
-- The bearer is stored in copilot's config file **in plaintext** — which is what §5.3's
+### (a) Measured on the wire, version-qualified from the run's own stream
+
+The two gating probes import `_stream_cli_version` **from the adapter** and recover the build from the
+same execution that produced the evidence. "At 1.0.79" is a property of that run, not of a preflight.
+
+- **`tools:` is a hard filter on stdio, `http` and `sse`**, with a control arm on each: an off-list call
+  never reaches the server, an on-list call does and its answer returns. Read from server-side receipts,
+  never the model's account. The gated arm asserts **each sign** — the allowed tool must arrive, the
+  off-list one must not — because a `tools:` that suppressed the server wholesale would otherwise look
+  identical to a working filter (`SUPPRESSES_ALL` is the verdict for that case).
+- The declared `Authorization: Bearer <sentinel>` reached the server on **every** request of both remote
+  arms, value intact.
+- **An absent `tools` key behaved as "no filter" on all three transports.** This is not an aside — it is
+  what every ungated control arm *is*: `mcp_config(…, tools=None)` omits the key and the off-list tool
+  arrives. See (b) for why the adapter should nonetheless write `["*"]`.
+- **A stdio server with no `type` key started and served tools** — `probe_copilot_gating.py` omits `type`
+  in both arms, and those arms are the source of the stdio half of the filter result above.
+
+### (b) Measured *shape*, attributable to no build
+
+`probe_copilot_config.py` points `COPILOT_HOME` at a throwaway dir, makes copilot write its own config
+with `copilot mcp add`, and reads back what it chose. `copilot mcp add` emits **no in-band witness**, so
+any version this probe reports comes from a *different execution* — the probe says so itself and reports
+it UNVERIFIED: it "measures shape, not a build". Treat every fact here as **unversioned**.
+
+- Config key spellings: `mcpServers`, `command`, `args`, `env`, `tools`, `url`, `headers` — across **two
+  different adds** (five from a stdio add, `url`/`headers` from the remote ones).
+- **copilot writes a `type` discriminator for itself** — `local` for stdio, `http` and `sse` for the
+  remote pair. Undocumented; nothing in the harness knew about it.
+- **copilot writes `tools: ["*"]` whenever no allowlist is given** — its own spelling of "everything".
+- The bearer is stored in that config file **in plaintext** (the probe adds `--header "Authorization:
+  Bearer PROBE_SENTINEL"` and reads the token back out), which is what §5.3's
   scratch-dir-outside-the-workspace rule already assumes of every CLI here.
-- `--secret-env-vars <names>` redacts those env values from output (verified 1.0.64).
-- The empty config shape is `{"mcpServers": {}}`; a bare `{}` fails validation with
-  `mcpServers: Required` and kills the session before execution.
+
+**What (b) licenses, and what it does not.** It licenses *emitting copilot's canonical shape*: writing
+`type`, and writing `["*"]` explicitly rather than omitting `tools`, matches what the binary produces for
+itself, and depending on an undocumented default instead is a bet a later build can settle silently. It
+does **not** license any claim about what omission *does*. Two such claims were previously asserted here
+and both are contradicted by (a). The one genuinely open case is **remote `type` omission**, which no
+probe has exercised — slice 1 closes it.
+
+### (c) Capability-survey claims — read from the CLI's own help, not exercised here
+
+Real, and recorded as verified in the survey; but nothing in this repo has driven them.
+
+- `--additional-mcp-config <json>` is documented as a JSON string **or `@file`**, repeatable, augmenting
+  the user config for the session. **Only `@file` is exercised**, by all three probes. Inline JSON,
+  repeatability, and the merge semantics of "augments" are unexercised — and slice 3 leans on the last of
+  those holding for the harness's own file.
+- `--secret-env-vars <names>` redacts those env values from output.
+- The empty config shape is `{"mcpServers": {}}`; a bare `{}` fails validation with `mcpServers: Required`
+  and kills the session before execution. (Load-bearing for Phase 0's mask, which already ships on it.)
+
+### (d) Current harness code — a statement about today, not a measurement
+
 - `_INERT_MCP_STATUSES = {"disabled", "not_configured"}` — [adapters/copilot.py:228](agentskill_evals/adapters/copilot.py#L228).
   Anything else counts as brought-up, `failed` included, "a spawned process being a spawned process".
+  This is the line slice 2 changes.
 
 ### The constraint that is easy to miss
 
@@ -107,8 +144,9 @@ selftest, mutation suite, Ruff. Four slices means four mutation runs.
 
 ### Slice 1 — measure (probes only, no production code)
 
-The three shipped copilot probes read **server-side receipts** — what copilot *sent*. Every remaining
-unknown is on the other side: what copilot *says it did*. One copilot run can answer all four:
+The three shipped copilot probes read **server-side receipts** — what copilot *sent*. Four of the five
+unknowns are on the other side: what copilot *says it did*, which one copilot run can answer together.
+The fifth is §2(b)'s: a shape read from an execution that carries no version.
 
 1. **MCP tool-name format in copilot's own JSON events.** §9 probe #3's first unanswered half. Needed by
    the parser (slice 4) and by `used_mcp_tool`. agy's is *inferred* as `mcp_<server>_<tool>` from binary
@@ -122,6 +160,16 @@ unknown is on the other side: what copilot *says it did*. One copilot run can an
    isolated runs already mask plugins, but a negative answer leaves a documented gap on non-isolated runs.
 4. **`--secret-env-vars` actual behaviour** — §8 lists it as belt-and-braces and nothing has measured
    what it does to an MCP-bearing run.
+5. **Remote `type` omission, as *behaviour* rather than shape.** Slice 3 writes `type` and an explicit
+   `tools: ["*"]` because §2(b) says copilot writes them for itself — but (b) is unversioned, and the
+   probe that produced it *cannot* be versioned: `copilot mcp add` emits no in-band witness, so no
+   amount of care makes that execution name its own build. The fix is not a better config probe, it is
+   **measuring the same question through a channel that does have a witness**: run a remote gating arm
+   with `type` omitted, on the fixture, and read the result from the run's own stream. That converts an
+   unversioned shape claim into a versioned behavioural one, and closes the only omission case (a) does
+   not already answer — stdio-without-`type` starts, and absent-`tools` is unfiltered, both measured.
+   Cheap: one more arm in `probe_copilot_remote_gating.py`, whose `mcp_config` already takes the shape
+   as an argument.
 
 Per repo policy the probes' **classification lives in named functions**, driven offline on synthetic
 rows in `verify_mcp_fixtures.py` (§E), with `F*` mutations. A fleet-wide negative requires every row
@@ -159,9 +207,31 @@ Also feeds the **two-axis** comparability reporting (§8): the set and the healt
   and that guard "arms itself the day copilot or agy gains injection". Needs its own arms rather than
   being discovered live.
 
-**Acceptance:** live end-to-end on stdio against `fixtures/echo_mcp_server.py`, **and live against NASA
-Earthdata** (`https://cmr.earthdata.nasa.gov/mcp/v1`, anonymous — the C3-4 endpoint) for remote `url` +
-native `tools:` gating. That is §8's pattern minus the token, on a real third-party server.
+**Acceptance.** The trap to avoid is accepting slice 3 on evidence that never runs slice 3's code. Every
+shipped remote measurement **hand-writes the config dict and invokes copilot directly** — see
+`probe_copilot_remote_gating.py`'s `mcp_config`, which builds `{"type", "url", "headers"}` by hand. So a
+broken `${VAR}` interpolation, a mis-serialized `headers` mapping, or a secret handled wrongly is
+invisible to all of it: the probes prove *copilot* honours a correct config, never that *the adapter
+produces one*. NASA is anonymous, so it cannot cover the gap either — it is §8's pattern **minus the
+token**, and the token is the half the design exists for.
+
+Three cases, and the middle one is the load-bearing one:
+
+1. **stdio, adapter path** — live against `fixtures/echo_mcp_server.py`.
+2. **remote with a real credential, adapter path** — live against `fixtures/http_mcp_server.py`, which
+   already writes one receipt per request, driven **through the adapter/runner from a scenario**, with:
+   - the bearer supplied as `${VAR}` from the environment, never a literal in the scenario — this is the
+     only thing that exercises interpolation at all;
+   - a native `tools:` allowlist;
+   - assert the **exact** `Authorization: Bearer <sentinel>` value on **every** receipt, matching the
+     existing probe's `bearer_reached` rather than checking presence;
+   - assert **both gating signs** — allowed tool arrives *and* answers, off-list tool does not — because
+     one sign alone cannot tell a filter from `SUPPRESSES_ALL`;
+   - assert `--secret-env-vars` **redacts the sentinel from the run's output**. Note these last two
+     observe different places and so do not conflict: the receipt is what the *server* saw, the redaction
+     is what the *harness* published. A test asserting only one of them passes on a build that leaks.
+3. **NASA Earthdata** (`https://cmr.earthdata.nasa.gov/mcp/v1`, anonymous — the C3-4 endpoint) as the
+   **third-party control**: a real server the harness does not own, proving the shape is not fixture-shaped.
 
 ### Slice 4 — parser and the portable assertion
 
