@@ -55,6 +55,43 @@ for this whole document — [cli.py:710](agentskill_evals/cli.py#L710):
 > Nothing was graded … exit 3 so CI can tell "no verdict" apart from a real failure (1) without falsely
 > claiming success (0).
 
+### Precedence — required before slice 1, under every option
+
+Degraded is a **second axis** (§3), so `failed + degraded` is a real state and the two axes must be
+ordered explicitly. Left unspecified, an implementation is free to render 🟡 over a genuine assertion
+failure or return the degraded code where it owes a failure — hiding a red behind a yellow, which is
+strictly worse than the false-green this document exists to end.
+
+**The ordering is not a consequence of D1/D2/D3 and does not wait on it.** Only the degraded-only exit
+code is in question; everything else below holds regardless.
+
+**Per cell — the first match wins, and it extends the chain `_cell_mark` already applies:**
+
+| order | state | renders |
+| --- | --- | --- |
+| 1 | `run_result.error` | `⚠️ <error>` |
+| 2 | `ungraded` | `⚪ ungraded` |
+| 3 | **failed** (degraded or not) | `❌` — **annotated as degraded when it is**, never replaced by 🟡 |
+| 4 | **degraded** and passed | `🟡` |
+| 5 | passed | `✅` |
+
+**Per run — the exit status is the most severe cell, not the last one computed:**
+
+| condition | exit |
+| --- | --- |
+| any graded cell failed or errored | **`1`** |
+| nothing was graded | **`3`** (unchanged) |
+| every graded cell passed, at least one degraded | **the degraded code — `4` under D2, `0` under D1/D3** |
+| every graded cell passed, none degraded | **`0`** |
+
+**Ordinary failure always wins visibly and always exits `1`.** Degradation annotates a failure, it never
+outranks one: the reason a cell failed is the thing the reader came for, and a run that lost a real
+failure into the yellow lane would have made the reporting worse than it was.
+
+The precedence itself is what slice 1's arms must exercise — a `failed + degraded` cell asserted at every
+render site *and* against the exit status, since "does 🟡 hide ❌" is exactly the question a check on
+either one alone cannot answer.
+
 "Without falsely claiming success" is the requirement. Exit 3 earned its own code for a *rarer* case
 than this one. D1 is the fallback if breaking `rc != 0` pipelines is unacceptable; note that D1 and D2
 differ only in the default, so D1 now does not foreclose D2 later.
@@ -71,9 +108,12 @@ The tri-state is half-built. Four precedents, all shipped:
 - **Display lanes beyond ✅/❌.** [`_cell_mark`](agentskill_evals/runner.py#L1302) checks `run_result.error`
   *first* and renders `⚠️ <error>`, then `⚪ ungraded`, and only then ✅/❌. `_cell_text` mirrors it with
   `ERR` / `SKIP` / `PASS` / `FAIL`.
-- **A tri-state at the progress layer.** `Progress.done(passed: bool | None)` renders `✓` / `✗` / `·`
-  ([progress.py:88](agentskill_evals/progress.py#L88)), and the runner already passes `None` for ungraded
-  cells ([runner.py:798](agentskill_evals/runner.py#L798)).
+- **A tri-state at the progress layer — precedent, but *not* spare capacity.** `Progress.done(passed:
+  bool | None)` renders `✓` / `✗` / `·` ([progress.py:88](agentskill_evals/progress.py#L88)) and the
+  runner passes `None` for ungraded cells ([runner.py:798](agentskill_evals/runner.py#L798)). **All three
+  values are already taken** — `True` pass, `False` fail, `None` ungraded — so there is nothing free to
+  spell degraded with. This one shows the shape is accepted here; it does not donate a slot, and slice 1
+  must **extend the API** rather than overload `None` or `False`.
 - **`ungraded`** — a per-cell boolean that is *not* pass and *not* fail
   ([runner.py:717](agentskill_evals/runner.py#L717)).
 
@@ -95,6 +135,43 @@ The failure mode to avoid is the one the repo has a rule about: **a new boolean 
 checks**, leaving every other caller publishing its old conclusion. So the deliverable of slice 1 is not
 the field — it is a single `cell_verdict(cell)` function that every row below calls.
 
+### The producer path, which does not exist yet
+
+**A `degraded` boolean alone is not enough, and settling for one would make slice 3 substring-match its
+own English.** There is no typed channel from an adapter to the verdict today. An adapter has exactly
+two ways to tell the runner anything non-fatal:
+
+- **raise** — `verify_post_run` is typed `-> None` ([base.py:691](agentskill_evals/adapters/base.py#L691)),
+  so its only outward signal is an exception, which `execute()` turns into `rr.error`;
+- **a warning string** — `notices.warn()` into a thread-local sink that `execute()` drains onto
+  `rr.warnings` ([exec.py:234](agentskill_evals/exec.py#L234)).
+
+`CellResult` is then constructed *afterwards*, in the runner. So "claude noticed a declared server never
+connected" reaches the verdict only as prose, and a `degraded` flag would have to be inferred by matching
+that prose — reproducing, one layer down, the exact untyped-string problem this document exists to fix.
+
+**Changing `verify_post_run`'s return type does not solve it**, and this is the constraint that decides
+the design: the two producers live in **different layers**. Slice 3's is adapter-level (inside
+`verify_post_run`); slice 2's is **runner-level** — `isolation_leaks` is computed by the runner and never
+passes through an adapter at all. A carrier reachable only from `verify_post_run` covers one and not the
+other.
+
+**So slice 1 defines a typed degradation record, and it is a data-model decision, not plumbing:**
+
+- a `Degradation` carrying a **`kind`** (a stable slug — `mcp_server_unavailable`,
+  `isolation_leak`) **and the human string**, so the warning text stays the detail and the kind is what a
+  consumer filters or aggregates on;
+- adapters emit it through the channel that already exists — a typed sibling of `notices.warn()`,
+  collected by the same thread-local sink, so it **joins the existing path** rather than adding a parallel
+  one, and keeps echoing to the operator exactly as now;
+- the runner collects its own findings into the same list, which is what lets `isolation_leaks` be slice
+  2's producer without an adapter round trip;
+- `cell_verdict()` reads that one list. `degraded` is then a *derived* property — `bool(degradations)` —
+  rather than a second thing that can disagree with it.
+
+Getting this wrong is expensive later and cheap now, which is why it belongs in slice 1 even though
+nothing produces a record until slice 2.
+
 | site | today | needs |
 | --- | --- | --- |
 | [runner.py:1299](agentskill_evals/runner.py#L1299) `_cell_text` | `PASS`/`FAIL` | `DEGR` lane |
@@ -103,7 +180,7 @@ the field — it is a single `cell_verdict(cell)` function that every row below 
 | [runner.py:1210](agentskill_evals/runner.py#L1210) | `n_passed` | `n_degraded` beside it |
 | [runner.py:1230](agentskill_evals/runner.py#L1230) | summary.json `cells[].passed` | `degraded` beside it |
 | [runner.py:902](agentskill_evals/runner.py#L902) | assertions.json `passed` | `degraded` beside it |
-| [runner.py:798](agentskill_evals/runner.py#L798) | `progress.done(passed=…)` | already tri-state; feed it |
+| [runner.py:798](agentskill_evals/runner.py#L798) | `progress.done(passed=…)` | **extend the API** — its three values are already spent (§2); take the verdict type, not a fourth bool |
 | [cli.py:661](agentskill_evals/cli.py#L661) | terminal tally | `(n degraded)` |
 | [cli.py:689](agentskill_evals/cli.py#L689) | `--verbose` failure list | degraded cells listed with their reason |
 | [cli.py:701](agentskill_evals/cli.py#L701) | `--reports fail` selection | **include degraded**, or the yellow cell has no report to read |
@@ -119,20 +196,35 @@ disagreeing about the same run.
 
 ### Slice 1 — the lane, with no producers
 
-`CellResult.degraded`, the `cell_verdict()` function, every row in §3 converted, exit status per §1.
-**No condition sets the flag yet**, so behaviour is unchanged and the slice is provable on synthetic
-`CellResult`s without running an agent.
+Four deliverables, and the first is the one that is expensive to change later:
 
-The assertion that must be able to fail here: a test that constructs a degraded cell and checks *each*
-render site — a check that only exercises `_cell_mark` passes while `summary.json` still says `passed:
-true`. Include the exit status in the same arm as the matrix text, since their agreement is the property
-under test, not two separate ones.
+1. **the typed `Degradation` record and its collection path** (§3) — the data model, decided before
+   anything produces one;
+2. **`cell_verdict()`** and the per-cell/per-run precedence in §1;
+3. **every row in §3 converted**, including the `Progress.done` extension its three spent values force;
+4. **the exit status**, per §1's decision.
+
+**No condition emits a record yet**, so behaviour is unchanged and the whole slice is provable on
+synthetic `CellResult`s without running an agent.
+
+Assertions that must be able to fail here:
+
+- a degraded cell checked at **every** render site *and* against the exit status in the same arm — a
+  check that only exercises `_cell_mark` passes while `summary.json` still says `passed: true`, and
+  their agreement is the property under test rather than two separate ones;
+- a **`failed + degraded`** cell, asserting ❌ survives and 🟡 does not replace it, and that the run exits
+  `1` rather than the degraded code. "Does yellow hide red" is unanswerable from either axis alone;
+- a degradation record whose **`kind` is read without touching its message**, since the point of the
+  type is that no consumer has to parse the prose.
 
 ### Slice 2 — `isolation_leaks` becomes the first producer
 
-No new detection: the leaks are already computed and discarded. One line at
-[runner.py:718](agentskill_evals/runner.py#L718)'s verdict, and the blockquote at
+No new detection: the leaks are already computed and discarded. The runner emits an `isolation_leak`
+record beside its existing `CellResult.isolation_leaks`, and the blockquote at
 [runner.py:1462](agentskill_evals/runner.py#L1462) keeps its detail.
+
+It is also the slice that **proves the record is reachable from the runner layer**, which is the half of
+§3's producer path an adapter-side carrier would have missed.
 
 **This is deliberately first.** It proves the lane on a real, already-shipped condition, and its negative
 control is free — an isolated run with no leaks must stay ✅, which is the check that the lane is not
@@ -140,9 +232,12 @@ simply degrading everything.
 
 ### Slice 3 — the MCP shortfall becomes the second producer
 
-claude's two `warn` calls keep warning **and** mark the cell degraded. The warning text is the detail;
-`degraded` is the verdict. copilot inherits this when Phase 2's witness slice lands — at which point
-`TODO_Phase2_Copilot.md` §1 is no longer a choice between a silent pass and a hard failure.
+claude's two `warn` calls become typed emissions carrying `kind="mcp_server_unavailable"` **and the same
+message**, so the operator echo and both durable locations are unchanged and the verdict now has a type
+to read. The warning text stays the detail; the `kind` is what the verdict and any consumer act on —
+**at no point does anything match the English**, which is the requirement §3's producer path exists to
+meet. copilot inherits this when Phase 2's witness slice lands, at which point `TODO_Phase2_Copilot.md`
+§1 is no longer a choice between a silent pass and a hard failure.
 
 Note this does **not** need the exception-channel rework a hard failure would have required: nothing
 raises, so `verify_post_run`'s "everything raised here means the run was not hermetic" contract is
