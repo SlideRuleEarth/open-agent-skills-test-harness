@@ -5,7 +5,8 @@ bearer token in `headers` and a per-server `tools:` allowlist that is really enf
 and no transport bridge. Scope is **stdio *and* remote**, not stdio first.
 
 `harness/DESIGN_MCP_Support.md` is authoritative for every fact below; this file is the build order and
-the decisions behind it. **No decision here is open** — §1 was the last one and closed on 2026-08-17.
+the decisions behind it. **Nothing here blocks Phase 2** — §1 was the last blocking decision and closed
+on 2026-08-17, though a later option **D** may yet supersede it without stopping any slice (§1).
 Read §2 (copilot), §5.2, §5.3 and §8 before changing anything. Counts live only in
 `TODO_Contained_HOME.md` §4 — do not restate them here.
 
@@ -39,19 +40,33 @@ line on claude's Phase 1, which shipped the **opposite** resolution:
 > asked for. So does one that appears in any state other than `connected` … An unrecognised status
 > warns too … An *undeclared* server still fails the run whatever its status claims.
 
-Claude's warnings are **recorded, not printed** (`notices.py` → `RunResult.warnings` → `cell.json`,
-`report.md`, `summary.json`), and the health axis separately reports `failed` per cell (§8's two-axis
-table). So the existing behaviour is a *recorded* pass, not a silent one — which materially weakens the
-"false green" argument the fail decision rested on.
+Claude's warnings are **recorded, not printed** (`notices.py` → `RunResult.warnings`), which weakens the
+"false green" argument the fail decision rested on. But only so far, and the limits are narrower than an
+earlier revision of this section claimed — both corrections are load-bearing for §1 and were wrong here:
 
-Three coherent resolutions were considered. **B was never acceptable**, and is kept only to stay ruled
-out:
+- The warning survives into **`report.md` and `summary.json`'s `cells[].warnings`. That is all.** The
+  per-cell JSONs do *not* carry it: `RunResult.to_dict()` ([schema.py:148](agentskill_evals/schema.py#L148))
+  omits `warnings`, so `result.json` lacks it, and `_write_cell_json` emits `assertions.json`, whose keys
+  stop at `assertions`. There is no `cell.json` — the method name is a misnomer that
+  [runner.py:2077](agentskill_evals/runner.py#L2077) and [selftest.py:12535](agentskill_evals/selftest.py#L12535)
+  both repeat in prose.
+- **The health axis does not report the shortfall.** It reports the *status*, and its verdicts compare
+  cells to **each other, not to the declaration**: if the server fails to come up in every cell the sets
+  agree and `mcp_server_set_verified` stays **true**, while `mcp_server_health_verified` goes false only
+  when health *differs* between cells. The axes detect **drift, not shortfall**.
+
+So the only artifact that compares what ran against what the scenario *declared* is the warning string,
+in two places, neither of them a machine-readable per-cell field.
+
+Four resolutions, three of them considered when this was decided and the fourth raised afterwards.
+**B was never acceptable**, and is kept only to stay ruled out:
 
 | | behaviour | verdict |
 | --- | --- | --- |
-| **A** | copilot **warns**, matching claude | **CHOSEN.** Consistent immediately; a declared-but-dead server still lets the cell pass, with the warning and the health axis carrying it |
+| **A** | copilot **warns**, matching claude | **CHOSEN**, for now. Consistent immediately; a declared-but-dead server still lets the cell pass, carried by **the warning alone** — the health axis records the status, not the shortfall |
 | **B** | copilot **fails**, claude keeps warning | two runners answer "did my declared server work?" differently. A scenario green on claude and red on copilot for a reason that is neither's fault. **Rejected.** |
-| **C** | **both fail** — apply the principle everywhere | stricter and still coherent, but it rewrites claude's shipped, reviewed behaviour and widens Phase 2 into Phase 1's code with its own arms and mutations. **Not taken.** Should C ever be revisited it belongs in its own PR, before slice 2, so claude's change is reviewed on claude's own terms. |
+| **C** | **both fail** — apply the principle everywhere | stricter and still coherent, but it rewrites claude's shipped, reviewed behaviour and widens Phase 2 into Phase 1's code with its own arms and mutations. **Not taken.** Should C ever be revisited it belongs in its own PR, before slice 2, so claude's change is reviewed on claude's own terms. Its real blocker is structural: every raise out of `verify_post_run` is reported as *"MCP hermeticity was not confirmed"* ([exec.py:238](agentskill_evals/exec.py#L238)), so a shortfall would be published as a leak — opposite facts with opposite remedies on one error string. |
+| **D** | a **degraded verdict** — 🟡 beside ✅/❌ | **RAISED AFTER THIS WAS DECIDED**, and it supersedes the A/C trade rather than sitting inside it: the shortfall gets a machine-readable field and a visible lane without conflating "the run was too empty" with "the run was too permissive". Planned separately in `TODO_Degraded_Verdict.md`; revisit §1 once its first slice lands. |
 
 **Undeclared servers fail under every option.** That is the kill-switch and it was never in question.
 So is an *unavailable* declared set: the witness fails closed there, because a rule that permits the
@@ -59,10 +74,11 @@ declared set must never become a way to switch the audit off.
 
 ### What A costs, stated plainly
 
-A declared-but-dead server lets the cell pass. The information is not lost — the warning is recorded in
-three artifacts and the health axis publishes `failed` per cell — but nothing *forces* anyone to look.
-That is the whole of the "false green" objection, and it survives the decision rather than being
-answered by it.
+A declared-but-dead server lets the cell pass. The information is not lost, but it is thinner than
+"recorded in the artifacts" suggests: two prose locations, no machine-readable per-cell field stating the
+discrepancy, and an axis that reports drift rather than shortfall (see above). Nothing *forces* anyone to
+look. That is the whole of the "false green" objection, and it survives the decision rather than being
+answered by it — which is why **D** exists.
 
 **What answers it is not the witness — it is slice 3's acceptance.** The scenario the objection really
 fears is *injection silently not working*: the harness writes no usable config, copilot reports the
