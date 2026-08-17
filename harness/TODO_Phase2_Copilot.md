@@ -40,13 +40,21 @@ line on claude's Phase 1, which shipped the **opposite** resolution:
 > asked for. So does one that appears in any state other than `connected` … An unrecognised status
 > warns too … An *undeclared* server still fails the run whatever its status claims.
 
-Claude's warnings are **recorded, not printed** (`notices.py` → `RunResult.warnings`), which weakens the
-"false green" argument the fail decision rested on. But only so far, and the limits are narrower than an
-earlier revision of this section claimed — both corrections are load-bearing for §1 and were wrong here:
+Claude's warnings are **recorded as well as printed**: `warn()` echoes to the harness's stderr *and*
+appends to `RunResult.warnings` ([notices.py:29](agentskill_evals/notices.py#L29)), and both health calls
+take that default. An earlier revision here said "recorded, **not** printed", which inverts what the
+module did — the change that made these durable **added** the record, it did not remove the echo. What
+matters for §1 is that the echo is **ephemeral**: `execute()` archives the *child's* stderr, never the
+harness's own, so only the durable half outlives the run.
 
-- The warning survives into **`report.md` and `summary.json`'s `cells[].warnings`. That is all.** The
-  other per-cell JSONs do *not* carry it: `RunResult.to_dict()` ([schema.py:148](agentskill_evals/schema.py#L148))
-  omits `warnings`, so `result.json` lacks it, and `_write_cell_json` emits `assertions.json`, whose keys
+That weakens the "false green" argument the fail decision rested on. But only so far, and the limits are
+narrower than earlier revisions of this section claimed — both corrections below are load-bearing for §1
+and were wrong here:
+
+- The warning survives into **two durable locations — `report.md` and `summary.json`'s
+  `cells[].warnings` — and no others.** The remaining per-cell JSONs do *not* carry it:
+  `RunResult.to_dict()` ([schema.py:148](agentskill_evals/schema.py#L148)) omits `warnings`, so
+  `result.json` lacks it, and `_write_cell_json` emits `assertions.json`, whose keys
   stop at `assertions`. There is no `cell.json` — the method name is a misnomer that
   [runner.py:2077](agentskill_evals/runner.py#L2077) and [selftest.py:12535](agentskill_evals/selftest.py#L12535)
   both repeat in prose.
@@ -60,7 +68,7 @@ earlier revision of this section claimed — both corrections are load-bearing f
   when health *differs* between cells. The axes detect **drift, not shortfall**.
 
 So the only thing that compares what ran against what the scenario *declared* is the warning string —
-reachable in two places, and typed in neither.
+durable in two places, typed in neither, and additionally echoed to a stderr nothing archives.
 
 Four resolutions, three of them considered when this was decided and the fourth raised afterwards.
 **B was never acceptable**, and is kept only to stay ruled out:
@@ -79,10 +87,12 @@ declared set must never become a way to switch the audit off.
 ### What A costs, stated plainly
 
 A declared-but-dead server lets the cell pass. The information is not lost, but it is thinner than
-"recorded in the artifacts" suggests: two locations, both free text, no typed field a consumer could
-filter or aggregate on, and an axis that reports drift rather than shortfall (see above). Nothing
-*forces* anyone to look, and nothing lets a machine look without pattern-matching prose. That is the whole of the "false green" objection, and it survives the decision rather than being
-answered by it — which is why **D** exists.
+"recorded in the artifacts" suggests: **two** durable locations, both free text, no typed field a
+consumer could filter or aggregate on, and an axis that reports drift rather than shortfall (see above).
+The operator also gets a stderr echo at the moment it happens, which helps whoever is watching and
+nobody reading the run afterwards. Nothing *forces* anyone to look, and nothing lets a machine look
+without pattern-matching prose. That is the whole of the "false green" objection, and it survives the
+decision rather than being answered by it — which is why **D** exists.
 
 **What answers it is not the witness — it is slice 3's acceptance.** The scenario the objection really
 fears is *injection silently not working*: the harness writes no usable config, copilot reports the
