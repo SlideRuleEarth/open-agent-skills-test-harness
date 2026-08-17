@@ -287,14 +287,15 @@ block, so the line after it looked for `harness/harness/.venv/bin/python` and th
 not be pasted as written (review, fifth round).
 
 ```sh
-make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
+make -C harness dev             # once — creates .venv with the PINNED ruff AND shellcheck
 
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
-make -C harness lint                                          # ruff; must print "All checks passed!"
+make -C harness lint                                          # ruff + shellcheck + a parse under every shell
 python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 169/169 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 probes; 559 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
+harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine
 git diff --check
 
 # AFTER the mutation run, because what it should have left behind is nothing, and "the
@@ -344,103 +345,71 @@ printed under an `INCOMPLETE` heading, and the summary line refuses the word. Th
 discrimination is what makes it honest — loopback *denied* is a skip; loopback available and a
 fixture that still will not start is a defect, and stays red.
 
-**Reproduce a restricted environment here rather than trusting that it works there.** Each
-denial is one line, and the `bind()` one reaches child processes through `PYTHONPATH`, which
-is the only reason it touches the fixtures at all — they are subprocesses.
+**Reproduce a restricted environment here rather than trusting that it works there.**
+`harness/tools/restricted_env.sh` denies each capability and runs the suites under each denial
+and under both. Each denial is one line; the `bind()` one reaches child processes through
+`PYTHONPATH`, which is the only reason it touches the fixtures at all — they are subprocesses.
 
 ```sh
-# ONE SUBSHELL, so an `exit` on a failed guard ends the RECIPE and not the reader's shell.
-(
-# ONE PARENT DIRECTORY, so there is a single allocation to guard and a single thing to remove.
-# Two independent `mktemp -d` calls meant the second could fail AFTER the first succeeded, and
-# the `exit` on that guard walked straight past the `rm -rf` at the bottom. That leak was only
-# reachable by a stub failing the SECOND call, which an always-fail stub cannot produce — the
-# hole and the test that missed it had the same shape (external review).
-sandbox="$(mktemp -d)" || exit 1
-[ -n "$sandbox" ] && [ -d "$sandbox" ] || exit 1
-
-# CLEANUP ON EVERY EXIT PATH THE SHELL CAN CATCH, INSTALLED BEFORE ANYTHING IS PUT IN IT. A
-# `rm -rf` at the bottom runs only when the bottom is reached; a trap runs when the guards below
-# fire too. Positional cleanup is what made the leak above possible at all.
-#
-# THE SIGNAL HANDLERS MUST *EXIT*, NOT MERELY CLEAN UP — and the first version of this trap did
-# not, which made the fix an instance of the very class documented below it. A handler that runs
-# `rm -rf` and RETURNS leaves the shell to carry on with the next command: the sandbox is gone,
-# so `PATH="$sandbox/nops"` and `PYTHONPATH="$sandbox/nobind"` name nothing, and the remaining
-# runs execute with NO DENIAL IN PLACE — reporting a full green pass as though the restricted
-# environment had been exercised. Interruption is fail-OPEN unless the handler ends the recipe
-# (external review). `exit` from the handler still fires the EXIT trap, so cleanup is not lost.
-#
-# EVERY SIGNAL THAT IS *SENT* TO THE RECIPE, WHICH IS NOT THE SAME AS "the ones I tested".
-# `INT` and `TERM` alone left Ctrl-\ to kill the shell with the EXIT trap UNRUN and the sandbox
-# behind; the five that replaced them still left `ABRT`, `ALRM`, `USR1`, `USR2`, `XCPU`, `XFSZ`
-# (both external review). The line drawn now is not a list but a distinction — see below — and
-# it is drawn where it is because DELEGATING THIS TO THE SHELL DOES NOT WORK. Measured across
-# every shell on this machine, EXIT-trap-runs-anyway is not a property of `sh`: dash runs it for
-# NONE of the twenty, zsh for two, bash for eighteen, ksh for nineteen. A recipe that relies on
-# it is correct under the shell it was written in and silently leaky under the next one.
-trap 'rm -rf "$sandbox"' EXIT
-trap 'exit 129' HUP     # terminal closed, ssh dropped
-trap 'exit 130' INT     # Ctrl-C
-trap 'exit 131' QUIT    # Ctrl-\ quit from the keyboard (no line-end backslash: see below)
-trap 'exit 141' PIPE    # output piped into something that exits first
-trap 'exit 143' TERM    # kill, CI cancellation
-# The rest of the sent set: a resource limit (`XCPU`, `XFSZ`), a timeout wrapper (`ALRM`), an
-# `abort`, or a human with the wrong pid. 128 rather than 1 ON PURPOSE — exit 1 is this recipe's
-# EXPECTED status (INCOMPLETE, below), so reusing it would make a run killed halfway through
-# indistinguishable from a run that finished and skipped a section.
-trap 'exit 128' ABRT ALRM USR1 USR2 XCPU XFSZ VTALRM PROF
-
-mkdir "$sandbox/nops" "$sandbox/nobind" || exit 1
-
-# PRIVATE DIRECTORIES, because both are WRITTEN THROUGH. A predictable /tmp/<known-name> that
-# already exists — a directory someone else owns, or a symlink — redirects the redirection into
-# whatever it points at. `mktemp -d` creates 0700 in the PLATFORM-SELECTED temporary location —
-# which is not necessarily `$TMPDIR`, and on macOS is not: it uses the per-user Darwin temp dir
-# and ignores `TMPDIR` outright, which is what made the first signal control below vacuous. Do
-# not read the sandbox's location off an environment variable; ask the shell where it went. The
-# paths are quoted everywhere for the same reason (external review).
-#
-# Deny `ps`: the fake must be the ONLY thing on PATH, since execvp keeps searching after
-# EACCES. Hence the absolute interpreter — PATH no longer resolves `python3` either.
-printf '#!/bin/sh\nexit 0\n' > "$sandbox/nops/ps" || exit 1
-chmod 0644 "$sandbox/nops/ps" || exit 1
-
-# Deny bind(), inherited by every child through PYTHONPATH.
-cat > "$sandbox/nobind/sitecustomize.py" <<'PYDENY' || exit 1
-import socket
-def _denied(self, addr):
-    raise PermissionError(1, "Operation not permitted")
-socket.socket.bind = _denied
-PYDENY
-
-# THE FIXTURES ARE CHECKED, NOT ONLY THE COMMANDS THAT WROTE THEM. Every construction step
-# above carries `|| exit 1`, and that is still not the property the runs depend on: what they
-# need is that `ps` EXISTS and is NOT executable, and that `sitecustomize.py` exists and is
-# non-empty. A missing or truncated denial file does not error — it makes the run below
-# silently UNRESTRICTED, which publishes a false negative instead of a failure (ext. review).
-[ -s "$sandbox/nops/ps" ] || exit 1
-[ ! -x "$sandbox/nops/ps" ] || exit 1
-[ -s "$sandbox/nobind/sitecustomize.py" ] || exit 1
-
-# EXIT 1 IS THE EXPECTED RESULT BELOW, not a failure: a skipped section is not a pass. That is
-# why the guards above use `|| exit 1` on their own lines rather than a blanket `set -e`, which
-# would have ended the recipe on the first denial run.
-
-# THE VERIFIER UNDER EACH DENIAL, AND UNDER BOTH. The `bind()` case belongs here and not only
-# on the selftest: E16's two transports are what it exercises, and pointing it at the selftest
-# alone demonstrates the FIFO replacement and nothing else (external review).
-PATH="$sandbox/nops" harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
-PYTHONPATH="$sandbox/nobind" harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
-PATH="$sandbox/nops" PYTHONPATH="$sandbox/nobind" \
-    harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
-
-# ...and the selftest separately, which is the arm the `mkfifo` replacement is for.
-PYTHONPATH="$sandbox/nobind" harness/.venv/bin/python -m agentskill_evals.cli selftest
-)   # cleanup on every path out except an uncatchable signal or a fault in the shell — see below
+harness/tools/restricted_env.sh                                  # the reproduction itself
+harness/.venv/bin/python harness/tools/verify_restricted_env.py  # and its FAILURE paths
 ```
 
-**THE FAILURE PATHS ARE TESTED, NOT JUST THE HAPPY ONE**, and that is the lesson this recipe
+**It was sixty lines of shell in a fenced block in this file, and that is why it took six review
+rounds.** Five of the six findings were fail-OPEN — a construction step whose failure let a later
+step run unrestricted, a leak on a second allocation, a signal handler that cleaned up and
+*returned*, a signal set that was "the ones I tested", a status collision — and every one of them
+reported green while broken. Prose-shell is the one artifact here that the suite cannot run, so
+it converged at the speed of review attention rather than the speed of the harness. Moving it
+bought three things a fenced block cannot have:
+
+- **`shellcheck` in `make lint`**, pinned like Ruff and installed by `make dev`. It found a real
+  defect the moment it was aimed at the script — not a style nit: the payload hook invoked a bare
+  `sh`, which under the `ps`-denied phase is not on PATH at all, so it died 127 without running.
+  That is the script's own "absolute interpreter" lesson, re-introduced two lines away from the
+  comment explaining it.
+- **Every rationale beside the line it defends**, where it is read by whoever edits that line
+  rather than by whoever happens to read this file.
+- **The failure paths below as CHECKS** rather than as controls run by hand in a scratch
+  directory that dies with the session. That is the whole argument: the lessons in this section
+  were each paid for once, and until now nothing re-derived them on every run.
+
+**And the script's own exit status was the next instance of the same class.** It discarded every
+phase status and always exited 0, on the stated theory that the suites' reports were the output
+and folding "sections were skipped" into a failure would hide the interesting case. Driving all
+four phases to exit 7 still returned 0 (external review). A denial that silently does not take
+then produces UNRESTRICTED green verifier runs with a green reproduction on top of them — the one
+outcome the script exists to make impossible. Each phase now declares the status **and the
+evidence** it must produce, and **section D** drives that production path against a stub
+interpreter: the reported exit-7 case, a run where the denial did not take, and a half-applied
+denial whose status is correct and whose bind() skip reason never appears. Only the evidence
+catches the last one, which is why a status alone was never going to be enough — and why the
+evidence is the skip REASONS rather than the skip counts, which drift when a section is added.
+
+**Then the way those cases were WRITTEN turned out to prove less than it looked.** Each broke
+several expectations at once and asserted only "non-zero status, and some PROBLEM", so no case
+showed that any individual guard discriminates — deleting a requirement outright left every case
+green, because the remaining problems still rejected the run (external review). Each case now
+breaks exactly one requirement in one phase and demands the exact `PROBLEM` line, plus the
+absence of any other. The deeper version of the same trap survived even that: section D
+GENERATES its cases from the script's own `judge` calls, so deleting a requirement deletes the
+case that would have caught it — a universal quantified over a set the subject controls. The
+fix is §4's own rule, a structural clause ahead of the universal: the contract is stated
+independently in the verifier, phase by phase, so removing a demand reddens a check rather than
+shrinking the matrix. **Section E then breaks the script one thing at a time on every run**, and
+requires the section NAMED for each break to redden on the CHECK named for it — an aggregate
+non-zero status does not say which guard noticed, or whether any did for the right reason. The
+declaration mutations are GENERATED from the contract, one requirement per phase plus each
+status and each whole judge call, so a hand-written list cannot quietly sample a subset while
+the prose claims "each" (external review). The second kind matters more: breaking `judge`
+itself — its status comparison, its evidence loop, its counter, its final verdict — leaves every
+declaration intact, so only section D can catch it, and until those existed **nothing had ever
+shown section D to be load-bearing at all**. Two controls run first, because "the child went
+red" is evidence about the mutation only if the child can go green, and only if the flag it runs
+under is honoured: accepting a mistyped `--only` ran two sections and exited 0, making a typo
+look like a pass.
+
+**THE FAILURE PATHS ARE TESTED, NOT JUST THE HAPPY ONE**, and that is the lesson this script
 cost three review rounds to learn. Each round fixed the step the finding named — `mktemp`, then
 its guard, then the writes after it — while the siblings stayed open, because the verification
 was aimed at the finding rather than at the class. The class is: **any step whose failure lets a
@@ -448,10 +417,12 @@ later step run in a state it claims not to be in.** A missing `sitecustomize.py`
 it makes the "bind denied" run silently UNRESTRICTED, which publishes a false negative rather
 than a failure — strictly worse than crashing.
 
-So the recipe is driven with each construction step failing in turn (`mktemp`, `mkdir`, `chmod`,
-`cat`, and an unwritable target directory, which no PATH stub can produce), asserting three
-things every time: **the runs are never reached, the exit status is non-zero, and no sandbox is
-left behind.** All five hold.
+**Section A** of `verify_restricted_env.py` drives the script with each construction step failing
+in turn — `mktemp`, `mkdir`, `chmod`, `cat`, and an unwritable sandbox, which no PATH stub can
+produce — asserting three things every time: **the phases are never reached, the exit status is
+non-zero, and no sandbox is left behind.** It carries a POSITIVE control beside them, because
+"no phase was reached" is also what a script that never ran at all produces: unbroken, every
+phase must run, and the expected number is read out of the script rather than written down.
 
 **INTERRUPTION IS A FAILURE PATH TOO, and the first trap here got it exactly backwards.**
 `trap 'rm -rf "$sandbox"' EXIT INT TERM` cleans up and *returns*, so the shell carries on: the
@@ -459,7 +430,7 @@ sandbox is gone, `PATH="$sandbox/nops"` names nothing, and every remaining run e
 denial in place and reports green. Signalling the process group — what Ctrl-C actually does —
 during the first verifier run showed it plainly: **exit 0 and three further runs completed**,
 each of them unrestricted and each of them reported as a pass. The handlers now `exit`, and the
-same control gives one run, exit 130 (SIGINT) or death by signal (SIGTERM), and no leak. That a
+same control gives one phase, exit 130 (SIGINT) or death by signal (SIGTERM), and no leak. That a
 CLEANUP fix introduced a fail-open path is the same lesson one turn later: the class is any step
 whose failure lets a later step run in a state it claims not to be in, and a signal handler that
 returns is such a step. The always-fail stub used in the previous round could only ever
@@ -480,8 +451,10 @@ sandbox went away" is not "my handler removed it," and only the witness separate
 (external review). Two rounds in a row the fix stopped at the reproduction, so the third stops
 at a *distinction* instead, with the whole surface measured across every shell on this machine:
 
-**Signals SENT to the recipe are trapped. Signals raised because the shell itself FAULTED are
-not.** A `XCPU` from a CI `ulimit`, an `ALRM` from a timeout wrapper, a human with the wrong pid
+**Signals SENT to the script are trapped. Signals raised because the shell itself FAULTED are
+not.** **Section C** pins that distinction in BOTH directions — every sent signal trapped with a
+handler that `exit`s, no fault signal trapped — by reading the trap table out of the script, so a
+handler deleted upstream reddens a check instead of silently shrinking the covered set. A `XCPU` from a CI `ulimit`, an `ALRM` from a timeout wrapper, a human with the wrong pid
 — those arrive at a healthy shell that can be trusted to run `rm -rf "$sandbox"`. `ILL`, `TRAP`,
 `EMT`, `FPE`, `BUS`, `SEGV` and `SYS` mean the shell process is broken, and a destructive command
 issued from a faulted interpreter is a worse bargain than a leaked 0700 directory containing a
@@ -491,11 +464,11 @@ exit path", and not "every catchable terminating signal" either — this, measur
 
 The measurement also killed the argument for leaving any of it to the shell. **EXIT-trap-runs-
 anyway is not a property of `sh`:** dash runs it for NONE of the twenty signals — not `INT`, not
-`TERM`, not `HUP` — zsh for two, bash for eighteen, ksh for nineteen. The doc's fence says `sh`
-and macOS hands an interactive user zsh, so the two shells most likely to meet this recipe are
-the two that clean up least. One typographic hazard, since the
-signal that started this round is spelled with a backslash: **no comment in the block may END in
-one.** POSIX discards a comment to the newline and bash-3.2 was checked doing so, but a shell
+`TERM`, not `HUP` — zsh for two, bash for eighteen, ksh for nineteen. The shebang says `sh`
+and macOS hands an interactive user zsh, so the two shells most likely to meet this script are
+the two that clean up least; section B therefore runs it under EVERY shell present rather than
+under the one it was written in. One typographic hazard, since the signal that started this
+round is spelled with a backslash: **no comment in the script may END in one.** POSIX discards a comment to the newline and bash-3.2 was checked doing so, but a shell
 that continued the line instead would swallow the `trap` beneath it — silently, and in the
 direction that removes a handler.
 
@@ -504,11 +477,12 @@ direction that removes a handler.
 IGNORES `TMPDIR` and allocates in the per-user Darwin temp dir, so the leak check listed a
 directory the sandbox was never created in and reported every shape, old and new, as clean.
 Nothing was recorded, and nothing-recorded read as nothing-wrong. The fix is the rule from §4
-applied to the instrument: the block now echoes its real `$sandbox` path out, the control asserts
-that path EXISTS before it signals, and only then is a later absence evidence of cleanup. A
-negative control also has to be able to fail — this one now reports how many signals break the
-OLD shape and fails if the answer is zero, because a control that breaks nothing is measuring
-nothing.
+applied to the instrument, and it is now structural: the verifier INTERCEPTS `mktemp` so the
+sandbox is allocated where it can see it, rather than guessing where the platform put it. Two
+negative controls run FIRST and gate everything after them — a planted sandbox must be detected,
+and the script's pre-review trap shape (DERIVED from the shipping file, not typed out beside it)
+must be caught leaking under `SIGQUIT`. If either fails the run refuses to continue, because "no
+leaks were found" and "no leaks could have been found" print the same way.
 
 Every signal delivered to the process GROUP mid-run — which is what a keyboard signal does, and
 what signalling the `sh` pid alone does not reproduce. **How many of the twenty catchable

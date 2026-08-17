@@ -20,7 +20,11 @@ schema = ["jsonschema>=4.0"]  # stricter output_schema validation (a built-in fa
 # upgrade into what looks like a code regression — and the lint contract here is "zero
 # findings means this change introduced none", which only holds if everyone runs the same
 # checker. `make dev` installs this; `make lint` runs it.
-dev = ["ruff==0.16.0"]
+# shellcheck is pinned for the SAME reason and carried as a wheel so `make dev` is still one
+# command with no system package manager involved: tools/restricted_env.sh is the one artifact
+# here that neither the selftest nor the mutation suite can run, which is precisely why six
+# rounds of review found five fail-OPEN defects in it while it was prose in a Markdown fence.
+dev = ["ruff==0.16.0", "shellcheck-py==0.11.0.1"]
 
 [project.scripts]
 agentskill-evals = "agentskill_evals.cli:main"

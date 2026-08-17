@@ -48,17 +48,27 @@ root, prefix it with `make -C harness`):
 | Target | For | What it does |
 | --- | --- | --- |
 | `make install` | running the evals | Puts the `agentskill-evals` CLI on your PATH in an isolated env (pipx). |
-| `make dev` | editing the harness | Creates `.venv/` and editable-installs with the `[schema,dev]` extras — `jsonschema` (a built-in fallback works without it) and the **exact** Ruff `make lint` requires. Activate with `. .venv/bin/activate`. |
-| `make lint` | before pushing | Runs that pinned Ruff. The tree passes at **zero** findings, so anything it prints is a regression from your change, not existing debt. |
+| `make dev` | editing the harness | Creates `.venv/` and editable-installs with the `[schema,dev]` extras — `jsonschema` (a built-in fallback works without it) plus the **exact** Ruff and ShellCheck `make lint` requires. Activate with `. .venv/bin/activate`. |
+| `make lint` | before pushing | Runs that pinned Ruff, then that pinned ShellCheck over `tools/*.sh`, then parses each script under every shell present. The tree passes at **zero** findings, so anything it prints is a regression from your change, not existing debt. |
+| `make restricted` | after touching `tools/restricted_env.sh` | Drives that script's FAILURE paths (~1 min): each construction step failing in turn, and every catchable terminating signal delivered to the process group under every shell here. |
 
 Both pull in `pyyaml` for you. After `make install`, sanity-check with `agentskill-evals list-agents-configured-models
---skills-root ..`; `make help` lists the other targets (`selftest`, `lint`, `mutation`, `clean`, `uninstall`).
+--skills-root ..`; `make help` lists the other targets (`selftest`, `lint`, `verify`, `restricted`, `mutation`,
+`clean`, `uninstall`).
 
 > **Why Ruff is pinned to a single version.** `pyproject.toml` sets `required-version`, and a
 > different build simply refuses to run. Family selectors like `UP` gain rules between
 > releases, so an unpinned checker turns a tool upgrade into something indistinguishable from
 > a code regression — and "zero findings" is only a meaningful contract if everyone's checker
 > agrees. `make lint` deliberately uses `.venv/bin/ruff`, never one found on PATH.
+>
+> **ShellCheck is pinned for the same reason**, and ships as a wheel so `make dev` stays one
+> command with no system package manager involved. `make lint` FAILS rather than skips when it
+> is missing: an explicit request to lint that reports success without having checked the shell
+> is precisely the fail-open shape `tools/restricted_env.sh` spent six review rounds removing.
+> (The pre-push hook makes the opposite call on purpose — an incidental gate should not block a
+> push over a missing optional tool.) The separate parse check exists because ShellCheck *reads*
+> a script; it does not hand it to `dash` and ask.
 
 > **`make install` requires [pipx](https://pipx.pypa.io).** Install it with `brew install pipx`
 > (macOS) or `python3 -m pip install --user pipx && python3 -m pipx ensurepath`, then re-run

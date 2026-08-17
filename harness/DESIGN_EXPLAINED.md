@@ -341,6 +341,19 @@ This is a nice bit of meta-engineering, and it's why the project trusts its own 
   never summed: only one of the three measures coverage of production code, and adding
   them would claim more than exists.
 
+- **A shell script, and a verifier built for it** ([`tools/restricted_env.sh`](tools/restricted_env.sh),
+  driven by [`tools/verify_restricted_env.py`](tools/verify_restricted_env.py), run with
+  `make restricted`). Some of the harness's guarantees are about what happens when the operating
+  system says *no* — when `ps` or a network socket is forbidden — and the honest answer there is
+  a **third result state**: a check that could not run is neither a pass nor a failure, and must
+  not be reported as one. Proving that machinery works means denying those capabilities on
+  purpose, which is a job for a shell script. A shell script, though, is the one artifact the
+  self-test cannot import and the mutation suite does not target — so it got a verifier of its
+  own, which drives its *failure* paths (each construction step failing in turn, every
+  terminating signal, the checks it makes on the suites it runs) and then **mutates the script
+  on every run** to confirm those checks can still fail. Same idea as mutation testing, carried
+  out inside the verifier because the main suite cannot reach the language.
+
 - **A local pre-push git hook** (`.git/hooks/pre-push`). Since GitHub-hosted macOS
   runners aren't available for this org — and the self-test is verified on macOS, where
   its filesystem checks rely on macOS semantics — CI runs *on the developer's machine*
@@ -348,9 +361,12 @@ This is a nice bit of meta-engineering, and it's why the project trusts its own 
   `git push`, and blocks the push if anything fails (bypass with `git push --no-verify`).
   It's the local stand-in for a cloud CI service.
 
-The layering is worth appreciating: **the harness tests agents; the self-test and the two
-verifiers test the harness; and mutation testing tests all three of those.** Each layer
-exists because the one below it can be wrong in a way nothing else would notice.
+The layering is worth appreciating: **the harness tests agents; the self-test and the three
+verifiers test the harness; and each of those is itself mutation-tested.** Each layer exists
+because the one below it can be wrong in a way nothing else would notice. The one seam worth
+knowing: `mutate_mcp.py` drives three of those suites, and the fourth — the restricted-environment
+verifier — carries its own mutations inline, because its subject is a shell script rather than
+Python. Same guarantee, different mechanism, and it is a boundary rather than an oversight.
 
 > **Exact counts live in exactly one place** — the verification block in
 > [`TODO_Contained_HOME.md`](TODO_Contained_HOME.md) §4, which lists every command and the
@@ -367,6 +383,16 @@ cd harness && make dev && . .venv/bin/activate
 
 # the self-test — no agent CLIs or API keys needed, runs in seconds
 python3 -m agentskill_evals selftest
+
+# lint: the pinned Ruff over the Python, the pinned ShellCheck over the shell, then a parse of
+# each script under every shell installed. Both linters come from .venv, never from your PATH.
+make lint
+
+# the two wire-level verifiers (real pipes, real child processes) — seconds
+make verify
+
+# the restricted-environment script's failure paths, including its own mutations — about 90s
+make restricted
 
 # mutation-test the checks themselves — SLOW: it runs a whole suite per mutation, and there
 # are hundreds. It prints its own elapsed time at the end, plus the slowest single mutation,
@@ -465,7 +491,8 @@ the picture at all.
 - [`tools/verify_mcp_fixtures.py`](tools/verify_mcp_fixtures.py) — drives both stdio fixtures against a scripted client, because a measurement is only as good as the thing that took it, and a test double only as good as its resemblance to a real server.
 - [`fixtures/http_mcp_server.py`](fixtures/http_mcp_server.py) — the same idea for *remote* servers: a small MCP server that speaks both HTTP flavours, runs offline, and writes down every request it received including the headers. That last part is what makes it evidence — "did the agent's credential actually reach the server?" is a question only the server can answer, and asking the agent is asking the thing under test.
 - [`tools/probe_remote_mcp.py`](tools/probe_remote_mcp.py) and the three `tools/probe_copilot_*.py` — **opt-in** probes that need a real CLI installed, and all but one of them spend real API calls, so nothing routine runs them. They exist because a claim like "this CLI's tool allowlist really blocks tools" expires the next time that CLI updates, and a claim nobody can re-run expires silently — so each is a procedure you can run again rather than a paragraph someone wrote once. Their *decision logic* is exercised offline by `verify_mcp_fixtures.py`, because otherwise a fix lands in one copy and not the other.
-- [`tools/verify_mcp_proxy.py`](tools/verify_mcp_proxy.py) — the third suite: it runs the real proxy over real pipes, with a real child process, and checks what actually happened to that process afterwards. Some things cannot be established from inside the program under test — "the server it was fronting is really gone" is a claim about the operating system, and a program asserting it about itself is the one witness you cannot trust. Its awkward counterpart is [`fixtures/proxy_target_server.py`](fixtures/proxy_target_server.py), a deliberately badly-behaved MCP server that ignores signals, lingers, and spawns helpers that escape their process group.
+- [`tools/restricted_env.sh`](tools/restricted_env.sh) and [`tools/verify_restricted_env.py`](tools/verify_restricted_env.py) — the script that reproduces a capability-denied environment, and the verifier that tests *its* failure paths. The script exists because "a denied capability is not a passing result" is a claim you can only check by denying one; the verifier exists because the script's own failure paths are the fail-open kind — a denial that quietly does not take produces an unrestricted run that reports green. It also mutates the script on every run and requires the named check to go red, which is mutation testing done locally for a file the main mutation suite cannot target.
+- [`tools/verify_mcp_proxy.py`](tools/verify_mcp_proxy.py) — the third mutation suite: it runs the real proxy over real pipes, with a real child process, and checks what actually happened to that process afterwards. Some things cannot be established from inside the program under test — "the server it was fronting is really gone" is a claim about the operating system, and a program asserting it about itself is the one witness you cannot trust. Its awkward counterpart is [`fixtures/proxy_target_server.py`](fixtures/proxy_target_server.py), a deliberately badly-behaved MCP server that ignores signals, lingers, and spawns helpers that escape their process group.
 
 ---
 

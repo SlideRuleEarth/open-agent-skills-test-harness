@@ -10,7 +10,7 @@ VENV   ?= .venv
 # Distribution / CLI name used with pipx — MUST match [project].name in pyproject.toml.
 DIST   ?= agentskill-evals
 
-.PHONY: help install dev selftest lint verify mutation clean uninstall
+.PHONY: help install dev selftest lint verify restricted mutation clean uninstall
 
 help: ## That's me!
 	@printf "\033[37m%-30s\033[0m %s\n" "#-----------------------------------------------------------------------------------------"
@@ -50,13 +50,36 @@ selftest: ## Run the parser self-test (no agent CLIs or third-party deps require
 # either refuse to run or — worse, if it happened to match — quietly become the thing the
 # "zero findings" contract depends on. The tree passes at zero, so any output here is a
 # regression introduced by the change in front of you, not pre-existing debt.
-lint: ## Lint with the pinned Ruff (run `make dev` first)
+lint: ## Lint the Python with the pinned Ruff and the shell with the pinned ShellCheck (run `make dev` first)
 	@test -x $(VENV)/bin/ruff || { \
 	  echo "lint: $(VENV)/bin/ruff is missing — run 'make dev' first (it installs the"; \
 	  echo "      exact Ruff version pyproject.toml's required-version pins; a different"; \
 	  echo "      build reports different findings for the same code)."; \
 	  exit 1; }
 	$(VENV)/bin/ruff check .
+# FAILS rather than skips when ShellCheck is absent, for the reason the Ruff guard above does:
+# `make lint` is an explicit request to lint, and a target that prints success without having
+# checked the shell is the same fail-OPEN shape this script spent six review rounds on. (The
+# pre-push hook makes the opposite call on purpose — an incidental gate should not block a
+# push over a missing optional tool.) `make dev` installs it; there is no system package to
+# find, and no ambient shellcheck is used even if one is on PATH.
+	@test -x $(VENV)/bin/shellcheck || { \
+	  echo "lint: $(VENV)/bin/shellcheck is missing — run 'make dev' first (it installs the"; \
+	  echo "      exact ShellCheck the lint contract is written against; a different build"; \
+	  echo "      reports different findings for the same script)."; \
+	  exit 1; }
+	$(VENV)/bin/shellcheck tools/*.sh
+# A parse check under every shell present, which ShellCheck does NOT do: it reads the script,
+# it does not hand it to `dash` and ask. A comment ending in a backslash would swallow the
+# `trap` on the next line under a shell that continued it — silently, in the direction that
+# removes a handler.
+	@for sh in /bin/sh /bin/dash /bin/zsh /bin/ksh /bin/bash; do \
+	  [ -x "$$sh" ] || continue; \
+	  for f in tools/*.sh; do \
+	    "$$sh" -n "$$f" || { echo "lint: $$f does not parse under $$sh"; exit 1; }; \
+	  done; \
+	  echo "  parses under $$sh"; \
+	done
 
 # The two wire-level drivers. They are not arms and are not in the selftest's count: the
 # fixtures and the proxy's I/O half are only reachable by running the real programs over real
@@ -69,6 +92,17 @@ verify: ## Drive the MCP fixtures and the C3 proxy over real pipes (seconds; run
 	  exit 1; }
 	$(VENV)/bin/python tools/verify_mcp_fixtures.py
 	$(VENV)/bin/python tools/verify_mcp_proxy.py
+
+# The one artifact neither the selftest nor the mutation suite can run is a shell script, so its
+# failure paths get their own driver: each construction step failing in turn, and every catchable
+# terminating signal delivered to the process group under every shell on the machine. Slower than
+# `verify` (about a minute) because most of those checks are a process launch, which is why it is
+# its own target rather than folded into that one.
+restricted: ## Drive tools/restricted_env.sh's FAILURE paths (~90s; run `make dev` first)
+	@test -x $(VENV)/bin/python || { \
+	  echo "restricted: $(VENV) is missing — run 'make dev' first."; \
+	  exit 1; }
+	$(VENV)/bin/python tools/verify_restricted_env.py
 
 # Unlike `selftest`, this one NEEDS $(VENV): mutate_mcp copies the tree per mutation and runs
 # `$(VENV)/bin/python -m agentskill_evals selftest` inside each copy. Checked up front because
