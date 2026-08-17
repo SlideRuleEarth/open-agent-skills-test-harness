@@ -295,7 +295,7 @@ make -C harness lint                                          # ruff + shellchec
 python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 169/169 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 probes; 559 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
-harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 126 here, over the 5 shells on this machine
+harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine
 git diff --check
 
 # AFTER the mutation run, because what it should have left behind is nothing, and "the
@@ -396,12 +396,18 @@ GENERATES its cases from the script's own `judge` calls, so deleting a requireme
 case that would have caught it — a universal quantified over a set the subject controls. The
 fix is §4's own rule, a structural clause ahead of the universal: the contract is stated
 independently in the verifier, phase by phase, so removing a demand reddens a check rather than
-shrinking the matrix. **Section E then mutates the script nine ways on every run** — deleting
-each requirement, weakening each status, and stopping a handler from exiting — and requires the
-red. Two of those nine were green before the round that added them. It runs two controls of its
-own first: the child must PASS on the unmutated script — otherwise "the child went red" is
-evidence about the invocation rather than the mutation — and a mistyped `--only` value must be
-REFUSED, since accepting one ran two sections and exited 0, making a typo look like a pass.
+shrinking the matrix. **Section E then breaks the script one thing at a time on every run**, and
+requires the section NAMED for each break to redden on the CHECK named for it — an aggregate
+non-zero status does not say which guard noticed, or whether any did for the right reason. The
+declaration mutations are GENERATED from the contract, one requirement per phase plus each
+status and each whole judge call, so a hand-written list cannot quietly sample a subset while
+the prose claims "each" (external review). The second kind matters more: breaking `judge`
+itself — its status comparison, its evidence loop, its counter, its final verdict — leaves every
+declaration intact, so only section D can catch it, and until those existed **nothing had ever
+shown section D to be load-bearing at all**. Two controls run first, because "the child went
+red" is evidence about the mutation only if the child can go green, and only if the flag it runs
+under is honoured: accepting a mistyped `--only` ran two sections and exited 0, making a typo
+look like a pass.
 
 **THE FAILURE PATHS ARE TESTED, NOT JUST THE HAPPY ONE**, and that is the lesson this script
 cost three review rounds to learn. Each round fixed the step the finding named — `mktemp`, then

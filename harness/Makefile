@@ -98,7 +98,7 @@ verify: ## Drive the MCP fixtures and the C3 proxy over real pipes (seconds; run
 # terminating signal delivered to the process group under every shell on the machine. Slower than
 # `verify` (about a minute) because most of those checks are a process launch, which is why it is
 # its own target rather than folded into that one.
-restricted: ## Drive tools/restricted_env.sh's FAILURE paths (~1 min; run `make dev` first)
+restricted: ## Drive tools/restricted_env.sh's FAILURE paths (~90s; run `make dev` first)
 	@test -x $(VENV)/bin/python || { \
 	  echo "restricted: $(VENV) is missing — run 'make dev' first."; \
 	  exit 1; }

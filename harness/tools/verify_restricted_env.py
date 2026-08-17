@@ -36,9 +36,15 @@ Five sections, five different questions:
      time, in one phase, and the exact PROBLEM line is demanded along with the absence of any
      other: batched failures cannot show that an individual guard discriminates.
 
-  E  MUTATIONS. The script is mutated nine ways on every run — each requirement deleted, each
-     expected status weakened, a handler stopped from exiting — and C and D must redden for
-     each. Two of the nine were green when they were written, so this is not a formality.
+  E  MUTATIONS. The script is broken one thing at a time on every run, and the section named
+     for each break must redden on the CHECK named for it — an aggregate non-zero status does
+     not say which guard noticed, or whether any did for the right reason. Two kinds, because
+     they are caught by different sections: deleting a REQUIREMENT changes what the script
+     declares (C's business), while breaking `judge` itself — the status comparison, the
+     evidence loop, the counter, the final verdict — leaves every declaration intact, so only
+     D's behavioural cases can catch it. The declaration set is GENERATED from
+     EXPECTED_CONTRACT, one requirement per phase plus each status and each whole judge call,
+     so a requirement added there is mutated automatically rather than sampled by hand.
 
 ONE DELIBERATE COPY, AND EVERYTHING ELSE READ FROM THE SOURCE. The trap set, the construction
 steps, the phase list and the per-phase expectations are read out of restricted_env.sh itself;
@@ -606,6 +612,43 @@ def section_c() -> None:
           not re.search(r"```sh.*?mktemp -d.*?PYDENY.*?```", doc, re.DOTALL))
 
 
+def _source_token(text: str, literal: str) -> str:
+    """How a literal is spelled in the script — "$PS_DENIED" or the bare string."""
+    for name, value in re.findall(r'^([A-Z_][A-Z_0-9]*)="([^"]*)"$', text, re.MULTILINE):
+        if value == literal:
+            return f'"${name}"'
+    return f'"{literal}"'
+
+
+def _judge_line(text: str, phase: str) -> str:
+    for line in text.splitlines():
+        if line.startswith(f'judge "{phase}" '):
+            return line
+    return ""
+
+
+def _drop_requirement(text: str, phase: str, literal: str) -> str:
+    """Delete ONE requirement from ONE phase, leaving every other phase intact."""
+    line = _judge_line(text, phase)
+    token = _source_token(text, literal)
+    if not line or f" {token}" not in line:
+        return text                      # unchanged: the caller reports it as a dead mutation
+    return text.replace(line, line.replace(f" {token}", "", 1), 1)
+
+
+def _weaken_status(text: str, phase: str, want: int) -> str:
+    line = _judge_line(text, phase)
+    if not line:
+        return text
+    wrong = 7 if want != 7 else 5
+    return text.replace(line, line.replace(f'"$status" {want}', f'"$status" {wrong}', 1), 1)
+
+
+def _drop_phase(text: str, phase: str) -> str:
+    line = _judge_line(text, phase)
+    return text.replace(line + "\n", "", 1) if line else text
+
+
 def _child(script: pathlib.Path, *args: str) -> subprocess.CompletedProcess:
     """This verifier, run against a given copy of the script. Used only by section E."""
     return subprocess.run(
@@ -615,55 +658,76 @@ def _child(script: pathlib.Path, *args: str) -> subprocess.CompletedProcess:
 
 
 def section_e() -> None:
-    """MUTATE THE SCRIPT AND REQUIRE C AND D TO NOTICE.
+    """MUTATE THE SCRIPT AND REQUIRE THE NAMED SECTION TO NOTICE.
 
     Sections C and D assert that the script's guards discriminate. This asserts that those
-    assertions can FAIL, by deleting one requirement at a time from a copy of the script and
-    demanding a red run each time. Without it, "every guard is discriminating" rests on the
-    author's intent -- which is how the batched version of section D passed while deleting both
-    `$PS_DENIED` requirements left it green (external review), and how removing `"INCOMPLETE"`
-    from one judge call survived the first fix: section D generates its cases FROM the script,
-    so a deleted requirement deletes its own test.
+    assertions can FAIL, by breaking one thing at a time and demanding the red. Without it,
+    "every guard is discriminating" rests on the author's intent -- which is how the batched
+    version of section D passed while deleting both `$PS_DENIED` requirements left it green,
+    and how removing `"INCOMPLETE"` from one judge call survived the first fix (external
+    review).
 
-    The child runs `--only cd` against the mutated copy, so it cannot recurse into this section.
+    TWO KINDS, AND THE SECOND KIND IS THE ONE THAT WAS MISSING. Deleting a REQUIREMENT changes
+    what the script declares, which section C pins. Breaking `judge` itself -- the status
+    comparison, the evidence loop, the counter, the final verdict -- leaves every declaration
+    intact, so only section D's behavioural cases can catch it. Every earlier mutation here was
+    of the first kind, which meant nothing had ever shown section D to be load-bearing at all.
+
+    Each mutation therefore NAMES the section that must catch it, the child runs that section
+    alone, and the expected failing check must appear by name: an aggregate non-zero status
+    does not say which guard noticed, or whether any did for the right reason (external
+    review). The declaration set is generated from EXPECTED_CONTRACT rather than hand-listed,
+    so a requirement added there is mutated automatically instead of being sampled.
     """
-    print("\nE. MUTATIONS — each deletion must REDDEN sections C and D")
+    print("\nE. MUTATIONS — one break at a time; the NAMED section must redden")
     text = SCRIPT.read_text()
 
-    # TWO CONTROLS BEFORE THE MUTATIONS. "The child exited non-zero" is evidence about the
-    # mutation only if the child can exit ZERO — a broken invocation would report every
-    # mutation as caught, for the wrong reason. And the flag it runs under has to be honoured:
-    # `--only nonsense` used to run C and D and exit 0, so a typo produced a green partial
-    # sweep and would have silently reduced what every mutation below proves (external review).
-    clean = _child(SCRIPT, "--only", "cd")
-    check("  the child PASSES on the unmutated script, so a red below is the mutation talking",
-          clean.returncode == 0, (clean.returncode, clean.stdout[-200:]))
+    # CONTROLS FIRST. "The child went red" is evidence about the mutation only if the child can
+    # go green, and only if the flag it runs under is honoured: `--only nonsense` used to run a
+    # green partial sweep (external review).
+    for only in ("c", "d"):
+        clean = _child(SCRIPT, "--only", only)
+        check(f"  the child PASSES section {only.upper()} on the unmutated script",
+              clean.returncode == 0, (clean.returncode, clean.stdout[-160:]))
     typo = _child(SCRIPT, "--only", "nonsense")
     check("  `--only nonsense` is REJECTED, not run as a green partial sweep",
           typo.returncode == 2, (typo.returncode, typo.stdout[-120:]))
-    mutations = [
-        ("both uses of $PS_DENIED deleted", lambda s: s.replace(' "$PS_DENIED"', "")),
-        ("$BIND_DENIED deleted", lambda s: s.replace(' "$BIND_DENIED"', "")),
-        ("the SELFTEST PASSED requirement deleted",
-         lambda s: s.replace(' "SELFTEST PASSED"', "")),
-        ("INCOMPLETE deleted from ps-denied",
-         lambda s: s.replace('judge "ps-denied" "$status" 1 "INCOMPLETE"',
-                             'judge "ps-denied" "$status" 1')),
-        ("INCOMPLETE deleted from both-denied",
-         lambda s: s.replace('judge "both-denied" "$status" 1 "INCOMPLETE"',
-                             'judge "both-denied" "$status" 1')),
-        ("ps-denied expected status weakened to the failing one",
-         lambda s: s.replace('judge "ps-denied" "$status" 1', 'judge "ps-denied" "$status" 7')),
-        ("the selftest expected status weakened",
-         lambda s: s.replace('judge "selftest-bind-denied" "$status" 0',
-                             'judge "selftest-bind-denied" "$status" 1')),
-        ("the whole both-denied judge deleted",
-         lambda s: re.sub(r'^judge "both-denied".*$', "", s, flags=re.MULTILINE)),
-        ("a handler stops exiting", lambda s: s.replace("trap 'exit 130' INT",
-                                                        "trap 'rm -rf \"$sandbox\"' INT")),
+
+    mutations: list[tuple[str, str, str, str]] = []
+    # DECLARATIONS -> section C. Generated from the contract, one requirement at a time, so
+    # every (phase, requirement) pair is covered rather than sampled.
+    for phase, (want_status, evidence) in EXPECTED_CONTRACT.items():
+        for literal in evidence:
+            mutations.append((f"{phase}: requirement {literal[:26]!r} deleted",
+                              _drop_requirement(text, phase, literal), "c",
+                              f"{phase} demands exactly"))
+        mutations.append((f"{phase}: expected status weakened",
+                          _weaken_status(text, phase, want_status), "c",
+                          f"{phase} demands exactly"))
+        mutations.append((f"{phase}: the whole judge call deleted",
+                          _drop_phase(text, phase), "c", f"{phase} demands exactly"))
+    handler_that_returns = """trap 'rm -rf "$sandbox"' INT"""
+    mutations.append(("a signal handler stops exiting",
+                      text.replace("trap 'exit 130' INT", handler_that_returns),
+                      "c", "SENT INT's handler EXITS"))
+    # ENFORCEMENT -> section D. Declarations untouched, so C stays green and only D can catch
+    # these. Nothing here was mutated before, which is why D had never been shown to matter.
+    mutations += [
+        ("judge stops comparing the status",
+         text.replace('if [ "$actual" != "$expected" ]; then', "if false; then"),
+         "d", "ps-denied / status: rejected"),
+        ("judge stops checking the evidence",
+         text.replace('if ! grep -qF "$want" "$log"; then', "if false; then"),
+         "d", "ps-denied / no-ps: rejected"),
+        ("problems are printed but never counted",
+         text.replace("problems=$((problems + 1))", "problems=$problems"),
+         "d", "ps-denied / status: rejected"),
+        ("the final verdict stops failing",
+         text.replace('if [ "$problems" -gt 0 ]; then', "if false; then"),
+         "d", "ps-denied / status: rejected"),
     ]
-    for name, mutate in mutations:
-        mutated = mutate(text)
+
+    for name, mutated, only, want_fail in mutations:
         if mutated == text:
             check(f"  {name}: the mutation still applies to this script", False,
                   "no textual change — the pattern has drifted, so this proves nothing")
@@ -671,16 +735,22 @@ def section_e() -> None:
         with tempfile.TemporaryDirectory() as td:
             copy = pathlib.Path(td) / SCRIPT.name
             _write(copy, mutated)
-            proc = _child(copy, "--only", "cd")
-            check(f"  {name}: caught", proc.returncode != 0,
-                  (proc.returncode, proc.stdout[-160:]))
+            proc = _child(copy, "--only", only)
+            reds = [ln for ln in proc.stdout.splitlines() if ln.startswith("  FAIL")]
+            named = [ln for ln in reds if want_fail in ln]
+            check(f"  {name}: section {only.upper()} reddens on {want_fail!r}",
+                  proc.returncode != 0 and named != [], (proc.returncode, reds[:3]))
 
 
 # The accepted `--only` values, as data rather than as a string comparison. `--only cd` runs
 # just the two sections section E mutates against, so the child cannot recurse into E and a
 # mutation costs seconds rather than a full sweep. ANY OTHER VALUE IS AN ERROR: accepting one
 # silently ran C and D and exited 0, which makes a typo look like a pass (external review).
-ONLY_SECTIONS = {"cd": (section_c, section_d)}
+ONLY_SECTIONS = {
+    "c": (section_c,),
+    "d": (section_d,),
+    "cd": (section_c, section_d),
+}
 
 
 def main() -> int:
