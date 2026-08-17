@@ -1083,42 +1083,31 @@ def _check_workspace_relocation(failures, verbose):
             # A special file the scrub cannot read and therefore cannot certify: it gets
             # QUARANTINED, which is a deletion the cell has to report.
             #
-            # A socket rather than a FIFO, deliberately. Both are special files and both
-            # take the same `_give_up` branch, but `open()` on a FIFO BLOCKS while `open()`
-            # on a socket fails ENXIO at once — and this arm drives `_run_cell` on the main
-            # thread. Mutation testing found that the hard way: the mutation that makes the
-            # scrub treat every non-directory as a readable regular file wedged the whole
-            # suite here. The one arm that must use a FIFO joins a 20s thread for this
-            # reason; every other arm should simply not arm the trap.
-            # Bound RELATIVE, from inside the workspace. An AF_UNIX address is capped by
-            # sun_path — 104 bytes on darwin, 108 on Linux — and the workspace lives under
-            # TMPDIR, so the absolute form spent the budget on a path the test does not
-            # control: `<TMPDIR>/ase-ws-XXXXXXXX/workspace/sock` fits on a host whose TMPDIR
-            # is short and does not on one whose TMPDIR is deep (a container, a CI runner,
-            # anyone who exports their own). `bind("sock")` after chdir costs 4 bytes
-            # whatever TMPDIR is. Reproduced before the fix by padding TMPDIR: the bind
-            # failed, the fixture was silently absent, and
-            # relocate.scrub_verdict_survives_a_raise_that_rebuilds_the_result went red.
+            # A FIFO RATHER THAN A SOCKET, which reverses an earlier decision and inherits
+            # its warning. Both are special files and both take the same `_give_up` branch;
+            # the socket was chosen because `open()` on a FIFO BLOCKS while `open()` on a
+            # socket fails ENXIO at once, and M37 — "every non-directory is a regular file"
+            # — makes the scrub open what it should have refused. That mutation wedged the
+            # whole suite here once. The reason it is safe now is NOT that the hazard went
+            # away: it is that this arm no longer drives `_run_cell` on the main thread, and
+            # joins a bounded thread exactly as `mcp.special_files_are_removed_rather_than_
+            # read` does. Removing that join re-arms the trap, so the arm asserts on it.
+            #
+            # WHY REVERSE IT: `socket()`+`bind()` is a capability a restricted environment
+            # may deny outright, and this arm was the selftest's only such dependency — one
+            # red arm out of 579 under a sandbox, for a fixture whose only requirement is
+            # "a directory entry that is not a link, a directory, or a regular file".
+            # `mkfifo` is a filesystem call and needs no socket privileges at all. The
+            # sun_path budget that made the old fixture bind RELATIVE from inside the
+            # workspace stops applying too, so the chdir dance goes with it.
             #
             # And the failure is recorded rather than swallowed. `_try` turned an
             # un-creatable fixture into an arm that fails on its assertion, which reads as
             # "the scrub stopped reporting quarantines" — a defect in the code under test —
             # when the truth is that the test never built the thing it was asserting about.
             # A fixture that cannot be created has to say so in its own words.
-            def _sock():
-                import socket as _socket
-                prev = os.getcwd()
-                os.chdir(cwd)
-                try:
-                    s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-                    try:
-                        s.bind("sock")
-                    finally:
-                        s.close()
-                finally:
-                    os.chdir(prev)
             try:
-                _sock()
+                os.mkfifo(os.path.join(cwd, "sock"))
             except OSError as exc:
                 seen["special_error"] = f"{type(exc).__name__}: {exc}"
         if seen.get("lock_exec_root") and os.path.basename(cwd) == "workspace":
@@ -1668,16 +1657,30 @@ def _check_workspace_relocation(failures, verbose):
         r.run_id, r.run_dir = "run15", run_dir15
         seen["make_special"] = True
         r.progress = _DoneExplodes()
+        # ON A BOUNDED THREAD, because the fixture is now a FIFO. Under M37 the scrub opens
+        # what it should have refused and never returns; on the main thread that wedges the
+        # entire suite with no output, which is a mutation reported as a hang rather than as
+        # the finding it is. `not t15.is_alive()` is in the assertion below so that deleting
+        # this join fails the arm instead of silently re-arming the trap.
+        import threading as _threading      # local, as every other bounded join here is
+        box15: dict = {}
+        t15 = _threading.Thread(
+            target=lambda: box15.update(c=_try(
+                lambda: r._run_cell(ModelTarget(), spec_secret, cell_idx=1), None)),
+            daemon=True)
         try:
-            cell15 = r._run_cell(ModelTarget(), spec_secret, cell_idx=1)
+            t15.start()
+            t15.join(20.0)
         finally:
             r.progress = _saved_progress
             r._secrets = r._run_secrets = ()
             os.environ.pop("ASE_SELFTEST_TOKEN", None)
+        cell15 = box15.get("c")
         res15 = _try(lambda: open(os.path.join(cell15.artifacts_dir, "result.json")).read(), "")
-        ws15 = os.path.join(cell15.artifacts_dir, "workspace")
+        ws15 = os.path.join(cell15.artifacts_dir, "workspace") if cell15 else ""
         _check("relocate.scrub_verdict_survives_a_raise_that_rebuilds_the_result",
-               "progress.done exploded" in res15 and "could not certify" in res15
+               not t15.is_alive() and cell15 is not None
+               and "progress.done exploded" in res15 and "could not certify" in res15
                and "sock" in res15 and not os.path.lexists(os.path.join(ws15, "sock")),
                "the scrub removed an artifact it could not certify and then a later raise "
                "rebuilt the result: rescanning finds the tree clean, so the deletion goes "

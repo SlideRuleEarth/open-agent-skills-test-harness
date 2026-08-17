@@ -201,6 +201,50 @@ def check(label, cond, detail=""):
         fails.append(label)
 
 
+# ARMS THAT COULD NOT RUN, kept apart from arms that ran and failed — two different facts, and
+# collapsing them is what this list exists to prevent.
+#
+# THIS FILE IS A LINEAR SCRIPT, so an unhandled raise ends it where it stands. Under a sandbox
+# that denies the process observer it did exactly that: 376 of 559 checks printed, the last of
+# them green, and E18, E19 and E20 never executed — with NO LINE ANYWHERE SAYING SO. A reader
+# saw a wall of `ok` and a traceback, and the sections that never ran were legible only by
+# knowing they should have (external review, PR #115). That is absence of a result read as a
+# result, in the file whose whole job is refusing that reading.
+#
+# So a capability this file cannot have is recorded rather than crashed on, and it is NOT a
+# pass: `skipped` joins `fails` in the exit status, because a run that could not ask a question
+# has not answered it. The reason is printed with the section, so "it was green here" can never
+# be said of a section that never ran.
+skipped: list[tuple[str, str]] = []
+
+
+def skip(section, reason):
+    print(f"  SKIP {section}  <- {reason}")
+    skipped.append((section, str(reason)[:300]))
+
+
+def _loopback_available():
+    """Can anything here bind a loopback listener? Asked once, before it is needed.
+
+    A PROXY FOR THE CHILD'S ABILITY, and knowingly so: the fixtures are subprocesses, and what
+    this tests is the parent. A sandbox that denied `bind()` to one and not the other would
+    fool it — which is a narrower claim than "the fixture failed", and the narrower claim is
+    the one worth making, because it keeps a genuine fixture defect RED. Loopback available
+    plus a fixture that will not start is still a failure; only the denial is a skip.
+    """
+    probe = socket.socket()
+    try:
+        probe.bind(("127.0.0.1", 0))
+        return True, ""
+    except OSError as exc:
+        return False, f"a loopback listener cannot be bound here: {exc}"
+    finally:
+        probe.close()
+
+
+LOOPBACK, _LOOPBACK_WHY = _loopback_available()
+
+
 def modern(method, mid, **extra):
     return {"jsonrpc": "2.0", "id": mid, "method": method,
             "params": dict(MODERN_META, **extra)}
@@ -1409,13 +1453,20 @@ def dig(obj, *path, default=None):
 
 
 with _Remote() as _rm:
-    # THE INSTRUMENT'S OWN LIVENESS IS CHECK ONE and everything else is inside its `if`. Not a
-    # skip — this reddens — because a suite that quietly ran fewer checks reports the same
-    # "ALL PASS" as one that ran them all. (The third result state that would let this be an
-    # honest SKIP is a backlog item, not something to invent here.)
-    check("the fixture announces the port it actually bound",
-          _rm.up and _rm.info.get("streamable", "").endswith("/mcp"),
-          _rm.failure or _rm.info)
+    # THE INSTRUMENT'S OWN LIVENESS IS CHECK ONE and everything else is inside its `if`. This
+    # used to redden unconditionally, with a note that "the third result state that would let
+    # this be an honest SKIP is a backlog item, not something to invent here" — because a suite
+    # that quietly ran fewer checks reports the same "ALL PASS" as one that ran them all. That
+    # state now exists (`skip`, above), so this is the backlog item being closed rather than a
+    # rule being relaxed: the discrimination is what makes it honest. Loopback DENIED is a
+    # capability this environment withholds; loopback available and a fixture that still will
+    # not start is a defect, and stays red.
+    if not LOOPBACK:
+        skip("E16: streamable HTTP — the fixture and every arm below it", _LOOPBACK_WHY)
+    else:
+        check("the fixture announces the port it actually bound",
+              _rm.up and _rm.info.get("streamable", "").endswith("/mcp"),
+              _rm.failure or _rm.info)
 
     if _rm.up:
         # THE WITNESS SAYS SOMETHING POSITIVE BEFORE ITS SILENCE IS EVIDENCE. Every header
@@ -1579,7 +1630,10 @@ with _Remote() as _rm:
 # check that says so: the reply to a POST does NOT come back in that POST's response. A fixture
 # that answered in place would satisfy a client that had never implemented SSE.
 with _Remote() as _rm2:
-    check("the SSE fixture starts too", _rm2.up, _rm2.failure)
+    if not LOOPBACK:
+        skip("E16: the legacy SSE pair — the fixture and every arm below it", _LOOPBACK_WHY)
+    else:
+        check("the SSE fixture starts too", _rm2.up, _rm2.failure)
     if _rm2.up:
         _events, _endpoint = [], []
 
@@ -1969,9 +2023,21 @@ def _with_ps(body, mode=0o755, only=False):
 # rather than a function that never answers. It also proves the self-witness clause is satisfied
 # by the real `ps`, which is what makes its absence meaningful in the blind case.
 _real_tree = survives(MUT.process_tree)
-check("the process observer answers, and lists this very process",
-      isinstance(_real_tree, dict) and os.getpid() in _real_tree and len(_real_tree) > 5,
-      f"got {type(_real_tree).__name__}: {_real_tree if not isinstance(_real_tree, dict) else len(_real_tree)}")
+# THE CAPABILITY, ASKED ONCE AND ANSWERED FOR THE WHOLE FILE. `process_tree` shells out to
+# `ps -eo …`, which a restricted environment may refuse outright — and every LIVE arm below
+# rests on it, while the scripted ones (which drive a stubbed `MUT.process_tree`) do not. This
+# is the line that decides which of those two a reader is being shown.
+OBSERVER = isinstance(_real_tree, dict) and os.getpid() in _real_tree
+_OBSERVER_WHY = (f"the process observer is unavailable here: {_real_tree}"
+                 if not OBSERVER else "")
+if OBSERVER:
+    check("the process observer answers, and lists this very process",
+          len(_real_tree) > 5, f"only {len(_real_tree)} processes visible")
+else:
+    # NOT a failed check. The instrument is fine; this machine will not let it look. Saying
+    # "FAIL" here would report a defect in code that has none, and a reader chasing it finds
+    # nothing — which is how a red line stops being read at all.
+    skip("E17: the process observer and every LIVE containment arm below it", _OBSERVER_WHY)
 check("a `ps` that is not there at all is a named failure, not an empty machine",
       isinstance(_with_ps(None, only=True), MUT.ObserverFailed), _with_ps(None, only=True))
 # `only=True` IS THE WHOLE ARRANGEMENT HERE, and the first version of this check failed for
@@ -2092,12 +2158,22 @@ check("...and an exit status is read the way subprocess spells it, signals negat
 # would leave a zombie and, on the next mutation, a `wait4` on a pid nothing can wait for.
 _sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
 _slept_status, _slept_cpu, _slept_left, _slept_fault = MUT._await(_sleeper, 0.5)
-check("a child that outlives its bound is reported as such, killed, and reaped",
-      (_slept_status is None and _sleeper.returncode == -signal.SIGKILL
-       and isinstance(survives(os.waitpid, _sleeper.pid, 0), ChildProcessError)
-       and _slept_left == () and _slept_fault == ""),
-      f"status={_slept_status} rc={_sleeper.returncode} cpu={_slept_cpu} left={_slept_left} "
-      f"fault={_slept_fault!r}")
+# THE REAP HAPPENS OUTSIDE THE ASSERTION. It used to sit inside the `check(...)` argument, so
+# skipping the check would have skipped the `waitpid` with it and left a zombie — a side effect
+# hidden in a condition is one that disappears the moment the condition stops being evaluated.
+_slept_reaped = survives(os.waitpid, _sleeper.pid, 0)
+if OBSERVER:
+    check("a child that outlives its bound is reported as such, killed, and reaped",
+          (_slept_status is None and _sleeper.returncode == -signal.SIGKILL
+           and isinstance(_slept_reaped, ChildProcessError)
+           and _slept_left == () and _slept_fault == ""),
+          f"status={_slept_status} rc={_sleeper.returncode} cpu={_slept_cpu} "
+          f"left={_slept_left} fault={_slept_fault!r}")
+else:
+    # `_await` still killed and waited — that path is syscalls. What is unreadable is its
+    # REPORT: `_slept_fault` carries the observer's failure, so the arm cannot distinguish a
+    # clean bounded wait from a blind one, which is the only thing it exists to say.
+    skip("E17: the bounded-wait reap arm", _OBSERVER_WHY)
 
 def _alive(pid):
     """True while `pid` names something that is not a zombie — asked of `ps`, not of a signal.
@@ -2369,47 +2445,55 @@ _SPAWNER_LOOP = ("import subprocess, sys, time\n"
                  "    subprocess.Popen(['/bin/sh', '-c', 'sleep 30; :', sys.argv[1]])\n"
                  "    time.sleep(0.05)\n"
                  "time.sleep(30)\n")
-_racer = subprocess.Popen([sys.executable, "-c", _SPAWNER_LOOP, _race_nonce])
+# NOT SPAWNED AT ALL WITHOUT THE OBSERVER, which is the difference between skipping an
+# experiment and running it blind. This arm's subject is sixty MARKERLESS `sleep 30`
+# children: the sweep reaches them by having frozen their parent, and NOTHING else can name
+# them — not argv, not parentage once the parent dies. Starting them where they cannot be
+# enumerated would leak precisely what the arm exists to prove is reachable.
+if not OBSERVER:
+    skip("E17: the markerless-race sweep", _OBSERVER_WHY)
+else:
+    _racer = subprocess.Popen([sys.executable, "-c", _SPAWNER_LOOP, _race_nonce])
 
 
-def _nonce_alive():
-    """The spawner's CHILDREN carrying the nonce — never the spawner itself.
+    def _nonce_alive():
+        """The spawner's CHILDREN carrying the nonce — never the spawner itself.
 
-    It carries the nonce too (as `sys.argv[1]`), and its argv begins with the interpreter path,
-    which inside a work tree is under the work tree. Counting it would put a MARKED process in
-    the set the case calls markerless — which is exactly what the control below caught.
-    """
-    table = survives(MUT.process_tree)
-    return () if not isinstance(table, dict) else tuple(
-        sorted(pid for pid, proc in table.items()
-               if _race_nonce in proc.command and pid != _racer.pid))
+        It carries the nonce too (as `sys.argv[1]`), and its argv begins with the interpreter path,
+        which inside a work tree is under the work tree. Counting it would put a MARKED process in
+        the set the case calls markerless — which is exactly what the control below caught.
+        """
+        table = survives(MUT.process_tree)
+        return () if not isinstance(table, dict) else tuple(
+            sorted(pid for pid, proc in table.items()
+                   if _race_nonce in proc.command and pid != _racer.pid))
 
 
-for _spin in range(60):                      # let the loop get some children out
-    if len(_nonce_alive()) >= 3:
-        break
-    time.sleep(0.05)
-_race_before = _nonce_alive()
-check("a suite that keeps spawning MARKERLESS children really is producing them",
-      len(_race_before) >= 3 and all(
-          str(MUT.HARNESS) not in survives(MUT.process_tree).get(p, _P(0, "S", "")).command
-          for p in _race_before),
-      f"{len(_race_before)} nonce children; without this the sweep below is certified against "
-      f"a spawner that never spawned")
-_race_status, _race_cpu, _race_left, _race_fault = MUT._await(_racer, 0.5, str(MUT.HARNESS))
-for _settle in range(60):
-    if not _nonce_alive():
-        break
-    time.sleep(0.05)
-_race_after = _nonce_alive()
-check("...and every one of them is gone, including those spawned after the first snapshot",
-      (_race_status is None and not _race_after and _race_fault == ""
-       and not _alive(_racer.pid)),
-      f"before={len(_race_before)} after={list(_race_after)} fault={_race_fault!r} — these are "
-      f"orphans with no work-tree path in their argv, so nothing but freezing the tree while "
-      f"parentage still connected it could have reached them")
-for _stray in _race_after:                   # never leak out of a failing check
-    survives(MUT._signal, _stray)
+    for _spin in range(60):                      # let the loop get some children out
+        if len(_nonce_alive()) >= 3:
+            break
+        time.sleep(0.05)
+    _race_before = _nonce_alive()
+    check("a suite that keeps spawning MARKERLESS children really is producing them",
+          len(_race_before) >= 3 and all(
+              str(MUT.HARNESS) not in survives(MUT.process_tree).get(p, _P(0, "S", "")).command
+              for p in _race_before),
+          f"{len(_race_before)} nonce children; without this the sweep below is certified against "
+          f"a spawner that never spawned")
+    _race_status, _race_cpu, _race_left, _race_fault = MUT._await(_racer, 0.5, str(MUT.HARNESS))
+    for _settle in range(60):
+        if not _nonce_alive():
+            break
+        time.sleep(0.05)
+    _race_after = _nonce_alive()
+    check("...and every one of them is gone, including those spawned after the first snapshot",
+          (_race_status is None and not _race_after and _race_fault == ""
+           and not _alive(_racer.pid)),
+          f"before={len(_race_before)} after={list(_race_after)} fault={_race_fault!r} — these are "
+          f"orphans with no work-tree path in their argv, so nothing but freezing the tree while "
+          f"parentage still connected it could have reached them")
+    for _stray in _race_after:                   # never leak out of a failing check
+        survives(MUT._signal, _stray)
 
 # LOSING THE DESCENDANTS IS A CONTAINMENT FAILURE; LOSING THE ROOT AS WELL IS A HANG. With the
 # observer broken, the sweep raises — and before this was in a `finally` the suite process was
@@ -2475,31 +2559,36 @@ _SPAWNER = ("import subprocess, sys, time\n"
             "                       start_new_session=True)\n"
             "print(kid.pid, flush=True)\n"
             "time.sleep(30)\n")
-_tree_probe = subprocess.Popen([sys.executable, "-c", _SPAWNER],
-                               stdout=subprocess.PIPE, text=True)
-_descendant = int(_tree_probe.stdout.readline().strip())
+# Same refusal, same reason: this spawns a `setsid` grandchild whose only link to us is a
+# parentage edge the table carries. Without the table it cannot be found, so it is not made.
+if not OBSERVER:
+    skip("E17: the whole-process-tree teardown arm", _OBSERVER_WHY)
+else:
+    _tree_probe = subprocess.Popen([sys.executable, "-c", _SPAWNER],
+                                   stdout=subprocess.PIPE, text=True)
+    _descendant = int(_tree_probe.stdout.readline().strip())
 
 
-# THE POSITIVE CONTROL, and it is the whole reason the check below means anything. "The
-# descendant is gone" is read off an absence, so it is satisfied by a descendant that never
-# started, by one that exited on its own, and by an observer that cannot see processes at all.
-check("the descendant of a suite is alive and observable before the bound is reached",
-      _alive(_descendant) and _alive(_tree_probe.pid) and _descendant != _tree_probe.pid,
-      f"suite={_tree_probe.pid} descendant={_descendant}; without this, the sweep below is "
-      f"certified by an instrument that saw nothing in the first place")
-_tree_status, _tree_cpu, _tree_left, _tree_fault = MUT._await(_tree_probe, 0.5)
-for _settle in range(40):                       # init reaps the orphan; it is not instant
-    if not _alive(_descendant) and not _alive(_tree_probe.pid):
-        break
-    time.sleep(0.05)
-check("...and a hung suite takes its whole process tree with it, `setsid` and all",
-      (_tree_status is None and not _alive(_descendant) and not _alive(_tree_probe.pid)
-       and _tree_left == () and _tree_fault == ""),
-      f"suite={_tree_probe.pid} alive={_alive(_tree_probe.pid)} descendant={_descendant} "
-      f"alive={_alive(_descendant)} leftover={_tree_left} — a survivor here outlives the "
-      f"deletion of the work tree it was launched from and runs beside the other workers")
-survives(os.waitpid, _tree_probe.pid, os.WNOHANG)
-_tree_probe.stdout.close()
+    # THE POSITIVE CONTROL, and it is the whole reason the check below means anything. "The
+    # descendant is gone" is read off an absence, so it is satisfied by a descendant that never
+    # started, by one that exited on its own, and by an observer that cannot see processes at all.
+    check("the descendant of a suite is alive and observable before the bound is reached",
+          _alive(_descendant) and _alive(_tree_probe.pid) and _descendant != _tree_probe.pid,
+          f"suite={_tree_probe.pid} descendant={_descendant}; without this, the sweep below is "
+          f"certified by an instrument that saw nothing in the first place")
+    _tree_status, _tree_cpu, _tree_left, _tree_fault = MUT._await(_tree_probe, 0.5)
+    for _settle in range(40):                       # init reaps the orphan; it is not instant
+        if not _alive(_descendant) and not _alive(_tree_probe.pid):
+            break
+        time.sleep(0.05)
+    check("...and a hung suite takes its whole process tree with it, `setsid` and all",
+          (_tree_status is None and not _alive(_descendant) and not _alive(_tree_probe.pid)
+           and _tree_left == () and _tree_fault == ""),
+          f"suite={_tree_probe.pid} alive={_alive(_tree_probe.pid)} descendant={_descendant} "
+          f"alive={_alive(_descendant)} leftover={_tree_left} — a survivor here outlives the "
+          f"deletion of the work tree it was launched from and runs beside the other workers")
+    survives(os.waitpid, _tree_probe.pid, os.WNOHANG)
+    _tree_probe.stdout.close()
 
 # THE MARKER ARM, ON A PROCESS WITH NO PARENTAGE LINK AT ALL. It is what closes the window
 # between reading the table and acting on it: a process spawned in that gap is reparented the
@@ -2507,18 +2596,37 @@ _tree_probe.stdout.close()
 # process rather than a table, because the argv `ps` reports is not obviously the argv passed.
 _orphan_mark = f"ase-sweep-{uuid.uuid4().hex}"
 _orphan = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", _orphan_mark])
-check("a process nothing links to us is still ours if its argv names our work tree",
-      _alive(_orphan.pid) and _orphan.pid in MUT.owned_pids(MUT.process_tree(), None, _orphan_mark),
-      f"{_orphan_mark} -> pid {_orphan.pid}")
-_orphan_swept = MUT.kill_owned(None, _orphan_mark)
-for _settle in range(40):
-    if not _alive(_orphan.pid):
-        break
-    time.sleep(0.05)
-check("...and the sweep reaches it by that name alone",
-      not _alive(_orphan.pid) and _orphan_swept.leftover == () and _orphan_swept.fault == "",
-      f"pid {_orphan.pid} survived a sweep for {_orphan_mark!r}; swept={_orphan_swept}")
-survives(os.waitpid, _orphan.pid, os.WNOHANG)
+try:
+    if not OBSERVER:
+        # THE ARM THAT ENDED THE RUN. `kill_owned` raises `ObserverFailed` rather than
+        # answering "nothing left behind" — deliberately, and the check a few hundred lines up
+        # exists to keep it that way. So the fix is not to soften the sweep; it is for this
+        # file to stop treating a denied capability as a crash. Skipped, named, and counted.
+        skip("E17: the marker sweep against a real orphan", _OBSERVER_WHY)
+    else:
+        check("a process nothing links to us is still ours if its argv names our work tree",
+              _alive(_orphan.pid)
+              and _orphan.pid in MUT.owned_pids(MUT.process_tree(), None, _orphan_mark),
+              f"{_orphan_mark} -> pid {_orphan.pid}")
+        _orphan_swept = MUT.kill_owned(None, _orphan_mark)
+        for _settle in range(40):
+            if not _alive(_orphan.pid):
+                break
+            time.sleep(0.05)
+        check("...and the sweep reaches it by that name alone",
+              not _alive(_orphan.pid) and _orphan_swept.leftover == ()
+              and _orphan_swept.fault == "",
+              f"pid {_orphan.pid} survived a sweep for {_orphan_mark!r}; "
+              f"swept={_orphan_swept}")
+finally:
+    # THE CHILD IS REAPED WHETHER OR NOT THE ARM RAN. A skip must not leak what the arm would
+    # have cleaned up: this process sleeps 30s and would otherwise outlive the verifier, which
+    # is the exact residue §4's post-run block checks for. The teardown is signal-and-wait —
+    # `_signal` is `os.kill`, `waitpid` is a syscall — so it needs no observer, which `_alive`
+    # deliberately does (it asks the table, because `os.kill(pid, 0)` succeeds against a zombie
+    # and a just-killed descendant passes through exactly that state).
+    MUT._kill_all([_orphan.pid])
+    survives(os.waitpid, _orphan.pid, os.WNOHANG)
 
 
 # THE WORK TREE, AND THE ONE THING IT HAS TO DO. The venv is 520MB of a 531MB tree and is now
@@ -4073,5 +4181,18 @@ check("W's default is the harness's own per-cell cap, read from the field that s
       SESS.W_DEFAULT == _spec_cap and SESS.W_DEFAULT > 0, (SESS.W_DEFAULT, _spec_cap))
 
 print()
-print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")
-sys.exit(1 if fails else 0)
+if skipped:
+    # NAMED, AND ABOVE THE VERDICT. A skipped section is the one thing a green transcript
+    # cannot tell you about itself.
+    print(f"INCOMPLETE — {len(skipped)} section(s) could not run here:")
+    for _sec, _why in skipped:
+        print(f"  - {_sec}: {_why}")
+    print("A capability this environment denies is not a passing result. Re-run somewhere it "
+          "is available before reading this as coverage.")
+if fails:
+    print("FAILED: " + ", ".join(fails))
+elif skipped:
+    print(f"NO FAILURES, but INCOMPLETE — {len(skipped)} section(s) skipped; not a pass")
+else:
+    print("ALL PASS")
+sys.exit(1 if (fails or skipped) else 0)

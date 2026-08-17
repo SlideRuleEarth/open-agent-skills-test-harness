@@ -292,7 +292,7 @@ make -C harness dev             # once — creates .venv with the PINNED ruff (s
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff; must print "All checks passed!"
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 2/2 instrument + 169/169 fixture
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 169/169 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 probes; 559 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 git diff --check
@@ -319,6 +319,233 @@ harness/.venv/bin/python harness/tools/probe_remote_mcp.py    # 19 checks; claud
 # --skip-survival for the rest in about 20s. Its classifiers are driven offline at §E20.
 harness/.venv/bin/python harness/tools/probe_session_mcp.py   # C3-4; NASA Earthdata by default, --url for another
 ```
+
+### Running the block where the OS says no
+
+**The block used to be unrunnable under a restricted environment, and the way it failed was
+worse than failing.** `verify_mcp_fixtures.py` is a linear script: an unhandled raise ends it
+where it stands. A reviewer running it in a sandbox that denies process enumeration got **376
+of 559 checks, the last of them green, a traceback, and no line anywhere saying that E18, E19
+and E20 never executed** (external review, PR #115). Absence of a result, read as a result, in
+the file whose whole job is refusing that reading.
+
+**Three capabilities are involved, and only one of them ever stopped the run:**
+
+| Capability | Used by | What it did |
+| --- | --- | --- |
+| `ps -eo …` (process enumeration) | `mutate_mcp.process_tree`, via every LIVE containment arm in §E17 | **Aborted the script.** `kill_owned` raises `ObserverFailed` rather than reporting a clean tree — deliberately, and a check exists to keep it that way — so the verifier is what had to stop treating a denied capability as a crash. |
+| `bind()` on loopback | the `http_mcp_server.py` fixtures in §E16 | Two red checks, then ~36 arms silently not run, because the body is already behind `if _rm.up:`. |
+| `socket(AF_UNIX)` + `bind()` | one selftest fixture | One red arm out of 579. **Now uses `os.mkfifo`**, which needs no socket privileges. |
+
+**What replaced them is a third result state.** Each capability is probed once, and a section
+that cannot run is recorded by `skip()` rather than crashed on or quietly passed over. A
+skipped section is **not a pass**: `skipped` joins `fails` in the exit status, the reasons are
+printed under an `INCOMPLETE` heading, and the summary line refuses the word. The
+discrimination is what makes it honest — loopback *denied* is a skip; loopback available and a
+fixture that still will not start is a defect, and stays red.
+
+**Reproduce a restricted environment here rather than trusting that it works there.** Each
+denial is one line, and the `bind()` one reaches child processes through `PYTHONPATH`, which
+is the only reason it touches the fixtures at all — they are subprocesses.
+
+```sh
+# ONE SUBSHELL, so an `exit` on a failed guard ends the RECIPE and not the reader's shell.
+(
+# ONE PARENT DIRECTORY, so there is a single allocation to guard and a single thing to remove.
+# Two independent `mktemp -d` calls meant the second could fail AFTER the first succeeded, and
+# the `exit` on that guard walked straight past the `rm -rf` at the bottom. That leak was only
+# reachable by a stub failing the SECOND call, which an always-fail stub cannot produce — the
+# hole and the test that missed it had the same shape (external review).
+sandbox="$(mktemp -d)" || exit 1
+[ -n "$sandbox" ] && [ -d "$sandbox" ] || exit 1
+
+# CLEANUP ON EVERY EXIT PATH THE SHELL CAN CATCH, INSTALLED BEFORE ANYTHING IS PUT IN IT. A
+# `rm -rf` at the bottom runs only when the bottom is reached; a trap runs when the guards below
+# fire too. Positional cleanup is what made the leak above possible at all.
+#
+# THE SIGNAL HANDLERS MUST *EXIT*, NOT MERELY CLEAN UP — and the first version of this trap did
+# not, which made the fix an instance of the very class documented below it. A handler that runs
+# `rm -rf` and RETURNS leaves the shell to carry on with the next command: the sandbox is gone,
+# so `PATH="$sandbox/nops"` and `PYTHONPATH="$sandbox/nobind"` name nothing, and the remaining
+# runs execute with NO DENIAL IN PLACE — reporting a full green pass as though the restricted
+# environment had been exercised. Interruption is fail-OPEN unless the handler ends the recipe
+# (external review). `exit` from the handler still fires the EXIT trap, so cleanup is not lost.
+#
+# EVERY SIGNAL THAT IS *SENT* TO THE RECIPE, WHICH IS NOT THE SAME AS "the ones I tested".
+# `INT` and `TERM` alone left Ctrl-\ to kill the shell with the EXIT trap UNRUN and the sandbox
+# behind; the five that replaced them still left `ABRT`, `ALRM`, `USR1`, `USR2`, `XCPU`, `XFSZ`
+# (both external review). The line drawn now is not a list but a distinction — see below — and
+# it is drawn where it is because DELEGATING THIS TO THE SHELL DOES NOT WORK. Measured across
+# every shell on this machine, EXIT-trap-runs-anyway is not a property of `sh`: dash runs it for
+# NONE of the twenty, zsh for two, bash for eighteen, ksh for nineteen. A recipe that relies on
+# it is correct under the shell it was written in and silently leaky under the next one.
+trap 'rm -rf "$sandbox"' EXIT
+trap 'exit 129' HUP     # terminal closed, ssh dropped
+trap 'exit 130' INT     # Ctrl-C
+trap 'exit 131' QUIT    # Ctrl-\ quit from the keyboard (no line-end backslash: see below)
+trap 'exit 141' PIPE    # output piped into something that exits first
+trap 'exit 143' TERM    # kill, CI cancellation
+# The rest of the sent set: a resource limit (`XCPU`, `XFSZ`), a timeout wrapper (`ALRM`), an
+# `abort`, or a human with the wrong pid. 128 rather than 1 ON PURPOSE — exit 1 is this recipe's
+# EXPECTED status (INCOMPLETE, below), so reusing it would make a run killed halfway through
+# indistinguishable from a run that finished and skipped a section.
+trap 'exit 128' ABRT ALRM USR1 USR2 XCPU XFSZ VTALRM PROF
+
+mkdir "$sandbox/nops" "$sandbox/nobind" || exit 1
+
+# PRIVATE DIRECTORIES, because both are WRITTEN THROUGH. A predictable /tmp/<known-name> that
+# already exists — a directory someone else owns, or a symlink — redirects the redirection into
+# whatever it points at. `mktemp -d` creates 0700 in the PLATFORM-SELECTED temporary location —
+# which is not necessarily `$TMPDIR`, and on macOS is not: it uses the per-user Darwin temp dir
+# and ignores `TMPDIR` outright, which is what made the first signal control below vacuous. Do
+# not read the sandbox's location off an environment variable; ask the shell where it went. The
+# paths are quoted everywhere for the same reason (external review).
+#
+# Deny `ps`: the fake must be the ONLY thing on PATH, since execvp keeps searching after
+# EACCES. Hence the absolute interpreter — PATH no longer resolves `python3` either.
+printf '#!/bin/sh\nexit 0\n' > "$sandbox/nops/ps" || exit 1
+chmod 0644 "$sandbox/nops/ps" || exit 1
+
+# Deny bind(), inherited by every child through PYTHONPATH.
+cat > "$sandbox/nobind/sitecustomize.py" <<'PYDENY' || exit 1
+import socket
+def _denied(self, addr):
+    raise PermissionError(1, "Operation not permitted")
+socket.socket.bind = _denied
+PYDENY
+
+# THE FIXTURES ARE CHECKED, NOT ONLY THE COMMANDS THAT WROTE THEM. Every construction step
+# above carries `|| exit 1`, and that is still not the property the runs depend on: what they
+# need is that `ps` EXISTS and is NOT executable, and that `sitecustomize.py` exists and is
+# non-empty. A missing or truncated denial file does not error — it makes the run below
+# silently UNRESTRICTED, which publishes a false negative instead of a failure (ext. review).
+[ -s "$sandbox/nops/ps" ] || exit 1
+[ ! -x "$sandbox/nops/ps" ] || exit 1
+[ -s "$sandbox/nobind/sitecustomize.py" ] || exit 1
+
+# EXIT 1 IS THE EXPECTED RESULT BELOW, not a failure: a skipped section is not a pass. That is
+# why the guards above use `|| exit 1` on their own lines rather than a blanket `set -e`, which
+# would have ended the recipe on the first denial run.
+
+# THE VERIFIER UNDER EACH DENIAL, AND UNDER BOTH. The `bind()` case belongs here and not only
+# on the selftest: E16's two transports are what it exercises, and pointing it at the selftest
+# alone demonstrates the FIFO replacement and nothing else (external review).
+PATH="$sandbox/nops" harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
+PYTHONPATH="$sandbox/nobind" harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
+PATH="$sandbox/nops" PYTHONPATH="$sandbox/nobind" \
+    harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py
+
+# ...and the selftest separately, which is the arm the `mkfifo` replacement is for.
+PYTHONPATH="$sandbox/nobind" harness/.venv/bin/python -m agentskill_evals.cli selftest
+)   # cleanup on every path out except an uncatchable signal or a fault in the shell — see below
+```
+
+**THE FAILURE PATHS ARE TESTED, NOT JUST THE HAPPY ONE**, and that is the lesson this recipe
+cost three review rounds to learn. Each round fixed the step the finding named — `mktemp`, then
+its guard, then the writes after it — while the siblings stayed open, because the verification
+was aimed at the finding rather than at the class. The class is: **any step whose failure lets a
+later step run in a state it claims not to be in.** A missing `sitecustomize.py` does not error;
+it makes the "bind denied" run silently UNRESTRICTED, which publishes a false negative rather
+than a failure — strictly worse than crashing.
+
+So the recipe is driven with each construction step failing in turn (`mktemp`, `mkdir`, `chmod`,
+`cat`, and an unwritable target directory, which no PATH stub can produce), asserting three
+things every time: **the runs are never reached, the exit status is non-zero, and no sandbox is
+left behind.** All five hold.
+
+**INTERRUPTION IS A FAILURE PATH TOO, and the first trap here got it exactly backwards.**
+`trap 'rm -rf "$sandbox"' EXIT INT TERM` cleans up and *returns*, so the shell carries on: the
+sandbox is gone, `PATH="$sandbox/nops"` names nothing, and every remaining run executes with no
+denial in place and reports green. Signalling the process group — what Ctrl-C actually does —
+during the first verifier run showed it plainly: **exit 0 and three further runs completed**,
+each of them unrestricted and each of them reported as a pass. The handlers now `exit`, and the
+same control gives one run, exit 130 (SIGINT) or death by signal (SIGTERM), and no leak. That a
+CLEANUP fix introduced a fail-open path is the same lesson one turn later: the class is any step
+whose failure lets a later step run in a state it claims not to be in, and a signal handler that
+returns is such a step. The always-fail stub used in the previous round could only ever
+exercise the FIRST allocation — the hole it missed and the test that missed it had the same
+shape, which is why the fixture checks below are on the ARTIFACTS rather than on the commands
+that wrote them.
+
+**AND `INT`/`TERM` WERE THE TWO SIGNALS THAT HAD BEEN TESTED, WHICH IS NOT THE SAME SET AS THE
+ONES THAT ARRIVE.** Ctrl-\ sends `QUIT`; untrapped, it killed the shell with the EXIT trap unrun
+and the sandbox left behind (external review). Handling the named signal alone would have been
+the reproduction rather than the principle. A second control with an EXIT trap that leaves a
+witness line says *why* the other three held under bash, which the leak matrix alone cannot:
+**bash runs the EXIT trap on `HUP`, `PIPE` and `TERM` itself, and skips it on `QUIT`.** "The
+sandbox went away" is not "my handler removed it," and only the witness separates them.
+
+**Then five handlers were called "every catchable terminating signal," and they are not** —
+`ABRT`, `ALRM`, `USR1`, `USR2`, `XCPU` and `XFSZ` also terminate by default and were also unrun
+(external review). Two rounds in a row the fix stopped at the reproduction, so the third stops
+at a *distinction* instead, with the whole surface measured across every shell on this machine:
+
+**Signals SENT to the recipe are trapped. Signals raised because the shell itself FAULTED are
+not.** A `XCPU` from a CI `ulimit`, an `ALRM` from a timeout wrapper, a human with the wrong pid
+— those arrive at a healthy shell that can be trusted to run `rm -rf "$sandbox"`. `ILL`, `TRAP`,
+`EMT`, `FPE`, `BUS`, `SEGV` and `SYS` mean the shell process is broken, and a destructive command
+issued from a faulted interpreter is a worse bargain than a leaked 0700 directory containing a
+fake `ps`. **That is the residual leak surface: those seven at worst — dash and zsh leak all
+seven, ksh only `SEGV`, bash and `sh` none — plus `KILL`**, which nobody can trap. Not "every
+exit path", and not "every catchable terminating signal" either — this, measured, per shell.
+
+The measurement also killed the argument for leaving any of it to the shell. **EXIT-trap-runs-
+anyway is not a property of `sh`:** dash runs it for NONE of the twenty signals — not `INT`, not
+`TERM`, not `HUP` — zsh for two, bash for eighteen, ksh for nineteen. The doc's fence says `sh`
+and macOS hands an interactive user zsh, so the two shells most likely to meet this recipe are
+the two that clean up least. One typographic hazard, since the
+signal that started this round is spelled with a backslash: **no comment in the block may END in
+one.** POSIX discards a comment to the newline and bash-3.2 was checked doing so, but a shell
+that continued the line instead would swallow the `trap` beneath it — silently, and in the
+direction that removes a handler.
+
+**The control that measured this was itself vacuous on the first run, and said PASS.** It pointed
+`TMPDIR` at a directory of its own and then counted what was left there — but macOS `mktemp -d`
+IGNORES `TMPDIR` and allocates in the per-user Darwin temp dir, so the leak check listed a
+directory the sandbox was never created in and reported every shape, old and new, as clean.
+Nothing was recorded, and nothing-recorded read as nothing-wrong. The fix is the rule from §4
+applied to the instrument: the block now echoes its real `$sandbox` path out, the control asserts
+that path EXISTS before it signals, and only then is a later absence evidence of cleanup. A
+negative control also has to be able to fail — this one now reports how many signals break the
+OLD shape and fails if the answer is zero, because a control that breaks nothing is measuring
+nothing.
+
+Every signal delivered to the process GROUP mid-run — which is what a keyboard signal does, and
+what signalling the `sh` pid alone does not reproduce. **How many of the twenty catchable
+terminating signals leave the sandbox behind**, with only an EXIT trap installed, and with the
+handlers above:
+
+| shell | EXIT trap alone | with the handlers | still leaking |
+| --- | --- | --- | --- |
+| `/bin/dash` | **20 of 20 leak** | 7 | the fault signals |
+| `/bin/zsh` (macOS interactive default) | 18 of 20 leak | 7 | the fault signals |
+| `/bin/sh`, `/bin/bash` | 2 of 20 leak (`QUIT`, `PROF`) | **0** | — |
+| `/bin/ksh` | 1 of 20 leak (`SEGV`) | 1 | `SEGV` |
+
+**No signal that is SENT to the recipe leaks under any shell measured**; every survivor is a
+fault signal, which is the line drawn on purpose. And no shape lets a run start after the
+signal — `runs completed = 1` in every trial, the property the previous round's fix bought and
+this round must not spend.
+
+Measured here, and each number is a different question answered:
+
+| Run | checks | skips | fails | exit |
+| --- | --- | --- | --- | --- |
+| verifier, `ps` denied | 551 | 5 (E17 live arms) | 0 | 1 |
+| verifier, `bind()` denied | 527 | 2 (E16 http + sse) | 0 | 1 |
+| verifier, both denied | 519 | 7 | 0 | 1 |
+| selftest, `bind()` denied | 579 arms | — | 0 | 0 |
+
+Every restricted **verifier** run reaches **E20 with no traceback and no false failures** — the selftest is in the table for the FIFO arm and has no E20 to reach. The counts in the
+block above are the UNRESTRICTED ones — a restricted run reports fewer checks and says which
+ones it could not ask, which is the whole point.
+
+**The FIFO carries a hazard the socket did not, and it is bounded rather than avoided.** `M37`
+makes the scrub treat every non-directory as a regular file, so it `open()`s the FIFO and never
+returns. The relocation arm therefore runs its cell on a **bounded thread** and asserts
+`not t15.is_alive()`, exactly as `mcp.special_files_are_removed_rather_than_read` already did —
+removing the join re-arms the trap, so `I3` exists to catch that. Verified by hand-applying M37:
+the suite finishes in 47s and reports two failing arms rather than wedging.
 
 **`--jobs 8` is the recommended way to run it and `--jobs 1` is what it means.** The suite is
 mostly WAITING — the proxy arms are ~43s of settles and grace periods on ~5s of CPU, which is

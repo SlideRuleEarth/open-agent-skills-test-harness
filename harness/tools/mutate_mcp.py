@@ -1538,6 +1538,20 @@ MUTATIONS = [
     # the wiring that actually regressed was not, and "2/2 instrument" claimed coverage it
     # did not have (review, sixth round). `_banner` exists so this line is inside the
     # function the arm calls and the run prints.
+    # THE BOUNDED JOIN THAT KEEPS M37 A FINDING RATHER THAN A HANG. The relocation fixture is
+    # a FIFO — chosen so the arm needs no socket privileges — and M37 makes the scrub `open()`
+    # it, which never returns. On the main thread that wedges the whole suite with no output.
+    # Legitimate as an `I*` because the bound is a feature of the SELFTEST, unreachable by any
+    # production edit: shorten it and the arm must notice it did not finish.
+    # SHORTENING the bound is NOT the mutation: the cell finishes in well under 10ms on a clean
+    # tree, so `join(0.01)` is behaviourally identical and came back MISSED — the suite catching
+    # a mutation that could not fail, which is the same defect as a check that cannot fail.
+    # REMOVING it is discriminating: the main thread reaches the assertion while the cell is
+    # still running, so `not t15.is_alive()` goes false. Confirmed by hand, three runs of three.
+    ("I3-the-relocation-cell-is-not-bounded", SELFTEST,
+     "            t15.join(20.0)",
+     "            pass",
+     "relocate.scrub_verdict_survives_a_raise_that_rebuilds_the_result"),
     ("I2-arm-count-reverts-to-process-lifetime", SELFTEST,
      "    arms = _arms_since(arms_before)\n",
      "    arms = _ARMS_RUN\n",
