@@ -287,15 +287,15 @@ block, so the line after it looked for `harness/harness/.venv/bin/python` and th
 not be pasted as written (review, fifth round).
 
 ```sh
-make -C harness dev             # once — creates .venv with the PINNED ruff (see below)
+make -C harness dev             # once — creates .venv with the PINNED ruff AND shellcheck
 
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
-make -C harness lint                                          # ruff; must print "All checks passed!"
+make -C harness lint                                          # ruff + shellcheck + a parse under every shell
 python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 169/169 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 probes; 559 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
-harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 87 here, over the 5 shells on this machine
+harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 124 here, over the 5 shells on this machine
 git diff --check
 
 # AFTER the mutation run, because what it should have left behind is nothing, and "the
@@ -385,6 +385,20 @@ interpreter: the reported exit-7 case, a run where the denial did not take, and 
 denial whose status is correct and whose bind() skip reason never appears. Only the evidence
 catches the last one, which is why a status alone was never going to be enough — and why the
 evidence is the skip REASONS rather than the skip counts, which drift when a section is added.
+
+**Then the way those cases were WRITTEN turned out to prove less than it looked.** Each broke
+several expectations at once and asserted only "non-zero status, and some PROBLEM", so no case
+showed that any individual guard discriminates — deleting a requirement outright left every case
+green, because the remaining problems still rejected the run (external review). Each case now
+breaks exactly one requirement in one phase and demands the exact `PROBLEM` line, plus the
+absence of any other. The deeper version of the same trap survived even that: section D
+GENERATES its cases from the script's own `judge` calls, so deleting a requirement deletes the
+case that would have caught it — a universal quantified over a set the subject controls. The
+fix is §4's own rule, a structural clause ahead of the universal: the contract is stated
+independently in the verifier, phase by phase, so removing a demand reddens a check rather than
+shrinking the matrix. **Section E then mutates the script nine ways on every run** — deleting
+each requirement, weakening each status, and stopping a handler from exiting — and requires the
+red. Two of those nine were green before the round that added them.
 
 **THE FAILURE PATHS ARE TESTED, NOT JUST THE HAPPY ONE**, and that is the lesson this script
 cost three review rounds to learn. Each round fixed the step the finding named — `mktemp`, then

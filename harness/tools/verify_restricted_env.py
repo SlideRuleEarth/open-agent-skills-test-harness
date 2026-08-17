@@ -10,7 +10,7 @@ reported green while being broken. That is the class this file exists for:
 
     any step whose failure lets a later step run in a state it claims not to be in.
 
-Three sections, three different questions:
+Four sections, four different questions:
 
   A  CONSTRUCTION. Each step is made to fail in turn. The phases must never be reached, the
      status must be non-zero, and nothing may be left behind. An always-fail stub is not
@@ -20,14 +20,21 @@ Three sections, three different questions:
   B  SIGNALS. Every catchable terminating signal, delivered to the process GROUP (what a
      keyboard signal does; signalling the script's pid alone misses its subshells), under
      every shell on this machine. EXIT-trap-runs-anyway is NOT a property of `sh`, so this
-     is measured per shell rather than assumed: no signal that is SENT may leak under any
-     shell, and the residual is expected to be exactly the FAULT signals, which the script
-     deliberately does not trap.
+     is measured per shell rather than assumed. The contract is read out of the script: no
+     signal it TRAPS may leak. What remains is REPORTED, not asserted -- which fault signals
+     a given shell runs the EXIT trap for is a fact about that shell, not something this repo
+     can hold it to, and asserting the residual was a subset of FAULT could not fail.
 
-  C  PINS. The trap set is read out of the script and checked against the distinction the
-     documentation claims, in BOTH directions — every sent signal trapped, no fault signal
-     trapped. A handler deleted upstream must redden a check here, not silently shrink the
-     covered set.
+  C  PINS. The trap set and the per-phase expectations are read out of the script and checked
+     against the distinction the documentation claims, in BOTH directions — every sent signal
+     trapped, no fault signal trapped, and every evidence literal still DEMANDED by a judge
+     call rather than merely assigned to a variable. A requirement deleted upstream must redden
+     a check here, not silently shrink the covered set.
+
+  D  THE PRODUCTION PATH. Default mode — no `--payload`, no test-only switch — against a stub
+     interpreter reached through the script's own path logic. One requirement is broken at a
+     time, in one phase, and the exact PROBLEM line is demanded along with the absence of any
+     other: batched failures cannot show that an individual guard discriminates.
 
 NOTHING HERE IS A COPY. The trap set, the construction steps and the phase list are read
 out of restricted_env.sh itself; a duplicated rule that can drift silently is the defect
@@ -53,7 +60,10 @@ import tempfile
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SCRIPT = ROOT / "harness" / "tools" / "restricted_env.sh"
+# Overridable ONLY so section E can point a child run at a mutated copy. Unset everywhere
+# else, including in every run a human starts.
+SCRIPT = pathlib.Path(os.environ.get(
+    "VRE_SCRIPT_UNDER_TEST", ROOT / "harness" / "tools" / "restricted_env.sh"))
 DOC = ROOT / "harness" / "TODO_Contained_HOME.md"
 
 # Catchable signals whose default action terminates. KILL/STOP are absent because nobody can
@@ -117,6 +127,34 @@ def script_phases(text: str) -> list[str]:
             "this pin uses no longer matches the script, so every phase-count check below "
             "would be measuring nothing.")
     return labels
+
+
+def script_expectations(text: str) -> dict[str, tuple[int, list[str]]]:
+    """{label: (expected status, [evidence literals])}, parsed from the `judge` calls.
+
+    Resolves "$PS_DENIED" through the script's own assignment, so a requirement is counted
+    only where it is USED. Checking that a literal merely appears in the file matched its own
+    variable declaration and stayed green when every use was deleted (external review).
+    """
+    assigns = dict(re.findall(r'^([A-Z_][A-Z_0-9]*)="([^"]*)"$', text, re.MULTILINE))
+    out: dict[str, tuple[int, list[str]]] = {}
+    for line in text.splitlines():
+        m = re.match(r'^judge "([^"]+)" "\$status" (\d+)(.*)$', line)
+        if not m:
+            continue
+        rest = re.sub(r"#.*$", "", m.group(3))
+        args = re.findall(r'"([^"]*)"', rest)
+        out[m.group(1)] = (int(m.group(2)),
+                           [assigns[a[1:]] if a.startswith("$") and a[1:] in assigns else a
+                            for a in args])
+    if not out:
+        raise SystemExit(
+            "verify_restricted_env: parsed no `judge` calls out of restricted_env.sh — the "
+            "expectation matrix would be empty, which is not the same as passing.")
+    unresolved = [e for _s, ev in out.values() for e in ev if e.startswith("$")]
+    if unresolved:
+        raise SystemExit(f"verify_restricted_env: unresolved evidence variables: {unresolved}")
+    return out
 
 
 # --------------------------------------------------------------------------- driving the script
@@ -369,35 +407,82 @@ def section_b() -> None:
         print(f"    {shell:11} {', '.join(names) if names else 'none'}")
 
 
-# The two literal strings the script greps for as proof a denial took effect. Pinned to the
-# suite that prints them in section C, so a reworded skip reason is a named failure here rather
-# than a reproduction that silently stops proving anything.
+# The two literal strings the script greps for as proof a denial took effect.
 PS_EVIDENCE = "the process observer is unavailable here"
 BIND_EVIDENCE = "a loopback listener cannot be bound here"
 
-# A stand-in for the two suites, selected through the script's OWN path logic: it is written to
-# <fake>/harness/.venv/bin/python and the script's `$repo/harness/.venv/bin/python` finds it.
-# No test-only switch in the shipping script -- the production path is what runs.
-STUB_PY = rf"""#!/bin/sh
+# What each phase MUST demand: expected status, and every evidence literal. Checked against the
+# script in section C, and the reason a deleted requirement cannot hide -- see the note there.
+EXPECTED_CONTRACT = {
+    "ps-denied": (1, ["INCOMPLETE", PS_EVIDENCE]),
+    "bind-denied": (1, ["INCOMPLETE", BIND_EVIDENCE]),
+    "both-denied": (1, ["INCOMPLETE", PS_EVIDENCE, BIND_EVIDENCE]),
+    "selftest-bind-denied": (0, ["SELFTEST PASSED"]),
+}
+
+# Which single defect suppresses which requirement. Every evidence string the script demands
+# must appear here, or section D refuses to run: a requirement this matrix cannot drive is a
+# requirement nothing proves is load-bearing.
+EVIDENCE_DEFECT = {
+    "INCOMPLETE": "no-incomplete",
+    PS_EVIDENCE: "no-ps",
+    BIND_EVIDENCE: "no-bind",
+    "SELFTEST PASSED": "no-banner",
+}
+
+# A stand-in for the two suites, selected through the script's OWN path logic: written to
+# <fake>/harness/.venv/bin/python, where `$repo/harness/.venv/bin/python` finds it. No
+# test-only switch exists in the shipping script -- the production path is what runs.
+#
+# It identifies its phase the way the script's denials present themselves (argv for the
+# selftest, PATH/PYTHONPATH for the three verifier phases) and misbehaves ONLY in the phase
+# named by $TARGET, and only in the one way named by $DEFECT. Batching several failures into
+# one case meant a nonzero status could not be attributed to the guard under test: deleting
+# both `$PS_DENIED` requirements left every case green, because the remaining problems still
+# rejected the negative plans (external review).
+_STUB_PY = r"""#!/bin/sh
+ps_on=no; bind_on=no
+case "$PATH" in *nops*) ps_on=yes ;; esac
+case "${PYTHONPATH:-}" in *nobind*) bind_on=yes ;; esac
 case "$*" in
-  *agentskill_evals.cli*)
-      case "$PLAN" in
-        exit7) exit 7 ;;
-        *) echo "SELFTEST PASSED — 579 arms"; exit 0 ;;
-      esac ;;
+  *agentskill_evals.cli*) phase="selftest-bind-denied" ;;
+  *)
+    if [ "$ps_on" = yes ] && [ "$bind_on" = yes ]; then phase="both-denied"
+    elif [ "$ps_on" = yes ]; then phase="ps-denied"
+    elif [ "$bind_on" = yes ]; then phase="bind-denied"
+    else phase="undenied"; fi ;;
 esac
-case "$PLAN" in
-  exit7) exit 7 ;;
-  unrestricted) echo "ALL PASS"; exit 0 ;;
-esac
-echo "INCOMPLETE — some section(s) could not run here"
-case "$PATH" in *nops*) echo "  - {PS_EVIDENCE}: \`ps\` did not run" ;; esac
-case "$PLAN" in
-  halfapplied) ;;
-  *) case "${{PYTHONPATH:-}}" in *nobind*) echo "  - {BIND_EVIDENCE}: [Errno 1]" ;; esac ;;
-esac
+
+defect=""
+if [ "$phase" = "${TARGET:-}" ]; then defect="${DEFECT:-}"; fi
+
+# EVIDENCE FIRST, STATUS LAST, so the two defects are INDEPENDENT. Exiting early on the
+# status defect also suppressed the output, so one broken requirement produced three
+# PROBLEMs and the case could not show that the status guard alone rejects anything.
+if [ "$phase" = "selftest-bind-denied" ]; then
+    case "$defect" in no-banner) ;; *) echo "SELFTEST PASSED — 579 arms" ;; esac
+    case "$defect" in status) exit 3 ;; esac
+    exit 0
+fi
+
+case "$defect" in no-incomplete) ;; *) echo "INCOMPLETE — some section(s) could not run here" ;; esac
+if [ "$ps_on" = yes ] && [ "$defect" != no-ps ]; then
+    echo "  - __PS__: \`ps\` did not run"
+fi
+if [ "$bind_on" = yes ] && [ "$defect" != no-bind ]; then
+    echo "  - __BIND__: [Errno 1]"
+fi
+case "$defect" in status) exit 7 ;; esac
 exit 1
 """
+STUB_PY = _STUB_PY.replace("__PS__", PS_EVIDENCE).replace("__BIND__", BIND_EVIDENCE)
+
+
+def _drive_default(target: str | None, defect: str | None) -> Run:
+    with tempfile.TemporaryDirectory() as td:
+        script = fake_repo(pathlib.Path(td))
+        return run_script("/bin/sh", None, script=script,
+                          env_extra={"TARGET": target or "", "DEFECT": defect or ""})
 
 
 def fake_repo(root: pathlib.Path) -> pathlib.Path:
@@ -412,36 +497,47 @@ def fake_repo(root: pathlib.Path) -> pathlib.Path:
 
 
 def section_d() -> None:
-    """DEFAULT MODE: the script must refuse to call a broken run a reproduction.
+    """DEFAULT MODE: every production guard, driven alone, asserted by name.
 
-    The first version discarded every phase status and always exited 0 -- all four phases
-    driven to exit 7 still returned 0 (external review). A denial that silently does not take
-    then yields UNRESTRICTED green verifier runs underneath a green reproduction, which is the
-    one outcome this script exists to make impossible.
+    The script's first version discarded phase statuses and always exited 0 (external review).
+    The first fix for that was checked with BATCHED failures -- several expectations broken at
+    once, asserted only by "nonzero status and some PROBLEM" -- which cannot show that any
+    individual guard discriminates: deleting a requirement left every case green because the
+    remaining problems still rejected the run. Each case below breaks exactly ONE requirement
+    in exactly ONE phase and demands the exact PROBLEM line, and the absence of any other.
     """
-    print("\nD. THE PRODUCTION PATH — default mode, against a stub interpreter")
-    cases = [
-        ("faithful", None, 0, "a denied run that reports what a denied run reports"),
-        ("exit7", "exit7", 1, "every phase exits 7 (the reported defect)"),
-        ("unrestricted", "unrestricted", 1,
-         "the denial silently did not take: green suites, no INCOMPLETE"),
-        ("halfapplied", "halfapplied", 1,
-         "status is right but the bind() reason never appears — only EVIDENCE catches this"),
-    ]
-    for name, plan, want_rc, why in cases:
-        with tempfile.TemporaryDirectory() as td:
-            script = fake_repo(pathlib.Path(td))
-            run = run_script("/bin/sh", None, script=script,
-                             env_extra={"PLAN": plan or "faithful"})
-            ok = (run.rc == 0) if want_rc == 0 else (run.rc != 0)
-            check(f"{name}: {why}", ok, (run.rc, run.out[-200:]))
-            if name == "faithful":
-                check("  ...and it ran every phase and said so",
-                      run.phases == 4 and "expected status and the evidence" in run.out,
-                      (run.phases, run.out[-120:]))
-            else:
-                check("  ...and it says which expectation failed rather than only exiting",
-                      "PROBLEM" in run.out, run.out[-200:])
+    text = SCRIPT.read_text()
+    expectations = script_expectations(text)
+    print(f"\nD. THE PRODUCTION PATH — {len(expectations)} phases, one broken requirement at a "
+          f"time, against a stub interpreter")
+
+    faithful = _drive_default(None, None)
+    check("faithful: a denied run that reports what a denied run reports is accepted",
+          faithful.rc == 0, (faithful.rc, faithful.out[-200:]))
+    check(f"  ...and every phase ran ({len(expectations)}, read from the script), no PROBLEM",
+          faithful.phases == len(expectations) and "PROBLEM" not in faithful.out
+          and "expected status and the evidence" in faithful.out,
+          (faithful.phases, faithful.out[-200:]))
+
+    # STRUCTURAL CLAUSE AHEAD OF THE UNIVERSAL: a requirement this matrix cannot drive would
+    # otherwise be silently skipped, and "every guard discriminates" would quantify over
+    # whatever happened to be drivable.
+    undrivable = [e for _s, ev in expectations.values() for e in ev if e not in EVIDENCE_DEFECT]
+    check("every evidence string the script demands can be driven by this matrix",
+          undrivable == [], undrivable)
+
+    for label, (want_status, evidence) in expectations.items():
+        check(f"  {label}: declares at least one evidence requirement", evidence != [], label)
+        wrong = 3 if want_status == 0 else 7
+        cases = [("status", f"PROBLEM {label} exited {wrong}, expected {want_status}")]
+        cases += [(EVIDENCE_DEFECT[e], f"PROBLEM {label} never reported: {e}")
+                  for e in evidence if e in EVIDENCE_DEFECT]
+        for defect, want_problem in cases:
+            run = _drive_default(label, defect)
+            problems = re.findall(r"^PROBLEM .*$", run.out, re.MULTILINE)
+            check(f"  {label} / {defect}: rejected", run.rc != 0, (run.rc, run.out[-160:]))
+            check(f"  {label} / {defect}: names EXACTLY this problem — {want_problem!r}",
+                  problems == [want_problem], problems)
 
 
 def section_c() -> None:
@@ -467,14 +563,30 @@ def section_c() -> None:
           "status — an interrupted run and a false reproduction must not look alike",
           all(h != "exit 1" for h in traps.values()), catchall)
 
-    # PIN: the script greps for these literals as proof the denial took. If the suite that
+    # PIN, BOTH ENDS: still printed by the suite, and still DEMANDED by a judge call. If
     # prints them is reworded, the reproduction stops proving anything -- fail-closed, but the
     # failure would name a phase rather than the cause. This names the cause.
     verifier_src = (ROOT / "harness" / "tools" / "verify_mcp_fixtures.py").read_text()
+    expectations = script_expectations(text)
+    demanded = {e for _s, ev in expectations.values() for e in ev}
     for literal in (PS_EVIDENCE, BIND_EVIDENCE):
-        check(f"  the script's evidence string is still printed by the suite: {literal!r}",
+        check(f"  the evidence string is still printed by the suite: {literal!r}",
               literal in verifier_src)
-        check("  ...and the script actually greps for it", literal in text)
+        check("  ...and is still DEMANDED by a judge call, not merely assigned to a variable",
+              literal in demanded, sorted(demanded))
+    # THE CONTRACT, STATED INDEPENDENTLY OF THE SCRIPT — the structural clause ahead of
+    # section D's universal. Section D generates its cases FROM the script's judge calls, so
+    # deleting a requirement also deletes the case that would have caught it: quantifying over
+    # a set the subject controls. Removing `"INCOMPLETE"` from the ps-denied judge survived the
+    # whole matrix for exactly that reason. Stated here, removing any requirement reddens a
+    # check instead of quietly shrinking the matrix. It is a deliberate duplicate: changing the
+    # script's contract SHOULD require saying so twice.
+    for label, want in EXPECTED_CONTRACT.items():
+        check(f"  {label} demands exactly {want[0]} + {[e[:22] for e in want[1]]}",
+              expectations.get(label) == (want[0], list(want[1])), expectations.get(label))
+    check("...and the script declares no phase this contract does not cover",
+          set(expectations) == set(EXPECTED_CONTRACT),
+          sorted(set(expectations) ^ set(EXPECTED_CONTRACT)))
 
     doc = DOC.read_text()
     check("the documentation points at the script rather than carrying a second copy",
@@ -483,7 +595,76 @@ def section_c() -> None:
           not re.search(r"```sh.*?mktemp -d.*?PYDENY.*?```", doc, re.DOTALL))
 
 
+def section_e() -> None:
+    """MUTATE THE SCRIPT AND REQUIRE C AND D TO NOTICE.
+
+    Sections C and D assert that the script's guards discriminate. This asserts that those
+    assertions can FAIL, by deleting one requirement at a time from a copy of the script and
+    demanding a red run each time. Without it, "every guard is discriminating" rests on the
+    author's intent -- which is how the batched version of section D passed while deleting both
+    `$PS_DENIED` requirements left it green (external review), and how removing `"INCOMPLETE"`
+    from one judge call survived the first fix: section D generates its cases FROM the script,
+    so a deleted requirement deletes its own test.
+
+    The child runs `--only cd` against the mutated copy, so it cannot recurse into this section.
+    """
+    print("\nE. MUTATIONS — each deletion must REDDEN sections C and D")
+    text = SCRIPT.read_text()
+    mutations = [
+        ("both uses of $PS_DENIED deleted", lambda s: s.replace(' "$PS_DENIED"', "")),
+        ("$BIND_DENIED deleted", lambda s: s.replace(' "$BIND_DENIED"', "")),
+        ("the SELFTEST PASSED requirement deleted",
+         lambda s: s.replace(' "SELFTEST PASSED"', "")),
+        ("INCOMPLETE deleted from ps-denied",
+         lambda s: s.replace('judge "ps-denied" "$status" 1 "INCOMPLETE"',
+                             'judge "ps-denied" "$status" 1')),
+        ("INCOMPLETE deleted from both-denied",
+         lambda s: s.replace('judge "both-denied" "$status" 1 "INCOMPLETE"',
+                             'judge "both-denied" "$status" 1')),
+        ("ps-denied expected status weakened to the failing one",
+         lambda s: s.replace('judge "ps-denied" "$status" 1', 'judge "ps-denied" "$status" 7')),
+        ("the selftest expected status weakened",
+         lambda s: s.replace('judge "selftest-bind-denied" "$status" 0',
+                             'judge "selftest-bind-denied" "$status" 1')),
+        ("the whole both-denied judge deleted",
+         lambda s: re.sub(r'^judge "both-denied".*$', "", s, flags=re.MULTILINE)),
+        ("a handler stops exiting", lambda s: s.replace("trap 'exit 130' INT",
+                                                        "trap 'rm -rf \"$sandbox\"' INT")),
+    ]
+    for name, mutate in mutations:
+        mutated = mutate(text)
+        if mutated == text:
+            check(f"  {name}: the mutation still applies to this script", False,
+                  "no textual change — the pattern has drifted, so this proves nothing")
+            continue
+        with tempfile.TemporaryDirectory() as td:
+            copy = pathlib.Path(td) / SCRIPT.name
+            _write(copy, mutated)
+            proc = subprocess.run(
+                [sys.executable, str(pathlib.Path(__file__).resolve()), "--only", "cd"],
+                cwd=str(ROOT), env=dict(os.environ, VRE_SCRIPT_UNDER_TEST=str(copy)),
+                capture_output=True, text=True, timeout=300)
+            check(f"  {name}: caught", proc.returncode != 0,
+                  (proc.returncode, proc.stdout[-160:]))
+
+
 def main() -> int:
+    # `--only cd` runs just the two sections section E mutates against. It exists so the child
+    # cannot recurse into E, and so a mutation costs seconds rather than a full sweep.
+    only = ""
+    argv = sys.argv[1:]
+    if argv[:1] == ["--only"] and len(argv) == 2:
+        only = argv[1]
+    elif argv:
+        print(f"usage: {sys.argv[0]} [--only cd]")
+        return 2
+    if only:
+        section_c()
+        section_d()
+        print(f"\n{checks} checks (--only {only})")
+        if fails:
+            print("FAILED: " + ", ".join(fails))
+        return 1 if fails else 0
     print(f"restricted_env.sh failure paths — shells: {', '.join(SHELLS)}")
     if not SCRIPT.exists():
         print(f"FAILED: {SCRIPT} is missing")
@@ -498,6 +679,7 @@ def main() -> int:
     section_b()
     section_c()
     section_d()
+    section_e()
 
     print()
     if skipped:

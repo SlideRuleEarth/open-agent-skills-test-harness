@@ -12,7 +12,12 @@
 #
 # EXIT STATUS MEANS "THIS WAS A REPRODUCTION", WHICH IS A CLAIM ABOUT THE SUITE RESULTS AND
 # NOT MERELY ABOUT REACHING THEM. 0 means every phase produced the status AND the evidence a
-# denied run must produce; 1 means it did not; 2 is usage; 128+n means a signal ended the run.
+# denied run must produce; 1 means it did not; 2 is usage; and >= 128 means A SIGNAL ENDED THE
+# RUN -- 129/130/131/141/143 for HUP/INT/QUIT/PIPE/TERM, and exactly 128 for every other signal
+# handled below, which is NOT 128+n (external review). The grouped handlers do not compute
+# 128+n because signal NUMBERS are not portable: USR1 is 30 on macOS and the BSDs and 10 on
+# Linux, so a hardcoded table would be quietly wrong somewhere. The five spelled out have had
+# the same numbers everywhere for decades; the rest only promise ">= 128, ended by a signal".
 #
 # The first version of this script discarded the phase statuses and always exited 0, on the
 # theory that the suites' own reports were the output and folding "the suite skipped sections"
@@ -31,8 +36,11 @@
 # failure paths are driven by harness/tools/verify_restricted_env.py, which reads THIS FILE
 # rather than a copy of it.
 
+# The header block IS the help text, printed by walking it rather than by slicing fixed line
+# numbers: the header has grown three times in review, and a hardcoded range silently truncates
+# mid-sentence when it does.
 usage() {
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
 PAYLOAD=""
@@ -100,10 +108,15 @@ trap 'exit 131' QUIT    # Ctrl-\ quit from the keyboard (never end a comment wit
 trap 'exit 141' PIPE    # output piped into something that exits first
 trap 'exit 143' TERM    # kill, CI cancellation
 # The rest of the sent set: a resource limit (XCPU, XFSZ), a timeout wrapper (ALRM), an abort,
-# or a human with the wrong pid. 128 rather than 1 ON PURPOSE — 1 is this script's own "the
-# expectations were not met" status, so reusing it for a signal would make a run KILLED halfway
-# through indistinguishable from a run that finished and found the denial had not taken. Those
-# are opposite problems: one is an interruption, the other is a false reproduction.
+# or a human with the wrong pid. ONE HANDLER, ONE STATUS: 128 exactly, NOT 128+n, because these
+# signals' numbers differ across platforms — USR1 is 30 on macOS and the BSDs, 10 on Linux — so
+# a hardcoded per-signal table would be quietly wrong somewhere. The five above keep 128+n only
+# because their numbers have been the same everywhere for decades.
+#
+# 128 rather than 1 ON PURPOSE: 1 is this script's own "the expectations were not met" status,
+# so reusing it for a signal would make a run KILLED halfway through indistinguishable from one
+# that finished and found the denial had not taken. Those are opposite problems — an
+# interruption, and a false reproduction.
 trap 'exit 128' ABRT ALRM USR1 USR2 XCPU XFSZ VTALRM PROF
 
 mkdir "$sandbox/nops" "$sandbox/nobind" || exit 1
