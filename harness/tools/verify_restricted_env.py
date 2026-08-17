@@ -10,7 +10,7 @@ reported green while being broken. That is the class this file exists for:
 
     any step whose failure lets a later step run in a state it claims not to be in.
 
-Four sections, four different questions:
+Five sections, five different questions:
 
   A  CONSTRUCTION. Each step is made to fail in turn. The phases must never be reached, the
      status must be non-zero, and nothing may be left behind. An always-fail stub is not
@@ -36,9 +36,20 @@ Four sections, four different questions:
      time, in one phase, and the exact PROBLEM line is demanded along with the absence of any
      other: batched failures cannot show that an individual guard discriminates.
 
-NOTHING HERE IS A COPY. The trap set, the construction steps and the phase list are read
-out of restricted_env.sh itself; a duplicated rule that can drift silently is the defect
-this repo has spent the most rounds on.
+  E  MUTATIONS. The script is mutated nine ways on every run — each requirement deleted, each
+     expected status weakened, a handler stopped from exiting — and C and D must redden for
+     each. Two of the nine were green when they were written, so this is not a formality.
+
+ONE DELIBERATE COPY, AND EVERYTHING ELSE READ FROM THE SOURCE. The trap set, the construction
+steps, the phase list and the per-phase expectations are read out of restricted_env.sh itself;
+a duplicate that can drift silently is the defect this repo has spent the most rounds on.
+
+`EXPECTED_CONTRACT` is the exception, and it is deliberate: section D generates its cases FROM
+the script's `judge` calls, so a requirement deleted upstream would delete the very case that
+should have caught it — a universal quantified over a set the subject controls. Stating the
+contract independently is the structural clause ahead of that universal, which means changing
+what the script demands SHOULD require saying so in two places. Section E is what keeps the
+copy honest: it performs those deletions and requires the red.
 
 Two negative controls run first, because a leak detector that cannot see a leak reports a
 clean sweep exactly like a clean sweep: a planted sandbox must be DETECTED, and the script's
@@ -595,6 +606,14 @@ def section_c() -> None:
           not re.search(r"```sh.*?mktemp -d.*?PYDENY.*?```", doc, re.DOTALL))
 
 
+def _child(script: pathlib.Path, *args: str) -> subprocess.CompletedProcess:
+    """This verifier, run against a given copy of the script. Used only by section E."""
+    return subprocess.run(
+        [sys.executable, str(pathlib.Path(__file__).resolve()), *args],
+        cwd=str(ROOT), env=dict(os.environ, VRE_SCRIPT_UNDER_TEST=str(script)),
+        capture_output=True, text=True, timeout=300, check=False)
+
+
 def section_e() -> None:
     """MUTATE THE SCRIPT AND REQUIRE C AND D TO NOTICE.
 
@@ -610,6 +629,18 @@ def section_e() -> None:
     """
     print("\nE. MUTATIONS — each deletion must REDDEN sections C and D")
     text = SCRIPT.read_text()
+
+    # TWO CONTROLS BEFORE THE MUTATIONS. "The child exited non-zero" is evidence about the
+    # mutation only if the child can exit ZERO — a broken invocation would report every
+    # mutation as caught, for the wrong reason. And the flag it runs under has to be honoured:
+    # `--only nonsense` used to run C and D and exit 0, so a typo produced a green partial
+    # sweep and would have silently reduced what every mutation below proves (external review).
+    clean = _child(SCRIPT, "--only", "cd")
+    check("  the child PASSES on the unmutated script, so a red below is the mutation talking",
+          clean.returncode == 0, (clean.returncode, clean.stdout[-200:]))
+    typo = _child(SCRIPT, "--only", "nonsense")
+    check("  `--only nonsense` is REJECTED, not run as a green partial sweep",
+          typo.returncode == 2, (typo.returncode, typo.stdout[-120:]))
     mutations = [
         ("both uses of $PS_DENIED deleted", lambda s: s.replace(' "$PS_DENIED"', "")),
         ("$BIND_DENIED deleted", lambda s: s.replace(' "$BIND_DENIED"', "")),
@@ -640,27 +671,31 @@ def section_e() -> None:
         with tempfile.TemporaryDirectory() as td:
             copy = pathlib.Path(td) / SCRIPT.name
             _write(copy, mutated)
-            proc = subprocess.run(
-                [sys.executable, str(pathlib.Path(__file__).resolve()), "--only", "cd"],
-                cwd=str(ROOT), env=dict(os.environ, VRE_SCRIPT_UNDER_TEST=str(copy)),
-                capture_output=True, text=True, timeout=300)
+            proc = _child(copy, "--only", "cd")
             check(f"  {name}: caught", proc.returncode != 0,
                   (proc.returncode, proc.stdout[-160:]))
 
 
+# The accepted `--only` values, as data rather than as a string comparison. `--only cd` runs
+# just the two sections section E mutates against, so the child cannot recurse into E and a
+# mutation costs seconds rather than a full sweep. ANY OTHER VALUE IS AN ERROR: accepting one
+# silently ran C and D and exited 0, which makes a typo look like a pass (external review).
+ONLY_SECTIONS = {"cd": (section_c, section_d)}
+
+
 def main() -> int:
-    # `--only cd` runs just the two sections section E mutates against. It exists so the child
-    # cannot recurse into E, and so a mutation costs seconds rather than a full sweep.
-    only = ""
     argv = sys.argv[1:]
-    if argv[:1] == ["--only"] and len(argv) == 2:
-        only = argv[1]
-    elif argv:
-        print(f"usage: {sys.argv[0]} [--only cd]")
-        return 2
+    only = None
+    if argv:
+        if argv[:1] == ["--only"] and len(argv) == 2 and argv[1] in ONLY_SECTIONS:
+            only = argv[1]
+        else:
+            print(f"usage: {sys.argv[0]} [--only {'|'.join(sorted(ONLY_SECTIONS))}]",
+                  file=sys.stderr)
+            return 2
     if only:
-        section_c()
-        section_d()
+        for section in ONLY_SECTIONS[only]:
+            section()
         print(f"\n{checks} checks (--only {only})")
         if fails:
             print("FAILED: " + ", ".join(fails))

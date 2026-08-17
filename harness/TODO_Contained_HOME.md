@@ -295,7 +295,7 @@ make -C harness lint                                          # ruff + shellchec
 python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 169/169 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 probes; 559 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
-harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 124 here, over the 5 shells on this machine
+harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 126 here, over the 5 shells on this machine
 git diff --check
 
 # AFTER the mutation run, because what it should have left behind is nothing, and "the
@@ -398,7 +398,10 @@ fix is §4's own rule, a structural clause ahead of the universal: the contract 
 independently in the verifier, phase by phase, so removing a demand reddens a check rather than
 shrinking the matrix. **Section E then mutates the script nine ways on every run** — deleting
 each requirement, weakening each status, and stopping a handler from exiting — and requires the
-red. Two of those nine were green before the round that added them.
+red. Two of those nine were green before the round that added them. It runs two controls of its
+own first: the child must PASS on the unmutated script — otherwise "the child went red" is
+evidence about the invocation rather than the mutation — and a mistyped `--only` value must be
+REFUSED, since accepting one ran two sections and exited 0, making a typo look like a pass.
 
 **THE FAILURE PATHS ARE TESTED, NOT JUST THE HAPPY ONE**, and that is the lesson this script
 cost three review rounds to learn. Each round fixed the step the finding named — `mktemp`, then
