@@ -20,9 +20,11 @@ scenario described"*, and both resolve to **green**:
 
 - **A declared MCP server that never connected.** claude warns
   ([claude.py:707](agentskill_evals/adapters/claude.py#L707), [:727](agentskill_evals/adapters/claude.py#L727));
-  the warning reaches `report.md` and `summary.json`'s `cells[].warnings` and nothing else. If the
-  scenario asserts on that surface the cell fails on the assertion — loudly, if confusingly. If it does
-  not, the cell passes.
+  the warning reaches **two durable locations — `report.md` and `summary.json`'s `cells[].warnings` —
+  and no others**, plus an echo to the harness's stderr that nothing archives (`execute()` captures the
+  *child's*). `cells[].warnings` is machine-readable and per-cell; what it is not is **typed**, so
+  finding this class of finding means substring-matching prose. If the scenario asserts on that surface
+  the cell fails on the assertion — loudly, if confusingly. If it does not, the cell passes.
 - **An isolation leak.** The run read undeclared skills from the real repo checkout, bypassing
   HOME-based isolation. `passed` is computed at [runner.py:718](agentskill_evals/runner.py#L718)
   **without consulting `isolation_leaks` at all**; the leak is recorded in `assertions.json` and
@@ -171,8 +173,13 @@ documented wherever consumers are told what to read.
 
 ## 6. Interaction with Phase 2
 
-`TODO_Phase2_Copilot.md` §1 currently chooses **A** (warn, matching claude) over **C** (both fail),
-recording that A is defensible *because* slice 3's live acceptance case catches broken injection. A
-degraded verdict changes that trade: the shortfall gets a machine-readable field and a visible lane
-without conflating "the run was too empty" with "the run was too permissive" on one error channel —
-which was C's blocker. §1 should be revisited, not rewritten pre-emptively, once slice 1 here lands.
+`TODO_Phase2_Copilot.md` §1 chooses **A** (warn, matching claude) "for now", recording that A is
+defensible *because* Phase 2 slice 3's live acceptance case catches broken injection. It also already
+carries this document as row **D**, described there as superseding the A/C trade rather than sitting
+inside it — so the cross-reference runs both ways and neither file should be edited on the assumption
+that the other still frames it as a three-way choice.
+
+What a degraded verdict changes: the shortfall gets a **typed** field — the distinction that matters,
+since `cells[].warnings` is already machine-readable and merely untyped — and a visible lane, without
+conflating "the run was too empty" with "the run was too permissive" on one error channel, which was C's
+blocker. §1 should be revisited, not rewritten pre-emptively, once slice 1 here lands.
