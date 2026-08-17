@@ -45,18 +45,22 @@ Claude's warnings are **recorded, not printed** (`notices.py` → `RunResult.war
 earlier revision of this section claimed — both corrections are load-bearing for §1 and were wrong here:
 
 - The warning survives into **`report.md` and `summary.json`'s `cells[].warnings`. That is all.** The
-  per-cell JSONs do *not* carry it: `RunResult.to_dict()` ([schema.py:148](agentskill_evals/schema.py#L148))
+  other per-cell JSONs do *not* carry it: `RunResult.to_dict()` ([schema.py:148](agentskill_evals/schema.py#L148))
   omits `warnings`, so `result.json` lacks it, and `_write_cell_json` emits `assertions.json`, whose keys
   stop at `assertions`. There is no `cell.json` — the method name is a misnomer that
   [runner.py:2077](agentskill_evals/runner.py#L2077) and [selftest.py:12535](agentskill_evals/selftest.py#L12535)
   both repeat in prose.
+  **`cells[].warnings` is machine-readable and per-cell** — that much is not the limitation. The
+  limitation is that it is an **untyped free-text array**: finding a declared-server shortfall in it means
+  substring-matching English, and nothing structural separates that entry from a version-drift warning or
+  any other `warn()`. There is no *typed* field naming the shortfall, which is precisely what **D** adds.
 - **The health axis does not report the shortfall.** It reports the *status*, and its verdicts compare
   cells to **each other, not to the declaration**: if the server fails to come up in every cell the sets
   agree and `mcp_server_set_verified` stays **true**, while `mcp_server_health_verified` goes false only
   when health *differs* between cells. The axes detect **drift, not shortfall**.
 
-So the only artifact that compares what ran against what the scenario *declared* is the warning string,
-in two places, neither of them a machine-readable per-cell field.
+So the only thing that compares what ran against what the scenario *declared* is the warning string —
+reachable in two places, and typed in neither.
 
 Four resolutions, three of them considered when this was decided and the fourth raised afterwards.
 **B was never acceptable**, and is kept only to stay ruled out:
@@ -75,9 +79,9 @@ declared set must never become a way to switch the audit off.
 ### What A costs, stated plainly
 
 A declared-but-dead server lets the cell pass. The information is not lost, but it is thinner than
-"recorded in the artifacts" suggests: two prose locations, no machine-readable per-cell field stating the
-discrepancy, and an axis that reports drift rather than shortfall (see above). Nothing *forces* anyone to
-look. That is the whole of the "false green" objection, and it survives the decision rather than being
+"recorded in the artifacts" suggests: two locations, both free text, no typed field a consumer could
+filter or aggregate on, and an axis that reports drift rather than shortfall (see above). Nothing
+*forces* anyone to look, and nothing lets a machine look without pattern-matching prose. That is the whole of the "false green" objection, and it survives the decision rather than being
 answered by it — which is why **D** exists.
 
 **What answers it is not the witness — it is slice 3's acceptance.** The scenario the objection really
@@ -190,9 +194,11 @@ selftest, mutation suite, Ruff. Four slices means four mutation runs.
 
 ### Slice 1 — measure (probes only, no production code)
 
-The three shipped copilot probes read **server-side receipts** — what copilot *sent*. Four of the five
-unknowns are on the other side: what copilot *says it did*, which one copilot run can answer together.
-The fifth is §2(b)'s: a shape read from an execution that carries no version.
+The shipped copilot probes read two different things, and §2's provenance split is the same distinction:
+the **two gating probes** read **server-side receipts** — what copilot *sent* (§2(a)) — while
+`probe_copilot_config.py` reads **the config copilot wrote for itself**, never a wire (§2(b)). Four of
+the five unknowns are on a side neither reaches: what copilot *says it did*, which one copilot run can
+answer together. The fifth is §2(b)'s own limit — a shape read from an execution that carries no version.
 
 1. **MCP tool-name format in copilot's own JSON events.** §9 probe #3's first unanswered half. Needed by
    the parser (slice 4) and by `used_mcp_tool`. agy's is *inferred* as `mcp_<server>_<tool>` from binary
