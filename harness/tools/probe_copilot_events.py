@@ -28,15 +28,21 @@ event reports the name the server claimed" — the two readings produce identica
 Phase 2 would pick one by coin flip. So the config key is `CONFIG_KEY` and the fixture
 advertises `ADVERTISED_NAME`, and the classifier reports WHICH it saw.
 
-THE SECRET ARM HAS A POSITIVE CONTROL, for the reason §4 spends a rule on: a run where the
-sentinel never reached the output at all produces exactly the same silence as redaction that
-works. So the control arm runs the identical prompt with the flag ABSENT and must find the
-sentinel; only then does its absence under the flag mean anything. Without that, `REDACTS` is
-a claim about a channel nobody proved was connected.
+THE SECRET ARM RESTS ON TWO WITNESSES, NOT ONE, and the first version of it had only the
+weaker (review, PR #120). A control that runs the same prompt with the flag ABSENT and finds
+the sentinel proves the value CAN travel — but it proves it about the control, and `REDACTS`
+is a claim about the *other* arm. An arm that crashed, timed out, or simply never called the
+tool produces the identical silence, and the probe would read the absence of the exchange as
+the absence of the value. So the secret arm carries its own POSITIVE witness, authored by the
+fixture rather than by the process under test: its server's receipts must show the `tools/call`
+that carries the marker, and the `listening` row must carry the digest of THIS run's sentinel —
+so "the value was in the channel" and "the channel was used" are both facts about the arm the
+verdict is about. Nothing the CLI emits can forge either: the receipts are written by a
+different process, and the marker itself never appears there, only its sha256.
 
 WHAT THIS PROBE DOES NOT ANSWER. Whether `--disable-mcp-server` reaches plugin-declared
 servers (§9 probe #3's other half) — that needs an installed plugin, not an injected config,
-and is a Phase 0 hermeticity question rather than a Phase 2 blocker.
+and is answered by `probe_copilot_plugin_mcp.py`.
 
     python tools/probe_copilot_events.py        # two arms; prints every reading either way
 
@@ -46,6 +52,7 @@ established what Phase 2 needs, and must not exit 0 on the strength of the two.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -73,9 +80,11 @@ DEADLINE = 180.0
 CLAUDE_STYLE = "CLAUDE_STYLE"        # mcp__<server>__<tool>
 AGY_STYLE = "AGY_STYLE"              # mcp_<server>_<tool>
 DOTTED = "DOTTED"                    # <server>.<tool>
+HYPHEN = "HYPHEN"                    # <server>-<tool>
 BARE = "BARE"                        # <tool>, with no server component at all
 OTHER = "OTHER"                      # a real name in none of the above shapes
 UNMEASURED = "UNMEASURED"            # no MCP tool call reached the stream: NOT a format finding
+AMBIGUOUS = "AMBIGUOUS"              # the sources disagreed: there is no ONE canonical spelling
 
 REPORTS_CONFIG_KEY = "REPORTS_CONFIG_KEY"
 REPORTS_ADVERTISED = "REPORTS_ADVERTISED"
@@ -84,6 +93,11 @@ REPORTS_NEITHER = "REPORTS_NEITHER"
 REDACTS = "REDACTS"                  # sentinel present in control, absent under the flag
 NO_REDACTION = "NO_REDACTION"        # sentinel present in both
 CONTROL_FAILED = "CONTROL_FAILED"    # sentinel never reached the control's output
+SECRET_ARM_INCOMPLETE = "SECRET_ARM_INCOMPLETE"   # the arm under the flag never made the call
+
+# The two sources a tool name can come from, kept apart because they can disagree.
+EXECUTION = "execution"              # tool.execution_start.data.toolName — what copilot RAN
+REQUEST = "request"                  # assistant.message.data.toolRequests[] — what it ASKED for
 
 
 def parse_events(stream: str) -> list[dict]:
@@ -110,13 +124,16 @@ def parse_events(stream: str) -> list[dict]:
 
 
 def loaded_servers(events: list[dict]) -> list[tuple[str | None, str | None]]:
-    """Every (name, status) copilot reported, from BOTH witness events.
+    """Every (name, status) copilot reported, IN STREAM ORDER, from BOTH witness events.
 
     `session.mcp_servers_loaded` carries `data.servers[]` with `name`/`status`;
     `session.mcp_server_status_changed` carries `data.serverName`/`data.status`. Reading only
     the first would miss a server that arrived healthy and then failed, and a later transition
     is exactly the case Phase 2 slice 2 has to classify. Field spellings are the adapter's
     (`_mcp_witness`), which is where they were verified.
+
+    ORDER IS PART OF THE READING, not an accident of iteration — `effective_status` below is
+    the consumer that depends on it.
     """
     seen: list[tuple[str | None, str | None]] = []
     for obj in events:
@@ -132,32 +149,53 @@ def loaded_servers(events: list[dict]) -> list[tuple[str | None, str | None]]:
     return seen
 
 
-def declared_spelling(seen: list[tuple[str | None, str | None]]) -> tuple[str, str | None]:
-    """(which spelling the witness used, the status it carried) for OUR declared server.
+def statuses_for(seen: list[tuple[str | None, str | None]], name: str) -> list[str | None]:
+    """Every status `name` carried, in order. Shared with the remote-gating probe, which
+    imports it rather than keeping a second reader of the same two events."""
+    return [status for nm, status in seen if nm == name]
 
-    Returns `REPORTS_NEITHER` with a None status when the run named neither spelling, which is
+
+def effective_status(statuses: list[str | None]) -> str | None:
+    """The status our server ENDED on, which is the only one that describes the run.
+
+    THE LAST, NOT THE FIRST. `loaded_servers` was written to see a server that came up healthy
+    and then failed, and the first consumer of it then took the first match and reported
+    `connected` for exactly that server — the reader fixed, the conclusion not (review,
+    PR #120). Slice 2 splits `_INERT_MCP_STATUSES` on this value, so a stale healthy status
+    here becomes a hermeticity witness that permits a server nothing is talking to.
+    """
+    return statuses[-1] if statuses else None
+
+
+def declared_spelling(
+        seen: list[tuple[str | None, str | None]]) -> tuple[str, list[str | None]]:
+    """(which spelling the witness used, EVERY status it carried) for OUR declared server.
+
+    Returns `REPORTS_NEITHER` with no statuses when the run named neither spelling, which is
     the honest reading of a stream that never mentioned our server — not a claim that the
     server was absent, since a stream that never arrived says the same thing. `main` gates on
     the stream having been produced at all before treating this as an answer.
     """
-    for name, status in seen:
-        if name == CONFIG_KEY:
-            return REPORTS_CONFIG_KEY, status
-    for name, status in seen:
-        if name == ADVERTISED_NAME:
-            return REPORTS_ADVERTISED, status
-    return REPORTS_NEITHER, None
+    for spelling, name in ((REPORTS_CONFIG_KEY, CONFIG_KEY),
+                           (REPORTS_ADVERTISED, ADVERTISED_NAME)):
+        statuses = statuses_for(seen, name)
+        if statuses:
+            return spelling, statuses
+    return REPORTS_NEITHER, []
 
 
-def tool_names(events: list[dict]) -> list[str]:
-    """Every tool name copilot said it executed, from the execution event and the request.
+def tool_names(events: list[dict]) -> list[tuple[str, str]]:
+    """Every (source, tool name) copilot reported, from the execution event and the request.
 
-    TWO SOURCES, because they can disagree and the disagreement matters: `tool.execution_start`
-    is copilot's own record of what it ran, while `assistant.message.data.toolRequests[]` is
-    what the model asked for. If the canonical spelling differs between them, Phase 2's parser
-    has to know which one `used_mcp_tool` should match.
+    TWO SOURCES, AND THEY STAY APART: `tool.execution_start` is copilot's own record of what it
+    ran, while `assistant.message.data.toolRequests[]` is what the model asked for. The first
+    version of this returned bare strings, so a disagreement between the two — the case the
+    docstring said mattered — was flattened into a list and then resolved by taking whichever
+    came first (review, PR #120). If the canonical spelling differs between them, Phase 2's
+    parser has to know which one `used_mcp_tool` should match, and that is a question the probe
+    must ASK rather than answer by iteration order.
     """
-    names: list[str] = []
+    names: list[tuple[str, str]] = []
     for obj in events:
         data = obj.get("data")
         if not isinstance(data, dict):
@@ -165,28 +203,107 @@ def tool_names(events: list[dict]) -> list[str]:
         if obj.get("type") == "tool.execution_start":
             nm = data.get("toolName")
             if isinstance(nm, str):
-                names.append(nm)
+                names.append((EXECUTION, nm))
         elif obj.get("type") == "assistant.message":
             for req in data.get("toolRequests") or []:
                 if isinstance(req, dict):
                     nm = req.get("toolName") or req.get("name")
                     if isinstance(nm, str):
-                        names.append(nm)
+                        names.append((REQUEST, nm))
     return names
 
 
-def mcp_tool_name(names: list[str]) -> str | None:
-    """The one name among `names` that refers to OUR tool on OUR server, or None.
+FIELDS_PRESENT = "FIELDS_PRESENT"    # copilot names server and tool in SEPARATE fields
+FIELDS_ABSENT = "FIELDS_ABSENT"      # only the composite name is on offer
+FIELDS_UNMEASURED = "FIELDS_UNMEASURED"   # no MCP execution event at all: nothing to read
+
+
+def mcp_fields(events: list[dict]) -> list[tuple[str | None, str | None]]:
+    """(mcpServerName, mcpToolName) from every `tool.execution_start`, in stream order.
+
+    A SECOND, BETTER ANSWER TO QUESTION 1, found by looking at the event rather than at the
+    string it contains. copilot 1.0.80 puts the server and the tool in their own fields beside
+    the composite `toolName`, which means slice 4's `used_mcp_tool` can match on the two facts
+    it actually cares about instead of splitting a name on a separator whose escaping rules
+    nobody has measured — a server or tool whose own name contains the separator breaks the
+    split and cannot break these. Entries are reported with `None`s intact so a build that
+    stops emitting them is visible as a change rather than as an empty list.
+    """
+    out: list[tuple[str | None, str | None]] = []
+    for obj in events:
+        data = obj.get("data")
+        if obj.get("type") == "tool.execution_start" and isinstance(data, dict):
+            if "mcpServerName" in data or "mcpToolName" in data:
+                out.append((data.get("mcpServerName"), data.get("mcpToolName")))
+    return out
+
+
+def fields_verdict(pairs: list[tuple[str | None, str | None]],
+                   executions: int) -> tuple[str, str]:
+    """(verdict, why) for "can slice 4 read the server and tool without parsing a name?".
+
+    `executions` — how many `tool.execution_start` events the stream carried at all — is the
+    structural clause: with none, an empty `pairs` says nothing about whether copilot emits
+    the fields, and `FIELDS_ABSENT` would be a fleet-wide negative drawn from a row nobody
+    answered.
+    """
+    if not executions:
+        return FIELDS_UNMEASURED, ("no tool executed in this run, so whether the execution "
+                                   "event carries the fields was not observed")
+    ours = [(srv, tool) for srv, tool in pairs
+            if tool == TOOL and srv in (CONFIG_KEY, ADVERTISED_NAME)]
+    if not ours:
+        return FIELDS_ABSENT, (f"{executions} tool execution(s) ran and none named our server "
+                               f"and tool in `mcpServerName`/`mcpToolName`: slice 4 has only "
+                               f"the composite name to work with")
+    return FIELDS_PRESENT, (f"copilot names the server and the tool in their own fields "
+                            f"({ours[0]!r}), so `used_mcp_tool` need not parse the composite")
+
+
+def executions(events: list[dict]) -> int:
+    """How many `tool.execution_start` events the stream carried — the structural clause for
+    `fields_verdict`, counted separately so it cannot be inferred from what it gates."""
+    return sum(1 for obj in events if obj.get("type") == "tool.execution_start")
+
+
+def is_our_tool(name: str) -> bool:
+    """Whether `name` refers to OUR tool on OUR server.
 
     Matched by containing both components rather than by an assumed separator — the separator
     is the very thing being measured, so a predicate spelling it would only ever confirm the
     guess it was written with. Built-in tools (`shell`, `view`) are excluded by the same test:
     they carry neither component.
     """
-    for nm in names:
-        if TOOL in nm and (CONFIG_KEY in nm or ADVERTISED_NAME in nm):
-            return nm
-    return None
+    return TOOL in name and (CONFIG_KEY in name or ADVERTISED_NAME in name)
+
+
+def mcp_names_by_source(pairs: list[tuple[str, str]]) -> dict[str, list[str]]:
+    """{source: the distinct names it used for OUR tool}, in stream order.
+
+    Sources with nothing to say are absent rather than present-and-empty, so a caller cannot
+    mistake "this source named no MCP tool" for "this source agreed with the other one".
+    """
+    by_source: dict[str, list[str]] = {}
+    for source, name in pairs:
+        if is_our_tool(name) and name not in by_source.setdefault(source, []):
+            by_source[source].append(name)
+    return {src: names for src, names in by_source.items() if names}
+
+
+def canonical_name(by_source: dict[str, list[str]]) -> tuple[str | None, bool]:
+    """(the one name every source used, whether they agreed).
+
+    AGREEMENT IS THE FINDING, not a precondition to be assumed. Two spellings for one tool
+    means slice 4 has two candidate strings for `used_mcp_tool` and no basis to choose, which
+    is an unanswered question wearing an answer's clothes. `(None, True)` is the honest reading
+    of a run where no source named our tool at all — nothing to disagree about.
+    """
+    distinct = {name for names in by_source.values() for name in names}
+    if not distinct:
+        return None, True
+    if len(distinct) > 1:
+        return None, False
+    return distinct.pop(), True
 
 
 def name_format(name: str | None) -> str:
@@ -206,31 +323,108 @@ def name_format(name: str | None) -> str:
             return AGY_STYLE
         if name == f"{server}.{TOOL}":
             return DOTTED
+        if name == f"{server}-{TOOL}":
+            return HYPHEN
     if name == TOOL:
         return BARE
     return OTHER
 
 
-def secret_verdict(control_stream: str, secret_stream: str, sentinel: str) -> tuple[str, str]:
-    """(verdict, why) for `--secret-env-vars`, with its control read FIRST.
+def format_reading(by_source: dict[str, list[str]]) -> tuple[str, str | None]:
+    """(verdict, the observed name) for question 1 — the classifier plus the agreement test.
 
-    THE CONTROL IS THE MEASUREMENT. Absence of the sentinel under the flag is evidence of
-    redaction only if the same run without the flag produced it; otherwise the sentinel simply
-    never travelled, and `REDACTS` would be a claim about a channel nobody connected. So a
-    control that does not carry the sentinel returns `CONTROL_FAILED` — not a weaker positive.
+    `AMBIGUOUS` is a distinct outcome from `UNMEASURED` because they call for different next
+    steps: one run did not exercise the tool, the other exercised it and produced two answers.
+    Collapsing them would hide the second, which is the one that has to be resolved before a
+    parser is written.
+    """
+    name, agreed = canonical_name(by_source)
+    if not agreed:
+        return AMBIGUOUS, None
+    return name_format(name), name
+
+
+# --- the secret arm's own witnesses, authored by the fixture ---------------------------
+def read_receipts(path: str) -> list[dict]:
+    """Well-formed records only; a truncated final line is an ordinary ending, not a crash."""
+    out = []
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    out.append(obj)
+    except OSError:
+        return []
+    return out
+
+
+def served_tool(records: list[dict]) -> bool:
+    """Whether OUR tool was actually called on the fixture in this arm.
+
+    The `request` row is written before the server decides whether to answer, so this is what
+    the CLIENT sent — the fact `REDACTS` needs and the one the CLI's own stream cannot be
+    trusted to supply, since the CLI is the subject.
+    """
+    return any(r.get("kind") == "request" and r.get("method") == "tools/call"
+               and r.get("tool") == TOOL for r in records)
+
+
+def held_sentinel(records: list[dict], sentinel: str) -> bool:
+    """Whether the fixture that served this arm was carrying THIS run's marker.
+
+    A DIGEST, because the receipts file lands where the CLI can read it under `--allow-all`
+    and the plain marker there would be a second route to the value (PR #110). sha256 is not
+    invertible, so the driver can still recognise it and the CLI cannot mint it.
+    """
+    want = hashlib.sha256(sentinel.encode("utf-8")).hexdigest()
+    return any(r.get("kind") == "listening" and r.get("identity_digest") == want
+               for r in records)
+
+
+def arm_exchanged(records: list[dict], sentinel: str) -> bool:
+    """Whether this arm ran the exchange the secret question is about: the marker was in the
+    server AND the tool carrying it was called. Both, because either alone is satisfied by a
+    run that could not have put the value into the output."""
+    return held_sentinel(records, sentinel) and served_tool(records)
+
+
+def secret_verdict(control_stream: str, secret_stream: str, sentinel: str,
+                   *, secret_exchanged: bool) -> tuple[str, str]:
+    """(verdict, why) for `--secret-env-vars`, with both structural gates read FIRST.
+
+    THE CONTROL PROVES THE VALUE CAN TRAVEL; THE SECRET ARM'S OWN RECEIPTS PROVE IT DID.
+    Absence of the sentinel under the flag is evidence of redaction only if the arm that
+    produced the absence actually ran the exchange — otherwise the sentinel simply never
+    travelled in THAT run, and `REDACTS` is a claim about a channel nobody connected. The
+    first version had the control alone, and a secret arm that returned an empty string
+    certified redaction (review, PR #120).
     """
     if sentinel not in control_stream:
         return CONTROL_FAILED, ("the sentinel never reached the control run's output, so its "
                                 "absence under --secret-env-vars measures nothing: there was "
                                 "no value in the channel to redact")
+    if not secret_exchanged:
+        return SECRET_ARM_INCOMPLETE, ("the arm under --secret-env-vars never completed the "
+                                       "exchange that carries the value — its fixture did not "
+                                       "record both this run's marker and a call to the tool "
+                                       "that returns it — so the sentinel's absence from its "
+                                       "output is the absence of the CALL, not of the value")
     if sentinel in secret_stream:
         return NO_REDACTION, ("the sentinel appears in the output WITH --secret-env-vars naming "
                               "its variable — the flag did not redact the value where it landed")
-    return REDACTS, ("the sentinel reached the control's output and is absent under "
-                     "--secret-env-vars, so the flag redacted the value itself")
+    return REDACTS, ("the sentinel reached the control's output, the secret arm made the same "
+                     "call with the same marker in its server, and the value is absent from "
+                     "its output — so the flag redacted the value itself")
 
 
-def mcp_config(path: str, sentinel: str) -> str:
+def mcp_config(path: str, sentinel: str, receipts: str) -> str:
     """One stdio echo server under `CONFIG_KEY`, advertising `ADVERTISED_NAME`.
 
     NO `type` KEY, deliberately: the stdio gating probe omits it too and its servers start, so
@@ -239,20 +433,27 @@ def mcp_config(path: str, sentinel: str) -> str:
     """
     server = {"command": sys.executable, "args": [ECHO],
               "env": {"ECHO_MCP_SERVER_NAME": ADVERTISED_NAME,
-                      "ECHO_MCP_IDENTITY": sentinel}}
+                      "ECHO_MCP_IDENTITY": sentinel,
+                      "ECHO_MCP_RECEIPTS": receipts}}
     with open(path, "w", encoding="utf-8") as handle:
         json.dump({"mcpServers": {CONFIG_KEY: server}}, handle)
     return path
 
 
-def run_arm(workdir: str, sentinel: str, *, redact: bool) -> str:
-    """One copilot run. Returns stdout+stderr — the stream is the whole measurement here.
+def run_arm(workdir: str, sentinel: str, *, redact: bool) -> tuple[str, list[dict]]:
+    """One copilot run. Returns (stdout+stderr, the fixture's receipts for THIS arm).
+
+    ONE RECEIPTS FILE PER ARM: the fixture appends, and two arms sharing a file would let the
+    control's call satisfy the secret arm's structural gate — the two runs agreeing with each
+    other rather than each being measured (§4).
 
     The prompt names the server and tool explicitly and asks for the reply VERBATIM: the
     identity marker rides back in the tool's answer, which is what puts the sentinel into
     copilot's own output and gives the secret arm something to redact.
     """
-    config = mcp_config(os.path.join(workdir, f"cfg-{uuid.uuid4().hex}.json"), sentinel)
+    tag = uuid.uuid4().hex
+    receipts = os.path.join(workdir, f"receipts-{'secret' if redact else 'control'}-{tag}.jsonl")
+    config = mcp_config(os.path.join(workdir, f"cfg-{tag}.json"), sentinel, receipts)
     prompt = (f"Use the `{CONFIG_KEY}` MCP server: call its {TOOL} tool with the text HELLO, "
               f"and quote the tool's reply back VERBATIM, exactly as it returned it.")
     argv = ["copilot", "-p", prompt,
@@ -266,19 +467,22 @@ def run_arm(workdir: str, sentinel: str, *, redact: bool) -> str:
     try:
         done = subprocess.run(argv, cwd=workdir, capture_output=True, text=True,
                               timeout=DEADLINE, env=env)
+        stream = (done.stdout or "") + (done.stderr or "")
     except FileNotFoundError:
-        return ""
+        stream = ""
     except subprocess.TimeoutExpired:
-        return ""
-    return (done.stdout or "") + (done.stderr or "")
+        stream = ""
+    return stream, read_receipts(receipts)
 
 
 def agreed_version(streams: list[str]) -> tuple[str, bool]:
-    """(text, usable) over EVERY arm that ran — the same rule the gating probes settled on.
+    """(text, usable) over EVERY arm the probe launched — the same rule the gating probes
+    settled on, and now over the arms rather than over the ones that answered.
 
-    One witness per executed arm, and the set must be a singleton. An arm with no witness is
-    precisely the arm that could have executed a different build, so absence anywhere is
-    unverified rather than tolerated.
+    One witness per arm, and the set must be a singleton. An arm with no witness is precisely
+    the arm that could have executed a different build — or no build at all — so absence
+    anywhere is unverified rather than tolerated. Filtering the empty ones out first is what
+    let a vanished secret arm ride through version agreement (review, PR #120).
     """
     if not streams:
         return "(no runs to witness)", False
@@ -296,9 +500,10 @@ def answered(fmt: str, spelling: str, secret: str) -> bool:
     Each term is a separate question, and a run that settled two of them has not established
     what Phase 2 needs. `REPORTS_NEITHER` is unanswered rather than a negative finding, for the
     same reason `UNMEASURED` is: a stream that never named our server and a stream that never
-    arrived are the same bytes.
+    arrived are the same bytes. `AMBIGUOUS` joins them: two spellings for one tool is a
+    question with two answers, which is not an answer.
     """
-    return (fmt != UNMEASURED
+    return (fmt not in (UNMEASURED, AMBIGUOUS)
             and spelling != REPORTS_NEITHER
             and secret in (REDACTS, NO_REDACTION))
 
@@ -310,37 +515,64 @@ def main() -> int:
     print(f"advertised   : {ADVERTISED_NAME}")
     print(f"sentinel     : {sentinel}\n")
 
-    control = run_arm(workdir, sentinel, redact=False)
-    secret = run_arm(workdir, sentinel, redact=True)
-    streams = [s for s in (control, secret) if s]
-    if not streams:
+    control, control_receipts = run_arm(workdir, sentinel, redact=False)
+    secret, secret_receipts = run_arm(workdir, sentinel, redact=True)
+    if not (control or secret):
         print("INSTRUMENT_FAILED: no arm produced any output (is `copilot` on PATH?)")
         return 1
 
-    version, version_ok = agreed_version(streams)
-    # BOTH ARMS POOLED. Reading one arm and falling back to the other would report
-    # `UNMEASURED` whenever the arm consulted happened not to call the tool, while the arm
-    # beside it carried the answer — an absence produced by the reader's choice rather than by
-    # the run. `seen` is printed whole below, so a disagreement between the arms stays visible
-    # rather than being hidden by the first-match classifiers.
-    events = parse_events(control) + parse_events(secret)
-    seen = loaded_servers(events)
-    spelling, status = declared_spelling(seen)
-    names = tool_names(events)
-    observed = mcp_tool_name(names)
-    fmt = name_format(observed)
-    verdict, why = secret_verdict(control, secret, sentinel)
+    # EVERY ARM LAUNCHED, not every arm that spoke. An arm that produced nothing is the one
+    # whose build is least accounted for.
+    version, version_ok = agreed_version([control, secret])
 
-    print(f"version          : {version} ({'usable' if version_ok else 'UNVERIFIED'})")
-    print(f"servers reported : {seen or '(none)'}")
-    print(f"Q2 name spelling : {spelling}   status={status!r}")
-    print(f"tool names seen  : {names or '(none)'}")
-    print(f"Q1 tool format   : {fmt}   observed={observed!r}")
-    print(f"Q4 secret        : {verdict}\n    {why}")
+    # Q1 POOLS BOTH ARMS; Q2 DOES NOT. Whether the model calls a tool is its own decision, so
+    # reading one arm and falling back would report `UNMEASURED` whenever the arm consulted
+    # happened not to call it while the arm beside it carried the answer. Server loading is
+    # NOT the model's decision — the MCP host initializes before the model acts — so question 2
+    # is read from the control arm, one run, where a status SEQUENCE has a meaning that
+    # concatenating two runs' streams would destroy. The secret arm's reading is printed
+    # beside it so a disagreement stays visible.
+    ev_control, ev_secret = parse_events(control), parse_events(secret)
+    by_source = mcp_names_by_source(tool_names(ev_control) + tool_names(ev_secret))
+    fmt, observed = format_reading(by_source)
+    fields, fields_why = fields_verdict(mcp_fields(ev_control) + mcp_fields(ev_secret),
+                                        executions(ev_control) + executions(ev_secret))
+
+    seen = loaded_servers(ev_control)
+    spelling, statuses = declared_spelling(seen)
+    status = effective_status(statuses)
+    seen_secret = loaded_servers(ev_secret)
+    spelling_secret, statuses_secret = declared_spelling(seen_secret)
+
+    verdict, why = secret_verdict(control, secret, sentinel,
+                                  secret_exchanged=arm_exchanged(secret_receipts, sentinel))
+
+    print(f"version            : {version} ({'usable' if version_ok else 'UNVERIFIED'})")
+    print(f"servers (control)  : {seen or '(none)'}")
+    print(f"servers (secret)   : {seen_secret or '(none)'}")
+    print(f"Q2 name spelling   : {spelling}   statuses={statuses}   effective={status!r}")
+    print(f"   secret arm said : {spelling_secret}   statuses={statuses_secret}"
+          f"{'   (DISAGREES with the control)' if spelling_secret != spelling else ''}")
+    print(f"tool names by source: {by_source or '(none)'}")
+    print(f"Q1 tool format     : {fmt}   observed={observed!r}")
+    print(f"Q1 structured      : {fields}\n    {fields_why}")
+    print(f"Q4 secret          : {verdict}\n    {why}")
+    print(f"   control receipts: served={served_tool(control_receipts)} "
+          f"marker={held_sentinel(control_receipts, sentinel)}")
+    print(f"   secret  receipts: served={served_tool(secret_receipts)} "
+          f"marker={held_sentinel(secret_receipts, sentinel)}")
+
+    # THE FOOTER PROMISED A DIRECTORY AND NOTHING WAS EVER PUT IN IT. These readings are the
+    # slice's deliverable and they get quoted into a design document, so the stream they came
+    # from has to outlive the print: a reading nobody can re-derive is a claim, not a
+    # measurement.
+    for label, text in (("control", control), ("secret", secret)):
+        with open(os.path.join(workdir, f"{label}.stream"), "w", encoding="utf-8") as fh:
+            fh.write(text)
 
     ok = answered(fmt, spelling, verdict) and version_ok
     print(f"\n{'ANSWERED' if ok else 'NOT FULLY ANSWERED'} — "
-          f"artifacts under {workdir}")
+          f"raw streams and receipts under {workdir}")
     return 0 if ok else 1
 
 

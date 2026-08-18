@@ -3372,13 +3372,27 @@ try:
     # pooled singleton, which is the property under test: an arm that ran on a different build
     # must break agreement whichever arm it was.
     _omit_version: list = []
+    _omit_control_version: list = []
 
     def _fake_omission(_workdir, _kind, _endpoint, _sentinel):
-        v = _omit_version[0] if _omit_version else "1.0.79"
-        line = json.dumps({"type": "session.skills_loaded", "data": {"skills": [
-            {"source": "builtin",
-             "path": f"/x/pkg/darwin-arm64/{v}/builtin/s/SKILL.md"}]}})
-        return CRG.STARTS_WITHOUT_TYPE, "canned", [{"kind": "listening"}], line
+        # TWO STREAMS, because the omission measurement is now a PAIR: the bare arm and the
+        # with-`type` control it is read against. Both must reach the pool — a control that
+        # executed a different build makes the comparison meaningless just as surely as a
+        # bare arm that did, and the two versions are driven SEPARATELY below so that dropping
+        # either one from the pool is visible.
+        def _line(v):
+            return json.dumps({"type": "session.skills_loaded", "data": {"skills": [
+                {"source": "builtin",
+                 "path": f"/x/pkg/darwin-arm64/{v}/builtin/s/SKILL.md"}]}})
+        # EACH ARM DEFAULTS TO THE FLEET VERSION, never to the OTHER arm. Defaulting the
+        # control to `bare` made the "bare arm is odd" case set BOTH arms odd, so the check
+        # was satisfied by the control's version and would have passed a pool that carried
+        # only the control — which is precisely the mutation it exists to kill (mutation run,
+        # PR #120). One driver, one arm.
+        bare = _omit_version[0] if _omit_version else "1.0.79"
+        control = _omit_control_version[0] if _omit_control_version else "1.0.79"
+        return (CRG.STARTS_WITHOUT_TYPE, "canned", [{"kind": "listening"}],
+                [_line(control), _line(bare)])
 
     _real_measure = CRG.measure
     _real_omission = CRG.measure_type_omission
@@ -3394,14 +3408,24 @@ try:
         _split = CRG.main()
         check("remote: every arm of every transport names ONE build, not one per transport",
               _same == 0 and _split == 1, (_same, _split))
-        # THE NEW ARM IS INSIDE THE POOL, not beside it. If its stream were dropped from
-        # `all_streams`, an omission arm executing a different build would ride out under a
-        # green result — the same one-sided hole `agreed_version` was written to close.
+        # THE NEW ARMS ARE INSIDE THE POOL, not beside it. If either stream were dropped from
+        # `all_streams`, an arm executing a different build would ride out under a green
+        # result — the same one-sided hole `agreed_version` was written to close. Each arm of
+        # the pair is driven odd SEPARATELY, because a check that only ever varied one of them
+        # would pass a pool that carried the other alone.
         _per_transport[:] = ["1.0.79", "1.0.79"]
+        _omit_control_version[:] = []
         _omit_version[:] = ["9.9.9"]
         _odd = CRG.main()
         check("...and the `type`-omission arm's own build is pooled with the rest",
               _odd == 1, _odd)
+        _per_transport[:] = ["1.0.79", "1.0.79"]
+        _omit_version[:] = ["1.0.79"]
+        _omit_control_version[:] = ["9.9.9"]
+        _odd_control = CRG.main()
+        check("...as is its WITH-`type` control's, which is now half the measurement",
+              _odd_control == 1, _odd_control)
+        _omit_control_version[:] = []
     finally:
         CRG.measure = _real_measure
         CRG.measure_type_omission = _real_omission
@@ -4218,6 +4242,13 @@ print("E21. Phase 2 slice 1: the events probe's classifiers, and the `type`-omis
 # confident wrong answer for the "unmeasured" that would have blocked the build. Every arm
 # below drives a case where a broken implementation produces a DIFFERENT word, never a case
 # where any implementation would agree.
+#
+# FOUR OF THESE ARMS EXIST BECAUSE THE FIRST VERSION OF THIS SECTION ENCODED THE PROBE'S
+# FALSE POSITIVES RATHER THAN ITS ANSWERS (review, PR #120): it asserted the first status
+# rather than the last, the first tool name rather than agreement between the two sources,
+# redaction without the redacting arm having run, and a `type` finding with no control to
+# attribute it to. Each is now driven by the case that separates the two readings, and each
+# fails against the code as it stood before the review.
 import probe_copilot_events as EV               # noqa: E402 — after the path bootstrap at E14
 
 _e21 = tempfile.mkdtemp(prefix="verify-copilot-events-")
@@ -4238,15 +4269,62 @@ try:
     check("...and a stream of nothing but prose yields no events rather than raising",
           EV.parse_events("hello\nworld") == [], EV.parse_events("hello\nworld"))
 
+    # -- the synthetic streams below are PINNED TO REAL ONES ---------------------------------
+    # Every arm past this point drives the readers on stream text this file composes, and a
+    # composed stream agrees with whatever the reader expects — the §E19 objection, one
+    # instrument over, and there is no fixture that authors copilot's output. What there is
+    # instead is two VERBATIM lines from copilot 1.0.80, captured by the probe itself and kept
+    # under `tools/pinned/`. If a build changes these events, these arms redden and every
+    # synthetic arm under them is known to describe a stream that no longer exists.
+    #
+    # THE EXPECTATIONS ARE TYPED HERE, NOT DERIVED FROM THE FILE, which would be the data under
+    # test certifying itself. `EV.CONFIG_KEY` and `EV.TOOL` are the probe's own constants, so
+    # these arms also pin the probe to a stream a real build emitted FOR IT.
+    _pinned = [ln for ln in open(os.path.join(HERE, "pinned",
+                                              "copilot-1.0.80-events.jsonl"),
+                                 encoding="utf-8").read().splitlines()
+               if ln.strip() and not ln.startswith("#")]
+    check("the pinned capture holds the two events the readings below depend on",
+          len(_pinned) == 2, _pinned)
+    _real_loaded, _real_exec = _pinned
+    check("the readers find our server in a VERBATIM 1.0.80 line, so the shape is real",
+          EV.loaded_servers(EV.parse_events(_real_loaded)) == [(EV.CONFIG_KEY, "connected")],
+          EV.loaded_servers(EV.parse_events(_real_loaded)))
+    check("...and the real execution event names the server and tool in their OWN fields",
+          EV.mcp_fields(EV.parse_events(_real_exec)) == [(EV.CONFIG_KEY, EV.TOOL)],
+          EV.mcp_fields(EV.parse_events(_real_exec)))
+    check("...and the composite name in that same real line is the HYPHEN shape",
+          EV.format_reading(EV.mcp_names_by_source(EV.tool_names(EV.parse_events(_real_exec))))
+          == (EV.HYPHEN, f"{EV.CONFIG_KEY}-{EV.TOOL}"),
+          EV.tool_names(EV.parse_events(_real_exec)))
+
+    # A `session.skills_loaded` line is NOT pinned here: it carries the machine's own skill
+    # inventory, and `_stream_cli_version` is the adapter's function with its own coverage.
+    # What this composes is the minimum shape that function documents, plus an arm proving the
+    # composition actually yields a version — without which the two agreement arms below would
+    # both be passing on `None == None`.
+    REAL_VERSION_LINE = json.dumps({"type": "session.skills_loaded", "data": {"skills": [
+        {"source": "builtin",
+         "path": "/x/pkg/darwin-arm64/1.0.80/builtin/s/SKILL.md"}]}}) + "\n"
+    check("the composed version line really carries a version, or the agreement arms are vacuous",
+          EV.agreed_version([REAL_VERSION_LINE])[0] == "1.0.80",
+          EV.agreed_version([REAL_VERSION_LINE]))
+
+    def _loaded_line(*servers):
+        return json.dumps({"type": "session.mcp_servers_loaded",
+                           "data": {"servers": list(servers)}}) + "\n"
+
+    def _changed_line(name, status):
+        return json.dumps({"type": "session.mcp_server_status_changed",
+                           "data": {"serverName": name, "status": status}}) + "\n"
+
     # -- loaded_servers: BOTH witness events, not just the first -----------------------------
     # A later `session.mcp_server_status_changed` is precisely the case slice 2 must classify —
     # a server that arrived healthy and then failed. A reader that consulted only
     # `mcp_servers_loaded` would report it healthy forever.
     _both = EV.parse_events(
-        '{"type":"session.mcp_servers_loaded","data":{"servers":['
-        '{"name":"' + EV.CONFIG_KEY + '","status":"connected"}]}}\n'
-        '{"type":"session.mcp_server_status_changed","data":{"serverName":"'
-        + EV.CONFIG_KEY + '","status":"failed"}}\n')
+        _loaded_line({"name": EV.CONFIG_KEY, "status": "connected"})
+        + _changed_line(EV.CONFIG_KEY, "failed"))
     check("the witness reads BOTH events, so a later transition is not invisible",
           EV.loaded_servers(_both)
           == [(EV.CONFIG_KEY, "connected"), (EV.CONFIG_KEY, "failed")],
@@ -4255,56 +4333,166 @@ try:
           EV.loaded_servers(EV.parse_events(
               '{"type":"session.mcp_servers_loaded","data":42}\n')) == [], "should be []")
 
+    # -- effective_status: the LAST status, which is the one that describes the run ----------
+    # THE ARM THE REVIEW ADDED. `loaded_servers` was written to see a server that came up
+    # healthy and then failed, and the first consumer of it took the FIRST match and reported
+    # `connected` for exactly that server — so the reader was fixed and the conclusion was not.
+    # Slice 2 splits `_INERT_MCP_STATUSES` on this value, and a stale healthy status here is a
+    # hermeticity witness permitting a server nothing is talking to.
+    check("a server that came up healthy and then FAILED reports `failed`, not `connected`",
+          EV.effective_status(EV.statuses_for(EV.loaded_servers(_both), EV.CONFIG_KEY))
+          == "failed",
+          EV.statuses_for(EV.loaded_servers(_both), EV.CONFIG_KEY))
+    check("...and the whole sequence is kept, so the transition itself stays readable",
+          EV.statuses_for(EV.loaded_servers(_both), EV.CONFIG_KEY) == ["connected", "failed"],
+          "both statuses")
+    check("...a server never mentioned has no status, which is not a status",
+          EV.effective_status(EV.statuses_for(EV.loaded_servers(_both), "nobody")) is None,
+          "absence is not a value")
+
     # -- declared_spelling: the whole reason the two names differ ---------------------------
     # THE MEASUREMENT IS UNANSWERABLE IF THEY MATCH. With key == advertised name, "the event
     # reports our key" and "the event reports the server's own name" produce identical output,
     # and Phase 2 would pick one by coin flip. These arms are what prove the probe can tell.
     check("the config KEY is recognised as such",
           EV.declared_spelling([(EV.CONFIG_KEY, "connected")])
-          == (EV.REPORTS_CONFIG_KEY, "connected"), "key")
+          == (EV.REPORTS_CONFIG_KEY, ["connected"]), "key")
     check("...the ADVERTISED name is recognised as a different answer",
           EV.declared_spelling([(EV.ADVERTISED_NAME, "running")])
-          == (EV.REPORTS_ADVERTISED, "running"), "advertised")
+          == (EV.REPORTS_ADVERTISED, ["running"]), "advertised")
     check("...and a stream naming neither is UNANSWERED, not a negative finding",
           EV.declared_spelling([("github-mcp-server", "disabled")])
-          == (EV.REPORTS_NEITHER, None), "neither")
+          == (EV.REPORTS_NEITHER, []), "neither")
+    check("...a spelling that appears TWICE carries both statuses to its caller",
+          EV.declared_spelling([(EV.CONFIG_KEY, "pending"), (EV.CONFIG_KEY, "connected")])
+          == (EV.REPORTS_CONFIG_KEY, ["pending", "connected"]), "sequence preserved")
     check("the two names really are distinct, or every arm above is vacuous",
           EV.CONFIG_KEY != EV.ADVERTISED_NAME, (EV.CONFIG_KEY, EV.ADVERTISED_NAME))
 
-    # -- mcp_tool_name / name_format: the separator is the SUBJECT ---------------------------
+    # -- tool_names / canonical_name: the two sources must not be flattened -----------------
+    # THE ARM THE REVIEW ADDED. The docstring said the execution event and the model's request
+    # can disagree and that the disagreement matters — and the code then returned bare strings
+    # and took whichever came first, so the case it named could not be reported.
+    _exec_line = json.dumps({"type": "tool.execution_start",
+                             "data": {"toolName": f"mcp__{EV.CONFIG_KEY}__{EV.TOOL}"}}) + "\n"
+    _req_line = json.dumps({"type": "assistant.message", "data": {"toolRequests": [
+        {"toolName": f"{EV.CONFIG_KEY}.{EV.TOOL}"}]}}) + "\n"
+    _pairs = EV.tool_names(EV.parse_events(_exec_line + _req_line))
+    check("a name is reported WITH the source that said it",
+          sorted(_pairs) == sorted([(EV.EXECUTION, f"mcp__{EV.CONFIG_KEY}__{EV.TOOL}"),
+                                    (EV.REQUEST, f"{EV.CONFIG_KEY}.{EV.TOOL}")]), _pairs)
+    _split = EV.mcp_names_by_source(_pairs)
+    check("...so two sources spelling it differently are BOTH kept",
+          set(_split) == {EV.EXECUTION, EV.REQUEST}, _split)
+    check("...and the disagreement is AMBIGUOUS, never resolved by whichever came first",
+          EV.format_reading(_split) == (EV.AMBIGUOUS, None), EV.format_reading(_split))
+    _agree = EV.mcp_names_by_source(EV.tool_names(EV.parse_events(
+        _exec_line + json.dumps({"type": "assistant.message", "data": {"toolRequests": [
+            {"toolName": f"mcp__{EV.CONFIG_KEY}__{EV.TOOL}"}]}}) + "\n")))
+    check("...while two sources AGREEING yields the one name and its shape",
+          EV.format_reading(_agree)
+          == (EV.CLAUDE_STYLE, f"mcp__{EV.CONFIG_KEY}__{EV.TOOL}"), EV.format_reading(_agree))
+    check("...and a run where no source named our tool is UNMEASURED, with nothing to dispute",
+          EV.format_reading({}) == (EV.UNMEASURED, None), EV.format_reading({}))
+
+    # -- name_format: the separator is the SUBJECT -------------------------------------------
     # A matcher spelled with a separator could only ever confirm the guess it was written
-    # with, which is why `mcp_tool_name` tests for both COMPONENTS. These arms drive every
+    # with, which is why `is_our_tool` tests for both COMPONENTS. These arms drive every
     # shape the fleet is known to use plus one nobody predicted.
     _builtin = ["shell", "view"]
     check("built-in tool names are not mistaken for the MCP one",
-          EV.mcp_tool_name(_builtin) is None, _builtin)
+          not any(EV.is_our_tool(n) for n in _builtin), _builtin)
     for _shape, _expect in (
             (f"mcp__{EV.CONFIG_KEY}__{EV.TOOL}", EV.CLAUDE_STYLE),
             (f"mcp_{EV.CONFIG_KEY}_{EV.TOOL}", EV.AGY_STYLE),
             (f"{EV.CONFIG_KEY}.{EV.TOOL}", EV.DOTTED),
+            (f"{EV.CONFIG_KEY}-{EV.TOOL}", EV.HYPHEN),
             (f"{EV.ADVERTISED_NAME}.{EV.TOOL}", EV.DOTTED)):
+        _by = EV.mcp_names_by_source([(EV.EXECUTION, n) for n in _builtin + [_shape]])
         check(f"the shape {_shape!r} is found and classified {_expect}",
-              EV.name_format(EV.mcp_tool_name(_builtin + [_shape])) == _expect, _shape)
+              EV.format_reading(_by) == (_expect, _shape), (_shape, _by))
     check("a shape nobody predicted is OTHER — a finding, not a crash and not a guess",
           EV.name_format(f"{EV.CONFIG_KEY}::{EV.TOOL}") == EV.OTHER, "unknown separator")
     # THE LOAD-BEARING ONE. No MCP call in the stream must NOT read as "no prefix": that is a
     # fleet-wide negative drawn from a row nobody answered, and it would tell slice 4 to match
     # a bare tool name.
     check("no MCP tool call at all is UNMEASURED, never BARE",
-          EV.name_format(EV.mcp_tool_name(_builtin)) == EV.UNMEASURED
-          and EV.UNMEASURED != EV.BARE, "absence is not a format")
+          EV.name_format(None) == EV.UNMEASURED and EV.UNMEASURED != EV.BARE,
+          "absence is not a format")
 
-    # -- secret_verdict: the positive control IS the measurement -----------------------------
-    _sent = "SENT-deadbeef"
+    # -- mcp_fields: the better answer, with its own structural clause -----------------------
+    # copilot 1.0.80 names the server and tool in separate fields beside the composite, which
+    # is what slice 4 should match on. The clause is `executions`: with no tool execution at
+    # all, an empty field list says nothing about whether the fields exist.
+    check("no execution at all is UNMEASURED, not `the fields are absent`",
+          EV.fields_verdict([], 0)[0] == EV.FIELDS_UNMEASURED, "empty quantifier")
+    check("...an execution that carried no such fields IS a negative finding",
+          EV.fields_verdict([], 3)[0] == EV.FIELDS_ABSENT, "ran and did not name them")
+    check("...and our server and tool named in their own fields is FIELDS_PRESENT",
+          EV.fields_verdict([(EV.CONFIG_KEY, EV.TOOL)], 1)[0] == EV.FIELDS_PRESENT, "present")
+    check("...while somebody ELSE's MCP server in those fields is not ours",
+          EV.fields_verdict([("github", "search")], 1)[0] == EV.FIELDS_ABSENT, "not ours")
+    check("`executions` counts the execution events, so the clause cannot be inferred from "
+          "what it gates",
+          EV.executions(EV.parse_events(_exec_line + _req_line)) == 1,
+          EV.executions(EV.parse_events(_exec_line + _req_line)))
+
+    # -- the secret arm's own witnesses, on rows THE FIXTURE wrote ---------------------------
+    # NOT HAND-TYPED, for §E19's reason: `served_tool` and `held_sentinel` are the probe's
+    # private copy of the echo fixture's receipt spelling, and a synthetic row would agree
+    # with whatever the probe expects. These are produced by running the fixture.
+    _sent = "SENT-" + "ab" * 16
+    _r_full = os.path.join(_e21, "secret-full.jsonl")
+    run([{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+          "params": {"name": EV.TOOL, "arguments": {"text": "HI"}}}],
+        server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": _r_full, "ECHO_MCP_IDENTITY": _sent})
+    _r_nocall = os.path.join(_e21, "secret-nocall.jsonl")
+    run([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}],
+        server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": _r_nocall, "ECHO_MCP_IDENTITY": _sent})
+    _r_other = os.path.join(_e21, "secret-other.jsonl")
+    run([{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+          "params": {"name": EV.TOOL, "arguments": {"text": "HI"}}}],
+        server=ECHO, extra_env={"ECHO_MCP_RECEIPTS": _r_other,
+                                "ECHO_MCP_IDENTITY": "SENT-" + "cd" * 16})
+    _rows_full = EV.read_receipts(_r_full)
+    _rows_nocall = EV.read_receipts(_r_nocall)
+    _rows_other = EV.read_receipts(_r_other)
+    check("the probe's receipt reader agrees with what the echo fixture actually writes",
+          EV.served_tool(_rows_full) and EV.held_sentinel(_rows_full, _sent), _rows_full)
+    check("...a run that listed tools but never CALLED ours is not an exchange",
+          EV.held_sentinel(_rows_nocall, _sent) and not EV.served_tool(_rows_nocall),
+          _rows_nocall)
+    check("...a server holding a DIFFERENT marker is not this run's exchange either",
+          EV.served_tool(_rows_other) and not EV.held_sentinel(_rows_other, _sent), _rows_other)
+    check("...so `arm_exchanged` is the conjunction and each half can veto it",
+          EV.arm_exchanged(_rows_full, _sent)
+          and not EV.arm_exchanged(_rows_nocall, _sent)
+          and not EV.arm_exchanged(_rows_other, _sent), "both facts required")
+    check("...and NO receipts at all — the arm that never ran — is not an exchange",
+          not EV.arm_exchanged([], _sent), "the empty case")
+
+    # -- secret_verdict: TWO structural gates, and the review's reproduction -----------------
     check("a control that never carried the sentinel measures nothing",
-          EV.secret_verdict("clean output", "clean output", _sent)[0] == EV.CONTROL_FAILED,
+          EV.secret_verdict("clean output", "clean output", _sent,
+                            secret_exchanged=True)[0] == EV.CONTROL_FAILED,
           "no value in the channel to redact")
-    check("...sentinel in the control and gone under the flag is REDACTS",
-          EV.secret_verdict(f"saw {_sent} here", "nothing here", _sent)[0] == EV.REDACTS,
-          "redacted")
+    # THE ARM THE REVIEW ADDED, and the exact case a reviewer reproduced: control fine, secret
+    # arm returns "". Absence of the sentinel from an arm that never made the call is the
+    # absence of the CALL. The old code certified REDACTS from it.
+    check("a secret arm that never ran the exchange cannot certify redaction",
+          EV.secret_verdict(f"saw {_sent} here", "", _sent,
+                            secret_exchanged=False)[0] == EV.SECRET_ARM_INCOMPLETE,
+          "an empty arm is not a redacted arm")
+    check("...and neither can one that produced plenty of output without calling the tool",
+          EV.secret_verdict(f"saw {_sent} here", "I could not find that server, sorry.", _sent,
+                            secret_exchanged=False)[0] == EV.SECRET_ARM_INCOMPLETE,
+          "nonempty is not exchanged")
+    check("...sentinel in the control, exchange made, and gone under the flag is REDACTS",
+          EV.secret_verdict(f"saw {_sent} here", "nothing here", _sent,
+                            secret_exchanged=True)[0] == EV.REDACTS, "redacted")
     check("...sentinel in both is NO_REDACTION",
-          EV.secret_verdict(f"saw {_sent}", f"still {_sent}", _sent)[0] == EV.NO_REDACTION,
-          "not redacted")
+          EV.secret_verdict(f"saw {_sent}", f"still {_sent}", _sent,
+                            secret_exchanged=True)[0] == EV.NO_REDACTION, "not redacted")
 
     # -- answered(): a conjunction, so any single gap fails it -------------------------------
     # The tell for a lookup-on-the-last-value bug is that ONE unanswered term still passes.
@@ -4312,15 +4500,74 @@ try:
           EV.answered(EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.REDACTS), "all three")
     for _f, _s, _x, _why in (
             (EV.UNMEASURED, EV.REPORTS_CONFIG_KEY, EV.REDACTS, "format unmeasured"),
+            (EV.AMBIGUOUS, EV.REPORTS_CONFIG_KEY, EV.REDACTS, "two spellings, so no answer"),
             (EV.CLAUDE_STYLE, EV.REPORTS_NEITHER, EV.REDACTS, "server never named"),
-            (EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.CONTROL_FAILED, "secret control failed")):
+            (EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.CONTROL_FAILED, "secret control failed"),
+            (EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.SECRET_ARM_INCOMPLETE,
+             "secret arm never exchanged")):
         check(f"...and ONE gap ({_why}) is enough to fail it", not EV.answered(_f, _s, _x), _why)
     check("NO_REDACTION is an ANSWER, not a gap — a finding still settles the question",
           EV.answered(EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.NO_REDACTION), "negative answer")
 
-    # -- type_omission_verdict: structural clause before the finding -------------------------
-    # ROWS AUTHORED BY THE FIXTURE, then narrowed by dropping rows — so all three cases are
-    # real subsets of a real run rather than dicts that agree with whatever the reader expects
+    # -- agreed_version: an arm that produced NOTHING is not excused ------------------------
+    # Filtering the empty streams out before this is what let a vanished secret arm ride
+    # through (review, PR #120), so the caller now hands over every arm it launched.
+    check("an arm with no output has no witness, and that fails agreement",
+          not EV.agreed_version([_real_loaded + "\n" + REAL_VERSION_LINE, ""])[1],
+          EV.agreed_version([_real_loaded + "\n" + REAL_VERSION_LINE, ""]))
+    check("...while two arms carrying the SAME real version agree",
+          EV.agreed_version([REAL_VERSION_LINE, REAL_VERSION_LINE])[1],
+          EV.agreed_version([REAL_VERSION_LINE, REAL_VERSION_LINE]))
+
+    # -- main(): the reviewer's reproduction, end to end -------------------------------------
+    # THE UNIT ARMS ABOVE TEST THE VERDICTS; THIS TESTS THE WIRING, and the wiring is where the
+    # reproduction lived — "main() returns 0 with the secret arm returning ''". Two gates now
+    # stand between that run and a 0, and they are independent, so each mode below is a run
+    # only ONE of them stops: the good mode proves a 0 is reachable at all (without it every
+    # negative here passes for the wrong reason), and each failing mode isolates one gate.
+    _mode = ["good"]
+
+    def _fake_arm(_workdir, sentinel, *, redact):
+        rows = [{"kind": "listening",
+                 "identity_digest": hashlib.sha256(sentinel.encode("utf-8")).hexdigest()},
+                {"kind": "request", "method": "tools/call", "tool": EV.TOOL}]
+        stream = (REAL_VERSION_LINE + _real_loaded + "\n" + _real_exec + "\n"
+                  + ("" if redact else f"the tool replied {sentinel}:HELLO\n"))
+        if not redact:
+            return stream, rows
+        if _mode[0] == "empty":            # the arm vanished: no stream, no receipts
+            return "", []
+        if _mode[0] == "stream_lost":      # it ran and served, but its stream never arrived
+            return "", rows
+        if _mode[0] == "no_call":          # it ran and answered WITHOUT ever calling the tool
+            return stream, []
+        return stream, rows
+
+    # `EV.main()` mints its own workdir and deliberately does NOT delete it — the real probe's
+    # artifacts are the point. Here that would leave four directories behind per verifier run,
+    # so the process default is pointed inside `_e21`, which the `finally` below removes.
+    _real_arm, _saved_tmpdir = EV.run_arm, tempfile.tempdir
+    try:
+        tempfile.tempdir = _e21
+        EV.run_arm = _fake_arm
+        _mode[0] = "good"
+        check("a complete pair of arms ANSWERS and exits 0, or every mode below is vacuous",
+              EV.main() == 0, "the positive control for this block")
+        _mode[0] = "empty"
+        check("...the secret arm returning '' does NOT exit 0 — the reproduction, closed",
+              EV.main() == 1, "an absent arm cannot certify redaction")
+        _mode[0] = "no_call"
+        check("...nor does a secret arm that produced plenty of output and never called the tool",
+              EV.main() == 1, "the absence of the call is not the absence of the value")
+        _mode[0] = "stream_lost"
+        check("...nor one that served the call but whose stream carries no version witness",
+              EV.main() == 1, "an arm with no in-band build is not accounted for")
+    finally:
+        EV.run_arm, tempfile.tempdir = _real_arm, _saved_tmpdir
+
+    # -- type_omission_verdict: a PAIRED control, not a bare negative ------------------------
+    # ROWS AUTHORED BY THE FIXTURE, then narrowed by dropping rows — so every case is a real
+    # subset of a real run rather than dicts that agree with whatever the reader expects
     # (the §E19 argument, one classifier over).
     _omit_receipts = os.path.join(_e21, "omit-receipts.jsonl")
     HTTPF.RECEIPTS = HTTPF.Receipts(_omit_receipts)
@@ -4339,15 +4586,55 @@ try:
     _no_listen = [r for r in _full if CRG.called([r], "echo")]
     check("fixture-authored rows really do show a served call, or every arm below is vacuous",
           CRG.server_ran(_full) and CRG.called(_full, "echo"), _full)
-    check("a listening server that served the tool STARTS_WITHOUT_TYPE",
-          CRG.type_omission_verdict(_full)[0] == CRG.STARTS_WITHOUT_TYPE, _full)
-    check("...a listening server that served nothing NEVER_STARTS",
-          CRG.type_omission_verdict(_listening)[0] == CRG.NEVER_STARTS, _listening)
-    # THE STRUCTURAL CLAUSE. Without `server_ran` asked first, a fixture that never started
+    # The copilot-side halves. `reported_status` is the witness that does not depend on the
+    # model choosing to call anything, which is the whole repair.
+    _conn = _loaded_line({"name": CRG.SERVER_KEY, "status": CRG.CONNECTED})
+    _pending = (_loaded_line({"name": CRG.SERVER_KEY, "status": "pending"})
+                + _changed_line(CRG.SERVER_KEY, "failed"))
+    _silent = _loaded_line({"name": "somebody-elses-server", "status": CRG.CONNECTED})
+    check("`reported_status` reads copilot's own last word about OUR server",
+          CRG.reported_status(_conn) == CRG.CONNECTED
+          and CRG.reported_status(_pending) == "failed"
+          and CRG.reported_status(_silent) is None,
+          (CRG.reported_status(_conn), CRG.reported_status(_pending)))
+    check("a listening server that served the tool, with a sound control, STARTS_WITHOUT_TYPE",
+          CRG.type_omission_verdict(_full, _conn, _full, _conn)[0] == CRG.STARTS_WITHOUT_TYPE,
+          "served")
+    check("...and copilot reporting it `connected` settles it even with no call at all",
+          CRG.type_omission_verdict(_listening, _conn, _full, _conn)[0]
+          == CRG.STARTS_WITHOUT_TYPE,
+          "the connection witness does not need the model's cooperation")
+    check("...a server copilot reported in a NON-connected state NEVER_STARTS",
+          CRG.type_omission_verdict(_listening, _pending, _full, _conn)[0] == CRG.NEVER_STARTS,
+          "reported failed without the key")
+    check("...and one copilot never listed, while the control WAS listed, NEVER_STARTS",
+          CRG.type_omission_verdict(_listening, _silent, _full, _conn)[0] == CRG.NEVER_STARTS,
+          "listed with the key, absent without it")
+    # THE ARM THE REVIEW ADDED, and the reason this signature grew a control. A listening
+    # fixture with no call proves nothing about the key: the probe starts that fixture itself,
+    # and a turn where the model simply never called the tool produces identical receipts. The
+    # old one-argument verdict published NEVER_STARTS from exactly this.
+    check("a bare arm with no call and no status is UNMEASURED when copilot reported nothing",
+          CRG.type_omission_verdict(_listening, _silent, _full, _silent)[0]
+          == CRG.OMISSION_UNMEASURED,
+          "a control sound only on its CALL leaves the bare arm's silence unattributable")
+    check("...and a control that never connected and never got a call is INSTRUMENT_FAILED",
+          CRG.type_omission_verdict(_full, _conn, _listening, _silent)[0]
+          == CRG.INSTRUMENT_FAILED,
+          "no positive control, so the bare arm measures the prompt")
+    # THE STRUCTURAL CLAUSES. Without `server_ran` asked first, a fixture that never started
     # produces "the tool never arrived" and would be reported as a finding about `type` —
-    # an instrument failure wearing the answer's clothes.
-    check("...but a server that never announced itself is INSTRUMENT_FAILED, not a finding",
-          CRG.type_omission_verdict(_no_listen)[0] == CRG.INSTRUMENT_FAILED, _no_listen)
+    # an instrument failure wearing the answer's clothes. Asked of BOTH fixtures, because a
+    # control that never bound is not a control.
+    check("...but a bare arm whose server never announced itself is INSTRUMENT_FAILED",
+          CRG.type_omission_verdict(_no_listen, _conn, _full, _conn)[0] == CRG.INSTRUMENT_FAILED,
+          _no_listen)
+    check("...and a CONTROL whose server never announced itself is INSTRUMENT_FAILED too",
+          CRG.type_omission_verdict(_full, _conn, _no_listen, _conn)[0] == CRG.INSTRUMENT_FAILED,
+          "an unbound control is not a control")
+    check("OMISSION_UNMEASURED is not one of the answers the probe exits 0 on",
+          CRG.OMISSION_UNMEASURED not in (CRG.STARTS_WITHOUT_TYPE, CRG.NEVER_STARTS),
+          "an unmeasured arm must not pass for a finding")
 
     # -- the omission arm must actually omit the key -----------------------------------------
     # The arm is worthless if `write_type=False` still writes it, and that is a one-character
@@ -4356,12 +4643,17 @@ try:
                               tools=None, write_type=False)
     _cfg_on = CRG.mcp_config(os.path.join(_e21, "on.json"), "http://x/mcp", "tok", "http",
                              tools=None, write_type=True)
-    _off = json.loads(open(_cfg_off, encoding="utf-8").read())["mcpServers"]["echo"]
-    _on = json.loads(open(_cfg_on, encoding="utf-8").read())["mcpServers"]["echo"]
+    _off = json.loads(open(_cfg_off, encoding="utf-8").read())["mcpServers"][CRG.SERVER_KEY]
+    _on = json.loads(open(_cfg_on, encoding="utf-8").read())["mcpServers"][CRG.SERVER_KEY]
     check("write_type=False really omits the key, and True really writes it",
           "type" not in _off and _on.get("type") == "http", (_off, _on))
     check("...and nothing ELSE differs between the two shapes, so the arm varies one thing",
           {k: v for k, v in _on.items() if k != "type"} == _off, (_on, _off))
+    # THE STATUS READER IS IMPORTED, NOT COPIED. A second reader of the same two events could
+    # disagree with the first silently, and §4 spends a rule on exactly that.
+    check("the remote probe reads statuses through the events probe, not a private copy",
+          CRG.statuses_for is EV.statuses_for and CRG.effective_status is EV.effective_status,
+          "one reader")
 finally:
     shutil.rmtree(_e21, ignore_errors=True)
 

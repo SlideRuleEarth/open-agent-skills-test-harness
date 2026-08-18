@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff AN
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff + shellcheck + a parse under every shell
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 176/176 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 589 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 188/188 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 633 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine
 git diff --check
@@ -2006,6 +2006,32 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   the reading was about the instrument. The direction of the error is the dangerous one, because
   a false POSITIVE here sends the next reader hunting a leak that is not there — and the same
   mistake in the other direction, a filter that excludes too much, would hide a real one.
+- **FOUR FINDINGS ACROSS THREE PROBES, ONE DEFECT: an absence read as a result, from an
+  instrument whose own participation was never established.** Every finding of the PR #120/#121 review was this,
+  wearing a different coat. A `--secret-env-vars` arm that returned the empty string certified
+  redaction — the sentinel was missing because nothing ran, not because anything was redacted. A
+  `type`-omission arm that received no tool call certified that copilot had rejected the config —
+  but the probe starts that fixture itself, so "listening" says nothing about the client, and a
+  turn where the model simply never called the tool produces byte-identical receipts. A candidate
+  `--disable-mcp-server` spelling whose run produced no stream at all joined the list of
+  "spellings that do not work". And a server's status sequence read at its FIRST element reported
+  a dead server healthy, in a reader whose own docstring had argued that reading the first event
+  would miss exactly that.
+  **The generalization is not "add a control".** Three of the four HAD a control; what they
+  lacked was a positive fact about *the arm the conclusion is about*. A control proves the
+  quantity can be produced — it says nothing about whether the other arm produced it. So the
+  repair is: **name the positive fact the reading requires, and get it from somewhere the subject
+  does not author.** The fixture's own receipts for the exchange (a different process, and the
+  marker never appears there — only its digest). Copilot's own connection status for whether it
+  understood a config, since the MCP host decides that before the model acts. A paired arm
+  differing in ONE key for whether this machine and this turn can produce the result at all. The
+  last status rather than the first, because a transient (`pending`) precedes the answer.
+  **And the offline checks had all been green**, because they had been written from the same
+  understanding as the code — the arms encoded the probes' false positives rather than their
+  answers. An arm that cannot fail on the case the code gets wrong is not coverage; the tell is
+  that no arm drives the *distinguishing* case, and here that meant no arm where the treatment
+  arm is silent while the control speaks. Each repaired predicate now has an arm that fails
+  against the code as it stood, and a mutation aimed at the clause that decides it.
 - **A single-line anchor aimed at `mutate_mcp.py` itself matches TWICE**, and one of the two is
   the mutation entry quoting it. It is refused up front by `stale_anchors` rather than silently
   mutating the list instead of the code, but the fix is not obvious from the message: pin it

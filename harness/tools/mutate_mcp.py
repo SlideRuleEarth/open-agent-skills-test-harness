@@ -141,6 +141,9 @@ CGATE_REMOTE = "tools/probe_copilot_remote_gating.py"
 # rather than server-side receipts. Slice 2's witness change and slice 4's parser are both
 # about to be built on the words it prints, which is the same weight the three above carry.
 CEVENTS = "tools/probe_copilot_events.py"
+# The plugin probe reads a SUPPRESSION, so its whole risk is a false negative: an instrument
+# that never loaded a plugin publishing "the flag does not reach plugin servers" about a
+# hermeticity control. Its mutations are correspondingly about the control and about absence.
 # The proxy's I/O half and the awkward server it is driven against. PRODUCTION code that no
 # selftest arm can reach — it is only executed by running the real program over real pipes —
 # so it is `M*` like any other production target, proven by a THIRD suite. The classification
@@ -3003,14 +3006,14 @@ MUTATIONS = [
      "a control that never carried the sentinel measures nothing"),
     # A conjunction over three questions, not a lookup on the last one read.
     ("F173-two-answered-questions-are-enough", CEVENTS,
-     "    return (fmt != UNMEASURED\n            and spelling != REPORTS_NEITHER",
-     "    return (fmt != UNMEASURED\n            or spelling != REPORTS_NEITHER",
+     "    return (fmt not in (UNMEASURED, AMBIGUOUS)\n            and spelling != REPORTS_NEITHER",
+     "    return (fmt not in (UNMEASURED, AMBIGUOUS)\n            or spelling != REPORTS_NEITHER",
      "...and ONE gap (server never named) is enough to fail it"),
     # The advertised name and the config key are the whole reason question 2 is answerable.
     # Checking only one spelling makes the other read as "our server never appeared".
     ("F174-only-the-config-key-is-ever-recognised", CEVENTS,
-     "    for name, status in seen:\n        if name == ADVERTISED_NAME:\n            return REPORTS_ADVERTISED, status",
-     "    for name, status in seen:\n        if False:\n            return REPORTS_ADVERTISED, status",
+     "                           (REPORTS_ADVERTISED, ADVERTISED_NAME)):",
+     "                           (REPORTS_CONFIG_KEY, CONFIG_KEY)):",
      "...the ADVERTISED name is recognised as a different answer"),
     # A witness that reads only the first event cannot see a server that failed later — the
     # exact transition slice 2 exists to classify.
@@ -3021,14 +3024,89 @@ MUTATIONS = [
     # The structural clause. Without it, a fixture that never started reports "the tool never
     # arrived" and it is published as a finding about `type`.
     ("F176-an-unstarted-fixture-becomes-a-type-finding", CGATE_REMOTE,
-     "    if not server_ran(records):\n        return INSTRUMENT_FAILED, (",
-     "    if False:\n        return INSTRUMENT_FAILED, (",
-     "...but a server that never announced itself is INSTRUMENT_FAILED, not a finding"),
+     "    if not server_ran(bare_records):",
+     "    if False:",
+     "...but a bare arm whose server never announced itself is INSTRUMENT_FAILED"),
     # The arm is worthless if the flag does not change the shape it writes.
     ("F177-the-omission-arm-writes-type-anyway", CGATE_REMOTE,
      '    if write_type:\n        server["type"] = kind',
      '    if True:\n        server["type"] = kind',
      "write_type=False really omits the key, and True really writes it"),
+    # --- PR #120/#121 review: the predicates that were added because the old ones could
+    # --- not fail on the cases that mattered ----------------------------------------------
+    # THE READER WAS FIXED AND THE CONCLUSION WAS NOT. `loaded_servers` was written to see a
+    # server that came up healthy and then failed; its first consumer took the FIRST match.
+    ("F184-the-first-status-is-taken-as-the-runs-answer", CEVENTS,
+     "    return statuses[-1] if statuses else None",
+     "    return statuses[0] if statuses else None",
+     "a server that came up healthy and then FAILED reports `failed`, not `connected`"),
+    # Two sources spelling one tool differently is a question with two answers. Resolving it
+    # by iteration order hands slice 4 a canonical name nobody established.
+    ("F185-a-disagreement-is-resolved-by-whichever-came-first", CEVENTS,
+     "    if len(distinct) > 1:\n        return None, False",
+     "    if len(distinct) > 2:\n        return None, False",
+     "...and the disagreement is AMBIGUOUS, never resolved by whichever came first"),
+    # THE REVIEWER'S REPRODUCTION. Absence of the sentinel from an arm that never made the
+    # call is the absence of the CALL.
+    ("F186-an-arm-that-never-called-certifies-redaction", CEVENTS,
+     "    if not secret_exchanged:\n        return SECRET_ARM_INCOMPLETE, (",
+     "    if False:\n        return SECRET_ARM_INCOMPLETE, (",
+     "a secret arm that never ran the exchange cannot certify redaction"),
+    # Both halves are required: a call with the wrong marker, and the right marker with no
+    # call, are each satisfied by a run that could not have put the value into the output.
+    ("F187-either-half-of-the-exchange-will-do", CEVENTS,
+     "    return held_sentinel(records, sentinel) and served_tool(records)",
+     "    return held_sentinel(records, sentinel) or served_tool(records)",
+     "...so `arm_exchanged` is the conjunction and each half can veto it"),
+    # The marker check is what ties the fixture to THIS run; without it any echo server that
+    # ever ran would do.
+    ("F188-any-servers-marker-will-do", CEVENTS,
+     '    return any(r.get("kind") == "listening" and r.get("identity_digest") == want',
+     '    return any(r.get("kind") == "listening" and r.get("identity_digest") != want',
+     "...a server holding a DIFFERENT marker is not this run's exchange either"),
+    # AN ARM THAT PRODUCED NOTHING IS THE ONE WHOSE BUILD IS LEAST ACCOUNTED FOR. Filtering
+    # the empties out before agreement is what let a vanished secret arm ride through.
+    ("F189-an-arm-with-no-stream-is-excused-from-agreement", CEVENTS,
+     "    version, version_ok = agreed_version([control, secret])",
+     "    version, version_ok = agreed_version([s for s in (control, secret) if s])",
+     "...nor one that served the call but whose stream carries no version witness"),
+    # The gate must read the receipts of the arm it is judging, not the arm beside it.
+    ("F190-the-controls-receipts-vouch-for-the-secret-arm", CEVENTS,
+     "                                  secret_exchanged=arm_exchanged(secret_receipts, sentinel))",
+     "                                  secret_exchanged=arm_exchanged(control_receipts, sentinel))",
+     "...nor does a secret arm that produced plenty of output and never called the tool"),
+    # An empty field list from a run with no tool execution says nothing about the fields.
+    ("F191-no-execution-reads-as-the-fields-being-absent", CEVENTS,
+     "    if not executions:\n        return FIELDS_UNMEASURED, (",
+     "    if False:\n        return FIELDS_UNMEASURED, (",
+     "no execution at all is UNMEASURED, not `the fields are absent`"),
+    # --- the `type`-omission arm's paired control -----------------------------------------
+    # WITHOUT A POSITIVE CONTROL the bare arm's silence measures the prompt, the machine or
+    # the model, and it gets published as a finding about the key.
+    ("F196-the-bare-arm-needs-no-positive-control", CGATE_REMOTE,
+     "    if control_status != CONNECTED and not called(control_records, ALLOWED):",
+     "    if False:",
+     "...and a control that never connected and never got a call is INSTRUMENT_FAILED"),
+    # A control whose fixture never bound is not a control.
+    ("F197-an-unbound-control-is-still-a-control", CGATE_REMOTE,
+     "    if not server_ran(control_records):",
+     "    if False:",
+     "...and a CONTROL whose server never announced itself is INSTRUMENT_FAILED too"),
+    # BOTH arms of the pair must reach version agreement: a control that executed a different
+    # build makes the comparison meaningless just as surely as a bare arm that did. TWO
+    # MUTATIONS, ONE PER DIRECTION, because a single one is killed by whichever arm it happens
+    # to drop and says nothing about the other — the first version of this pair named the bare
+    # arm's check while dropping the CONTROL's stream, and the suite reported it as failing via
+    # the wrong arm (mutation run, PR #120). `outs` is `[control, bare]`, so the slice says
+    # which one is being dropped.
+    ("F198-the-with-type-controls-build-is-not-pooled", CGATE_REMOTE,
+     "            all_streams.extend(outs)",
+     "            all_streams.extend(outs[1:])",
+     "...as is its WITH-`type` control's, which is now half the measurement"),
+    ("F199-only-the-controls-build-is-pooled", CGATE_REMOTE,
+     "            all_streams.extend(outs)",
+     "            all_streams.extend(outs[:1])",
+     "...and the `type`-omission arm's own build is pooled with the rest"),
     ("F41-the-bearer-need-only-arrive-once", CGATE_REMOTE,
      '    return all((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
      '    return any((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',

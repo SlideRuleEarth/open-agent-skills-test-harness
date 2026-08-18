@@ -1,0 +1,7 @@
+# VERBATIM lines from copilot 1.0.80, captured by tools/probe_copilot_events.py on
+# 2026-08-18. Kept so the synthetic streams in verify_mcp_fixtures.py §E21 are pinned to
+# a shape a real build actually emitted: if copilot changes these events, §E21 reddens
+# and every synthetic arm under it is known to describe a stream that no longer exists.
+# Lines starting with # are comments; everything else is one event, exactly as received.
+{"type":"session.mcp_servers_loaded","data":{"servers":[{"name":"cfgkeyzulu","status":"connected","transport":"stdio"}]},"ephemeral":true,"id":"35bf1eb0-46a7-49e3-b5d2-978c829646de","timestamp":"2026-08-18T13:10:33.061Z","parentId":"db38d64a-c17c-4bed-aaec-de6f0eb7caae"}
+{"type":"tool.execution_start","data":{"toolCallId":"toolu_01JB8LirzjRrNNyMgdTpX8J6","toolName":"cfgkeyzulu-echo","arguments":{"text":"HELLO"},"turnId":"0","model":"claude-sonnet-5","rte":true,"mcpServerName":"cfgkeyzulu","mcpToolName":"echo"},"id":"c4eb3347-594e-4535-bd7d-dec2c88a77f9","timestamp":"2026-08-18T13:10:34.764Z","parentId":"f2a329d0-92af-415c-8953-3762b56bbea8"}
