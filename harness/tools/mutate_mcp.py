@@ -3006,14 +3006,14 @@ MUTATIONS = [
      "a control that never carried the sentinel measures nothing"),
     # A conjunction over three questions, not a lookup on the last one read.
     ("F173-two-answered-questions-are-enough", CEVENTS,
-     "    return (fmt not in (UNMEASURED, AMBIGUOUS)\n            and spelling != REPORTS_NEITHER",
-     "    return (fmt not in (UNMEASURED, AMBIGUOUS)\n            or spelling != REPORTS_NEITHER",
+     "    return (fmt not in (UNMEASURED, AMBIGUOUS, ONE_SOURCE_ONLY)\n            and spelling not in",
+     "    return (fmt not in (UNMEASURED, AMBIGUOUS, ONE_SOURCE_ONLY)\n            or spelling not in",
      "...and ONE gap (server never named) is enough to fail it"),
     # The advertised name and the config key are the whole reason question 2 is answerable.
     # Checking only one spelling makes the other read as "our server never appeared".
     ("F174-only-the-config-key-is-ever-recognised", CEVENTS,
-     "                           (REPORTS_ADVERTISED, ADVERTISED_NAME)):",
-     "                           (REPORTS_CONFIG_KEY, CONFIG_KEY)):",
+     "    by_advertised = statuses_for(seen, ADVERTISED_NAME)",
+     "    by_advertised = []",
      "...the ADVERTISED name is recognised as a different answer"),
     # A witness that reads only the first event cannot see a server that failed later — the
     # exact transition slice 2 exists to classify.
@@ -3043,8 +3043,8 @@ MUTATIONS = [
     # Two sources spelling one tool differently is a question with two answers. Resolving it
     # by iteration order hands slice 4 a canonical name nobody established.
     ("F185-a-disagreement-is-resolved-by-whichever-came-first", CEVENTS,
-     "    if len(distinct) > 1:\n        return None, False",
-     "    if len(distinct) > 2:\n        return None, False",
+     "    if len(distinct) > 1:\n        return DISAGREED",
+     "    if len(distinct) > 2:\n        return DISAGREED",
      "...and the disagreement is AMBIGUOUS, never resolved by whichever came first"),
     # THE REVIEWER'S REPRODUCTION. Absence of the sentinel from an arm that never made the
     # call is the absence of the CALL.
@@ -3055,8 +3055,8 @@ MUTATIONS = [
     # Both halves are required: a call with the wrong marker, and the right marker with no
     # call, are each satisfied by a run that could not have put the value into the output.
     ("F187-either-half-of-the-exchange-will-do", CEVENTS,
-     "    return held_sentinel(records, sentinel) and served_tool(records)",
-     "    return held_sentinel(records, sentinel) or served_tool(records)",
+     "    return held_sentinel(records, sentinel) and answered_with_marker(records)",
+     "    return held_sentinel(records, sentinel) or answered_with_marker(records)",
      "...so `arm_exchanged` is the conjunction and each half can veto it"),
     # The marker check is what ties the fixture to THIS run; without it any echo server that
     # ever ran would do.
@@ -3107,6 +3107,61 @@ MUTATIONS = [
      "            all_streams.extend(outs)",
      "            all_streams.extend(outs[:1])",
      "...and the `type`-omission arm's own build is pooled with the rest"),
+    # --- PR #120, second review round: four classifiers that could not fail on the case
+    # --- they were written for ------------------------------------------------------------
+    # AGREEMENT NEEDS TWO PARTIES. One source saying one thing is one observation and one
+    # UNOBSERVED source, and reading it as agreement exits ANSWERED under a conclusion that
+    # says "both sources, identically".
+    ("F200-one-source-counts-as-agreement", CEVENTS,
+     "    if any(not by_source.get(src) for src in EXPECTED_SOURCES):\n        return PARTIAL",
+     "    if False:\n        return PARTIAL",
+     "only the 'execution' source speaking is ONE_SOURCE_ONLY, not AGREED"),
+    # A PARTIAL reading is not an answer, whatever the classifier calls it.
+    ("F201-a-partial-source-reading-still-answers", CEVENTS,
+     "    return (fmt not in (UNMEASURED, AMBIGUOUS, ONE_SOURCE_ONLY)\n",
+     "    return (fmt not in (UNMEASURED, AMBIGUOUS)\n",
+     "...and ONE_SOURCE_ONLY is not an answer"),
+    # THE REQUEST ROW IS WRITTEN BEFORE THE SERVER DECIDES ANYTHING. A call refused on
+    # protocol grounds leaves the same row as a served one, and redaction read off it is a
+    # claim about a reply that was never produced.
+    # A WHOLE-PREDICATE MUTATION, and it has to be one: the repair is over-determined, because
+    # the `served` row carries a field the arrival row does not. Swapping the row kind alone
+    # leaves `carried_identity` unreadable and the predicate false for a DIFFERENT reason, so
+    # no single-clause edit expresses "arrival counted as an answer". This restores the exact
+    # predicate the review found and asks whether any arm notices the repair being undone.
+    ("F202-arrival-counts-as-an-answer", CEVENTS,
+     '    return any(r.get("kind") == "served" and r.get("method") == "tools/call"\n               and r.get("tool") == TOOL and r.get("carried_identity") is True\n               for r in records)',
+     '    return any(r.get("kind") == "request" and r.get("method") == "tools/call"\n               and r.get("tool") == TOOL for r in records)',
+     "a call that ARRIVED and was REJECTED is arrival without an answer"),
+    # An answer that carried no marker put no value on the wire, so its absence downstream
+    # measures nothing.
+    ("F203-a-reply-carrying-nothing-is-still-an-exchange", CEVENTS,
+     '    return any(r.get("kind") == "served" and r.get("method") == "tools/call"\n               and r.get("tool") == TOOL and r.get("carried_identity") is True',
+     '    return any(r.get("kind") == "served" and r.get("method") == "tools/call"\n               and r.get("tool") == TOOL',
+     "...and a reply carrying NO marker is an answer without a value"),
+    # BOTH SERVER SPELLINGS IN ONE RUN is a finding about the contract. A priority order hides
+    # it twice: it reports one spelling confidently AND drops the final status.
+    ("F204-a-mixed-spelling-run-picks-the-config-key", CEVENTS,
+     "    if by_key and by_advertised:",
+     "    if False:",
+     "BOTH spellings in one run is REPORTS_BOTH, never the first one checked"),
+    ("F205-reports-both-still-answers", CEVENTS,
+     "            and spelling not in (REPORTS_NEITHER, REPORTS_BOTH)",
+     "            and spelling not in (REPORTS_NEITHER,)",
+     "...which `answered()` refuses, since a contract that is two things is not an answer"),
+    # `pending` IS THE ORDINARY TRANSIENT, measured by this same probe. Treating every
+    # non-`connected` status as the negative publishes a finding about the key from a
+    # truncated arm — and from any word a later build invents.
+    ("F206-every-non-connected-status-is-a-type-finding", CGATE_REMOTE,
+     "    if bare_status in TERMINAL_FAILURE:",
+     "    if bare_status is not None:",
+     "a bare arm ENDING at `pending` is UNMEASURED — that is the transient, not a failure"),
+    # "Our server was not listed" is evidence only from an arm that got far enough to say
+    # what it HAD.
+    ("F207-an-arm-that-published-nothing-still-decides", CGATE_REMOTE,
+     "    if control_status is not None and reported_inventory(bare_stream):",
+     "    if control_status is not None:",
+     "...but an arm that never published an inventory AT ALL is UNMEASURED, not a finding"),
     ("F41-the-bearer-need-only-arrive-once", CGATE_REMOTE,
      '    return all((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
      '    return any((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',

@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff AN
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff + shellcheck + a parse under every shell
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 188/188 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 633 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 196/196 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 658 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine
 git diff --check
@@ -2032,6 +2032,28 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   that no arm drives the *distinguishing* case, and here that meant no arm where the treatment
   arm is silent while the control speaks. Each repaired predicate now has an arm that fails
   against the code as it stood, and a mutation aimed at the clause that decides it.
+- **FIXING ALL FOUR SITES DID NOT EXHAUST THE PRINCIPLE — a second round found four more, and
+  they were the SIBLING defect: an intermediate reading promoted to a conclusion.** Where the
+  first round read *absence* as a result, these read a state that had not finished being one:
+  a tool call that ARRIVED as one that was answered (the fixture writes its request row before
+  it decides whether to reply at all, so a rejected call is byte-identical to a served one); a
+  `pending` server status — the transient this same probe had just recorded as preceding
+  `connected` — as a terminal failure, along with every word a later build might invent; ONE of
+  two expected event sources speaking as the two of them AGREEING; and two contradictory server
+  spellings in one run resolved by which the code checked first, which also silently dropped
+  the status carried under the loser.
+  **The unifying test is worth stating in one line: is the thing you read the quantity you are
+  claiming?** Arrival is not completion. A transient is not an outcome. One observation is not
+  agreement. A tie is not a winner. Each needed the same repair as round one — a positive fact
+  naming the actual quantity — and three of the four needed something that did not exist yet:
+  a new fixture row written *after* the reply flushed, a status vocabulary split by what each
+  word licenses rather than by equality with the good one, and `EXPECTED_SOURCES` to say what
+  agreement is judged against.
+  **The lesson for review, not just for code:** the first fix made the four named sites right
+  and left the *class* live, because it was stated as "add a witness" rather than as "the
+  reading is not the quantity". A repair phrased at the level of the reproduction leaves the
+  next instance to be found by the next reviewer — which is CLAUDE.md's first rule, arriving
+  in the thing that was supposed to be applying it.
 - **A single-line anchor aimed at `mutate_mcp.py` itself matches TWICE**, and one of the two is
   the mutation entry quoting it. It is refused up front by `stale_anchors` rather than silently
   mutating the list instead of the code, but the fix is not obvious from the message: pin it

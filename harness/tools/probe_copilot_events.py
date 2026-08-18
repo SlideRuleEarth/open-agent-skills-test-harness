@@ -85,10 +85,12 @@ BARE = "BARE"                        # <tool>, with no server component at all
 OTHER = "OTHER"                      # a real name in none of the above shapes
 UNMEASURED = "UNMEASURED"            # no MCP tool call reached the stream: NOT a format finding
 AMBIGUOUS = "AMBIGUOUS"              # the sources disagreed: there is no ONE canonical spelling
+ONE_SOURCE_ONLY = "ONE_SOURCE_ONLY"  # only one of the two sources spoke: agreement UNOBSERVED
 
 REPORTS_CONFIG_KEY = "REPORTS_CONFIG_KEY"
 REPORTS_ADVERTISED = "REPORTS_ADVERTISED"
 REPORTS_NEITHER = "REPORTS_NEITHER"
+REPORTS_BOTH = "REPORTS_BOTH"        # the run used BOTH spellings: there is no single answer
 
 REDACTS = "REDACTS"                  # sentinel present in control, absent under the flag
 NO_REDACTION = "NO_REDACTION"        # sentinel present in both
@@ -98,6 +100,13 @@ SECRET_ARM_INCOMPLETE = "SECRET_ARM_INCOMPLETE"   # the arm under the flag never
 # The two sources a tool name can come from, kept apart because they can disagree.
 EXECUTION = "execution"              # tool.execution_start.data.toolName — what copilot RAN
 REQUEST = "request"                  # assistant.message.data.toolRequests[] — what it ASKED for
+EXPECTED_SOURCES = (EXECUTION, REQUEST)
+
+# How the two sources stood, which is a separate question from what they said.
+AGREED = "AGREED"                    # both spoke, and they said the same thing
+DISAGREED = "DISAGREED"              # more than one distinct name for our tool
+PARTIAL = "PARTIAL"                  # at least one expected source said nothing
+SILENT = "SILENT"                    # neither named our tool: nothing to agree about
 
 
 def parse_events(stream: str) -> list[dict]:
@@ -171,16 +180,31 @@ def declared_spelling(
         seen: list[tuple[str | None, str | None]]) -> tuple[str, list[str | None]]:
     """(which spelling the witness used, EVERY status it carried) for OUR declared server.
 
+    BOTH SPELLINGS APPEARING IS A FINDING, not a tie to be broken. The first version checked
+    the config key first and returned on a match, so a run whose `mcp_servers_loaded` used the
+    key and whose later `mcp_server_status_changed` used the advertised name reported one
+    spelling confidently AND silently dropped the final status — the two defects compounding,
+    since the status that went missing is the one slice 2 reads (review, PR #120). Whichever
+    is true of copilot, a design cannot be built on "the key, except when it is the other one",
+    so `REPORTS_BOTH` says the contract is not one thing and `answered()` refuses it.
+
     Returns `REPORTS_NEITHER` with no statuses when the run named neither spelling, which is
     the honest reading of a stream that never mentioned our server — not a claim that the
     server was absent, since a stream that never arrived says the same thing. `main` gates on
     the stream having been produced at all before treating this as an answer.
     """
-    for spelling, name in ((REPORTS_CONFIG_KEY, CONFIG_KEY),
-                           (REPORTS_ADVERTISED, ADVERTISED_NAME)):
-        statuses = statuses_for(seen, name)
-        if statuses:
-            return spelling, statuses
+    by_key = statuses_for(seen, CONFIG_KEY)
+    by_advertised = statuses_for(seen, ADVERTISED_NAME)
+    if by_key and by_advertised:
+        # IN STREAM ORDER, over both names. Concatenating one name's sequence onto the
+        # other's would invent an ordering across two identities; this is the run as it
+        # happened, which is what a reader diagnosing the ambiguity needs.
+        return REPORTS_BOTH, [st for nm, st in seen
+                              if nm in (CONFIG_KEY, ADVERTISED_NAME)]
+    if by_key:
+        return REPORTS_CONFIG_KEY, by_key
+    if by_advertised:
+        return REPORTS_ADVERTISED, by_advertised
     return REPORTS_NEITHER, []
 
 
@@ -290,20 +314,33 @@ def mcp_names_by_source(pairs: list[tuple[str, str]]) -> dict[str, list[str]]:
     return {src: names for src, names in by_source.items() if names}
 
 
-def canonical_name(by_source: dict[str, list[str]]) -> tuple[str | None, bool]:
-    """(the one name every source used, whether they agreed).
+def sources_verdict(by_source: dict[str, list[str]]) -> str:
+    """How the two sources stood: AGREED, DISAGREED, PARTIAL or SILENT.
 
-    AGREEMENT IS THE FINDING, not a precondition to be assumed. Two spellings for one tool
-    means slice 4 has two candidate strings for `used_mcp_tool` and no basis to choose, which
-    is an unanswered question wearing an answer's clothes. `(None, True)` is the honest reading
-    of a run where no source named our tool at all — nothing to disagree about.
+    AGREEMENT NEEDS TWO PARTIES, and the first version of this did not require them. It asked
+    only whether the set of names had one element, so a run where the model's request event
+    never named our tool — or a build that stops emitting one of the events — read as
+    "agreed", and the probe exited ANSWERED while the recorded conclusion said "both sources,
+    identically" (review, PR #120). One source saying one thing is not two sources saying the
+    same thing; it is one observation and an unobserved one, and `PARTIAL` is what that is.
+
+    `EXPECTED_SOURCES` is the structural clause: agreement is judged against the sources that
+    are supposed to speak, never against however many happened to.
     """
     distinct = {name for names in by_source.values() for name in names}
     if not distinct:
-        return None, True
+        return SILENT
     if len(distinct) > 1:
-        return None, False
-    return distinct.pop(), True
+        return DISAGREED
+    if any(not by_source.get(src) for src in EXPECTED_SOURCES):
+        return PARTIAL
+    return AGREED
+
+
+def canonical_name(by_source: dict[str, list[str]]) -> str | None:
+    """The single name our tool was called by, or None when there is not exactly one."""
+    distinct = {name for names in by_source.values() for name in names}
+    return distinct.pop() if len(distinct) == 1 else None
 
 
 def name_format(name: str | None) -> str:
@@ -333,15 +370,20 @@ def name_format(name: str | None) -> str:
 def format_reading(by_source: dict[str, list[str]]) -> tuple[str, str | None]:
     """(verdict, the observed name) for question 1 — the classifier plus the agreement test.
 
-    `AMBIGUOUS` is a distinct outcome from `UNMEASURED` because they call for different next
-    steps: one run did not exercise the tool, the other exercised it and produced two answers.
-    Collapsing them would hide the second, which is the one that has to be resolved before a
-    parser is written.
+    THREE WAYS OF NOT HAVING AN ANSWER, kept apart because they call for different next steps.
+    `UNMEASURED`: the run never exercised the tool. `AMBIGUOUS`: it did, and produced two
+    spellings that have to be reconciled before a parser is written. `ONE_SOURCE_ONLY`: one
+    source spoke and the other did not, so what the probe has is a name and no agreement —
+    and it reports the name, because which source fell silent is the diagnostic.
     """
-    name, agreed = canonical_name(by_source)
-    if not agreed:
+    state = sources_verdict(by_source)
+    if state == SILENT:
+        return UNMEASURED, None
+    if state == DISAGREED:
         return AMBIGUOUS, None
-    return name_format(name), name
+    if state == PARTIAL:
+        return ONE_SOURCE_ONLY, canonical_name(by_source)
+    return name_format(canonical_name(by_source)), canonical_name(by_source)
 
 
 # --- the secret arm's own witnesses, authored by the fixture ---------------------------
@@ -365,15 +407,42 @@ def read_receipts(path: str) -> list[dict]:
     return out
 
 
-def served_tool(records: list[dict]) -> bool:
-    """Whether OUR tool was actually called on the fixture in this arm.
+def requested_tool(records: list[dict]) -> bool:
+    """Whether a `tools/call` for OUR tool ARRIVED at the fixture in this arm.
 
-    The `request` row is written before the server decides whether to answer, so this is what
-    the CLIENT sent — the fact `REDACTS` needs and the one the CLI's own stream cannot be
-    trusted to supply, since the CLI is the subject.
+    Arrival only. The fixture writes this row before `_reject` and before any answer, on
+    purpose — a filter measurement needs what the client SENT, and a refused request still
+    arrived. Reported for diagnosis; never the basis of a claim about what came back.
     """
     return any(r.get("kind") == "request" and r.get("method") == "tools/call"
                and r.get("tool") == TOOL for r in records)
+
+
+def answered_with_marker(records: list[dict]) -> bool:
+    """Whether the fixture ANSWERED our tool in this arm with a reply carrying its marker.
+
+    THE REQUEST ROW WAS THE WRONG WITNESS, and this is the repair (review, PR #120). It is
+    written before the server decides whether to answer at all: a call refused on protocol
+    grounds, or one whose reply never flushed, leaves exactly the same row as a served one. A
+    probe reading "the value is absent from the output" off that row certifies redaction for a
+    reply that was never produced — the same defect as the empty arm, one layer in.
+
+    The `served` row exists only past a successful `_result`, and it carries
+    `carried_identity`: whether the reply the fixture just put on the wire actually began with
+    this process's marker. Both clauses are required, and neither is the CLI's account of
+    itself.
+
+    NO `is_error` CLAUSE, deliberately. It was here and it could not fail: only the fixture's
+    SUCCESS path prefixes the marker, so `carried_identity` already implies a non-error reply,
+    and no arm could distinguish a predicate carrying the clause from one without it. An
+    assertion that cannot fail is one §4 spends a rule on, so it is gone and the implication it
+    was standing in for is asserted directly — §E21 drives an error reply and requires
+    `carried_identity` false on it, which is what makes dropping the clause safe rather than
+    merely tidy.
+    """
+    return any(r.get("kind") == "served" and r.get("method") == "tools/call"
+               and r.get("tool") == TOOL and r.get("carried_identity") is True
+               for r in records)
 
 
 def held_sentinel(records: list[dict], sentinel: str) -> bool:
@@ -389,10 +458,15 @@ def held_sentinel(records: list[dict], sentinel: str) -> bool:
 
 
 def arm_exchanged(records: list[dict], sentinel: str) -> bool:
-    """Whether this arm ran the exchange the secret question is about: the marker was in the
-    server AND the tool carrying it was called. Both, because either alone is satisfied by a
-    run that could not have put the value into the output."""
-    return held_sentinel(records, sentinel) and served_tool(records)
+    """Whether this arm ran the exchange the secret question is about.
+
+    Two independent facts, both required: the server that answered was holding THIS run's
+    marker (`held_sentinel`, from the digest on the startup row), and it actually produced a
+    reply carrying that marker (`answered_with_marker`, from a row written after the reply
+    flushed). Either alone is satisfied by a run that could not have put the value into the
+    output, which is exactly what the absence downstream is being read as evidence of.
+    """
+    return held_sentinel(records, sentinel) and answered_with_marker(records)
 
 
 def secret_verdict(control_stream: str, secret_stream: str, sentinel: str,
@@ -419,9 +493,10 @@ def secret_verdict(control_stream: str, secret_stream: str, sentinel: str,
     if sentinel in secret_stream:
         return NO_REDACTION, ("the sentinel appears in the output WITH --secret-env-vars naming "
                               "its variable — the flag did not redact the value where it landed")
-    return REDACTS, ("the sentinel reached the control's output, the secret arm made the same "
-                     "call with the same marker in its server, and the value is absent from "
-                     "its output — so the flag redacted the value itself")
+    return REDACTS, ("the sentinel reached the control's output, the secret arm's own server "
+                     "recorded ANSWERING the same call with a reply that carried the same "
+                     "marker, and the value is absent from that arm's output — so the flag "
+                     "redacted the value itself")
 
 
 def mcp_config(path: str, sentinel: str, receipts: str) -> str:
@@ -501,10 +576,12 @@ def answered(fmt: str, spelling: str, secret: str) -> bool:
     what Phase 2 needs. `REPORTS_NEITHER` is unanswered rather than a negative finding, for the
     same reason `UNMEASURED` is: a stream that never named our server and a stream that never
     arrived are the same bytes. `AMBIGUOUS` joins them: two spellings for one tool is a
-    question with two answers, which is not an answer.
+    question with two answers, which is not an answer. So do `ONE_SOURCE_ONLY` — a name with
+    no agreement observed — and `REPORTS_BOTH`, where the run used both server spellings and
+    the contract is therefore not one thing.
     """
-    return (fmt not in (UNMEASURED, AMBIGUOUS)
-            and spelling != REPORTS_NEITHER
+    return (fmt not in (UNMEASURED, AMBIGUOUS, ONE_SOURCE_ONLY)
+            and spelling not in (REPORTS_NEITHER, REPORTS_BOTH)
             and secret in (REDACTS, NO_REDACTION))
 
 
@@ -557,10 +634,10 @@ def main() -> int:
     print(f"Q1 tool format     : {fmt}   observed={observed!r}")
     print(f"Q1 structured      : {fields}\n    {fields_why}")
     print(f"Q4 secret          : {verdict}\n    {why}")
-    print(f"   control receipts: served={served_tool(control_receipts)} "
-          f"marker={held_sentinel(control_receipts, sentinel)}")
-    print(f"   secret  receipts: served={served_tool(secret_receipts)} "
-          f"marker={held_sentinel(secret_receipts, sentinel)}")
+    for label, rows in (("control", control_receipts), ("secret ", secret_receipts)):
+        print(f"   {label} receipts: arrived={requested_tool(rows)} "
+              f"answered_with_marker={answered_with_marker(rows)} "
+              f"server_held_marker={held_sentinel(rows, sentinel)}")
 
     # THE FOOTER PROMISED A DIRECTORY AND NOTHING WAS EVER PUT IN IT. These readings are the
     # slice's deliverable and they get quoted into a design document, so the stream they came

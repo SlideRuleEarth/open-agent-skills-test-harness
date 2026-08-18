@@ -82,6 +82,20 @@ SERVER_KEY = "echo"
 # value `probe_copilot_events.py` reads for a stdio server, and the reason the omission arm
 # has a witness that does not depend on the model choosing to call anything.
 CONNECTED = "connected"
+# THE STATUS VOCABULARY, SPLIT BY WHAT EACH ONE LICENSES — and the split is the point. A
+# reader that treated "not `connected`" as the negative publishes a finding about the `type`
+# key from `pending`, which THIS SAME MEASUREMENT recorded as the ordinary transient before
+# `connected`: an arm truncated mid-startup ends there, and so does an arm whose server was
+# about to come up fine (review, PR #120). It would do the same for any word a later build
+# invents. Only a status measured to mean "this server will not be coming up" can establish a
+# negative; everything else leaves the question unmeasured, which is the direction that
+# refuses to publish rather than the one that guesses.
+TERMINAL_FAILURE = ("failed",)   # measured at 1.0.80: the sse arm with no `type` ends here
+TRANSIENT = ("pending",)         # measured at 1.0.80: precedes `connected` in a healthy run
+# NOT listed as terminal, deliberately: `not_configured` and `disabled` are in production's
+# `_INERT_MCP_STATUSES` and plausibly mean "never came up", but neither has been OBSERVED in
+# this arm, and `disabled` would mean a flag suppressed the server rather than that the entry
+# was misunderstood — a different question. They fall through to unmeasured until measured.
 
 ENFORCED = "ENFORCED"
 LEAKED = "LEAKED"
@@ -354,6 +368,18 @@ def reported_status(stream: str) -> str | None:
     return effective_status(statuses_for(loaded_servers(parse_events(stream)), SERVER_KEY))
 
 
+def reported_inventory(stream: str) -> bool:
+    """Whether copilot published its MCP server inventory in this arm AT ALL.
+
+    THE CLAUSE THAT MAKES "OUR SERVER WAS NOT LISTED" MEAN SOMETHING. An arm killed before the
+    MCP host initialized has no entry for our server either, and reading that as "the entry
+    was not understood" is the defect this whole verdict was rebuilt around, arriving one
+    branch further down. Our server's absence is evidence only from a run that got far enough
+    to say what it HAD.
+    """
+    return any(obj.get("type") == "session.mcp_servers_loaded" for obj in parse_events(stream))
+
+
 def type_omission_verdict(bare_records: list[dict], bare_stream: str,
                           control_records: list[dict], control_stream: str) -> tuple[str, str]:
     """Did a remote entry with no `type` key produce a server copilot could reach?
@@ -396,18 +422,30 @@ def type_omission_verdict(bare_records: list[dict], bare_stream: str,
         return STARTS_WITHOUT_TYPE, (f"{ALLOWED!r} arrived at a server declared with NO `type` "
                                      f"key, so copilot reached it (its own status for the "
                                      f"server was {bare_status!r})")
+    if bare_status in TERMINAL_FAILURE:
+        return NEVER_STARTS, (f"copilot reported the server {bare_status!r} without the `type` "
+                              f"key, while the control reported {control_status!r} with it — a "
+                              f"status this probe has measured to mean the server will not be "
+                              f"coming up")
     if bare_status is not None:
-        return NEVER_STARTS, (f"copilot reported the server {bare_status!r} rather than "
-                              f"{CONNECTED!r} without the `type` key, while the control "
-                              f"reported {control_status!r} with it")
-    if control_status is not None:
-        return NEVER_STARTS, (f"copilot listed the server ({control_status!r}) when `type` was "
-                              f"present and did not list it AT ALL when it was omitted, and "
-                              f"nothing reached the fixture")
-    return OMISSION_UNMEASURED, ("the bare arm produced neither a connection witness nor a "
-                                 "call, and the control never produced a status either — so "
-                                 "this run has no instrument for the question, rather than a "
-                                 "negative answer to it")
+        return OMISSION_UNMEASURED, (
+            f"copilot's last word about the server was {bare_status!r}, which is "
+            + ("the ordinary transient before `connected` — an arm that ENDED there was "
+               "truncated or is still starting, and either way says nothing about the key"
+               if bare_status in TRANSIENT else
+               "a status this probe has never measured, so reading it as a negative would "
+               "publish a finding about the key from a word nobody has established the "
+               "meaning of")
+            + f" (the control reported {control_status!r})")
+    if control_status is not None and reported_inventory(bare_stream):
+        return NEVER_STARTS, (f"copilot published its MCP inventory in the bare arm and our "
+                              f"server was NOT in it, while the control listed it "
+                              f"({control_status!r}) — the entry without `type` did not become "
+                              f"a server, and nothing reached the fixture")
+    return OMISSION_UNMEASURED, ("the bare arm never published an MCP inventory naming our "
+                                 "server and nothing reached the fixture — an arm that got no "
+                                 "further than that is one this run has no instrument for, "
+                                 "rather than a negative answer")
 
 
 def measure_type_omission(workdir: str, kind: str, endpoint: str, sentinel: str):

@@ -324,6 +324,26 @@ def _error(req_id, code: int, message: str) -> None:
     _send(error_envelope(req_id, code, message))
 
 
+def _carried_identity(payload: dict) -> bool:
+    """Whether the reply just produced actually carries this process's marker.
+
+    A FACT ABOUT THIS REPLY, not about the process. `identity_digest()` on the `listening`
+    row says which marker this server holds; it says nothing about whether any particular
+    answer carried it. A measurement of *redaction* needs the second: the value has to have
+    been put on the wire before its absence downstream can mean anything.
+
+    Reports a BOOLEAN and never the marker, for the reason the `listening` row carries a
+    digest instead (PR #110) — the receipts file sits where the CLI can read it.
+    """
+    if not IDENTITY:
+        return False
+    for item in payload.get("content") or []:
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            if item["text"].startswith(f"{IDENTITY}:"):
+                return True
+    return False
+
+
 def _text(s: str, *, is_error: bool = False) -> dict:
     return {"content": [{"type": "text", "text": s}], "isError": is_error}
 
@@ -442,7 +462,22 @@ def main() -> int:
         elif method == "tools/list":
             _result(req_id, {"tools": TOOLS}, modern=modern, cacheable=True)
         elif method == "tools/call":
-            _result(req_id, _call_tool(params), modern=modern)
+            payload = _call_tool(params)
+            _result(req_id, payload, modern=modern)
+            # AFTER THE REPLY IS ON THE WIRE, AND ONLY THEN. The `request` row above is
+            # written before `_reject` and before any answer, deliberately: a measurement of a
+            # client's FILTER needs what the client sent, and a refused request still arrived.
+            # But a measurement of what came BACK cannot use it — a call rejected on protocol
+            # grounds, or one whose reply never flushed, writes the same `request` row as a
+            # served one, and a probe reading "the value is absent downstream" off that row
+            # certifies redaction for a reply that was never produced (review, PR #120).
+            # `_result` raises through this line if the flush fails, so the row exists only
+            # where an answer really went out. Readers of the filter question keep using
+            # `request`; readers of the round trip must use this.
+            _receipt(kind="served", method=method,
+                     tool=params.get("name") if isinstance(params.get("name"), str) else None,
+                     is_error=bool(payload.get("isError")),
+                     carried_identity=_carried_identity(payload))
         elif method == "ping":
             _result(req_id, {}, modern=modern)
         else:

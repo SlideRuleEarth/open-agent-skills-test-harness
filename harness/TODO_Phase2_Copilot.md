@@ -239,7 +239,10 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
 1. ~~**MCP tool-name format in copilot's own JSON events.**~~ — **ANSWERED at 1.0.80**
    (`tools/probe_copilot_events.py`): **`<server>-<tool>`**, observed as `cfgkeyzulu-echo`. A hyphen —
    not claude's `mcp__<server>__<tool>`, not agy's inferred `mcp_<server>_<tool>`. The **execution event
-   and the model's request agree**, so there is one canonical spelling rather than two.
+   and the model's request agree** — and agreement is *required* now, not inferred: one source saying
+   one thing is one observation and one UNOBSERVED source, which the first version scored as agreement
+   (review, PR #120). `ONE_SOURCE_ONLY` is a distinct non-answer from `AMBIGUOUS`, and both real lines
+   are pinned, because a conclusion that says "both sources" cannot rest on evidence holding one.
    **And a better answer to the same question came with it:** `tool.execution_start.data` carries
    **`mcpServerName` and `mcpToolName` as their own fields**. Slice 4's `used_mcp_tool` should match
    those and never split the composite — a server or tool whose own name contains a hyphen breaks the
@@ -248,7 +251,9 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
 2. ~~**What `session.mcp_servers_loaded` reports for a DECLARED server**~~ — **ANSWERED at 1.0.80**
    (same probe). It names **the config key** (`cfgkeyzulu`), *not* the server's advertised
    `serverInfo.name` (`advnamequebec`) — the two were deliberately different, which is the only reason
-   this is an answer rather than a coin flip. A healthy injected server goes **`pending` → `connected`**,
+   this is an answer rather than a coin flip. A run using **both** spellings is `REPORTS_BOTH` and not
+   an answer: the version that broke that tie by priority also silently dropped whichever statuses were
+   carried under the losing name, and the status it dropped is the one this row exists to supply. A healthy injected server goes **`pending` → `connected`**,
    with a later `session.mcp_server_status_changed` repeating `connected`.
    **The status vocabulary observed across all five probes is `pending`, `connected`, `failed`,
    `disabled`** — which is what slice 2 splits `_INERT_MCP_STATUSES` on. Note `pending` in particular:
@@ -259,13 +264,19 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
    isolated runs already mask plugins, but a negative answer leaves a documented gap on non-isolated runs.
 4. ~~**`--secret-env-vars` actual behaviour**~~ — **ANSWERED at 1.0.80** (same probe): it **REDACTS**.
    A per-run marker rode back in the MCP tool's reply and reached the control run's output; under the
-   flag it is absent from a run whose own fixture receipts show the same call with the same marker in
-   the server. So §8's belt-and-braces holds in the case that needed it — the value, wherever the value
-   landed, not merely the variable name where it is echoed.
-   **The second witness is what makes that a reading**, and it was added in review (PR #120): the
-   control proves the value *can* travel, but `REDACTS` is a claim about the *other* arm, and an arm
-   that crashed or never called the tool produces the identical silence. The receipts are authored by
-   the fixture — a different process — so the CLI under test cannot forge them.
+   flag it is absent from a run whose own fixture recorded **answering** that call with a reply that
+   carried the marker. So §8's belt-and-braces holds in the case that needed it — the value, wherever
+   the value landed, not merely the variable name where it is echoed.
+   **The second witness is what makes that a reading**, and it took two review rounds to get right
+   (PR #120). The control proves the value *can* travel, but `REDACTS` is a claim about the *other*
+   arm, and an arm that crashed or never called the tool produces the identical silence — so the arm
+   needs its own positive fact, authored by the fixture rather than by the CLI under test. The first
+   attempt used the receipt the fixture already wrote, which turned out to be **the wrong row**: it is
+   emitted before `_reject` and before any answer, deliberately, because a measurement of a *filter*
+   needs what the client SENT and a refused request still arrived. A call rejected on protocol grounds
+   leaves exactly that row, so redaction read off it is a claim about a reply that was never produced.
+   The fixture now writes a `served` row past a successful flush, carrying whether that reply began
+   with the marker; the filter readers keep the arrival row, and the comment there says why.
 5. **Remote `type` omission, as *behaviour* rather than shape.** Slice 3 writes `type` and an explicit
    `tools: ["*"]` because §2(b) says copilot writes them for itself — but (b) is unversioned, and the
    probe that produced it *cannot* be versioned: `copilot mcp add` emits no in-band witness, so no
@@ -284,6 +295,12 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
    |---|---|---|
    | `http` (Streamable) | **starts anyway** — copilot reported `connected`, and `echo` arrived at the server | the connection witness plus the fixture's receipts |
    | `sse` | **does not start** — copilot reported **`failed`**, where the paired with-`type` control reported `connected` | copilot's own status, against a control differing in one key |
+
+   The status vocabulary is split by **what each word licenses**, not by "is it `connected`". Only
+   `failed` has been measured to mean the server will not be coming up. `pending` is the transient
+   *before* `connected` — a truncated arm ends there and so does a healthy one — and an unmeasured word
+   a later build invents is in the same position, so both leave the question `OMISSION_UNMEASURED`
+   rather than publishing a negative (review, PR #120).
 
    **So slice 3 must write `type`, and that is now a measurement rather than a preference.**
    **The arm needed rebuilding to say it** (review, PR #120). The first version read only the fixture's
