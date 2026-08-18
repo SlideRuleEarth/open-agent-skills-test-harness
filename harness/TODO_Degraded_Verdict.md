@@ -1,12 +1,17 @@
 # A degraded verdict — 🟡 beside ✅ and ❌
 
-**Goal:** a cell that *ran and graded* but did not have the premises the scenario described stops
-reporting as a clean pass. Today it reports green with an explanation in prose, and prose is not a
-field anything reads.
+**Goal:** a cell whose run did not have the premises the scenario described stops reporting as a clean
+pass. Today it reports green with an explanation in prose, and prose is not a field anything reads.
 
-This is a runner/reporting change, not adapter work. Every agent inherits it. It has **two customers
-already in the tree** before any new detection code is written, which is the argument for building the
-lane rather than special-casing MCP.
+Note the scope deliberately says *ran*, not *ran and graded*: degradation is a claim about the run's
+**premises**, so an `ungraded` cell can be degraded too, and the two axes are orthogonal throughout
+(§1).
+
+The **lane** is runner/reporting infrastructure and every agent inherits it — but connecting a producer
+to it is adapter work where the producer lives in an adapter, which is exactly slice 3 (claude's
+emissions, and copilot's when Phase 2's witness slice lands). Slices 1 and 2 touch no adapter at all.
+It has **two customers already in the tree** before any new detection code is written, which is the
+argument for building the lane rather than special-casing MCP.
 
 `harness/DESIGN_MCP_Support.md` is authoritative for the MCP half. Counts live only in
 `TODO_Contained_HOME.md` §4 — do not restate them here.
@@ -62,7 +67,13 @@ than this one**.
 **What D2 costs, stated plainly:** a pipeline that today treats any nonzero status as failure will start
 failing on degraded runs. That is the intended effect rather than a side effect — a degraded run *is* a
 run whose premises differed from what the scenario declared — but it is a change to observable behaviour
-and belongs in slice 4's release note, not discovered by whoever owns the pipeline.
+and must not be discovered by whoever owns the pipeline.
+
+**The notice ships with slice 2, not slice 4.** Slice 1 has no producers, so `4` is unreachable and
+nothing changes; **slice 2 is the first slice that can emit one**, which is the moment a green pipeline
+can turn red. Documenting it in slice 4 would put the warning after the behaviour by two slices unless
+they landed atomically, which nothing guarantees. So slice 2 carries the release note as a deliverable,
+and does not land without it.
 
 ### Precedence — per cell and per run
 
@@ -156,8 +167,10 @@ The tri-state is half-built. Four precedents, all shipped:
 **`ungraded` is the shape to copy and the field to leave alone.** It removes the cell from the
 denominator (`graded = [c for c in results if not c.ungraded]`,
 [cli.py:660](agentskill_evals/cli.py#L660)) because a rubric-only eval with no judge produced no verdict
-to count. A degraded cell *did* produce one. Reusing the field would silently shrink the denominator and
-make the pass rate improve as things get worse.
+to count. A **graded** degraded cell did produce one, and that is the case this rule is about — an
+ungraded cell may also be degraded (§1), and there `ungraded` wins the denominator question because
+there is still no verdict to count. Reusing the field would silently shrink the denominator and make
+the pass rate improve as things get worse.
 
 ---
 
@@ -266,7 +279,11 @@ record beside its existing `CellResult.isolation_leaks`, and the blockquote at
 [runner.py:1462](agentskill_evals/runner.py#L1462) keeps its detail.
 
 It is also the slice that **proves the record is reachable from the runner layer**, which is the half of
-§3's producer path an adapter-side carrier would have missed.
+§3's producer path an adapter-side carrier would have missed — and the slice that first produces an
+`ungraded + degraded` cell in the wild, since a rubric-only cell with no judge can leak (§1).
+
+**It carries the exit-`4` release note** (§1). This is the first slice at which a previously-green
+pipeline can go red, so the notice ships here or the warning arrives after the behaviour.
 
 **This is deliberately first.** It proves the lane on a real, already-shipped condition, and its negative
 control is free — an isolated run with no leaks must stay ✅, which is the check that the lane is not
@@ -288,15 +305,21 @@ untouched, and no accumulate-then-raise ordering problem appears.
 ### Slice 4 — documentation and schema
 
 `DESIGN_MCP_Support.md` §8's warn-vs-raise resolution gains the third answer;
-`TODO_Phase2_Copilot.md` §1 records that degraded supersedes its A/C framing; the summary.json shape is
-documented wherever consumers are told what to read.
+`TODO_Phase2_Copilot.md` §1 records that degraded supersedes its A/C framing; the `summary.json` and
+`assertions.json` shapes — including `degradations: [{kind, message}]` — are documented wherever
+consumers are told what to read.
+
+**The exit-`4` release note is not here**; it ships with slice 2, the first slice that can emit a
+degradation (§1). What remains for this slice is the reference documentation, which can trail the
+behaviour without anyone's pipeline breaking on it.
 
 ---
 
 ## 5. Risks
 
-1. **The denominator.** Degraded cells stay in `graded`. The tell that this went wrong is a pass rate
-   that *improves* when a server breaks.
+1. **The denominator.** **Graded** degraded cells stay in `graded`; an `ungraded` degraded cell does not,
+   because `ungraded` governs membership (§1). The tell that this went wrong is a pass rate that
+   *improves* when a server breaks.
 2. **Verdict/exit-status divergence.** The single reason for `cell_verdict()`. Any site in §3 left
    reading `.passed` directly is a place the matrix and the exit code can disagree.
 3. **Scope creep.** Every existing warning will look like a candidate for degraded. It is not:
