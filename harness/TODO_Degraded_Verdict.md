@@ -79,7 +79,7 @@ degraded-only code was ever in question. It is unchanged by the decision.
 | order | state | renders |
 | --- | --- | --- |
 | 1 | `run_result.error` | `⚠️ <error>` |
-| 2 | `ungraded` | `⚪ ungraded` |
+| 2 | `ungraded` | `⚪ ungraded` — **annotated as degraded when it is**, on the same principle as row 3 |
 | 3 | **failed** (degraded or not) | `❌` — **annotated as degraded when it is**, never replaced by 🟡 |
 | 4 | **degraded** and passed | `🟡` |
 | 5 | passed | `✅` |
@@ -89,9 +89,9 @@ degraded-only code was ever in question. It is unchanged by the decision.
 | condition | exit |
 | --- | --- |
 | any graded cell failed or errored | **`1`** |
-| nothing was graded | **`3`** (unchanged) |
-| every graded cell passed, at least one degraded | **`4`** (§1) |
-| every graded cell passed, none degraded | **`0`** |
+| nothing was graded | **`3`** (unchanged) — `3` outranks `4`; see the cross-product note below |
+| every graded cell passed, **any cell degraded — graded or not** | **`4`** (§1) |
+| every graded cell passed, no cell degraded | **`0`** |
 
 **Ordinary failure always wins visibly and always exits `1`.** Degradation annotates a failure, it never
 outranks one: the reason a cell failed is the thing the reader came for, and a run that lost a real
@@ -101,7 +101,38 @@ The precedence itself is what slice 1's arms must exercise — a `failed + degra
 render site *and* against the exit status, since "does 🟡 hide ❌" is exactly the question a check on
 either one alone cannot answer.
 
-**Not in question:** a degraded cell stays in the denominator. See §5's first risk.
+**Not in question:** a **graded** degraded cell stays in the denominator. See §5's first risk — and the
+cross-product note immediately below for why that qualifier is load-bearing.
+
+### `ungraded` + `degraded` — reachable, and both axes are kept
+
+This combination is **not** hypothetical and must not be left to an implementer to discover. `ungraded`
+is computed at [runner.py:717](agentskill_evals/runner.py#L717) and `isolation_leaks` at
+[runner.py:685](agentskill_evals/runner.py#L685), **independently** — so a rubric-only cell with no judge
+can leak, and slice 2 will produce exactly that: `ungraded=True` with a degradation record.
+
+**The invariant: the two axes are orthogonal and both are preserved.** An ungraded cell may be degraded;
+nothing suppresses the record. Suppressing it would be the worse error, because an isolation leak is a
+fact about what the run *did*, and it does not stop being true because no assertion graded it.
+
+- **Rendering** — `⚪ ungraded`, annotated with the degradation, exactly as a failed cell is annotated
+  rather than replaced. The finding is never invisible.
+- **Denominator** — `ungraded` governs membership, and wins. §1's rule above is about **graded** cells:
+  a cell that produced no verdict has nothing to count, whether or not it also degraded.
+- **Exit status** — **`3` outranks `4`.** `4` is a claim about cells that *passed*, and a run that graded
+  nothing cannot make it; `3` says the run yielded no verdict, which is the stronger and more honest
+  statement about what the run is worth. The degradation still reaches the matrix and the artifacts, so
+  nothing is lost — only the exit code, which can carry one fact, carries the more severe one.
+
+**One sub-case the table states outright, because it is where an implementer would guess:** a run with
+*some* graded cells that all passed, plus an ungraded cell that degraded, exits **`4`**, not `0`. The
+degraded axis is a claim about the run's **premises**, not about grading, so a degradation anywhere in
+the run counts — the cell being outside the denominator affects the pass *rate*, never whether the
+finding happened.
+
+That last point is the general rule for this table: the exit status reports the **most severe** thing
+true of the run, and severity is ordered by how little the run established, not by how recently a fact
+was learned.
 
 ---
 
@@ -183,8 +214,8 @@ nothing produces a record until slice 2.
 | [runner.py:1310](agentskill_evals/runner.py#L1310) `_cell_mark` | `✅`/`❌` | `🟡` lane |
 | [runner.py:1336](agentskill_evals/runner.py#L1336), [:1378](agentskill_evals/runner.py#L1378) | summary.md tallies | degraded count beside pass rate |
 | [runner.py:1210](agentskill_evals/runner.py#L1210) | `n_passed` | `n_degraded` beside it |
-| [runner.py:1230](agentskill_evals/runner.py#L1230) | summary.json `cells[].passed` | `degraded` beside it |
-| [runner.py:902](agentskill_evals/runner.py#L902) | assertions.json `passed` | `degraded` beside it |
+| [runner.py:1230](agentskill_evals/runner.py#L1230) | summary.json `cells[].passed` | **`degradations: [{kind, message}]`** *and* the derived `degraded` |
+| [runner.py:902](agentskill_evals/runner.py#L902) | assertions.json `passed` | **`degradations: [{kind, message}]`** *and* the derived `degraded` |
 | [runner.py:798](agentskill_evals/runner.py#L798) | `progress.done(passed=…)` | **extend the API** — its three values are already spent (§2); take the verdict type, not a fourth bool |
 | [cli.py:661](agentskill_evals/cli.py#L661) | terminal tally | `(n degraded)` |
 | [cli.py:689](agentskill_evals/cli.py#L689) | `--verbose` failure list | degraded cells listed with their reason |
@@ -219,8 +250,14 @@ Assertions that must be able to fail here:
   their agreement is the property under test rather than two separate ones;
 - a **`failed + degraded`** cell, asserting ❌ survives and 🟡 does not replace it, and that the run exits
   `1` rather than `4`. "Does yellow hide red" is unanswerable from either axis alone;
+- an **`ungraded + degraded`** cell — reachable via slice 2, so not hypothetical — asserting the record
+  survives on an ungraded cell, that the cell stays *out* of the denominator, and that the run exits
+  `3` rather than `4`;
 - a degradation record whose **`kind` is read without touching its message**, since the point of the
-  type is that no consumer has to parse the prose.
+  type is that no consumer has to parse the prose;
+- a record **round-tripped through `assertions.json` and `summary.json`** and read back by `kind` — the
+  serialization is where a typed record would otherwise decay into the derived boolean and take the
+  whole point of §3's producer path with it.
 
 ### Slice 2 — `isolation_leaks` becomes the first producer
 
