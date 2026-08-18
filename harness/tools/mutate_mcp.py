@@ -3001,9 +3001,9 @@ MUTATIONS = [
     # The positive control IS the measurement. Without it, a run where the sentinel never
     # travelled certifies redaction — a channel nobody proved was connected reporting silence.
     ("F172-redaction-is-certified-without-a-control", CEVENTS,
-     "    if sentinel not in control_stream:\n        return CONTROL_FAILED, (",
+     "    if not control_result_carried:\n        return CONTROL_FAILED, (",
      "    if False:\n        return CONTROL_FAILED, (",
-     "a control that never carried the sentinel measures nothing"),
+     "a control whose own tool RESULT never carried the sentinel measures nothing"),
     # A conjunction over three questions, not a lookup on the last one read.
     ("F173-two-answered-questions-are-enough", CEVENTS,
      "    return (fmt not in (UNMEASURED, AMBIGUOUS, ONE_SOURCE_ONLY)\n            and spelling not in",
@@ -3072,8 +3072,8 @@ MUTATIONS = [
      "...nor one that served the call but whose stream carries no version witness"),
     # The gate must read the receipts of the arm it is judging, not the arm beside it.
     ("F190-the-controls-receipts-vouch-for-the-secret-arm", CEVENTS,
-     "                                  secret_exchanged=arm_exchanged(secret_receipts, sentinel))",
-     "                                  secret_exchanged=arm_exchanged(control_receipts, sentinel))",
+     "        secret_exchanged=arm_exchanged(secret_receipts, sentinel))",
+     "        secret_exchanged=arm_exchanged(control_receipts, sentinel))",
      "...nor does a secret arm that produced plenty of output and never called the tool"),
     # An empty field list from a run with no tool execution says nothing about the fields.
     ("F191-no-execution-reads-as-the-fields-being-absent", CEVENTS,
@@ -3162,6 +3162,51 @@ MUTATIONS = [
      "    if control_status is not None and reported_inventory(bare_stream):",
      "    if control_status is not None:",
      "...but an arm that never published an inventory AT ALL is UNMEASURED, not a finding"),
+    # --- PR #120, third review round -------------------------------------------------------
+    # QUESTION 2 ASKS TWO THINGS and only the spelling reached the exit predicate, so a witness
+    # naming our server with no `status` field exited ANSWERED having measured half of it.
+    ("F208-the-status-half-of-question-2-need-not-be-measured", CEVENTS,
+     "            and status_state == STATUS_MEASURED\n",
+     "",
+     "...and ONE gap (no status observed) is enough to fail it"),
+    # Reading whatever status appeared and calling it the HEALTHY one assumes the thing being
+    # measured: a server that failed to start reports `failed`, and the status does not say so.
+    ("F209-any-status-is-the-healthy-status", CEVENTS,
+     "    if not served:\n        return STATUS_UNWITNESSED, (",
+     "    if False:\n        return STATUS_UNWITNESSED, (",
+     "a real status from an arm that never served is UNWITNESSED, not the healthy status"),
+    # An absent status is not a status. Without this the empty string and None both sail past.
+    ("F210-an-absent-status-counts-as-one", CEVENTS,
+     "    if not isinstance(status, str) or not status:",
+     "    if False:",
+     "...and that is STATUS_ABSENT, so the exit predicate can see it"),
+    # THE CONTROL MUST HAVE DONE THE SAME THING. Without this the two arms are not comparable,
+    # and a control that echoed a config while calling nothing certifies redaction.
+    ("F211-the-control-need-not-have-run-the-exchange", CEVENTS,
+     "    if not control_exchanged:\n        return CONTROL_INCOMPLETE, (",
+     "    if False:\n        return CONTROL_INCOMPLETE, (",
+     "a control that never ran the exchange makes the two arms incomparable"),
+    # The control's evidence must be ATTRIBUTED to our tool's result. A substring search over
+    # the whole stream is satisfied by the config this probe wrote, under `--allow-all`.
+    ("F212-any-appearance-in-the-stream-is-the-tool-reply", CEVENTS,
+     "    ids = mcp_call_ids(events)\n    if not ids:\n        return False",
+     "    ids = mcp_call_ids(events)\n    if True:\n        return any(sentinel in json.dumps(o) for o in events)",
+     "...but the sentinel merely APPEARING in the stream does not"),
+    # AN UNREADABLE INVENTORY IS NOT AN INVENTORY. `{"data": 42}` has the right event type and
+    # says nothing about which servers copilot had, so absence from it proves nothing.
+    ("F213-a-malformed-inventory-proves-absence", CGATE_REMOTE,
+     ("        if isinstance(servers, list) and all(\n"
+      "                isinstance(srv, dict) and isinstance(srv.get(\"name\"), str) for srv in servers):\n"
+      "            return True"),
+     "        return True",
+     "...nor does schema drift (`servers` is not a list) — the unparsable entry could be ours"),
+    # THE OTHER GUARD ON THE SAME PREDICATE, and it needs its own mutation because the two
+    # reject different shapes: `{"data": 42}` never reaches the `servers` clause at all, so the
+    # arm for it cannot kill a mutation of that clause (mutation run, PR #120).
+    ("F214-an-unreadable-data-object-is-an-inventory", CGATE_REMOTE,
+     "        if not isinstance(data, dict):\n            continue",
+     "        if not isinstance(data, dict):\n            return True",
+     "an inventory event whose `data` is unreadable does NOT establish absence"),
     ("F41-the-bearer-need-only-arrive-once", CGATE_REMOTE,
      '    return all((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
      '    return any((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',

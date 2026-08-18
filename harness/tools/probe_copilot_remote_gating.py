@@ -369,15 +369,39 @@ def reported_status(stream: str) -> str | None:
 
 
 def reported_inventory(stream: str) -> bool:
-    """Whether copilot published its MCP server inventory in this arm AT ALL.
+    """Whether copilot published a READABLE MCP server inventory in this arm.
 
     THE CLAUSE THAT MAKES "OUR SERVER WAS NOT LISTED" MEAN SOMETHING. An arm killed before the
-    MCP host initialized has no entry for our server either, and reading that as "the entry
-    was not understood" is the defect this whole verdict was rebuilt around, arriving one
-    branch further down. Our server's absence is evidence only from a run that got far enough
-    to say what it HAD.
+    MCP host initialized has no entry for our server either, and reading that as "the entry was
+    not understood" is the defect this whole verdict was rebuilt around, arriving one branch
+    further down. Our server's absence is evidence only from a run that got far enough to say
+    what it HAD.
+
+    READABLE, not merely present — and the first version only checked the event `type`
+    (review, PR #120). `{"type": "session.mcp_servers_loaded", "data": 42}` is an inventory
+    this probe cannot read: `loaded_servers` correctly extracts nothing from it, and taking
+    that emptiness as "our server was absent" publishes a finding about the `type` key from an
+    event whose contents were never examined. The same holds for schema drift — a `servers`
+    that is not a list, or entries that are not named objects — where the entry that could not
+    be parsed is exactly the one that might have been ours.
+
+    An EMPTY `servers` list is a genuine inventory, and the one this clause exists to admit:
+    copilot said what it had and had nothing. That is why the structural test is the
+    list-ness, with `all()` over the entries beneath it — `all()` over `[]` being True is the
+    correct reading here, not a vacuous one, because `isinstance(servers, list)` has already
+    established that the collection is real.
     """
-    return any(obj.get("type") == "session.mcp_servers_loaded" for obj in parse_events(stream))
+    for obj in parse_events(stream):
+        if obj.get("type") != "session.mcp_servers_loaded":
+            continue
+        data = obj.get("data")
+        if not isinstance(data, dict):
+            continue
+        servers = data.get("servers")
+        if isinstance(servers, list) and all(
+                isinstance(srv, dict) and isinstance(srv.get("name"), str) for srv in servers):
+            return True
+    return False
 
 
 def type_omission_verdict(bare_records: list[dict], bare_stream: str,

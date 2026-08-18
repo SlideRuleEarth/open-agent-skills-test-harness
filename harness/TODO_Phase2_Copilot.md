@@ -253,7 +253,14 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
    `serverInfo.name` (`advnamequebec`) — the two were deliberately different, which is the only reason
    this is an answer rather than a coin flip. A run using **both** spellings is `REPORTS_BOTH` and not
    an answer: the version that broke that tie by priority also silently dropped whichever statuses were
-   carried under the losing name, and the status it dropped is the one this row exists to supply. A healthy injected server goes **`pending` → `connected`**,
+   carried under the losing name, and the status it dropped is the one this row exists to supply.
+   **The status is its own term in the exit predicate**, which it was not for two rounds: the question
+   asks for the spelling AND the status, and only the spelling was checked, so a witness naming our
+   server with no `status` field at all exited ANSWERED having measured half of it. It also has to be
+   the status of a server whose health was established *outside* copilot's account — the fixture's own
+   receipts, showing it answered our tool with this run's marker. Reading whatever status appeared and
+   calling it the healthy one assumes the answer: a server that failed to start reports `failed`, and
+   nothing in the status itself says which case you are looking at. A healthy injected server goes **`pending` → `connected`**,
    with a later `session.mcp_server_status_changed` repeating `connected`.
    **The status vocabulary observed across all five probes is `pending`, `connected`, `failed`,
    `disabled`** — which is what slice 2 splits `_INERT_MCP_STATUSES` on. Note `pending` in particular:
@@ -277,6 +284,12 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
    leaves exactly that row, so redaction read off it is a claim about a reply that was never produced.
    The fixture now writes a `served` row past a successful flush, carrying whether that reply began
    with the marker; the filter readers keep the arrival row, and the comment there says why.
+   **A third round then found the control weaker than the arm it was controlling for.** It was asked
+   only whether the marker appeared *somewhere* in its output — and the marker is also in an env var and
+   in the config file this probe writes, on a run with `--allow-all`. So the control now carries the
+   same two facts as the secret arm: its fixture's receipts, and copilot's own `tool.execution_complete`
+   correlated to our execution by `toolCallId` (the result event carries no tool name). A comparison is
+   only a comparison if both arms are established to have done the same thing.
 5. **Remote `type` omission, as *behaviour* rather than shape.** Slice 3 writes `type` and an explicit
    `tools: ["*"]` because §2(b) says copilot writes them for itself — but (b) is unversioned, and the
    probe that produced it *cannot* be versioned: `copilot mcp add` emits no in-band witness, so no
@@ -300,7 +313,10 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
    `failed` has been measured to mean the server will not be coming up. `pending` is the transient
    *before* `connected` — a truncated arm ends there and so does a healthy one — and an unmeasured word
    a later build invents is in the same position, so both leave the question `OMISSION_UNMEASURED`
-   rather than publishing a negative (review, PR #120).
+   rather than publishing a negative (review, PR #120). The "listed with the key, absent without it"
+   branch needs the bare arm to have published a **readable** inventory as well: an event with the right
+   type and unreadable contents says nothing about which servers copilot had, and the entry that could
+   not be parsed is the one that might have been ours. An empty list is a real inventory.
 
    **So slice 3 must write `type`, and that is now a measurement rather than a preference.**
    **The arm needed rebuilding to say it** (review, PR #120). The first version read only the fixture's

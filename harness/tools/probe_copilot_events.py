@@ -94,8 +94,14 @@ REPORTS_BOTH = "REPORTS_BOTH"        # the run used BOTH spellings: there is no 
 
 REDACTS = "REDACTS"                  # sentinel present in control, absent under the flag
 NO_REDACTION = "NO_REDACTION"        # sentinel present in both
-CONTROL_FAILED = "CONTROL_FAILED"    # sentinel never reached the control's output
+CONTROL_FAILED = "CONTROL_FAILED"    # the control's own tool RESULT never carried the sentinel
+CONTROL_INCOMPLETE = "CONTROL_INCOMPLETE"         # the control never ran the exchange either
 SECRET_ARM_INCOMPLETE = "SECRET_ARM_INCOMPLETE"   # the arm under the flag never made the call
+
+# Question 2 is "which spelling AND what status", so the status needs a verdict of its own.
+STATUS_MEASURED = "STATUS_MEASURED"          # a real status, from an arm proven to have served
+STATUS_ABSENT = "STATUS_ABSENT"              # our server was named and carried no status
+STATUS_UNWITNESSED = "STATUS_UNWITNESSED"    # a status, from an arm that never proved it worked
 
 # The two sources a tool name can come from, kept apart because they can disagree.
 EXECUTION = "execution"              # tool.execution_start.data.toolName — what copilot RAN
@@ -343,6 +349,91 @@ def canonical_name(by_source: dict[str, list[str]]) -> str | None:
     return distinct.pop() if len(distinct) == 1 else None
 
 
+def mcp_call_ids(events: list[dict]) -> set[str]:
+    """The `toolCallId`s copilot assigned to executions of OUR tool.
+
+    The correlation key the result event needs. `tool.execution_complete` carries no tool name
+    at all — only `toolCallId`, `result` and telemetry (measured, 1.0.80) — so attributing a
+    result to our tool means matching the id copilot itself minted on the start event.
+    """
+    ids: set[str] = set()
+    for obj in events:
+        if obj.get("type") != "tool.execution_start":
+            continue
+        data = obj.get("data")
+        if not isinstance(data, dict):
+            continue
+        cid = data.get("toolCallId")
+        if not isinstance(cid, str) or not cid:
+            continue
+        name = data.get("toolName")
+        if (data.get("mcpToolName") == TOOL
+                and data.get("mcpServerName") in (CONFIG_KEY, ADVERTISED_NAME)) or (
+                isinstance(name, str) and is_our_tool(name)):
+            ids.add(cid)
+    return ids
+
+
+def tool_result_carried(events: list[dict], sentinel: str) -> bool:
+    """Whether the RESULT of one of OUR tool's executions carried `sentinel`.
+
+    THE CONTROL'S EVIDENCE, ATTRIBUTED. "The sentinel appears somewhere in the control's
+    stream" is a weaker fact than it looks: the marker is also in an env var and in the config
+    file this probe writes, and the run has `--allow-all`, so a diagnostic echo or a file read
+    satisfies it without any tool reply having travelled — and `REDACTS` would then be resting
+    on a route the secret arm's absence says nothing about (review, PR #120). This asks the
+    narrower question the verdict actually claims: did the value come back *in our tool's
+    result*.
+
+    Searched over the SERIALIZED result rather than one field, because 1.0.80 renders the same
+    text under `content`, `detailedContent` and `contents[].text`, and pinning one spelling
+    would go quiet on a rendering change while the value sat plainly in the other two.
+
+    The structural clause is `ids`: with no execution of our tool there is no result of ours to
+    read, and every `tool.execution_complete` in the stream belongs to something else.
+    """
+    ids = mcp_call_ids(events)
+    if not ids:
+        return False
+    for obj in events:
+        if obj.get("type") != "tool.execution_complete":
+            continue
+        data = obj.get("data")
+        if not isinstance(data, dict) or data.get("toolCallId") not in ids:
+            continue
+        if sentinel in json.dumps(data.get("result")):
+            return True
+    return False
+
+
+def healthy_status_verdict(status: str | None, *, served: bool) -> tuple[str, str]:
+    """(verdict, why) for the half of question 2 that is about the STATUS.
+
+    TWO WAYS OF NOT HAVING MEASURED IT, and `answered()` used to see neither. The spelling and
+    the status are separate deliverables — slice 2 splits `_INERT_MCP_STATUSES` on the status —
+    but only the spelling reached the exit predicate, so a witness naming our server with no
+    `status` field at all exited ANSWERED having measured half the question (review, PR #120).
+
+    The second way is subtler and is the same trap this file keeps finding. The question is
+    what status a *healthy* server reports; reading whatever status appeared and calling it the
+    healthy one assumes the thing being measured. A server that failed to start reports
+    `failed`, and nothing in the status itself says which case this is. So health is
+    established from OUTSIDE copilot's account — the fixture's own receipts, which show it
+    answered our tool with a reply carrying this run's marker — and without that the status is
+    a real reading of an unknown condition, not the answer to this question.
+    """
+    if not isinstance(status, str) or not status:
+        return STATUS_ABSENT, ("the witness named our server and carried no status, so the "
+                               "value slice 2 has to split its allowlist on was not observed")
+    if not served:
+        return STATUS_UNWITNESSED, (
+            f"the witness reported {status!r}, but nothing outside copilot's own account shows "
+            f"this arm's server ever answered our tool — so this is the status of a condition "
+            f"the run did not establish, and calling it the HEALTHY status assumes the answer")
+    return STATUS_MEASURED, (f"the server answered our tool — proven by its own fixture, not by "
+                             f"the CLI — and copilot reported it {status!r}")
+
+
 def name_format(name: str | None) -> str:
     """Classify the observed MCP tool name into a known shape.
 
@@ -469,21 +560,33 @@ def arm_exchanged(records: list[dict], sentinel: str) -> bool:
     return held_sentinel(records, sentinel) and answered_with_marker(records)
 
 
-def secret_verdict(control_stream: str, secret_stream: str, sentinel: str,
-                   *, secret_exchanged: bool) -> tuple[str, str]:
-    """(verdict, why) for `--secret-env-vars`, with both structural gates read FIRST.
+def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool,
+                   control_result_carried: bool, secret_exchanged: bool) -> tuple[str, str]:
+    """(verdict, why) for `--secret-env-vars`, with every structural gate read FIRST.
 
-    THE CONTROL PROVES THE VALUE CAN TRAVEL; THE SECRET ARM'S OWN RECEIPTS PROVE IT DID.
-    Absence of the sentinel under the flag is evidence of redaction only if the arm that
-    produced the absence actually ran the exchange — otherwise the sentinel simply never
-    travelled in THAT run, and `REDACTS` is a claim about a channel nobody connected. The
-    first version had the control alone, and a secret arm that returned an empty string
-    certified redaction (review, PR #120).
+    BOTH ARMS MUST HAVE RUN THE SAME EXCHANGE, and the control's half arrived last (review,
+    PR #120). The secret arm's gate came first: absence of the sentinel under the flag is
+    evidence only if THAT arm actually ran the exchange, since otherwise the value never
+    travelled in that run. But the control was still being asked only whether the sentinel
+    appeared *somewhere* in its output — and the marker also sits in an env var and in the
+    config file this probe writes, under `--allow-all`. So a control that echoed a config and
+    never called anything, paired with a secret arm that completed the exchange and whose reply
+    simply did not render, produced `REDACTS`. The comparison is only a comparison if both arms
+    are established to have done the same thing.
+
+    Each arm therefore carries the same two witnesses, from the same two authors: its fixture's
+    receipts (a different process) say the tool was answered with this run's marker, and
+    copilot's own result event says whether that reply reached the output.
     """
-    if sentinel not in control_stream:
-        return CONTROL_FAILED, ("the sentinel never reached the control run's output, so its "
-                                "absence under --secret-env-vars measures nothing: there was "
-                                "no value in the channel to redact")
+    if not control_exchanged:
+        return CONTROL_INCOMPLETE, ("the control arm never completed the exchange either — its "
+                                    "fixture did not record answering our tool with this run's "
+                                    "marker — so the two arms did not do the same thing and "
+                                    "the difference between them is not about the flag")
+    if not control_result_carried:
+        return CONTROL_FAILED, ("the control's own tool RESULT never carried the sentinel, so "
+                                "the value does not reach the output by that route at all and "
+                                "its absence under --secret-env-vars measures nothing")
     if not secret_exchanged:
         return SECRET_ARM_INCOMPLETE, ("the arm under --secret-env-vars never completed the "
                                        "exchange that carries the value — its fixture did not "
@@ -493,10 +596,9 @@ def secret_verdict(control_stream: str, secret_stream: str, sentinel: str,
     if sentinel in secret_stream:
         return NO_REDACTION, ("the sentinel appears in the output WITH --secret-env-vars naming "
                               "its variable — the flag did not redact the value where it landed")
-    return REDACTS, ("the sentinel reached the control's output, the secret arm's own server "
-                     "recorded ANSWERING the same call with a reply that carried the same "
-                     "marker, and the value is absent from that arm's output — so the flag "
-                     "redacted the value itself")
+    return REDACTS, ("both arms answered our tool with this run's marker, the control's tool "
+                     "RESULT carried it into the output, and the value is absent from the "
+                     "secret arm's output entirely — so the flag redacted the value itself")
 
 
 def mcp_config(path: str, sentinel: str, receipts: str) -> str:
@@ -569,7 +671,7 @@ def agreed_version(streams: list[str]) -> tuple[str, bool]:
     return found[0], True
 
 
-def answered(fmt: str, spelling: str, secret: str) -> bool:
+def answered(fmt: str, spelling: str, status_state: str, secret: str) -> bool:
     """Whether all three questions were ANSWERED — a conjunction, never a lookup.
 
     Each term is a separate question, and a run that settled two of them has not established
@@ -579,9 +681,14 @@ def answered(fmt: str, spelling: str, secret: str) -> bool:
     question with two answers, which is not an answer. So do `ONE_SOURCE_ONLY` — a name with
     no agreement observed — and `REPORTS_BOTH`, where the run used both server spellings and
     the contract is therefore not one thing.
+
+    THE STATUS IS ITS OWN TERM, because question 2 asks two things and only one of them used to
+    reach here: a run naming our server with no status at all answered the spelling and left
+    the value slice 2 splits its allowlist on unmeasured.
     """
     return (fmt not in (UNMEASURED, AMBIGUOUS, ONE_SOURCE_ONLY)
             and spelling not in (REPORTS_NEITHER, REPORTS_BOTH)
+            and status_state == STATUS_MEASURED
             and secret in (REDACTS, NO_REDACTION))
 
 
@@ -621,23 +728,36 @@ def main() -> int:
     seen_secret = loaded_servers(ev_secret)
     spelling_secret, statuses_secret = declared_spelling(seen_secret)
 
-    verdict, why = secret_verdict(control, secret, sentinel,
-                                  secret_exchanged=arm_exchanged(secret_receipts, sentinel))
+    # ONE FACT, TWO QUESTIONS. Whether the CONTROL arm's server actually answered our tool is
+    # what makes its status the HEALTHY one (question 2) and what makes its output a
+    # comparison for the secret arm (question 4). It was computed for neither and printed for
+    # both (review, PR #120).
+    control_exchanged = arm_exchanged(control_receipts, sentinel)
+    status_state, status_why = healthy_status_verdict(status, served=control_exchanged)
+
+    verdict, why = secret_verdict(
+        secret, sentinel,
+        control_exchanged=control_exchanged,
+        control_result_carried=tool_result_carried(ev_control, sentinel),
+        secret_exchanged=arm_exchanged(secret_receipts, sentinel))
 
     print(f"version            : {version} ({'usable' if version_ok else 'UNVERIFIED'})")
     print(f"servers (control)  : {seen or '(none)'}")
     print(f"servers (secret)   : {seen_secret or '(none)'}")
     print(f"Q2 name spelling   : {spelling}   statuses={statuses}   effective={status!r}")
+    print(f"Q2 healthy status  : {status_state}\n    {status_why}")
     print(f"   secret arm said : {spelling_secret}   statuses={statuses_secret}"
           f"{'   (DISAGREES with the control)' if spelling_secret != spelling else ''}")
     print(f"tool names by source: {by_source or '(none)'}")
     print(f"Q1 tool format     : {fmt}   observed={observed!r}")
     print(f"Q1 structured      : {fields}\n    {fields_why}")
     print(f"Q4 secret          : {verdict}\n    {why}")
-    for label, rows in (("control", control_receipts), ("secret ", secret_receipts)):
+    for label, rows, evs in (("control", control_receipts, ev_control),
+                             ("secret ", secret_receipts, ev_secret)):
         print(f"   {label} receipts: arrived={requested_tool(rows)} "
               f"answered_with_marker={answered_with_marker(rows)} "
-              f"server_held_marker={held_sentinel(rows, sentinel)}")
+              f"server_held_marker={held_sentinel(rows, sentinel)} "
+              f"result_carried_it={tool_result_carried(evs, sentinel)}")
 
     # THE FOOTER PROMISED A DIRECTORY AND NOTHING WAS EVER PUT IN IT. These readings are the
     # slice's deliverable and they get quoted into a design document, so the stream they came
@@ -647,7 +767,7 @@ def main() -> int:
         with open(os.path.join(workdir, f"{label}.stream"), "w", encoding="utf-8") as fh:
             fh.write(text)
 
-    ok = answered(fmt, spelling, verdict) and version_ok
+    ok = answered(fmt, spelling, status_state, verdict) and version_ok
     print(f"\n{'ANSWERED' if ok else 'NOT FULLY ANSWERED'} — "
           f"raw streams and receipts under {workdir}")
     return 0 if ok else 1

@@ -4284,9 +4284,14 @@ try:
                                               "copilot-1.0.80-events.jsonl"),
                                  encoding="utf-8").read().splitlines()
                if ln.strip() and not ln.startswith("#")]
-    check("the pinned capture holds the three events the readings below depend on",
-          len(_pinned) == 3, _pinned)
-    _real_loaded, _real_exec, _real_req = _pinned
+    check("the pinned capture holds the four events the readings below depend on",
+          len(_pinned) == 4, _pinned)
+    _real_loaded, _real_exec, _real_req, _real_done = _pinned
+    # The marker that WAS in the pinned run, recovered from the pinned line itself so the arm
+    # below cannot drift from the capture. It is a spent per-run token, not a credential.
+    _pinned_sent = json.loads(_real_done)["data"]["result"]["content"].split(":")[0]
+    check("the pinned result line carries a recoverable per-run marker",
+          _pinned_sent.startswith("SENT-") and len(_pinned_sent) > 10, _pinned_sent)
     check("the readers find our server in a VERBATIM 1.0.80 line, so the shape is real",
           EV.loaded_servers(EV.parse_events(_real_loaded)) == [(EV.CONFIG_KEY, "connected")],
           EV.loaded_servers(EV.parse_events(_real_loaded)))
@@ -4388,9 +4393,35 @@ try:
           EV.declared_spelling(_mixed_names)[1] == ["connected", "failed"],
           EV.declared_spelling(_mixed_names))
     check("...which `answered()` refuses, since a contract that is two things is not an answer",
-          not EV.answered(EV.CLAUDE_STYLE, EV.REPORTS_BOTH, EV.REDACTS), "two spellings")
+          not EV.answered(EV.CLAUDE_STYLE, EV.REPORTS_BOTH, EV.STATUS_MEASURED,
+                          EV.REDACTS), "two spellings")
     check("the two names really are distinct, or every arm above is vacuous",
           EV.CONFIG_KEY != EV.ADVERTISED_NAME, (EV.CONFIG_KEY, EV.ADVERTISED_NAME))
+
+    # -- the STATUS half of question 2, which never reached the exit predicate ---------------
+    # THE ARM THE REVIEW ADDED. Question 2 asks for the spelling AND the status a healthy
+    # server carries — slice 2 splits `_INERT_MCP_STATUSES` on the second — and only the
+    # spelling was a term in `answered()`. A witness naming our server with no `status` field
+    # exited ANSWERED having measured half the question.
+    check("our server named with NO status is a spelling, not a status",
+          EV.declared_spelling([(EV.CONFIG_KEY, None)]) == (EV.REPORTS_CONFIG_KEY, [None])
+          and EV.effective_status([None]) is None, "the reading that used to pass")
+    check("...and that is STATUS_ABSENT, so the exit predicate can see it",
+          EV.healthy_status_verdict(None, served=True)[0] == EV.STATUS_ABSENT, "no status")
+    check("...an empty string is not a status either",
+          EV.healthy_status_verdict("", served=True)[0] == EV.STATUS_ABSENT, "empty")
+    # THE SECOND HALF, and the subtler one: reading whatever status appeared and calling it the
+    # HEALTHY status assumes the thing being measured. A server that failed to start reports
+    # `failed`, and the status alone does not say which case this is.
+    check("a real status from an arm that never served is UNWITNESSED, not the healthy status",
+          EV.healthy_status_verdict("connected", served=False)[0] == EV.STATUS_UNWITNESSED,
+          "health has to come from outside copilot's account")
+    check("...and a real status from an arm that DID serve is measured",
+          EV.healthy_status_verdict("connected", served=True)[0] == EV.STATUS_MEASURED, "ok")
+    for _state, _why in ((EV.STATUS_ABSENT, "no status observed"),
+                         (EV.STATUS_UNWITNESSED, "status of an unestablished condition")):
+        check(f"...and `answered()` refuses it ({_why})",
+              not EV.answered(EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, _state, EV.REDACTS), _why)
 
     # -- tool_names / canonical_name: the two sources must not be flattened -----------------
     # THE ARM THE REVIEW ADDED. The docstring said the execution event and the model's request
@@ -4432,7 +4463,8 @@ try:
     check("...while both sources naming it is AGREED, or every arm above is vacuous",
           EV.sources_verdict({EV.EXECUTION: ["x"], EV.REQUEST: ["x"]}) == EV.AGREED, "both")
     check("...and ONE_SOURCE_ONLY is not an answer",
-          not EV.answered(EV.ONE_SOURCE_ONLY, EV.REPORTS_CONFIG_KEY, EV.REDACTS), "partial")
+          not EV.answered(EV.ONE_SOURCE_ONLY, EV.REPORTS_CONFIG_KEY,
+                          EV.STATUS_MEASURED, EV.REDACTS), "partial")
     check("the two expected sources are the two the reader produces, or PARTIAL is unreachable",
           set(EV.EXPECTED_SOURCES) == {EV.EXECUTION, EV.REQUEST}, EV.EXPECTED_SOURCES)
 
@@ -4582,43 +4614,117 @@ try:
     check("...and it NEVER carries the marker itself, only the fact that the reply did",
           _sent not in open(_r_full, encoding="utf-8").read(), "the PR #110 rule, still held")
 
-    # -- secret_verdict: TWO structural gates, and the review's reproduction -----------------
-    check("a control that never carried the sentinel measures nothing",
-          EV.secret_verdict("clean output", "clean output", _sent,
-                            secret_exchanged=True)[0] == EV.CONTROL_FAILED,
+    # -- tool_result_carried: the control's evidence, ATTRIBUTED to our tool -----------------
+    # THE ARM THE REVIEW ADDED. "The sentinel appears somewhere in the control's stream" is
+    # weaker than it looks: the marker is in an env var and in the config file this probe
+    # writes, and the run has `--allow-all`. A diagnostic echo satisfies it with no tool reply
+    # having travelled. The result event carries no tool name — only `toolCallId` — so
+    # attribution runs through the id copilot minted on the start event.
+    _cid = "toolu_probe_01"
+    _start = json.dumps({"type": "tool.execution_start", "data": {
+        "toolCallId": _cid, "toolName": f"{EV.CONFIG_KEY}-{EV.TOOL}",
+        "mcpServerName": EV.CONFIG_KEY, "mcpToolName": EV.TOOL}}) + "\n"
+    _done = json.dumps({"type": "tool.execution_complete", "data": {
+        "toolCallId": _cid, "result": {"content": f"{_sent}:HELLO",
+                                       "contents": [{"type": "text",
+                                                     "text": f"{_sent}:HELLO"}]}}}) + "\n"
+    check("a result correlated to OUR execution, carrying the sentinel, counts",
+          EV.tool_result_carried(EV.parse_events(_start + _done), _sent), "attributed")
+    # THE DISTINGUISHING CASE: the value is in the stream, and not by the route claimed.
+    _echoed = json.dumps({"type": "assistant.message", "data": {
+        "content": f"your config says ECHO_MCP_IDENTITY={_sent}"}}) + "\n"
+    check("...but the sentinel merely APPEARING in the stream does not",
+          not EV.tool_result_carried(EV.parse_events(_echoed), _sent),
+          "an echoed config is not a tool reply")
+    check("...nor does a result belonging to SOMEBODY ELSE'S tool call",
+          not EV.tool_result_carried(EV.parse_events(
+              json.dumps({"type": "tool.execution_start", "data": {
+                  "toolCallId": "other", "toolName": "shell"}}) + "\n"
+              + json.dumps({"type": "tool.execution_complete", "data": {
+                  "toolCallId": "other", "result": {"content": _sent}}}) + "\n"), _sent),
+          "the correlation is the point")
+    check("...and an execution of ours with no result event carries nothing",
+          not EV.tool_result_carried(EV.parse_events(_start), _sent), "no result")
+    # THE REAL PAIR, which is what makes the synthetic arms above more than shape agreement:
+    # copilot's own start and complete events from one run, correlated by the id it minted.
+    check("the REAL start/complete pair correlates, and the result carries the run's marker",
+          EV.tool_result_carried(EV.parse_events(_real_exec + "\n" + _real_done), _pinned_sent),
+          "the pinned run, end to end")
+    check("...and the complete event ALONE carries nothing, since it names no tool",
+          not EV.tool_result_carried(EV.parse_events(_real_done), _pinned_sent),
+          "the correlation is doing the work, not a substring search")
+
+    # -- secret_verdict: every gate, and each one reproduced ---------------------------------
+    _ok = dict(control_exchanged=True, control_result_carried=True, secret_exchanged=True)
+    # THE ARM THE REVIEW ADDED. The control was asked only whether the sentinel appeared
+    # SOMEWHERE. A control that echoed a config and called nothing, paired with a secret arm
+    # that completed the exchange and whose reply did not render, produced REDACTS.
+    check("a control that never ran the exchange makes the two arms incomparable",
+          EV.secret_verdict("nothing here", _sent,
+                            **dict(_ok, control_exchanged=False))[0] == EV.CONTROL_INCOMPLETE,
+          "the control has to do the same thing")
+    check("a control whose own tool RESULT never carried the sentinel measures nothing",
+          EV.secret_verdict("nothing here", _sent,
+                            **dict(_ok, control_result_carried=False))[0] == EV.CONTROL_FAILED,
           "no value in the channel to redact")
-    # THE ARM THE REVIEW ADDED, and the exact case a reviewer reproduced: control fine, secret
-    # arm returns "". Absence of the sentinel from an arm that never made the call is the
-    # absence of the CALL. The old code certified REDACTS from it.
+    # The exact case a reviewer reproduced earlier: control fine, secret arm returns "".
     check("a secret arm that never ran the exchange cannot certify redaction",
-          EV.secret_verdict(f"saw {_sent} here", "", _sent,
-                            secret_exchanged=False)[0] == EV.SECRET_ARM_INCOMPLETE,
+          EV.secret_verdict("", _sent,
+                            **dict(_ok, secret_exchanged=False))[0] == EV.SECRET_ARM_INCOMPLETE,
           "an empty arm is not a redacted arm")
     check("...and neither can one that produced plenty of output without calling the tool",
-          EV.secret_verdict(f"saw {_sent} here", "I could not find that server, sorry.", _sent,
-                            secret_exchanged=False)[0] == EV.SECRET_ARM_INCOMPLETE,
+          EV.secret_verdict("I could not find that server, sorry.", _sent,
+                            **dict(_ok, secret_exchanged=False))[0] == EV.SECRET_ARM_INCOMPLETE,
           "nonempty is not exchanged")
-    check("...sentinel in the control, exchange made, and gone under the flag is REDACTS",
-          EV.secret_verdict(f"saw {_sent} here", "nothing here", _sent,
-                            secret_exchanged=True)[0] == EV.REDACTS, "redacted")
-    check("...sentinel in both is NO_REDACTION",
-          EV.secret_verdict(f"saw {_sent}", f"still {_sent}", _sent,
-                            secret_exchanged=True)[0] == EV.NO_REDACTION, "not redacted")
+    check("...both arms exchanged, the control's result carried it, gone under the flag: REDACTS",
+          EV.secret_verdict("nothing here", _sent, **_ok)[0] == EV.REDACTS, "redacted")
+    check("...sentinel still present under the flag is NO_REDACTION",
+          EV.secret_verdict(f"still {_sent}", _sent, **_ok)[0] == EV.NO_REDACTION,
+          "not redacted")
+    check("...and the control gates are read BEFORE the secret arm's, so a doubly-broken run "
+          "names the control",
+          EV.secret_verdict("", _sent, control_exchanged=False, control_result_carried=False,
+                            secret_exchanged=False)[0] == EV.CONTROL_INCOMPLETE, "order")
 
     # -- answered(): a conjunction, so any single gap fails it -------------------------------
     # The tell for a lookup-on-the-last-value bug is that ONE unanswered term still passes.
-    check("all three answered is answered",
-          EV.answered(EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.REDACTS), "all three")
-    for _f, _s, _x, _why in (
-            (EV.UNMEASURED, EV.REPORTS_CONFIG_KEY, EV.REDACTS, "format unmeasured"),
-            (EV.AMBIGUOUS, EV.REPORTS_CONFIG_KEY, EV.REDACTS, "two spellings, so no answer"),
-            (EV.CLAUDE_STYLE, EV.REPORTS_NEITHER, EV.REDACTS, "server never named"),
-            (EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.CONTROL_FAILED, "secret control failed"),
-            (EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.SECRET_ARM_INCOMPLETE,
-             "secret arm never exchanged")):
-        check(f"...and ONE gap ({_why}) is enough to fail it", not EV.answered(_f, _s, _x), _why)
+    check("all four answered is answered",
+          EV.answered(EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.STATUS_MEASURED, EV.REDACTS),
+          "all four")
+    for _f, _s, _t, _x, _why in (
+            (EV.UNMEASURED, EV.REPORTS_CONFIG_KEY, EV.STATUS_MEASURED, EV.REDACTS,
+             "format unmeasured"),
+            (EV.AMBIGUOUS, EV.REPORTS_CONFIG_KEY, EV.STATUS_MEASURED, EV.REDACTS,
+             "two spellings, so no answer"),
+            (EV.ONE_SOURCE_ONLY, EV.REPORTS_CONFIG_KEY, EV.STATUS_MEASURED, EV.REDACTS,
+             "one source, agreement unobserved"),
+            (EV.CLAUDE_STYLE, EV.REPORTS_NEITHER, EV.STATUS_MEASURED, EV.REDACTS,
+             "server never named"),
+            (EV.CLAUDE_STYLE, EV.REPORTS_BOTH, EV.STATUS_MEASURED, EV.REDACTS,
+             "both spellings used"),
+            (EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.STATUS_ABSENT, EV.REDACTS,
+             "no status observed"),
+            (EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.STATUS_UNWITNESSED, EV.REDACTS,
+             "status of an unestablished condition"),
+            (EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.STATUS_MEASURED, EV.CONTROL_FAILED,
+             "secret control failed"),
+            (EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.STATUS_MEASURED, EV.CONTROL_INCOMPLETE,
+             "control never exchanged"),
+            (EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.STATUS_MEASURED,
+             EV.SECRET_ARM_INCOMPLETE, "secret arm never exchanged")):
+        check(f"...and ONE gap ({_why}) is enough to fail it",
+              not EV.answered(_f, _s, _t, _x), _why)
     check("NO_REDACTION is an ANSWER, not a gap — a finding still settles the question",
-          EV.answered(EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.NO_REDACTION), "negative answer")
+          EV.answered(EV.CLAUDE_STYLE, EV.REPORTS_CONFIG_KEY, EV.STATUS_MEASURED,
+                      EV.NO_REDACTION), "negative answer")
+    # EVERY NON-ANSWER IS ITS OWN WORD, and none of them may collide — a collision is how two
+    # different ways of not having the quantity get read as each other.
+    _vocab = [EV.UNMEASURED, EV.AMBIGUOUS, EV.ONE_SOURCE_ONLY, EV.REPORTS_NEITHER,
+              EV.REPORTS_BOTH, EV.STATUS_ABSENT, EV.STATUS_UNWITNESSED, EV.STATUS_MEASURED,
+              EV.CONTROL_FAILED, EV.CONTROL_INCOMPLETE, EV.SECRET_ARM_INCOMPLETE,
+              EV.REDACTS, EV.NO_REDACTION]
+    check("the verdict vocabulary has no two words spelled the same",
+          len(set(_vocab)) == len(_vocab), _vocab)
 
     # -- agreed_version: an arm that produced NOTHING is not excused ------------------------
     # Filtering the empty streams out before this is what let a vanished secret arm ride
@@ -4646,9 +4752,15 @@ try:
                 {"kind": "request", "method": "tools/call", "tool": EV.TOOL},
                 {"kind": "served", "method": "tools/call", "tool": EV.TOOL,
                  "is_error": False, "carried_identity": True}]
+        # The CONTROL's result event carries the marker; the secret arm's does not. That is
+        # the difference the whole measurement is about, so the fake has to express it here
+        # rather than by sprinkling the marker into loose text.
+        _cid = json.loads(_real_exec)["data"]["toolCallId"]
+        _result = json.dumps({"type": "tool.execution_complete", "data": {
+            "toolCallId": _cid,
+            "result": {"content": ("[REDACTED]" if redact else f"{sentinel}:HELLO")}}})
         stream = (REAL_VERSION_LINE + _real_loaded + "\n" + _real_exec + "\n"
-                  + _real_req + "\n"
-                  + ("" if redact else f"the tool replied {sentinel}:HELLO\n"))
+                  + _real_req + "\n" + _result + "\n")
         if not redact:
             return stream, rows
         if _mode[0] == "empty":            # the arm vanished: no stream, no receipts
@@ -4758,6 +4870,29 @@ try:
     check("`reported_inventory` separates those two, or the clause above cannot bite",
           CRG.reported_inventory(_silent) and not CRG.reported_inventory(REAL_VERSION_LINE),
           (CRG.reported_inventory(_silent), CRG.reported_inventory(REAL_VERSION_LINE)))
+    # THE ARM THE REVIEW ADDED. The clause checked only the event TYPE, so an inventory whose
+    # `data` is unreadable — right event, no readable contents — established absence. The
+    # reader correctly extracts nothing from it, and taking that emptiness as "our server was
+    # not there" publishes a finding about the `type` key from an event nobody could parse.
+    _garbage = '{"type":"session.mcp_servers_loaded","data":42}\n'
+    check("an inventory event whose `data` is unreadable does NOT establish absence",
+          not CRG.reported_inventory(_garbage)
+          and CRG.loaded_servers(CRG.parse_events(_garbage)) == [],
+          "the reader finds nothing in it, and so must the clause")
+    for _drift, _why in (('{"type":"session.mcp_servers_loaded","data":{"servers":7}}\n',
+                          "`servers` is not a list"),
+                         ('{"type":"session.mcp_servers_loaded","data":{"servers":["x"]}}\n',
+                          "an entry is not an object"),
+                         ('{"type":"session.mcp_servers_loaded","data":{"servers":[{"id":1}]}}\n',
+                          "an entry carries no name")):
+        check(f"...nor does schema drift ({_why}) — the unparsable entry could be ours",
+              not CRG.reported_inventory(_drift), _drift)
+    # AN EMPTY LIST IS A REAL INVENTORY, and the one this clause exists to admit: copilot said
+    # what it had and had nothing. Without this arm the fix could over-tighten into never
+    # admitting the case it was written for.
+    check("...but an EMPTY server list IS an inventory — copilot said what it had",
+          CRG.reported_inventory('{"type":"session.mcp_servers_loaded","data":{"servers":[]}}\n'),
+          "absence from a real inventory is the finding")
     # THE ARM THE REVIEW ADDED, and the reason this signature grew a control. A listening
     # fixture with no call proves nothing about the key: the probe starts that fixture itself,
     # and a turn where the model simply never called the tool produces identical receipts. The

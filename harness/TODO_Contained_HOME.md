@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff AN
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff + shellcheck + a parse under every shell
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 196/196 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 658 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 203/203 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 685 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine
 git diff --check
@@ -2054,6 +2054,25 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   reading is not the quantity". A repair phrased at the level of the reproduction leaves the
   next instance to be found by the next reviewer — which is CLAUDE.md's first rule, arriving
   in the thing that was supposed to be applying it.
+- **A THIRD ROUND FOUND THREE MORE, and two of them were in the CONTROLS the earlier rounds
+  had just added.** Strengthening the treatment arm and leaving the control where it was makes
+  the pair *less* balanced, not more: the redaction control was still being asked only whether
+  the marker appeared SOMEWHERE in its output, while the secret arm had to prove it answered
+  the call — and the marker also sits in an env var and in the config the probe writes, on a
+  run with `--allow-all`. A control that echoed a config while calling nothing, paired with a
+  secret arm whose reply did not render, produced the positive. **A comparison is only a
+  comparison if both arms are established to have done the same thing**, so whatever the
+  treatment arm must prove, the control must prove too — the third round's rule, and the one
+  the second round should have derived.
+  The other two are the same shape one level down. A structural clause added to make an
+  absence meaningful was itself satisfiable by garbage: "copilot published an inventory and
+  ours was not in it" checked only the event TYPE, so `{"data": 42}` — right event, unreadable
+  contents — established absence. And question 2's exit predicate checked the server's
+  SPELLING while the question also asks for its STATUS, so a witness naming the server with no
+  status field answered half a question and exited green. **When you add a clause to make a
+  reading meaningful, ask what the WEAKEST input satisfying that clause looks like** — here, an
+  event with the right name and no contents, and a predicate with the right shape and one of
+  its two terms missing.
 - **A single-line anchor aimed at `mutate_mcp.py` itself matches TWICE**, and one of the two is
   the mutation entry quoting it. It is refused up front by `stale_anchors` rather than silently
   mutating the list instead of the code, but the fix is not obvious from the message: pin it
