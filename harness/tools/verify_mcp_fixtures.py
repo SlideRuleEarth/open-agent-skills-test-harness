@@ -5561,6 +5561,204 @@ finally:
     shutil.rmtree(_e21, ignore_errors=True)
 
 
+print("E22. the plugin-MCP probe's classifiers — the ones a false NEGATIVE would ride out on")
+# WHY THIS SECTION IS SHAPED AROUND ABSENCE. The probe reads a SUPPRESSION: its finding is that
+# something is not there. Every reading of that kind is worthless unless something proves it
+# would have been there, so the arms below are mostly about the CONTROL and about refusing to
+# treat absence as success. A probe that got this wrong would publish "the flag does not reach
+# plugin servers" from an instrument that never loaded a plugin — a false negative about a
+# hermeticity control, which is the direction that costs the most.
+import probe_copilot_plugin_mcp as PLG          # noqa: E402 — after the path bootstrap at E14
+
+_e22 = tempfile.mkdtemp(prefix="verify-copilot-plugin-")
+try:
+    # -- the manifest the probe plants ------------------------------------------------------
+    _pd = PLG.write_plugin(os.path.join(_e22, "plug"), os.path.join(_e22, "r.jsonl"))
+    _manifest = json.loads(open(os.path.join(_pd, "plugin.json"), encoding="utf-8").read())
+    check("the planted manifest declares the server under the probe's own name",
+          _manifest["name"] == PLG.PLUGIN_NAME
+          and list(_manifest["mcpServers"]) == [PLG.SERVER_NAME], _manifest)
+    check("...and the declared command is the echo fixture, not a placeholder that cannot start",
+          _manifest["mcpServers"][PLG.SERVER_NAME]["args"] == [PLG.ECHO],
+          _manifest["mcpServers"][PLG.SERVER_NAME])
+
+    # -- server_entry: matched by NAME, never by being the only one -------------------------
+    # THE TRAP: the probe runs against the REAL home, so a machine with any MCP server
+    # configured would break a reader that took "the only entry" or "the first entry".
+    def _loaded(*entries):
+        return PLG.parse_events(json.dumps(
+            {"type": "session.mcp_servers_loaded", "data": {"servers": list(entries)}}))
+
+    _mine = {"name": PLG.SERVER_NAME, "status": PLG.CONNECTED, "source": "plugin",
+             "sourcePlugin": PLG.PLUGIN_NAME, "pluginName": PLG.PLUGIN_NAME}
+    _other = {"name": "someone-elses-server", "status": PLG.CONNECTED, "source": "user"}
+    check("our server is found when it is NOT the first entry",
+          PLG.server_entry(_loaded(_other, _mine), PLG.SERVER_NAME) == _mine, "second position")
+    check("...and a stream with only OTHER servers yields None rather than the wrong entry",
+          PLG.server_entry(_loaded(_other), PLG.SERVER_NAME) is None, "not ours")
+
+    # -- attributed_to_plugin: a same-named server from elsewhere is not ours ----------------
+    check("an entry attributed to our plugin is recognised",
+          PLG.attributed_to_plugin(_mine), _mine)
+    # ONE VARIABLE. The first version of this arm passed an entry with `source: "user"` and NO
+    # plugin fields, so it varied both halves of the predicate at once and stayed False for the
+    # wrong reason — a mutation widening the `source` test to accept "user" did not move it
+    # (F181, caught by the mutation run rather than by review). The plugin-attribution fields
+    # are now IDENTICAL to the good entry's and only `source` differs, so this arm can fail
+    # exactly when that clause stops discriminating.
+    check("...a same-named, same-plugin-named server from a DIFFERENT source is not",
+          not PLG.attributed_to_plugin({"name": PLG.SERVER_NAME, "status": PLG.CONNECTED,
+                                        "source": "user",
+                                        "sourcePlugin": PLG.PLUGIN_NAME,
+                                        "pluginName": PLG.PLUGIN_NAME}), "user-sourced")
+    check("...and one naming a different plugin is not either",
+          not PLG.attributed_to_plugin({"name": PLG.SERVER_NAME, "source": "plugin",
+                                        "sourcePlugin": "someone-else",
+                                        "pluginName": "someone-else"}), "other plugin")
+
+    # -- control_ok: three distinct ways the instrument fails --------------------------------
+    # Each of these would otherwise become "the flag does not reach it".
+    check("a control that never listed the server FAILS rather than proving anything",
+          not PLG.control_ok(None)[0], "absent")
+    check("...a control whose server never reached `connected` FAILS",
+          not PLG.control_ok({"name": PLG.SERVER_NAME, "status": "failed", "source": "plugin",
+                              "sourcePlugin": PLG.PLUGIN_NAME})[0], "failed")
+    check("...a control whose entry is not attributed to our plugin FAILS",
+          not PLG.control_ok({"name": PLG.SERVER_NAME, "status": PLG.CONNECTED,
+                              "source": "user"})[0], "wrong source")
+    check("...and a healthy, attributed control PASSES, or every arm above is vacuous",
+          PLG.control_ok(_mine)[0], _mine)
+
+    # -- disabled_by: `disabled`, not absence ------------------------------------------------
+    # ABSENCE IS THE FALSE POSITIVE. A server missing from the list is also what a plugin that
+    # failed to load looks like, so accepting it would let a broken arm certify the flag.
+    check("an entry reported `disabled` counts as suppressed",
+          PLG.disabled_by({"name": PLG.SERVER_NAME, "status": PLG.DISABLED}), "disabled")
+    check("...an ABSENT entry does NOT count as suppressed",
+          not PLG.disabled_by(None), "absence is not evidence")
+    check("...and a still-connected entry does not either",
+          not PLG.disabled_by(_mine), "connected")
+
+    # -- arm_state: EVERY candidate is its own measurement ------------------------------------
+    # THE SECTION THE REVIEW ADDED. The first version verified attribution for the CONTROL
+    # only; a candidate arm took the first same-named entry from any source, and an absent or
+    # failed entry was read as "that spelling did not work". So an arm that crashed and an arm
+    # that proved the flag does nothing produced the same word.
+    _disabled_mine = dict(_mine, status=PLG.DISABLED)
+    check("an attributed, `disabled` arm is the one state that says the flag reached it",
+          PLG.arm_state(_disabled_mine)[0] == PLG.ARM_DISABLED, _disabled_mine)
+    check("...an attributed, still-`connected` arm says the flag did NOT reach it",
+          PLG.arm_state(_mine)[0] == PLG.ARM_CONNECTED, _mine)
+    check("...an arm that listed no entry at all measured nothing, and says so",
+          PLG.arm_state(None)[0] == PLG.ARM_FAILED, "absent is not `not disabled`")
+    # THE IMPOSTOR, and the exact entry a reviewer used to reproduce exit 0. Same name, same
+    # `disabled` status, a different source: read as a result it certifies the flag against
+    # somebody else's server.
+    check("...a `disabled` entry from ANOTHER source is a failed arm, not a working spelling",
+          PLG.arm_state(dict(_disabled_mine, source="user"))[0] == PLG.ARM_FAILED,
+          "a same-named server from elsewhere is not ours")
+    # THE STATUS SET IS CLOSED. A word this probe does not understand must not quietly become
+    # "not disabled", because that publishes a negative about a hermeticity control.
+    check("...and a status nobody predicted is a failed arm, not a quiet `not disabled`",
+          PLG.arm_state(dict(_mine, status="degraded"))[0] == PLG.ARM_FAILED, "unknown status")
+
+    # -- classify: the control gates everything, and then every arm must have spoken ----------
+    _works = {PLG.SERVER_NAME: _disabled_mine}
+    _none = {n: dict(_mine) for n in PLG.CANDIDATES}
+    check("a failed control is INSTRUMENT_FAILED even when every arm looks suppressed",
+          PLG.classify(None, _works)[0] == PLG.INSTRUMENT_FAILED,
+          "absence of a control outranks a perfect-looking result")
+    check("...with a good control, a spelling that suppressed it is REACHES",
+          PLG.classify(_mine, _works)[0] == PLG.REACHES, "reaches")
+    check("...and the working spelling is REPORTED, since the naming is half the question",
+          PLG.classify(_mine, _works)[2] == [PLG.SERVER_NAME], "names it")
+    check("...no spelling working is UNREACHABLE — a finding, not an instrument failure",
+          PLG.classify(_mine, _none)[0] == PLG.UNREACHABLE, "unreachable")
+    # THE STRUCTURAL CLAUSE, in its purest form: `working` is a comprehension over `arms`, and
+    # over an empty dict it is empty — which reads exactly like "no spelling worked".
+    check("...but NO arms tried at all is INSTRUMENT_FAILED, not UNREACHABLE",
+          PLG.classify(_mine, {})[0] == PLG.INSTRUMENT_FAILED,
+          "an empty quantifier is not a negative result")
+    # THE REVIEWER'S REPRODUCTION, entire: the one "working" spelling sourced from `user` and
+    # every other arm empty. The old classifier returned REACHES and the probe exited 0.
+    _repro = {PLG.SERVER_NAME: dict(_disabled_mine, source="user")}
+    _repro.update({n: None for n in PLG.CANDIDATES if n != PLG.SERVER_NAME})
+    check("a `disabled` impostor with every other arm EMPTY is INSTRUMENT_FAILED, not REACHES",
+          PLG.classify(_mine, _repro)[0] == PLG.INSTRUMENT_FAILED,
+          "the run a reviewer reproduced exit 0 from")
+    check("...and it reports no working spelling, so nothing downstream can read one off it",
+          PLG.classify(_mine, _repro)[2] == [], "no naming result from a broken run")
+    # ONE BAD ARM POISONS THE NEGATIVE TOO. `UNREACHABLE` names the spellings that do not work,
+    # and an arm that never spoke is not one of them.
+    check("one silent arm among three good ones still blocks the answer",
+          PLG.classify(_mine, dict(_none, **{PLG.PLUGIN_NAME: None}))[0]
+          == PLG.INSTRUMENT_FAILED,
+          "with any arm unread the set of spellings that do not work is unknown")
+    check("...and every arm's state is reported, so which one failed is visible",
+          PLG.classify(_mine, _repro)[3].get(PLG.PLUGIN_NAME) == PLG.ARM_FAILED,
+          PLG.classify(_mine, _repro)[3])
+
+    # -- main(): every arm launched reaches version agreement ---------------------------------
+    # The classifier arms above prove a broken arm cannot become a naming result. This proves
+    # the OTHER half of the same repair: an arm that produced no stream at all was dropped
+    # before version agreement, so three silent arms rode out under one build's name. The good
+    # mode is the positive control — without it, "returns 1" would be satisfied by a main()
+    # that never returns 0 at all.
+    def _plug_stream(status, *, versioned=True):
+        head = (json.dumps({"type": "session.skills_loaded", "data": {"skills": [
+                    {"source": "builtin",
+                     "path": "/x/pkg/darwin-arm64/1.0.80/builtin/s/SKILL.md"}]}}) + "\n"
+                if versioned else "")
+        return head + json.dumps({"type": "session.mcp_servers_loaded", "data": {"servers": [
+            dict(_mine, status=status)]}}) + "\n"
+
+    # TWO WAYS ONE ARM CAN SPOIL THE RUN, and they are stopped by DIFFERENT gates — which is
+    # why both are here. A silent arm is caught by `classify`, because no stream means no
+    # entry. An arm that spoke perfectly well but carried no in-band build is invisible to
+    # `classify` and is caught only by version agreement, and that is the arm that could have
+    # executed a different copilot.
+    _spoil = [None]
+
+    def _fake_plug_arm(_workdir, _plugin_dir, disable):
+        status = PLG.DISABLED if disable == PLG.SERVER_NAME else PLG.CONNECTED
+        if disable is None:
+            return _plug_stream(PLG.CONNECTED)
+        if _spoil[0] == ("silent", disable):
+            return ""
+        if _spoil[0] == ("unversioned", disable):
+            return _plug_stream(status, versioned=False)
+        return _plug_stream(status)
+
+    _real_plug_arm = PLG.run_arm
+    try:
+        PLG.run_arm = _fake_plug_arm
+        _spoil[0] = None
+        check("a full set of attributed arms REACHES and exits 0, or the arms below are vacuous",
+              PLG.main() == 0, "the positive control for this block")
+        _spoil[0] = ("silent", PLG.PLUGIN_NAME)
+        check("...one arm producing NO stream fails the run rather than being dropped",
+              PLG.main() == 1, "no stream means no entry, and `classify` says so")
+        _spoil[0] = ("unversioned", PLG.PLUGIN_NAME)
+        check("...and one arm with a perfect entry but NO in-band build fails it too",
+              PLG.main() == 1,
+              "the arm `classify` cannot see is exactly the one that could be another build")
+    finally:
+        PLG.run_arm = _real_plug_arm
+
+    # -- the candidate set has to contain more than the answer -------------------------------
+    # Trying only the spelling that works would never learn that the qualified ones do not,
+    # and trying only a qualified one would report UNREACHABLE for a flag that works.
+    check("more than one candidate spelling is tried, and they are distinct",
+          len(PLG.CANDIDATES) > 1 and len(set(PLG.CANDIDATES)) == len(PLG.CANDIDATES),
+          PLG.CANDIDATES)
+    check("...including the bare server key and at least one plugin-qualified spelling",
+          PLG.SERVER_NAME in PLG.CANDIDATES
+          and any(PLG.PLUGIN_NAME in c and c != PLG.PLUGIN_NAME for c in PLG.CANDIDATES),
+          PLG.CANDIDATES)
+finally:
+    shutil.rmtree(_e22, ignore_errors=True)
+
+
 print()
 if skipped:
     # NAMED, AND ABOVE THE VERDICT. A skipped section is the one thing a green transcript

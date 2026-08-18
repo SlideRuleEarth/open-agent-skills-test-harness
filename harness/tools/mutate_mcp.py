@@ -144,6 +144,7 @@ CEVENTS = "tools/probe_copilot_events.py"
 # The plugin probe reads a SUPPRESSION, so its whole risk is a false negative: an instrument
 # that never loaded a plugin publishing "the flag does not reach plugin servers" about a
 # hermeticity control. Its mutations are correspondingly about the control and about absence.
+CPLUGIN = "tools/probe_copilot_plugin_mcp.py"
 # The proxy's I/O half and the awkward server it is driven against. PRODUCTION code that no
 # selftest arm can reach — it is only executed by running the real program over real pipes —
 # so it is `M*` like any other production target, proven by a THIRD suite. The classification
@@ -3032,6 +3033,39 @@ MUTATIONS = [
      '    if write_type:\n        server["type"] = kind',
      '    if True:\n        server["type"] = kind',
      "write_type=False really omits the key, and True really writes it"),
+    # --- the plugin-declared MCP probe (§9 #3's second half) ------------------------------
+    # THE CONTROL GATE. Without it a run that loaded no plugin reports UNREACHABLE, and the
+    # false negative lands on a claim about hermeticity.
+    ("F178-arms-are-read-without-a-working-control", CPLUGIN,
+     "    ok, why = control_ok(control)\n    if not ok:",
+     "    ok, why = control_ok(control)\n    if False:",
+     "a failed control is INSTRUMENT_FAILED even when every arm looks suppressed"),
+    # ABSENCE AS SUCCESS, the specific way this probe would lie. A server missing from the
+    # list is also what a plugin that failed to load looks like.
+    ("F179-an-absent-server-counts-as-suppressed", CPLUGIN,
+     '    return isinstance(entry, dict) and entry.get("status") == DISABLED',
+     '    return not isinstance(entry, dict) or entry.get("status") == DISABLED',
+     "...an ABSENT entry does NOT count as suppressed"),
+    # An empty quantifier reads exactly like a negative result.
+    ("F180-no-arms-tried-reads-as-no-spelling-worked", CPLUGIN,
+     '    if not arms:\n        return INSTRUMENT_FAILED, "no candidate spelling was tried", []',
+     '    if False:\n        return INSTRUMENT_FAILED, "no candidate spelling was tried", []',
+     "...but NO arms tried at all is INSTRUMENT_FAILED, not UNREACHABLE"),
+    # A same-named server from another source would make every arm measure the wrong thing.
+    ("F181-any-source-counts-as-our-plugins-server", CPLUGIN,
+     '    return (entry.get("source") == "plugin"',
+     '    return (entry.get("source") in ("plugin", "user")',
+     "...a same-named, same-plugin-named server from a DIFFERENT source is not"),
+    # The control must require a RUNNING server, not merely a listed one.
+    ("F182-a-server-that-never-connected-is-a-good-control", CPLUGIN,
+     '    if entry.get("status") != CONNECTED:',
+     "    if False:",
+     "...a control whose server never reached `connected` FAILS"),
+    # Reading the first entry works only until the machine has a second server.
+    ("F183-the-first-listed-server-is-taken-as-ours", CPLUGIN,
+     '            if isinstance(srv, dict) and srv.get("name") == name:',
+     "            if isinstance(srv, dict):",
+     "...and a stream with only OTHER servers yields None rather than the wrong entry"),
     # --- PR #120/#121 review: the predicates that were added because the old ones could
     # --- not fail on the cases that mattered ----------------------------------------------
     # THE READER WAS FIXED AND THE CONCLUSION WAS NOT. `loaded_servers` was written to see a
@@ -3084,6 +3118,29 @@ MUTATIONS = [
      "    if not executions:\n        return FIELDS_UNMEASURED, (",
      "    if False:\n        return FIELDS_UNMEASURED, (",
      "no execution at all is UNMEASURED, not `the fields are absent`"),
+    # --- the plugin probe: every candidate is its own measurement -------------------------
+    # Attribution was verified for the CONTROL only, so a same-named server from another
+    # source could certify the flag.
+    ("F192-a-candidate-arm-needs-no-attribution", CPLUGIN,
+     "    if not attributed_to_plugin(entry):\n        return ARM_FAILED, (f\"this arm's entry",
+     "    if False:\n        return ARM_FAILED, (f\"this arm's entry",
+     "...a `disabled` entry from ANOTHER source is a failed arm, not a working spelling"),
+    # A status this probe does not understand must not quietly become "not disabled".
+    ("F193-an-unknown-status-means-not-disabled", CPLUGIN,
+     '    return ARM_FAILED, (f"our plugin\'s server carried the unexpected status {status!r}, which "',
+     '    return ARM_CONNECTED, (f"our plugin\'s server carried the unexpected status {status!r}, which "',
+     "...and a status nobody predicted is a failed arm, not a quiet `not disabled`"),
+    # With any arm unread, the set of spellings that do NOT work is unknown — and that set is
+    # half the question this probe exists to answer.
+    ("F194-a-broken-arm-joins-the-did-not-work-list", CPLUGIN,
+     "    if broken:\n        return INSTRUMENT_FAILED, (",
+     "    if False:\n        return INSTRUMENT_FAILED, (",
+     "a `disabled` impostor with every other arm EMPTY is INSTRUMENT_FAILED, not REACHES"),
+    # A settled answer that names no build is a claim about no build.
+    ("F195-a-settled-answer-need-not-be-version-qualified", CPLUGIN,
+     "        return 0 if (settled and version_ok) else 1",
+     "        return 0 if settled else 1",
+     "...and one arm with a perfect entry but NO in-band build fails it too"),
     # --- the `type`-omission arm's paired control -----------------------------------------
     # WITHOUT A POSITIVE CONTROL the bare arm's silence measures the prompt, the machine or
     # the model, and it gets published as a finding about the key.

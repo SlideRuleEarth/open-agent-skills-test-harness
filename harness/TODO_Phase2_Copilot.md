@@ -266,9 +266,12 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
    `disabled`** — which is what slice 2 splits `_INERT_MCP_STATUSES` on. Note `pending` in particular:
    it is a *transient* that appears before `connected`, so slice 2's witness must read the server's
    **last** status and not its first. The probe had that bug and the review caught it (PR #120).
-3. **Does `--disable-mcp-server` reach plugin-declared servers**, and under what naming — §9 probe #3's
-   second unanswered half. A Phase 0 hermeticity question, not a Phase 2 blocker. *May generate work:*
-   isolated runs already mask plugins, but a negative answer leaves a documented gap on non-isolated runs.
+3. ~~**Does `--disable-mcp-server` reach plugin-declared servers**, and under what naming~~ —
+   **ANSWERED at 1.0.80** (`tools/probe_copilot_plugin_mcp.py`): **yes, by the bare server key**;
+   plugin-qualified spellings do nothing. It corrected a claim in shipped code — the flag was never the
+   limitation, **unenumerability** is — and it generated the work this row warned about, though not the
+   work that was expected: the witness carries `source`/`sourcePlugin`/`pluginName`, which `_mcp_witness`
+   discards, so a plugin-declared server is identifiable *after* a run and the harness throws that away.
 4. ~~**`--secret-env-vars` actual behaviour**~~ — **ANSWERED at 1.0.80** (same probe): it **REDACTS**.
    A per-run marker rode back in the MCP tool's reply and reached the control run's output; under the
    flag it is absent from a run whose own fixture recorded **answering** that call with a reply that
@@ -374,8 +377,7 @@ Per repo policy the probes' **classification lives in named functions**, driven 
 rows in `verify_mcp_fixtures.py` (§E19, §E21, §E22), with `F*` mutations. A fleet-wide negative requires
 every row answered; absence of a positive is not a negative result.
 
-**Four of slice 1's five questions are answered here** (the fifth, plugin-declared servers, is a
-separate change), every reading version-qualified to copilot
+**Slice 1 is complete: all five questions are answered, every reading version-qualified to copilot
 1.0.80 and taken from the run's own stream.** The two verbatim events the readings rest on are kept
 under `tools/pinned/copilot-1.0.80-events.jsonl`, so the synthetic streams §E21 drives its classifiers
 on are pinned to a shape a real build actually emitted — if copilot changes the events, §E21 reddens
