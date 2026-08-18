@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff AN
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff + shellcheck + a parse under every shell
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 203/203 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 685 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 216/216 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 703 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine
 git diff --check
@@ -2073,6 +2073,49 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   reading meaningful, ask what the WEAKEST input satisfying that clause looks like** — here, an
   event with the right name and no contents, and a predicate with the right shape and one of
   its two terms missing.
+- **A FOURTH ROUND FOUND TWO MORE, and both are a reading that stops one field short of the
+  quantity.** Round three had just made the redaction CONTROL prove that copilot emitted a
+  result carrying the value. The secret arm was still asked only for its **fixture's**
+  receipts — and *the receipts end at the wire*. They say the reply went OUT carrying the
+  marker; nothing in them says anything came BACK. So an arm with an execution and no
+  completion event — killed mid-call, or one whose result copilot never emitted — certified
+  `REDACTS` from an output that was never produced, on receipts that were entirely genuine.
+  Round three's own rule is symmetric (*whatever the treatment arm must prove, the control
+  must prove too*) and it was applied only in the direction the reproduction pointed, which is
+  CLAUDE.md's first rule arriving inside the fix for CLAUDE.md's first rule.
+  **The boolean was the mechanism.** "Our tool's result carried the value" being `False` meant
+  either *it came back without it* or *it never came back at all*, and only the first is
+  evidence about redaction. A predicate answering one question with two meanings is the same
+  shape §4 already records for one field carrying two independent facts — arriving here as a
+  return type rather than a record field. Three states now, and the loss case has a word of
+  its own.
+  The other finding is the same stopping-short over a different field. `NEVER_STARTS` says
+  *copilot did not list our server*, and the code decided it by reading the server's STATUS: an
+  entry copilot listed with no `status` gives the status reader `None`, indistinguishable from
+  a stream that never mentioned it, while the presence reader confirmed a readable inventory —
+  so the pair published "not listed" from the very event that lists it. **A negative about a
+  NAME has to be read from the name.** It is its own reading now, tainted by any inventory
+  event that could not be parsed and never overturned by one, because an unreadable event
+  hides servers and cannot un-name them. That asymmetry is the second half of the lesson:
+  when a taint and a positive can both apply to one reading, decide which outranks which
+  **deliberately** and write down why — the ordering is the entire content of the rule, and it
+  is invisible in code that just happens to check one of them first.
+- **A THROWAWAY MUTATION HARNESS IS STILL A HARNESS, and mine left the tree mutated twice.**
+  Driving one mutation at a time before spending a full suite run is the right move and it
+  costs a script that WRITES SOURCE FILES. The first incident was the plain one — killed
+  mid-iteration, three mutations left applied, which then made the verifier's own
+  mutate-plumbing section fail *and leave another one applied*, a feedback loop that reads as
+  files changing underneath you. The script now refuses to snapshot a tree that is not clean,
+  restores on `SIGTERM`/`SIGINT`, and asserts every target byte-identical before it exits.
+  The second incident is the one worth recording, because none of that helped: **the tool
+  running the script returned while the script was still running.** Its output was
+  block-buffered into a pipe, so it looked like a command that had produced nothing and
+  finished; it was an orphan (`ppid 1`) still cycling apply/restore, and three successive
+  inspections of the same file each caught a different mutation applied. Two follow-up
+  "reverts" were then aimed at whatever was applied at that instant. The rule: **`ps` decides
+  whether something finished, not the absence of output** — and a tool that writes source
+  files gets a run whose completion is observed, not inferred. `git diff --stat` after every
+  such run is the cheap version of the same check.
 - **A single-line anchor aimed at `mutate_mcp.py` itself matches TWICE**, and one of the two is
   the mutation entry quoting it. It is refused up front by `stale_anchors` rather than silently
   mutating the list instead of the code, but the fix is not obvious from the message: pin it

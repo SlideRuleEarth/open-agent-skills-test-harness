@@ -290,6 +290,15 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
    same two facts as the secret arm: its fixture's receipts, and copilot's own `tool.execution_complete`
    correlated to our execution by `toolCallId` (the result event carries no tool name). A comparison is
    only a comparison if both arms are established to have done the same thing.
+   **A fourth round found the same imbalance one witness later**: the receipts end at the wire. They
+   prove the reply went **out** carrying the value; only copilot's result event says anything came
+   **back**, and that witness was still being asked of the control alone. A secret arm with an execution
+   and no completion event — killed mid-call, or one whose result copilot never emitted — certified
+   `REDACTS` from an output that was never produced. Each arm's result is now read in three states
+   (`RESULT_CARRIED` / `RESULT_CLEAN` / `RESULT_ABSENT`), because *came back without the value* and
+   *never came back* are different facts and a boolean had made them the same `False`. The reading is
+   also sharper for it: the redaction is localized to the tool result rather than to the output at
+   large.
 5. **Remote `type` omission, as *behaviour* rather than shape.** Slice 3 writes `type` and an explicit
    `tools: ["*"]` because §2(b) says copilot writes them for itself — but (b) is unversioned, and the
    probe that produced it *cannot* be versioned: `copilot mcp add` emits no in-band witness, so no
@@ -316,7 +325,12 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
    rather than publishing a negative (review, PR #120). The "listed with the key, absent without it"
    branch needs the bare arm to have published a **readable** inventory as well: an event with the right
    type and unreadable contents says nothing about which servers copilot had, and the entry that could
-   not be parsed is the one that might have been ours. An empty list is a real inventory.
+   not be parsed is the one that might have been ours. An empty list is a real inventory. **And the
+   negative is about a NAME, which was being read through the status**: a server listed with no `status`
+   field read as `None` — the same answer as a stream that never mentioned it — and was published as
+   *not listed* from the inventory that names it. Naming and status are separate readings now
+   (`SERVER_NAMED` / `ABSENCE_UNREADABLE` / `ABSENCE_ESTABLISHED`), an unreadable event taints the
+   negative instead of yielding to a readable one beside it, and it cannot un-name (review, PR #120).
 
    **So slice 3 must write `type`, and that is now a measurement rather than a preference.**
    **The arm needed rebuilding to say it** (review, PR #120). The first version read only the fixture's

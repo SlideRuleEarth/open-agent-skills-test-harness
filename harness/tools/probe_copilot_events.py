@@ -40,6 +40,14 @@ so "the value was in the channel" and "the channel was used" are both facts abou
 verdict is about. Nothing the CLI emits can forge either: the receipts are written by a
 different process, and the marker itself never appears there, only its sha256.
 
+AND THE RECEIPTS ARE ONLY HALF OF IT, because they end at the wire. They say the fixture put a
+reply carrying the value onto it; they cannot say copilot ever emitted a result for that call.
+An arm with an execution and no completion event has nothing to redact and nothing to have
+redacted, and reading its silence as redaction is the same absence-as-evidence error one layer
+further out (review, PR #120). So each arm is read from BOTH authors — its fixture's receipts
+and copilot's own correlated `tool.execution_complete` — and the treatment arm is held to
+exactly what the control is.
+
 WHAT THIS PROBE DOES NOT ANSWER. Whether `--disable-mcp-server` reaches plugin-declared
 servers (§9 probe #3's other half) — that needs an installed plugin, not an injected config,
 and is answered by `probe_copilot_plugin_mcp.py`.
@@ -97,6 +105,13 @@ NO_REDACTION = "NO_REDACTION"        # sentinel present in both
 CONTROL_FAILED = "CONTROL_FAILED"    # the control's own tool RESULT never carried the sentinel
 CONTROL_INCOMPLETE = "CONTROL_INCOMPLETE"         # the control never ran the exchange either
 SECRET_ARM_INCOMPLETE = "SECRET_ARM_INCOMPLETE"   # the arm under the flag never made the call
+
+# What became of OUR tool's result in one arm's stream. THREE STATES, BECAUSE TWO OF THEM WERE
+# ONE BOOLEAN: "the result came back without the value" and "no result of ours came back at
+# all" are different facts, and only the first is evidence about redaction (review, PR #120).
+RESULT_CARRIED = "RESULT_CARRIED"    # a result of our tool reached the output, WITH the value
+RESULT_CLEAN = "RESULT_CLEAN"        # a result of our tool reached the output, without it
+RESULT_ABSENT = "RESULT_ABSENT"      # no result of our tool reached the output at all
 
 # Question 2 is "which spelling AND what status", so the status needs a verdict of its own.
 STATUS_MEASURED = "STATUS_MEASURED"          # a real status, from an arm proven to have served
@@ -374,27 +389,35 @@ def mcp_call_ids(events: list[dict]) -> set[str]:
     return ids
 
 
-def tool_result_carried(events: list[dict], sentinel: str) -> bool:
-    """Whether the RESULT of one of OUR tool's executions carried `sentinel`.
+def tool_result_state(events: list[dict], sentinel: str) -> str:
+    """Whether a RESULT of one of OUR tool's executions reached the output, and what it carried.
 
-    THE CONTROL'S EVIDENCE, ATTRIBUTED. "The sentinel appears somewhere in the control's
-    stream" is a weaker fact than it looks: the marker is also in an env var and in the config
-    file this probe writes, and the run has `--allow-all`, so a diagnostic echo or a file read
-    satisfies it without any tool reply having travelled — and `REDACTS` would then be resting
-    on a route the secret arm's absence says nothing about (review, PR #120). This asks the
-    narrower question the verdict actually claims: did the value come back *in our tool's
-    result*.
+    ATTRIBUTED, NOT SEARCHED. "The sentinel appears somewhere in this arm's stream" is a weaker
+    fact than it looks: the marker is also in an env var and in the config file this probe
+    writes, and the run has `--allow-all`, so a diagnostic echo or a file read satisfies it
+    without any tool reply having travelled — and `REDACTS` would then be resting on a route
+    the secret arm's absence says nothing about (review, PR #120). This asks the narrower
+    question the verdict actually claims: did the value come back *in our tool's result*.
+
+    THREE STATES, BECAUSE THE ABSENT CASE WAS NOT A CLEAN ONE (review, PR #120). A boolean
+    made "our tool's result carried no sentinel" and "our tool's result never appeared"
+    indistinguishable, and the secret arm read the pair of them as redaction: a run whose reply
+    the fixture wrote and copilot never emitted certified `REDACTS`, on the strength of an
+    output that was never produced. The fixture's receipts prove the value went ONTO the wire;
+    only this says whether anything came back OFF it.
 
     Searched over the SERIALIZED result rather than one field, because 1.0.80 renders the same
     text under `content`, `detailedContent` and `contents[].text`, and pinning one spelling
     would go quiet on a rendering change while the value sat plainly in the other two.
 
     The structural clause is `ids`: with no execution of our tool there is no result of ours to
-    read, and every `tool.execution_complete` in the stream belongs to something else.
+    read, and every `tool.execution_complete` in the stream belongs to something else — which
+    is `RESULT_ABSENT`, never `RESULT_CLEAN`.
     """
     ids = mcp_call_ids(events)
     if not ids:
-        return False
+        return RESULT_ABSENT
+    state = RESULT_ABSENT
     for obj in events:
         if obj.get("type") != "tool.execution_complete":
             continue
@@ -402,8 +425,9 @@ def tool_result_carried(events: list[dict], sentinel: str) -> bool:
         if not isinstance(data, dict) or data.get("toolCallId") not in ids:
             continue
         if sentinel in json.dumps(data.get("result")):
-            return True
-    return False
+            return RESULT_CARRIED
+        state = RESULT_CLEAN
+    return state
 
 
 def healthy_status_verdict(status: str | None, *, served: bool) -> tuple[str, str]:
@@ -561,7 +585,8 @@ def arm_exchanged(records: list[dict], sentinel: str) -> bool:
 
 
 def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool,
-                   control_result_carried: bool, secret_exchanged: bool) -> tuple[str, str]:
+                   control_result: str, secret_exchanged: bool,
+                   secret_result: str) -> tuple[str, str]:
     """(verdict, why) for `--secret-env-vars`, with every structural gate read FIRST.
 
     BOTH ARMS MUST HAVE RUN THE SAME EXCHANGE, and the control's half arrived last (review,
@@ -576,29 +601,53 @@ def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool
 
     Each arm therefore carries the same two witnesses, from the same two authors: its fixture's
     receipts (a different process) say the tool was answered with this run's marker, and
-    copilot's own result event says whether that reply reached the output.
+    copilot's own result event says whether that reply reached the output. THE SECOND ONE WAS
+    ASKED OF THE CONTROL ALONE, which is the same imbalance one round later (review, PR #120):
+    the secret arm had to prove the reply was WRITTEN, not that anything came back. A run with
+    an execution and no completion event — killed mid-call, or one whose result copilot never
+    emitted — has nothing to redact and nothing to have redacted, and it read as `REDACTS`.
+
+    So the secret arm's result is read in three states rather than searched for a substring.
+    `RESULT_ABSENT` is incomplete: no output to judge. `RESULT_CARRIED` and a sentinel anywhere
+    else in the stream are both `NO_REDACTION` — the flag is a claim about the OUTPUT, so the
+    route the value leaked by is diagnosis, not a different verdict. Only a result that came
+    back without it, in an arm whose fixture proved it went out with it, is redaction.
     """
     if not control_exchanged:
         return CONTROL_INCOMPLETE, ("the control arm never completed the exchange either — its "
                                     "fixture did not record answering our tool with this run's "
                                     "marker — so the two arms did not do the same thing and "
                                     "the difference between them is not about the flag")
-    if not control_result_carried:
-        return CONTROL_FAILED, ("the control's own tool RESULT never carried the sentinel, so "
-                                "the value does not reach the output by that route at all and "
-                                "its absence under --secret-env-vars measures nothing")
+    if control_result != RESULT_CARRIED:
+        return CONTROL_FAILED, (
+            "the control's own tool RESULT never carried the sentinel"
+            + (" — no result of our tool reached its output at all"
+               if control_result == RESULT_ABSENT else
+               " — its result came back without the value, with no flag set")
+            + ", so the value does not reach the output by that route and its absence under "
+              "--secret-env-vars measures nothing")
     if not secret_exchanged:
         return SECRET_ARM_INCOMPLETE, ("the arm under --secret-env-vars never completed the "
                                        "exchange that carries the value — its fixture did not "
                                        "record both this run's marker and a call to the tool "
                                        "that returns it — so the sentinel's absence from its "
                                        "output is the absence of the CALL, not of the value")
+    if secret_result == RESULT_ABSENT:
+        return SECRET_ARM_INCOMPLETE, ("the arm under --secret-env-vars answered our tool and "
+                                       "then emitted no result for it at all, so nothing came "
+                                       "back to be redacted — the fixture proves the value went "
+                                       "onto the wire and nothing shows what copilot did with "
+                                       "it, which is not the same as showing it removed it")
     if sentinel in secret_stream:
-        return NO_REDACTION, ("the sentinel appears in the output WITH --secret-env-vars naming "
-                              "its variable — the flag did not redact the value where it landed")
+        return NO_REDACTION, (
+            "the sentinel appears in the output WITH --secret-env-vars naming its variable"
+            + (" — in our tool's own result" if secret_result == RESULT_CARRIED else
+               " — outside our tool's result, which came back without it")
+            + ": the flag did not redact the value where it landed")
     return REDACTS, ("both arms answered our tool with this run's marker, the control's tool "
-                     "RESULT carried it into the output, and the value is absent from the "
-                     "secret arm's output entirely — so the flag redacted the value itself")
+                     "RESULT carried it into the output, the secret arm's result came back too "
+                     "— and the value is absent from that arm's output entirely, so the flag "
+                     "redacted the value itself")
 
 
 def mcp_config(path: str, sentinel: str, receipts: str) -> str:
@@ -738,8 +787,9 @@ def main() -> int:
     verdict, why = secret_verdict(
         secret, sentinel,
         control_exchanged=control_exchanged,
-        control_result_carried=tool_result_carried(ev_control, sentinel),
-        secret_exchanged=arm_exchanged(secret_receipts, sentinel))
+        control_result=tool_result_state(ev_control, sentinel),
+        secret_exchanged=arm_exchanged(secret_receipts, sentinel),
+        secret_result=tool_result_state(ev_secret, sentinel))
 
     print(f"version            : {version} ({'usable' if version_ok else 'UNVERIFIED'})")
     print(f"servers (control)  : {seen or '(none)'}")
@@ -757,7 +807,7 @@ def main() -> int:
         print(f"   {label} receipts: arrived={requested_tool(rows)} "
               f"answered_with_marker={answered_with_marker(rows)} "
               f"server_held_marker={held_sentinel(rows, sentinel)} "
-              f"result_carried_it={tool_result_carried(evs, sentinel)}")
+              f"tool_result={tool_result_state(evs, sentinel)}")
 
     # THE FOOTER PROMISED A DIRECTORY AND NOTHING WAS EVER PUT IN IT. These readings are the
     # slice's deliverable and they get quoted into a design document, so the stream they came

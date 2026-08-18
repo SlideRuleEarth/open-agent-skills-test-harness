@@ -354,6 +354,28 @@ STARTS_WITHOUT_TYPE = "STARTS_WITHOUT_TYPE"   # copilot reached a server declare
 NEVER_STARTS = "NEVER_STARTS"                 # the entry was not understood: nothing reached it
 OMISSION_UNMEASURED = "OMISSION_UNMEASURED"   # the arm established neither, which is not a finding
 
+# Whether our server's ABSENCE from copilot's own account is established. A SEPARATE READING
+# FROM THE STATUS, and the two used to collapse: a stream naming our server and giving it no
+# `status` produced `None` from the status reader and "a readable inventory" from the presence
+# reader, and the pair of them said the server was never listed — contradicted by the very
+# event they were both read from (review, PR #120). The name and the status are independent
+# facts about the same entry, so they get independent readings.
+SERVER_NAMED = "SERVER_NAMED"                 # copilot NAMED our server: absence is disproven
+ABSENCE_ESTABLISHED = "ABSENCE_ESTABLISHED"   # every inventory readable, our name in none
+ABSENCE_UNREADABLE = "ABSENCE_UNREADABLE"     # no inventory, or one this probe cannot parse
+
+
+def reported_statuses(stream: str) -> list[str | None]:
+    """Every status copilot carried for OUR server in this arm, in order — `None` included.
+
+    THE LIST IS THE READING THE NAME LIVES IN. An entry copilot listed with no `status` field
+    contributes `None` here, which is why this is not the same fact as `reported_status`
+    below: `[]` means copilot never named our server, `[None]` means it named it and said
+    nothing about it, and those two called for opposite verdicts while one function returned
+    `None` for both (review, PR #120).
+    """
+    return statuses_for(loaded_servers(parse_events(stream)), SERVER_KEY)
+
 
 def reported_status(stream: str) -> str | None:
     """The status COPILOT reported for our server in this arm, or None if it never said.
@@ -364,26 +386,38 @@ def reported_status(stream: str) -> str | None:
     copilot's own account of whether it CONNECTED, which is decided by the MCP host before the
     model acts. The first version of this arm had only the receipts, so model nondeterminism
     and a rejected entry produced identical evidence (review, PR #120).
+
+    `None` HERE IS NOT ABSENCE. It is "no status word to read", which a listed-but-statusless
+    entry satisfies as fully as a stream that never mentioned our server. `absence_verdict` is
+    what separates them, and every caller reading a negative out of this must consult it.
     """
-    return effective_status(statuses_for(loaded_servers(parse_events(stream)), SERVER_KEY))
+    return effective_status(reported_statuses(stream))
 
 
-def reported_inventory(stream: str) -> bool:
-    """Whether copilot published a READABLE MCP server inventory in this arm.
+def absence_verdict(stream: str) -> str:
+    """Is "copilot never created a server for our entry" ESTABLISHED by this arm?
 
     THE CLAUSE THAT MAKES "OUR SERVER WAS NOT LISTED" MEAN SOMETHING. An arm killed before the
     MCP host initialized has no entry for our server either, and reading that as "the entry was
     not understood" is the defect this whole verdict was rebuilt around, arriving one branch
     further down. Our server's absence is evidence only from a run that got far enough to say
-    what it HAD.
+    what it HAD, and only when what it had did not include us.
 
-    READABLE, not merely present — and the first version only checked the event `type`
-    (review, PR #120). `{"type": "session.mcp_servers_loaded", "data": 42}` is an inventory
-    this probe cannot read: `loaded_servers` correctly extracts nothing from it, and taking
-    that emptiness as "our server was absent" publishes a finding about the `type` key from an
-    event whose contents were never examined. The same holds for schema drift — a `servers`
-    that is not a list, or entries that are not named objects — where the entry that could not
-    be parsed is exactly the one that might have been ours.
+    THREE OUTCOMES, because the middle one was missing. `SERVER_NAMED` comes FIRST and is read
+    from every witness event, not only the inventory: copilot naming our server — with a
+    status, with a null status, or in a later transition — disproves absence outright, and a
+    malformed event elsewhere cannot un-name it. That asymmetry is the point of the ordering:
+    an event this probe cannot parse can only HIDE servers, never remove one that was named.
+
+    `ABSENCE_UNREADABLE` is the taint, and it now taints rather than being skipped over
+    (review, PR #120). The first version `continue`d past an unreadable inventory and returned
+    on a later readable one — so a run whose real inventory was the one that failed to parse
+    established absence from the other. `{"type": "session.mcp_servers_loaded", "data": 42}`
+    is an inventory this probe cannot read: `loaded_servers` correctly extracts nothing from
+    it, and taking that emptiness as "our server was absent" publishes a finding about the
+    `type` key from an event whose contents were never examined. The same holds for schema
+    drift — a `servers` that is not a list, or entries that are not named objects — where the
+    entry that could not be parsed is exactly the one that might have been ours.
 
     An EMPTY `servers` list is a genuine inventory, and the one this clause exists to admit:
     copilot said what it had and had nothing. That is why the structural test is the
@@ -391,17 +425,21 @@ def reported_inventory(stream: str) -> bool:
     correct reading here, not a vacuous one, because `isinstance(servers, list)` has already
     established that the collection is real.
     """
-    for obj in parse_events(stream):
+    events = parse_events(stream)
+    if reported_statuses(stream):
+        return SERVER_NAMED
+    readable = False
+    for obj in events:
         if obj.get("type") != "session.mcp_servers_loaded":
             continue
         data = obj.get("data")
-        if not isinstance(data, dict):
-            continue
-        servers = data.get("servers")
-        if isinstance(servers, list) and all(
-                isinstance(srv, dict) and isinstance(srv.get("name"), str) for srv in servers):
-            return True
-    return False
+        servers = data.get("servers") if isinstance(data, dict) else None
+        if not (isinstance(servers, list) and all(
+                isinstance(srv, dict) and isinstance(srv.get("name"), str)
+                for srv in servers)):
+            return ABSENCE_UNREADABLE
+        readable = True
+    return ABSENCE_ESTABLISHED if readable else ABSENCE_UNREADABLE
 
 
 def type_omission_verdict(bare_records: list[dict], bare_stream: str,
@@ -461,15 +499,28 @@ def type_omission_verdict(bare_records: list[dict], bare_stream: str,
                "publish a finding about the key from a word nobody has established the "
                "meaning of")
             + f" (the control reported {control_status!r})")
-    if control_status is not None and reported_inventory(bare_stream):
-        return NEVER_STARTS, (f"copilot published its MCP inventory in the bare arm and our "
-                              f"server was NOT in it, while the control listed it "
-                              f"({control_status!r}) — the entry without `type` did not become "
-                              f"a server, and nothing reached the fixture")
-    return OMISSION_UNMEASURED, ("the bare arm never published an MCP inventory naming our "
-                                 "server and nothing reached the fixture — an arm that got no "
-                                 "further than that is one this run has no instrument for, "
-                                 "rather than a negative answer")
+    absence = absence_verdict(bare_stream)
+    if absence == SERVER_NAMED:
+        return OMISSION_UNMEASURED, (
+            "copilot LISTED our server in the bare arm and never gave it a status word, so the "
+            "entry was understood well enough to name and this run does not say what became of "
+            "it — reading that as `not listed` would publish an absence the very event it came "
+            "from contradicts")
+    if absence == ABSENCE_UNREADABLE:
+        return OMISSION_UNMEASURED, (
+            "the bare arm published no MCP inventory this probe can read — either none at all, "
+            "or one whose contents it could not parse — and nothing reached the fixture; the "
+            "entry that could not be read is exactly the one that might have been ours, so "
+            "this is an arm with no instrument rather than a negative answer")
+    if control_status is None:
+        return OMISSION_UNMEASURED, (
+            "our server was in neither arm's inventory: the control was sound on its CALL "
+            "alone, so nothing here shows this run's witness naming our server when it DOES "
+            "exist, and the bare arm's absence has nothing to be an absence against")
+    return NEVER_STARTS, (f"copilot published its MCP inventory in the bare arm and our "
+                          f"server was NOT in it, while the control listed it "
+                          f"({control_status!r}) — the entry without `type` did not become "
+                          f"a server, and nothing reached the fixture")
 
 
 def measure_type_omission(workdir: str, kind: str, endpoint: str, sentinel: str):

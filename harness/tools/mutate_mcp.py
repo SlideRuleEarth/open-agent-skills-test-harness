@@ -3001,9 +3001,9 @@ MUTATIONS = [
     # The positive control IS the measurement. Without it, a run where the sentinel never
     # travelled certifies redaction — a channel nobody proved was connected reporting silence.
     ("F172-redaction-is-certified-without-a-control", CEVENTS,
-     "    if not control_result_carried:\n        return CONTROL_FAILED, (",
+     "    if control_result != RESULT_CARRIED:\n        return CONTROL_FAILED, (",
      "    if False:\n        return CONTROL_FAILED, (",
-     "a control whose own tool RESULT never carried the sentinel measures nothing"),
+     "a control whose own tool RESULT never appeared measures nothing"),
     # A conjunction over three questions, not a lookup on the last one read.
     ("F173-two-answered-questions-are-enough", CEVENTS,
      "    return (fmt not in (UNMEASURED, AMBIGUOUS, ONE_SOURCE_ONLY)\n            and spelling not in",
@@ -3066,14 +3066,18 @@ MUTATIONS = [
      "...a server holding a DIFFERENT marker is not this run's exchange either"),
     # AN ARM THAT PRODUCED NOTHING IS THE ONE WHOSE BUILD IS LEAST ACCOUNTED FOR. Filtering
     # the empties out before agreement is what let a vanished secret arm ride through.
+    # RE-AIMED (mutation run, PR #120): the exit status stopped being able to catch this once
+    # the secret arm had to produce a RESULT event, since an empty arm is refused by that gate
+    # first and exits 1 for a reason this mutation does not touch. The rule is about the
+    # ARGUMENT `agreed_version` receives, so the arm reads the argument.
     ("F189-an-arm-with-no-stream-is-excused-from-agreement", CEVENTS,
      "    version, version_ok = agreed_version([control, secret])",
      "    version, version_ok = agreed_version([s for s in (control, secret) if s])",
-     "...nor one that served the call but whose stream carries no version witness"),
+     "...and the version witness is handed EVERY arm main() launched, the empty one included"),
     # The gate must read the receipts of the arm it is judging, not the arm beside it.
     ("F190-the-controls-receipts-vouch-for-the-secret-arm", CEVENTS,
-     "        secret_exchanged=arm_exchanged(secret_receipts, sentinel))",
-     "        secret_exchanged=arm_exchanged(control_receipts, sentinel))",
+     "        secret_exchanged=arm_exchanged(secret_receipts, sentinel),",
+     "        secret_exchanged=arm_exchanged(control_receipts, sentinel),",
      "...nor does a secret arm that produced plenty of output and never called the tool"),
     # An empty field list from a run with no tool execution says nothing about the fields.
     ("F191-no-execution-reads-as-the-fields-being-absent", CEVENTS,
@@ -3159,8 +3163,8 @@ MUTATIONS = [
     # "Our server was not listed" is evidence only from an arm that got far enough to say
     # what it HAD.
     ("F207-an-arm-that-published-nothing-still-decides", CGATE_REMOTE,
-     "    if control_status is not None and reported_inventory(bare_stream):",
-     "    if control_status is not None:",
+     "    if absence == ABSENCE_UNREADABLE:\n        return OMISSION_UNMEASURED, (",
+     "    if False:\n        return OMISSION_UNMEASURED, (",
      "...but an arm that never published an inventory AT ALL is UNMEASURED, not a finding"),
     # --- PR #120, third review round -------------------------------------------------------
     # QUESTION 2 ASKS TWO THINGS and only the spelling reached the exit predicate, so a witness
@@ -3189,24 +3193,117 @@ MUTATIONS = [
     # The control's evidence must be ATTRIBUTED to our tool's result. A substring search over
     # the whole stream is satisfied by the config this probe wrote, under `--allow-all`.
     ("F212-any-appearance-in-the-stream-is-the-tool-reply", CEVENTS,
-     "    ids = mcp_call_ids(events)\n    if not ids:\n        return False",
-     "    ids = mcp_call_ids(events)\n    if True:\n        return any(sentinel in json.dumps(o) for o in events)",
-     "...but the sentinel merely APPEARING in the stream does not"),
+     "    ids = mcp_call_ids(events)\n    if not ids:\n        return RESULT_ABSENT",
+     ("    ids = mcp_call_ids(events)\n    if True:\n"
+      "        return (RESULT_CARRIED if any(sentinel in json.dumps(o) for o in events)\n"
+      "                else RESULT_ABSENT)"),
+     "...but the sentinel merely APPEARING in the stream is not our tool's result"),
     # AN UNREADABLE INVENTORY IS NOT AN INVENTORY. `{"data": 42}` has the right event type and
     # says nothing about which servers copilot had, so absence from it proves nothing.
     ("F213-a-malformed-inventory-proves-absence", CGATE_REMOTE,
-     ("        if isinstance(servers, list) and all(\n"
-      "                isinstance(srv, dict) and isinstance(srv.get(\"name\"), str) for srv in servers):\n"
-      "            return True"),
-     "        return True",
+     ("        if not (isinstance(servers, list) and all(\n"
+      "                isinstance(srv, dict) and isinstance(srv.get(\"name\"), str)\n"
+      "                for srv in servers)):"),
+     "        if servers is None:",
      "...nor does schema drift (`servers` is not a list) — the unparsable entry could be ours"),
     # THE OTHER GUARD ON THE SAME PREDICATE, and it needs its own mutation because the two
     # reject different shapes: `{"data": 42}` never reaches the `servers` clause at all, so the
     # arm for it cannot kill a mutation of that clause (mutation run, PR #120).
     ("F214-an-unreadable-data-object-is-an-inventory", CGATE_REMOTE,
-     "        if not isinstance(data, dict):\n            continue",
-     "        if not isinstance(data, dict):\n            return True",
+     '        servers = data.get("servers") if isinstance(data, dict) else None',
+     '        servers = data.get("servers") if isinstance(data, dict) else []',
      "an inventory event whose `data` is unreadable does NOT establish absence"),
+    # --- PR #120, fourth review round ------------------------------------------------------
+    # A NAME AND A STATUS ARE TWO FACTS ABOUT ONE ENTRY, and the name was being read through
+    # the status: a server copilot listed with no `status` field gave the status reader `None`
+    # — the same answer as a stream that never mentioned it — and the pair published "our
+    # server was not in the inventory" from the inventory that names it.
+    ("F215-a-listed-server-with-no-status-is-absent", CGATE_REMOTE,
+     "    if reported_statuses(stream):\n        return SERVER_NAMED",
+     "    if False:\n        return SERVER_NAMED",
+     "a server copilot LISTED, statusless, is NAMED — absence is disproven, not proven"),
+    # AN UNREADABLE INVENTORY TAINTS THE NEGATIVE; it does not yield to a readable one beside
+    # it. The `continue` this restores is what let a run whose real inventory failed to parse
+    # establish absence from the other one.
+    ("F216-an-unreadable-inventory-yields-to-a-readable-one", CGATE_REMOTE,
+     "            return ABSENCE_UNREADABLE\n        readable = True",
+     "            continue\n        readable = True",
+     "...and one unreadable inventory taints a readable one beside it, either order"),
+    # ...and a run that published NO inventory at all has not established absence either.
+    ("F217-a-run-with-no-inventory-establishes-absence", CGATE_REMOTE,
+     "    return ABSENCE_ESTABLISHED if readable else ABSENCE_UNREADABLE",
+     "    return ABSENCE_ESTABLISHED",
+     "`absence_verdict` separates those two, or the clause above cannot bite"),
+    # "OUR SERVER WAS NOT LISTED" NEEDS AN ARM THAT LISTS IT WHEN IT EXISTS. A control sound
+    # only on its CALL never showed this run's witness naming the server at all.
+    ("F218-the-bare-arms-absence-needs-no-control-listing", CGATE_REMOTE,
+     "    if control_status is None:\n        return OMISSION_UNMEASURED, (",
+     "    if False:\n        return OMISSION_UNMEASURED, (",
+     "a bare arm with no call and no status is UNMEASURED when copilot reported nothing"),
+    # THE RECEIPTS END AT THE WIRE. They prove the reply went OUT carrying the value; only
+    # copilot's own result event says anything came back. An arm with an execution and no
+    # completion event has nothing to redact, and it certified REDACTS.
+    ("F219-a-lost-result-is-a-redacted-one", CEVENTS,
+     "    if secret_result == RESULT_ABSENT:\n        return SECRET_ARM_INCOMPLETE, (",
+     "    if False:\n        return SECRET_ARM_INCOMPLETE, (",
+     "a secret arm that served the call and emitted NO result is incomplete, not REDACTS"),
+    # ...and the gate must read the arm it is judging, not the arm beside it — F190's rule,
+    # over the witness the same review added.
+    ("F220-the-controls-result-vouches-for-the-secret-arm", CEVENTS,
+     "        secret_result=tool_result_state(ev_secret, sentinel))",
+     "        secret_result=tool_result_state(ev_control, sentinel))",
+     "...nor one whose call was served and whose RESULT copilot never emitted"),
+    # A RESULT THAT CAME BACK WITHOUT THE VALUE IS NOT A RESULT THAT NEVER CAME BACK. Merging
+    # them is what made the loss case above unreachable, so it gets its own mutation.
+    ("F221-a-result-without-the-value-is-no-result", CEVENTS,
+     "            return RESULT_CARRIED\n        state = RESULT_CLEAN",
+     "            return RESULT_CARRIED\n        state = RESULT_ABSENT",
+     "...while one whose result came back WITHOUT the value is RESULT_CLEAN — not absent"),
+    # A NULL STATUS IS STILL AN ENTRY. Filtering the `None` out reads as "not named", which is
+    # the same collapse one function earlier.
+    ("F223-a-null-status-drops-the-entry", CGATE_REMOTE,
+     "    return statuses_for(loaded_servers(parse_events(stream)), SERVER_KEY)",
+     ("    return [st for st in statuses_for(loaded_servers(parse_events(stream)), SERVER_KEY)\n"
+      "            if st]"),
+     "a LISTED-but-statusless server reads `None` as a status, and keeps its NAME"),
+    # NAMING IS READ FROM EVERY WITNESS EVENT, not only the inventory: a server copilot first
+    # mentions in a status transition has still been named.
+    ("F224-only-the-inventory-can-name-our-server", CGATE_REMOTE,
+     "    if reported_statuses(stream):\n        return SERVER_NAMED",
+     ('    if any(o.get("type") == "session.mcp_servers_loaded" for o in events) and \\\n'
+      "            reported_statuses(stream):\n        return SERVER_NAMED"),
+     "...and a later status TRANSITION naming it counts as naming it, with no inventory"),
+    # THE TAINT IS ASYMMETRIC ON PURPOSE. An unreadable event may HIDE servers; it can never
+    # remove one that another event named, so the naming is read first and outranks it.
+    ("F225-an-unreadable-event-un-names-our-server", CGATE_REMOTE,
+     ("    events = parse_events(stream)\n    if reported_statuses(stream):\n"
+      "        return SERVER_NAMED"),
+     ("    events = parse_events(stream)\n    if reported_statuses(stream) and all(\n"
+      '            isinstance(o.get("data"), dict) for o in events\n'
+      '            if o.get("type") == "session.mcp_servers_loaded"):\n'
+      "        return SERVER_NAMED"),
+     "...while garbage beside a NAMING event leaves the naming standing"),
+    # WHICH LOSS IT WAS IS THE DIAGNOSIS, so the two control failures do not share a sentence.
+    ("F226-the-two-control-losses-read-the-same", CEVENTS,
+     ('            + (" — no result of our tool reached its output at all"\n'
+      "               if control_result == RESULT_ABSENT else\n"
+      '               " — its result came back without the value, with no flag set")'),
+     '            + ""',
+     "...and those two control failures are told apart in the reason, not merged"),
+    # ...and so do the two routes the value can still be in the output by.
+    ("F227-the-two-leak-routes-read-the-same", CEVENTS,
+     ('            + (" — in our tool\'s own result" if secret_result == RESULT_CARRIED else\n'
+      '               " — outside our tool\'s result, which came back without it")'),
+     '            + ""',
+     "...and a secret result that CARRIED the value is NO_REDACTION by its OWN route"),
+    # THE STRONGEST READING WINS, NOT THE LAST. A scan that keeps whichever result it saw most
+    # recently reports `RESULT_CLEAN` for a run that leaked in an earlier one.
+    ("F222-the-last-result-decides-rather-than-the-worst", CEVENTS,
+     ("        if sentinel in json.dumps(data.get(\"result\")):\n"
+      "            return RESULT_CARRIED\n        state = RESULT_CLEAN"),
+     ("        state = (RESULT_CARRIED if sentinel in json.dumps(data.get(\"result\"))\n"
+      "                 else RESULT_CLEAN)"),
+     "...a clean result AFTER a carrying one does not erase it"),
     ("F41-the-bearer-need-only-arrive-once", CGATE_REMOTE,
      '    return all((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
      '    return any((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
