@@ -181,13 +181,23 @@ def classify(gated: list[dict], control: list[dict], answered: bool) -> tuple[st
 
 
 def mcp_config(path: str, url: str, sentinel: str, kind: str,
-               *, tools: list[str] | None) -> str:
+               *, tools: list[str] | None, write_type: bool = True) -> str:
     """The remote entry in copilot's own spelling — `type`/`url`/`headers`/`tools`, as
     measured by `probe_copilot_config.py` rather than taken from documentation. `type` in
     particular is a key nothing in §3 had, and copilot writes `http` for the Streamable shape
     and `sse` for the legacy one — `kind` is which of those this arm is measuring."""
-    server: dict = {"type": kind, "url": url,
+    server: dict = {"url": url,
                     "headers": {"Authorization": f"Bearer {sentinel}"}}
+    # `write_type=False` is the OMISSION ARM (Phase 2 slice 1, question 5). §2(b) records that
+    # copilot writes `type` for itself, but that is a fact about its OUTPUT read from an
+    # execution carrying no version — `copilot mcp add` emits no in-band witness — so it
+    # licenses writing the key, never any claim about omitting it. On stdio the answer is
+    # already known and is the opposite of what this design once asserted:
+    # `probe_copilot_gating.py` omits `type` in both arms and those servers start and serve.
+    # Remote was the one case nothing had exercised, and this arm reads it from a stream that
+    # names its own build.
+    if write_type:
+        server["type"] = kind
     if tools is not None:
         server["tools"] = list(tools)
     with open(path, "w", encoding="utf-8") as handle:
@@ -195,10 +205,11 @@ def mcp_config(path: str, url: str, sentinel: str, kind: str,
     return path
 
 
-def run_arm(workdir: str, url: str, sentinel: str, kind: str, *, tools: list[str] | None):
+def run_arm(workdir: str, url: str, sentinel: str, kind: str, *, tools: list[str] | None,
+            write_type: bool = True):
     receipts_before = None
     config = mcp_config(os.path.join(workdir, f"cfg-{uuid.uuid4().hex}.json"), url, sentinel,
-                        kind, tools=tools)
+                        kind, tools=tools, write_type=write_type)
     # BOTH TOOLS, ALLOWED FIRST — see `classify`. Naming only the off-list one leaves the
     # allowed one uncalled in every arm, which is exactly what an off switch looks like.
     # The reply is quoted VERBATIM so the opaque marker survives into the output, which is
@@ -295,6 +306,55 @@ def cli_version() -> tuple[str, bool]:
     return version_verdict(done.returncode, done.stdout, done.stderr)
 
 
+# --- question 5: does a REMOTE server start with no `type` key? -------------------------
+# Either answer is a finding, so the exit status requires this to be ANSWERED, never to come
+# back positive. A `NEVER_STARTS` result would say the adapter MUST write `type`; a
+# `STARTS_WITHOUT_TYPE` says the key is canonical rather than required. Phase 2 slice 3 writes
+# it either way — depending on an undocumented default is a bet a later build settles silently
+# — but the design may then only claim what was measured.
+STARTS_WITHOUT_TYPE = "STARTS_WITHOUT_TYPE"   # server ran and the tool arrived, no `type` key
+NEVER_STARTS = "NEVER_STARTS"                 # the entry was not understood: nothing reached it
+
+
+def type_omission_verdict(records: list[dict]) -> tuple[str, str]:
+    """Did a remote entry with no `type` key produce a running, reachable server?
+
+    STRUCTURAL CLAUSE FIRST. `server_ran` is asked before anything about tools, because a
+    fixture that never announced itself makes every downstream negative true for the wrong
+    reason — the arm would report "the tool never arrived" for a server that was never started
+    by this probe at all, and that is an instrument failure rather than a finding about
+    `type`.
+    """
+    if not server_ran(records):
+        return INSTRUMENT_FAILED, ("the fixture never announced `listening`, so nothing about "
+                                   "the config shape was measured by this arm")
+    if called(records, ALLOWED):
+        return STARTS_WITHOUT_TYPE, (f"a remote entry with NO `type` key started and served: "
+                                     f"{ALLOWED!r} arrived at the server")
+    return NEVER_STARTS, ("the server was listening and no declared tool ever arrived — the "
+                          "entry without `type` did not become a server copilot could reach")
+
+
+def measure_type_omission(workdir: str, kind: str, endpoint: str, sentinel: str):
+    """One UNGATED arm with `type` omitted. Returns (verdict, reason, records, stream).
+
+    Ungated on purpose: `tools:` is not the subject here and a filter would add a second way
+    for the call not to arrive, which is precisely the confusion this arm exists to avoid.
+    """
+    receipts = os.path.join(workdir, f"receipts-{kind}-notype.jsonl")
+    proc, info = start_fixture(receipts, IDENTITY_GENERATE)
+    if proc is None:
+        return INSTRUMENT_FAILED, f"fixture: {info}", [], ""
+    try:
+        out, _ = run_arm(workdir, info[endpoint], sentinel, kind, tools=None, write_type=False)
+    finally:
+        proc.kill()
+        proc.wait(timeout=15)
+    records = read_receipts(receipts)
+    verdict, reason = type_omission_verdict(records)
+    return verdict, reason, records, out
+
+
 def measure(workdir: str, kind: str, endpoint: str, sentinel: str):
     """One transport, both arms. Returns (verdict, reason, results, bearer_ok, answered)."""
     # ONE RECEIPTS FILE PER ARM, because the fixture appends and two arms sharing a file
@@ -384,6 +444,19 @@ def main() -> int:
                 print(f"  SETTLED, AND THE ANSWER IS NO for {kind}: {verdict} is a definite "
                       f"result and it says §8's pattern cannot be declared `native` here")
             ok = ok and good
+        # QUESTION 5, once per transport: the omission arm. Its verdict does not gate on being
+        # POSITIVE — both answers are findings — but an UNANSWERED one leaves slice 3 writing
+        # `type` on an unversioned shape reading, which is the whole reason this arm exists.
+        for kind, endpoint in TRANSPORTS:
+            v, why, recs, out = measure_type_omission(workdir, kind, endpoint, sentinel)
+            all_streams.append(out)
+            print(f"probe C2-copilot-remote [{kind}] NO-`type` arm: {v}")
+            print(f"  {why}")
+            print(f"  records={len(recs)} server_ran={server_ran(recs)} "
+                  f"called({ALLOWED})={called(recs, ALLOWED)}")
+            if v not in (STARTS_WITHOUT_TYPE, NEVER_STARTS):
+                print("  UNANSWERED: question 5 is not settled by this run")
+                ok = False
         pooled, pooled_ok = agreed_version(all_streams)
         print(f"across every arm of every transport: copilot {pooled}")
         if not pooled_ok:

@@ -137,6 +137,10 @@ SESSPROBE = "tools/probe_session_mcp.py"
 CCONFIG = "tools/probe_copilot_config.py"
 CGATE = "tools/probe_copilot_gating.py"
 CGATE_REMOTE = "tools/probe_copilot_remote_gating.py"
+# Phase 2 slice 1's fourth copilot probe: the one that reads copilot's OWN account of the run
+# rather than server-side receipts. Slice 2's witness change and slice 4's parser are both
+# about to be built on the words it prints, which is the same weight the three above carry.
+CEVENTS = "tools/probe_copilot_events.py"
 # The proxy's I/O half and the awkward server it is driven against. PRODUCTION code that no
 # selftest arm can reach — it is only executed by running the real program over real pipes —
 # so it is `M*` like any other production target, proven by a THIRD suite. The classification
@@ -2983,6 +2987,48 @@ MUTATIONS = [
     # reported STALE ANCHOR and refused to claim 52/52; driving only the NEW mutations, which is
     # what I did, could not have found it. Changing a line invalidates every mutation aimed at
     # it, and the two axes over one expression are still two axes (review, PR #110).
+    # --- Phase 2 slice 1: the events probe, and the `type`-omission arm -------------------
+    # THE UNMEASURED/NEGATIVE COLLAPSE, which is this file's most-repeated defect one probe
+    # over. "No MCP tool call in the stream" and "copilot uses bare tool names" are different
+    # facts, and reading the first as the second would tell slice 4 to match a bare name.
+    ("F171-no-tool-call-reads-as-a-bare-name", CEVENTS,
+     "    if name is None:\n        return UNMEASURED",
+     "    if name is None:\n        return BARE",
+     "no MCP tool call at all is UNMEASURED, never BARE"),
+    # The positive control IS the measurement. Without it, a run where the sentinel never
+    # travelled certifies redaction — a channel nobody proved was connected reporting silence.
+    ("F172-redaction-is-certified-without-a-control", CEVENTS,
+     "    if sentinel not in control_stream:\n        return CONTROL_FAILED, (",
+     "    if False:\n        return CONTROL_FAILED, (",
+     "a control that never carried the sentinel measures nothing"),
+    # A conjunction over three questions, not a lookup on the last one read.
+    ("F173-two-answered-questions-are-enough", CEVENTS,
+     "    return (fmt != UNMEASURED\n            and spelling != REPORTS_NEITHER",
+     "    return (fmt != UNMEASURED\n            or spelling != REPORTS_NEITHER",
+     "...and ONE gap (server never named) is enough to fail it"),
+    # The advertised name and the config key are the whole reason question 2 is answerable.
+    # Checking only one spelling makes the other read as "our server never appeared".
+    ("F174-only-the-config-key-is-ever-recognised", CEVENTS,
+     "    for name, status in seen:\n        if name == ADVERTISED_NAME:\n            return REPORTS_ADVERTISED, status",
+     "    for name, status in seen:\n        if False:\n            return REPORTS_ADVERTISED, status",
+     "...the ADVERTISED name is recognised as a different answer"),
+    # A witness that reads only the first event cannot see a server that failed later — the
+    # exact transition slice 2 exists to classify.
+    ("F175-a-later-status-transition-is-invisible", CEVENTS,
+     '        elif etype == "session.mcp_server_status_changed" and isinstance(data, dict):',
+     "        elif False:",
+     "the witness reads BOTH events, so a later transition is not invisible"),
+    # The structural clause. Without it, a fixture that never started reports "the tool never
+    # arrived" and it is published as a finding about `type`.
+    ("F176-an-unstarted-fixture-becomes-a-type-finding", CGATE_REMOTE,
+     "    if not server_ran(records):\n        return INSTRUMENT_FAILED, (",
+     "    if False:\n        return INSTRUMENT_FAILED, (",
+     "...but a server that never announced itself is INSTRUMENT_FAILED, not a finding"),
+    # The arm is worthless if the flag does not change the shape it writes.
+    ("F177-the-omission-arm-writes-type-anyway", CGATE_REMOTE,
+     '    if write_type:\n        server["type"] = kind',
+     '    if True:\n        server["type"] = kind',
+     "write_type=False really omits the key, and True really writes it"),
     ("F41-the-bearer-need-only-arrive-once", CGATE_REMOTE,
      '    return all((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
      '    return any((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
