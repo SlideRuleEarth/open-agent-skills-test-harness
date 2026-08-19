@@ -4625,9 +4625,9 @@ try:
         "toolCallId": _cid, "toolName": f"{EV.CONFIG_KEY}-{EV.TOOL}",
         "mcpServerName": EV.CONFIG_KEY, "mcpToolName": EV.TOOL}}) + "\n"
     _done = json.dumps({"type": "tool.execution_complete", "data": {
-        "toolCallId": _cid, "result": {"content": f"{_sent}:HELLO",
-                                       "contents": [{"type": "text",
-                                                     "text": f"{_sent}:HELLO"}]}}}) + "\n"
+        "toolCallId": _cid, "success": True,
+        "result": {"content": f"{_sent}:HELLO",
+                   "contents": [{"type": "text", "text": f"{_sent}:HELLO"}]}}}) + "\n"
     check("a result correlated to OUR execution, carrying the sentinel, is RESULT_CARRIED",
           EV.tool_result_state(EV.parse_events(_start + _done), _sent) == EV.RESULT_CARRIED,
           "attributed")
@@ -4642,7 +4642,8 @@ try:
               json.dumps({"type": "tool.execution_start", "data": {
                   "toolCallId": "other", "toolName": "shell"}}) + "\n"
               + json.dumps({"type": "tool.execution_complete", "data": {
-                  "toolCallId": "other", "result": {"content": _sent}}}) + "\n"), _sent)
+                  "toolCallId": "other", "success": True,
+                  "result": {"content": _sent}}}) + "\n"), _sent)
           == EV.RESULT_ABSENT,
           "the correlation is the point")
     # THE ARM THE REVIEW ADDED, and the state the boolean had no room for. "Our tool's result
@@ -4650,16 +4651,82 @@ try:
     # `False`, and the secret arm read the pair as redaction: a run whose reply the fixture
     # wrote and copilot never emitted certified REDACTS on an output never produced.
     _done_clean = json.dumps({"type": "tool.execution_complete", "data": {
-        "toolCallId": _cid, "result": {"content": "[REDACTED]:HELLO"}}}) + "\n"
+        "toolCallId": _cid, "success": True,
+        "result": {"content": "[REDACTED]:HELLO"}}}) + "\n"
     check("an execution of ours with NO result event at all is RESULT_ABSENT",
           EV.tool_result_state(EV.parse_events(_start), _sent) == EV.RESULT_ABSENT,
           "nothing came back")
-    check("...while one whose result came back WITHOUT the value is RESULT_CLEAN — not absent",
+    check("...while one whose result came back WITHOUT the value is RESULT_CLEAN — not absent, "
+          "and not unreadable either",
           EV.tool_result_state(EV.parse_events(_start + _done_clean), _sent) == EV.RESULT_CLEAN,
-          "the two loss cases are different facts")
-    check("...and the three states really are three words, or that distinction is cosmetic",
-          len({EV.RESULT_CARRIED, EV.RESULT_CLEAN, EV.RESULT_ABSENT}) == 3,
-          (EV.RESULT_CARRIED, EV.RESULT_CLEAN, EV.RESULT_ABSENT))
+          "the loss cases are different facts")
+    check("...and the four states really are four words, or those distinctions are cosmetic",
+          len({EV.RESULT_CARRIED, EV.RESULT_CLEAN, EV.RESULT_UNREADABLE,
+               EV.RESULT_ABSENT}) == 4,
+          (EV.RESULT_CARRIED, EV.RESULT_CLEAN, EV.RESULT_UNREADABLE, EV.RESULT_ABSENT))
+    # THE ARM THE REVIEW ADDED, and the case the clean arm above could not reach: it always
+    # supplies a payload. "A completion arrived" was being read as "a result came back", so a
+    # FAILED call carrying no result at all was `RESULT_CLEAN` and `REDACTS` was published from
+    # a completion with nothing in it — absence of the value in a payload that does not exist.
+    for _bad, _why in (
+            (json.dumps({"type": "tool.execution_complete",
+                         "data": {"toolCallId": _cid, "success": False}}) + "\n",
+             "the call FAILED and carried no result"),
+            # THE INPUT THAT ISOLATES THE `success` CLAUSE, and without it that clause has no
+            # arm of its own: every case above and below is rejected by the PAYLOAD clause,
+            # which a mutation of `success` does not touch — so deleting the success test left
+            # every one of them still unreadable and the mutation survived (mutation run,
+            # PR #120). A well-formed payload on a FAILED call is the distinguishing shape.
+            (json.dumps({"type": "tool.execution_complete",
+                         "data": {"toolCallId": _cid, "success": False,
+                                  "result": {"content": "upstream refused"}}}) + "\n",
+             "the call FAILED though its payload is well-formed"),
+            (json.dumps({"type": "tool.execution_complete",
+                         "data": {"toolCallId": _cid, "success": True, "result": {}}}) + "\n",
+             "an EMPTY result payload"),
+            (json.dumps({"type": "tool.execution_complete",
+                         "data": {"toolCallId": _cid, "success": True, "result": None}}) + "\n",
+             "a NULL result"),
+            (json.dumps({"type": "tool.execution_complete",
+                         "data": {"toolCallId": _cid, "success": True}}) + "\n",
+             "no `result` key at all"),
+            (json.dumps({"type": "tool.execution_complete",
+                         "data": {"toolCallId": _cid,
+                                  "result": {"content": "hi"}}}) + "\n",
+             "no `success` key — shape drift, which fails CLOSED")):
+        check(f"...but a completion with {_why} is RESULT_UNREADABLE, never clean",
+              EV.tool_result_state(EV.parse_events(_start + _bad), _sent)
+              == EV.RESULT_UNREADABLE, _bad)
+    # THE LEAK TEST OUTRANKS THE USABILITY TEST, and that ordering is the whole content of the
+    # rule: a completion carrying the value is a leak whether or not the call it reports
+    # succeeded, and asking about usability first would file it as "nothing to inspect" —
+    # suppressing the ACCUSING verdict on the strength of a flag the process under test sets.
+    _done_failed_leak = json.dumps({"type": "tool.execution_complete", "data": {
+        "toolCallId": _cid, "success": False,
+        "result": {"content": f"error: upstream said {_sent}"}}}) + "\n"
+    check("...while a FAILED completion whose result carries the value is still a leak",
+          EV.tool_result_state(EV.parse_events(_start + _done_failed_leak), _sent)
+          == EV.RESULT_CARRIED, "the reading that accuses outranks the one that excuses")
+    # THE RANK IS A LADDER, not a last-write-wins scan, in both directions.
+    _done_bad = json.dumps({"type": "tool.execution_complete",
+                            "data": {"toolCallId": _cid, "success": False}}) + "\n"
+    check("...an unreadable completion AFTER a usable one does not demote the reading",
+          EV.tool_result_state(EV.parse_events(_start + _done_clean + _done_bad), _sent)
+          == EV.RESULT_CLEAN, "strongest evidence wins, in either order")
+    check("...and a usable one after an unreadable one promotes it",
+          EV.tool_result_state(EV.parse_events(_start + _done_bad + _done_clean), _sent)
+          == EV.RESULT_CLEAN, "order does not decide it")
+    # PINNED TO THE MEASURED SHAPE, §4's duplicated-rule rule: `usable_result` encodes what
+    # 1.0.80 emits, and the pinned line is the original it must agree with. A build that stops
+    # sending `success` or renames `result` reddens here rather than silently reclassifying
+    # every completion as unreadable in a run nobody is watching.
+    check("`usable_result` accepts the REAL 1.0.80 completion, and it is `success: true`",
+          EV.usable_result(json.loads(_real_done)["data"])
+          and json.loads(_real_done)["data"]["success"] is True,
+          json.loads(_real_done)["data"].keys())
+    check("...and only RESULT_CARRIED/RESULT_CLEAN are states a redaction claim is about",
+          EV.INSPECTABLE_RESULTS == (EV.RESULT_CARRIED, EV.RESULT_CLEAN),
+          EV.INSPECTABLE_RESULTS)
     # ONE CARRYING RESULT AMONG SEVERAL CLEAN ONES IS STILL A LEAK. The accumulator must not
     # let a later clean result overwrite an earlier carrying one — a scan that keeps the LAST
     # answer instead of the strongest reports `RESULT_CLEAN` for a run that leaked.
@@ -4719,6 +4786,29 @@ try:
                             **dict(_ok, secret_result=EV.RESULT_ABSENT))[0]
           == EV.SECRET_ARM_INCOMPLETE,
           "the fixture proves it went out; nothing shows what came back")
+    # THE ARM THE REVIEW ADDED. `RESULT_ABSENT` was the only loss the gate refused, so a
+    # completion that arrived with nothing in it walked through it into REDACTS.
+    check("...nor can one whose completion carried no result to inspect",
+          EV.secret_verdict("nothing here", _sent,
+                            **dict(_ok, secret_result=EV.RESULT_UNREADABLE))[0]
+          == EV.SECRET_ARM_INCOMPLETE,
+          "a completion is not a result")
+    check("...and those two secret losses are told apart in the reason, not merged",
+          EV.secret_verdict("nothing here", _sent,
+                            **dict(_ok, secret_result=EV.RESULT_UNREADABLE))[1]
+          != EV.secret_verdict("nothing here", _sent,
+                               **dict(_ok, secret_result=EV.RESULT_ABSENT))[1],
+          "which loss it was is the diagnosis")
+    check("...and a control whose completion carried no result to inspect fails too",
+          EV.secret_verdict("nothing here", _sent,
+                            **dict(_ok, control_result=EV.RESULT_UNREADABLE))[0]
+          == EV.CONTROL_FAILED,
+          "the control has to show the value travelling, not merely a completion")
+    check("...with its own reason, distinct from the control's other two losses",
+          len({EV.secret_verdict("nothing here", _sent,
+                                 **dict(_ok, control_result=st))[1]
+               for st in (EV.RESULT_ABSENT, EV.RESULT_UNREADABLE, EV.RESULT_CLEAN)}) == 3,
+          "three losses, three sentences")
     check("...and the stream being FULL of other output does not make that a measurement",
           EV.secret_verdict("I called the tool and here is a long answer.", _sent,
                             **dict(_ok, secret_result=EV.RESULT_ABSENT))[0]
@@ -4814,7 +4904,7 @@ try:
         # rather than by sprinkling the marker into loose text.
         _cid = json.loads(_real_exec)["data"]["toolCallId"]
         _result = json.dumps({"type": "tool.execution_complete", "data": {
-            "toolCallId": _cid,
+            "toolCallId": _cid, "success": True,
             "result": {"content": ("[REDACTED]" if redact else f"{sentinel}:HELLO")}}})
         stem = (REAL_VERSION_LINE + _real_loaded + "\n" + _real_exec + "\n"
                 + _real_req + "\n")
@@ -4823,6 +4913,9 @@ try:
             return stream, rows
         if _mode[0] == "no_result":        # it served the call; copilot emitted no result
             return stem, rows
+        if _mode[0] == "bad_result":       # a completion arrived carrying nothing to inspect
+            return stem + json.dumps({"type": "tool.execution_complete", "data": {
+                "toolCallId": _cid, "success": False}}) + "\n", rows
         if _mode[0] == "empty":            # the arm vanished: no stream, no receipts
             return "", []
         if _mode[0] == "stream_lost":      # it ran and served, but its stream never arrived
@@ -4877,6 +4970,13 @@ try:
         _mode[0] = "no_result"
         check("...nor one whose call was served and whose RESULT copilot never emitted",
               EV.main() == 1, "a lost result is not a removed value")
+        # THE MODE THE REVIEW ADDED, and the narrowest gap yet: a completion event that DID
+        # arrive, reporting a failed call and carrying no result. Every fake above supplied a
+        # `[REDACTED]` payload, so the wiring was never driven through a completion with
+        # nothing in it to be redacted.
+        _mode[0] = "bad_result"
+        check("...nor one whose completion arrived carrying no result to inspect",
+              EV.main() == 1, "a completion is not a result")
     finally:
         EV.run_arm, tempfile.tempdir = _real_arm, _saved_tmpdir
 

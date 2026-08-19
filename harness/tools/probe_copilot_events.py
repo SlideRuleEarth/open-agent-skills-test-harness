@@ -110,8 +110,20 @@ SECRET_ARM_INCOMPLETE = "SECRET_ARM_INCOMPLETE"   # the arm under the flag never
 # ONE BOOLEAN: "the result came back without the value" and "no result of ours came back at
 # all" are different facts, and only the first is evidence about redaction (review, PR #120).
 RESULT_CARRIED = "RESULT_CARRIED"    # a result of our tool reached the output, WITH the value
-RESULT_CLEAN = "RESULT_CLEAN"        # a result of our tool reached the output, without it
-RESULT_ABSENT = "RESULT_ABSENT"      # no result of our tool reached the output at all
+RESULT_CLEAN = "RESULT_CLEAN"        # a USABLE result reached the output, and it lacked the value
+RESULT_UNREADABLE = "RESULT_UNREADABLE"   # a completion arrived carrying no result to inspect
+RESULT_ABSENT = "RESULT_ABSENT"      # no completion for our tool reached the output at all
+
+# The states in which something came back that a redaction claim can be ABOUT. Named, and
+# tested against by membership, because this is the predicate every reader of "did anything
+# come back" must consult: the first version tested `== RESULT_ABSENT` at one call site, and a
+# fourth state added later would have gone on reading as inspectable there (§4's rule).
+INSPECTABLE_RESULTS = (RESULT_CARRIED, RESULT_CLEAN)
+
+# Strongest evidence first, weakest last — the order `tool_result_state` resolves several
+# completions by. A leak once observed is not erased by a later clean result; a usable result
+# that lacked the value is evidence an unusable sibling does not erase; absence is the floor.
+_RESULT_RANK = (RESULT_ABSENT, RESULT_UNREADABLE, RESULT_CLEAN, RESULT_CARRIED)
 
 # Question 2 is "which spelling AND what status", so the status needs a verdict of its own.
 STATUS_MEASURED = "STATUS_MEASURED"          # a real status, from an arm proven to have served
@@ -389,6 +401,38 @@ def mcp_call_ids(events: list[dict]) -> set[str]:
     return ids
 
 
+def usable_result(data: dict) -> bool:
+    """Whether this completion event actually carries a tool result to INSPECT.
+
+    THE CLAUSE THAT WAS MISSING FROM `RESULT_CLEAN` (review, PR #120). "A completion arrived"
+    was being read as "a result came back", so `{"toolCallId": id, "success": false}` — a call
+    that failed, carrying no result at all — read as *clean*, and `REDACTS` was published from
+    a completion with nothing in it. Absence of the value in a payload that does not exist is
+    not evidence about redaction; it is the same absence-as-evidence error one field further
+    in, on a witness added to close the previous one.
+
+    TWO CLAUSES, BOTH PINNED TO THE MEASURED SHAPE. 1.0.80's completion carries `success: true`
+    and a `result` object with `content` / `detailedContent` / `contents[]` — the pinned line
+    under `tools/pinned/` is the original this agrees with, and §E21 asserts the predicate
+    against it, so a build that changes the shape reddens rather than silently reclassifying.
+
+    `success is not True` FAILS CLOSED, deliberately: a build that stops emitting the field
+    leaves every completion unreadable, and the probe then reports `SECRET_ARM_INCOMPLETE`
+    rather than certifying anything. Refusing to answer is the correct behaviour for an
+    instrument whose subject changed shape underneath it — and the pin above is what makes
+    that refusal visible instead of mysterious.
+
+    The payload clause is structural rather than a field spelling, for the reason the search
+    in `tool_result_state` is: the same text renders under three keys at 1.0.80 and pinning one
+    would go quiet on a rendering change. A non-empty dict, list or string is a result; `None`,
+    `{}`, `""` and a bare number are not.
+    """
+    if data.get("success") is not True:
+        return False
+    result = data.get("result")
+    return isinstance(result, (dict, list, str)) and bool(result)
+
+
 def tool_result_state(events: list[dict], sentinel: str) -> str:
     """Whether a RESULT of one of OUR tool's executions reached the output, and what it carried.
 
@@ -399,12 +443,18 @@ def tool_result_state(events: list[dict], sentinel: str) -> str:
     the secret arm's absence says nothing about (review, PR #120). This asks the narrower
     question the verdict actually claims: did the value come back *in our tool's result*.
 
-    THREE STATES, BECAUSE THE ABSENT CASE WAS NOT A CLEAN ONE (review, PR #120). A boolean
-    made "our tool's result carried no sentinel" and "our tool's result never appeared"
-    indistinguishable, and the secret arm read the pair of them as redaction: a run whose reply
-    the fixture wrote and copilot never emitted certified `REDACTS`, on the strength of an
-    output that was never produced. The fixture's receipts prove the value went ONTO the wire;
-    only this says whether anything came back OFF it.
+    FOUR STATES, EACH A DIFFERENT WAY OF NOT HAVING THE VALUE BACK, and the vocabulary grew
+    one word per review round (PR #120). A boolean first made "our tool's result carried no
+    sentinel" and "our tool's result never appeared" indistinguishable, and the secret arm read
+    the pair of them as redaction: a run whose reply the fixture wrote and copilot never
+    emitted certified `REDACTS` on the strength of an output that was never produced. Splitting
+    those two left the same hole one field in — `RESULT_CLEAN` was assigned to any correlated
+    completion, so a FAILED one carrying no result at all was "clean", and the value was absent
+    from a payload that did not exist. `usable_result` below is the clause that decides it.
+
+    The fixture's receipts prove the value went ONTO the wire; only this says whether anything
+    came back OFF it, and only `RESULT_CARRIED`/`RESULT_CLEAN` say something came back that a
+    redaction claim can be about — which is what `INSPECTABLE_RESULTS` names.
 
     Searched over the SERIALIZED result rather than one field, because 1.0.80 renders the same
     text under `content`, `detailedContent` and `contents[].text`, and pinning one spelling
@@ -424,9 +474,19 @@ def tool_result_state(events: list[dict], sentinel: str) -> str:
         data = obj.get("data")
         if not isinstance(data, dict) or data.get("toolCallId") not in ids:
             continue
+        # THE LEAK TEST COMES FIRST, AND NOT BY ACCIDENT. A completion that carries the value
+        # is a leak whether or not the call it reports succeeded, and asking about usability
+        # first would file that as "nothing to inspect" — suppressing the alarming verdict on
+        # the strength of a flag set by the process under test. Same asymmetry as the gating
+        # probe's naming-before-taint: the reading that ACCUSES outranks the one that excuses.
         if sentinel in json.dumps(data.get("result")):
-            return RESULT_CARRIED
-        state = RESULT_CLEAN
+            this = RESULT_CARRIED
+        elif usable_result(data):
+            this = RESULT_CLEAN
+        else:
+            this = RESULT_UNREADABLE
+        if _RESULT_RANK.index(this) > _RESULT_RANK.index(state):
+            state = this
     return state
 
 
@@ -621,8 +681,10 @@ def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool
     if control_result != RESULT_CARRIED:
         return CONTROL_FAILED, (
             "the control's own tool RESULT never carried the sentinel"
-            + (" — no result of our tool reached its output at all"
+            + (" — no completion for our tool reached its output at all"
                if control_result == RESULT_ABSENT else
+               " — its completion carried no result to inspect: the call failed, or the "
+               "payload was empty" if control_result == RESULT_UNREADABLE else
                " — its result came back without the value, with no flag set")
             + ", so the value does not reach the output by that route and its absence under "
               "--secret-env-vars measures nothing")
@@ -632,12 +694,16 @@ def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool
                                        "record both this run's marker and a call to the tool "
                                        "that returns it — so the sentinel's absence from its "
                                        "output is the absence of the CALL, not of the value")
-    if secret_result == RESULT_ABSENT:
-        return SECRET_ARM_INCOMPLETE, ("the arm under --secret-env-vars answered our tool and "
-                                       "then emitted no result for it at all, so nothing came "
-                                       "back to be redacted — the fixture proves the value went "
-                                       "onto the wire and nothing shows what copilot did with "
-                                       "it, which is not the same as showing it removed it")
+    if secret_result not in INSPECTABLE_RESULTS:
+        return SECRET_ARM_INCOMPLETE, (
+            "the arm under --secret-env-vars answered our tool and then"
+            + (" emitted no completion for it at all"
+               if secret_result == RESULT_ABSENT else
+               " emitted a completion carrying no result to inspect: the call failed, or the "
+               "payload was empty")
+            + ", so nothing came back to be redacted — the fixture proves the value went onto "
+              "the wire and nothing shows what copilot did with it, which is not the same as "
+              "showing it removed it")
     if sentinel in secret_stream:
         return NO_REDACTION, (
             "the sentinel appears in the output WITH --secret-env-vars naming its variable"

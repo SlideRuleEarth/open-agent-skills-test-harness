@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff AN
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff + shellcheck + a parse under every shell
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 216/216 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 703 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 221/221 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 719 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine
 git diff --check
@@ -2100,6 +2100,37 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   when a taint and a positive can both apply to one reading, decide which outranks which
   **deliberately** and write down why — the ordering is the entire content of the rule, and it
   is invisible in code that just happens to check one of them first.
+- **A FIFTH ROUND FOUND THE FOURTH ROUND'S OWN FIX ONE FIELD SHORT — and the pattern is now
+  the finding.** Round four split "our tool's result came back without the value" from "no
+  result came back at all", which was right and stopped exactly where the reproduction did.
+  `RESULT_CLEAN` was then assigned to **any** correlated completion, so
+  `{"toolCallId": id, "success": false}` — a call that failed, carrying no result at all — read
+  as clean, and `REDACTS` was published from a completion with nothing in it. The value was
+  absent from a payload that did not exist.
+  **Read the ladder, not the rung.** Four rounds walked one witness at a time: does an arm
+  exist → did its fixture answer → did copilot emit a completion → does that completion carry a
+  result. Each round added the next rung and stopped, and each time the reviewer found the
+  gap immediately above it. The generalisable move is to write the chain down *first* — from
+  "the value existed" to "a human could have read it in the output" — and ask which links the
+  code actually checks, rather than fixing the one the reproduction lands on. A witness added
+  to close a gap is itself a new thing that can be absent, malformed, or unsuccessful.
+  **Two orderings in this codebase are now deliberate and say so.** `SERVER_NAMED` is read
+  before the unreadable-inventory taint, and the leak test is read before the usability test:
+  in both, *the reading that accuses outranks the reading that excuses*. Nothing enforces
+  either but a comment and an arm, which is why both got a mutation aimed at the ordering
+  itself rather than at the clauses either side of it.
+  **And `usable_result` fails closed on shape drift** — no `success` field means unreadable,
+  not usable — which is only safe because the predicate is pinned to a verbatim 1.0.80 line:
+  the refusal shows up as a red §E21 rather than as a probe that quietly stops answering.
+- **A MUTATION AIMED BESIDE ITS CLAUSE SURVIVES, AND THE SECOND ONE IN A ROUND IS THE TELL.**
+  `F228` deleted the `success` test in `usable_result` and nothing went red: every arm named
+  for it fed input the OTHER clause rejects anyway — `{"success": false}` carries no payload,
+  so the payload test refuses it with or without the mutation. The distinguishing input is a
+  **well-formed payload on a failed call**, which no arm had. This is the identical mistake
+  `F213`/`F214` made one round earlier over the same kind of two-clause predicate, found the
+  identical way: by driving each mutation individually before spending a suite run. When a
+  predicate has two guards, the arm for each must feed input the OTHER guard accepts — and
+  the cheap way to know is to state, for each guard, the input that only it rejects.
 - **A THROWAWAY MUTATION HARNESS IS STILL A HARNESS, and mine left the tree mutated twice.**
   Driving one mutation at a time before spending a full suite run is the right move and it
   costs a script that WRITES SOURCE FILES. The first incident was the plain one — killed

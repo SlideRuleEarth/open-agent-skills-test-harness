@@ -3244,7 +3244,7 @@ MUTATIONS = [
     # copilot's own result event says anything came back. An arm with an execution and no
     # completion event has nothing to redact, and it certified REDACTS.
     ("F219-a-lost-result-is-a-redacted-one", CEVENTS,
-     "    if secret_result == RESULT_ABSENT:\n        return SECRET_ARM_INCOMPLETE, (",
+     "    if secret_result not in INSPECTABLE_RESULTS:\n        return SECRET_ARM_INCOMPLETE, (",
      "    if False:\n        return SECRET_ARM_INCOMPLETE, (",
      "a secret arm that served the call and emitted NO result is incomplete, not REDACTS"),
     # ...and the gate must read the arm it is judging, not the arm beside it — F190's rule,
@@ -3256,9 +3256,10 @@ MUTATIONS = [
     # A RESULT THAT CAME BACK WITHOUT THE VALUE IS NOT A RESULT THAT NEVER CAME BACK. Merging
     # them is what made the loss case above unreachable, so it gets its own mutation.
     ("F221-a-result-without-the-value-is-no-result", CEVENTS,
-     "            return RESULT_CARRIED\n        state = RESULT_CLEAN",
-     "            return RESULT_CARRIED\n        state = RESULT_ABSENT",
-     "...while one whose result came back WITHOUT the value is RESULT_CLEAN — not absent"),
+     "        elif usable_result(data):\n            this = RESULT_CLEAN",
+     "        elif False:\n            this = RESULT_CLEAN",
+     ("...while one whose result came back WITHOUT the value is RESULT_CLEAN — not absent, "
+      "and not unreadable either")),
     # A NULL STATUS IS STILL AN ENTRY. Filtering the `None` out reads as "not named", which is
     # the same collapse one function earlier.
     ("F223-a-null-status-drops-the-entry", CGATE_REMOTE,
@@ -3284,9 +3285,11 @@ MUTATIONS = [
       "        return SERVER_NAMED"),
      "...while garbage beside a NAMING event leaves the naming standing"),
     # WHICH LOSS IT WAS IS THE DIAGNOSIS, so the two control failures do not share a sentence.
-    ("F226-the-two-control-losses-read-the-same", CEVENTS,
-     ('            + (" — no result of our tool reached its output at all"\n'
+    ("F226-the-control-losses-read-the-same", CEVENTS,
+     ('            + (" — no completion for our tool reached its output at all"\n'
       "               if control_result == RESULT_ABSENT else\n"
+      '               " — its completion carried no result to inspect: the call failed, or the "\n'
+      '               "payload was empty" if control_result == RESULT_UNREADABLE else\n'
       '               " — its result came back without the value, with no flag set")'),
      '            + ""',
      "...and those two control failures are told apart in the reason, not merged"),
@@ -3299,11 +3302,45 @@ MUTATIONS = [
     # THE STRONGEST READING WINS, NOT THE LAST. A scan that keeps whichever result it saw most
     # recently reports `RESULT_CLEAN` for a run that leaked in an earlier one.
     ("F222-the-last-result-decides-rather-than-the-worst", CEVENTS,
-     ("        if sentinel in json.dumps(data.get(\"result\")):\n"
-      "            return RESULT_CARRIED\n        state = RESULT_CLEAN"),
-     ("        state = (RESULT_CARRIED if sentinel in json.dumps(data.get(\"result\"))\n"
-      "                 else RESULT_CLEAN)"),
+     ("        if _RESULT_RANK.index(this) > _RESULT_RANK.index(state):\n"
+      "            state = this"),
+     "        if True:\n            state = this",
      "...a clean result AFTER a carrying one does not erase it"),
+    # --- PR #120, fifth review round -------------------------------------------------------
+    # "A COMPLETION ARRIVED" IS NOT "A RESULT CAME BACK". A failed call carrying no result read
+    # as `RESULT_CLEAN`, and REDACTS was published from a completion with nothing in it.
+    ("F228-a-failed-completion-is-a-clean-result", CEVENTS,
+     '    if data.get("success") is not True:\n        return False',
+     "    if False:\n        return False",
+     ("...but a completion with the call FAILED though its payload is well-formed is "
+      "RESULT_UNREADABLE, never clean")),
+    # ...and the payload half of the same predicate, which rejects a different shape: a
+    # `success: true` completion whose `result` is empty, null or missing entirely.
+    ("F229-an-empty-payload-is-a-result", CEVENTS,
+     "    return isinstance(result, (dict, list, str)) and bool(result)",
+     "    return True",
+     "...but a completion with an EMPTY result payload is RESULT_UNREADABLE, never clean"),
+    # THE GATE MUST JOIN THE PREDICATE, not name one state: `== RESULT_ABSENT` is exactly the
+    # version that let a completion with nothing in it walk through into REDACTS.
+    ("F230-only-a-missing-completion-is-a-loss", CEVENTS,
+     "    if secret_result not in INSPECTABLE_RESULTS:",
+     "    if secret_result == RESULT_ABSENT:",
+     "...nor can one whose completion carried no result to inspect"),
+    # THE READING THAT ACCUSES OUTRANKS THE ONE THAT EXCUSES. Asking about usability first
+    # files a failed completion that carries the value as "nothing to inspect".
+    ("F231-a-failed-completion-cannot-leak", CEVENTS,
+     '        if sentinel in json.dumps(data.get("result")):\n            this = RESULT_CARRIED',
+     ('        if usable_result(data) and sentinel in json.dumps(data.get("result")):\n'
+      "            this = RESULT_CARRIED"),
+     "...while a FAILED completion whose result carries the value is still a leak"),
+    # ...and which loss it was is the diagnosis on the secret side too.
+    ("F232-the-two-secret-losses-read-the-same", CEVENTS,
+     ('            + (" emitted no completion for it at all"\n'
+      "               if secret_result == RESULT_ABSENT else\n"
+      '               " emitted a completion carrying no result to inspect: the call failed, or the "\n'
+      '               "payload was empty")'),
+     '            + ""',
+     "...and those two secret losses are told apart in the reason, not merged"),
     ("F41-the-bearer-need-only-arrive-once", CGATE_REMOTE,
      '    return all((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
      '    return any((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
