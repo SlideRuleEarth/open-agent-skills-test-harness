@@ -374,29 +374,52 @@ def canonical_name(by_source: dict[str, list[str]]) -> str | None:
     return distinct.pop() if len(distinct) == 1 else None
 
 
+def is_our_execution(data: dict) -> bool:
+    """Whether this `tool.execution_start`'s payload identifies OUR tool.
+
+    EXTRACTED SO TWO READERS CANNOT DISAGREE about what "ours" means. `mcp_starts` counts these
+    events and `mcp_call_ids` correlates by their ids; when the test lived inside the second,
+    the first could only be written by copying it (§4's duplicated-rule rule, at function
+    scope). The structured fields are preferred and the composite name is the fallback, because
+    1.0.80 carries both and a build that drops either should not silently stop matching.
+    """
+    name = data.get("toolName")
+    return bool((data.get("mcpToolName") == TOOL
+                 and data.get("mcpServerName") in (CONFIG_KEY, ADVERTISED_NAME))
+                or (isinstance(name, str) and is_our_tool(name)))
+
+
+def mcp_starts(events: list[dict]) -> list[dict]:
+    """Every `tool.execution_start` for OUR tool, WHETHER OR NOT its id is usable.
+
+    THE COUNT OF EXECUTIONS, WHICH IS NOT THE COUNT OF IDS (review, PR #120). `mcp_call_ids`
+    returns a SET and skips any start whose `toolCallId` is missing or malformed, so it answers
+    "how many ids can I correlate on", not "how many times did the model call our tool". The
+    attribution rule needs the second: two starts sharing one id, or one usable start beside an
+    identifiable start with no id at all, are two executions that the id count reports as one —
+    and `RESULT_CLEAN` was published for both, which is the ambiguous join all over again, in
+    the clause added to close it.
+
+    A LIST, NOT A SET, for exactly that reason: the duplicates ARE the finding here.
+    """
+    return [obj["data"] for obj in events
+            if obj.get("type") == "tool.execution_start"
+            and isinstance(obj.get("data"), dict)
+            and is_our_execution(obj["data"])]
+
+
 def mcp_call_ids(events: list[dict]) -> set[str]:
     """The `toolCallId`s copilot assigned to executions of OUR tool.
 
     The correlation key the result event needs. `tool.execution_complete` carries no tool name
     at all — only `toolCallId`, `result` and telemetry (measured, 1.0.80) — so attributing a
     result to our tool means matching the id copilot itself minted on the start event.
+
+    Deduplicating and dropping unusable ids is right for THIS question and wrong for counting
+    executions, which is why `mcp_starts` exists above rather than this being read as both.
     """
-    ids: set[str] = set()
-    for obj in events:
-        if obj.get("type") != "tool.execution_start":
-            continue
-        data = obj.get("data")
-        if not isinstance(data, dict):
-            continue
-        cid = data.get("toolCallId")
-        if not isinstance(cid, str) or not cid:
-            continue
-        name = data.get("toolName")
-        if (data.get("mcpToolName") == TOOL
-                and data.get("mcpServerName") in (CONFIG_KEY, ADVERTISED_NAME)) or (
-                isinstance(name, str) and is_our_tool(name)):
-            ids.add(cid)
-    return ids
+    return {data["toolCallId"] for data in mcp_starts(events)
+            if isinstance(data.get("toolCallId"), str) and data["toolCallId"]}
 
 
 def usable_result(data: dict) -> bool:
@@ -473,7 +496,15 @@ def tool_result_state(events: list[dict], sentinel: str, *, replies: int) -> str
     So attribution is established by CARDINALITY rather than by an identifier: exactly one
     marker-bearing reply, exactly one execution of our tool, exactly one completion for it. In
     that run the completion cannot belong to anything else, and the proof needs no field the
-    protocol does not have. In any other run the answer is `RESULT_UNATTRIBUTED`, which
+    protocol does not have.
+
+    "EXACTLY ONE EXECUTION" IS COUNTED OVER THE START EVENTS, not over the ids (review,
+    PR #120). `mcp_call_ids` is a SET and it drops starts whose id is missing or malformed, so
+    it answers a different question — how many ids can be correlated on — and reading it as the
+    execution count made two starts sharing an id, and a usable start beside an id-less one,
+    both look like a single exchange. The id count is still required, and now means what it
+    says: the ONE execution's id is usable. A lone start whose id is not is unattributable,
+    since nothing can be correlated to it at all. In any other run the answer is `RESULT_UNATTRIBUTED`, which
     `INSPECTABLE_RESULTS` already refuses — the payoff of putting that predicate in one place.
 
     THE COST, STATED: a run where the model calls the tool more than once is no longer
@@ -492,18 +523,21 @@ def tool_result_state(events: list[dict], sentinel: str, *, replies: int) -> str
     multi-call run: the control's claim is that the value CAN travel this route, and which call
     carried it does not weaken that.
     """
-    ids = mcp_call_ids(events)
-    if not ids:
+    starts = mcp_starts(events)
+    if not starts:
         return RESULT_ABSENT
-    done = [obj.get("data") for obj in events
+    ids = mcp_call_ids(events)
+    done = [obj["data"] for obj in events
             if obj.get("type") == "tool.execution_complete"
             and isinstance(obj.get("data"), dict)
             and obj["data"].get("toolCallId") in ids]
-    if not done:
-        return RESULT_ABSENT
     if any(sentinel in json.dumps(data.get("result")) for data in done):
         return RESULT_CARRIED
-    if len(ids) != 1 or len(done) != 1 or replies != 1:
+    if len(starts) != 1 or len(ids) != 1 or replies != 1:
+        return RESULT_UNATTRIBUTED
+    if not done:
+        return RESULT_ABSENT
+    if len(done) != 1:
         return RESULT_UNATTRIBUTED
     if not usable_result(done[0]):
         return RESULT_UNREADABLE

@@ -3193,8 +3193,8 @@ MUTATIONS = [
     # The control's evidence must be ATTRIBUTED to our tool's result. A substring search over
     # the whole stream is satisfied by the config this probe wrote, under `--allow-all`.
     ("F212-any-appearance-in-the-stream-is-the-tool-reply", CEVENTS,
-     "    ids = mcp_call_ids(events)\n    if not ids:\n        return RESULT_ABSENT",
-     ("    ids = mcp_call_ids(events)\n    if True:\n"
+     "    starts = mcp_starts(events)\n    if not starts:\n        return RESULT_ABSENT",
+     ("    starts = mcp_starts(events)\n    if True:\n"
       "        return (RESULT_CARRIED if any(sentinel in json.dumps(o) for o in events)\n"
       "                else RESULT_ABSENT)"),
      "...but the sentinel merely APPEARING in the stream is not our tool's result"),
@@ -3303,9 +3303,13 @@ MUTATIONS = [
      "...and a secret result that CARRIED the value is NO_REDACTION by its OWN route"),
     # THE STRONGEST READING WINS, NOT THE LAST. A scan that keeps whichever result it saw most
     # recently reports `RESULT_CLEAN` for a run that leaked in an earlier one.
+    # `done and …` IS LOAD-BEARING IN THE REPLACEMENT: without it the mutant raises IndexError
+    # on the no-completion arms, which ENDS the linear verifier before the arm named here ever
+    # runs — a mutation must be a plausible wrong implementation, not a crashing one, or it is
+    # "caught" by the wrong thing and proves nothing (mutation run, PR #120).
     ("F222-the-last-result-decides-rather-than-the-worst", CEVENTS,
      '    if any(sentinel in json.dumps(data.get("result")) for data in done):',
-     '    if sentinel in json.dumps(done[-1].get("result")):',
+     '    if done and sentinel in json.dumps(done[-1].get("result")):',
      "...a clean result AFTER a carrying one does not erase it"),
     # --- PR #120, fifth review round -------------------------------------------------------
     # "A COMPLETION ARRIVED" IS NOT "A RESULT CAME BACK". A failed call carrying no result read
@@ -3340,20 +3344,41 @@ MUTATIONS = [
     # cardinality: one marker-bearing reply, one execution, one completion. Each conjunct is a
     # different way for two calls to be mistaken for one, so each gets its own mutation.
     ("F233-a-second-marker-bearing-reply-is-still-one-exchange", CEVENTS,
-     "    if len(ids) != 1 or len(done) != 1 or replies != 1:",
-     "    if len(ids) != 1 or len(done) != 1:",
+     "    if len(starts) != 1 or len(ids) != 1 or replies != 1:",
+     "    if len(starts) != 1 or len(ids) != 1:",
      ("...a clean result in a run with TWO marker-bearing replies on the fixture's wire is "
       "UNATTRIBUTED, not clean")),
     ("F234-a-second-completion-is-still-one-result", CEVENTS,
-     "    if len(ids) != 1 or len(done) != 1 or replies != 1:",
-     "    if len(ids) != 1 or replies != 1:",
+     "    if len(done) != 1:\n        return RESULT_UNATTRIBUTED",
+     "    if False:\n        return RESULT_UNATTRIBUTED",
      ("...a clean result in a run with two completions for one execution is UNATTRIBUTED, "
       "not clean")),
-    ("F235-a-second-execution-is-still-one-call", CEVENTS,
-     "    if len(ids) != 1 or len(done) != 1 or replies != 1:",
-     "    if len(done) != 1 or replies != 1:",
-     ("...a clean result in a run with TWO executions of our tool, one completion is "
-      "UNATTRIBUTED, not clean")),
+    # THE ID COUNT NOW MEANS WHAT IT SAYS — the one execution's id is usable — so its arm is
+    # the lone-unusable-id run, not the two-execution run that `len(starts)` catches first
+    # (review, PR #120).
+    ("F235-an-uncorrelatable-execution-is-still-attributable", CEVENTS,
+     "    if len(starts) != 1 or len(ids) != 1 or replies != 1:",
+     "    if len(starts) != 1 or replies != 1:",
+     "...and a LONE execution whose id is unusable can be correlated to nothing"),
+    # --- PR #120, seventh review round -----------------------------------------------------
+    # A SET OF IDS IS NOT A COUNT OF CALLS. `mcp_call_ids` deduplicates and drops unusable ids,
+    # both correct for correlation and both wrong for counting executions.
+    ("F238-the-id-count-is-the-execution-count", CEVENTS,
+     "    if len(starts) != 1 or len(ids) != 1 or replies != 1:",
+     "    if len(ids) != 1 or replies != 1:",
+     ("...a second execution of ours carrying the SAME `toolCallId` reused is still a second "
+      "execution")),
+    # ...and the execution list must not itself filter on the id, which would reinstate the
+    # same blindness one function down.
+    ("F239-an-id-less-start-is-not-an-execution", CEVENTS,
+     ("    return [obj[\"data\"] for obj in events\n"
+      '            if obj.get("type") == "tool.execution_start"'),
+     ("    return [obj[\"data\"] for obj in events\n"
+      '            if obj.get("type") == "tool.execution_start"\n'
+      '            and isinstance(obj.get("data"), dict)\n'
+      '            and isinstance(obj["data"].get("toolCallId"), str)'),
+     ("...a second execution of ours carrying no `toolCallId` at all is still a second "
+      "execution")),
     # NOTHING CAME BACK AT ALL IS ITS OWN LOSS, and folding it into the attribution branch
     # would report a run copilot never answered as one it answered ambiguously.
     ("F236-a-missing-completion-is-merely-unattributable", CEVENTS,

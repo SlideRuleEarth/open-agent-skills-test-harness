@@ -4734,6 +4734,42 @@ try:
             (_start + _done_clean, 2, "TWO marker-bearing replies on the fixture's wire")):
         check(f"...a clean result in a run with {_why} is UNATTRIBUTED, not clean",
               _result_state(_stream, _sent, replies=_reps) == EV.RESULT_UNATTRIBUTED, _why)
+    # THE ARM THE REVIEW ADDED, and the hole in the arm above it: it used two DISTINCT valid
+    # ids, which is the one multi-execution shape the id count already caught. `mcp_call_ids`
+    # is a SET and it drops starts whose id is missing or malformed, so it answers "how many
+    # ids can I correlate on" and was being read as "how many times did the model call our
+    # tool". Two starts sharing an id, and a usable start beside an id-less one, are two
+    # executions that the id count reports as one — and both published RESULT_CLEAN.
+    def _ours(**data):
+        return json.dumps({"type": "tool.execution_start",
+                           "data": dict({"toolName": f"{EV.CONFIG_KEY}-{EV.TOOL}",
+                                         "mcpServerName": EV.CONFIG_KEY,
+                                         "mcpToolName": EV.TOOL}, **data)}) + "\n"
+
+    for _second, _why in ((_ours(), "no `toolCallId` at all"),
+                          (_ours(toolCallId=""), "an EMPTY `toolCallId`"),
+                          (_ours(toolCallId=42), "a non-string `toolCallId`"),
+                          (_ours(toolCallId=_cid), "the SAME `toolCallId` reused")):
+        check(f"...a second execution of ours carrying {_why} is still a second execution",
+              _result_state((_ours(toolCallId=_cid) + _second + _done_clean), _sent)
+              == EV.RESULT_UNATTRIBUTED, _why)
+    check("...and a LONE execution whose id is unusable can be correlated to nothing",
+          _result_state((_ours(toolCallId=42) + _done_clean), _sent) == EV.RESULT_UNATTRIBUTED,
+          "no id to match a completion against, so no result is ours")
+    check("`mcp_starts` counts EXECUTIONS and `mcp_call_ids` counts correlatable IDS — the "
+          "two are different numbers, which is the whole finding",
+          len(EV.mcp_starts(EV.parse_events(_ours(toolCallId=_cid) + _ours(toolCallId=_cid)))) == 2
+          and len(EV.mcp_call_ids(EV.parse_events(
+              _ours(toolCallId=_cid) + _ours(toolCallId=_cid)))) == 1
+          and len(EV.mcp_starts(EV.parse_events(_ours(toolCallId=_cid) + _ours()))) == 2
+          and len(EV.mcp_call_ids(EV.parse_events(_ours(toolCallId=_cid) + _ours()))) == 1,
+          "a set of ids is not a count of calls")
+    check("...and `is_our_execution` is the ONE test of `ours`, by either route",
+          EV.is_our_execution({"mcpServerName": EV.CONFIG_KEY, "mcpToolName": EV.TOOL})
+          and EV.is_our_execution({"toolName": f"{EV.CONFIG_KEY}-{EV.TOOL}"})
+          and not EV.is_our_execution({"toolName": "shell"})
+          and not EV.is_our_execution({}),
+          "structured fields or composite name, and nothing else")
     check("...and NO marker-bearing reply at all cannot attribute one either",
           _result_state((_start + _done_clean), _sent, replies=0) == EV.RESULT_UNATTRIBUTED,
           "a result belonging to a reply that never carried the marker proves nothing")

@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff AN
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff + shellcheck + a parse under every shell
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 226/226 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 728 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 228/228 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 735 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine
 git diff --check
@@ -2143,6 +2143,23 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   (a per-call nonce minted by the fixture, carried in the reply, recorded on the row) is
   written down in the probe rather than left for the next reader to re-derive, because it
   changes a reply format four probes read and that trade deserves to be visible.
+- **A COUNT OF IDENTIFIERS IS NOT A COUNT OF EVENTS, and the cardinality proof rested on the
+  wrong one.** The attribution rule above needs "the model called our tool exactly once", and
+  it asked `len(mcp_call_ids(events)) == 1`. That function returns a SET and skips any start
+  whose `toolCallId` is missing or malformed — both correct for its own question, which is
+  what can be correlated on, and both wrong for counting calls. Two starts sharing an id, and
+  a usable start beside an id-less one, are two executions the id count reports as one, so
+  `RESULT_CLEAN` was published for exactly the ambiguity the clause had just been added to
+  refuse. The arm missed it by using two DISTINCT valid ids — the one multi-execution shape
+  the id count does catch.
+  **A deduplicating reader is a lossy counter, and the loss is invisible at the call site.**
+  `set`, `dict` keys, `{...}` comprehensions, "skip the malformed ones" — every one of them
+  answers a question about *distinct usable* things, and every one is a plausible-looking
+  stand-in for *how many happened*. When a proof turns on a count, count the events; derive
+  the identifiers separately, and say in both docstrings which question each answers. Here
+  that meant `mcp_starts` (a LIST, because the duplicates are the finding) with
+  `mcp_call_ids` defined over it, and `is_our_execution` extracted so the two readers cannot
+  drift on what "ours" means.
 - **A NEW GATE CAN MAKE AN OLDER MUTATION'S ARM INSENSITIVE, AND THE COUNT STAYS GREEN WHILE
   IT HAPPENS.** Twice now: `F189` (the version witness must be handed every arm) and `F190`
   (each arm's exchange gate must read its own receipts) both stopped being killed by the arms
@@ -2156,6 +2173,15 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   records the call and reads it, which no downstream gate can absorb. The general form: when a
   rule is about *what is passed*, an assertion on *what comes out* is only accidentally
   sensitive to it, and the accident expires the next time the code gets stricter.
+- **A MUTATION THAT CRASHES IS NOT A MUTATION THAT FAILS.** `F222`'s replacement read
+  `done[-1]` where the original folded over the whole list, and on the arms where nothing came
+  back that is an `IndexError` — which ENDS the linear verifier before the arm named for the
+  mutation ever runs. The suite duly reported it red, `failed, but NOT via …`, having been
+  caught by two checks in an unrelated section that happen to run earlier. A mutation has to be
+  a **plausible wrong implementation**: the version a reasonable person would have written by
+  mistake, which for a fold-over-a-list is a last-write-wins scan that still handles the empty
+  case. Guard the replacement so it is total, or the mutation tests nothing but the file's line
+  ordering.
 - **A MUTATION AIMED BESIDE ITS CLAUSE SURVIVES, AND THE SECOND ONE IN A ROUND IS THE TELL.**
   `F228` deleted the `success` test in `usable_result` and nothing went red: every arm named
   for it fed input the OTHER clause rejects anyway — `{"success": false}` carries no payload,
