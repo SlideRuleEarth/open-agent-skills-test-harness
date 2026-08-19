@@ -3078,7 +3078,7 @@ MUTATIONS = [
     ("F190-the-controls-receipts-vouch-for-the-secret-arm", CEVENTS,
      "        secret_exchanged=arm_exchanged(secret_receipts, sentinel),",
      "        secret_exchanged=arm_exchanged(control_receipts, sentinel),",
-     "...nor does a secret arm that produced plenty of output and never called the tool"),
+     "...and each arm's exchange gate is computed from ITS OWN receipts"),
     # An empty field list from a run with no tool execution says nothing about the fields.
     ("F191-no-execution-reads-as-the-fields-being-absent", CEVENTS,
      "    if not executions:\n        return FIELDS_UNMEASURED, (",
@@ -3250,16 +3250,18 @@ MUTATIONS = [
     # ...and the gate must read the arm it is judging, not the arm beside it — F190's rule,
     # over the witness the same review added.
     ("F220-the-controls-result-vouches-for-the-secret-arm", CEVENTS,
-     "        secret_result=tool_result_state(ev_secret, sentinel))",
-     "        secret_result=tool_result_state(ev_control, sentinel))",
+     "        secret_result=tool_result_state(ev_secret, sentinel,",
+     "        secret_result=tool_result_state(ev_control, sentinel,",
      "...nor one whose call was served and whose RESULT copilot never emitted"),
-    # A RESULT THAT CAME BACK WITHOUT THE VALUE IS NOT A RESULT THAT NEVER CAME BACK. Merging
-    # them is what made the loss case above unreachable, so it gets its own mutation.
-    ("F221-a-result-without-the-value-is-no-result", CEVENTS,
-     "        elif usable_result(data):\n            this = RESULT_CLEAN",
-     "        elif False:\n            this = RESULT_CLEAN",
-     ("...while one whose result came back WITHOUT the value is RESULT_CLEAN — not absent, "
-      "and not unreadable either")),
+    # THE CALLER MUST CONSULT THE PREDICATE, which is a different mutation from breaking either
+    # clause INSIDE it (F228/F229): this one deletes the question rather than an answer, and it
+    # is aimed at an arm neither of those two claims — RE-AIMED after it survived naming the
+    # CLEAN arm, which a mutation that only turns unreadable into clean cannot redden
+    # (mutation run, PR #120).
+    ("F221-the-usability-clause-is-not-consulted", CEVENTS,
+     "    if not usable_result(done[0]):\n        return RESULT_UNREADABLE",
+     "    if False:\n        return RESULT_UNREADABLE",
+     "...but a completion with a NULL result is RESULT_UNREADABLE, never clean"),
     # A NULL STATUS IS STILL AN ENTRY. Filtering the `None` out reads as "not named", which is
     # the same collapse one function earlier.
     ("F223-a-null-status-drops-the-entry", CGATE_REMOTE,
@@ -3302,9 +3304,8 @@ MUTATIONS = [
     # THE STRONGEST READING WINS, NOT THE LAST. A scan that keeps whichever result it saw most
     # recently reports `RESULT_CLEAN` for a run that leaked in an earlier one.
     ("F222-the-last-result-decides-rather-than-the-worst", CEVENTS,
-     ("        if _RESULT_RANK.index(this) > _RESULT_RANK.index(state):\n"
-      "            state = this"),
-     "        if True:\n            state = this",
+     '    if any(sentinel in json.dumps(data.get("result")) for data in done):',
+     '    if sentinel in json.dumps(done[-1].get("result")):',
      "...a clean result AFTER a carrying one does not erase it"),
     # --- PR #120, fifth review round -------------------------------------------------------
     # "A COMPLETION ARRIVED" IS NOT "A RESULT CAME BACK". A failed call carrying no result read
@@ -3329,14 +3330,48 @@ MUTATIONS = [
     # THE READING THAT ACCUSES OUTRANKS THE ONE THAT EXCUSES. Asking about usability first
     # files a failed completion that carries the value as "nothing to inspect".
     ("F231-a-failed-completion-cannot-leak", CEVENTS,
-     '        if sentinel in json.dumps(data.get("result")):\n            this = RESULT_CARRIED',
-     ('        if usable_result(data) and sentinel in json.dumps(data.get("result")):\n'
-      "            this = RESULT_CARRIED"),
+     ('    if any(sentinel in json.dumps(data.get("result")) for data in done):\n'
+      "        return RESULT_CARRIED"),
+     ('    if any(usable_result(data) and sentinel in json.dumps(data.get("result"))\n'
+      "           for data in done):\n        return RESULT_CARRIED"),
      "...while a FAILED completion whose result carries the value is still a leak"),
+    # --- PR #120, sixth review round -------------------------------------------------------
+    # THE `served` ROW AND THE COMPLETION SHARE NO IDENTIFIER, so attribution is established by
+    # cardinality: one marker-bearing reply, one execution, one completion. Each conjunct is a
+    # different way for two calls to be mistaken for one, so each gets its own mutation.
+    ("F233-a-second-marker-bearing-reply-is-still-one-exchange", CEVENTS,
+     "    if len(ids) != 1 or len(done) != 1 or replies != 1:",
+     "    if len(ids) != 1 or len(done) != 1:",
+     ("...a clean result in a run with TWO marker-bearing replies on the fixture's wire is "
+      "UNATTRIBUTED, not clean")),
+    ("F234-a-second-completion-is-still-one-result", CEVENTS,
+     "    if len(ids) != 1 or len(done) != 1 or replies != 1:",
+     "    if len(ids) != 1 or replies != 1:",
+     ("...a clean result in a run with two completions for one execution is UNATTRIBUTED, "
+      "not clean")),
+    ("F235-a-second-execution-is-still-one-call", CEVENTS,
+     "    if len(ids) != 1 or len(done) != 1 or replies != 1:",
+     "    if len(done) != 1 or replies != 1:",
+     ("...a clean result in a run with TWO executions of our tool, one completion is "
+      "UNATTRIBUTED, not clean")),
+    # NOTHING CAME BACK AT ALL IS ITS OWN LOSS, and folding it into the attribution branch
+    # would report a run copilot never answered as one it answered ambiguously.
+    ("F236-a-missing-completion-is-merely-unattributable", CEVENTS,
+     "    if not done:\n        return RESULT_ABSENT",
+     "    if False:\n        return RESULT_ABSENT",
+     "an execution of ours with NO result event at all is RESULT_ABSENT"),
+    # ...and the count must come from the arm being judged — F190/F220's rule, third witness.
+    ("F237-the-controls-reply-count-vouches-for-the-secret-arm", CEVENTS,
+     "                                        replies=marker_replies(secret_receipts)))",
+     "                                        replies=marker_replies(control_receipts)))",
+     "...nor one whose fixture answered TWICE, leaving the clean result unattributable"),
     # ...and which loss it was is the diagnosis on the secret side too.
     ("F232-the-two-secret-losses-read-the-same", CEVENTS,
      ('            + (" emitted no completion for it at all"\n'
       "               if secret_result == RESULT_ABSENT else\n"
+      '               " emitted results this run cannot tie to that reply: the exchange happened more "\n'
+      '               "than once, and the fixture\'s receipts and copilot\'s events share no identifier"\n'
+      "               if secret_result == RESULT_UNATTRIBUTED else\n"
       '               " emitted a completion carrying no result to inspect: the call failed, or the "\n'
       '               "payload was empty")'),
      '            + ""',

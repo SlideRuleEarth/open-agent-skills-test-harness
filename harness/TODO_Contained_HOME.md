@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff AN
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff + shellcheck + a parse under every shell
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 221/221 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 719 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 226/226 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 728 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine
 git diff --check
@@ -2122,6 +2122,40 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   **And `usable_result` fails closed on shape drift** — no `success` field means unreadable,
   not usable — which is only safe because the predicate is pinned to a verbatim 1.0.80 line:
   the refusal shows up as a red §E21 rather than as a probe that quietly stops answering.
+- **A SIXTH ROUND FOUND THE TWO WITNESSES JOINED BY NOTHING BUT BEING IN THE SAME RUN.** The
+  fixture's `served` row proves a reply went out carrying the marker; copilot's
+  `tool.execution_complete` proves a result came back. Five rounds hardened each of those
+  separately and never asked what connects them — and nothing does: `toolCallId` is copilot's,
+  the JSON-RPC id is the transport's, and no field spans the two. In a run where the model
+  called the tool twice, which is what a retry after an error looks like, the reply the
+  receipts prove and the result copilot emitted could be different calls, and `REDACTS` was
+  published off the pair.
+  **Two independent witnesses of one event are not thereby witnesses of the SAME event.**
+  That is the generalisation, and it is not the same as any of the five before it: those were
+  each about one witness being weaker than its claim. This one is about the JOIN. When a
+  conclusion needs two facts from two authors, write down what makes them facts about the same
+  occurrence — and if the answer is "they are both in this run", the conclusion is only as
+  strong as the run containing exactly one occurrence.
+  **Cardinality is a legitimate join when no identifier exists.** One marker-bearing reply, one
+  execution, one completion: in that run the completion cannot belong to anything else, and it
+  needs no field the protocol does not have. It costs the multi-call run, which is now
+  `RESULT_UNATTRIBUTED` rather than measured wrongly — and the alternative that would keep it
+  (a per-call nonce minted by the fixture, carried in the reply, recorded on the row) is
+  written down in the probe rather than left for the next reader to re-derive, because it
+  changes a reply format four probes read and that trade deserves to be visible.
+- **A NEW GATE CAN MAKE AN OLDER MUTATION'S ARM INSENSITIVE, AND THE COUNT STAYS GREEN WHILE
+  IT HAPPENS.** Twice now: `F189` (the version witness must be handed every arm) and `F190`
+  (each arm's exchange gate must read its own receipts) both stopped being killed by the arms
+  named for them — not because either rule weakened, but because a gate added later refuses
+  the same input FIRST. The run still exits 1, so the mutation still "fails", just never
+  through the assertion that encodes its rule. `mutate_mcp.py` reports that distinction
+  (`failed, but NOT via …`) and it is the only reason either was noticed; a suite that merely
+  counted failures would have shown 226/226.
+  **The repair is the same both times: assert the ARGUMENT, not the exit status.** Each rule is
+  about what one call receives — every launched arm, that arm's own receipts — so the arm
+  records the call and reads it, which no downstream gate can absorb. The general form: when a
+  rule is about *what is passed*, an assertion on *what comes out* is only accidentally
+  sensitive to it, and the accident expires the next time the code gets stricter.
 - **A MUTATION AIMED BESIDE ITS CLAUSE SURVIVES, AND THE SECOND ONE IN A ROUND IS THE TELL.**
   `F228` deleted the `success` test in `usable_result` and nothing went red: every arm named
   for it fed input the OTHER clause rejects anyway — `{"success": false}` carries no payload,

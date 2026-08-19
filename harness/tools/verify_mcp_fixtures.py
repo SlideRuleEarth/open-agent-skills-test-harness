@@ -4620,6 +4620,12 @@ try:
     # writes, and the run has `--allow-all`. A diagnostic echo satisfies it with no tool reply
     # having travelled. The result event carries no tool name — only `toolCallId` — so
     # attribution runs through the id copilot minted on the start event.
+    def _result_state(stream, sentinel, *, replies=1):
+        """One arm's reading. `replies` is how many marker-bearing replies its fixture put on
+        the wire — 1 unless an arm is about the attribution rule, which is the point of
+        naming it here rather than defaulting it out of sight."""
+        return EV.tool_result_state(EV.parse_events(stream), sentinel, replies=replies)
+
     _cid = "toolu_probe_01"
     _start = json.dumps({"type": "tool.execution_start", "data": {
         "toolCallId": _cid, "toolName": f"{EV.CONFIG_KEY}-{EV.TOOL}",
@@ -4629,16 +4635,16 @@ try:
         "result": {"content": f"{_sent}:HELLO",
                    "contents": [{"type": "text", "text": f"{_sent}:HELLO"}]}}}) + "\n"
     check("a result correlated to OUR execution, carrying the sentinel, is RESULT_CARRIED",
-          EV.tool_result_state(EV.parse_events(_start + _done), _sent) == EV.RESULT_CARRIED,
+          _result_state((_start + _done), _sent) == EV.RESULT_CARRIED,
           "attributed")
     # THE DISTINGUISHING CASE: the value is in the stream, and not by the route claimed.
     _echoed = json.dumps({"type": "assistant.message", "data": {
         "content": f"your config says ECHO_MCP_IDENTITY={_sent}"}}) + "\n"
     check("...but the sentinel merely APPEARING in the stream is not our tool's result",
-          EV.tool_result_state(EV.parse_events(_echoed), _sent) == EV.RESULT_ABSENT,
+          _result_state((_echoed), _sent) == EV.RESULT_ABSENT,
           "an echoed config is not a tool reply")
     check("...nor is a result belonging to SOMEBODY ELSE'S tool call",
-          EV.tool_result_state(EV.parse_events(
+          _result_state((
               json.dumps({"type": "tool.execution_start", "data": {
                   "toolCallId": "other", "toolName": "shell"}}) + "\n"
               + json.dumps({"type": "tool.execution_complete", "data": {
@@ -4654,16 +4660,17 @@ try:
         "toolCallId": _cid, "success": True,
         "result": {"content": "[REDACTED]:HELLO"}}}) + "\n"
     check("an execution of ours with NO result event at all is RESULT_ABSENT",
-          EV.tool_result_state(EV.parse_events(_start), _sent) == EV.RESULT_ABSENT,
+          _result_state((_start), _sent) == EV.RESULT_ABSENT,
           "nothing came back")
     check("...while one whose result came back WITHOUT the value is RESULT_CLEAN — not absent, "
           "and not unreadable either",
-          EV.tool_result_state(EV.parse_events(_start + _done_clean), _sent) == EV.RESULT_CLEAN,
+          _result_state((_start + _done_clean), _sent) == EV.RESULT_CLEAN,
           "the loss cases are different facts")
-    check("...and the four states really are four words, or those distinctions are cosmetic",
-          len({EV.RESULT_CARRIED, EV.RESULT_CLEAN, EV.RESULT_UNREADABLE,
-               EV.RESULT_ABSENT}) == 4,
-          (EV.RESULT_CARRIED, EV.RESULT_CLEAN, EV.RESULT_UNREADABLE, EV.RESULT_ABSENT))
+    check("...and the five states really are five words, or those distinctions are cosmetic",
+          len({EV.RESULT_CARRIED, EV.RESULT_CLEAN, EV.RESULT_UNATTRIBUTED,
+               EV.RESULT_UNREADABLE, EV.RESULT_ABSENT}) == 5,
+          (EV.RESULT_CARRIED, EV.RESULT_CLEAN, EV.RESULT_UNATTRIBUTED, EV.RESULT_UNREADABLE,
+           EV.RESULT_ABSENT))
     # THE ARM THE REVIEW ADDED, and the case the clean arm above could not reach: it always
     # supplies a payload. "A completion arrived" was being read as "a result came back", so a
     # FAILED call carrying no result at all was `RESULT_CLEAN` and `REDACTS` was published from
@@ -4695,7 +4702,7 @@ try:
                                   "result": {"content": "hi"}}}) + "\n",
              "no `success` key — shape drift, which fails CLOSED")):
         check(f"...but a completion with {_why} is RESULT_UNREADABLE, never clean",
-              EV.tool_result_state(EV.parse_events(_start + _bad), _sent)
+              _result_state((_start + _bad), _sent)
               == EV.RESULT_UNREADABLE, _bad)
     # THE LEAK TEST OUTRANKS THE USABILITY TEST, and that ordering is the whole content of the
     # rule: a completion carrying the value is a leak whether or not the call it reports
@@ -4705,17 +4712,43 @@ try:
         "toolCallId": _cid, "success": False,
         "result": {"content": f"error: upstream said {_sent}"}}}) + "\n"
     check("...while a FAILED completion whose result carries the value is still a leak",
-          EV.tool_result_state(EV.parse_events(_start + _done_failed_leak), _sent)
+          _result_state((_start + _done_failed_leak), _sent)
           == EV.RESULT_CARRIED, "the reading that accuses outranks the one that excuses")
-    # THE RANK IS A LADDER, not a last-write-wins scan, in both directions.
     _done_bad = json.dumps({"type": "tool.execution_complete",
                             "data": {"toolCallId": _cid, "success": False}}) + "\n"
-    check("...an unreadable completion AFTER a usable one does not demote the reading",
-          EV.tool_result_state(EV.parse_events(_start + _done_clean + _done_bad), _sent)
-          == EV.RESULT_CLEAN, "strongest evidence wins, in either order")
-    check("...and a usable one after an unreadable one promotes it",
-          EV.tool_result_state(EV.parse_events(_start + _done_bad + _done_clean), _sent)
-          == EV.RESULT_CLEAN, "order does not decide it")
+    # THE ARM THE REVIEW ADDED, and the one the whole state exists for. The fixture's `served`
+    # row and copilot's completion share NO identifier — `toolCallId` is copilot's, the
+    # JSON-RPC id is the transport's — so in a run where the model called the tool twice, the
+    # marker-bearing reply the receipts prove and the clean result copilot emitted could be
+    # two different calls, and REDACTS was published off the pair. Attribution is established
+    # by cardinality instead: one reply, one execution, one completion, or no answer.
+    _start_b = json.dumps({"type": "tool.execution_start", "data": {
+        "toolCallId": "toolu_probe_02", "toolName": f"{EV.CONFIG_KEY}-{EV.TOOL}",
+        "mcpServerName": EV.CONFIG_KEY, "mcpToolName": EV.TOOL}}) + "\n"
+    _done_b_clean = json.dumps({"type": "tool.execution_complete", "data": {
+        "toolCallId": "toolu_probe_02", "success": True,
+        "result": {"content": "[REDACTED]:HELLO"}}}) + "\n"
+    for _stream, _reps, _why in (
+            (_start + _start_b + _done_b_clean, 1, "TWO executions of our tool, one completion"),
+            (_start + _done_clean + _done_bad, 1, "two completions for one execution"),
+            (_start + _done_clean, 2, "TWO marker-bearing replies on the fixture's wire")):
+        check(f"...a clean result in a run with {_why} is UNATTRIBUTED, not clean",
+              _result_state(_stream, _sent, replies=_reps) == EV.RESULT_UNATTRIBUTED, _why)
+    check("...and NO marker-bearing reply at all cannot attribute one either",
+          _result_state((_start + _done_clean), _sent, replies=0) == EV.RESULT_UNATTRIBUTED,
+          "a result belonging to a reply that never carried the marker proves nothing")
+    check("...while the single-exchange run this probe actually measures still reads CLEAN",
+          _result_state((_start + _done_clean), _sent, replies=1) == EV.RESULT_CLEAN,
+          "or the clause above has simply switched the measurement off")
+    # ...AND THE LEAK OUTRANKS ATTRIBUTION TOO. Which call carried the value does not weaken
+    # the claim that it CAN travel this route, which is all the control asserts.
+    check("...but a leak in an unattributable run is still a leak",
+          _result_state((_start + _start_b + _done + _done_b_clean), _sent, replies=2)
+          == EV.RESULT_CARRIED, "the accusing reading outranks attribution as well")
+    check("`marker_replies` counts the fixture rows that clause is read from",
+          EV.marker_replies(_rows_full) == 1 and EV.marker_replies(_rows_full + _rows_full) == 2
+          and EV.marker_replies(_rows_nomarker) == 0 and EV.marker_replies([]) == 0,
+          (EV.marker_replies(_rows_full), EV.marker_replies(_rows_nomarker)))
     # PINNED TO THE MEASURED SHAPE, §4's duplicated-rule rule: `usable_result` encodes what
     # 1.0.80 emits, and the pinned line is the original it must agree with. A build that stops
     # sending `success` or renames `result` reddens here rather than silently reclassifying
@@ -4731,15 +4764,15 @@ try:
     # let a later clean result overwrite an earlier carrying one — a scan that keeps the LAST
     # answer instead of the strongest reports `RESULT_CLEAN` for a run that leaked.
     check("...a clean result AFTER a carrying one does not erase it",
-          EV.tool_result_state(EV.parse_events(_start + _done + _done_clean), _sent)
+          _result_state((_start + _done + _done_clean), _sent)
           == EV.RESULT_CARRIED, "the strongest reading wins, not the last")
     # THE REAL PAIR, which is what makes the synthetic arms above more than shape agreement:
     # copilot's own start and complete events from one run, correlated by the id it minted.
     check("the REAL start/complete pair correlates, and the result carries the run's marker",
-          EV.tool_result_state(EV.parse_events(_real_exec + "\n" + _real_done), _pinned_sent)
+          _result_state((_real_exec + "\n" + _real_done), _pinned_sent)
           == EV.RESULT_CARRIED, "the pinned run, end to end")
     check("...and the complete event ALONE is ABSENT, since it names no tool",
-          EV.tool_result_state(EV.parse_events(_real_done), _pinned_sent) == EV.RESULT_ABSENT,
+          _result_state((_real_done), _pinned_sent) == EV.RESULT_ABSENT,
           "the correlation is doing the work, not a substring search")
 
     # -- secret_verdict: every gate, and each one reproduced ---------------------------------
@@ -4793,6 +4826,15 @@ try:
                             **dict(_ok, secret_result=EV.RESULT_UNREADABLE))[0]
           == EV.SECRET_ARM_INCOMPLETE,
           "a completion is not a result")
+    check("...nor can one whose results cannot be tied to the marker-bearing reply",
+          EV.secret_verdict("nothing here", _sent,
+                            **dict(_ok, secret_result=EV.RESULT_UNATTRIBUTED))[0]
+          == EV.SECRET_ARM_INCOMPLETE,
+          "a result from some other call is not that reply coming back")
+    check("...with its own reason, distinct from the other two secret losses",
+          len({EV.secret_verdict("nothing here", _sent, **dict(_ok, secret_result=st))[1]
+               for st in (EV.RESULT_ABSENT, EV.RESULT_UNATTRIBUTED, EV.RESULT_UNREADABLE)}) == 3,
+          "three losses, three sentences")
     check("...and those two secret losses are told apart in the reason, not merged",
           EV.secret_verdict("nothing here", _sent,
                             **dict(_ok, secret_result=EV.RESULT_UNREADABLE))[1]
@@ -4916,6 +4958,8 @@ try:
         if _mode[0] == "bad_result":       # a completion arrived carrying nothing to inspect
             return stem + json.dumps({"type": "tool.execution_complete", "data": {
                 "toolCallId": _cid, "success": False}}) + "\n", rows
+        if _mode[0] == "retry":            # the tool was answered TWICE with the marker
+            return stream, rows + [dict(rows[-1])]
         if _mode[0] == "empty":            # the arm vanished: no stream, no receipts
             return "", []
         if _mode[0] == "stream_lost":      # it ran and served, but its stream never arrived
@@ -4960,6 +5004,23 @@ try:
         _mode[0] = "no_call"
         check("...nor does a secret arm that produced plenty of output and never called the tool",
               EV.main() == 1, "the absence of the call is not the absence of the value")
+        # THE EXCHANGE GATE MUST READ THE ARM IT IS JUDGING, and the exit status stopped being
+        # able to say so: an arm with no receipts now fails the ATTRIBUTION clause as well, so
+        # a gate wired to the control's receipts still exits 1 — for a reason the swap does not
+        # touch (mutation run, PR #120). Read the ARGUMENT instead, the repair `F189` needed
+        # for the same reason: a stronger gate downstream makes an older gate's arm insensitive.
+        _args = []
+        _real_verdict = EV.secret_verdict
+        try:
+            EV.secret_verdict = lambda *a, **k: (_args.append(k), _real_verdict(*a, **k))[1]
+            _mode[0] = "no_call"
+            EV.main()
+        finally:
+            EV.secret_verdict = _real_verdict
+        check("...and each arm's exchange gate is computed from ITS OWN receipts",
+              len(_args) == 1 and _args[0]["secret_exchanged"] is False
+              and _args[0]["control_exchanged"] is True,
+              _args)
         _mode[0] = "stream_lost"
         check("...nor one that served the call but whose stream carries no version witness",
               EV.main() == 1, "an arm with no in-band build is not accounted for")
@@ -4977,6 +5038,13 @@ try:
         _mode[0] = "bad_result"
         check("...nor one whose completion arrived carrying no result to inspect",
               EV.main() == 1, "a completion is not a result")
+        # THE MODE THE REVIEW ADDED. Everything the receipts and the stream say is real here —
+        # the fixture answered with the marker, copilot emitted a clean result — and they
+        # still cannot be tied to each other: the tool was answered TWICE and nothing on the
+        # wire says which reply that result came back from.
+        _mode[0] = "retry"
+        check("...nor one whose fixture answered TWICE, leaving the clean result unattributable",
+              EV.main() == 1, "one reply, one completion, or no answer")
     finally:
         EV.run_arm, tempfile.tempdir = _real_arm, _saved_tmpdir
 

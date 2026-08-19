@@ -294,10 +294,11 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
    prove the reply went **out** carrying the value; only copilot's result event says anything came
    **back**, and that witness was still being asked of the control alone. A secret arm with an execution
    and no completion event — killed mid-call, or one whose result copilot never emitted — certified
-   `REDACTS` from an output that was never produced. Each arm's result is now read in four states
-   (`RESULT_CARRIED` / `RESULT_CLEAN` / `RESULT_UNREADABLE` / `RESULT_ABSENT`), because *came back
-   without the value*, *arrived with nothing in it* and *never arrived* are three different facts and a
-   boolean had made them one `False`. The reading is also sharper for it: the redaction is localized to
+   `REDACTS` from an output that was never produced. Each arm's result is now read as one of five
+   `RESULT_*` states, because *came back without the value*, *arrived with nothing in it*, *cannot be
+   tied to the marker-bearing reply* and *never arrived* are four different facts and a boolean had made
+   them one `False`. The gate is membership in `INSPECTABLE_RESULTS`, so each state added since has
+   needed no call site changed. The reading is also sharper for it: the redaction is localized to
    the tool result rather than to the output at large.
    **A fifth round found the third of those still merged into the second**: `RESULT_CLEAN` was assigned
    to any correlated completion, so a failed one carrying no result read as clean. `usable_result`

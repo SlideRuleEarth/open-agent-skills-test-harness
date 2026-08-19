@@ -106,24 +106,22 @@ CONTROL_FAILED = "CONTROL_FAILED"    # the control's own tool RESULT never carri
 CONTROL_INCOMPLETE = "CONTROL_INCOMPLETE"         # the control never ran the exchange either
 SECRET_ARM_INCOMPLETE = "SECRET_ARM_INCOMPLETE"   # the arm under the flag never made the call
 
-# What became of OUR tool's result in one arm's stream. THREE STATES, BECAUSE TWO OF THEM WERE
-# ONE BOOLEAN: "the result came back without the value" and "no result of ours came back at
-# all" are different facts, and only the first is evidence about redaction (review, PR #120).
+# What became of OUR tool's result in one arm's stream. ONE WORD PER WAY OF NOT HAVING THE
+# VALUE BACK, and the list grew one word per review round because each round found two of them
+# sharing an answer (PR #120). Read the comment on each: they are not degrees of the same
+# thing, they are different facts, and only the first two are evidence about redaction.
 RESULT_CARRIED = "RESULT_CARRIED"    # a result of our tool reached the output, WITH the value
-RESULT_CLEAN = "RESULT_CLEAN"        # a USABLE result reached the output, and it lacked the value
+RESULT_CLEAN = "RESULT_CLEAN"        # THE marker-bearing reply's own result, and it lacked it
+RESULT_UNATTRIBUTED = "RESULT_UNATTRIBUTED"   # results came back; not tied to that reply
 RESULT_UNREADABLE = "RESULT_UNREADABLE"   # a completion arrived carrying no result to inspect
 RESULT_ABSENT = "RESULT_ABSENT"      # no completion for our tool reached the output at all
 
 # The states in which something came back that a redaction claim can be ABOUT. Named, and
 # tested against by membership, because this is the predicate every reader of "did anything
 # come back" must consult: the first version tested `== RESULT_ABSENT` at one call site, and a
-# fourth state added later would have gone on reading as inspectable there (§4's rule).
+# later state would have gone on reading as inspectable there (§4's rule). `RESULT_UNATTRIBUTED`
+# is what that rule bought — it was added after this predicate and needed no call site changed.
 INSPECTABLE_RESULTS = (RESULT_CARRIED, RESULT_CLEAN)
-
-# Strongest evidence first, weakest last — the order `tool_result_state` resolves several
-# completions by. A leak once observed is not erased by a later clean result; a usable result
-# that lacked the value is evidence an unusable sibling does not erase; absence is the floor.
-_RESULT_RANK = (RESULT_ABSENT, RESULT_UNREADABLE, RESULT_CLEAN, RESULT_CARRIED)
 
 # Question 2 is "which spelling AND what status", so the status needs a verdict of its own.
 STATUS_MEASURED = "STATUS_MEASURED"          # a real status, from an arm proven to have served
@@ -433,8 +431,22 @@ def usable_result(data: dict) -> bool:
     return isinstance(result, (dict, list, str)) and bool(result)
 
 
-def tool_result_state(events: list[dict], sentinel: str) -> str:
-    """Whether a RESULT of one of OUR tool's executions reached the output, and what it carried.
+def marker_replies(records: list[dict]) -> int:
+    """How many replies THIS arm's fixture put on the wire carrying this run's marker.
+
+    A COUNT, NOT A BOOLEAN, because the count is what decides whether a result can be
+    attributed to a reply at all (review, PR #120). `answered_with_marker` asks whether the
+    exchange happened, which "at least one" answers correctly; `tool_result_state` asks what
+    became of *the* marker-bearing reply, and that question has no answer in a run containing
+    two of them.
+    """
+    return sum(1 for r in records
+               if r.get("kind") == "served" and r.get("method") == "tools/call"
+               and r.get("tool") == TOOL and r.get("carried_identity") is True)
+
+
+def tool_result_state(events: list[dict], sentinel: str, *, replies: int) -> str:
+    """What became of the marker-bearing reply once copilot had it.
 
     ATTRIBUTED, NOT SEARCHED. "The sentinel appears somewhere in this arm's stream" is a weaker
     fact than it looks: the marker is also in an env var and in the config file this probe
@@ -443,51 +455,59 @@ def tool_result_state(events: list[dict], sentinel: str) -> str:
     the secret arm's absence says nothing about (review, PR #120). This asks the narrower
     question the verdict actually claims: did the value come back *in our tool's result*.
 
-    FOUR STATES, EACH A DIFFERENT WAY OF NOT HAVING THE VALUE BACK, and the vocabulary grew
-    one word per review round (PR #120). A boolean first made "our tool's result carried no
-    sentinel" and "our tool's result never appeared" indistinguishable, and the secret arm read
-    the pair of them as redaction: a run whose reply the fixture wrote and copilot never
-    emitted certified `REDACTS` on the strength of an output that was never produced. Splitting
-    those two left the same hole one field in — `RESULT_CLEAN` was assigned to any correlated
-    completion, so a FAILED one carrying no result at all was "clean", and the value was absent
-    from a payload that did not exist. `usable_result` below is the clause that decides it.
+    ONE WORD PER WAY OF NOT HAVING THE VALUE BACK, and the list grew one word per review round
+    because each round found two of them sharing an answer. A boolean first made "the result
+    came back without the value" and "the result never came back" the same `False`. Splitting
+    those left `RESULT_CLEAN` assigned to any correlated completion, so a FAILED one carrying
+    no result at all was "clean" — `usable_result` decides that. And splitting THAT left the
+    reply and the result joined by nothing but both being in the same run.
 
-    The fixture's receipts prove the value went ONTO the wire; only this says whether anything
-    came back OFF it, and only `RESULT_CARRIED`/`RESULT_CLEAN` say something came back that a
-    redaction claim can be about — which is what `INSPECTABLE_RESULTS` names.
+    THE ATTRIBUTION CLAUSE, WHICH IS THE ONE THIS DOCSTRING EXISTS FOR. The fixture's `served`
+    row and copilot's `tool.execution_complete` share no identifier: copilot mints `toolCallId`
+    for itself and the MCP request carries a JSON-RPC id of its own, so nothing on the wire
+    ties one to the other. In a run where the model called the tool twice — a retry after an
+    error is the ordinary way — `answered_with_marker` was satisfied by one call and the clean
+    result could come from the OTHER, and `REDACTS` was published without anything showing that
+    the reply carrying the marker is the reply that came back stripped of it.
 
-    Searched over the SERIALIZED result rather than one field, because 1.0.80 renders the same
-    text under `content`, `detailedContent` and `contents[].text`, and pinning one spelling
-    would go quiet on a rendering change while the value sat plainly in the other two.
+    So attribution is established by CARDINALITY rather than by an identifier: exactly one
+    marker-bearing reply, exactly one execution of our tool, exactly one completion for it. In
+    that run the completion cannot belong to anything else, and the proof needs no field the
+    protocol does not have. In any other run the answer is `RESULT_UNATTRIBUTED`, which
+    `INSPECTABLE_RESULTS` already refuses — the payoff of putting that predicate in one place.
 
-    The structural clause is `ids`: with no execution of our tool there is no result of ours to
-    read, and every `tool.execution_complete` in the stream belongs to something else — which
-    is `RESULT_ABSENT`, never `RESULT_CLEAN`.
+    THE COST, STATED: a run where the model calls the tool more than once is no longer
+    measured, where before it was measured wrongly. Every live run of this probe has been a
+    single exchange, and refusing the ambiguous one is the direction this file errs in
+    everywhere else. The alternative — a per-call nonce minted by the fixture, carried in the
+    reply and recorded on the `served` row — would measure those runs too, and it was not taken
+    here because it changes a reply format four other probes read. If multi-call runs ever need
+    measuring, that is the way, and this comment is the note to whoever needs it.
+
+    THE LEAK TEST COMES FIRST, AND NOT BY ACCIDENT — before attribution as well as before
+    usability. A completion carrying the value is a leak whichever call it belongs to and
+    whether or not that call succeeded, so `RESULT_CARRIED` is decided over every correlated
+    completion. The reading that ACCUSES outranks the ones that excuse; the same asymmetry as
+    the gating probe's naming-before-taint. It is also what keeps the control honest in a
+    multi-call run: the control's claim is that the value CAN travel this route, and which call
+    carried it does not weaken that.
     """
     ids = mcp_call_ids(events)
     if not ids:
         return RESULT_ABSENT
-    state = RESULT_ABSENT
-    for obj in events:
-        if obj.get("type") != "tool.execution_complete":
-            continue
-        data = obj.get("data")
-        if not isinstance(data, dict) or data.get("toolCallId") not in ids:
-            continue
-        # THE LEAK TEST COMES FIRST, AND NOT BY ACCIDENT. A completion that carries the value
-        # is a leak whether or not the call it reports succeeded, and asking about usability
-        # first would file that as "nothing to inspect" — suppressing the alarming verdict on
-        # the strength of a flag set by the process under test. Same asymmetry as the gating
-        # probe's naming-before-taint: the reading that ACCUSES outranks the one that excuses.
-        if sentinel in json.dumps(data.get("result")):
-            this = RESULT_CARRIED
-        elif usable_result(data):
-            this = RESULT_CLEAN
-        else:
-            this = RESULT_UNREADABLE
-        if _RESULT_RANK.index(this) > _RESULT_RANK.index(state):
-            state = this
-    return state
+    done = [obj.get("data") for obj in events
+            if obj.get("type") == "tool.execution_complete"
+            and isinstance(obj.get("data"), dict)
+            and obj["data"].get("toolCallId") in ids]
+    if not done:
+        return RESULT_ABSENT
+    if any(sentinel in json.dumps(data.get("result")) for data in done):
+        return RESULT_CARRIED
+    if len(ids) != 1 or len(done) != 1 or replies != 1:
+        return RESULT_UNATTRIBUTED
+    if not usable_result(done[0]):
+        return RESULT_UNREADABLE
+    return RESULT_CLEAN
 
 
 def healthy_status_verdict(status: str | None, *, served: bool) -> tuple[str, str]:
@@ -667,11 +687,15 @@ def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool
     an execution and no completion event — killed mid-call, or one whose result copilot never
     emitted — has nothing to redact and nothing to have redacted, and it read as `REDACTS`.
 
-    So the secret arm's result is read in three states rather than searched for a substring.
-    `RESULT_ABSENT` is incomplete: no output to judge. `RESULT_CARRIED` and a sentinel anywhere
-    else in the stream are both `NO_REDACTION` — the flag is a claim about the OUTPUT, so the
-    route the value leaked by is diagnosis, not a different verdict. Only a result that came
-    back without it, in an arm whose fixture proved it went out with it, is redaction.
+    So the secret arm's result is read as one of the `RESULT_*` states rather than searched for
+    a substring, and the gate is membership in `INSPECTABLE_RESULTS` rather than equality with
+    any one of them — that list is where "did anything come back that this claim can be about"
+    lives, and every state added since has needed no change here. Everything outside it is
+    `SECRET_ARM_INCOMPLETE`: no completion at all, one carrying nothing to read, or results that
+    cannot be tied to the marker-bearing reply. `RESULT_CARRIED` and a sentinel anywhere else in
+    the stream are both `NO_REDACTION` — the flag is a claim about the OUTPUT, so the route the
+    value leaked by is diagnosis, not a different verdict. Only the marker-bearing reply's own
+    result, coming back without the value, is redaction.
     """
     if not control_exchanged:
         return CONTROL_INCOMPLETE, ("the control arm never completed the exchange either — its "
@@ -699,6 +723,9 @@ def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool
             "the arm under --secret-env-vars answered our tool and then"
             + (" emitted no completion for it at all"
                if secret_result == RESULT_ABSENT else
+               " emitted results this run cannot tie to that reply: the exchange happened more "
+               "than once, and the fixture's receipts and copilot's events share no identifier"
+               if secret_result == RESULT_UNATTRIBUTED else
                " emitted a completion carrying no result to inspect: the call failed, or the "
                "payload was empty")
             + ", so nothing came back to be redacted — the fixture proves the value went onto "
@@ -853,9 +880,11 @@ def main() -> int:
     verdict, why = secret_verdict(
         secret, sentinel,
         control_exchanged=control_exchanged,
-        control_result=tool_result_state(ev_control, sentinel),
+        control_result=tool_result_state(ev_control, sentinel,
+                                         replies=marker_replies(control_receipts)),
         secret_exchanged=arm_exchanged(secret_receipts, sentinel),
-        secret_result=tool_result_state(ev_secret, sentinel))
+        secret_result=tool_result_state(ev_secret, sentinel,
+                                        replies=marker_replies(secret_receipts)))
 
     print(f"version            : {version} ({'usable' if version_ok else 'UNVERIFIED'})")
     print(f"servers (control)  : {seen or '(none)'}")
@@ -873,7 +902,8 @@ def main() -> int:
         print(f"   {label} receipts: arrived={requested_tool(rows)} "
               f"answered_with_marker={answered_with_marker(rows)} "
               f"server_held_marker={held_sentinel(rows, sentinel)} "
-              f"tool_result={tool_result_state(evs, sentinel)}")
+              f"marker_replies={marker_replies(rows)} "
+              f"tool_result={tool_result_state(evs, sentinel, replies=marker_replies(rows))}")
 
     # THE FOOTER PROMISED A DIRECTORY AND NOTHING WAS EVER PUT IN IT. These readings are the
     # slice's deliverable and they get quoted into a design document, so the stream they came
