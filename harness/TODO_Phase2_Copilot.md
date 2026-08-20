@@ -18,7 +18,7 @@ Read §2 (copilot), §5.2, §5.3 and §8 before changing anything. Counts live o
 
 ## 0. STATUS — where the build is, and what is next
 
-**Read this first; it is deliberately four facts and a set of pointers.** Everything it would
+**Read this first; it is deliberately a short list of facts and a set of pointers.** Everything it would
 otherwise restate — the PR table, the slice contents, the status vocabulary, the counts — lives
 once, further down or in `TODO_Contained_HOME.md` §4. A status block that copies them is a second
 place for them to be wrong.
@@ -28,11 +28,11 @@ place for them to be wrong.
 2. **No production code has been written for slices 2–4.** Nothing is in flight.
 3. **The next change is PR 0**, which is not part of any slice — see §3's table for what it is and
    why it goes first.
-4. **One decision is still open, and it blocks exactly one thing**: whether the serialized health
-   field means *first-bad* or *final*, given that claude and copilot answer it differently for their
-   own event shapes. §3's slice 2 states it. It blocks **slice 2's reducer** and nothing else — PR 0
-   and PR 1 do not touch that field — and it must be **settled before the reducer is written**,
-   rather than discovered while writing it.
+4. **No decision is open.** The last one — what the serialized health field means, given that
+   claude and copilot answer it differently for their own event shapes — was settled on 2026-08-20,
+   and it is neither of the two candidates that were on the table: health is a **conjunction over
+   every status observed**, with measured transients excluded. §3's slice 2, under "Which status
+   wins", has the rule and what it changes (claude: nothing). Slice 2's reducer is unblocked.
 
 The build order, the packaging, and the reasoning behind both are §3. `DESIGN_MCP_Support.md` stays
 authoritative for every fact either of them rests on.
@@ -534,13 +534,16 @@ from **one** reducer over the stream rather than each walking it:
 
 1. the contract violation, if any, and whether the witness existed at all;
 2. the servers **ever observed non-inert** — the hermeticity reduction;
-3. **every** server's **final** status — the health reduction;
+3. **every** status observed for each server, in order — the health reduction reads them all, and
+   *which* reading it performs is settled under "Which status wins" below: a conjunction, not a
+   lookup on the first or the last;
 4. validated plugin attribution, for diagnostics only.
 
 (2) and (3) are different reductions of the same sequence and neither substitutes for the other. The
 current `note()` only ever ADDS to `live`, so an inert status never clears a name recorded live
-earlier — correct for (2), wrong for (3), where a declared server whose last status is `disabled` is
-not healthy. `live[name]` today is the last **non-inert** status, which is not the last status.
+earlier — correct for (2), and unusable for (3), which needs every observation rather than a
+survivor. `live[name]` today is the last **non-inert** status, which is neither the last status nor
+the sequence.
 `_fmt_live` also hands back `"name (status)"` strings, so there is no structured map for the
 reporting side to build `(name, status)` pairs from; the reducer is what supplies it.
 
@@ -555,9 +558,9 @@ is that the spelling exists. It does not establish what the runtime does when it
 | status | evidence | safety (ever non-inert) | declared-server health |
 |---|---|---|---|
 | `connected` | observed 1.0.80 | non-inert | healthy |
-| `pending` | observed 1.0.80 | non-inert | **not** healthy — a transient; final `pending` is an incomplete start |
+| `pending` | observed 1.0.80 | non-inert | **transient** — excluded from the conjunction; a run with nothing else observed is unknown, an incomplete start |
 | `failed` | observed 1.0.80 | non-inert | unhealthy |
-| `disabled` | observed 1.0.80 | inert | unhealthy if final for a DECLARED server |
+| `disabled` | observed 1.0.80 | inert | unhealthy for a DECLARED server — inert on safety is not transient on health |
 | `needs-auth` | bundle enum only | **non-inert** | **unknown**, never healthy |
 | `not_configured` | bundle enum only | **non-inert** | **unknown**, never healthy |
 | anything else | — | **non-inert** (fail closed) | **unknown**, never healthy |
@@ -605,19 +608,57 @@ that way: its witness contract *requires* an undeclared entry, the built-in sent
 reported `disabled`. So "ever non-inert" is not copilot relaxing claude's rule, it is the same rule
 under a stream that always contains one inert entry by construction.
 
-*Which status wins.* Claude keeps the **first non-`connected`** status it sees — `statuses[name]` is
-overwritten only while it still reads `connected` — so a later good reading cannot erase an earlier
-bad one across claude's repeated `init` events. The decision above for copilot is the **final**
-status, which is required by copilot's stream, where the healthy path is literally
-`pending → connected` and first-wins would call every healthy server unhealthy. Both rules are right
-for their own event shape. What is **not** settled is what the serialized field then MEANS. No
-comparison crosses adapters — `_consistency` runs within one — so nothing computes a wrong verdict.
-The exposure is a reader's: `mcp_servers_witnessed` and `mcp_server_states` appear under those names
-in every run record and `summary.json`, and they would mean *first-bad* on one adapter and *final*
-on the other, with nothing in the record saying which. A copilot server going `failed → connected`
-would publish healthy where a claude server on the same trajectory publishes failed. Raised
-2026-08-20, rationale corrected in the same review; **decide before slice 2 writes the reducer**,
-since the answer is a property of the serialized field rather than of either adapter.
+*Which status wins* — **SETTLED 2026-08-20, and neither of the two candidates won.**
+
+The question was: claude keeps the **first non-`connected`** status it sees (`statuses[name]` is
+overwritten only while it still reads `connected`), so a later good reading cannot erase an earlier
+bad one; copilot cannot use that rule, because its healthy path is literally `pending → connected`
+and first-wins would call every healthy server unhealthy. `mcp_servers_witnessed` and
+`mcp_server_states` are published under those names in every run record and `summary.json`, so the
+same field would have meant *first-bad* on one adapter and *final* on the other with nothing in the
+record saying which.
+
+**Both candidates are lookups on one element of a sequence, and that is the defect they share.**
+`TODO_Contained_HOME.md` §4 already states it for a different field: a verdict over several facts is
+a **conjunction over every fact**, never a lookup on whichever arrived last. First-bad and final are
+the *first* and *last* lookup; the health of a server that was observed twice is a statement about
+both observations.
+
+So the rule is neither, and it is one rule for both adapters:
+
+> A server's health is a **conjunction over every status observed for it**, with statuses that are
+> *not yet a health claim* excluded from the conjunction — never a lookup on one element. It is
+> **healthy** iff every status observed and not excluded was `connected`; **unknown** iff none was;
+> and otherwise the serialized word is the **first observed status that was not `connected` and not
+> excluded**, which is the reading that names *why* rather than merely *unhealthy*.
+
+**The excluded set is per-adapter, measured, and closed — and it is NOT `_INERT_MCP_STATUSES`.**
+Inertness is a **safety** property (*this server never came up*, so it cannot be a leak); transience
+is a **health** property (*this is not yet a health claim*). A word's membership in one says nothing
+about its membership in the other, and `pending` is the proof: **non-inert** on the safety axis (a
+spawned process is a spawned process, fail closed) and **transient** on the health axis (it is the
+measured precursor to `connected`). They are two sets over one vocabulary, and merging them would
+make `disabled` — inert, and a real health answer for a declared server — disappear from the health
+verdict.
+
+The transient set takes the same conservative rule as the inert one, for the same reason: **a word
+is transient only where that has been measured**, since assuming transience is fail-open on health.
+So it is `{pending}` for copilot, measured at 1.0.80, and **empty for claude**, where no `pending`
+has ever been observed and this repo enumerates no claude status vocabulary at all.
+
+**What it changes.** Claude: **nothing**. With an empty transient set the rule reduces exactly to
+first-non-`connected`-sticks, which is what `adapters/claude.py` already does — so no claude value
+published today moves, and that is a property of the rule rather than a coincidence to be re-checked
+later. Copilot: `pending → connected` publishes `connected`, a truncated run ending at `pending`
+publishes **unknown** (matching this section's table, where `pending` with nothing else observed is
+an incomplete start), and `failed → connected` publishes `failed`.
+
+**This supersedes the "final status" half of the health reduction agreed earlier in this section.**
+Final was shorthand for *`pending` must not win*, and the accurate requirement is narrower than it:
+transience, not recency. The two differ on exactly one trajectory — a server that was broken and
+recovered — and the conjunction is right there. That cell did not run against the same tool surface
+throughout, which is the entire question `_consistency` exists to answer, and *final* would report it
+as though it had.
 
 **Plugin attribution is diagnostic only.** `mcp_servers_witnessed` stays `(name, status)` across
 adapters — but not for the reason an earlier revision of this line gave. `_consistency` compares
