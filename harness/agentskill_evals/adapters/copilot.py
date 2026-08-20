@@ -1674,9 +1674,18 @@ class CopilotAdapter(Adapter):
                               ".copilot/agents": None,
                               ".copilot/config.json": _sanitized_copilot_config,
                               ".copilot/settings.json": _sanitized_copilot_config}
-    # No flag disables copilot's plugin-declared MCP servers, and their names live inside
-    # plugin definitions the harness cannot enumerate — so the argv disables above cannot be
-    # AIMED at that channel and the masks are what closes it. That makes the whole MCP-off
+    # `--disable-mcp-server` DOES reach a plugin-declared server — MEASURED 1.0.80,
+    # `tools/probe_copilot_plugin_mcp.py`, addressed by the BARE server key (a
+    # `<plugin>/<server>`, `<plugin>:<server>` or bare-plugin spelling does nothing). An
+    # earlier revision of this comment said no flag disables them at all, which was never
+    # measured and is false. What survives, and is the actual reason the argv layer cannot be
+    # AIMED at this channel, is the SECOND half: those names live inside plugin definitions
+    # the harness cannot enumerate BEFORE the run, so there is nothing to put on the flag.
+    # The conclusion is therefore unchanged — the masks are what closes the plugin channel —
+    # but it now rests on unenumerability rather than on a flag limitation that does not
+    # exist. Note the same probe found the witness carries `source`/`sourcePlugin`/
+    # `pluginName`, so a plugin server IS identifiable AFTER a run even though its name was
+    # not predictable before one; `_mcp_witness` keeps none of those fields today. That makes the whole MCP-off
     # guarantee overlay-dependent even though most of it is argv: a non-isolated run keeps
     # the argv layer and loses the only cover the plugin channel has (the runner warns, and
     # a DECLARED `mcp_servers:` set is refused outright — see Adapter.mcp_off_mechanism).
