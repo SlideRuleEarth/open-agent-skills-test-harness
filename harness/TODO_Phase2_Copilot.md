@@ -207,7 +207,7 @@ Real, and recorded as verified in the survey; but nothing in this repo has drive
 
 - `_INERT_MCP_STATUSES = {"disabled", "not_configured"}` — [adapters/copilot.py:228](agentskill_evals/adapters/copilot.py#L228).
   Anything else counts as brought-up, `failed` included, "a spawned process being a spawned process".
-  This is the line slice 2 changes.
+  **PR 0** drops `not_configured` from it (§3); slice 2 then reads the set, and does not edit it.
 
 ### The constraint that is easy to miss
 
@@ -223,19 +223,25 @@ tripping it.
 
 ---
 
-## 3. Build order — four slices, three PRs, one arming
+## 3. Build order — four slices, four PRs, one arming
 
 Each slice touches `agentskill_evals/`, so each pays the full gate in `TODO_Contained_HOME.md` §4:
 selftest, mutation suite, Ruff.
 
-**Packaging (decided 2026-08-20, in review).** Four slices, three pull requests, and slice 3 splits
-at the moment injection becomes reachable:
+**Packaging (decided 2026-08-20, in review).** Four slices across four pull requests — one of which
+carries no slice at all — and slice 3 splits at the moment injection becomes reachable:
 
 | PR | contents | `supports_mcp_injection` |
 |---|---|---|
+| **0** | drop `not_configured` from `_INERT_MCP_STATUSES` (§ slice 2's vocabulary) — no Phase 2 dependency in either direction | stays `False` |
 | 1 | slice 4's **parser** half, then slice **3a** — config writer, `--additional-mcp-config`, `--secret-env-vars`, `${VAR}` interpolation | stays `False` |
 | 2 | slice **2** — the witness reducer, the two readers, the declared-set policy | stays `False` |
 | 3 | slice **3b** — flip the flag, live acceptance — then slice 4's **`used_mcp_tool`** half | `True` |
+
+**PR 0 is its own PR rather than PR 1's first commit** (decided in review, 2026-08-20). It is a
+safety change to shipped code that can newly fail runs, and it depends on nothing in Phase 2 — so it
+should not wait on a Phase 2 design discussion, and it should be bisectable on its own. The cost is
+honest: a fourth §4 gate for a one-word change, rather than a gate hidden inside a row.
 
 Each behavioural boundary is its own COMMIT inside those PRs — parser, writer, witness, arming — so
 a reviewer can read them apart even where they ship together.
@@ -271,13 +277,26 @@ and health stops being `()`. That is the better reading and the reason the field
 **visible change in the published record of every copilot run**, and it lands two PRs before
 anything is injected.
 
-So each of PR 1 and PR 2 needs **ordinary live-run coverage** — a copilot cell declaring no
-`mcp_servers:` at all, run end to end, with `summary.json`'s `mcp_server_sets` /
-`mcp_server_states` / `*_unknown_cells` / `*_verified` fields compared against what `main` produces
-for the same scenario. The expected diff is stated above; anything else is a finding. Offline arms
-cannot stand in for it, because the thing being checked is which of two code paths a real run takes.
+So PR 1 and PR 2 each need an **ordinary live run** — a copilot cell declaring no `mcp_servers:` at
+all, run end to end. They are not the same test, and conflating them was the first version of this
+paragraph:
 
-Three PRs means three mutation runs rather than four (~14 min each, `full-suite-gates-merge-not-commit`).
+- **PR 2 — the comparison, and it is real coverage.** `summary.json`'s `mcp_server_sets` /
+  `mcp_server_states` / `*_unknown_cells` / `*_verified` diffed against what `main` produces for the
+  same scenario. The expected diff is stated above; anything else is a finding. No offline arm
+  substitutes, because what is under test is **which of two code paths a real run takes**, and the
+  fallback is chosen by a `None` the offline arm would be supplying itself.
+- **PR 1 — a REGRESSION SMOKE, and it is not parser coverage.** A cell with no declared servers makes
+  no MCP tool call, and none of those `mcp_server_*` fields depends on a normalized tool name: **that
+  run passes with the parser's MCP branch deleted** (found in review, 2026-08-20 — §4's rule, a check
+  that only exercises the path where the bug cannot appear). What it establishes is the other
+  direction, which is still worth establishing: `parse()` did not break the ordinary cell. Parser
+  coverage in PR 1 is the **pinned-stream** arms — `tools/pinned/copilot-1.0.80-events.jsonl` — and
+  the live assertion on a normalized MCP tool identity belongs to **PR 3's injected acceptance**,
+  which is the first run in the whole plan that produces an MCP tool call at all.
+
+Four gates, not three: **PR 0** above, then the three slice PRs (~14 min each,
+`full-suite-gates-merge-not-commit`).
 
 ### Slice 1 — measure (probes only, no production code)
 
@@ -494,7 +513,7 @@ is that the spelling exists. It does not establish what the runtime does when it
 | `pending` | observed 1.0.80 | non-inert | **not** healthy — a transient; final `pending` is an incomplete start |
 | `failed` | observed 1.0.80 | non-inert | unhealthy |
 | `disabled` | observed 1.0.80 | inert | unhealthy if final for a DECLARED server |
-| `needs-auth` | bundle enum only | **non-inert** | unhealthy — and unmeasured |
+| `needs-auth` | bundle enum only | **non-inert** | **unknown**, never healthy |
 | `not_configured` | bundle enum only | **non-inert** | **unknown**, never healthy |
 | anything else | — | **non-inert** (fail closed) | **unknown**, never healthy |
 
@@ -511,15 +530,22 @@ status, or by reading the executable's control flow around where it is emitted �
 spelling appearing in a list.
 
 **That one is a change to shipped code, not to this plan.** It is a live fail-open path today,
-independent of every Phase 2 slice, so it lands **before PR 1** as its own small change with the
-§4 gate, rather than riding into PR 2 with the reducer. The cost is stated plainly: a hermetic run
-that reports a server `not_configured` will now fail closed where it passed before, and the reason
-it fails is *nobody has established what that word means* — which is the honest position and the
-direction this harness errs in everywhere else.
+independent of every Phase 2 slice, so it lands as **PR 0** (§3) — its own change with its own §4
+gate, rather than riding into PR 2 with the reducer or hiding as PR 1's first commit. The cost is
+stated plainly: a hermetic run that reports a server `not_configured` will now fail closed where it
+passed before, and the reason it fails is *nobody has established what that word means* — which is
+the honest position and the direction this harness errs in everywhere else.
 
-`needs-auth` is in that enum too and appears **nowhere else in this repo** — no probe, no plan, no
-table — while being non-inert today, which is the safe direction by luck rather than by decision.
-It is written down here so the health axis has a row for it.
+`needs-auth` gets the **same treatment on both axes**, and an earlier revision of this table did not
+give it that (found in review, 2026-08-20): it read `needs-auth` as *unhealthy* while reading
+`not_configured` as *unknown*, on identical evidence. The rule two paragraphs up says what an enum
+entry establishes — that a spelling exists — and "a server that has not come up" is a reading of the
+NAME, which is the one thing an unmeasured word does not license. Both are unknown until measured,
+and unknown is already never-healthy, so nothing is lost by saying so accurately.
+
+It also appears **nowhere else in this repo** — no probe, no plan, no table — while being non-inert
+today, which is the safe direction by luck rather than by decision. It is written down here so both
+axes have a row for it.
 
 An unknown word keeps its **raw spelling** in diagnostics while contributing *unknown* health to
 comparability. Losing the word to a bucket is how the next vocabulary change becomes unreadable.
@@ -633,7 +659,9 @@ on. The assertion needs a run that actually uses an MCP tool, so it goes with th
   and `mcpToolName`, which `tool.execution_start.data` carries as their own fields, and never split
   the composite — a server or tool whose own name contains a hyphen breaks the split and cannot
   break the fields. The composite `<server>-<tool>` stays the fallback for a build that stops
-  emitting them.
+  emitting them. **Its coverage in PR 1 is the pinned-stream arms, not PR 1's live run** — that run
+  declares no servers, so it makes no MCP tool call and would pass with this branch deleted (§3).
+  The live assertion on a normalized tool identity is PR 3's, below.
 - **PR 3** — **`used_mcp_tool`**, blocked since Phase 1 on "a second injecting adapter"; copilot is
   that adapter. It must match the `tool_use` event and **not assume it is the first tool in the
   transcript** (§9: the model may route through a `ToolSearch` step first)
@@ -644,8 +672,8 @@ on. The assertion needs a run that actually uses an MCP tool, so it goes with th
 
 1. **Slice 1 can generate unscoped work** — a bad answer on plugin-declared servers is a Phase 0 gap.
 2. **Arming `supports_mcp_injection`** wakes an interaction that has never executed (risk 3 above).
-3. **Three mutation runs** (four slices, three PRs — §3). Run the suite once per PR at merge rather
-   than per push (`full-suite-gates-merge-not-commit`).
+3. **Four mutation runs** (four slices, three PRs, plus PR 0 — §3). Run the suite once per PR at
+   merge rather than per push (`full-suite-gates-merge-not-commit`).
 4. **copilot's version is unreadable and unpinnable from outside** (§8) — `--no-auto-update` is
    load-bearing for *code selection*, not just update traffic. Any new probe must go through the same
    argv the run uses, or probe and run can execute different code.
