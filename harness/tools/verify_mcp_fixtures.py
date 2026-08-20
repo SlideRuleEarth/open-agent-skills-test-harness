@@ -5615,14 +5615,88 @@ try:
           not PLG.attributed_to_plugin({"name": PLG.SERVER_NAME, "source": "plugin",
                                         "sourcePlugin": "someone-else",
                                         "pluginName": "someone-else"}), "other plugin")
+    # ONE FIELD AT A TIME, and the arm above is why this block exists: it changes BOTH plugin
+    # fields together, so it stayed red no matter which of them the predicate consulted and an
+    # `or` across them was invisible to it (review, PR #121). A fact two fields both name is
+    # witnessed by two witnesses, and a fact either of two DISAGREEING witnesses can establish
+    # is established by neither — the rule `sources_verdict` applies one file over.
+    #
+    # THE CASES ARE GENERATED FROM `PLUGIN_NAME_FIELDS` rather than listed, so a field added to
+    # the predicate cannot arrive without its own disagreement and omission arms. The tuple is
+    # pinned in the aggregate checks below, which is what stops an emptied one from making
+    # every `all()` here quantify over nothing.
+    _fields_pinned = PLG.PLUGIN_NAME_FIELDS == ("sourcePlugin", "pluginName")
+    check("the plugin-identity fields are the two the 1.0.80 witness carries, read off the probe",
+          _fields_pinned, PLG.PLUGIN_NAME_FIELDS)
+    for _field in PLG.PLUGIN_NAME_FIELDS:
+        check(f"...an entry naming ANOTHER plugin in `{_field}` alone is refused",
+              not PLG.attributed_to_plugin(dict(_mine, **{_field: "someone-else"})),
+              (_field, dict(_mine, **{_field: "someone-else"})))
+        check(f"...and one that OMITS `{_field}` while the other names us is refused too",
+              not PLG.attributed_to_plugin({k: v for k, v in _mine.items() if k != _field}),
+              (_field, {k: v for k, v in _mine.items() if k != _field}))
+    # ...and the same two facts with labels a mutation can name, since the loop's are built.
+    check("an entry whose two plugin fields CONTRADICT each other attributes nothing",
+          _fields_pinned
+          and not any(PLG.attributed_to_plugin(dict(_mine, **{f: "someone-else"}))
+                      for f in PLG.PLUGIN_NAME_FIELDS),
+          [f for f in PLG.PLUGIN_NAME_FIELDS
+           if PLG.attributed_to_plugin(dict(_mine, **{f: "someone-else"}))])
+    check("...and one that OMITS either of them attributes nothing either",
+          _fields_pinned
+          and not any(PLG.attributed_to_plugin({k: v for k, v in _mine.items() if k != f})
+                      for f in PLG.PLUGIN_NAME_FIELDS),
+          [f for f in PLG.PLUGIN_NAME_FIELDS
+           if PLG.attributed_to_plugin({k: v for k, v in _mine.items() if k != f})])
+    check("...while the entry with BOTH fields naming us is still ours, or this is a refusal "
+          "to measure rather than a narrowing",
+          PLG.attributed_to_plugin(_mine)
+          and all(_mine.get(f) == PLG.PLUGIN_NAME for f in PLG.PLUGIN_NAME_FIELDS)
+          and _fields_pinned,
+          _mine)
+    # THE POSITIVE CONTROL FOR THE WHOLE PREDICATE, and the reason the strictness is a
+    # narrowing rather than a refusal to measure: a VERBATIM control-arm line from 1.0.80.
+    # Requiring every field is only safe while the build sends every field, and that is a fact
+    # about copilot, not about this probe — so it is pinned rather than assumed. A build that
+    # stops emitting one reddens here, instead of failing every arm closed in a live run.
+    # The expectations are typed, not read off the file, which would be the capture certifying
+    # itself; `PLG.SERVER_NAME` and `PLG.PLUGIN_NAME` are the probe's own constants, so this
+    # also pins the probe to a stream a real build emitted FOR IT.
+    _pin_plugin = [ln for ln in open(os.path.join(HERE, "pinned",
+                                                  "copilot-1.0.80-plugin-servers-loaded.jsonl"),
+                                     encoding="utf-8").read().splitlines()
+                   if ln.strip() and not ln.startswith("#")]
+    check("the pinned plugin capture holds the one witness line the arms below depend on",
+          len(_pin_plugin) == 1, _pin_plugin)
+    _real_entry = PLG.server_entry(PLG.parse_events(_pin_plugin[0]), PLG.SERVER_NAME)
+    check("the REAL 1.0.80 witness carries every field attribution requires, all naming us",
+          _fields_pinned and _real_entry is not None
+          and _real_entry.get("source") == "plugin"
+          and all(_real_entry.get(f) == PLG.PLUGIN_NAME for f in PLG.PLUGIN_NAME_FIELDS),
+          _real_entry)
+    check("...so the real entry is attributed, and the stricter rule narrows rather than refuses",
+          PLG.attributed_to_plugin(_real_entry) and PLG.control_ok(_real_entry)[0], _real_entry)
+    # ...AND THE SAME REAL ENTRY, WITH ONE FIELD CONTRADICTED, IS REFUSED. The negative control
+    # for the capture: without it, "the pinned entry passes" would also be true of a predicate
+    # that passes everything.
+    check("...while that same real entry with one field contradicted is refused",
+          _fields_pinned
+          and not any(PLG.attributed_to_plugin(dict(_real_entry, **{f: "someone-else"}))
+                      for f in PLG.PLUGIN_NAME_FIELDS),
+          [f for f in PLG.PLUGIN_NAME_FIELDS
+           if PLG.attributed_to_plugin(dict(_real_entry, **{f: "someone-else"}))])
 
     # -- control_ok: three distinct ways the instrument fails --------------------------------
     # Each of these would otherwise become "the flag does not reach it".
     check("a control that never listed the server FAILS rather than proving anything",
           not PLG.control_ok(None)[0], "absent")
+    # ONE VARIABLE, again: this entry used to carry `sourcePlugin` and no `pluginName`, which
+    # was attribution enough under the old `or`. Requiring both made it fail for TWO reasons at
+    # once, so a mutation of the STATUS gate would not have moved it (§4's F181 lesson, arriving
+    # a second time in the same file). It is a fully attributed entry now, and only the status
+    # differs from the good one.
     check("...a control whose server never reached `connected` FAILS",
-          not PLG.control_ok({"name": PLG.SERVER_NAME, "status": "failed", "source": "plugin",
-                              "sourcePlugin": PLG.PLUGIN_NAME})[0], "failed")
+          not PLG.control_ok(dict(_mine, status="failed"))[0], "failed")
     check("...a control whose entry is not attributed to our plugin FAILS",
           not PLG.control_ok({"name": PLG.SERVER_NAME, "status": PLG.CONNECTED,
                               "source": "user"})[0], "wrong source")
@@ -5697,6 +5771,27 @@ try:
     check("...and every arm's state is reported, so which one failed is visible",
           PLG.classify(_mine, _repro)[3].get(PLG.PLUGIN_NAME) == PLG.ARM_FAILED,
           PLG.classify(_mine, _repro)[3])
+    # THE REVIEWER'S SECOND REPRODUCTION, end to end (PR #121). A `disabled` candidate naming
+    # our plugin in one field and somebody else's in the other, with every other arm healthy —
+    # the shape that reads as a clean positive. Under the `or` this returned REACHES, so an
+    # internally contradictory witness carried the headline result of the whole probe. Driven
+    # per field, because a run where both fields are wrong is a different entry entirely.
+    for _field in PLG.PLUGIN_NAME_FIELDS:
+        _contra = dict(_none, **{PLG.SERVER_NAME:
+                                 dict(_disabled_mine, **{_field: "someone-else"})})
+        check(f"a `disabled` candidate contradicting itself in `{_field}` cannot certify REACHES",
+              PLG.classify(_mine, _contra)[0] == PLG.INSTRUMENT_FAILED,
+              (_field, PLG.classify(_mine, _contra)[:2]))
+    check("a `disabled` candidate whose plugin fields disagree cannot certify REACHES",
+          _fields_pinned
+          and not any(PLG.classify(_mine, dict(_none, **{
+              PLG.SERVER_NAME: dict(_disabled_mine, **{f: "someone-else"})}))[0] == PLG.REACHES
+              for f in PLG.PLUGIN_NAME_FIELDS),
+          "an internally contradictory witness carried the headline result")
+    check("...while the same candidate with both fields naming us still certifies REACHES",
+          PLG.classify(_mine, dict(_none, **{PLG.SERVER_NAME: _disabled_mine}))[0]
+          == PLG.REACHES,
+          "or the fix has switched the measurement off rather than closing it")
 
     # -- main(): every arm launched reaches version agreement ---------------------------------
     # The classifier arms above prove a broken arm cannot become a naming result. This proves

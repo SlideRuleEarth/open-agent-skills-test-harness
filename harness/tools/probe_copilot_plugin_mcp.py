@@ -133,8 +133,17 @@ def server_entry(events: list[dict], name: str) -> dict | None:
     return None
 
 
+# THE WITNESS NAMES THE PLUGIN TWICE, and 1.0.80 carries both fields on the same entry
+# (pinned in §E22 against a real run). Two fields naming one thing are two witnesses of it, so
+# the rule over them lives here rather than being spelled at the site that reads them — and a
+# third field, if a later build adds one, joins this tuple and is required by everything at
+# once. `attributed_to_plugin` quantifies over it, so §E22 pins the tuple itself: emptied, an
+# `all()` over it is true of every entry and attribution stops discriminating at all (§4).
+PLUGIN_NAME_FIELDS = ("sourcePlugin", "pluginName")
+
+
 def attributed_to_plugin(entry: dict | None) -> bool:
-    """Whether the witness itself says this server came from our plugin.
+    """Whether the witness itself says this server came from our plugin — in EVERY field.
 
     THIS IS A SECOND FINDING, not a detail of the first. The event carries `source`,
     `sourcePlugin` and `pluginName`, which means a plugin-declared server is IDENTIFIABLE from
@@ -142,12 +151,27 @@ def attributed_to_plugin(entry: dict | None) -> bool:
     none of those fields. It does not make the names enumerable BEFORE the run, which is the
     half of the shipped claim that survives; it does mean "the harness cannot tell a
     plugin server from any other" is not true after one.
+
+    AND EITHER FIELD NAMING US WAS ENOUGH, WHICH IS NOT ATTRIBUTION (review, PR #121). The test
+    read `sourcePlugin == PLUGIN_NAME or pluginName == PLUGIN_NAME`, so an entry naming our
+    plugin in one field and a DIFFERENT plugin in the other was classified as ours — and since
+    `control_ok` gates the whole run on this predicate, an internally contradictory witness
+    could carry the headline `REACHES`. A reviewer reproduced exactly that from a `disabled`
+    candidate. Two fields naming one thing are two witnesses of it, and a fact that either of
+    two disagreeing witnesses can establish is established by neither: the same rule
+    `sources_verdict` applies to the events probe's two name sources, one file over.
+
+    So it FAILS CLOSED on disagreement and on omission alike. The build this probe measures
+    carries both fields, so a run that presents only one is a run whose witness this probe has
+    not measured, and reading it as attribution would be a claim about a shape nobody has seen.
+    That is the same choice `usable_result` makes about `success`, for the same reason — and
+    §E22 asserts the predicate against a pinned real entry, so a build that stops emitting a
+    field reddens the verifier rather than silently refusing every arm in a live run.
     """
     if not isinstance(entry, dict):
         return False
     return (entry.get("source") == "plugin"
-            and (entry.get("sourcePlugin") == PLUGIN_NAME
-                 or entry.get("pluginName") == PLUGIN_NAME))
+            and all(entry.get(field) == PLUGIN_NAME for field in PLUGIN_NAME_FIELDS))
 
 
 def control_ok(entry: dict | None) -> tuple[bool, str]:

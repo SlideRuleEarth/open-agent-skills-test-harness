@@ -1,0 +1,7 @@
+# VERBATIM from copilot 1.0.80, captured by tools/probe_copilot_plugin_mcp.py's control arm on
+# 2026-08-20. Kept so `attributed_to_plugin` is pinned to an entry a real build actually
+# emitted: the predicate requires EVERY field in `PLUGIN_NAME_FIELDS` to name our plugin, and
+# that is only a narrowing rather than a refusal to measure if the build emits all of them.
+# A build that stops sending one reddens §E22 here, instead of failing every arm closed in a
+# live run nobody is watching. Lines starting with # are comments.
+{"type":"session.mcp_servers_loaded","data":{"servers":[{"name":"probesrvoscar","status":"connected","source":"plugin","transport":"stdio","sourcePlugin":"probeplugmike","pluginName":"probeplugmike"}]},"ephemeral":true,"id":"c7e2e4f6-1af6-4fa6-bfe2-e8a121bb4f6f","timestamp":"2026-08-20T16:49:26.489Z","parentId":"fdb48dcb-1a93-42bc-809a-9ff11f4330aa"}

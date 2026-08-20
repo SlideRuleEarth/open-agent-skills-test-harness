@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff AN
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff + shellcheck + a parse under every shell
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 253/253 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 816 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 257/257 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 832 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine
 git diff --check
@@ -2285,6 +2285,33 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   comment inside a branch that justifies the branch by pointing at an earlier one.** It is the
   same fix as the round before, one join further in, which is why it was not caught by it: the
   raw existence question moved and the correlated one was left behind.
+- **A FACT TWO FIELDS BOTH NAME IS WITNESSED TWICE, AND EITHER-ONE-MATCHING IS NOT
+  ATTRIBUTION.** `attributed_to_plugin` read `source == "plugin" and (sourcePlugin == US or
+  pluginName == US)`, so an entry naming our plugin in one field and a DIFFERENT plugin in the
+  other was ours — and `control_ok` gates the whole probe on that predicate, so an internally
+  contradictory witness could carry the headline `REACHES` (review, PR #121). This is §4's
+  first assertion trap — a mixed `and`/`or` where the `or` is the interesting term — appearing
+  in **production** rather than in a check, and the remedy is the same one `sources_verdict`
+  applies to the events probe's two name sources one file over: a fact either of two
+  disagreeing witnesses can establish is established by neither. It fails closed on
+  disagreement AND on omission, because the build being measured carries both fields, so an
+  entry with only one is a shape nobody has observed.
+- **AN ARM THAT VARIES BOTH WITNESSES TOGETHER CANNOT SEE WHICH ONE IS CONSULTED.** The arm
+  that was supposed to cover this set BOTH plugin fields to `"someone-else"`, so it stayed red
+  whichever field the predicate read and an `or` across them was invisible to it. That is the
+  one-variable rule (F181, same file) one level up: not "vary one clause of the predicate" but
+  **"vary one witness of the conjunction"**, and a conjunction over N fields needs N
+  disagreement arms and N omission arms. Generate them from the field tuple rather than listing
+  them, so a field added later cannot arrive without its own, and pin the tuple — emptied, an
+  `all()` over it is true of every entry.
+- **MAKING A SHARED PREDICATE STRICTER CAN BREAK A NEIGHBOURING ARM'S ONE-VARIABLE PROPERTY.**
+  `control_ok`'s status arm drove an entry carrying `sourcePlugin` and no `pluginName` —
+  attribution enough under the old `or`. Requiring both made that entry fail for TWO reasons at
+  once, so `F182`, which disables the status gate, would have stopped moving it: a green arm
+  covering nothing. Nothing about `F182` or the status gate changed. **Tightening a predicate
+  is a reason to re-read every arm that builds an input for it**, because inputs written to
+  pass the old, looser rule now fail the new one incidentally. Same family as a newer gate
+  blinding an older arm, with the cause on the data side rather than the control-flow side.
 - **MOVING A DECISION CAN LEAVE A CLAUSE BEHIND THAT CAN NO LONGER FAIL, and the mutation
   suite is the only thing that says so.** Hoisting the empty-correlated-view branch above the
   cardinality gate made that gate's `len(ids) != 1` term undecidable: the line is now reached

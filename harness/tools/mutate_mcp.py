@@ -3056,7 +3056,37 @@ MUTATIONS = [
      '    return (entry.get("source") == "plugin"',
      '    return (entry.get("source") in ("plugin", "user")',
      "...a same-named, same-plugin-named server from a DIFFERENT source is not"),
+    # --- PR #121, review round: attribution needs BOTH names, and they must agree ----------
+    # EITHER FIELD NAMING US WAS ENOUGH, WHICH IS NOT ATTRIBUTION. `control_ok` gates the whole
+    # probe on this predicate, so an entry naming our plugin in one field and somebody else's in
+    # the other carried the headline REACHES — a reviewer reproduced it from a `disabled`
+    # candidate. Named at the END-TO-END arm on purpose: what the defect costs is the verdict.
+    ("F260-either-plugin-name-is-attribution-enough", CPLUGIN,
+     "            and all(entry.get(field) == PLUGIN_NAME for field in PLUGIN_NAME_FIELDS))",
+     "            and any(entry.get(field) == PLUGIN_NAME for field in PLUGIN_NAME_FIELDS))",
+     "a `disabled` candidate whose plugin fields disagree cannot certify REACHES"),
+    # ...and the quantifier needs something to quantify over: emptied, `all()` is true of every
+    # entry and attribution stops discriminating at all (§4's structural-clause rule, in the
+    # production code rather than in a check).
+    ("F261-the-identity-fields-are-a-quantifier-over-nothing", CPLUGIN,
+     '\nPLUGIN_NAME_FIELDS = ("sourcePlugin", "pluginName")',
+     "\nPLUGIN_NAME_FIELDS = ()",
+     "the plugin-identity fields are the two the 1.0.80 witness carries, read off the probe"),
+    # ...and dropping one of them is the `or` again, arrived at from the other side.
+    ("F262-one-identity-field-is-the-whole-identity", CPLUGIN,
+     '\nPLUGIN_NAME_FIELDS = ("sourcePlugin", "pluginName")',
+     '\nPLUGIN_NAME_FIELDS = ("sourcePlugin",)',
+     "...and one that OMITS either of them attributes nothing either"),
+    # ...and PRESENCE is not agreement: a field that names another plugin is still a field.
+    ("F263-a-present-identity-field-need-not-name-us", CPLUGIN,
+     "            and all(entry.get(field) == PLUGIN_NAME for field in PLUGIN_NAME_FIELDS))",
+     "            and all(entry.get(field) is not None for field in PLUGIN_NAME_FIELDS))",
+     "an entry whose two plugin fields CONTRADICT each other attributes nothing"),
     # The control must require a RUNNING server, not merely a listed one.
+    # ITS ARM WAS ONE-VARIABLE-BROKEN UNTIL THIS ROUND: the entry it drove carried
+    # `sourcePlugin` and no `pluginName`, which the old `or` accepted; once attribution
+    # required both, that entry failed for TWO reasons and this mutation would have stopped
+    # moving it. The arm is a fully attributed entry now (review, PR #121).
     ("F182-a-server-that-never-connected-is-a-good-control", CPLUGIN,
      '    if entry.get("status") != CONNECTED:',
      "    if False:",
