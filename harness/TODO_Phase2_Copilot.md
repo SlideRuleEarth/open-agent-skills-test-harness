@@ -321,6 +321,12 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
    longer names two of the four ways the join fails. §E21 gained **stream-to-state-to-sentence** arms,
    with the state read back from the stream, since a supplied state cannot show the classifier
    supplying the wrong one.
+   **An eleventh round found the same gate one join further in.** The empty *correlated* view was
+   still decided after cardinality, and borrowed its premise from it, so several identifiable
+   executions beside a completion that was provably none of theirs read as ambiguous rather than
+   empty. It now states both clauses itself, and §E21's invariant is an equivalence with a witness
+   on each side rather than a one-way implication a classifier could satisfy by never producing the
+   state.
 5. **Remote `type` omission, as *behaviour* rather than shape.** Slice 3 writes `type` and an explicit
    `tools: ["*"]` because §2(b) says copilot writes them for itself — but (b) is unversioned, and the
    probe that produced it *cannot* be versioned: `copilot mcp add` emits no in-band witness, so no

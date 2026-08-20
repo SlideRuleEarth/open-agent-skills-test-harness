@@ -3342,8 +3342,8 @@ MUTATIONS = [
     # cardinality: one marker-bearing reply, one execution, one completion. Each conjunct is a
     # different way for two calls to be mistaken for one, so each gets its own mutation.
     ("F233-a-second-marker-bearing-reply-is-still-one-exchange", CEVENTS,
-     "    if len(starts) != 1 or len(ids) != 1 or replies != 1:",
-     "    if len(starts) != 1 or len(ids) != 1:",
+     "    if len(starts) != 1 or replies != 1:",
+     "    if len(starts) != 1:",
      ("...a clean result in a run with TWO marker-bearing replies on the fixture's wire is "
       "UNATTRIBUTED, not clean")),
     ("F234-a-second-completion-is-still-one-result", CEVENTS,
@@ -3354,15 +3354,21 @@ MUTATIONS = [
     # THE ID COUNT NOW MEANS WHAT IT SAYS — the one execution's id is usable — so its arm is
     # the lone-unusable-id run, not the two-execution run that `len(starts)` catches first
     # (review, PR #120).
-    ("F235-an-uncorrelatable-execution-is-still-attributable", CEVENTS,
-     "    if len(starts) != 1 or len(ids) != 1 or replies != 1:",
-     "    if len(starts) != 1 or replies != 1:",
-     "...and a LONE execution whose id is unusable can be correlated to nothing"),
+    # `F235-an-uncorrelatable-execution-is-still-attributable` STOOD HERE and is retired, not
+    # lost. It dropped `len(ids) != 1` from the cardinality gate; the eleventh round moved the
+    # empty-correlated-view branch above that gate, which made the term undecidable there — the
+    # gate is reached only with a non-empty `done`, so `len(ids) >= 1`, and `len(starts) == 1`
+    # bounds it at 1. The mutation therefore produced code identical in behaviour to the
+    # original and could not be caught by anything (mutation run, PR #120). The term is gone
+    # from the source for the same reason. Its ARM is untouched and still red under `F257`,
+    # which perturbs `len(ids) == len(starts)` in the branch that now decides it — the rule
+    # moved, the coverage moved with it, and this comment is here so the gap in the numbering
+    # is not read as a deletion.
     # --- PR #120, seventh review round -----------------------------------------------------
     # A SET OF IDS IS NOT A COUNT OF CALLS. `mcp_call_ids` deduplicates and drops unusable ids,
     # both correct for correlation and both wrong for counting executions.
     ("F238-the-id-count-is-the-execution-count", CEVENTS,
-     "    if len(starts) != 1 or len(ids) != 1 or replies != 1:",
+     "    if len(starts) != 1 or replies != 1:",
      "    if len(ids) != 1 or replies != 1:",
      # RE-AIMED: with ownership inside `mcp_call_ids`, a REUSED id yields no usable id at all,
      # so `len(ids) != 1` refuses that run first and this mutation survives it. The shape that
@@ -3454,10 +3460,34 @@ MUTATIONS = [
     # mutation's arm insensitive". The shape that still reaches here is a completion that
     # ARRIVED and is provably somebody else's.
     ("F236-a-missing-completion-is-merely-unattributable", CEVENTS,
-     ("        return (RESULT_ABSENT if all(completion_id(data) for data in completions)\n"
+     ("        return (RESULT_ABSENT\n"
+      "                if all(completion_id(data) for data in completions)\n"
+      "                and len(ids) == len(starts)\n"
       "                else RESULT_UNATTRIBUTED)"),
      "        return RESULT_UNATTRIBUTED",
      "...and one carrying a completion is ABSENT only when every one can be EXCLUDED"),
+    # --- PR #120, eleventh review round ----------------------------------------------------
+    # THE EMPTY VIEW IS THE SAME QUESTION ONE JOIN IN, so it is settled before cardinality too.
+    # Left below that gate it borrowed "our id is unique here" from it, and two perfectly
+    # identifiable executions beside one foreign completion — provably neither of theirs —
+    # were refused as ambiguous instead of answered as empty.
+    ("F259-several-executions-cannot-have-an-empty-view", CEVENTS,
+     "    if not done:\n        # NOTHING OF OURS CAME BACK",
+     "    if not done and len(starts) == 1:\n        # NOTHING OF OURS CAME BACK",
+     "...and an empty correlated view IS ABSENT when every completion is excludable"),
+    # ...and how many replies the FIXTURE put on the wire cannot decide whether anything came
+    # BACK. That is the other half of the same borrowing, and it survives the arm above.
+    ("F258-the-reply-count-decides-whether-anything-came-back", CEVENTS,
+     "    if not done:\n        # NOTHING OF OURS CAME BACK",
+     "    if not done and replies == 1:\n        # NOTHING OF OURS CAME BACK",
+     "...and cardinality no longer stands in front of it: replies do not decide absence"),
+    # ...and EVERY execution of ours must be identifiable before absence is readable: a
+    # completion cannot be excluded from an execution that answers to no id at all, so an
+    # id-less start beside a foreign completion is unattributable, not empty.
+    ("F257-an-id-less-execution-can-still-be-excluded-from", CEVENTS,
+     "                and len(ids) == len(starts)\n",
+     "",
+     "...and an empty correlated view IS ABSENT when every completion is excludable"),
     # --- PR #120, tenth review round -------------------------------------------------------
     # EXISTENCE IS SETTLED BEFORE ATTRIBUTION. Read the other way round, a run with two starts
     # and NO completion whatever is "unattributable" — and publishes a sentence saying results
@@ -3479,8 +3509,8 @@ MUTATIONS = [
     # them: a run holding one excludable completion beside one it cannot read has not shown
     # that nothing of ours came back.
     ("F254-one-excludable-completion-excludes-them-all", CEVENTS,
-     "        return (RESULT_ABSENT if all(completion_id(data) for data in completions)",
-     "        return (RESULT_ABSENT if any(completion_id(data) for data in completions)",
+     "                if all(completion_id(data) for data in completions)",
+     "                if any(completion_id(data) for data in completions)",
      "...and one carrying a completion is ABSENT only when every one can be EXCLUDED"),
     # ...and "carries an id" means a USABLE one. A completion whose id is a number can be
     # excluded from nothing, and reading the raw field makes it excludable.

@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff AN
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff + shellcheck + a parse under every shell
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 241/241 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 776 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 243/243 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 783 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine
 git diff --check
@@ -2273,6 +2273,45 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   every run that reaches that state. The same obligation binds the FIXED half of a sentence,
   which is read for several states at once — "so nothing came back to be redacted" was false
   for the one of its three states where something did.
+- **A BRANCH THAT BORROWS ITS PREMISE FROM THE GATE ABOVE IT BELONGS ABOVE THAT GATE TOO.**
+  The empty-correlated-view branch said, in its own comment, "our id is unique and usable here
+  (the gate above)" — and that borrowing is what pinned it below the cardinality gate, where a
+  run with two perfectly identifiable executions and one foreign completion was refused as
+  ambiguous instead of answered as empty (review, PR #120, eleventh round). A borrowed premise
+  makes a decision positionally dependent on something that is not about it: cardinality asks
+  which reply a result BELONGS to, and that question needs a result. Write down what the branch
+  actually needs — here, every completion carries an id of its own AND every execution of ours
+  does, `len(ids) == len(starts)` — and it can then stand wherever it is true. **The tell is a
+  comment inside a branch that justifies the branch by pointing at an earlier one.** It is the
+  same fix as the round before, one join further in, which is why it was not caught by it: the
+  raw existence question moved and the correlated one was left behind.
+- **MOVING A DECISION CAN LEAVE A CLAUSE BEHIND THAT CAN NO LONGER FAIL, and the mutation
+  suite is the only thing that says so.** Hoisting the empty-correlated-view branch above the
+  cardinality gate made that gate's `len(ids) != 1` term undecidable: the line is now reached
+  only with a non-empty `done`, which needs a completion carrying one of `ids`, so
+  `len(ids) >= 1`; and `mcp_call_ids` adds at most one id per start, so the `len(starts) == 1`
+  in the same condition bounds it at 1. `F235` — which deletes that term — therefore produced
+  code identical in behaviour to the original and **survived**, the fourth time a newer gate
+  has made an older mutation's arm insensitive and the first time the cause was the arm's
+  clause becoming a tautology rather than an earlier gate answering first. A term that cannot
+  fail is worse than an absent one: it reads as a check, is not one, and no mutation of it can
+  be caught. The term is gone; the fact it carried moved to `len(ids) == len(starts)` in the
+  branch above, where it still bites, and `F257` is the mutation that says so. **`F235`'s ARM
+  is untouched and still red** — retiring the mutation is not retiring the coverage, and the
+  gap in the numbering carries a comment saying which mutation took it over, so it cannot be
+  read later as a deletion.
+- **A ONE-WAY INVARIANT IS SATISFIED BY A CLASSIFIER THAT NEVER PRODUCES THE STATE.** "Every
+  `RESULT_ABSENT` run had all its completions excludable" was green — and would stay green if
+  nothing were ever `ABSENT`. The claim that gives a state meaning is the **iff**, with a
+  witness on each side: at least one run that is `ABSENT` with completions, and at least one
+  that is not. Both `any(...)` clauses are there for that, and they are the same structural
+  clause §4 demands ahead of any `all(...)`, applied to an equivalence rather than to a
+  quantifier.
+- **THE CROSS-PRODUCT OF TWO TESTED CASES IS A THIRD CASE.** The table drove *several
+  executions with no completion* and *one execution with a foreign completion*, and neither is
+  *several executions with a foreign completion* — which is the one that was wrong. A table
+  built by listing the ways each state is reached will miss the combinations; the invariant
+  over the table is what covers them, and only if it is stated as an equivalence.
 - **WHERE THE RULE ITSELF IS UNDER TEST, IMPORTING IT IS THE BUG AND DUPLICATING IT IS THE
   FIX — which is the opposite of the standing advice, and the mutation suite is what tells the
   two apart.** §4 says a check that re-derives a definition cannot disagree with it, so import

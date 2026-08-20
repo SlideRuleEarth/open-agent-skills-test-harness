@@ -5083,6 +5083,27 @@ try:
             "toolCallId": 42, "success": True, "result": {"content": "x"}}}) + "\n",
          1, EV.RESULT_UNATTRIBUTED,
          "a completion whose id is not a usable string"),
+        # THE CROSS-PRODUCT, which the two rows it is made of did not cover between them
+        # (review, PR #120, eleventh round): several executions AND a completion that is
+        # provably none of theirs. Nothing of ours came back, however many of us called.
+        (_ours(toolCallId=_cid) + _ours(toolCallId="toolu_probe_02") + _someone_elses, 1,
+         EV.RESULT_ABSENT, "TWO identifiable executions and a completion that is neither's"),
+        (_start + _someone_elses, 2, EV.RESULT_ABSENT,
+         "a foreign completion and TWO marker-bearing replies to have wanted one"),
+        (_start + _someone_elses, 0, EV.RESULT_ABSENT,
+         "a foreign completion and NO marker-bearing reply at all"),
+        # ...AND THE CONVERSE, which is what stops that from being a licence: an execution
+        # answering to no id could be the one that foreign-looking completion belongs to.
+        (_ours(toolCallId=_cid) + _ours() + _someone_elses, 1, EV.RESULT_UNATTRIBUTED,
+         "an id-less execution beside a usable one, and a completion that might be its own"),
+        # ...and an id two of our own executions share identifies neither of them. This one is
+        # REFUSED rather than answered, and the refusal is a choice: the completion names an id
+        # neither start claimed, so absence is arguably readable — but `mcp_call_ids` is the
+        # file's one notion of an identifiable execution, and a second notion of "ours enough
+        # to exclude from" would be two id predicates with different rules. Stated here so the
+        # limit is visible rather than accidental.
+        (_ours(toolCallId=_cid) + _ours(toolCallId=_cid) + _someone_elses, 1,
+         EV.RESULT_UNATTRIBUTED, "two of our executions sharing one id, and a foreign result"),
     ]
     for _s, _r, _exp, _w in _e2e:
         check(f"stream to state: {_w} is {_exp}",
@@ -5129,6 +5150,37 @@ try:
                                        **dict(_ok, secret_result=st))[1]
                   for _s, _r, st, _w in _seen),
           "a supplied state cannot show the classifier supplying the wrong one")
+    def _identifiable(stream):
+        """Does every execution of OURS answer to an id nothing else claims?
+
+        `mcp_call_ids` drops a start whose id is missing, malformed or shared, so equality
+        with the execution count is the statement that each one can be told from the others.
+        A completion cannot be excluded from an execution that answers to no id at all.
+        """
+        ev = EV.parse_events(stream)
+        return len(EV.mcp_call_ids(ev)) == len(EV.mcp_starts(ev))
+
+    def _all_excludable(stream):
+        """Is every completion in this stream provably somebody else's?"""
+        ids = EV.mcp_call_ids(EV.parse_events(stream))
+        return all(_excludable(d) and d.get("toolCallId") not in ids
+                   for d in _completions(stream))
+
+    # THE OTHER DIRECTION, and the one the first invariant did not carry (review, PR #120,
+    # eleventh round). "Every ABSENT run was excludable" is satisfied by a classifier that
+    # never says ABSENT at all; the claim that makes the state mean something is the `iff`.
+    check("...and an empty correlated view IS ABSENT when every completion is excludable",
+          all((st == EV.RESULT_ABSENT) == (_all_excludable(_s) and _identifiable(_s))
+              for _s, _r, st, _w in _seen if _completions(_s))
+          # BOTH SIDES MUST OCCUR, or the equivalence is vacuous in the direction that matters.
+          and any(st == EV.RESULT_ABSENT and _completions(_s) for _s, _r, st, _w in _seen)
+          and any(st != EV.RESULT_ABSENT and _completions(_s) for _s, _r, st, _w in _seen),
+          [(_w, st, _all_excludable(_s), _identifiable(_s))
+           for _s, _r, st, _w in _seen if _completions(_s)])
+    check("...and cardinality no longer stands in front of it: replies do not decide absence",
+          {_result_state(_start + _someone_elses, _sent, replies=n) for n in (0, 1, 2)}
+          == {EV.RESULT_ABSENT},
+          "how many replies went out cannot change whether anything came back")
     check("`completion_id` reads an id by the SAME rule as `start_id`, and is not a copy of it",
           all(EV.completion_id(d) == EV.start_id(d)
               for d in ({"toolCallId": "x"}, {"toolCallId": ""}, {"toolCallId": 42}, {}))

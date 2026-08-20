@@ -567,9 +567,11 @@ def tool_result_state(events: list[dict], sentinel: str, *, replies: int) -> str
     PR #120). `mcp_call_ids` is a SET and it drops starts whose id is missing or malformed, so
     it answers a different question — how many ids can be correlated on — and reading it as the
     execution count made two starts sharing an id, and a usable start beside an id-less one,
-    both look like a single exchange. The id count is still required, and now means what it
-    says: the ONE execution's id is usable. A lone start whose id is not is unattributable,
-    since nothing can be correlated to it at all. In any other run the answer is `RESULT_UNATTRIBUTED`, which
+    both look like a single exchange. The id count is still required and it is asked ABOVE that
+    gate, as `len(ids) == len(starts)`: a lone start whose id is unusable can be correlated to
+    nothing, so nothing of ours can be shown to have come back. Asking it again at the gate
+    became a term that could not fail once the empty view moved above it — the comment there
+    has the argument. In any other run the answer is `RESULT_UNATTRIBUTED`, which
     `INSPECTABLE_RESULTS` already refuses — the payoff of putting that predicate in one place.
 
     THE COST, STATED: a run where the model calls the tool more than once is no longer
@@ -590,11 +592,16 @@ def tool_result_state(events: list[dict], sentinel: str, *, replies: int) -> str
     to different phases of the same lifecycle, which is §4's own tell for two facts sharing one
     field.
 
-    The dual of it is here too, one gate lower. `done` being empty has TWO causes — every
-    completion belongs to somebody else, or no completion can be read at all — and only the
-    first is an observation about our tool. Excluding a completion needs an id to exclude it
-    by, so a completion carrying none leaves the run unattributable rather than empty, on the
-    same rule that makes an id claimed twice no correlation key.
+    The dual of it is the same question one join in, and it is settled at the same point in the
+    order. `done` being empty has TWO causes — every completion belongs to somebody else, or
+    some completion cannot be told apart from ours — and only the first is an observation about
+    our tool. Excluding a completion needs an id to exclude it by; identifying OUR executions
+    needs one too, since a completion cannot be excluded from an execution that answers to no
+    id. Both clauses are stated in the branch rather than borrowed from the cardinality gate,
+    which is what put it below that gate the first time: two identifiable executions and one
+    foreign completion is an empty view, not an ambiguous one, however many executions there
+    were (review, PR #120). Cardinality asks which reply a result BELONGS to, and that question
+    needs a result.
 
     THE LEAK TEST COMES FIRST, AND NOT BY ACCIDENT — before attribution as well as before
     usability. A completion carrying the value is a leak whichever call it belongs to and
@@ -623,18 +630,40 @@ def tool_result_state(events: list[dict], sentinel: str, *, replies: int) -> str
             if isinstance(data, dict) and completion_id(data) in ids]
     if any(sentinel in json.dumps(data.get("result")) for data in done):
         return RESULT_CARRIED
-    if len(starts) != 1 or len(ids) != 1 or replies != 1:
-        return RESULT_UNATTRIBUTED
     if not done:
-        # SOMETHING CAME BACK AND NONE OF IT WAS OURS — but that is only readable when every
-        # completion can be EXCLUDED, which needs an id of its own to be excluded by. Our id
-        # is unique and usable here (the gate above), so a completion naming a different one
-        # is provably somebody else's; one naming nothing at all is not, and a negative about
-        # our tool must not be read from an observation that cannot tell our tool from
-        # another. `completions` is non-empty above, so this `all()` has something to quantify
-        # over.
-        return (RESULT_ABSENT if all(completion_id(data) for data in completions)
+        # NOTHING OF OURS CAME BACK — the SAME question one join in, and it is settled before
+        # cardinality for the same reason the raw one is (review, PR #120, eleventh round).
+        # The first cut of this branch sat below the cardinality gate and leaned on it: "our
+        # id is unique and usable here". That made the gate part of the argument, so a run
+        # with two perfectly identifiable executions and one foreign completion — provably
+        # neither of theirs — was refused as ambiguous rather than answered as empty. What the
+        # branch actually needs is stated here instead of borrowed:
+        #
+        #   every completion carries a usable id of its own, so each can be EXCLUDED, and
+        #   every execution of ours carries one too, so there is nothing left for a completion
+        #   to belong to unnoticed.
+        #
+        # `len(ids) == len(starts)` is the second clause: `mcp_call_ids` drops a start whose id
+        # is missing, malformed or shared, so equality means every one of our executions is
+        # identifiable. Without it an id-less start beside a foreign completion would read as
+        # empty, and that completion could be the id-less execution's own result. `completions`
+        # is non-empty above, so this `all()` has something to quantify over.
+        return (RESULT_ABSENT
+                if all(completion_id(data) for data in completions)
+                and len(ids) == len(starts)
                 else RESULT_UNATTRIBUTED)
+    # ONE EXECUTION AND ONE MARKER-BEARING REPLY. The id count used to be a third term here
+    # and is no longer, because moving the empty-view branch above this gate made it unable
+    # to decide anything: this line is reached only when `done` is non-empty, which needs a
+    # completion carrying one of `ids`, so `len(ids) >= 1`; and `mcp_call_ids` adds at most
+    # one id per start, so `len(starts) == 1` bounds it at 1. A term that cannot fail is
+    # worse than absent — it reads as a check and is not one, and no mutation of it can be
+    # caught (mutation run, PR #120: `F235` survived exactly here). The fact it used to
+    # carry — a lone execution whose id is unusable can be correlated to nothing — is now
+    # decided by `len(ids) == len(starts)` in the branch above, where it still bites, and
+    # `F257` is the mutation that says so.
+    if len(starts) != 1 or replies != 1:
+        return RESULT_UNATTRIBUTED
     if len(done) != 1:
         return RESULT_UNATTRIBUTED
     if not usable_result(done[0]):
