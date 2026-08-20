@@ -18,7 +18,7 @@ opens afterwards, never the model's account of itself. The fixture is REUSED thr
 `probe_remote_mcp.py`'s `start_fixture`, not reimplemented: that function already carries the
 reap-on-every-failure-path fix, and a second copy is a second thing to fix (§4).
 
-THE THREE FACTS THIS SETTLES, and they are separable:
+THE FOUR FACTS THIS SETTLES, and they are separable:
 
   1. does the declared `Authorization` header reach the server at all (probe #1 established
      this for claude; copilot is a different client and inherits nothing);
@@ -28,6 +28,14 @@ THE THREE FACTS THIS SETTLES, and they are separable:
      it. This was claimed here and not measured: the prompt named only the off-list tool, so
      `called(echo)=False` in both arms and the verdict read ENFORCED off it. The gated arm now
      carries a claim of each sign, and `SUPPRESSES_ALL` is the verdict when only one holds.
+  4. **does a REMOTE entry with no `type` key produce a server copilot can reach** — Phase 2
+     slice 1's question 5, added after the three above and once absent from this list, which is
+     the drift this file's own review keeps finding. §2(b) records that copilot writes `type`
+     for itself, but that is its OUTPUT read from an execution carrying no version: it licenses
+     writing the key and no claim whatever about omitting it. This measures the same question
+     through a channel that names its own build, and it is a PAIR of arms — the bare one and a
+     with-`type` control differing in exactly that key — read from copilot's own connection
+     status rather than from whether the model chose to call anything.
 
     python tools/probe_copilot_remote_gating.py        # prints the tally either way
 """
@@ -53,11 +61,41 @@ from echo_mcp_server import IDENTITY_GENERATE        # noqa: E402 — imported, 
 
 from agentskill_evals.adapters.copilot import _stream_cli_version  # noqa: E402 — the run's own witness
 
+# IMPORTED, NOT A SECOND READER OF THE SAME TWO EVENTS. `probe_copilot_events.py` established
+# which events carry an MCP server's status and in which field, and a copy here could disagree
+# with it silently — §4's rule, and the same argument that already pulled `minted_digest` and
+# `start_fixture` in rather than duplicating them.
+from probe_copilot_events import (                    # noqa: E402 — after the path bootstrap
+    effective_status, loaded_servers, parse_events, statuses_for)
+
 _VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
 
 ALLOWED = "echo"
 OFF_LIST = "add"
 DEADLINE = 240.0
+
+# The key the server is declared UNDER, which is the name copilot's own witness reports it by.
+# Spelled the same as the tool by history rather than by design; named separately so the two
+# readings below cannot be confused for one another.
+SERVER_KEY = "echo"
+# copilot's own word for a server it reached, measured from the stream at 1.0.80 — the same
+# value `probe_copilot_events.py` reads for a stdio server, and the reason the omission arm
+# has a witness that does not depend on the model choosing to call anything.
+CONNECTED = "connected"
+# THE STATUS VOCABULARY, SPLIT BY WHAT EACH ONE LICENSES — and the split is the point. A
+# reader that treated "not `connected`" as the negative publishes a finding about the `type`
+# key from `pending`, which THIS SAME MEASUREMENT recorded as the ordinary transient before
+# `connected`: an arm truncated mid-startup ends there, and so does an arm whose server was
+# about to come up fine (review, PR #120). It would do the same for any word a later build
+# invents. Only a status measured to mean "this server will not be coming up" can establish a
+# negative; everything else leaves the question unmeasured, which is the direction that
+# refuses to publish rather than the one that guesses.
+TERMINAL_FAILURE = ("failed",)   # measured at 1.0.80: the sse arm with no `type` ends here
+TRANSIENT = ("pending",)         # measured at 1.0.80: precedes `connected` in a healthy run
+# NOT listed as terminal, deliberately: `not_configured` and `disabled` are in production's
+# `_INERT_MCP_STATUSES` and plausibly mean "never came up", but neither has been OBSERVED in
+# this arm, and `disabled` would mean a flag suppressed the server rather than that the entry
+# was misunderstood — a different question. They fall through to unmeasured until measured.
 
 ENFORCED = "ENFORCED"
 LEAKED = "LEAKED"
@@ -181,24 +219,35 @@ def classify(gated: list[dict], control: list[dict], answered: bool) -> tuple[st
 
 
 def mcp_config(path: str, url: str, sentinel: str, kind: str,
-               *, tools: list[str] | None) -> str:
+               *, tools: list[str] | None, write_type: bool = True) -> str:
     """The remote entry in copilot's own spelling — `type`/`url`/`headers`/`tools`, as
     measured by `probe_copilot_config.py` rather than taken from documentation. `type` in
     particular is a key nothing in §3 had, and copilot writes `http` for the Streamable shape
     and `sse` for the legacy one — `kind` is which of those this arm is measuring."""
-    server: dict = {"type": kind, "url": url,
+    server: dict = {"url": url,
                     "headers": {"Authorization": f"Bearer {sentinel}"}}
+    # `write_type=False` is the OMISSION ARM (Phase 2 slice 1, question 5). §2(b) records that
+    # copilot writes `type` for itself, but that is a fact about its OUTPUT read from an
+    # execution carrying no version — `copilot mcp add` emits no in-band witness — so it
+    # licenses writing the key, never any claim about omitting it. On stdio the answer is
+    # already known and is the opposite of what this design once asserted:
+    # `probe_copilot_gating.py` omits `type` in both arms and those servers start and serve.
+    # Remote was the one case nothing had exercised, and this arm reads it from a stream that
+    # names its own build.
+    if write_type:
+        server["type"] = kind
     if tools is not None:
         server["tools"] = list(tools)
     with open(path, "w", encoding="utf-8") as handle:
-        json.dump({"mcpServers": {"echo": server}}, handle)
+        json.dump({"mcpServers": {SERVER_KEY: server}}, handle)
     return path
 
 
-def run_arm(workdir: str, url: str, sentinel: str, kind: str, *, tools: list[str] | None):
+def run_arm(workdir: str, url: str, sentinel: str, kind: str, *, tools: list[str] | None,
+            write_type: bool = True):
     receipts_before = None
     config = mcp_config(os.path.join(workdir, f"cfg-{uuid.uuid4().hex}.json"), url, sentinel,
-                        kind, tools=tools)
+                        kind, tools=tools, write_type=write_type)
     # BOTH TOOLS, ALLOWED FIRST — see `classify`. Naming only the off-list one leaves the
     # allowed one uncalled in every arm, which is exactly what an off switch looks like.
     # The reply is quoted VERBATIM so the opaque marker survives into the output, which is
@@ -295,6 +344,221 @@ def cli_version() -> tuple[str, bool]:
     return version_verdict(done.returncode, done.stdout, done.stderr)
 
 
+# --- question 5: does a REMOTE server start with no `type` key? -------------------------
+# Either answer is a finding, so the exit status requires this to be ANSWERED, never to come
+# back positive. A `NEVER_STARTS` result would say the adapter MUST write `type`; a
+# `STARTS_WITHOUT_TYPE` says the key is canonical rather than required. Phase 2 slice 3 writes
+# it either way — depending on an undocumented default is a bet a later build settles silently
+# — but the design may then only claim what was measured.
+STARTS_WITHOUT_TYPE = "STARTS_WITHOUT_TYPE"   # copilot reached a server declared with no `type`
+NEVER_STARTS = "NEVER_STARTS"                 # the entry was not understood: nothing reached it
+OMISSION_UNMEASURED = "OMISSION_UNMEASURED"   # the arm established neither, which is not a finding
+
+# Whether our server's ABSENCE from copilot's own account is established. A SEPARATE READING
+# FROM THE STATUS, and the two used to collapse: a stream naming our server and giving it no
+# `status` produced `None` from the status reader and "a readable inventory" from the presence
+# reader, and the pair of them said the server was never listed — contradicted by the very
+# event they were both read from (review, PR #120). The name and the status are independent
+# facts about the same entry, so they get independent readings.
+SERVER_NAMED = "SERVER_NAMED"                 # copilot NAMED our server: absence is disproven
+ABSENCE_ESTABLISHED = "ABSENCE_ESTABLISHED"   # every inventory readable, our name in none
+ABSENCE_UNREADABLE = "ABSENCE_UNREADABLE"     # no inventory, or one this probe cannot parse
+
+
+def reported_statuses(stream: str) -> list[str | None]:
+    """Every status copilot carried for OUR server in this arm, in order — `None` included.
+
+    THE LIST IS THE READING THE NAME LIVES IN. An entry copilot listed with no `status` field
+    contributes `None` here, which is why this is not the same fact as `reported_status`
+    below: `[]` means copilot never named our server, `[None]` means it named it and said
+    nothing about it, and those two called for opposite verdicts while one function returned
+    `None` for both (review, PR #120).
+    """
+    return statuses_for(loaded_servers(parse_events(stream)), SERVER_KEY)
+
+
+def reported_status(stream: str) -> str | None:
+    """The status COPILOT reported for our server in this arm, or None if it never said.
+
+    THE WITNESS THAT DOES NOT DEPEND ON THE MODEL. `called()` reads the fixture's receipts,
+    which record what arrived — but nothing arriving is equally true of a config copilot
+    rejected and of a turn where the model simply answered without calling a tool. This reads
+    copilot's own account of whether it CONNECTED, which is decided by the MCP host before the
+    model acts. The first version of this arm had only the receipts, so model nondeterminism
+    and a rejected entry produced identical evidence (review, PR #120).
+
+    `None` HERE IS NOT ABSENCE. It is "no status word to read", which a listed-but-statusless
+    entry satisfies as fully as a stream that never mentioned our server. `absence_verdict` is
+    what separates them, and every caller reading a negative out of this must consult it.
+    """
+    return effective_status(reported_statuses(stream))
+
+
+def absence_verdict(stream: str) -> str:
+    """Is "copilot never created a server for our entry" ESTABLISHED by this arm?
+
+    THE CLAUSE THAT MAKES "OUR SERVER WAS NOT LISTED" MEAN SOMETHING. An arm killed before the
+    MCP host initialized has no entry for our server either, and reading that as "the entry was
+    not understood" is the defect this whole verdict was rebuilt around, arriving one branch
+    further down. Our server's absence is evidence only from a run that got far enough to say
+    what it HAD, and only when what it had did not include us.
+
+    THREE OUTCOMES, because the middle one was missing. `SERVER_NAMED` comes FIRST and is read
+    from every witness event, not only the inventory: copilot naming our server — with a
+    status, with a null status, or in a later transition — disproves absence outright, and a
+    malformed event elsewhere cannot un-name it. That asymmetry is the point of the ordering:
+    an event this probe cannot parse can only HIDE servers, never remove one that was named.
+
+    `ABSENCE_UNREADABLE` is the taint, and it now taints rather than being skipped over
+    (review, PR #120). The first version `continue`d past an unreadable inventory and returned
+    on a later readable one — so a run whose real inventory was the one that failed to parse
+    established absence from the other. `{"type": "session.mcp_servers_loaded", "data": 42}`
+    is an inventory this probe cannot read: `loaded_servers` correctly extracts nothing from
+    it, and taking that emptiness as "our server was absent" publishes a finding about the
+    `type` key from an event whose contents were never examined. The same holds for schema
+    drift — a `servers` that is not a list, or entries that are not named objects — where the
+    entry that could not be parsed is exactly the one that might have been ours.
+
+    An EMPTY `servers` list is a genuine inventory, and the one this clause exists to admit:
+    copilot said what it had and had nothing. That is why the structural test is the
+    list-ness, with `all()` over the entries beneath it — `all()` over `[]` being True is the
+    correct reading here, not a vacuous one, because `isinstance(servers, list)` has already
+    established that the collection is real.
+    """
+    events = parse_events(stream)
+    if reported_statuses(stream):
+        return SERVER_NAMED
+    readable = False
+    for obj in events:
+        if obj.get("type") != "session.mcp_servers_loaded":
+            continue
+        data = obj.get("data")
+        servers = data.get("servers") if isinstance(data, dict) else None
+        if not (isinstance(servers, list) and all(
+                isinstance(srv, dict) and isinstance(srv.get("name"), str)
+                for srv in servers)):
+            return ABSENCE_UNREADABLE
+        readable = True
+    return ABSENCE_ESTABLISHED if readable else ABSENCE_UNREADABLE
+
+
+def type_omission_verdict(bare_records: list[dict], bare_stream: str,
+                          control_records: list[dict], control_stream: str) -> tuple[str, str]:
+    """Did a remote entry with no `type` key produce a server copilot could reach?
+
+    TWO STRUCTURAL CLAUSES AND A POSITIVE CONTROL, ahead of any reading. `server_ran` is asked
+    of both fixtures, because a fixture that never announced itself makes every downstream
+    negative true for the wrong reason. Then the WITH-`type` arm — same fixture shape, same
+    prompt, same model — must show what success looks like here: if the control neither
+    connected nor received a call, the bare arm's silence is a fact about the prompt, the
+    machine or the model, and attributing it to the missing key is the error this pairing
+    exists to prevent.
+
+    Only then is the bare arm read, and it is read from copilot's own status first: a
+    `connected` server is one copilot understood the entry for and opened a connection to,
+    whether or not the model went on to use it.
+    """
+    if not server_ran(bare_records):
+        return INSTRUMENT_FAILED, ("the NO-`type` arm's fixture never announced `listening`, "
+                                   "so nothing about the config shape was measured by it")
+    if not server_ran(control_records):
+        return INSTRUMENT_FAILED, ("the WITH-`type` control's fixture never announced "
+                                   "`listening`, so there is nothing to compare the bare arm "
+                                   "against")
+    control_status = reported_status(control_stream)
+    if control_status != CONNECTED and not called(control_records, ALLOWED):
+        return INSTRUMENT_FAILED, (f"the WITH-`type` control neither connected "
+                                   f"(status={control_status!r}) nor received a call, so this "
+                                   f"run cannot tell a rejected entry from a turn that simply "
+                                   f"never used the tool — the bare arm below measures the "
+                                   f"prompt, not the key")
+    bare_status = reported_status(bare_stream)
+    arrived = called(bare_records, ALLOWED)
+    if bare_status == CONNECTED:
+        return STARTS_WITHOUT_TYPE, (f"copilot reported the server {CONNECTED!r} for an entry "
+                                     f"with NO `type` key"
+                                     + (f", and {ALLOWED!r} arrived at it" if arrived else
+                                        f"; the model did not go on to call {ALLOWED!r}, which "
+                                        f"is a fact about the turn and not about the key"))
+    if arrived:
+        return STARTS_WITHOUT_TYPE, (f"{ALLOWED!r} arrived at a server declared with NO `type` "
+                                     f"key, so copilot reached it (its own status for the "
+                                     f"server was {bare_status!r})")
+    if bare_status in TERMINAL_FAILURE:
+        return NEVER_STARTS, (f"copilot reported the server {bare_status!r} without the `type` "
+                              f"key, while the control reported {control_status!r} with it — a "
+                              f"status this probe has measured to mean the server will not be "
+                              f"coming up")
+    if bare_status is not None:
+        return OMISSION_UNMEASURED, (
+            f"copilot's last word about the server was {bare_status!r}, which is "
+            + ("the ordinary transient before `connected` — an arm that ENDED there was "
+               "truncated or is still starting, and either way says nothing about the key"
+               if bare_status in TRANSIENT else
+               "a status this probe has never measured, so reading it as a negative would "
+               "publish a finding about the key from a word nobody has established the "
+               "meaning of")
+            + f" (the control reported {control_status!r})")
+    absence = absence_verdict(bare_stream)
+    if absence == SERVER_NAMED:
+        return OMISSION_UNMEASURED, (
+            "copilot LISTED our server in the bare arm and never gave it a status word, so the "
+            "entry was understood well enough to name and this run does not say what became of "
+            "it — reading that as `not listed` would publish an absence the very event it came "
+            "from contradicts")
+    if absence == ABSENCE_UNREADABLE:
+        return OMISSION_UNMEASURED, (
+            "the bare arm published no MCP inventory this probe can read — either none at all, "
+            "or one whose contents it could not parse — and nothing reached the fixture; the "
+            "entry that could not be read is exactly the one that might have been ours, so "
+            "this is an arm with no instrument rather than a negative answer")
+    if control_status is None:
+        return OMISSION_UNMEASURED, (
+            "our server was in neither arm's inventory: the control was sound on its CALL "
+            "alone, so nothing here shows this run's witness naming our server when it DOES "
+            "exist, and the bare arm's absence has nothing to be an absence against")
+    return NEVER_STARTS, (f"copilot published its MCP inventory in the bare arm and our "
+                          f"server was NOT in it, while the control listed it "
+                          f"({control_status!r}) — the entry without `type` did not become "
+                          f"a server, and nothing reached the fixture")
+
+
+def measure_type_omission(workdir: str, kind: str, endpoint: str, sentinel: str):
+    """The omission arm and its PAIRED control. Returns (verdict, reason, records, streams).
+
+    TWO ARMS, DIFFERING IN ONE KEY. The control writes `type` and is otherwise identical —
+    same fixture, same prompt, same transport — so it establishes that this transport, this
+    machine and this turn do produce a reachable server, which is the premise the bare arm's
+    negative would otherwise be resting on unstated.
+
+    Both are UNGATED on purpose: `tools:` is not the subject here and a filter would add a
+    second way for the call not to arrive, which is precisely the confusion this arm exists to
+    avoid.
+
+    ONE FIXTURE AND ONE RECEIPTS FILE PER ARM, because the fixture appends and two arms sharing
+    a file would let the control's call satisfy the bare arm's check — the two runs agreeing
+    with each other rather than each being measured (§4).
+    """
+    arms: dict[str, tuple[list[dict], str]] = {}
+    for label, write_type in (("control", True), ("bare", False)):
+        receipts = os.path.join(workdir, f"receipts-{kind}-{label}-notype.jsonl")
+        proc, info = start_fixture(receipts, IDENTITY_GENERATE)
+        if proc is None:
+            return INSTRUMENT_FAILED, f"fixture ({label}): {info}", [], []
+        try:
+            out, _ = run_arm(workdir, info[endpoint], sentinel, kind, tools=None,
+                             write_type=write_type)
+        finally:
+            proc.kill()
+            proc.wait(timeout=15)
+        arms[label] = (read_receipts(receipts), out)
+    bare_records, bare_stream = arms["bare"]
+    control_records, control_stream = arms["control"]
+    verdict, reason = type_omission_verdict(bare_records, bare_stream,
+                                            control_records, control_stream)
+    return verdict, reason, bare_records, [control_stream, bare_stream]
+
+
 def measure(workdir: str, kind: str, endpoint: str, sentinel: str):
     """One transport, both arms. Returns (verdict, reason, results, bearer_ok, answered)."""
     # ONE RECEIPTS FILE PER ARM, because the fixture appends and two arms sharing a file
@@ -384,6 +648,23 @@ def main() -> int:
                 print(f"  SETTLED, AND THE ANSWER IS NO for {kind}: {verdict} is a definite "
                       f"result and it says §8's pattern cannot be declared `native` here")
             ok = ok and good
+        # QUESTION 5, once per transport: the omission arm. Its verdict does not gate on being
+        # POSITIVE — both answers are findings — but an UNANSWERED one leaves slice 3 writing
+        # `type` on an unversioned shape reading, which is the whole reason this arm exists.
+        for kind, endpoint in TRANSPORTS:
+            v, why, recs, outs = measure_type_omission(workdir, kind, endpoint, sentinel)
+            # EVERY ARM'S STREAM, the control's included. An arm left out of the pool is an
+            # arm whose build nothing accounted for, and the paired control is now half the
+            # measurement rather than scaffolding.
+            all_streams.extend(outs)
+            print(f"probe C2-copilot-remote [{kind}] NO-`type` arm: {v}")
+            print(f"  {why}")
+            print(f"  records={len(recs)} server_ran={server_ran(recs)} "
+                  f"called({ALLOWED})={called(recs, ALLOWED)} "
+                  f"copilot_status={reported_status(outs[-1]) if outs else None!r}")
+            if v not in (STARTS_WITHOUT_TYPE, NEVER_STARTS):
+                print("  UNANSWERED: question 5 is not settled by this run")
+                ok = False
         pooled, pooled_ok = agreed_version(all_streams)
         print(f"across every arm of every transport: copilot {pooled}")
         if not pooled_ok:

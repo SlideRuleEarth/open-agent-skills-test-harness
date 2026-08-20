@@ -137,6 +137,13 @@ SESSPROBE = "tools/probe_session_mcp.py"
 CCONFIG = "tools/probe_copilot_config.py"
 CGATE = "tools/probe_copilot_gating.py"
 CGATE_REMOTE = "tools/probe_copilot_remote_gating.py"
+# Phase 2 slice 1's fourth copilot probe: the one that reads copilot's OWN account of the run
+# rather than server-side receipts. Slice 2's witness change and slice 4's parser are both
+# about to be built on the words it prints, which is the same weight the three above carry.
+CEVENTS = "tools/probe_copilot_events.py"
+# The plugin probe reads a SUPPRESSION, so its whole risk is a false negative: an instrument
+# that never loaded a plugin publishing "the flag does not reach plugin servers" about a
+# hermeticity control. Its mutations are correspondingly about the control and about absence.
 # The proxy's I/O half and the awkward server it is driven against. PRODUCTION code that no
 # selftest arm can reach — it is only executed by running the real program over real pipes —
 # so it is `M*` like any other production target, proven by a THIRD suite. The classification
@@ -2983,6 +2990,552 @@ MUTATIONS = [
     # reported STALE ANCHOR and refused to claim 52/52; driving only the NEW mutations, which is
     # what I did, could not have found it. Changing a line invalidates every mutation aimed at
     # it, and the two axes over one expression are still two axes (review, PR #110).
+    # --- Phase 2 slice 1: the events probe, and the `type`-omission arm -------------------
+    # THE UNMEASURED/NEGATIVE COLLAPSE, which is this file's most-repeated defect one probe
+    # over. "No MCP tool call in the stream" and "copilot uses bare tool names" are different
+    # facts, and reading the first as the second would tell slice 4 to match a bare name.
+    ("F171-no-tool-call-reads-as-a-bare-name", CEVENTS,
+     "    if name is None:\n        return UNMEASURED",
+     "    if name is None:\n        return BARE",
+     "no MCP tool call at all is UNMEASURED, never BARE"),
+    # The positive control IS the measurement. Without it, a run where the sentinel never
+    # travelled certifies redaction — a channel nobody proved was connected reporting silence.
+    ("F172-redaction-is-certified-without-a-control", CEVENTS,
+     "    if control_result != RESULT_CARRIED:\n        return CONTROL_FAILED, (",
+     "    if False:\n        return CONTROL_FAILED, (",
+     "a control whose own tool RESULT never appeared measures nothing"),
+    # A conjunction over three questions, not a lookup on the last one read.
+    ("F173-two-answered-questions-are-enough", CEVENTS,
+     "    return (fmt not in (UNMEASURED, AMBIGUOUS, ONE_SOURCE_ONLY)\n            and spelling not in",
+     "    return (fmt not in (UNMEASURED, AMBIGUOUS, ONE_SOURCE_ONLY)\n            or spelling not in",
+     "...and ONE gap (server never named) is enough to fail it"),
+    # The advertised name and the config key are the whole reason question 2 is answerable.
+    # Checking only one spelling makes the other read as "our server never appeared".
+    ("F174-only-the-config-key-is-ever-recognised", CEVENTS,
+     "    by_advertised = statuses_for(seen, ADVERTISED_NAME)",
+     "    by_advertised = []",
+     "...the ADVERTISED name is recognised as a different answer"),
+    # A witness that reads only the first event cannot see a server that failed later — the
+    # exact transition slice 2 exists to classify.
+    ("F175-a-later-status-transition-is-invisible", CEVENTS,
+     '        elif etype == "session.mcp_server_status_changed" and isinstance(data, dict):',
+     "        elif False:",
+     "the witness reads BOTH events, so a later transition is not invisible"),
+    # The structural clause. Without it, a fixture that never started reports "the tool never
+    # arrived" and it is published as a finding about `type`.
+    ("F176-an-unstarted-fixture-becomes-a-type-finding", CGATE_REMOTE,
+     "    if not server_ran(bare_records):",
+     "    if False:",
+     "...but a bare arm whose server never announced itself is INSTRUMENT_FAILED"),
+    # The arm is worthless if the flag does not change the shape it writes.
+    ("F177-the-omission-arm-writes-type-anyway", CGATE_REMOTE,
+     '    if write_type:\n        server["type"] = kind',
+     '    if True:\n        server["type"] = kind',
+     "write_type=False really omits the key, and True really writes it"),
+    # --- PR #120/#121 review: the predicates that were added because the old ones could
+    # --- not fail on the cases that mattered ----------------------------------------------
+    # THE READER WAS FIXED AND THE CONCLUSION WAS NOT. `loaded_servers` was written to see a
+    # server that came up healthy and then failed; its first consumer took the FIRST match.
+    ("F184-the-first-status-is-taken-as-the-runs-answer", CEVENTS,
+     "    return statuses[-1] if statuses else None",
+     "    return statuses[0] if statuses else None",
+     "a server that came up healthy and then FAILED reports `failed`, not `connected`"),
+    # Two sources spelling one tool differently is a question with two answers. Resolving it
+    # by iteration order hands slice 4 a canonical name nobody established.
+    ("F185-a-disagreement-is-resolved-by-whichever-came-first", CEVENTS,
+     "    if len(distinct) > 1:\n        return DISAGREED",
+     "    if len(distinct) > 2:\n        return DISAGREED",
+     "...and the disagreement is AMBIGUOUS, never resolved by whichever came first"),
+    # THE REVIEWER'S REPRODUCTION. Absence of the sentinel from an arm that never made the
+    # call is the absence of the CALL.
+    ("F186-an-arm-that-never-called-certifies-redaction", CEVENTS,
+     "    if not secret_exchanged:\n        return SECRET_ARM_INCOMPLETE, (",
+     "    if False:\n        return SECRET_ARM_INCOMPLETE, (",
+     "a secret arm that never ran the exchange cannot certify redaction"),
+    # Both halves are required: a call with the wrong marker, and the right marker with no
+    # call, are each satisfied by a run that could not have put the value into the output.
+    ("F187-either-half-of-the-exchange-will-do", CEVENTS,
+     "    return held_sentinel(records, sentinel) and answered_with_marker(records)",
+     "    return held_sentinel(records, sentinel) or answered_with_marker(records)",
+     "...so `arm_exchanged` is the conjunction and each half can veto it"),
+    # The marker check is what ties the fixture to THIS run; without it any echo server that
+    # ever ran would do.
+    ("F188-any-servers-marker-will-do", CEVENTS,
+     '    return any(r.get("kind") == "listening" and r.get("identity_digest") == want',
+     '    return any(r.get("kind") == "listening" and r.get("identity_digest") != want',
+     "...a server holding a DIFFERENT marker is not this run's exchange either"),
+    # AN ARM THAT PRODUCED NOTHING IS THE ONE WHOSE BUILD IS LEAST ACCOUNTED FOR. Filtering
+    # the empties out before agreement is what let a vanished secret arm ride through.
+    # RE-AIMED (mutation run, PR #120): the exit status stopped being able to catch this once
+    # the secret arm had to produce a RESULT event, since an empty arm is refused by that gate
+    # first and exits 1 for a reason this mutation does not touch. The rule is about the
+    # ARGUMENT `agreed_version` receives, so the arm reads the argument.
+    ("F189-an-arm-with-no-stream-is-excused-from-agreement", CEVENTS,
+     "    version, version_ok = agreed_version([control, secret])",
+     "    version, version_ok = agreed_version([s for s in (control, secret) if s])",
+     "...and the version witness is handed EVERY arm main() launched, the empty one included"),
+    # The gate must read the receipts of the arm it is judging, not the arm beside it.
+    ("F190-the-controls-receipts-vouch-for-the-secret-arm", CEVENTS,
+     "        secret_exchanged=arm_exchanged(secret_receipts, sentinel),",
+     "        secret_exchanged=arm_exchanged(control_receipts, sentinel),",
+     "...and each arm's exchange gate is computed from ITS OWN receipts"),
+    # An empty field list from a run with no tool execution says nothing about the fields.
+    ("F191-no-execution-reads-as-the-fields-being-absent", CEVENTS,
+     "    if not executions:\n        return FIELDS_UNMEASURED, (",
+     "    if False:\n        return FIELDS_UNMEASURED, (",
+     "no execution at all is UNMEASURED, not `the fields are absent`"),
+    # --- the `type`-omission arm's paired control -----------------------------------------
+    # WITHOUT A POSITIVE CONTROL the bare arm's silence measures the prompt, the machine or
+    # the model, and it gets published as a finding about the key.
+    ("F196-the-bare-arm-needs-no-positive-control", CGATE_REMOTE,
+     "    if control_status != CONNECTED and not called(control_records, ALLOWED):",
+     "    if False:",
+     "...and a control that never connected and never got a call is INSTRUMENT_FAILED"),
+    # A control whose fixture never bound is not a control.
+    ("F197-an-unbound-control-is-still-a-control", CGATE_REMOTE,
+     "    if not server_ran(control_records):",
+     "    if False:",
+     "...and a CONTROL whose server never announced itself is INSTRUMENT_FAILED too"),
+    # BOTH arms of the pair must reach version agreement: a control that executed a different
+    # build makes the comparison meaningless just as surely as a bare arm that did. TWO
+    # MUTATIONS, ONE PER DIRECTION, because a single one is killed by whichever arm it happens
+    # to drop and says nothing about the other — the first version of this pair named the bare
+    # arm's check while dropping the CONTROL's stream, and the suite reported it as failing via
+    # the wrong arm (mutation run, PR #120). `outs` is `[control, bare]`, so the slice says
+    # which one is being dropped.
+    ("F198-the-with-type-controls-build-is-not-pooled", CGATE_REMOTE,
+     "            all_streams.extend(outs)",
+     "            all_streams.extend(outs[1:])",
+     "...as is its WITH-`type` control's, which is now half the measurement"),
+    ("F199-only-the-controls-build-is-pooled", CGATE_REMOTE,
+     "            all_streams.extend(outs)",
+     "            all_streams.extend(outs[:1])",
+     "...and the `type`-omission arm's own build is pooled with the rest"),
+    # --- PR #120, second review round: four classifiers that could not fail on the case
+    # --- they were written for ------------------------------------------------------------
+    # AGREEMENT NEEDS TWO PARTIES. One source saying one thing is one observation and one
+    # UNOBSERVED source, and reading it as agreement exits ANSWERED under a conclusion that
+    # says "both sources, identically".
+    ("F200-one-source-counts-as-agreement", CEVENTS,
+     "    if any(not by_source.get(src) for src in EXPECTED_SOURCES):\n        return PARTIAL",
+     "    if False:\n        return PARTIAL",
+     "only the 'execution' source speaking is ONE_SOURCE_ONLY, not AGREED"),
+    # A PARTIAL reading is not an answer, whatever the classifier calls it.
+    ("F201-a-partial-source-reading-still-answers", CEVENTS,
+     "    return (fmt not in (UNMEASURED, AMBIGUOUS, ONE_SOURCE_ONLY)\n",
+     "    return (fmt not in (UNMEASURED, AMBIGUOUS)\n",
+     "...and ONE_SOURCE_ONLY is not an answer"),
+    # THE REQUEST ROW IS WRITTEN BEFORE THE SERVER DECIDES ANYTHING. A call refused on
+    # protocol grounds leaves the same row as a served one, and redaction read off it is a
+    # claim about a reply that was never produced.
+    # A WHOLE-PREDICATE MUTATION, and it has to be one: the repair is over-determined, because
+    # the `served` row carries a field the arrival row does not. Swapping the row kind alone
+    # leaves `carried_identity` unreadable and the predicate false for a DIFFERENT reason, so
+    # no single-clause edit expresses "arrival counted as an answer". This restores the exact
+    # predicate the review found and asks whether any arm notices the repair being undone.
+    ("F202-arrival-counts-as-an-answer", CEVENTS,
+     '    return any(r.get("kind") == "served" and r.get("method") == "tools/call"\n               and r.get("tool") == TOOL and r.get("carried_identity") is True\n               for r in records)',
+     '    return any(r.get("kind") == "request" and r.get("method") == "tools/call"\n               and r.get("tool") == TOOL for r in records)',
+     "a call that ARRIVED and was REJECTED is arrival without an answer"),
+    # An answer that carried no marker put no value on the wire, so its absence downstream
+    # measures nothing.
+    ("F203-a-reply-carrying-nothing-is-still-an-exchange", CEVENTS,
+     '    return any(r.get("kind") == "served" and r.get("method") == "tools/call"\n               and r.get("tool") == TOOL and r.get("carried_identity") is True',
+     '    return any(r.get("kind") == "served" and r.get("method") == "tools/call"\n               and r.get("tool") == TOOL',
+     "...and a reply carrying NO marker is an answer without a value"),
+    # BOTH SERVER SPELLINGS IN ONE RUN is a finding about the contract. A priority order hides
+    # it twice: it reports one spelling confidently AND drops the final status.
+    ("F204-a-mixed-spelling-run-picks-the-config-key", CEVENTS,
+     "    if by_key and by_advertised:",
+     "    if False:",
+     "BOTH spellings in one run is REPORTS_BOTH, never the first one checked"),
+    ("F205-reports-both-still-answers", CEVENTS,
+     "            and spelling not in (REPORTS_NEITHER, REPORTS_BOTH)",
+     "            and spelling not in (REPORTS_NEITHER,)",
+     "...which `answered()` refuses, since a contract that is two things is not an answer"),
+    # `pending` IS THE ORDINARY TRANSIENT, measured by this same probe. Treating every
+    # non-`connected` status as the negative publishes a finding about the key from a
+    # truncated arm — and from any word a later build invents.
+    ("F206-every-non-connected-status-is-a-type-finding", CGATE_REMOTE,
+     "    if bare_status in TERMINAL_FAILURE:",
+     "    if bare_status is not None:",
+     "a bare arm ENDING at `pending` is UNMEASURED — that is the transient, not a failure"),
+    # "Our server was not listed" is evidence only from an arm that got far enough to say
+    # what it HAD.
+    ("F207-an-arm-that-published-nothing-still-decides", CGATE_REMOTE,
+     "    if absence == ABSENCE_UNREADABLE:\n        return OMISSION_UNMEASURED, (",
+     "    if False:\n        return OMISSION_UNMEASURED, (",
+     "...but an arm that never published an inventory AT ALL is UNMEASURED, not a finding"),
+    # --- PR #120, third review round -------------------------------------------------------
+    # QUESTION 2 ASKS TWO THINGS and only the spelling reached the exit predicate, so a witness
+    # naming our server with no `status` field exited ANSWERED having measured half of it.
+    ("F208-the-status-half-of-question-2-need-not-be-measured", CEVENTS,
+     "            and status_state == STATUS_MEASURED\n",
+     "",
+     "...and ONE gap (no status observed) is enough to fail it"),
+    # Reading whatever status appeared and calling it the HEALTHY one assumes the thing being
+    # measured: a server that failed to start reports `failed`, and the status does not say so.
+    ("F209-any-status-is-the-healthy-status", CEVENTS,
+     "    if not served:\n        return STATUS_UNWITNESSED, (",
+     "    if False:\n        return STATUS_UNWITNESSED, (",
+     "a real status from an arm that never served is UNWITNESSED, not the healthy status"),
+    # An absent status is not a status. Without this the empty string and None both sail past.
+    ("F210-an-absent-status-counts-as-one", CEVENTS,
+     "    if not isinstance(status, str) or not status:",
+     "    if False:",
+     "...and that is STATUS_ABSENT, so the exit predicate can see it"),
+    # THE CONTROL MUST HAVE DONE THE SAME THING. Without this the two arms are not comparable,
+    # and a control that echoed a config while calling nothing certifies redaction.
+    ("F211-the-control-need-not-have-run-the-exchange", CEVENTS,
+     "    if not control_exchanged:\n        return CONTROL_INCOMPLETE, (",
+     "    if False:\n        return CONTROL_INCOMPLETE, (",
+     "a control that never ran the exchange makes the two arms incomparable"),
+    # The control's evidence must be ATTRIBUTED to our tool's result. A substring search over
+    # the whole stream is satisfied by the config this probe wrote, under `--allow-all`.
+    ("F212-any-appearance-in-the-stream-is-the-tool-reply", CEVENTS,
+     "    starts = mcp_starts(events)\n    if not starts:\n        return RESULT_ABSENT",
+     ("    starts = mcp_starts(events)\n    if True:\n"
+      "        return (RESULT_CARRIED if any(sentinel in json.dumps(o) for o in events)\n"
+      "                else RESULT_ABSENT)"),
+     "...but the sentinel merely APPEARING in the stream is not our tool's result"),
+    # AN UNREADABLE INVENTORY IS NOT AN INVENTORY. `{"data": 42}` has the right event type and
+    # says nothing about which servers copilot had, so absence from it proves nothing.
+    ("F213-a-malformed-inventory-proves-absence", CGATE_REMOTE,
+     ("        if not (isinstance(servers, list) and all(\n"
+      "                isinstance(srv, dict) and isinstance(srv.get(\"name\"), str)\n"
+      "                for srv in servers)):"),
+     "        if servers is None:",
+     "...nor does schema drift (`servers` is not a list) — the unparsable entry could be ours"),
+    # THE OTHER GUARD ON THE SAME PREDICATE, and it needs its own mutation because the two
+    # reject different shapes: `{"data": 42}` never reaches the `servers` clause at all, so the
+    # arm for it cannot kill a mutation of that clause (mutation run, PR #120).
+    ("F214-an-unreadable-data-object-is-an-inventory", CGATE_REMOTE,
+     '        servers = data.get("servers") if isinstance(data, dict) else None',
+     '        servers = data.get("servers") if isinstance(data, dict) else []',
+     "an inventory event whose `data` is unreadable does NOT establish absence"),
+    # --- PR #120, fourth review round ------------------------------------------------------
+    # A NAME AND A STATUS ARE TWO FACTS ABOUT ONE ENTRY, and the name was being read through
+    # the status: a server copilot listed with no `status` field gave the status reader `None`
+    # — the same answer as a stream that never mentioned it — and the pair published "our
+    # server was not in the inventory" from the inventory that names it.
+    ("F215-a-listed-server-with-no-status-is-absent", CGATE_REMOTE,
+     "    if reported_statuses(stream):\n        return SERVER_NAMED",
+     "    if False:\n        return SERVER_NAMED",
+     "a server copilot LISTED, statusless, is NAMED — absence is disproven, not proven"),
+    # AN UNREADABLE INVENTORY TAINTS THE NEGATIVE; it does not yield to a readable one beside
+    # it. The `continue` this restores is what let a run whose real inventory failed to parse
+    # establish absence from the other one.
+    ("F216-an-unreadable-inventory-yields-to-a-readable-one", CGATE_REMOTE,
+     "            return ABSENCE_UNREADABLE\n        readable = True",
+     "            continue\n        readable = True",
+     "...and one unreadable inventory taints a readable one beside it, either order"),
+    # ...and a run that published NO inventory at all has not established absence either.
+    ("F217-a-run-with-no-inventory-establishes-absence", CGATE_REMOTE,
+     "    return ABSENCE_ESTABLISHED if readable else ABSENCE_UNREADABLE",
+     "    return ABSENCE_ESTABLISHED",
+     "`absence_verdict` separates those two, or the clause above cannot bite"),
+    # "OUR SERVER WAS NOT LISTED" NEEDS AN ARM THAT LISTS IT WHEN IT EXISTS. A control sound
+    # only on its CALL never showed this run's witness naming the server at all.
+    ("F218-the-bare-arms-absence-needs-no-control-listing", CGATE_REMOTE,
+     "    if control_status is None:\n        return OMISSION_UNMEASURED, (",
+     "    if False:\n        return OMISSION_UNMEASURED, (",
+     "a bare arm with no call and no status is UNMEASURED when copilot reported nothing"),
+    # THE RECEIPTS END AT THE WIRE. They prove the reply went OUT carrying the value; only
+    # copilot's own result event says anything came back. An arm with an execution and no
+    # completion event has nothing to redact, and it certified REDACTS.
+    ("F219-a-lost-result-is-a-redacted-one", CEVENTS,
+     "    if secret_result not in INSPECTABLE_RESULTS:\n        return SECRET_ARM_INCOMPLETE, (",
+     "    if False:\n        return SECRET_ARM_INCOMPLETE, (",
+     "a secret arm that served the call and emitted NO result is incomplete, not REDACTS"),
+    # ...and the gate must read the arm it is judging, not the arm beside it — F190's rule,
+    # over the witness the same review added.
+    ("F220-the-controls-result-vouches-for-the-secret-arm", CEVENTS,
+     "        secret_result=tool_result_state(ev_secret, sentinel,",
+     "        secret_result=tool_result_state(ev_control, sentinel,",
+     "...nor one whose call was served and whose RESULT copilot never emitted"),
+    # THE CALLER MUST CONSULT THE PREDICATE, which is a different mutation from breaking either
+    # clause INSIDE it (F228/F229): this one deletes the question rather than an answer, and it
+    # is aimed at an arm neither of those two claims — RE-AIMED after it survived naming the
+    # CLEAN arm, which a mutation that only turns unreadable into clean cannot redden
+    # (mutation run, PR #120).
+    ("F221-the-usability-clause-is-not-consulted", CEVENTS,
+     "    if not usable_result(done[0]):\n        return RESULT_UNREADABLE",
+     "    if False:\n        return RESULT_UNREADABLE",
+     "...but a completion with a NULL result is RESULT_UNREADABLE, never clean"),
+    # A NULL STATUS IS STILL AN ENTRY. Filtering the `None` out reads as "not named", which is
+    # the same collapse one function earlier.
+    ("F223-a-null-status-drops-the-entry", CGATE_REMOTE,
+     "    return statuses_for(loaded_servers(parse_events(stream)), SERVER_KEY)",
+     ("    return [st for st in statuses_for(loaded_servers(parse_events(stream)), SERVER_KEY)\n"
+      "            if st]"),
+     "a LISTED-but-statusless server reads `None` as a status, and keeps its NAME"),
+    # NAMING IS READ FROM EVERY WITNESS EVENT, not only the inventory: a server copilot first
+    # mentions in a status transition has still been named.
+    ("F224-only-the-inventory-can-name-our-server", CGATE_REMOTE,
+     "    if reported_statuses(stream):\n        return SERVER_NAMED",
+     ('    if any(o.get("type") == "session.mcp_servers_loaded" for o in events) and \\\n'
+      "            reported_statuses(stream):\n        return SERVER_NAMED"),
+     "...and a later status TRANSITION naming it counts as naming it, with no inventory"),
+    # THE TAINT IS ASYMMETRIC ON PURPOSE. An unreadable event may HIDE servers; it can never
+    # remove one that another event named, so the naming is read first and outranks it.
+    ("F225-an-unreadable-event-un-names-our-server", CGATE_REMOTE,
+     ("    events = parse_events(stream)\n    if reported_statuses(stream):\n"
+      "        return SERVER_NAMED"),
+     ("    events = parse_events(stream)\n    if reported_statuses(stream) and all(\n"
+      '            isinstance(o.get("data"), dict) for o in events\n'
+      '            if o.get("type") == "session.mcp_servers_loaded"):\n'
+      "        return SERVER_NAMED"),
+     "...while garbage beside a NAMING event leaves the naming standing"),
+    # WHICH LOSS IT WAS IS THE DIAGNOSIS, so the control failures do not share a sentence.
+    # RE-ANCHORED on the call that replaced the inline enumeration these used to quote
+    # (review, PR #120, ninth round). The mutation is the same one — every state in the
+    # branch reads alike — and it is now the thing the account table exists to prevent.
+    ("F226-the-control-losses-read-the-same", CEVENTS,
+     "            + result_account(control_result)",
+     '            + ""',
+     "...and those two control failures are told apart in the reason, not merged"),
+    # ...and so do the routes the value can still be in the output by.
+    ("F227-the-two-leak-routes-read-the-same", CEVENTS,
+     '            "variable, and " + result_account(secret_result)',
+     '            "variable, and " + ""',
+     "...and a secret result that CARRIED the value is NO_REDACTION by its OWN route"),
+    # THE STRONGEST READING WINS, NOT THE LAST. A scan that keeps whichever result it saw most
+    # recently reports `RESULT_CLEAN` for a run that leaked in an earlier one.
+    # `done and …` IS LOAD-BEARING IN THE REPLACEMENT: without it the mutant raises IndexError
+    # on the no-completion arms, which ENDS the linear verifier before the arm named here ever
+    # runs — a mutation must be a plausible wrong implementation, not a crashing one, or it is
+    # "caught" by the wrong thing and proves nothing (mutation run, PR #120).
+    ("F222-the-last-result-decides-rather-than-the-worst", CEVENTS,
+     '    if any(sentinel in json.dumps(data.get("result")) for data in done):',
+     '    if done and sentinel in json.dumps(done[-1].get("result")):',
+     "...a clean result AFTER a carrying one does not erase it"),
+    # --- PR #120, fifth review round -------------------------------------------------------
+    # "A COMPLETION ARRIVED" IS NOT "A RESULT CAME BACK". A failed call carrying no result read
+    # as `RESULT_CLEAN`, and REDACTS was published from a completion with nothing in it.
+    ("F228-a-failed-completion-is-a-clean-result", CEVENTS,
+     '    if data.get("success") is not True:\n        return False',
+     "    if False:\n        return False",
+     ("...but a completion with the call FAILED though its payload is well-formed is "
+      "RESULT_UNREADABLE, never clean")),
+    # ...and the payload half of the same predicate, which rejects a different shape: a
+    # `success: true` completion whose `result` is empty, null or missing entirely.
+    ("F229-an-empty-payload-is-a-result", CEVENTS,
+     "    return isinstance(result, (dict, list, str)) and bool(result)",
+     "    return True",
+     "...but a completion with an EMPTY result payload is RESULT_UNREADABLE, never clean"),
+    # THE GATE MUST JOIN THE PREDICATE, not name one state: `== RESULT_ABSENT` is exactly the
+    # version that let a completion with nothing in it walk through into REDACTS.
+    ("F230-only-a-missing-completion-is-a-loss", CEVENTS,
+     "    if secret_result not in INSPECTABLE_RESULTS:",
+     "    if secret_result == RESULT_ABSENT:",
+     "...nor can one whose completion carried no result to inspect"),
+    # THE READING THAT ACCUSES OUTRANKS THE ONE THAT EXCUSES. Asking about usability first
+    # files a failed completion that carries the value as "nothing to inspect".
+    ("F231-a-failed-completion-cannot-leak", CEVENTS,
+     ('    if any(sentinel in json.dumps(data.get("result")) for data in done):\n'
+      "        return RESULT_CARRIED"),
+     ('    if any(usable_result(data) and sentinel in json.dumps(data.get("result"))\n'
+      "           for data in done):\n        return RESULT_CARRIED"),
+     "...while a FAILED completion whose result carries the value is still a leak"),
+    # --- PR #120, sixth review round -------------------------------------------------------
+    # THE `served` ROW AND THE COMPLETION SHARE NO IDENTIFIER, so attribution is established by
+    # cardinality: one marker-bearing reply, one execution, one completion. Each conjunct is a
+    # different way for two calls to be mistaken for one, so each gets its own mutation.
+    ("F233-a-second-marker-bearing-reply-is-still-one-exchange", CEVENTS,
+     "    if len(starts) != 1 or replies != 1:",
+     "    if len(starts) != 1:",
+     ("...a clean result in a run with TWO marker-bearing replies on the fixture's wire is "
+      "UNATTRIBUTED, not clean")),
+    ("F234-a-second-completion-is-still-one-result", CEVENTS,
+     "    if len(done) != 1:\n        return RESULT_UNATTRIBUTED",
+     "    if False:\n        return RESULT_UNATTRIBUTED",
+     ("...a clean result in a run with two completions for one execution is UNATTRIBUTED, "
+      "not clean")),
+    # THE ID COUNT NOW MEANS WHAT IT SAYS — the one execution's id is usable — so its arm is
+    # the lone-unusable-id run, not the two-execution run that `len(starts)` catches first
+    # (review, PR #120).
+    # `F235-an-uncorrelatable-execution-is-still-attributable` STOOD HERE and is retired, not
+    # lost. It dropped `len(ids) != 1` from the cardinality gate; the eleventh round moved the
+    # empty-correlated-view branch above that gate, which made the term undecidable there — the
+    # gate is reached only with a non-empty `done`, so `len(ids) >= 1`, and `len(starts) == 1`
+    # bounds it at 1. The mutation therefore produced code identical in behaviour to the
+    # original and could not be caught by anything (mutation run, PR #120). The term is gone
+    # from the source for the same reason. Its ARM is untouched and still red under `F257`,
+    # which perturbs `len(ids) == len(starts)` in the branch that now decides it — the rule
+    # moved, the coverage moved with it, and this comment is here so the gap in the numbering
+    # is not read as a deletion.
+    # --- PR #120, seventh review round -----------------------------------------------------
+    # A SET OF IDS IS NOT A COUNT OF CALLS. `mcp_call_ids` deduplicates and drops unusable ids,
+    # both correct for correlation and both wrong for counting executions.
+    ("F238-the-id-count-is-the-execution-count", CEVENTS,
+     "    if len(starts) != 1 or replies != 1:",
+     "    if len(ids) != 1 or replies != 1:",
+     # RE-AIMED: with ownership inside `mcp_call_ids`, a REUSED id yields no usable id at all,
+     # so `len(ids) != 1` refuses that run first and this mutation survives it. The shape that
+     # still isolates the START count is a second execution whose id is unusable while the
+     # first one's remains valid (mutation run, PR #120).
+     ("...a second execution of ours carrying an EMPTY `toolCallId` is still a second "
+      "execution")),
+    # ...and the execution list must not itself filter on the id, which would reinstate the
+    # same blindness one function down.
+    # --- PR #120, eighth review round ------------------------------------------------------
+    # THE ID IS THE ONLY LINK, so an id two start events answer to is not a link. Counting our
+    # own starts caught two of OURS sharing an id and said nothing about a FOREIGN execution
+    # reusing it — and the completion names no tool.
+    ("F240-an-id-shared-with-another-tool-is-still-ours", CEVENTS,
+     "        if cid and claims.get(cid) == 1:",
+     "        if cid:",
+     "an id claimed by a FOREIGN execution too is nobody's correlation key"),
+    # ...and ownership is a fact about the WHOLE stream: counting only our own starts would
+    # call an id unambiguous while another tool claims it in the next line.
+    ("F241-ownership-is-counted-over-our-own-executions", CEVENTS,
+     ("    for obj in events:\n        if obj.get(\"type\") != \"tool.execution_start\":\n"
+      "            continue\n        data = obj.get(\"data\")\n"
+      "        if not isinstance(data, dict):\n            continue\n        cid = start_id(data)"),
+     "    for data in mcp_starts(events):\n        cid = start_id(data)",
+     "an id claimed by a FOREIGN execution too is nobody's correlation key"),
+    # THE ACCUSING READING NEEDS NEITHER CONTROL NOR ATTRIBUTION. Read last, a leak in a run
+    # whose control broke — or whose exchange could not be attributed — is reported as an
+    # incomplete arm rather than as the finding it is.
+    ("F242-a-leak-is-reported-only-once-everything-else-is-provable", CEVENTS,
+     ("    if sentinel in secret_stream:\n        return NO_REDACTION, (\n"
+      '            "the sentinel appears in the output WITH --secret-env-vars naming its "'),
+     ("    if False:\n        return NO_REDACTION, (\n"
+      '            "the sentinel appears in the output WITH --secret-env-vars naming its "'),
+     "a leak is reported even when the CONTROL never ran the exchange"),
+    # --- PR #120, ninth review round -------------------------------------------------------
+    # THE VERDICT MAY MERGE STATES; THE SENTENCE MAY NOT. This is the shape the account
+    # replaced, restored exactly: a two-way `else` over a five-word vocabulary, which tells
+    # four states what the fifth would have shown.
+    ("F243-one-states-sentence-serves-every-other-state", CEVENTS,
+     '            "variable, and " + result_account(secret_result)',
+     ('            "variable, and " + (result_account(RESULT_CARRIED)\n'
+      "                               if secret_result == RESULT_CARRIED else\n"
+      "                               result_account(RESULT_CLEAN))"),
+     ("...and no state but RESULT_CLEAN is told our tool's result came back without it")),
+    # ...and the same defect one branch down, where the `else` covered RESULT_CLEAN and
+    # RESULT_UNATTRIBUTED together and described only the first. No arm drove it.
+    ("F244-an-unattributable-control-result-is-a-clean-one", CEVENTS,
+     "            + result_account(control_result)",
+     ("            + result_account(RESULT_CLEAN if control_result == RESULT_UNATTRIBUTED\n"
+      "                             else control_result)"),
+     ("...including RESULT_UNATTRIBUTED, which its `else` called a result that came back")),
+    # ...and the table has to be TOTAL over the vocabulary, or a state falls to the fallback
+    # and the probe publishes a sentence that describes nothing.
+    ("F245-the-account-covers-the-states-someone-remembered", CEVENTS,
+     ("    RESULT_UNREADABLE: (\"our tool's completion carried no usable result to inspect: the call \"\n"
+      '                        "did not report success, or its payload was empty or unreadable"),\n'),
+     "",
+     ("...and `result_account` is total over it: its domain IS the vocabulary")),
+    # ...and two states sharing a sentence is the merge this whole table exists to prevent,
+    # arriving by the table instead of by an `else`.
+    ("F246-two-states-may-share-one-sentence", CEVENTS,
+     ("    RESULT_UNREADABLE: (\"our tool's completion carried no usable result to inspect: the call \"\n"
+      '                        "did not report success, or its payload was empty or unreadable"),'),
+     '    RESULT_UNREADABLE: "no completion for our tool reached the output at all",',
+     ("...with a different sentence for each, so no two states are told the same thing")),
+    # ...and the fallback must NAME the state it cannot account for. A fallback that hands
+    # back a real account is the original bug with a longer fuse: silent, and for a state
+    # nobody has read yet.
+    ("F247-the-fallback-is-a-default-rather-than-a-refusal", CEVENTS,
+     ("    return RESULT_ACCOUNTS.get(\n"
+      '        state, f"our tool\'s result is in state {state!r}, which this reader has no "\n'
+      '               f"account of")'),
+     "    return RESULT_ACCOUNTS.get(state, RESULT_ACCOUNTS[RESULT_CLEAN])",
+     ("...and a state with NO account is NAMED, not handed some other state's sentence")),
+    ("F239-an-id-less-start-is-not-an-execution", CEVENTS,
+     ("    return [obj[\"data\"] for obj in events\n"
+      '            if obj.get("type") == "tool.execution_start"'),
+     ("    return [obj[\"data\"] for obj in events\n"
+      '            if obj.get("type") == "tool.execution_start"\n'
+      '            and isinstance(obj.get("data"), dict)\n'
+      '            and isinstance(obj["data"].get("toolCallId"), str)'),
+     ("...a second execution of ours carrying no `toolCallId` at all is still a second "
+      "execution")),
+    # NOTHING CAME BACK AT ALL IS ITS OWN LOSS, and folding it into the attribution branch
+    # would report a run copilot never answered as one it answered ambiguously.
+    # RE-AIMED (review, PR #120, tenth round): the run this used to be caught on — an execution
+    # and no completion — is now answered by the EXISTENCE gate two lines up, so mutating this
+    # branch left the old arm green. Third instance of §4's "a new gate makes an older
+    # mutation's arm insensitive". The shape that still reaches here is a completion that
+    # ARRIVED and is provably somebody else's.
+    ("F236-a-missing-completion-is-merely-unattributable", CEVENTS,
+     ("        return (RESULT_ABSENT\n"
+      "                if all(completion_id(data) for data in completions)\n"
+      "                and len(ids) == len(starts)\n"
+      "                else RESULT_UNATTRIBUTED)"),
+     "        return RESULT_UNATTRIBUTED",
+     "...and one carrying a completion is ABSENT only when every one can be EXCLUDED"),
+    # --- PR #120, eleventh review round ----------------------------------------------------
+    # THE EMPTY VIEW IS THE SAME QUESTION ONE JOIN IN, so it is settled before cardinality too.
+    # Left below that gate it borrowed "our id is unique here" from it, and two perfectly
+    # identifiable executions beside one foreign completion — provably neither of theirs —
+    # were refused as ambiguous instead of answered as empty.
+    ("F259-several-executions-cannot-have-an-empty-view", CEVENTS,
+     "    if not done:\n        # NOTHING OF OURS CAME BACK",
+     "    if not done and len(starts) == 1:\n        # NOTHING OF OURS CAME BACK",
+     "...and an empty correlated view IS ABSENT when every completion is excludable"),
+    # ...and how many replies the FIXTURE put on the wire cannot decide whether anything came
+    # BACK. That is the other half of the same borrowing, and it survives the arm above.
+    ("F258-the-reply-count-decides-whether-anything-came-back", CEVENTS,
+     "    if not done:\n        # NOTHING OF OURS CAME BACK",
+     "    if not done and replies == 1:\n        # NOTHING OF OURS CAME BACK",
+     "...and cardinality no longer stands in front of it: replies do not decide absence"),
+    # ...and EVERY execution of ours must be identifiable before absence is readable: a
+    # completion cannot be excluded from an execution that answers to no id at all, so an
+    # id-less start beside a foreign completion is unattributable, not empty.
+    ("F257-an-id-less-execution-can-still-be-excluded-from", CEVENTS,
+     "                and len(ids) == len(starts)\n",
+     "",
+     "...and an empty correlated view IS ABSENT when every completion is excludable"),
+    # --- PR #120, tenth review round -------------------------------------------------------
+    # EXISTENCE IS SETTLED BEFORE ATTRIBUTION. Read the other way round, a run with two starts
+    # and NO completion whatever is "unattributable" — and publishes a sentence saying results
+    # came back, about a stream that contains none.
+    ("F252-ambiguity-is-decided-before-anything-came-back", CEVENTS,
+     "    if not completions:\n        return RESULT_ABSENT",
+     "    if False:\n        return RESULT_ABSENT",
+     "a stream carrying NO completion event is ABSENT, whatever its starts look like"),
+    # ...and the existence question is asked of the RAW events. Asked of the readable ones, a
+    # completion that arrived unreadable reads exactly like a completion that never arrived.
+    ("F253-an-unreadable-completion-never-arrived", CEVENTS,
+     ('    completions = [obj.get("data") for obj in events\n'
+      '                   if obj.get("type") == "tool.execution_complete"]'),
+     ('    completions = [obj.get("data") for obj in events\n'
+      '                   if obj.get("type") == "tool.execution_complete"\n'
+      '                   and isinstance(obj.get("data"), dict)]'),
+     "...and one carrying a completion is ABSENT only when every one can be EXCLUDED"),
+    # ...and EVERY completion must be excludable before absence is readable, not merely one of
+    # them: a run holding one excludable completion beside one it cannot read has not shown
+    # that nothing of ours came back.
+    ("F254-one-excludable-completion-excludes-them-all", CEVENTS,
+     "                if all(completion_id(data) for data in completions)",
+     "                if any(completion_id(data) for data in completions)",
+     "...and one carrying a completion is ABSENT only when every one can be EXCLUDED"),
+    # ...and "carries an id" means a USABLE one. A completion whose id is a number can be
+    # excluded from nothing, and reading the raw field makes it excludable.
+    ("F255-any-toolcallid-value-excludes-a-completion", CEVENTS,
+     "    return start_id(data) if isinstance(data, dict) else None",
+     '    return data.get("toolCallId") if isinstance(data, dict) else None',
+     "...and one carrying a completion is ABSENT only when every one can be EXCLUDED"),
+    # ...and the rule must be `start_id` itself rather than a copy of it, or the two readings
+    # of a usable id drift and the join stops meaning one thing (§4's duplicated-rule rule).
+    ("F256-the-completions-id-rule-is-a-copy-of-the-starts", CEVENTS,
+     "    return start_id(data) if isinstance(data, dict) else None",
+     ('    cid = data.get("toolCallId") if isinstance(data, dict) else None\n'
+      "    return cid if isinstance(cid, str) else None"),
+     "`completion_id` reads an id by the SAME rule as `start_id`, and is not a copy of it"),
+    # ...and the count must come from the arm being judged — F190/F220's rule, third witness.
+    ("F237-the-controls-reply-count-vouches-for-the-secret-arm", CEVENTS,
+     "                                        replies=marker_replies(secret_receipts)))",
+     "                                        replies=marker_replies(control_receipts)))",
+     "...nor one whose fixture answered TWICE, leaving the clean result unattributable"),
+    # ...and which loss it was is the diagnosis on the secret side too.
+    # RE-ANCHORED with F226 and F227, same round, same reason.
+    ("F232-the-two-secret-losses-read-the-same", CEVENTS,
+     "            + result_account(secret_result)",
+     '            + ""',
+     "...and those two secret losses are told apart in the reason, not merged"),
     ("F41-the-bearer-need-only-arrive-once", CGATE_REMOTE,
      '    return all((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',
      '    return any((r.get("headers") or {}).get("authorization", "") == expected for r in seen)',

@@ -20,8 +20,10 @@ entire reason C3 exists). So the pattern this whole design was written for is re
 injection alone. On claude the same pattern still needs §10.10's five bridge slices. Nothing retires
 the bridge: it stays the only route on claude, and the only tool gating agy will ever have (§10.1).
 
-The installed CLI is **1.0.79**. That is the build the *behavioural* measurements below were taken
-against, and they carry it from **each run's own stream**. It is not a blanket warrant over §2: one class
+The installed CLI **has since moved to 1.0.80** — copilot auto-updates, which is the exact expiry this
+document's provenance rules exist for. The behavioural measurements in §2 were taken at **1.0.79** and
+carry it from **each run's own stream**; slice 1's own readings carry **1.0.80** the same way. A claim
+here is qualified by the build its run witnessed, never by whatever is installed today. It is not a blanket warrant over §2: one class
 of fact here is attributable to no build at all, by construction, and reading §2 as uniformly "measured
 at 1.0.79" is exactly what would send slice 3 building on a claim nobody made.
 
@@ -105,9 +107,28 @@ have been the safer call.
 ### What the decision does and does not unblock
 
 It fixes slice 2's **policy** — every status class now has a verdict, and the change becomes a port of
-claude's resolution rather than a new one. It does **not** unblock slice 2's **implementation**: which
-status string a healthy injected copilot server actually reports is still unmeasured (slice 1, question
-2). A says what to do with each class; it does not say which string is which class.
+claude's resolution rather than a new one. It did **not** unblock slice 2's **implementation**, which
+needed the status string a healthy injected copilot server actually reports — **now measured at 1.0.80
+(slice 1, question 2): `pending` → `connected`, with `failed` and `disabled` the other two words the
+fleet's copilot probes have seen.** A says what to do with each class; slice 1 says which string is
+which class, and slice 2 can now be written.
+
+**One thing slice 2 must take from how that was measured, not just from what it says — and it is a
+place where the obvious lesson is the wrong one.** `pending` is a *transient*: it precedes `connected`
+in every healthy run, so a reader that takes the FIRST status a server carried calls a dead server
+healthy. The slice 1 probe shipped with exactly that and a review caught it (PR #120).
+
+**Do not port that fix into `_mcp_witness` as it stands.** The two are asking different questions of the
+same rows. Phase 0's kill-switch asks *did any server ever come up?* — for which "any non-inert status,
+at any point" is the right and fail-closed reading, and it is what the witness does today by
+accumulating violations rather than returning the first. Making it read only the LAST status would let a
+server that came up `connected` and was later reported `disabled` pass as never having run, which is a
+leak the current code catches. Slice 2's new question — *did this DECLARED server end up healthy?* — is
+the one that needs the last status. So the declared-set axis gets an end-state reading and the
+kill-switch axis keeps its any-time reading; they are two predicates over one status sequence, not one
+predicate to be retuned. Per the repo rule the declared fact still **joins the existing predicate**
+rather than arriving as a parallel flag — joining it does not mean overwriting how the existing one
+reads its evidence.
 
 One structural consequence, and it is the one to get right. Today copilot's question is binary — inert
 or leaked, decided by `_INERT_MCP_STATUSES` alone. Under A it becomes two questions on two axes: *is
@@ -162,18 +183,23 @@ it UNVERIFIED: it "measures shape, not a build". Treat every fact here as **unve
 `type`, and writing `["*"]` explicitly rather than omitting `tools`, matches what the binary produces for
 itself, and depending on an undocumented default instead is a bet a later build can settle silently. It
 does **not** license any claim about what omission *does*. Two such claims were previously asserted here
-and both are contradicted by (a). The one genuinely open case is **remote `type` omission**, which no
-probe has exercised — slice 1 closes it.
+and both are contradicted by (a). The one genuinely open case was **remote `type` omission** — **slice 1
+closed it, and moved the fact from (b) to (a)**: at 1.0.80, `http` connects without the key and **`sse`
+does not**, copilot reporting the server `failed` against a with-`type` control that reported
+`connected`. So the adapter writes `type` because on one transport it is *required*, not only because it
+is canonical — the strongest form the reason can take, and one (b) could never have supplied.
 
 ### (c) Capability-survey claims — read from the CLI's own help, not exercised here
 
 Real, and recorded as verified in the survey; but nothing in this repo has driven them.
 
 - `--additional-mcp-config <json>` is documented as a JSON string **or `@file`**, repeatable, augmenting
-  the user config for the session. **Only `@file` is exercised**, by all three probes. Inline JSON,
-  repeatability, and the merge semantics of "augments" are unexercised — and slice 3 leans on the last of
-  those holding for the harness's own file.
-- `--secret-env-vars <names>` redacts those env values from output.
+  the user config for the session. **Only `@file` is exercised**, by every probe that injects one — the
+  two gating probes and the events probe. Inline JSON, repeatability, and the merge semantics of
+  "augments" are unexercised — and slice 3 leans on the last of those holding for the harness's own file.
+- ~~`--secret-env-vars <names>` redacts those env values from output.~~ — **exercised and confirmed at
+  1.0.80** (slice 1, question 4): the marker reached the control run's output and is absent under the
+  flag, in an arm whose fixture receipts prove it made the same call carrying the same marker.
 - The empty config shape is `{"mcpServers": {}}`; a bare `{}` fails validation with `mcpServers: Required`
   and kills the session before execution. (Load-bearing for Phase 0's mask, which already ships on it.)
 
@@ -210,18 +236,97 @@ the **two gating probes** read **server-side receipts** — what copilot *sent* 
 the five unknowns are on a side neither reaches: what copilot *says it did*, which one copilot run can
 answer together. The fifth is §2(b)'s own limit — a shape read from an execution that carries no version.
 
-1. **MCP tool-name format in copilot's own JSON events.** §9 probe #3's first unanswered half. Needed by
-   the parser (slice 4) and by `used_mcp_tool`. agy's is *inferred* as `mcp_<server>_<tool>` from binary
-   strings; claude's is `mcp__<server>__<tool>`; copilot's is unmeasured.
-2. **What `session.mcp_servers_loaded` reports for a DECLARED server** — the exact name spelling and the
-   status value for a healthy injected server. **Slice 2 cannot be designed without this**: it decides
-   which statuses are permitted, and guessing the healthy one is the same trap as building to an
-   unmeasured config shape.
+1. ~~**MCP tool-name format in copilot's own JSON events.**~~ — **ANSWERED at 1.0.80**
+   (`tools/probe_copilot_events.py`): **`<server>-<tool>`**, observed as `cfgkeyzulu-echo`. A hyphen —
+   not claude's `mcp__<server>__<tool>`, not agy's inferred `mcp_<server>_<tool>`. The **execution event
+   and the model's request agree** — and agreement is *required* now, not inferred: one source saying
+   one thing is one observation and one UNOBSERVED source, which the first version scored as agreement
+   (review, PR #120). `ONE_SOURCE_ONLY` is a distinct non-answer from `AMBIGUOUS`, and both real lines
+   are pinned, because a conclusion that says "both sources" cannot rest on evidence holding one.
+   **And a better answer to the same question came with it:** `tool.execution_start.data` carries
+   **`mcpServerName` and `mcpToolName` as their own fields**. Slice 4's `used_mcp_tool` should match
+   those and never split the composite — a server or tool whose own name contains a hyphen breaks the
+   split and cannot break the fields. The composite stays the fallback if a build stops emitting them,
+   which is why the probe reports both.
+2. ~~**What `session.mcp_servers_loaded` reports for a DECLARED server**~~ — **ANSWERED at 1.0.80**
+   (same probe). It names **the config key** (`cfgkeyzulu`), *not* the server's advertised
+   `serverInfo.name` (`advnamequebec`) — the two were deliberately different, which is the only reason
+   this is an answer rather than a coin flip. A run using **both** spellings is `REPORTS_BOTH` and not
+   an answer: the version that broke that tie by priority also silently dropped whichever statuses were
+   carried under the losing name, and the status it dropped is the one this row exists to supply.
+   **The status is its own term in the exit predicate**, which it was not for two rounds: the question
+   asks for the spelling AND the status, and only the spelling was checked, so a witness naming our
+   server with no `status` field at all exited ANSWERED having measured half of it. It also has to be
+   the status of a server whose health was established *outside* copilot's account — the fixture's own
+   receipts, showing it answered our tool with this run's marker. Reading whatever status appeared and
+   calling it the healthy one assumes the answer: a server that failed to start reports `failed`, and
+   nothing in the status itself says which case you are looking at. A healthy injected server goes **`pending` → `connected`**,
+   with a later `session.mcp_server_status_changed` repeating `connected`.
+   **The status vocabulary observed across all five probes is `pending`, `connected`, `failed`,
+   `disabled`** — which is what slice 2 splits `_INERT_MCP_STATUSES` on. Note `pending` in particular:
+   it is a *transient* that appears before `connected`, so slice 2's witness must read the server's
+   **last** status and not its first. The probe had that bug and the review caught it (PR #120).
 3. **Does `--disable-mcp-server` reach plugin-declared servers**, and under what naming — §9 probe #3's
    second unanswered half. A Phase 0 hermeticity question, not a Phase 2 blocker. *May generate work:*
    isolated runs already mask plugins, but a negative answer leaves a documented gap on non-isolated runs.
-4. **`--secret-env-vars` actual behaviour** — §8 lists it as belt-and-braces and nothing has measured
-   what it does to an MCP-bearing run.
+4. ~~**`--secret-env-vars` actual behaviour**~~ — **ANSWERED at 1.0.80** (same probe): it **REDACTS**.
+   A per-run marker rode back in the MCP tool's reply and reached the control run's output; under the
+   flag it is absent from a run whose own fixture recorded **answering** that call with a reply that
+   carried the marker. So §8's belt-and-braces holds in the case that needed it — the value, wherever
+   the value landed, not merely the variable name where it is echoed.
+   **The second witness is what makes that a reading**, and it took two review rounds to get right
+   (PR #120). The control proves the value *can* travel, but `REDACTS` is a claim about the *other*
+   arm, and an arm that crashed or never called the tool produces the identical silence — so the arm
+   needs its own positive fact, authored by the fixture rather than by the CLI under test. The first
+   attempt used the receipt the fixture already wrote, which turned out to be **the wrong row**: it is
+   emitted before `_reject` and before any answer, deliberately, because a measurement of a *filter*
+   needs what the client SENT and a refused request still arrived. A call rejected on protocol grounds
+   leaves exactly that row, so redaction read off it is a claim about a reply that was never produced.
+   The fixture now writes a `served` row past a successful flush, carrying whether that reply began
+   with the marker; the filter readers keep the arrival row, and the comment there says why.
+   **A third round then found the control weaker than the arm it was controlling for.** It was asked
+   only whether the marker appeared *somewhere* in its output — and the marker is also in an env var and
+   in the config file this probe writes, on a run with `--allow-all`. So the control now carries the
+   same two facts as the secret arm: its fixture's receipts, and copilot's own `tool.execution_complete`
+   correlated to our execution by `toolCallId` (the result event carries no tool name). A comparison is
+   only a comparison if both arms are established to have done the same thing.
+   **A fourth round found the same imbalance one witness later**: the receipts end at the wire. They
+   prove the reply went **out** carrying the value; only copilot's result event says anything came
+   **back**, and that witness was still being asked of the control alone. A secret arm with an execution
+   and no completion event — killed mid-call, or one whose result copilot never emitted — certified
+   `REDACTS` from an output that was never produced. Each arm's result is now read as one of five
+   `RESULT_*` states, because *came back without the value*, *arrived with nothing in it*, *cannot be
+   tied to the marker-bearing reply* and *never arrived* are four different facts and a boolean had made
+   them one `False`. The gate is membership in `INSPECTABLE_RESULTS`, so each state added since has
+   needed no call site changed. The reading is also sharper for it: the redaction is localized to
+   the tool result rather than to the output at large.
+   **A fifth round found the third of those still merged into the second**: `RESULT_CLEAN` was assigned
+   to any correlated completion, so a failed one carrying no result read as clean. `usable_result`
+   requires `success: true` and a structurally usable payload, pinned to the shape 1.0.80 emits — and
+   the leak test runs *before* it, since a completion carrying the value is a leak whether or not the
+   call succeeded.
+   **A ninth round found the same collapse one layer out, in the reasons rather than the verdicts.**
+   Three sentences describe what became of a result, and two of them enumerated the states inline and
+   ended in an `else` naming one specific observation — so a leak from an arm with no completion at
+   all was told *our tool's result came back without it*, and so was a control whose results could
+   not be attributed. Every verdict was right, which is why every arm was green: a diagnosis is a
+   second assertion and needs driving of its own. `RESULT_ACCOUNTS` now puts each state into words
+   once, `result_account()` reads it, and §E21 holds its domain equal to the module's own `RESULT_*`
+   vocabulary, read off the module rather than restated.
+   **A tenth round found the classifier feeding that table the wrong state.** Attribution cardinality
+   was read before *anything came back at all*, so a run with two starts and no completion answered
+   `RESULT_UNATTRIBUTED` — a sentence saying results came back, about a stream containing none.
+   Existence is now settled over the raw events first; an empty correlated view is absence only when
+   every completion carries a usable id to be excluded by; and `RESULT_UNATTRIBUTED`'s account no
+   longer names two of the four ways the join fails. §E21 gained **stream-to-state-to-sentence** arms,
+   with the state read back from the stream, since a supplied state cannot show the classifier
+   supplying the wrong one.
+   **An eleventh round found the same gate one join further in.** The empty *correlated* view was
+   still decided after cardinality, and borrowed its premise from it, so several identifiable
+   executions beside a completion that was provably none of theirs read as ambiguous rather than
+   empty. It now states both clauses itself, and §E21's invariant is an equivalence with a witness
+   on each side rather than a one-way implication a classifier could satisfy by never producing the
+   state.
 5. **Remote `type` omission, as *behaviour* rather than shape.** Slice 3 writes `type` and an explicit
    `tools: ["*"]` because §2(b) says copilot writes them for itself — but (b) is unversioned, and the
    probe that produced it *cannot* be versioned: `copilot mcp add` emits no in-band witness, so no
@@ -233,9 +338,59 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
    Cheap: one more arm in `probe_copilot_remote_gating.py`, whose `mcp_config` already takes the shape
    as an argument.
 
+   **ANSWERED at 1.0.80, and the answer is TRANSPORT-DEPENDENT** — which is the shape of result a
+   one-transport arm would have got wrong, and the reason this probe runs both:
+
+   | transport | `type` omitted | established by |
+   |---|---|---|
+   | `http` (Streamable) | **starts anyway** — copilot reported `connected`, and `echo` arrived at the server | the connection witness plus the fixture's receipts |
+   | `sse` | **does not start** — copilot reported **`failed`**, where the paired with-`type` control reported `connected` | copilot's own status, against a control differing in one key |
+
+   The status vocabulary is split by **what each word licenses**, not by "is it `connected`". Only
+   `failed` has been measured to mean the server will not be coming up. `pending` is the transient
+   *before* `connected` — a truncated arm ends there and so does a healthy one — and an unmeasured word
+   a later build invents is in the same position, so both leave the question `OMISSION_UNMEASURED`
+   rather than publishing a negative (review, PR #120). The "listed with the key, absent without it"
+   branch needs the bare arm to have published a **readable** inventory as well: an event with the right
+   type and unreadable contents says nothing about which servers copilot had, and the entry that could
+   not be parsed is the one that might have been ours. An empty list is a real inventory. **And the
+   negative is about a NAME, which was being read through the status**: a server listed with no `status`
+   field read as `None` — the same answer as a stream that never mentioned it — and was published as
+   *not listed* from the inventory that names it. Naming and status are separate readings now
+   (`SERVER_NAMED` / `ABSENCE_UNREADABLE` / `ABSENCE_ESTABLISHED`), an unreadable event taints the
+   negative instead of yielding to a readable one beside it, and it cannot un-name (review, PR #120).
+
+   **So slice 3 must write `type`, and that is now a measurement rather than a preference.**
+   **The arm needed rebuilding to say it** (review, PR #120). The first version read only the fixture's
+   receipts, so "no tool call arrived" was the whole evidence for `NEVER_STARTS` — and a turn where the
+   model simply never called the tool produces identical receipts. The probe starts that fixture itself,
+   so "the server was listening" says nothing about whether copilot understood the entry. It now reads
+   **copilot's own connection status**, decided by the MCP host before the model acts, against a
+   **paired with-`type` control** that must show what success looks like on this machine, this transport
+   and this turn — and when neither witness speaks, the verdict is `OMISSION_UNMEASURED`, which the exit
+   status does not accept as a finding.
+
 Per repo policy the probes' **classification lives in named functions**, driven offline on synthetic
-rows in `verify_mcp_fixtures.py` (§E), with `F*` mutations. A fleet-wide negative requires every row
-answered; absence of a positive is not a negative result.
+rows in `verify_mcp_fixtures.py` (§E19, §E21, §E22), with `F*` mutations. A fleet-wide negative requires
+every row answered; absence of a positive is not a negative result.
+
+**Four of slice 1's five questions are answered here** (the fifth, plugin-declared servers, is a
+separate change), every reading version-qualified to copilot
+1.0.80 and taken from the run's own stream.** The two verbatim events the readings rest on are kept
+under `tools/pinned/copilot-1.0.80-events.jsonl`, so the synthetic streams §E21 drives its classifiers
+on are pinned to a shape a real build actually emitted — if copilot changes the events, §E21 reddens
+rather than continuing to certify a reader of a stream that no longer exists.
+
+**What the review of this slice was actually about, since it generalizes past copilot.** Every one of
+the six findings was the same defect wearing a different coat: *an absence read as a result, from an
+instrument whose own participation was never established*. A secret arm that returned nothing certified
+redaction; a `type` arm that received no call certified rejection; a candidate spelling whose run
+produced no stream certified that the spelling does not work; a status sequence read at its first
+element certified a dead server healthy. Each was a check that could not fail on the case it was written
+for — §4's rule — and the repair is the same in all four: **name the positive fact the reading requires,
+and get it from somewhere the subject does not author.** Fixture receipts for the exchange, copilot's
+own connection status for the config, a paired control for the transport, the last status rather than
+the first. Slices 2–4 read the same event stream and will meet the same trap.
 
 ### Slice 2 — the hermeticity witness learns about declared servers
 

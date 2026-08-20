@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff AN
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff + shellcheck + a parse under every shell
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 169/169 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 probes; 559 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 243/243 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 783 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine
 git diff --check
@@ -2006,12 +2006,330 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   the reading was about the instrument. The direction of the error is the dangerous one, because
   a false POSITIVE here sends the next reader hunting a leak that is not there — and the same
   mistake in the other direction, a filter that excludes too much, would hide a real one.
+- **FOUR FINDINGS ACROSS THREE PROBES, ONE DEFECT: an absence read as a result, from an
+  instrument whose own participation was never established.** Every finding of the PR #120/#121 review was this,
+  wearing a different coat. A `--secret-env-vars` arm that returned the empty string certified
+  redaction — the sentinel was missing because nothing ran, not because anything was redacted. A
+  `type`-omission arm that received no tool call certified that copilot had rejected the config —
+  but the probe starts that fixture itself, so "listening" says nothing about the client, and a
+  turn where the model simply never called the tool produces byte-identical receipts. A candidate
+  `--disable-mcp-server` spelling whose run produced no stream at all joined the list of
+  "spellings that do not work". And a server's status sequence read at its FIRST element reported
+  a dead server healthy, in a reader whose own docstring had argued that reading the first event
+  would miss exactly that.
+  **The generalization is not "add a control".** Three of the four HAD a control; what they
+  lacked was a positive fact about *the arm the conclusion is about*. A control proves the
+  quantity can be produced — it says nothing about whether the other arm produced it. So the
+  repair is: **name the positive fact the reading requires, and get it from somewhere the subject
+  does not author.** The fixture's own receipts for the exchange (a different process, and the
+  marker never appears there — only its digest). Copilot's own connection status for whether it
+  understood a config, since the MCP host decides that before the model acts. A paired arm
+  differing in ONE key for whether this machine and this turn can produce the result at all. The
+  last status rather than the first, because a transient (`pending`) precedes the answer.
+  **And the offline checks had all been green**, because they had been written from the same
+  understanding as the code — the arms encoded the probes' false positives rather than their
+  answers. An arm that cannot fail on the case the code gets wrong is not coverage; the tell is
+  that no arm drives the *distinguishing* case, and here that meant no arm where the treatment
+  arm is silent while the control speaks. Each repaired predicate now has an arm that fails
+  against the code as it stood, and a mutation aimed at the clause that decides it.
+- **FIXING ALL FOUR SITES DID NOT EXHAUST THE PRINCIPLE — a second round found four more, and
+  they were the SIBLING defect: an intermediate reading promoted to a conclusion.** Where the
+  first round read *absence* as a result, these read a state that had not finished being one:
+  a tool call that ARRIVED as one that was answered (the fixture writes its request row before
+  it decides whether to reply at all, so a rejected call is byte-identical to a served one); a
+  `pending` server status — the transient this same probe had just recorded as preceding
+  `connected` — as a terminal failure, along with every word a later build might invent; ONE of
+  two expected event sources speaking as the two of them AGREEING; and two contradictory server
+  spellings in one run resolved by which the code checked first, which also silently dropped
+  the status carried under the loser.
+  **The unifying test is worth stating in one line: is the thing you read the quantity you are
+  claiming?** Arrival is not completion. A transient is not an outcome. One observation is not
+  agreement. A tie is not a winner. Each needed the same repair as round one — a positive fact
+  naming the actual quantity — and three of the four needed something that did not exist yet:
+  a new fixture row written *after* the reply flushed, a status vocabulary split by what each
+  word licenses rather than by equality with the good one, and `EXPECTED_SOURCES` to say what
+  agreement is judged against.
+  **The lesson for review, not just for code:** the first fix made the four named sites right
+  and left the *class* live, because it was stated as "add a witness" rather than as "the
+  reading is not the quantity". A repair phrased at the level of the reproduction leaves the
+  next instance to be found by the next reviewer — which is CLAUDE.md's first rule, arriving
+  in the thing that was supposed to be applying it.
+- **A THIRD ROUND FOUND THREE MORE, and two of them were in the CONTROLS the earlier rounds
+  had just added.** Strengthening the treatment arm and leaving the control where it was makes
+  the pair *less* balanced, not more: the redaction control was still being asked only whether
+  the marker appeared SOMEWHERE in its output, while the secret arm had to prove it answered
+  the call — and the marker also sits in an env var and in the config the probe writes, on a
+  run with `--allow-all`. A control that echoed a config while calling nothing, paired with a
+  secret arm whose reply did not render, produced the positive. **A comparison is only a
+  comparison if both arms are established to have done the same thing**, so whatever the
+  treatment arm must prove, the control must prove too — the third round's rule, and the one
+  the second round should have derived.
+  The other two are the same shape one level down. A structural clause added to make an
+  absence meaningful was itself satisfiable by garbage: "copilot published an inventory and
+  ours was not in it" checked only the event TYPE, so `{"data": 42}` — right event, unreadable
+  contents — established absence. And question 2's exit predicate checked the server's
+  SPELLING while the question also asks for its STATUS, so a witness naming the server with no
+  status field answered half a question and exited green. **When you add a clause to make a
+  reading meaningful, ask what the WEAKEST input satisfying that clause looks like** — here, an
+  event with the right name and no contents, and a predicate with the right shape and one of
+  its two terms missing.
+- **A FOURTH ROUND FOUND TWO MORE, and both are a reading that stops one field short of the
+  quantity.** Round three had just made the redaction CONTROL prove that copilot emitted a
+  result carrying the value. The secret arm was still asked only for its **fixture's**
+  receipts — and *the receipts end at the wire*. They say the reply went OUT carrying the
+  marker; nothing in them says anything came BACK. So an arm with an execution and no
+  completion event — killed mid-call, or one whose result copilot never emitted — certified
+  `REDACTS` from an output that was never produced, on receipts that were entirely genuine.
+  Round three's own rule is symmetric (*whatever the treatment arm must prove, the control
+  must prove too*) and it was applied only in the direction the reproduction pointed, which is
+  CLAUDE.md's first rule arriving inside the fix for CLAUDE.md's first rule.
+  **The boolean was the mechanism.** "Our tool's result carried the value" being `False` meant
+  either *it came back without it* or *it never came back at all*, and only the first is
+  evidence about redaction. A predicate answering one question with two meanings is the same
+  shape §4 already records for one field carrying two independent facts — arriving here as a
+  return type rather than a record field. Three states now, and the loss case has a word of
+  its own.
+  The other finding is the same stopping-short over a different field. `NEVER_STARTS` says
+  *copilot did not list our server*, and the code decided it by reading the server's STATUS: an
+  entry copilot listed with no `status` gives the status reader `None`, indistinguishable from
+  a stream that never mentioned it, while the presence reader confirmed a readable inventory —
+  so the pair published "not listed" from the very event that lists it. **A negative about a
+  NAME has to be read from the name.** It is its own reading now, tainted by any inventory
+  event that could not be parsed and never overturned by one, because an unreadable event
+  hides servers and cannot un-name them. That asymmetry is the second half of the lesson:
+  when a taint and a positive can both apply to one reading, decide which outranks which
+  **deliberately** and write down why — the ordering is the entire content of the rule, and it
+  is invisible in code that just happens to check one of them first.
+- **A FIFTH ROUND FOUND THE FOURTH ROUND'S OWN FIX ONE FIELD SHORT — and the pattern is now
+  the finding.** Round four split "our tool's result came back without the value" from "no
+  result came back at all", which was right and stopped exactly where the reproduction did.
+  `RESULT_CLEAN` was then assigned to **any** correlated completion, so
+  `{"toolCallId": id, "success": false}` — a call that failed, carrying no result at all — read
+  as clean, and `REDACTS` was published from a completion with nothing in it. The value was
+  absent from a payload that did not exist.
+  **Read the ladder, not the rung.** Four rounds walked one witness at a time: does an arm
+  exist → did its fixture answer → did copilot emit a completion → does that completion carry a
+  result. Each round added the next rung and stopped, and each time the reviewer found the
+  gap immediately above it. The generalisable move is to write the chain down *first* — from
+  "the value existed" to "a human could have read it in the output" — and ask which links the
+  code actually checks, rather than fixing the one the reproduction lands on. A witness added
+  to close a gap is itself a new thing that can be absent, malformed, or unsuccessful.
+  **Two orderings in this codebase are now deliberate and say so.** `SERVER_NAMED` is read
+  before the unreadable-inventory taint, and the leak test is read before the usability test:
+  in both, *the reading that accuses outranks the reading that excuses*. Nothing enforces
+  either but a comment and an arm, which is why both got a mutation aimed at the ordering
+  itself rather than at the clauses either side of it.
+  **And `usable_result` fails closed on shape drift** — no `success` field means unreadable,
+  not usable — which is only safe because the predicate is pinned to a verbatim 1.0.80 line:
+  the refusal shows up as a red §E21 rather than as a probe that quietly stops answering.
+- **A SIXTH ROUND FOUND THE TWO WITNESSES JOINED BY NOTHING BUT BEING IN THE SAME RUN.** The
+  fixture's `served` row proves a reply went out carrying the marker; copilot's
+  `tool.execution_complete` proves a result came back. Five rounds hardened each of those
+  separately and never asked what connects them — and nothing does: `toolCallId` is copilot's,
+  the JSON-RPC id is the transport's, and no field spans the two. In a run where the model
+  called the tool twice, which is what a retry after an error looks like, the reply the
+  receipts prove and the result copilot emitted could be different calls, and `REDACTS` was
+  published off the pair.
+  **Two independent witnesses of one event are not thereby witnesses of the SAME event.**
+  That is the generalisation, and it is not the same as any of the five before it: those were
+  each about one witness being weaker than its claim. This one is about the JOIN. When a
+  conclusion needs two facts from two authors, write down what makes them facts about the same
+  occurrence — and if the answer is "they are both in this run", the conclusion is only as
+  strong as the run containing exactly one occurrence.
+  **Cardinality is a legitimate join when no identifier exists.** One marker-bearing reply, one
+  execution, one completion: in that run the completion cannot belong to anything else, and it
+  needs no field the protocol does not have. It costs the multi-call run, which is now
+  `RESULT_UNATTRIBUTED` rather than measured wrongly — and the alternative that would keep it
+  (a per-call nonce minted by the fixture, carried in the reply, recorded on the row) is
+  written down in the probe rather than left for the next reader to re-derive, because it
+  changes a reply format four probes read and that trade deserves to be visible.
+- **A COUNT OF IDENTIFIERS IS NOT A COUNT OF EVENTS, and the cardinality proof rested on the
+  wrong one.** The attribution rule above needs "the model called our tool exactly once", and
+  it asked `len(mcp_call_ids(events)) == 1`. That function returns a SET and skips any start
+  whose `toolCallId` is missing or malformed — both correct for its own question, which is
+  what can be correlated on, and both wrong for counting calls. Two starts sharing an id, and
+  a usable start beside an id-less one, are two executions the id count reports as one, so
+  `RESULT_CLEAN` was published for exactly the ambiguity the clause had just been added to
+  refuse. The arm missed it by using two DISTINCT valid ids — the one multi-execution shape
+  the id count does catch.
+  **And a filtered reader is a partial one.** The repair counted OUR start events, which
+  answers "how many times did the model call our tool" and still says nothing about who else
+  claims the ids those starts carry. A foreign execution reusing the id makes the completion —
+  which names no tool — answer to both, and the classifier read it as ours. Ownership is a fact
+  about the WHOLE stream, so `id_claims` counts every start's claim and `mcp_call_ids` returns
+  only ids with exactly one owner. **When a reader narrows its population to "ours", ask what
+  the discarded rows could have said about the ones kept**: here they were the only evidence
+  that the correlation key was a key at all.
+  **A deduplicating reader is a lossy counter, and the loss is invisible at the call site.**
+  `set`, `dict` keys, `{...}` comprehensions, "skip the malformed ones" — every one of them
+  answers a question about *distinct usable* things, and every one is a plausible-looking
+  stand-in for *how many happened*. When a proof turns on a count, count the events; derive
+  the identifiers separately, and say in both docstrings which question each answers. Here
+  that meant `mcp_starts` (a LIST, because the duplicates are the finding) with
+  `mcp_call_ids` defined over it, and `is_our_execution` extracted so the two readers cannot
+  drift on what "ours" means.
+- **A NEW GATE MAKES AN OLDER MUTATION'S ARM INSENSITIVE, AND THE COUNT STAYS GREEN WHILE IT
+  HAPPENS.** It has happened in most rounds since the gates started stacking — `F189`, `F190`,
+  `F235`, `F238` — and never because a rule weakened. A gate added LATER refuses the same input
+  first, so the run still exits 1 and the mutation still "fails", just never through the
+  assertion that encodes its rule. `mutate_mcp.py` reporting `failed, but NOT via …` is the
+  only reason any of them was noticed; a suite that merely counted failures would have shown a
+  full house every time. **Expect it in any round that adds a gate upstream of an existing
+  one**, and re-read the older mutations' arms rather than assuming the total covers them.
+  **Two repairs, depending on what the rule is about.** When the rule concerns *what a call
+  receives* — every launched arm, that arm's own receipts — assert the ARGUMENT, not the exit
+  status: an assertion on what comes out is only accidentally sensitive, and the accident
+  expires the next time the code gets stricter. When the rule concerns one clause of a
+  conjunction, find the input that the OTHER clauses accept and only this one refuses; that
+  input changes as the conjunction grows, which is why `F235` and `F238` each moved to a new
+  arm rather than to a new rule.
+- **A MUTATION THAT CRASHES IS NOT A MUTATION THAT FAILS.** `F222`'s replacement read
+  `done[-1]` where the original folded over the whole list, and on the arms where nothing came
+  back that is an `IndexError` — which ENDS the linear verifier before the arm named for the
+  mutation ever runs. The suite duly reported it red, `failed, but NOT via …`, having been
+  caught by two checks in an unrelated section that happen to run earlier. A mutation has to be
+  a **plausible wrong implementation**: the version a reasonable person would have written by
+  mistake, which for a fold-over-a-list is a last-write-wins scan that still handles the empty
+  case. Guard the replacement so it is total, or the mutation tests nothing but the file's line
+  ordering.
+- **A MUTATION AIMED BESIDE ITS CLAUSE SURVIVES, AND THE SECOND ONE IN A ROUND IS THE TELL.**
+  `F228` deleted the `success` test in `usable_result` and nothing went red: every arm named
+  for it fed input the OTHER clause rejects anyway — `{"success": false}` carries no payload,
+  so the payload test refuses it with or without the mutation. The distinguishing input is a
+  **well-formed payload on a failed call**, which no arm had. This is the identical mistake
+  `F213`/`F214` made one round earlier over the same kind of two-clause predicate, found the
+  identical way: by driving each mutation individually before spending a suite run. When a
+  predicate has two guards, the arm for each must feed input the OTHER guard accepts — and
+  the cheap way to know is to state, for each guard, the input that only it rejects.
+- **A THROWAWAY MUTATION HARNESS IS STILL A HARNESS, and mine left the tree mutated twice.**
+  Driving one mutation at a time before spending a full suite run is the right move and it
+  costs a script that WRITES SOURCE FILES. The first incident was the plain one — killed
+  mid-iteration, three mutations left applied, which then made the verifier's own
+  mutate-plumbing section fail *and leave another one applied*, a feedback loop that reads as
+  files changing underneath you. The script now refuses to snapshot a tree that is not clean,
+  restores on `SIGTERM`/`SIGINT`, and asserts every target byte-identical before it exits.
+  The second incident is the one worth recording, because none of that helped: **the tool
+  running the script returned while the script was still running.** Its output was
+  block-buffered into a pipe, so it looked like a command that had produced nothing and
+  finished; it was an orphan (`ppid 1`) still cycling apply/restore, and three successive
+  inspections of the same file each caught a different mutation applied. Two follow-up
+  "reverts" were then aimed at whatever was applied at that instant. The rule: **`ps` decides
+  whether something finished, not the absence of output** — and a tool that writes source
+  files gets a run whose completion is observed, not inferred. `git diff --stat` after every
+  such run is the cheap version of the same check.
 - **A single-line anchor aimed at `mutate_mcp.py` itself matches TWICE**, and one of the two is
   the mutation entry quoting it. It is refused up front by `stale_anchors` rather than silently
   mutating the list instead of the code, but the fix is not obvious from the message: pin it
   with a leading `\n`, which is a real newline in the source and an escape sequence in the
   entry, so the entry cannot match itself. Every `F*` aimed at `SELF` is written that way or
   spans several lines, which has the same effect for the same reason.
+- **A VERDICT MAY MERGE STATES; THE SENTENCE BESIDE IT MAY NOT — and an arm that reads the
+  verdict cannot see that.** `secret_verdict` publishes a word and a reason, and the reason is
+  a second assertion about what was observed. Three of its sentences described what became of
+  our tool's result, and each enumerated the five-word vocabulary inline; two of them ended in
+  an `else` that named one SPECIFIC observation, so every state reaching that `else` was told
+  what a different state would have shown — a leak from an arm with no completion at all was
+  told "our tool's result came back without it", and so was a control whose results could not
+  be attributed (review, PR #120, ninth round). Every one of those runs got the RIGHT verdict,
+  which is why a dozen arms asserting the verdict were green throughout: **a diagnosis is only
+  under test if something drives the diagnosis.** The tell is a trailing `else` inside a reason
+  string over a vocabulary of more than two words — it is the `elif`-chain rule one level down,
+  where the output is prose instead of a verdict. The fix is the same shape as
+  `INSPECTABLE_RESULTS`: one table beside the vocabulary, total over it by a check that reads
+  the vocabulary OFF THE MODULE rather than restating it, and each sentence asking it for the
+  middle. A sixth state is then right in all three sentences at once, and the fallback names
+  the state instead of handing it a fifth state's words.
+- **EXISTENCE IS SETTLED BEFORE AMBIGUITY, and they are not degrees of one scale.** *Nothing
+  came back* is a fact about the stream; *nobody can say whose it was* is a fact about a
+  correspondence between two things, and the second question does not arise until both sides
+  of it exist. `tool_result_state` read its cardinality gate first, so a run with two starts
+  and no `tool.execution_complete` at all answered `RESULT_UNATTRIBUTED` — and published the
+  sentence that state carries, which says results came back, about a stream containing none
+  (review, PR #120, tenth round). The tell is a gate that COMPARES COUNTS standing ahead of
+  the gate that asks whether the thing being counted exists; §4 already had the shape of it —
+  two facts from different phases of one lifecycle sharing a field — and this is the phase
+  version rather than the field version. The dual is one gate lower and worth the same
+  attention: an empty filtered view has two causes, *everything in it belonged to somebody
+  else* and *nothing in it could be read*, and only the first is an observation about our tool.
+  Excluding a completion needs an id to exclude it by.
+- **A CHECK THAT SUPPLIES A CLASSIFIER'S OUTPUT CANNOT SEE IT PRODUCING THE WRONG OUTPUT.**
+  The previous round's account arms feed a `RESULT_*` state straight into `result_account()`
+  and assert the wording. They prove the table consistent for a supplied state, and they were
+  all green while the classifier handed that table the wrong state for four different streams
+  — the defect above was invisible to eleven new arms written the round before. Anything with
+  a pipeline needs at least one arm per output that runs the WHOLE path, stream to published
+  sentence, and the invariants over it must be read back FROM the streams rather than from the
+  expectation column beside them: an expectation that agrees with a broken classifier is the
+  thing being guarded against. `_seen` in §E21 is that re-read, and the two invariants over it
+  ("no completion event means ABSENT", "ABSENT with completions means every one was
+  excludable") are the two facts that were false, stated so they can fail.
+- **A STATE IS NOT ITS CAUSE, and moving an enumeration into a table does not make it true.**
+  `RESULT_UNATTRIBUTED` is reached four ways — two executions, an id missing or shared, no
+  marker-bearing reply at all, more than one completion — and its sentence named two of them.
+  It was already false for the third the round it was written, and the fourth made it false
+  again the moment a new route reached it. The round before had moved that enumeration out of
+  an `if/else` and into `RESULT_ACCOUNTS`, which fixed the branch and carried the enumeration
+  along with it: the table is keyed on the STATE, so its sentence may say only what is true of
+  every run that reaches that state. The same obligation binds the FIXED half of a sentence,
+  which is read for several states at once — "so nothing came back to be redacted" was false
+  for the one of its three states where something did.
+- **A BRANCH THAT BORROWS ITS PREMISE FROM THE GATE ABOVE IT BELONGS ABOVE THAT GATE TOO.**
+  The empty-correlated-view branch said, in its own comment, "our id is unique and usable here
+  (the gate above)" — and that borrowing is what pinned it below the cardinality gate, where a
+  run with two perfectly identifiable executions and one foreign completion was refused as
+  ambiguous instead of answered as empty (review, PR #120, eleventh round). A borrowed premise
+  makes a decision positionally dependent on something that is not about it: cardinality asks
+  which reply a result BELONGS to, and that question needs a result. Write down what the branch
+  actually needs — here, every completion carries an id of its own AND every execution of ours
+  does, `len(ids) == len(starts)` — and it can then stand wherever it is true. **The tell is a
+  comment inside a branch that justifies the branch by pointing at an earlier one.** It is the
+  same fix as the round before, one join further in, which is why it was not caught by it: the
+  raw existence question moved and the correlated one was left behind.
+- **MOVING A DECISION CAN LEAVE A CLAUSE BEHIND THAT CAN NO LONGER FAIL, and the mutation
+  suite is the only thing that says so.** Hoisting the empty-correlated-view branch above the
+  cardinality gate made that gate's `len(ids) != 1` term undecidable: the line is now reached
+  only with a non-empty `done`, which needs a completion carrying one of `ids`, so
+  `len(ids) >= 1`; and `mcp_call_ids` adds at most one id per start, so the `len(starts) == 1`
+  in the same condition bounds it at 1. `F235` — which deletes that term — therefore produced
+  code identical in behaviour to the original and **survived**, the fourth time a newer gate
+  has made an older mutation's arm insensitive and the first time the cause was the arm's
+  clause becoming a tautology rather than an earlier gate answering first. A term that cannot
+  fail is worse than an absent one: it reads as a check, is not one, and no mutation of it can
+  be caught. The term is gone; the fact it carried moved to `len(ids) == len(starts)` in the
+  branch above, where it still bites, and `F257` is the mutation that says so. **`F235`'s ARM
+  is untouched and still red** — retiring the mutation is not retiring the coverage, and the
+  gap in the numbering carries a comment saying which mutation took it over, so it cannot be
+  read later as a deletion.
+- **A ONE-WAY INVARIANT IS SATISFIED BY A CLASSIFIER THAT NEVER PRODUCES THE STATE.** "Every
+  `RESULT_ABSENT` run had all its completions excludable" was green — and would stay green if
+  nothing were ever `ABSENT`. The claim that gives a state meaning is the **iff**, with a
+  witness on each side: at least one run that is `ABSENT` with completions, and at least one
+  that is not. Both `any(...)` clauses are there for that, and they are the same structural
+  clause §4 demands ahead of any `all(...)`, applied to an equivalence rather than to a
+  quantifier.
+- **THE CROSS-PRODUCT OF TWO TESTED CASES IS A THIRD CASE.** The table drove *several
+  executions with no completion* and *one execution with a foreign completion*, and neither is
+  *several executions with a foreign completion* — which is the one that was wrong. A table
+  built by listing the ways each state is reached will miss the combinations; the invariant
+  over the table is what covers them, and only if it is stated as an equivalence.
+- **WHERE THE RULE ITSELF IS UNDER TEST, IMPORTING IT IS THE BUG AND DUPLICATING IT IS THE
+  FIX — which is the opposite of the standing advice, and the mutation suite is what tells the
+  two apart.** §4 says a check that re-derives a definition cannot disagree with it, so import
+  where import is possible. The exception is a check whose SUBJECT is that definition: the new
+  invariant "a run is ABSENT only when every completion could be excluded" asked
+  `EV.completion_id` whether each completion carried a usable id — the very function `F255`
+  perturbs — so the mutation and the check moved together and the arm stayed green while the
+  classifier misread a numeric id as usable. The fix is the `fixtures/` pattern applied inside
+  the verifier: state the rule locally, and pin the copy to the original with an arm over the
+  cases that distinguish them. The tell is a check that would still pass if the function it
+  names returned anything self-consistent.
+- **Re-anchor a mutation whose clause you rewrote; do not retire it.** Extracting that table
+  broke three older mutations (`F226`, `F227`, `F232`) whose anchors quoted the enumerations it
+  replaced — and what each of them says, "every state in this branch reads alike", is exactly
+  what the table now exists to prevent. `stale_anchors` refused the run and named all three
+  before a suite was spent, which is the second time that gate has paid for itself in a round
+  where a refactor moved code an old mutation was aimed at. The replacement text is usually
+  simpler than the original: the same `+ ""`, one call further in.
 
 ---
 
