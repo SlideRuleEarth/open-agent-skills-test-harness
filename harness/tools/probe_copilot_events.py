@@ -101,10 +101,10 @@ REPORTS_NEITHER = "REPORTS_NEITHER"
 REPORTS_BOTH = "REPORTS_BOTH"        # the run used BOTH spellings: there is no single answer
 
 REDACTS = "REDACTS"                  # sentinel present in control, absent under the flag
-NO_REDACTION = "NO_REDACTION"        # sentinel present in both
+NO_REDACTION = "NO_REDACTION"        # the sentinel reached the output UNDER the flag
 CONTROL_FAILED = "CONTROL_FAILED"    # the control's own tool RESULT never carried the sentinel
 CONTROL_INCOMPLETE = "CONTROL_INCOMPLETE"         # the control never ran the exchange either
-SECRET_ARM_INCOMPLETE = "SECRET_ARM_INCOMPLETE"   # the arm under the flag never made the call
+SECRET_ARM_INCOMPLETE = "SECRET_ARM_INCOMPLETE"   # nothing came back for the claim to be about
 
 # What became of OUR tool's result in one arm's stream. ONE WORD PER WAY OF NOT HAVING THE
 # VALUE BACK, and the list grew one word per review round because each round found two of them
@@ -597,6 +597,42 @@ def tool_result_state(events: list[dict], sentinel: str, *, replies: int) -> str
     return RESULT_CLEAN
 
 
+# WHAT WAS OBSERVED, ONE SENTENCE PER STATE, IN ONE PLACE. A verdict may be shared by
+# several states — three of these are `SECRET_ARM_INCOMPLETE` — but the account of what
+# was SEEN may not be, and each of `secret_verdict`'s sentences used to enumerate the
+# states itself. Two of them ended in an `else` naming a specific observation ("its result
+# came back without the value"), so every state reaching that else inherited a sentence
+# true only of `RESULT_CLEAN`: a run whose completion never arrived was told its result
+# had come back (review, PR #120, ninth round). The same shape as the vocabulary itself —
+# a new state joins the table and every reader is right about it at once.
+RESULT_ACCOUNTS = {
+    RESULT_CARRIED: "our tool's own result carried it into the output",
+    RESULT_CLEAN: "our tool's own result came back without it",
+    RESULT_UNATTRIBUTED: ("results came back that this run cannot tie to the marker-bearing "
+                          "reply: the exchange happened more than once, or the id our tool's "
+                          "start claimed is not our tool's alone"),
+    RESULT_UNREADABLE: ("our tool's completion carried no result to inspect: the call "
+                        "failed, or the payload was empty"),
+    RESULT_ABSENT: "no completion for our tool reached the output at all",
+}
+
+
+def result_account(state: str) -> str:
+    """What was OBSERVED of our tool's result, in words. Total over the `RESULT_*` words.
+
+    The fallback is not decoration and it is not a default either. A sixth state added
+    without a sentence here would otherwise take a fifth state's — the very defect this
+    table was extracted to end — or crash a live probe two arms into a measurement. It
+    names the state and claims NOTHING about what came back. `verify_mcp_fixtures` holds
+    this domain equal to the module's own `RESULT_*` vocabulary, read off the module
+    rather than restated, so nothing `tool_result_state` returns can reach the fallback;
+    that check is what keeps it unreachable, and it is driven on a state that is not ours.
+    """
+    return RESULT_ACCOUNTS.get(
+        state, f"our tool's result is in state {state!r}, which this reader has no "
+               f"account of")
+
+
 def healthy_status_verdict(status: str | None, *, served: bool) -> tuple[str, str]:
     """(verdict, why) for the half of question 2 that is about the STATUS.
 
@@ -789,6 +825,15 @@ def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool
     the stream are both `NO_REDACTION` — the flag is a claim about the OUTPUT, so the route the
     value leaked by is diagnosis, not a different verdict. Only the marker-bearing reply's own
     result, coming back without the value, is redaction.
+
+    THE VERDICT MAY MERGE STATES; THE REASON MAY NOT. Three sentences here describe what
+    became of a result, and each used to enumerate the states inline — two of them ending in
+    an `else` that named one specific observation, so a state that reached it was told what a
+    DIFFERENT state would have shown (review, PR #120, ninth round: a leak from an arm with no
+    completion at all was told "our tool's result came back without it"). None of them
+    enumerates any more: each names the arm and the consequence, and asks `result_account` for
+    the middle. A new state is then right in all three at once, which is why the table is
+    beside the vocabulary and not inside any one reader.
     """
     # THE ACCUSING READING NEEDS NEITHER CONTROL NOR ATTRIBUTION, and it used to be read last
     # (review, PR #120, seventh round — raised by making ownership refuse a foreign leak and
@@ -802,10 +847,9 @@ def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool
     # usability, at the verdict level: the reading that ACCUSES outranks the ones that excuse.
     if sentinel in secret_stream:
         return NO_REDACTION, (
-            "the sentinel appears in the output WITH --secret-env-vars naming its variable"
-            + (" — in our tool's own result" if secret_result == RESULT_CARRIED else
-               " — outside our tool's result, which came back without it")
-            + ": the flag did not redact the value where it landed, and no control is needed "
+            "the sentinel appears in the output WITH --secret-env-vars naming its "
+            "variable, and " + result_account(secret_result)
+            + " — the flag did not redact the value where it landed, and no control is needed "
               "to read a value that is simply present")
     if not control_exchanged:
         return CONTROL_INCOMPLETE, ("the control arm never completed the exchange either — its "
@@ -814,12 +858,8 @@ def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool
                                     "the difference between them is not about the flag")
     if control_result != RESULT_CARRIED:
         return CONTROL_FAILED, (
-            "the control's own tool RESULT never carried the sentinel"
-            + (" — no completion for our tool reached its output at all"
-               if control_result == RESULT_ABSENT else
-               " — its completion carried no result to inspect: the call failed, or the "
-               "payload was empty" if control_result == RESULT_UNREADABLE else
-               " — its result came back without the value, with no flag set")
+            "the control's own tool RESULT never carried the sentinel — in that arm, "
+            + result_account(control_result)
             + ", so the value does not reach the output by that route and its absence under "
               "--secret-env-vars measures nothing")
     if not secret_exchanged:
@@ -830,14 +870,8 @@ def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool
                                        "output is the absence of the CALL, not of the value")
     if secret_result not in INSPECTABLE_RESULTS:
         return SECRET_ARM_INCOMPLETE, (
-            "the arm under --secret-env-vars answered our tool and then"
-            + (" emitted no completion for it at all"
-               if secret_result == RESULT_ABSENT else
-               " emitted results this run cannot tie to that reply: the exchange happened more "
-               "than once, and the fixture's receipts and copilot's events share no identifier"
-               if secret_result == RESULT_UNATTRIBUTED else
-               " emitted a completion carrying no result to inspect: the call failed, or the "
-               "payload was empty")
+            "the arm under --secret-env-vars answered our tool, but "
+            + result_account(secret_result)
             + ", so nothing came back to be redacted — the fixture proves the value went onto "
               "the wire and nothing shows what copilot did with it, which is not the same as "
               "showing it removed it")

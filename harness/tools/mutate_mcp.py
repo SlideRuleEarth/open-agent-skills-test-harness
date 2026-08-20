@@ -3286,20 +3286,18 @@ MUTATIONS = [
       '            if o.get("type") == "session.mcp_servers_loaded"):\n'
       "        return SERVER_NAMED"),
      "...while garbage beside a NAMING event leaves the naming standing"),
-    # WHICH LOSS IT WAS IS THE DIAGNOSIS, so the two control failures do not share a sentence.
+    # WHICH LOSS IT WAS IS THE DIAGNOSIS, so the control failures do not share a sentence.
+    # RE-ANCHORED on the call that replaced the inline enumeration these used to quote
+    # (review, PR #120, ninth round). The mutation is the same one — every state in the
+    # branch reads alike — and it is now the thing the account table exists to prevent.
     ("F226-the-control-losses-read-the-same", CEVENTS,
-     ('            + (" — no completion for our tool reached its output at all"\n'
-      "               if control_result == RESULT_ABSENT else\n"
-      '               " — its completion carried no result to inspect: the call failed, or the "\n'
-      '               "payload was empty" if control_result == RESULT_UNREADABLE else\n'
-      '               " — its result came back without the value, with no flag set")'),
+     "            + result_account(control_result)",
      '            + ""',
      "...and those two control failures are told apart in the reason, not merged"),
-    # ...and so do the two routes the value can still be in the output by.
+    # ...and so do the routes the value can still be in the output by.
     ("F227-the-two-leak-routes-read-the-same", CEVENTS,
-     ('            + (" — in our tool\'s own result" if secret_result == RESULT_CARRIED else\n'
-      '               " — outside our tool\'s result, which came back without it")'),
-     '            + ""',
+     '            "variable, and " + result_account(secret_result)',
+     '            "variable, and " + ""',
      "...and a secret result that CARRIED the value is NO_REDACTION by its OWN route"),
     # THE STRONGEST READING WINS, NOT THE LAST. A scan that keeps whichever result it saw most
     # recently reports `RESULT_CLEAN` for a run that leaked in an earlier one.
@@ -3395,10 +3393,50 @@ MUTATIONS = [
     # incomplete arm rather than as the finding it is.
     ("F242-a-leak-is-reported-only-once-everything-else-is-provable", CEVENTS,
      ("    if sentinel in secret_stream:\n        return NO_REDACTION, (\n"
-      '            "the sentinel appears in the output WITH --secret-env-vars naming its variable"'),
+      '            "the sentinel appears in the output WITH --secret-env-vars naming its "'),
      ("    if False:\n        return NO_REDACTION, (\n"
-      '            "the sentinel appears in the output WITH --secret-env-vars naming its variable"'),
+      '            "the sentinel appears in the output WITH --secret-env-vars naming its "'),
      "a leak is reported even when the CONTROL never ran the exchange"),
+    # --- PR #120, ninth review round -------------------------------------------------------
+    # THE VERDICT MAY MERGE STATES; THE SENTENCE MAY NOT. This is the shape the account
+    # replaced, restored exactly: a two-way `else` over a five-word vocabulary, which tells
+    # four states what the fifth would have shown.
+    ("F243-one-states-sentence-serves-every-other-state", CEVENTS,
+     '            "variable, and " + result_account(secret_result)',
+     ('            "variable, and " + (result_account(RESULT_CARRIED)\n'
+      "                               if secret_result == RESULT_CARRIED else\n"
+      "                               result_account(RESULT_CLEAN))"),
+     ("...and no state but RESULT_CLEAN is told our tool's result came back without it")),
+    # ...and the same defect one branch down, where the `else` covered RESULT_CLEAN and
+    # RESULT_UNATTRIBUTED together and described only the first. No arm drove it.
+    ("F244-an-unattributable-control-result-is-a-clean-one", CEVENTS,
+     "            + result_account(control_result)",
+     ("            + result_account(RESULT_CLEAN if control_result == RESULT_UNATTRIBUTED\n"
+      "                             else control_result)"),
+     ("...including RESULT_UNATTRIBUTED, which its `else` called a result that came back")),
+    # ...and the table has to be TOTAL over the vocabulary, or a state falls to the fallback
+    # and the probe publishes a sentence that describes nothing.
+    ("F245-the-account-covers-the-states-someone-remembered", CEVENTS,
+     ("    RESULT_UNREADABLE: (\"our tool's completion carried no result to inspect: the call \"\n"
+      '                        "failed, or the payload was empty"),\n'),
+     "",
+     ("...and `result_account` is total over it: its domain IS the vocabulary")),
+    # ...and two states sharing a sentence is the merge this whole table exists to prevent,
+    # arriving by the table instead of by an `else`.
+    ("F246-two-states-may-share-one-sentence", CEVENTS,
+     ("    RESULT_UNREADABLE: (\"our tool's completion carried no result to inspect: the call \"\n"
+      '                        "failed, or the payload was empty"),'),
+     '    RESULT_UNREADABLE: "no completion for our tool reached the output at all",',
+     ("...with a different sentence for each, so no two states are told the same thing")),
+    # ...and the fallback must NAME the state it cannot account for. A fallback that hands
+    # back a real account is the original bug with a longer fuse: silent, and for a state
+    # nobody has read yet.
+    ("F247-the-fallback-is-a-default-rather-than-a-refusal", CEVENTS,
+     ("    return RESULT_ACCOUNTS.get(\n"
+      '        state, f"our tool\'s result is in state {state!r}, which this reader has no "\n'
+      '               f"account of")'),
+     "    return RESULT_ACCOUNTS.get(state, RESULT_ACCOUNTS[RESULT_CLEAN])",
+     ("...and a state with NO account is NAMED, not handed some other state's sentence")),
     ("F239-an-id-less-start-is-not-an-execution", CEVENTS,
      ("    return [obj[\"data\"] for obj in events\n"
       '            if obj.get("type") == "tool.execution_start"'),
@@ -3420,14 +3458,9 @@ MUTATIONS = [
      "                                        replies=marker_replies(control_receipts)))",
      "...nor one whose fixture answered TWICE, leaving the clean result unattributable"),
     # ...and which loss it was is the diagnosis on the secret side too.
+    # RE-ANCHORED with F226 and F227, same round, same reason.
     ("F232-the-two-secret-losses-read-the-same", CEVENTS,
-     ('            + (" emitted no completion for it at all"\n'
-      "               if secret_result == RESULT_ABSENT else\n"
-      '               " emitted results this run cannot tie to that reply: the exchange happened more "\n'
-      '               "than once, and the fixture\'s receipts and copilot\'s events share no identifier"\n'
-      "               if secret_result == RESULT_UNATTRIBUTED else\n"
-      '               " emitted a completion carrying no result to inspect: the call failed, or the "\n'
-      '               "payload was empty")'),
+     "            + result_account(secret_result)",
      '            + ""',
      "...and those two secret losses are told apart in the reason, not merged"),
     ("F41-the-bearer-need-only-arrive-once", CGATE_REMOTE,

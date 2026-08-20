@@ -305,6 +305,14 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
    requires `success: true` and a structurally usable payload, pinned to the shape 1.0.80 emits — and
    the leak test runs *before* it, since a completion carrying the value is a leak whether or not the
    call succeeded.
+   **A ninth round found the same collapse one layer out, in the reasons rather than the verdicts.**
+   Three sentences describe what became of a result, and two of them enumerated the states inline and
+   ended in an `else` naming one specific observation — so a leak from an arm with no completion at
+   all was told *our tool's result came back without it*, and so was a control whose results could
+   not be attributed. Every verdict was right, which is why every arm was green: a diagnosis is a
+   second assertion and needs driving of its own. `RESULT_ACCOUNTS` now puts each state into words
+   once, `result_account()` reads it, and §E21 holds its domain equal to the module's own `RESULT_*`
+   vocabulary, read off the module rather than restated.
 5. **Remote `type` omission, as *behaviour* rather than shape.** Slice 3 writes `type` and an explicit
    `tools: ["*"]` because §2(b) says copilot writes them for itself — but (b) is unversioned, and the
    probe that produced it *cannot* be versioned: `copilot mcp add` emits no in-band witness, so no

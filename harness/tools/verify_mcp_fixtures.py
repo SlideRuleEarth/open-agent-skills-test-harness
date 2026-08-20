@@ -4961,6 +4961,81 @@ try:
                             secret_result=EV.RESULT_ABSENT)[0] == EV.CONTROL_INCOMPLETE,
           "order")
 
+    # -- result_account: the reason is an OBSERVATION, and it is not the verdict --------------
+    # THE VERDICT MAY MERGE STATES; THE SENTENCE MAY NOT. Two of the three sentences above used
+    # to enumerate the vocabulary inline and end in an `else` naming one specific observation,
+    # so every state that reached that else was told what RESULT_CLEAN would have shown: a leak
+    # from an arm with NO completion was told "our tool's result came back without it", and so
+    # was a control whose results could not be attributed (review, PR #120, ninth round). The
+    # arms above assert the VERDICT, which was right in every one of those runs — which is why
+    # the reasons are driven here, and driven over the whole vocabulary rather than over the
+    # states someone thought of.
+    _vocab = {v for k, v in vars(EV).items() if k.startswith("RESULT_") and isinstance(v, str)}
+    # THE STRUCTURAL CLAUSE every `all()` below carries: the set is read off the module, so a
+    # state that stops existing — or a sixth that starts — fails these checks instead of
+    # quietly emptying a quantifier into a vacuous pass.
+    _vocab_ok = _vocab == {EV.RESULT_CARRIED, EV.RESULT_CLEAN, EV.RESULT_UNATTRIBUTED,
+                           EV.RESULT_UNREADABLE, EV.RESULT_ABSENT}
+    check("the RESULT_* vocabulary is read off the module, and it is those five states",
+          _vocab_ok, sorted(_vocab))
+    check("...and `result_account` is total over it: its domain IS the vocabulary",
+          _vocab_ok and set(EV.RESULT_ACCOUNTS) == _vocab,
+          sorted(_vocab ^ set(EV.RESULT_ACCOUNTS)))
+    check("...with a different sentence for each, so no two states are told the same thing",
+          _vocab_ok and len({EV.result_account(st) for st in _vocab}) == len(_vocab),
+          sorted((st, EV.result_account(st)) for st in _vocab))
+    check("...and a state with NO account is NAMED, not handed some other state's sentence",
+          _vocab_ok and "RESULT_INVENTED" in EV.result_account("RESULT_INVENTED")
+          and all(EV.result_account(st) not in EV.result_account("RESULT_INVENTED")
+                  for st in _vocab),
+          EV.result_account("RESULT_INVENTED"))
+    check("the leak sentence tells the account of the state it was GIVEN, for every state",
+          _vocab_ok and all(
+              EV.result_account(st) in EV.secret_verdict(f"leaked {_sent}", _sent,
+                                                         **dict(_ok, secret_result=st))[1]
+              for st in _vocab),
+          "composed from the account, not written out of one state's sentence")
+    # THE REPRODUCTION. Every one of these is NO_REDACTION and every one of them was right;
+    # what was false was the half-sentence in the middle saying a result had come back.
+    check("...and no state but RESULT_CLEAN is told our tool's result came back without it",
+          _vocab_ok and all(
+              EV.result_account(EV.RESULT_CLEAN)
+              not in EV.secret_verdict(f"leaked {_sent}", _sent,
+                                       **dict(_ok, secret_result=st))[1]
+              for st in _vocab - {EV.RESULT_CLEAN}),
+          "a run with no completion at all was told its completion came back clean")
+    check("...so the leak reasons are as many different sentences as there are states",
+          _vocab_ok and len({EV.secret_verdict(f"leaked {_sent}", _sent,
+                                               **dict(_ok, secret_result=st))[1]
+                             for st in _vocab}) == len(_vocab),
+          "one state, one diagnosis")
+    # THE SAME DEFECT ONE BRANCH DOWN, which no arm had ever driven: the control's `else`
+    # covered RESULT_CLEAN and RESULT_UNATTRIBUTED together and described only the first.
+    check("the control's sentence tells the account too, for every state that reaches it",
+          _vocab_ok and all(
+              EV.result_account(st) in EV.secret_verdict("nothing here", _sent,
+                                                         **dict(_ok, control_result=st))[1]
+              for st in _vocab - {EV.RESULT_CARRIED}),
+          "RESULT_CARRIED is the one state that does not reach CONTROL_FAILED")
+    check("...including RESULT_UNATTRIBUTED, which its `else` called a result that came back",
+          EV.result_account(EV.RESULT_CLEAN)
+          not in EV.secret_verdict("nothing here", _sent,
+                                   **dict(_ok, control_result=EV.RESULT_UNATTRIBUTED))[1],
+          "undriven until this round, and false the whole time")
+    check("...so the control reasons are as many sentences as there are states reaching it",
+          _vocab_ok and len({EV.secret_verdict("nothing here", _sent,
+                                               **dict(_ok, control_result=st))[1]
+                             for st in _vocab - {EV.RESULT_CARRIED}})
+          == len(_vocab - {EV.RESULT_CARRIED}),
+          "one loss, one diagnosis")
+    check("the secret arm's sentence tells the account, for every state outside INSPECTABLE",
+          _vocab_ok and set(EV.INSPECTABLE_RESULTS) == {EV.RESULT_CARRIED, EV.RESULT_CLEAN}
+          and all(EV.result_account(st)
+                  in EV.secret_verdict("nothing here", _sent,
+                                       **dict(_ok, secret_result=st))[1]
+                  for st in _vocab - set(EV.INSPECTABLE_RESULTS)),
+          "the three losses, each described as itself")
+
     # -- answered(): a conjunction, so any single gap fails it -------------------------------
     # The tell for a lookup-on-the-last-value bug is that ONE unanswered term still passes.
     check("all four answered is answered",

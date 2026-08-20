@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff AN
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff + shellcheck + a parse under every shell
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 231/231 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 743 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 236/236 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 754 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine
 git diff --check
@@ -2223,6 +2223,29 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   with a leading `\n`, which is a real newline in the source and an escape sequence in the
   entry, so the entry cannot match itself. Every `F*` aimed at `SELF` is written that way or
   spans several lines, which has the same effect for the same reason.
+- **A VERDICT MAY MERGE STATES; THE SENTENCE BESIDE IT MAY NOT — and an arm that reads the
+  verdict cannot see that.** `secret_verdict` publishes a word and a reason, and the reason is
+  a second assertion about what was observed. Three of its sentences described what became of
+  our tool's result, and each enumerated the five-word vocabulary inline; two of them ended in
+  an `else` that named one SPECIFIC observation, so every state reaching that `else` was told
+  what a different state would have shown — a leak from an arm with no completion at all was
+  told "our tool's result came back without it", and so was a control whose results could not
+  be attributed (review, PR #120, ninth round). Every one of those runs got the RIGHT verdict,
+  which is why a dozen arms asserting the verdict were green throughout: **a diagnosis is only
+  under test if something drives the diagnosis.** The tell is a trailing `else` inside a reason
+  string over a vocabulary of more than two words — it is the `elif`-chain rule one level down,
+  where the output is prose instead of a verdict. The fix is the same shape as
+  `INSPECTABLE_RESULTS`: one table beside the vocabulary, total over it by a check that reads
+  the vocabulary OFF THE MODULE rather than restating it, and each sentence asking it for the
+  middle. A sixth state is then right in all three sentences at once, and the fallback names
+  the state instead of handing it a fifth state's words.
+- **Re-anchor a mutation whose clause you rewrote; do not retire it.** Extracting that table
+  broke three older mutations (`F226`, `F227`, `F232`) whose anchors quoted the enumerations it
+  replaced — and what each of them says, "every state in this branch reads alike", is exactly
+  what the table now exists to prevent. `stale_anchors` refused the run and named all three
+  before a suite was spent, which is the second time that gate has paid for itself in a round
+  where a refactor moved code an old mutation was aimed at. The replacement text is usually
+  simpler than the original: the same `+ ""`, one call further in.
 
 ---
 
