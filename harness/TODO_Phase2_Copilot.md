@@ -223,10 +223,35 @@ tripping it.
 
 ---
 
-## 3. Build order — four slices
+## 3. Build order — four slices, three PRs, one arming
 
 Each slice touches `agentskill_evals/`, so each pays the full gate in `TODO_Contained_HOME.md` §4:
-selftest, mutation suite, Ruff. Four slices means four mutation runs.
+selftest, mutation suite, Ruff.
+
+**Packaging (decided 2026-08-20, in review).** Four slices, three pull requests, and slice 3 splits
+at the moment injection becomes reachable:
+
+| PR | contents | `supports_mcp_injection` |
+|---|---|---|
+| 1 | slice 4's **parser** half, then slice **3a** — config writer, `--additional-mcp-config`, `--secret-env-vars`, `${VAR}` interpolation | stays `False` |
+| 2 | slice **2** — the witness reducer, the two readers, the declared-set policy | stays `False` |
+| 3 | slice **3b** — flip the flag, live acceptance — then slice 4's **`used_mcp_tool`** half | `True` |
+
+Each behavioural boundary is its own COMMIT inside those PRs — parser, writer, witness, arming — so
+a reviewer can read them apart even where they ship together.
+
+**PR 2 does not merge on its own.** Its declared-server policy is unreachable by any live run until
+PR 3 flips the flag, so merging it alone would put a branch on `main` that nothing but synthetic
+inputs has ever entered — §4's trap, and the reason the split exists in the first place is to avoid
+exactly that. PRs 2 and 3 are reviewed as a stack and land together, PR 2 first in the stack, after
+PR 3's live acceptance has been the thing that exercised it.
+
+The arming is one commit for a reason: risk 2 below is an interaction that has never executed on any
+build, and concentrating it makes it reviewable rather than diffuse. Everything before it is inert
+**by construction** — the flag refuses `mcp_servers:` at `validate_mcp_support`, so no scenario can
+reach the new code — rather than dead by accident.
+
+Three PRs means three mutation runs rather than four (~14 min each, `full-suite-gates-merge-not-commit`).
 
 ### Slice 1 — measure (probes only, no production code)
 
@@ -400,9 +425,88 @@ Mirror of claude's Phase 1 change (§8 line 282), adapted to copilot's event sha
 (`session.mcp_servers_loaded` + `session.mcp_server_status_changed`, rather than claude's `system`/`init`).
 
 - permit **exactly** the declared set, and only that
-- **undeclared + any status ⇒ fail the run** — unchanged, this is the kill-switch
+- **undeclared + ever non-inert ⇒ fail the run** — the kill-switch, and the qualification is not a
+  softening. **"Undeclared + any status" would fail every hermetic run there is**: copilot always
+  reports the built-in `github-mcp-server` as `disabled`, that entry is never declared by a
+  scenario, and the witness contract *requires* it — a well-formed event that does not name it is
+  refused (`_WITNESS_SENTINEL`, `adapters/copilot.py`). The shipped code already reads it this way
+  — `note()` records only non-inert statuses and `verify_post_run` raises on that map — so this
+  line was the plan disagreeing with the adapter, not a change of policy (found in review,
+  2026-08-20).
 - declared + healthy ⇒ allowed
 - declared + `failed` / unrecognised / absent ⇒ **warn, not raise** (§1, decided — matching claude)
+
+**One reducer, two readers.** Claude's split is the model — `_mcp_witness` may fail the run,
+`_witnessed_servers` runs on the reporting path and returns `None` instead of raising (§8's rule:
+malformed telemetry is an *unknown* where it is reported and a *failure* where the contract is
+judged). Copilot needs more internal evidence than claude's four values, so both readers derive
+from **one** reducer over the stream rather than each walking it:
+
+1. the contract violation, if any, and whether the witness existed at all;
+2. the servers **ever observed non-inert** — the hermeticity reduction;
+3. **every** server's **final** status — the health reduction;
+4. validated plugin attribution, for diagnostics only.
+
+(2) and (3) are different reductions of the same sequence and neither substitutes for the other. The
+current `note()` only ever ADDS to `live`, so an inert status never clears a name recorded live
+earlier — correct for (2), wrong for (3), where a declared server whose last status is `disabled` is
+not healthy. `live[name]` today is the last **non-inert** status, which is not the last status.
+`_fmt_live` also hands back `"name (status)"` strings, so there is no structured map for the
+reporting side to build `(name, status)` pairs from; the reducer is what supplies it.
+
+**The status vocabulary, on both axes.** 1.0.64's bundle enumerates
+`connected | failed | needs-auth | pending | disabled | not_configured`; slice 1 observed four of
+those six on the wire. Both facts matter, and they are different classes of evidence — the enum is
+§2(b) shape read out of a build, the observations are §2(a) behaviour read from a run:
+
+| status | observed at 1.0.80 | safety (§ever non-inert) | declared-server health |
+|---|---|---|---|
+| `connected` | yes | non-inert | healthy |
+| `pending` | yes | non-inert | **not** healthy — a transient; final `pending` is an incomplete start |
+| `failed` | yes | non-inert | unhealthy |
+| `disabled` | yes | inert | unhealthy if final for a DECLARED server |
+| `needs-auth` | no — enum only | non-inert | unhealthy: a server that has not come up |
+| `not_configured` | no — enum only | inert | unhealthy if final for a declared server |
+| anything else | — | **non-inert** (fail closed) | **unknown**, never healthy |
+
+`not_configured` stays in `_INERT_MCP_STATUSES`: the evidence for it is the enum read from 1.0.64's
+bundle, cited where the set is defined, which is weaker than a wire observation but is not nothing.
+`needs-auth` is in that enum too and appears **nowhere else in this repo** — no probe, no plan, no
+table — while being non-inert today, which is the safe direction by luck rather than by decision.
+It is written down here so the health axis has a row for it.
+
+An unknown word keeps its **raw spelling** in diagnostics while contributing *unknown* health to
+comparability. Losing the word to a bucket is how the next vocabulary change becomes unreadable.
+
+**Two asymmetries with claude, both deliberate, and the second one is not settled.**
+
+*Inertness.* `DESIGN_MCP_Support.md` §8 line 282 states the rule as "an undeclared server fails the
+run whatever its status claims", and that is accurate **for claude**, whose `live` list is every
+server the run reports with no status filter at all (`adapters/claude.py`) — nothing is
+unconditionally present there, so every reported name is a real question. Copilot cannot read it
+that way: its witness contract *requires* an undeclared entry, the built-in sentinel, always
+reported `disabled`. So "ever non-inert" is not copilot relaxing claude's rule, it is the same rule
+under a stream that always contains one inert entry by construction.
+
+*Which status wins.* Claude keeps the **first non-`connected`** status it sees — `statuses[name]` is
+overwritten only while it still reads `connected` — so a later good reading cannot erase an earlier
+bad one across claude's repeated `init` events. The decision above for copilot is the **final**
+status, which is required by copilot's stream, where the healthy path is literally
+`pending → connected` and first-wins would call every healthy server unhealthy. Both rules are right
+for their own event shape. What is **not** settled is that `mcp_servers_witnessed` is a field
+compared across cells, and it would then mean *first-bad* on one adapter and *final* on the other:
+a copilot server going `failed → connected` reports healthy where a claude server on the same
+trajectory reports failed. Raised 2026-08-20; **decide before slice 2 writes the reducer**, since
+the answer is a property of the compared field rather than of either adapter.
+
+**Plugin attribution is diagnostic only.** `mcp_servers_witnessed` stays `(name, status)` across
+adapters — a field compared cell-to-cell must have one shape, and widening copilot's tuple would
+make its rows structurally unlike claude's. The `source` / `sourcePlugin` / `pluginName` fields the
+witness currently discards are used to turn *"server X was loaded"* into *"server X was loaded,
+declared by plugin P"*, under PR #121's rule: `source == "plugin"` **and** both name fields present
+**and** equal. Two fields naming one plugin are two witnesses; either-one-matching is not
+attribution. Contradictory attribution is reported **as contradictory** — never resolved by picking
+a field.
 
 Fails closed if the declared set is unavailable: this must never become a way to *disable* the audit.
 Standing rule from §8 applies — *a fact learned from the run may warn; only the runtime contract may
@@ -411,10 +515,19 @@ pass*.
 Also feeds the **two-axis** comparability reporting (§8): the set and the health are separate verdicts,
 `None` ≠ `()`, and health is only compared within a uniform set.
 
-### Slice 3 — injection
+### Slice 3 — injection, split at the arming
 
-- `supports_mcp_injection = True` (currently the base default `False`), `mcp_tool_filter = "native"`,
-  `tool_filter_for` per server
+**3a builds it; 3b turns it on.** Everything in 3a is unreachable while `supports_mcp_injection` is
+`False`, because `validate_mcp_support` refuses `mcp_servers:` for the adapter before anything else
+runs — inert by construction, and reviewable without a live run. 3b is the flag, and it is where
+the acceptance below is spent.
+
+**3a — the writer** (flag stays `False`): `mcp_tool_filter = "native"`, `tool_filter_for` per
+server, the config writer, the argv flag, `--secret-env-vars`, `${VAR}` interpolation.
+
+**3b — the arming** (one commit): `supports_mcp_injection = True` (currently the base default
+`False`), plus the three acceptance cases run live.
+
 - config writer emitting **`type`**, `command`/`args`/`env` for stdio, `url`/`headers` for remote, and
   `tools` — never omitted to mean "everything", since copilot spells that `["*"]`
 - `--additional-mcp-config @file`, the file written 0600 in the per-cell `ase-mcp-` scratch dir outside
@@ -437,8 +550,13 @@ token**, and the token is the half the design exists for.
 Three cases, and the middle one is the load-bearing one:
 
 1. **stdio, adapter path** — live against `fixtures/echo_mcp_server.py`.
-2. **remote with a real credential, adapter path** — live against `fixtures/http_mcp_server.py`, which
-   already writes one receipt per request, driven **through the adapter/runner from a scenario**, with:
+2. **remote with a PER-RUN CREDENTIAL SENTINEL, adapter path** — live against
+   `fixtures/http_mcp_server.py`, which already writes one receipt per request, driven **through the
+   adapter/runner from a scenario**. Called a per-run credential sentinel and not a "real credential"
+   deliberately: the server is ours, so the value is a token this run generates and exports, and no
+   third-party authentication is implied to a reader. It exercises everything the design needs
+   exercised — interpolation, exact header delivery, gating, redaction — while introducing no external
+   secret and no external service. With:
    - the bearer supplied as `${VAR}` from the environment, never a literal in the scenario — this is the
      only thing that exercises interpolation at all;
    - a native `tools:` allowlist;
@@ -454,10 +572,18 @@ Three cases, and the middle one is the load-bearing one:
 
 ### Slice 4 — parser and the portable assertion
 
-- normalize copilot's MCP tool names using slice 1's measurement
-- **`used_mcp_tool`** — blocked since Phase 1 on "a second injecting adapter"; copilot is that adapter.
-  It must match the `tool_use` event and **not assume it is the first tool in the transcript** (§9: the
-  model may route through a `ToolSearch` step first)
+Its two halves land in different PRs, because they depend on different things. The parser needs only
+slice 1's measurement, so it goes in PR 1 and gives 3b's live run a correctly-named tool to assert
+on. The assertion needs a run that actually uses an MCP tool, so it goes with the arming.
+
+- **PR 1** — normalize copilot's MCP tool names using slice 1's measurement: match `mcpServerName`
+  and `mcpToolName`, which `tool.execution_start.data` carries as their own fields, and never split
+  the composite — a server or tool whose own name contains a hyphen breaks the split and cannot
+  break the fields. The composite `<server>-<tool>` stays the fallback for a build that stops
+  emitting them.
+- **PR 3** — **`used_mcp_tool`**, blocked since Phase 1 on "a second injecting adapter"; copilot is
+  that adapter. It must match the `tool_use` event and **not assume it is the first tool in the
+  transcript** (§9: the model may route through a `ToolSearch` step first)
 
 ---
 
@@ -465,8 +591,8 @@ Three cases, and the middle one is the load-bearing one:
 
 1. **Slice 1 can generate unscoped work** — a bad answer on plugin-declared servers is a Phase 0 gap.
 2. **Arming `supports_mcp_injection`** wakes an interaction that has never executed (risk 3 above).
-3. **Four mutation runs.** Consider running the suite once per slice at merge rather than per push
-   (`full-suite-gates-merge-not-commit`).
+3. **Three mutation runs** (four slices, three PRs — §3). Run the suite once per PR at merge rather
+   than per push (`full-suite-gates-merge-not-commit`).
 4. **copilot's version is unreadable and unpinnable from outside** (§8) — `--no-auto-update` is
    load-bearing for *code selection*, not just update traffic. Any new probe must go through the same
    argv the run uses, or probe and run can execute different code.
