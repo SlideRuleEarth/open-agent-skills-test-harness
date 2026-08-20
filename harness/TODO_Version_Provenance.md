@@ -528,13 +528,58 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
 
 ## Still open
 
-- **Phase 1 must refuse `isolated: false` together with `mcp_servers:`.** The companion to
-  the parallel/isolation guard now in `Runner.run()`, and it could not be written yet
-  because the `mcp_servers:` schema does not exist. The reasoning is the same: isolation is
-  what gives a cell a private config home, so a scenario that declares MCP servers *and*
-  turns isolation off is asking the harness to materialize server config into the user's
-  real `$HOME` — where it outlives the run and is visible to everything else on the
-  machine. Write it with the schema, not after.
+- **codex's residual ABA hole — an idle server that starts and is reverted is
+  undetectable.** A server added to a config codex reads after argv was built, started by
+  codex, then removed before `verify_post_run` re-enumerates, passes both checks whenever
+  the model never calls one of its tools. Neither half can see it: no tool call means no
+  stream evidence, and codex emits no event when a server *starts*. Because it is the idle
+  server that escapes, and a server can act at startup without ever being called, this is
+  a genuine hole rather than a technicality — for codex, a clean verification means "no
+  leak was detected", not "no server ran".
+
+  Detection cannot fix this; it needs **prevention**. The direction is a *materialized*
+  private config for the child instead of one shared with the host, so there is no file an
+  outside writer can add a server to mid-run. What makes it real work rather than a
+  one-liner:
+
+  * `$CODEX_HOME` currently mirrors the user's, which is what keeps auth (`auth.json`)
+    working — materializing it means deciding what to copy and what to synthesize.
+  * A *trusted project's* `.codex/config.toml` is found from the git root above cwd, i.e.
+    inside the workspace, so a private `CODEX_HOME` does not cover it. The scenario's own
+    task can write one mid-run (copilot documents the same false-positive shape).
+  * Whatever is materialized has to keep the pre-launch enumeration honest, or the
+    fail-closed path fires on every run.
+
+  Worth doing before Phase 1 puts *intentional* servers on codex, because that work has to
+  materialize a config anyway — the two changes want to be designed together rather than
+  the second one inheriting the first's shared-file assumption.
+
+- ~~**codex has no post-run config re-check.**~~ **Partly done — the persistent case is
+  covered, one case remains open.** `CodexAdapter.verify_post_run` now re-enumerates
+  codex's effective view after the run and fails any run where a server is configured that
+  the launched `-c ...enabled=false` set did not name, plus reads the run's own stream for
+  `mcp_tool_call` items. It does **not** close the window; see "codex's residual ABA hole"
+  above, which is tracked as its own open item.
+
+- **agy has a candidate in-band version source that is not yet usable.**
+  `~/.gemini/antigravity-cli/cli.log` opens with a `Language server version: <v>` banner
+  the run itself writes. Two things would have to be settled before it could be read:
+  it sits at a fixed shared path, so attributing a line to *this* run depends on the
+  isolated HOME actually containing it rather than the real one (unverified); and it is a
+  free-form log the agent's own activity also writes into, so a naive scan reads a channel
+  model-controlled text can reach — the forgery hazard copilot had to design around.
+
+- **`DESIGN_MCP_Support.md` §9 probe #2 — codex TOML array / inline-table values via `-c`** — remains deferred, and it is what blocks Phase 1b. *(The other probe this entry used to name, claude `--allowedTools` gating, is **answered**: under `--dangerously-skip-permissions` the flag is entirely inert for MCP tools, verified live at 2.1.113 and re-established unchanged at 2.1.231 — §6-C2. It is `--disallowedTools` that bites.)*
+
+## Landed — kept for the reasoning, not as work
+
+These were written as open items and the work each describes has since shipped. They stay because
+**the reasoning is the reusable part** — every one of them is a rule that generalizes past the
+defect that produced it. **Nothing in this section is a task.** It was split out of *Still open*
+on 2026-08-20, when a completed item was found sitting there under a heading that made it look
+like remaining work.
+
+- ~~**Phase 1 must refuse `isolated: false` together with `mcp_servers:`.**~~ **Done (2026-07-28)** — the `mcp_servers:` schema it was waiting on exists, and the refusal is in `exec.py`, narrowed there to the case that actually escapes rather than to the whole pair. `TODO_Contained_HOME.md` §6 records the same landing; this entry sat under *Still open* for weeks after it shipped, which is what a status kept in two files does when only one of them is updated. The reasoning it was written for, kept: isolation is what gives a cell a private config home, so a scenario that declares MCP servers *and* turns isolation off is asking the harness to materialize server config into the user's real `$HOME` — where it outlives the run and is visible to everything else on the machine.
 
 - **Provenance is only half the job; the other half is COMPARABILITY.** The whole point of
   a matrix is the difference between its cells, and that difference is only attributable to
@@ -607,45 +652,3 @@ Installed 0.140.0 matches the 7 pinned findings, so there is no drift today.
   reach it without anyone typing a flag. Nothing warned. An invariant maintained by a
   default is one nobody notices losing — the guard costs ~15 lines and converts it into
   something enforced. Worth a sweep for others of the same shape.
-
-- **codex's residual ABA hole — an idle server that starts and is reverted is
-  undetectable.** A server added to a config codex reads after argv was built, started by
-  codex, then removed before `verify_post_run` re-enumerates, passes both checks whenever
-  the model never calls one of its tools. Neither half can see it: no tool call means no
-  stream evidence, and codex emits no event when a server *starts*. Because it is the idle
-  server that escapes, and a server can act at startup without ever being called, this is
-  a genuine hole rather than a technicality — for codex, a clean verification means "no
-  leak was detected", not "no server ran".
-
-  Detection cannot fix this; it needs **prevention**. The direction is a *materialized*
-  private config for the child instead of one shared with the host, so there is no file an
-  outside writer can add a server to mid-run. What makes it real work rather than a
-  one-liner:
-
-  * `$CODEX_HOME` currently mirrors the user's, which is what keeps auth (`auth.json`)
-    working — materializing it means deciding what to copy and what to synthesize.
-  * A *trusted project's* `.codex/config.toml` is found from the git root above cwd, i.e.
-    inside the workspace, so a private `CODEX_HOME` does not cover it. The scenario's own
-    task can write one mid-run (copilot documents the same false-positive shape).
-  * Whatever is materialized has to keep the pre-launch enumeration honest, or the
-    fail-closed path fires on every run.
-
-  Worth doing before Phase 1 puts *intentional* servers on codex, because that work has to
-  materialize a config anyway — the two changes want to be designed together rather than
-  the second one inheriting the first's shared-file assumption.
-
-- **agy has a candidate in-band version source that is not yet usable.**
-  `~/.gemini/antigravity-cli/cli.log` opens with a `Language server version: <v>` banner
-  the run itself writes. Two things would have to be settled before it could be read:
-  it sits at a fixed shared path, so attributing a line to *this* run depends on the
-  isolated HOME actually containing it rather than the real one (unverified); and it is a
-  free-form log the agent's own activity also writes into, so a naive scan reads a channel
-  model-controlled text can reach — the forgery hazard copilot had to design around.
-- ~~**codex has no post-run config re-check.**~~ **Partly done — the persistent case is
-  covered, one case remains open.** `CodexAdapter.verify_post_run` now re-enumerates
-  codex's effective view after the run and fails any run where a server is configured that
-  the launched `-c ...enabled=false` set did not name, plus reads the run's own stream for
-  `mcp_tool_call` items. It does **not** close the window; see "codex's residual ABA hole"
-  below, which is now tracked as its own open item.
-- The two `DESIGN_MCP_Support.md` §9 probes (claude `--allowedTools` gating, codex TOML
-  array/inline-table values via `-c`) remain deferred, then Phase 1.
