@@ -2364,9 +2364,17 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   lesson's work done? — and every falsifier was somewhere else: in a last sentence, an aside,
   a parenthesis. A prose `all(...)` needs what §4 already demands of the code kind: read the
   members, not the label. The fix was to ANSWER the sweep rather than re-file it, which is
-  usually the cheaper of the two — its population was `_SCENARIO_OVERRIDE_KEYS`, four keys,
-  and all four turned out to be guarded by check rather than by default. A leftover
-  intention small enough to restate in a lesson is often small enough to settle instead.
+  usually the cheaper of the two — its population was `_SCENARIO_OVERRIDE_KEYS`, four keys.
+  Two further corrections came back on the answer, and they are the general lesson, not
+  the local one: **a negative result carries the scope of the population actually
+  enumerated**, so naming those four "the only knobs a YAML file can move" turned a valid
+  negative into an overclaim over `env:`, `mcp_servers:`, targets and timeouts, which were
+  never looked at; and **a summary must not upgrade the strength of what it summarizes** —
+  the paragraph said refused HERE, warned THERE, printed on the plan line, and the sentence
+  above it flattened all three into "guarded by check". The property that actually holds
+  over all four is the weakest one, which is also the one the defect was about: none is
+  taken silently. A leftover intention small enough to restate in a lesson is often small
+  enough to settle instead — but the settling gets the same reading the code gets.
 
 ---
 

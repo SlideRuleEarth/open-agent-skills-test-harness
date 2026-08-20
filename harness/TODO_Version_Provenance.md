@@ -654,19 +654,28 @@ like remaining work.
   something enforced.
 
   The sweep this entry used to ask for has been run (2026-08-20), over the population that
-  produced it: `_SCENARIO_OVERRIDE_KEYS` in `spec.py` — `{jobs, max_cells, judge, isolated}`,
-  the only knobs a YAML file can move without anyone typing a flag. It is negative; each of
-  the four now fails by check rather than by default. `jobs > 1` is refused in `Runner.run`
-  (the guard that also covers programmatic callers) and again in `cli.py` before the plan
-  prints. `isolated: false` is refused outright where it would materialize `mcp_servers:`
-  config into the real `$HOME` (`exec.py`), warns up front on a runner whose MCP-off
-  guarantee lives in the overlay (`runner.py`), and prints as `isolated: off` on the plan
-  line whichever path set it. `judge: false` raises a validation warning when a rubric would
-  be silently skipped, and prints as `judge: off`. `max_cells` is a spend ceiling rather than
-  a correctness invariant, and breaching it is a refusal that names the count. That is a read
-  of those call sites on the date above, not a mutation-proved claim. It is recorded rather
-  than left standing as an intention because "worth a sweep", sitting in a section of
-  finished work, is the same one-status-two-places defect this file was reorganized to
-  remove. **The rule outlives the result: a new scenario-override key re-opens the question
-  — ask what was true only because that key's default had never been moved, and give that
-  property a check in the commit the key ships in.**
+  produced it: the four optional RUN-KNOB overrides a scenario file may set —
+  `_SCENARIO_OVERRIDE_KEYS` in `spec.py`, `{jobs, max_cells, judge, isolated}`. That is
+  narrower than "what a YAML file controls", and the difference matters to what the result
+  is worth: a scenario or eval also declares `env:`, `mcp_servers:`, targets, timeouts and
+  assertions, and this says nothing about any of them. Over the four it is negative — but
+  the accurate form of the negative is that **none of them is taken silently**, not that
+  all four are checked, because what stands in the way differs by property and only two are
+  refusals. `jobs > 1` is refused in `Runner.run` (the guard that also covers programmatic
+  callers) and again in `cli.py` before the plan prints. `isolated: false` is refused only
+  in the narrow case where it would materialize `mcp_servers:` config into the real `$HOME`
+  (`exec.py`); on a runner whose MCP-off guarantee lives in the overlay it is a warning
+  (`runner.py`); otherwise it is rendered rather than guarded, printing as `isolated: off`
+  on the plan line whichever path set it. `judge: false` is never refused at all — it
+  raises a validation warning where a rubric would otherwise be silently skipped, and prints
+  as `judge: off`. `max_cells` is a spend ceiling rather than a correctness invariant, and
+  breaching it is a refusal that names the count. Refused, warned about, or rendered
+  explicitly, then — three different strengths, and the one thing true of all four is the
+  one the defect was about: the silence is gone. That is a read of those call sites on the
+  date above, not a mutation-proved claim. It is recorded rather than left standing as an
+  intention because "worth a sweep", sitting in a section of finished work, is the same
+  one-status-two-places defect this file was reorganized to remove. **The rule outlives the
+  result: a new run-knob override re-opens the question — ask what was true only because
+  that key's default had never been moved, and make the move visible in the commit the key
+  ships in, at the strength the property deserves. A refusal where it is a correctness
+  invariant; a warning, or a line in the plan the operator reads, where it is not.**
