@@ -5,8 +5,12 @@ bearer token in `headers` and a per-server `tools:` allowlist that is really enf
 and no transport bridge. Scope is **stdio *and* remote**, not stdio first.
 
 `harness/DESIGN_MCP_Support.md` is authoritative for every fact below; this file is the build order and
-the decisions behind it. **Nothing here blocks Phase 2** — §1 was the last blocking decision and closed
-on 2026-08-17, though a later option **D** may yet supersede it without stopping any slice (§1).
+the decisions behind it. **§1 closed on 2026-08-17** and blocks nothing; a later option **D** may yet
+supersede it without stopping any slice (§1). **What is blocked now is stated once, in §0** — this
+sentence used to read "nothing here blocks Phase 2", which was true while §1 was the only open
+decision and false the moment a second one was recorded, in the same edit that added §0 to say so
+(found in review, 2026-08-20). A file that answers "is anything blocked?" in two places will answer
+it differently.
 Read §2 (copilot), §5.2, §5.3 and §8 before changing anything. Counts live only in
 `TODO_Contained_HOME.md` §4 — do not restate them here.
 
@@ -24,10 +28,11 @@ place for them to be wrong.
 2. **No production code has been written for slices 2–4.** Nothing is in flight.
 3. **The next change is PR 0**, which is not part of any slice — see §3's table for what it is and
    why it goes first.
-4. **One decision is still open and blocks slice 2's reducer**: whether the serialized health field
-   means *first-bad* or *final*, given that claude and copilot answer it differently for their own
-   event shapes. §3's slice 2 states it; **it must be settled before the reducer is written**, not
-   discovered while writing it.
+4. **One decision is still open, and it blocks exactly one thing**: whether the serialized health
+   field means *first-bad* or *final*, given that claude and copilot answer it differently for their
+   own event shapes. §3's slice 2 states it. It blocks **slice 2's reducer** and nothing else — PR 0
+   and PR 1 do not touch that field — and it must be **settled before the reducer is written**,
+   rather than discovered while writing it.
 
 The build order, the packaging, and the reasoning behind both are §3. `DESIGN_MCP_Support.md` stays
 authoritative for every fact either of them rests on.
