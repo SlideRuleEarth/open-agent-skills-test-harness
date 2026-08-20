@@ -12,7 +12,29 @@ Read §2 (copilot), §5.2, §5.3 and §8 before changing anything. Counts live o
 
 ---
 
-## 0. Why copilot, and why now
+## 0. STATUS — where the build is, and what is next
+
+**Read this first; it is deliberately four facts and a set of pointers.** Everything it would
+otherwise restate — the PR table, the slice contents, the status vocabulary, the counts — lives
+once, further down or in `TODO_Contained_HOME.md` §4. A status block that copies them is a second
+place for them to be wrong.
+
+1. **Slice 1 is done** (PRs #120, #121). All five measurement questions are answered against copilot
+   1.0.80, each from the run's own stream. §3's slice 1 has the readings.
+2. **No production code has been written for slices 2–4.** Nothing is in flight.
+3. **The next change is PR 0**, which is not part of any slice — see §3's table for what it is and
+   why it goes first.
+4. **One decision is still open and blocks slice 2's reducer**: whether the serialized health field
+   means *first-bad* or *final*, given that claude and copilot answer it differently for their own
+   event shapes. §3's slice 2 states it; **it must be settled before the reducer is written**, not
+   discovered while writing it.
+
+The build order, the packaging, and the reasoning behind both are §3. `DESIGN_MCP_Support.md` stays
+authoritative for every fact either of them rests on.
+
+---
+
+## 0b. Why copilot, and why now
 
 copilot is the only adapter whose `tools:` is a **hard filter on every transport it offers** — measured
 on the wire at 1.0.79 (§2), the opposite of claude's answer to the same question (§6-C2, which is the

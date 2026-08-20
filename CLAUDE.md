@@ -1,7 +1,11 @@
 # Working in this repo
 
 **Authoritative documents.** `harness/DESIGN_MCP_Support.md` is the specification for MCP
-support — read the section you are about to change before changing it. `harness/TODO_Contained_HOME.md`
+support — read the section you are about to change before changing it. `harness/TODO_Phase2_Copilot.md`
+is the build order for the work in flight: its §0 says where the build is, what changes next, and
+which decision is still open; §3 holds the packaging and the reasoning behind it. Read those two
+sections before starting anything in Phase 2 — a summarized conversation loses the reasoning, and
+that file is what survives it. `harness/TODO_Contained_HOME.md`
 §4 is the list of mistakes already made here, kept so they are not made again, and its
 verification block holds the commands and the current arm/mutation/check counts. **Do not copy
 those numbers anywhere else.** A count that lives in two places drifts, and the drift is
