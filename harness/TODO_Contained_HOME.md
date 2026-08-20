@@ -2357,6 +2357,16 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   before a suite was spent, which is the second time that gate has paid for itself in a round
   where a refactor moved code an old mutation was aimed at. The replacement text is usually
   simpler than the original: the same `+ ""`, one call further in.
+- **A HEADING IS A UNIVERSALLY QUANTIFIED CLAIM, AND FILING A BULLET UNDER IT ASSERTS THAT
+  CLAIM OF THE BULLET.** The section that fixed a status kept in two files opened with
+  "Nothing in this section is a task" and then contained, six bullets later, "Worth a sweep
+  for others of the same shape". Each bullet had been classified on its SUBJECT — is this
+  lesson's work done? — and every falsifier was somewhere else: in a last sentence, an aside,
+  a parenthesis. A prose `all(...)` needs what §4 already demands of the code kind: read the
+  members, not the label. The fix was to ANSWER the sweep rather than re-file it, which is
+  usually the cheaper of the two — its population was `_SCENARIO_OVERRIDE_KEYS`, four keys,
+  and all four turned out to be guarded by check rather than by default. A leftover
+  intention small enough to restate in a lesson is often small enough to settle instead.
 
 ---
 
