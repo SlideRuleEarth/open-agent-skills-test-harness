@@ -243,6 +243,24 @@ safety change to shipped code that can newly fail runs, and it depends on nothin
 should not wait on a Phase 2 design discussion, and it should be bisectable on its own. The cost is
 honest: a fourth §4 gate for a one-word change, rather than a gate hidden inside a row.
 
+**The gate does not cover PR 0 unless PR 0 brings its own arm** (found in review, 2026-08-20). The
+existing witness arms drive `disabled`, `failed` and an invented unknown
+(`copilot.post_run_stream_evidence_catches_reverted_leak`, `selftest.py`) — and **never
+`not_configured`**. So the suite is green both before and after the only line PR 0 changes, and
+would stay green if someone put the word back. A fourth §4 gate that cannot see PR 0's sole
+behavioural change is a gate in name. PR 0 therefore ships three things, not one:
+
+1. **The arm.** An undeclared server reported `not_configured` must **fail the run**, alongside the
+   existing `disabled` arm, which must keep **passing** in the same check. One direction alone
+   cannot tell *the allowlist shrank by one word* from *everything now fails*, and `disabled` is
+   already there as that control.
+2. **The mutation.** An `M`-class entry that puts `"not_configured"` back into
+   `_INERT_MCP_STATUSES`, killed by the arm above. This is the repo's standing requirement rather
+   than a new one: a check is only known to work once the failure it exists for has been caused on
+   purpose.
+3. **The stale comment.** `selftest.py` says *"the allowlist is {disabled, not_configured}"* at the
+   arms it is describing. It is a copy of the line PR 0 edits and goes wrong the moment PR 0 lands.
+
 Each behavioural boundary is its own COMMIT inside those PRs — parser, writer, witness, arming — so
 a reviewer can read them apart even where they ship together.
 
