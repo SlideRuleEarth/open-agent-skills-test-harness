@@ -28,11 +28,12 @@ place for them to be wrong.
 2. **No production code has been written for slices 2–4.** Nothing is in flight.
 3. **The next change is PR 0**, which is not part of any slice — see §3's table for what it is and
    why it goes first.
-4. **No decision is open.** The last one — what the serialized health field means, given that
-   claude and copilot answer it differently for their own event shapes — was settled on 2026-08-20,
-   and it is neither of the two candidates that were on the table: health is a **conjunction over
-   every status observed**, with measured transients excluded. §3's slice 2, under "Which status
-   wins", has the rule and what it changes (claude: nothing). Slice 2's reducer is unblocked.
+4. **No decision is open.** The last one — what the serialized health field means when a server's
+   status moves during a run — was settled on 2026-08-20, and it is neither of the two candidates
+   that were on the table: health is a **three-valued conjunction** over every observation, where a
+   known-unhealthy one dominates, any unknown one yields unknown, and only all-known-`connected` is
+   healthy. §3's slice 2, under "Which status wins", has the rule, the per-adapter vocabulary, and
+   the claude change it turns out to require. Slice 2's reducer is unblocked.
 
 The build order, the packaging, and the reasoning behind both are §3. `DESIGN_MCP_Support.md` stays
 authoritative for every fact either of them rests on.
@@ -250,17 +251,19 @@ tripping it.
 
 ---
 
-## 3. Build order — four slices, four PRs, one arming
+## 3. Build order — four slices, five PRs, one arming
 
 Each slice touches `agentskill_evals/`, so each pays the full gate in `TODO_Contained_HOME.md` §4:
 selftest, mutation suite, Ruff.
 
-**Packaging (decided 2026-08-20, in review).** Four slices across four pull requests — one of which
-carries no slice at all — and slice 3 splits at the moment injection becomes reachable:
+**Packaging (decided 2026-08-20, in review).** Four slices across five pull requests — two of which
+carry no slice at all, being shipped-code corrections this design turned up — and slice 3 splits at
+the moment injection becomes reachable:
 
 | PR | contents | `supports_mcp_injection` |
 |---|---|---|
 | **0** | drop `not_configured` from `_INERT_MCP_STATUSES` (§ slice 2's vocabulary) — no Phase 2 dependency in either direction | stays `False` |
+| **0b** | claude's reporting path adopts the three-valued health reduction (§ slice 2, "Which status wins") — a shipped-code correction the decision turned up, and it must precede any copilot witness so the field never has two meanings at once | stays `False` |
 | 1 | slice 4's **parser** half, then slice **3a** — config writer, `--additional-mcp-config`, `--secret-env-vars`, `${VAR}` interpolation | stays `False` |
 | 2 | slice **2** — the witness reducer, the two readers, the declared-set policy | stays `False` |
 | 3 | slice **3b** — flip the flag, live acceptance — then slice 4's **`used_mcp_tool`** half | `True` |
@@ -340,8 +343,11 @@ paragraph:
   the live assertion on a normalized MCP tool identity belongs to **PR 3's injected acceptance**,
   which is the first run in the whole plan that produces an MCP tool call at all.
 
-Four gates, not three: **PR 0** above, then the three slice PRs (~14 min each,
-`full-suite-gates-merge-not-commit`).
+Five gates, not three: **PR 0** and **PR 0b** above, then the three slice PRs (~14 min each,
+`full-suite-gates-merge-not-commit`). Both of the numberless ones are corrections to shipped code
+that the Phase 2 design turned up rather than Phase 2 work, and each pays a gate that can see its
+own change — which for PR 0 had to be added on purpose (below), and for PR 0b is the arm over the
+trajectories claude's values move on.
 
 ### Slice 1 — measure (probes only, no production code)
 
@@ -378,9 +384,12 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
    nothing in the status itself says which case you are looking at. A healthy injected server goes **`pending` → `connected`**,
    with a later `session.mcp_server_status_changed` repeating `connected`.
    **The status vocabulary observed across all five probes is `pending`, `connected`, `failed`,
-   `disabled`** — which is what slice 2 splits `_INERT_MCP_STATUSES` on. Note `pending` in particular:
-   it is a *transient* that appears before `connected`, so slice 2's witness must read the server's
-   **last** status and not its first. The probe had that bug and the review caught it (PR #120).
+   `disabled`** — the vocabulary slice 2 classifies on (`_INERT_MCP_STATUSES` itself is PR 0's, §3).
+   Note `pending` in particular: what was measured is a **leading** `pending → connected`, so a
+   reader that takes the server's FIRST status calls every healthy server unhealthy. The probe had
+   that bug and the review caught it (PR #120). "Read the last status instead" is what this line
+   used to say, and it is not the rule slice 2 implements — see §3's "Which status wins", where
+   first and last are both rejected as lookups on one element of a sequence.
 3. ~~**Does `--disable-mcp-server` reach plugin-declared servers**, and under what naming~~ —
    **ANSWERED at 1.0.80** (`tools/probe_copilot_plugin_mcp.py`): **yes, by the bare server key**;
    plugin-qualified spellings do nothing. It corrected a claim in shipped code — the flag was never the
@@ -534,10 +543,12 @@ from **one** reducer over the stream rather than each walking it:
 
 1. the contract violation, if any, and whether the witness existed at all;
 2. the servers **ever observed non-inert** — the hermeticity reduction;
-3. **every** status observed for each server, in order — the health reduction reads them all, and
-   *which* reading it performs is settled under "Which status wins" below: a conjunction, not a
-   lookup on the first or the last;
-4. validated plugin attribution, for diagnostics only.
+3. **every** status observed for each server, **in order** — the health reduction reads them all,
+   and the reading is settled under "Which status wins" below: a three-valued conjunction, not a
+   lookup on the first or the last, and order-sensitive because one exclusion is positional;
+4. the **raw spellings**, for diagnostics only — never the compared field, which carries a
+   three-valued health rather than a word;
+5. validated plugin attribution, for diagnostics only.
 
 (2) and (3) are different reductions of the same sequence and neither substitutes for the other. The
 current `note()` only ever ADDS to `live`, so an inert status never clears a name recorded live
@@ -557,10 +568,10 @@ is that the spelling exists. It does not establish what the runtime does when it
 
 | status | evidence | safety (ever non-inert) | declared-server health |
 |---|---|---|---|
-| `connected` | observed 1.0.80 | non-inert | healthy |
-| `pending` | observed 1.0.80 | non-inert | **transient** — excluded from the conjunction; a run with nothing else observed is unknown, an incomplete start |
-| `failed` | observed 1.0.80 | non-inert | unhealthy |
-| `disabled` | observed 1.0.80 | inert | unhealthy for a DECLARED server — inert on safety is not transient on health |
+| `connected` | observed 1.0.80 | non-inert | **known-healthy** |
+| `pending` | observed 1.0.80 | non-inert | **excluded when leading**, unknown when it follows a health claim — see "Which status wins" |
+| `failed` | observed 1.0.80 | non-inert | **known-unhealthy** |
+| `disabled` | observed 1.0.80 | inert | **known-unhealthy** for a DECLARED server — inert on safety is not excluded on health |
 | `needs-auth` | bundle enum only | **non-inert** | **unknown**, never healthy |
 | `not_configured` | bundle enum only | **non-inert** | **unknown**, never healthy |
 | anything else | — | **non-inert** (fail closed) | **unknown**, never healthy |
@@ -598,7 +609,7 @@ axes have a row for it.
 An unknown word keeps its **raw spelling** in diagnostics while contributing *unknown* health to
 comparability. Losing the word to a bucket is how the next vocabulary change becomes unreadable.
 
-**Two asymmetries with claude, both deliberate, and the second one is not settled.**
+**Two asymmetries with claude, both deliberate. Both are now settled; the second one took three attempts.**
 
 *Inertness.* `DESIGN_MCP_Support.md` §8 line 282 states the rule as "an undeclared server fails the
 run whatever its status claims", and that is accurate **for claude**, whose `live` list is every
@@ -608,57 +619,78 @@ that way: its witness contract *requires* an undeclared entry, the built-in sent
 reported `disabled`. So "ever non-inert" is not copilot relaxing claude's rule, it is the same rule
 under a stream that always contains one inert entry by construction.
 
-*Which status wins* — **SETTLED 2026-08-20, and neither of the two candidates won.**
+*Which status wins* — **SETTLED 2026-08-20. Neither candidate won, and the first replacement for
+them was wrong twice more.**
 
-The question was: claude keeps the **first non-`connected`** status it sees (`statuses[name]` is
-overwritten only while it still reads `connected`), so a later good reading cannot erase an earlier
-bad one; copilot cannot use that rule, because its healthy path is literally `pending → connected`
-and first-wins would call every healthy server unhealthy. `mcp_servers_witnessed` and
-`mcp_server_states` are published under those names in every run record and `summary.json`, so the
-same field would have meant *first-bad* on one adapter and *final* on the other with nothing in the
-record saying which.
+The two candidates were claude's **first non-`connected` sticks** and copilot's **final status**.
+They share a defect: both are **lookups on one element of a sequence**, and `TODO_Contained_HOME.md`
+§4 already states the general form — a verdict over several facts is a conjunction over every fact,
+never a lookup on whichever arrived last. A server observed twice has a health that is a statement
+about both observations. So the reduction is a conjunction.
 
-**Both candidates are lookups on one element of a sequence, and that is the defect they share.**
-`TODO_Contained_HOME.md` §4 already states it for a different field: a verdict over several facts is
-a **conjunction over every fact**, never a lookup on whichever arrived last. First-bad and final are
-the *first* and *last* lookup; the health of a server that was observed twice is a statement about
-both observations.
+But a conjunction over *what values*, and *which observations count* — the two questions the first
+version of this rule got wrong (review, 2026-08-20):
 
-So the rule is neither, and it is one rule for both adapters:
+**(1) The conjunction is THREE-VALUED, and the published field is not a spelling.** The first version
+published "the first observed status that was not `connected`", which serializes `needs-auth`,
+`not_configured` or any future word **as a status** — and `runner.py` treats every non-`None` status
+as **known health**. That converts an unknown into a known state, contradicting this section's own
+table two paragraphs up, which gives those words *unknown, never healthy*. So:
 
-> A server's health is a **conjunction over every status observed for it**, with statuses that are
-> *not yet a health claim* excluded from the conjunction — never a lookup on one element. It is
-> **healthy** iff every status observed and not excluded was `connected`; **unknown** iff none was;
-> and otherwise the serialized word is the **first observed status that was not `connected` and not
-> excluded**, which is the reading that names *why* rather than merely *unhealthy*.
+> Classify each observation as **known-healthy**, **known-unhealthy**, **excluded** (not yet a health
+> claim), or **unknown** (any word whose meaning has not been measured, and a missing status). Then:
+> a **known-unhealthy** observation **dominates** — publish it, and health is known-and-bad; else any
+> **unknown** observation, or no health claim at all, publishes **`None`** — health is unknown; else
+> **all-known-`connected`** publishes `connected`. Nothing else is healthy.
 
-**The excluded set is per-adapter, measured, and closed — and it is NOT `_INERT_MCP_STATUSES`.**
-Inertness is a **safety** property (*this server never came up*, so it cannot be a leak); transience
-is a **health** property (*this is not yet a health claim*). A word's membership in one says nothing
-about its membership in the other, and `pending` is the proof: **non-inert** on the safety axis (a
-spawned process is a spawned process, fail closed) and **transient** on the health axis (it is the
-measured precursor to `connected`). They are two sets over one vocabulary, and merging them would
-make `disabled` — inert, and a real health answer for a declared server — disappear from the health
-verdict.
+Known-unhealthy dominating unknown is not a preference: it is a **positive fact** beating an absence
+of one. Having seen `failed` you know the surface was broken, whatever else you could not read.
 
-The transient set takes the same conservative rule as the inert one, for the same reason: **a word
-is transient only where that has been measured**, since assuming transience is fail-open on health.
-So it is `{pending}` for copilot, measured at 1.0.80, and **empty for claude**, where no `pending`
-has ever been observed and this repo enumerates no claude status vocabulary at all.
+**Raw spellings travel in the diagnostics, never in the compared field.** That is what keeps
+"an unknown word keeps its raw spelling" and "unknown contributes unknown health" from being the
+contradiction they were.
 
-**What it changes.** Claude: **nothing**. With an empty transient set the rule reduces exactly to
-first-non-`connected`-sticks, which is what `adapters/claude.py` already does — so no claude value
-published today moves, and that is a property of the rule rather than a coincidence to be re-checked
-later. Copilot: `pending → connected` publishes `connected`, a truncated run ending at `pending`
-publishes **unknown** (matching this section's table, where `pending` with nothing else observed is
-an incomplete start), and `failed → connected` publishes `failed`.
+**(2) `pending` is excluded POSITIONALLY, not globally.** What slice 1 measured is a **leading**
+`pending → connected` startup sequence. It does not establish that a `pending` anywhere in a run can
+be erased, and a global exclusion invents a **false green**: `connected → pending` would publish
+`connected`, when nothing establishes that a run in that state still had its tool surface. That is
+the `not_configured` defect again — a fail-open classification resting on a spelling rather than a
+measurement — so it takes the same conservative answer:
 
-**This supersedes the "final status" half of the health reduction agreed earlier in this section.**
-Final was shorthand for *`pending` must not win*, and the accurate requirement is narrower than it:
-transience, not recency. The two differ on exactly one trajectory — a server that was broken and
-recovered — and the conjunction is right there. That cell did not run against the same tool surface
-throughout, which is the entire question `_consistency` exists to answer, and *final* would report it
-as though it had.
+> A `pending` observed **before any known health claim for that server** is excluded. A `pending`
+> observed **after** one is **unknown**, and takes the unknown branch above.
+
+The alternative is to measure the global semantics, which nothing needs yet; the positional rule
+costs an ordered walk the reducer already performs.
+
+**The per-adapter vocabulary, and why it is not the inert set.** Inertness is a **safety** property
+(*this server never came up*, so it cannot be a leak); the health classes above are a **health**
+property. Two sets over one vocabulary, and `pending` proves they are independent — **non-inert** on
+safety (a spawned process is a spawned process, fail closed) and **excluded** on health when leading.
+Merging them would delete `disabled` from the health verdict, where it is a real answer for a
+declared server.
+
+| adapter | known-healthy | known-unhealthy | excluded (leading only) | everything else |
+|---|---|---|---|---|
+| copilot | `connected` | `failed`, `disabled` — both measured at 1.0.80 | `pending` | unknown |
+| claude | `connected` | **empty — nothing measured** | **empty — no `pending` observed** | unknown |
+
+Both sets are closed and measured, for the same reason the inert set is: assuming a meaning is
+**fail-open on health**.
+
+**"Claude: nothing" was wrong, and this is the third correction.** With empty transient and
+known-unhealthy sets the rule does *not* reduce to what `adapters/claude.py` does today. Claude tests
+only `== "connected"` and publishes every other word raw, so today an unrecognised status is
+published **as known health**; under the rule above it publishes `None`. Claude's values therefore
+**do** move — for unrecognised words and for a missing status — and they move in the direction that
+fixes the same defect (1) names. Only the ordinary `connected` / `connected`-then-worse trajectories
+are unchanged.
+
+**So the claude half is its own change: PR 0b** (§3), landing beside PR 0. A shipped-code correction,
+independent of every Phase 2 slice, with its own arm over the trajectories that move — unrecognised
+word, missing status, `connected` throughout, and a known-unhealthy word once one is measured. It
+goes **before** copilot publishes any witness, so there is never a window where two adapters publish
+the same field under two rules.
 
 **Plugin attribution is diagnostic only.** `mcp_servers_witnessed` stays `(name, status)` across
 adapters — but not for the reason an earlier revision of this line gave. `_consistency` compares
@@ -758,8 +790,8 @@ on. The assertion needs a run that actually uses an MCP tool, so it goes with th
 
 1. **Slice 1 can generate unscoped work** — a bad answer on plugin-declared servers is a Phase 0 gap.
 2. **Arming `supports_mcp_injection`** wakes an interaction that has never executed (risk 3 above).
-3. **Four mutation runs** (four slices, three PRs, plus PR 0 — §3). Run the suite once per PR at
-   merge rather than per push (`full-suite-gates-merge-not-commit`).
+3. **Five mutation runs** (four slices in three PRs, plus PR 0 and PR 0b — §3). Run the suite once
+   per PR at merge rather than per push (`full-suite-gates-merge-not-commit`).
 4. **copilot's version is unreadable and unpinnable from outside** (§8) — `--no-auto-update` is
    load-bearing for *code selection*, not just update traffic. Any new probe must go through the same
    argv the run uses, or probe and run can execute different code.
