@@ -3417,15 +3417,15 @@ MUTATIONS = [
     # ...and the table has to be TOTAL over the vocabulary, or a state falls to the fallback
     # and the probe publishes a sentence that describes nothing.
     ("F245-the-account-covers-the-states-someone-remembered", CEVENTS,
-     ("    RESULT_UNREADABLE: (\"our tool's completion carried no result to inspect: the call \"\n"
-      '                        "failed, or the payload was empty"),\n'),
+     ("    RESULT_UNREADABLE: (\"our tool's completion carried no usable result to inspect: the call \"\n"
+      '                        "did not report success, or its payload was empty or unreadable"),\n'),
      "",
      ("...and `result_account` is total over it: its domain IS the vocabulary")),
     # ...and two states sharing a sentence is the merge this whole table exists to prevent,
     # arriving by the table instead of by an `else`.
     ("F246-two-states-may-share-one-sentence", CEVENTS,
-     ("    RESULT_UNREADABLE: (\"our tool's completion carried no result to inspect: the call \"\n"
-      '                        "failed, or the payload was empty"),'),
+     ("    RESULT_UNREADABLE: (\"our tool's completion carried no usable result to inspect: the call \"\n"
+      '                        "did not report success, or its payload was empty or unreadable"),'),
      '    RESULT_UNREADABLE: "no completion for our tool reached the output at all",',
      ("...with a different sentence for each, so no two states are told the same thing")),
     # ...and the fallback must NAME the state it cannot account for. A fallback that hands
@@ -3448,10 +3448,53 @@ MUTATIONS = [
       "execution")),
     # NOTHING CAME BACK AT ALL IS ITS OWN LOSS, and folding it into the attribution branch
     # would report a run copilot never answered as one it answered ambiguously.
+    # RE-AIMED (review, PR #120, tenth round): the run this used to be caught on — an execution
+    # and no completion — is now answered by the EXISTENCE gate two lines up, so mutating this
+    # branch left the old arm green. Third instance of §4's "a new gate makes an older
+    # mutation's arm insensitive". The shape that still reaches here is a completion that
+    # ARRIVED and is provably somebody else's.
     ("F236-a-missing-completion-is-merely-unattributable", CEVENTS,
-     "    if not done:\n        return RESULT_ABSENT",
+     ("        return (RESULT_ABSENT if all(completion_id(data) for data in completions)\n"
+      "                else RESULT_UNATTRIBUTED)"),
+     "        return RESULT_UNATTRIBUTED",
+     "...and one carrying a completion is ABSENT only when every one can be EXCLUDED"),
+    # --- PR #120, tenth review round -------------------------------------------------------
+    # EXISTENCE IS SETTLED BEFORE ATTRIBUTION. Read the other way round, a run with two starts
+    # and NO completion whatever is "unattributable" — and publishes a sentence saying results
+    # came back, about a stream that contains none.
+    ("F252-ambiguity-is-decided-before-anything-came-back", CEVENTS,
+     "    if not completions:\n        return RESULT_ABSENT",
      "    if False:\n        return RESULT_ABSENT",
-     "an execution of ours with NO result event at all is RESULT_ABSENT"),
+     "a stream carrying NO completion event is ABSENT, whatever its starts look like"),
+    # ...and the existence question is asked of the RAW events. Asked of the readable ones, a
+    # completion that arrived unreadable reads exactly like a completion that never arrived.
+    ("F253-an-unreadable-completion-never-arrived", CEVENTS,
+     ('    completions = [obj.get("data") for obj in events\n'
+      '                   if obj.get("type") == "tool.execution_complete"]'),
+     ('    completions = [obj.get("data") for obj in events\n'
+      '                   if obj.get("type") == "tool.execution_complete"\n'
+      '                   and isinstance(obj.get("data"), dict)]'),
+     "...and one carrying a completion is ABSENT only when every one can be EXCLUDED"),
+    # ...and EVERY completion must be excludable before absence is readable, not merely one of
+    # them: a run holding one excludable completion beside one it cannot read has not shown
+    # that nothing of ours came back.
+    ("F254-one-excludable-completion-excludes-them-all", CEVENTS,
+     "        return (RESULT_ABSENT if all(completion_id(data) for data in completions)",
+     "        return (RESULT_ABSENT if any(completion_id(data) for data in completions)",
+     "...and one carrying a completion is ABSENT only when every one can be EXCLUDED"),
+    # ...and "carries an id" means a USABLE one. A completion whose id is a number can be
+    # excluded from nothing, and reading the raw field makes it excludable.
+    ("F255-any-toolcallid-value-excludes-a-completion", CEVENTS,
+     "    return start_id(data) if isinstance(data, dict) else None",
+     '    return data.get("toolCallId") if isinstance(data, dict) else None',
+     "...and one carrying a completion is ABSENT only when every one can be EXCLUDED"),
+    # ...and the rule must be `start_id` itself rather than a copy of it, or the two readings
+    # of a usable id drift and the join stops meaning one thing (§4's duplicated-rule rule).
+    ("F256-the-completions-id-rule-is-a-copy-of-the-starts", CEVENTS,
+     "    return start_id(data) if isinstance(data, dict) else None",
+     ('    cid = data.get("toolCallId") if isinstance(data, dict) else None\n'
+      "    return cid if isinstance(cid, str) else None"),
+     "`completion_id` reads an id by the SAME rule as `start_id`, and is not a copy of it"),
     # ...and the count must come from the arm being judged — F190/F220's rule, third witness.
     ("F237-the-controls-reply-count-vouches-for-the-secret-arm", CEVENTS,
      "                                        replies=marker_replies(secret_receipts)))",

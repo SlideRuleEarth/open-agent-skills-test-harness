@@ -414,6 +414,18 @@ def start_id(data: dict) -> str | None:
     return cid if isinstance(cid, str) and cid else None
 
 
+def completion_id(data: object) -> str | None:
+    """The `toolCallId` a COMPLETION event carries, or None when it carries no usable one.
+
+    NOT A SECOND DEFINITION of what a usable id is — `start_id` is that, and this hands it
+    the payload once there is a payload to hand it (§4's rule about a duplicated rule
+    needing to be pinned to its original; here it can simply BE the original). A completion
+    whose `data` is not an object has no id rather than a different kind of one, which is
+    the case that separates *no completion arrived* from *one arrived that cannot be read*.
+    """
+    return start_id(data) if isinstance(data, dict) else None
+
+
 def id_claims(events: list[dict]) -> dict[str, int]:
     """How many `tool.execution_start` events claim each id — ANY tool's, not only ours.
 
@@ -568,6 +580,22 @@ def tool_result_state(events: list[dict], sentinel: str, *, replies: int) -> str
     here because it changes a reply format four other probes read. If multi-call runs ever need
     measuring, that is the way, and this comment is the note to whoever needs it.
 
+    AND EXISTENCE IS SETTLED BEFORE ATTRIBUTION, which is the ordering the cardinality clause
+    above walked in front of (review, PR #120). "Nothing came back" is a fact about the stream;
+    "nobody can say whose it was" is a fact about a correspondence between two things, and it
+    does not arise until there is something on both sides of it. With the cardinality gate
+    read first, a run with two starts and no completion whatever — the model called the tool
+    twice and copilot emitted neither result — answered `RESULT_UNATTRIBUTED`, and the sentence
+    that state publishes says results came back. They are not degrees of one scale: they belong
+    to different phases of the same lifecycle, which is §4's own tell for two facts sharing one
+    field.
+
+    The dual of it is here too, one gate lower. `done` being empty has TWO causes — every
+    completion belongs to somebody else, or no completion can be read at all — and only the
+    first is an observation about our tool. Excluding a completion needs an id to exclude it
+    by, so a completion carrying none leaves the run unattributable rather than empty, on the
+    same rule that makes an id claimed twice no correlation key.
+
     THE LEAK TEST COMES FIRST, AND NOT BY ACCIDENT — before attribution as well as before
     usability. A completion carrying the value is a leak whichever call it belongs to and
     whether or not that call succeeded, so `RESULT_CARRIED` is decided over every correlated
@@ -579,17 +607,34 @@ def tool_result_state(events: list[dict], sentinel: str, *, replies: int) -> str
     starts = mcp_starts(events)
     if not starts:
         return RESULT_ABSENT
+    # EXISTENCE IS SETTLED BEFORE ATTRIBUTION, over the RAW events rather than the correlated
+    # ones. Nothing came back is a fact about the stream; nobody can say whose it was is a fact
+    # about a correspondence, and the second question does not arise until the first is
+    # answered yes. Read the other way round — the cardinality gate ahead of this one — a run
+    # with two starts and NO completion at all was `RESULT_UNATTRIBUTED`, and published the
+    # sentence "results came back that this run cannot tie to the marker-bearing reply" about
+    # a stream containing no result (review, PR #120, tenth round).
+    completions = [obj.get("data") for obj in events
+                   if obj.get("type") == "tool.execution_complete"]
+    if not completions:
+        return RESULT_ABSENT
     ids = mcp_call_ids(events)
-    done = [obj["data"] for obj in events
-            if obj.get("type") == "tool.execution_complete"
-            and isinstance(obj.get("data"), dict)
-            and obj["data"].get("toolCallId") in ids]
+    done = [data for data in completions
+            if isinstance(data, dict) and completion_id(data) in ids]
     if any(sentinel in json.dumps(data.get("result")) for data in done):
         return RESULT_CARRIED
     if len(starts) != 1 or len(ids) != 1 or replies != 1:
         return RESULT_UNATTRIBUTED
     if not done:
-        return RESULT_ABSENT
+        # SOMETHING CAME BACK AND NONE OF IT WAS OURS — but that is only readable when every
+        # completion can be EXCLUDED, which needs an id of its own to be excluded by. Our id
+        # is unique and usable here (the gate above), so a completion naming a different one
+        # is provably somebody else's; one naming nothing at all is not, and a negative about
+        # our tool must not be read from an observation that cannot tell our tool from
+        # another. `completions` is non-empty above, so this `all()` has something to quantify
+        # over.
+        return (RESULT_ABSENT if all(completion_id(data) for data in completions)
+                else RESULT_UNATTRIBUTED)
     if len(done) != 1:
         return RESULT_UNATTRIBUTED
     if not usable_result(done[0]):
@@ -605,14 +650,20 @@ def tool_result_state(events: list[dict], sentinel: str, *, replies: int) -> str
 # true only of `RESULT_CLEAN`: a run whose completion never arrived was told its result
 # had come back (review, PR #120, ninth round). The same shape as the vocabulary itself —
 # a new state joins the table and every reader is right about it at once.
+#
+# AND EACH SENTENCE SAYS ONLY WHAT IS TRUE OF EVERY RUN THAT REACHES ITS STATE. Naming the
+# CAUSE is the same mistake one scale smaller: `RESULT_UNATTRIBUTED` is reached by four
+# different failures of the join — two exchanges, an id that is missing or shared, no
+# marker-bearing reply at all, more than one completion — and the sentence that named two of
+# them was false for the other two the moment either became reachable (review, PR #120, tenth
+# round). A state is not its cause, and this table is keyed on the state.
 RESULT_ACCOUNTS = {
     RESULT_CARRIED: "our tool's own result carried it into the output",
     RESULT_CLEAN: "our tool's own result came back without it",
-    RESULT_UNATTRIBUTED: ("results came back that this run cannot tie to the marker-bearing "
-                          "reply: the exchange happened more than once, or the id our tool's "
-                          "start claimed is not our tool's alone"),
-    RESULT_UNREADABLE: ("our tool's completion carried no result to inspect: the call "
-                        "failed, or the payload was empty"),
+    RESULT_UNATTRIBUTED: ("results came back that nothing in this run ties to the "
+                          "marker-bearing reply"),
+    RESULT_UNREADABLE: ("our tool's completion carried no usable result to inspect: the call "
+                        "did not report success, or its payload was empty or unreadable"),
     RESULT_ABSENT: "no completion for our tool reached the output at all",
 }
 
@@ -860,8 +911,8 @@ def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool
         return CONTROL_FAILED, (
             "the control's own tool RESULT never carried the sentinel — in that arm, "
             + result_account(control_result)
-            + ", so the value does not reach the output by that route and its absence under "
-              "--secret-env-vars measures nothing")
+            + ", so this run does not show the value reaching the output by that route, and "
+              "its absence under --secret-env-vars measures nothing")
     if not secret_exchanged:
         return SECRET_ARM_INCOMPLETE, ("the arm under --secret-env-vars never completed the "
                                        "exchange that carries the value — its fixture did not "
@@ -872,9 +923,9 @@ def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool
         return SECRET_ARM_INCOMPLETE, (
             "the arm under --secret-env-vars answered our tool, but "
             + result_account(secret_result)
-            + ", so nothing came back to be redacted — the fixture proves the value went onto "
-              "the wire and nothing shows what copilot did with it, which is not the same as "
-              "showing it removed it")
+            + ", so nothing this run can read shows what became of the value — the fixture "
+              "proves it went onto the wire and nothing shows what copilot did with it, which "
+              "is not the same as showing it removed it")
     return REDACTS, ("both arms answered our tool with this run's marker, the control's tool "
                      "RESULT carried it into the output, the secret arm's result came back too "
                      "— and the value is absent from that arm's output entirely, so the flag "

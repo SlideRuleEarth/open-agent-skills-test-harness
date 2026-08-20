@@ -313,6 +313,14 @@ answer together. The fifth is §2(b)'s own limit — a shape read from an execut
    second assertion and needs driving of its own. `RESULT_ACCOUNTS` now puts each state into words
    once, `result_account()` reads it, and §E21 holds its domain equal to the module's own `RESULT_*`
    vocabulary, read off the module rather than restated.
+   **A tenth round found the classifier feeding that table the wrong state.** Attribution cardinality
+   was read before *anything came back at all*, so a run with two starts and no completion answered
+   `RESULT_UNATTRIBUTED` — a sentence saying results came back, about a stream containing none.
+   Existence is now settled over the raw events first; an empty correlated view is absence only when
+   every completion carries a usable id to be excluded by; and `RESULT_UNATTRIBUTED`'s account no
+   longer names two of the four ways the join fails. §E21 gained **stream-to-state-to-sentence** arms,
+   with the state read back from the stream, since a supplied state cannot show the classifier
+   supplying the wrong one.
 5. **Remote `type` omission, as *behaviour* rather than shape.** Slice 3 writes `type` and an explicit
    `tools: ["*"]` because §2(b) says copilot writes them for itself — but (b) is unversioned, and the
    probe that produced it *cannot* be versioned: `copilot mcp add` emits no in-band witness, so no

@@ -5036,6 +5036,112 @@ try:
                   for st in _vocab - set(EV.INSPECTABLE_RESULTS)),
           "the three losses, each described as itself")
 
+    # -- stream -> state -> sentence, which no arm above ever ran end to end -----------------
+    # THE GAP THE ROUND-9 ARMS LEFT OPEN, named by the review that found it: every account arm
+    # SUPPLIES a state and checks the wording, so it proves the table consistent for a given
+    # state and cannot see the classifier handing it the wrong one. `tool_result_state` read
+    # its cardinality gate before asking whether anything came back at all, so a run with two
+    # starts and NO completion was `RESULT_UNATTRIBUTED` and published "results came back"
+    # about a stream containing no result. Existence is a fact about the stream; attribution
+    # is a fact about a correspondence, and it does not arise until both sides exist.
+    _no_id = json.dumps({"type": "tool.execution_complete", "data": {
+        "success": True, "result": {"content": "[REDACTED]"}}}) + "\n"
+    _unreadable_event = json.dumps({"type": "tool.execution_complete", "data": "garbage"}) + "\n"
+    _someone_elses = json.dumps({"type": "tool.execution_complete", "data": {
+        "toolCallId": "somebody-else", "success": True,
+        "result": {"content": "[REDACTED]"}}}) + "\n"
+    # EVERY WAY EACH STATE IS REACHED, so the invariants below quantify over the real spread
+    # rather than over the cases that were easy to write.
+    _e2e = [
+        (_start, 1, EV.RESULT_ABSENT, "an execution of ours and no completion"),
+        (_ours(toolCallId=_cid) + _ours(toolCallId="toolu_probe_02"), 1, EV.RESULT_ABSENT,
+         "TWO executions of ours and no completion"),
+        (_ours(toolCallId=_cid) + _ours(), 1, EV.RESULT_ABSENT,
+         "a usable start beside an id-less one, and no completion"),
+        (_ours(), 1, EV.RESULT_ABSENT, "a lone id-less start and no completion"),
+        (_start, 2, EV.RESULT_ABSENT, "TWO marker-bearing replies and no completion"),
+        (_start, 0, EV.RESULT_ABSENT, "NO marker-bearing reply and no completion"),
+        (_start + _someone_elses, 1, EV.RESULT_ABSENT,
+         "a completion carrying an id that is provably not ours"),
+        (_start + _done, 1, EV.RESULT_CARRIED, "our own result, with the value"),
+        (_start + _done_clean, 1, EV.RESULT_CLEAN, "our own result, without it"),
+        (_start + _done_bad, 1, EV.RESULT_UNREADABLE, "our own completion, nothing in it"),
+        (_start + _done_clean, 2, EV.RESULT_UNATTRIBUTED,
+         "a completion, and two replies it could belong to"),
+        (_ours(toolCallId=_cid) + _ours() + _done_clean, 1, EV.RESULT_UNATTRIBUTED,
+         "a completion, and two executions it could belong to"),
+        (_start + _no_id, 1, EV.RESULT_UNATTRIBUTED,
+         "a completion carrying NO id, which cannot be excluded either"),
+        (_start + _unreadable_event, 1, EV.RESULT_UNATTRIBUTED,
+         "a completion whose data is not an object at all"),
+        # THE SHAPE THAT SEPARATES `all` FROM `any`: one completion IS excludable and the
+        # other is not, so a reader asking whether ANY of them could be excluded calls the
+        # run empty on the strength of the one it could read.
+        (_start + _someone_elses + _no_id, 1, EV.RESULT_UNATTRIBUTED,
+         "one excludable completion beside one that is not"),
+        (_start + json.dumps({"type": "tool.execution_complete", "data": {
+            "toolCallId": 42, "success": True, "result": {"content": "x"}}}) + "\n",
+         1, EV.RESULT_UNATTRIBUTED,
+         "a completion whose id is not a usable string"),
+    ]
+    for _s, _r, _exp, _w in _e2e:
+        check(f"stream to state: {_w} is {_exp}",
+              _result_state(_s, _sent, replies=_r) == _exp,
+              _result_state(_s, _sent, replies=_r))
+    # READ BACK FROM THE STREAMS, not from the column above: an expectation that agrees with a
+    # broken classifier is what the whole section is trying not to be.
+    _seen = [(_s, _r, _result_state(_s, _sent, replies=_r), _w) for _s, _r, _e, _w in _e2e]
+
+    def _completions(stream):
+        return [o.get("data") for o in EV.parse_events(stream)
+                if o.get("type") == "tool.execution_complete"]
+
+    def _excludable(data):
+        """Can this completion be shown to be somebody else's? Only by an id of its own.
+
+        WRITTEN OUT HERE RATHER THAN READ FROM `EV.completion_id`, which is the function the
+        invariant below is checking: a rule that re-derives itself from the thing under test
+        cannot disagree with it, and this one did — a mutation making `completion_id` return
+        the raw `toolCallId` was invisible because the check asked that same function whether
+        the id was usable (mutation run, PR #120). Pinned to the original on the cases that
+        distinguish them, exactly as `_id_key` and `_envelope_shape` are (§4).
+        """
+        return (isinstance(data, dict) and isinstance(data.get("toolCallId"), str)
+                and bool(data.get("toolCallId")))
+
+    check("...and those streams reach EVERY state, or the invariants below cover a subset",
+          {st for _s, _r, st, _w in _seen} == _vocab and _vocab_ok,
+          sorted(_vocab - {st for _s, _r, st, _w in _seen}))
+    check("a stream carrying NO completion event is ABSENT, whatever its starts look like",
+          all(st == EV.RESULT_ABSENT for _s, _r, st, _w in _seen if not _completions(_s))
+          and any(not _completions(_s) for _s, _r, _st, _w in _seen),
+          [(_w, st) for _s, _r, st, _w in _seen if not _completions(_s)])
+    check("...and one carrying a completion is ABSENT only when every one can be EXCLUDED",
+          all(all(_excludable(d) for d in _completions(_s))
+              for _s, _r, st, _w in _seen if st == EV.RESULT_ABSENT and _completions(_s))
+          and any(st == EV.RESULT_ABSENT and _completions(_s) for _s, _r, st, _w in _seen),
+          [(_w, st) for _s, _r, st, _w in _seen if _completions(_s)])
+    # THE WHOLE PATH IN ONE ASSERTION: stream -> classifier -> table -> published sentence.
+    check("the sentence a run publishes is the account of the state its OWN STREAM produced",
+          _vocab_ok and {st for _s, _r, st, _w in _seen} == _vocab
+          and all(EV.result_account(st)
+                  in EV.secret_verdict(f"leaked {_sent}", _sent,
+                                       **dict(_ok, secret_result=st))[1]
+                  for _s, _r, st, _w in _seen),
+          "a supplied state cannot show the classifier supplying the wrong one")
+    check("`completion_id` reads an id by the SAME rule as `start_id`, and is not a copy of it",
+          all(EV.completion_id(d) == EV.start_id(d)
+              for d in ({"toolCallId": "x"}, {"toolCallId": ""}, {"toolCallId": 42}, {}))
+          and EV.completion_id("garbage") is None and EV.completion_id(None) is None,
+          "a completion whose data is not an object has no id, not a different kind of one")
+    check("...and the invariant's own copy of that rule agrees with it, case for case",
+          all(bool(EV.completion_id(d)) == _excludable(d)
+              for d in ({"toolCallId": "x"}, {"toolCallId": ""}, {"toolCallId": 42}, {},
+                        "garbage", None, [])),
+          [(d, EV.completion_id(d), _excludable(d))
+           for d in ({"toolCallId": "x"}, {"toolCallId": ""}, {"toolCallId": 42}, {},
+                     "garbage", None, [])])
+
     # -- answered(): a conjunction, so any single gap fails it -------------------------------
     # The tell for a lookup-on-the-last-value bug is that ONE unanswered term still passes.
     check("all four answered is answered",

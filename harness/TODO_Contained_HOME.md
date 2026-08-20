@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff AN
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff + shellcheck + a parse under every shell
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 236/236 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 754 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 241/241 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 776 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine
 git diff --check
@@ -2239,6 +2239,51 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   the vocabulary OFF THE MODULE rather than restating it, and each sentence asking it for the
   middle. A sixth state is then right in all three sentences at once, and the fallback names
   the state instead of handing it a fifth state's words.
+- **EXISTENCE IS SETTLED BEFORE AMBIGUITY, and they are not degrees of one scale.** *Nothing
+  came back* is a fact about the stream; *nobody can say whose it was* is a fact about a
+  correspondence between two things, and the second question does not arise until both sides
+  of it exist. `tool_result_state` read its cardinality gate first, so a run with two starts
+  and no `tool.execution_complete` at all answered `RESULT_UNATTRIBUTED` — and published the
+  sentence that state carries, which says results came back, about a stream containing none
+  (review, PR #120, tenth round). The tell is a gate that COMPARES COUNTS standing ahead of
+  the gate that asks whether the thing being counted exists; §4 already had the shape of it —
+  two facts from different phases of one lifecycle sharing a field — and this is the phase
+  version rather than the field version. The dual is one gate lower and worth the same
+  attention: an empty filtered view has two causes, *everything in it belonged to somebody
+  else* and *nothing in it could be read*, and only the first is an observation about our tool.
+  Excluding a completion needs an id to exclude it by.
+- **A CHECK THAT SUPPLIES A CLASSIFIER'S OUTPUT CANNOT SEE IT PRODUCING THE WRONG OUTPUT.**
+  The previous round's account arms feed a `RESULT_*` state straight into `result_account()`
+  and assert the wording. They prove the table consistent for a supplied state, and they were
+  all green while the classifier handed that table the wrong state for four different streams
+  — the defect above was invisible to eleven new arms written the round before. Anything with
+  a pipeline needs at least one arm per output that runs the WHOLE path, stream to published
+  sentence, and the invariants over it must be read back FROM the streams rather than from the
+  expectation column beside them: an expectation that agrees with a broken classifier is the
+  thing being guarded against. `_seen` in §E21 is that re-read, and the two invariants over it
+  ("no completion event means ABSENT", "ABSENT with completions means every one was
+  excludable") are the two facts that were false, stated so they can fail.
+- **A STATE IS NOT ITS CAUSE, and moving an enumeration into a table does not make it true.**
+  `RESULT_UNATTRIBUTED` is reached four ways — two executions, an id missing or shared, no
+  marker-bearing reply at all, more than one completion — and its sentence named two of them.
+  It was already false for the third the round it was written, and the fourth made it false
+  again the moment a new route reached it. The round before had moved that enumeration out of
+  an `if/else` and into `RESULT_ACCOUNTS`, which fixed the branch and carried the enumeration
+  along with it: the table is keyed on the STATE, so its sentence may say only what is true of
+  every run that reaches that state. The same obligation binds the FIXED half of a sentence,
+  which is read for several states at once — "so nothing came back to be redacted" was false
+  for the one of its three states where something did.
+- **WHERE THE RULE ITSELF IS UNDER TEST, IMPORTING IT IS THE BUG AND DUPLICATING IT IS THE
+  FIX — which is the opposite of the standing advice, and the mutation suite is what tells the
+  two apart.** §4 says a check that re-derives a definition cannot disagree with it, so import
+  where import is possible. The exception is a check whose SUBJECT is that definition: the new
+  invariant "a run is ABSENT only when every completion could be excluded" asked
+  `EV.completion_id` whether each completion carried a usable id — the very function `F255`
+  perturbs — so the mutation and the check moved together and the arm stayed green while the
+  classifier misread a numeric id as usable. The fix is the `fixtures/` pattern applied inside
+  the verifier: state the rule locally, and pin the copy to the original with an arm over the
+  cases that distinguish them. The tell is a check that would still pass if the function it
+  names returned anything self-consistent.
 - **Re-anchor a mutation whose clause you rewrote; do not retire it.** Extracting that table
   broke three older mutations (`F226`, `F227`, `F232`) whose anchors quoted the enumerations it
   replaced — and what each of them says, "every state in this branch reads alike", is exactly
