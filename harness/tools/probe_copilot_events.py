@@ -408,18 +408,64 @@ def mcp_starts(events: list[dict]) -> list[dict]:
             and is_our_execution(obj["data"])]
 
 
+def start_id(data: dict) -> str | None:
+    """A start event's `toolCallId`, or None when it is missing or not a usable string."""
+    cid = data.get("toolCallId")
+    return cid if isinstance(cid, str) and cid else None
+
+
+def id_claims(events: list[dict]) -> dict[str, int]:
+    """How many `tool.execution_start` events claim each id — ANY tool's, not only ours.
+
+    THE POPULATION IS EVERY EXECUTION, and that is the whole point of this function existing
+    separately from `mcp_starts` (review, PR #120). Ownership of an id is a fact about the
+    stream, not about our tool: counting only our own starts would say an id is unambiguously
+    ours while some other tool's execution is claiming it in the very next line.
+    """
+    counts: dict[str, int] = {}
+    for obj in events:
+        if obj.get("type") != "tool.execution_start":
+            continue
+        data = obj.get("data")
+        if not isinstance(data, dict):
+            continue
+        cid = start_id(data)
+        if cid:
+            counts[cid] = counts.get(cid, 0) + 1
+    return counts
+
+
 def mcp_call_ids(events: list[dict]) -> set[str]:
-    """The `toolCallId`s copilot assigned to executions of OUR tool.
+    """The `toolCallId`s that belong to OUR tool AND to nothing else in this stream.
 
     The correlation key the result event needs. `tool.execution_complete` carries no tool name
     at all — only `toolCallId`, `result` and telemetry (measured, 1.0.80) — so attributing a
     result to our tool means matching the id copilot itself minted on the start event.
 
+    AND MINTED FOR NOTHING ELSE, which is the clause that makes it a correlation rather than a
+    guess (review, PR #120). The id is the only link, so an id claimed by two start events is
+    not a link at all: our execution and some other tool's both answer to it, the completion
+    names no tool, and the result could be either one's. Counting our own starts caught two of
+    OURS sharing an id; it said nothing about a FOREIGN execution reusing it, and a foreign
+    completion is exactly what must not be read as our tool's reply.
+
+    THIS IS WHERE THE CLAUSE BELONGS, not at the one call site that noticed it missing: every
+    reader of "which results are ours" gets it, and a future second reader cannot be written
+    without it (§4's rule about a new trustworthiness fact joining the existing predicate).
+    It also puts ownership AHEAD of both `RESULT_CARRIED` and `RESULT_CLEAN` for free — a
+    foreign completion carrying the marker cannot prove the value travelled through our MCP
+    reply, so it must not be read as a leak by that route either.
+
     Deduplicating and dropping unusable ids is right for THIS question and wrong for counting
     executions, which is why `mcp_starts` exists above rather than this being read as both.
     """
-    return {data["toolCallId"] for data in mcp_starts(events)
-            if isinstance(data.get("toolCallId"), str) and data["toolCallId"]}
+    claims = id_claims(events)
+    ids: set[str] = set()
+    for data in mcp_starts(events):
+        cid = start_id(data)
+        if cid and claims.get(cid) == 1:
+            ids.add(cid)
+    return ids
 
 
 def usable_result(data: dict) -> bool:
@@ -497,6 +543,13 @@ def tool_result_state(events: list[dict], sentinel: str, *, replies: int) -> str
     marker-bearing reply, exactly one execution of our tool, exactly one completion for it. In
     that run the completion cannot belong to anything else, and the proof needs no field the
     protocol does not have.
+
+    AND THE ID MUST HAVE NO OTHER OWNER. `mcp_call_ids` refuses an id claimed by more than one
+    start event, ours or anyone's: the id is the only link between a completion and a tool, so
+    two executions answering to it means the completion names neither. That check sits inside
+    the id reader, which puts it ahead of BOTH `RESULT_CARRIED` and `RESULT_CLEAN` — a foreign
+    completion carrying the marker is not evidence that the value travelled through our reply,
+    and the whole-stream test in `secret_verdict` is what reports it as a leak instead.
 
     "EXACTLY ONE EXECUTION" IS COUNTED OVER THE START EVENTS, not over the ids (review,
     PR #120). `mcp_call_ids` is a SET and it drops starts whose id is missing or malformed, so
@@ -721,6 +774,12 @@ def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool
     an execution and no completion event — killed mid-call, or one whose result copilot never
     emitted — has nothing to redact and nothing to have redacted, and it read as `REDACTS`.
 
+    THE NEGATIVE IS READ FIRST AND NEEDS NOTHING ELSE. Every gate below exists to make
+    `REDACTS` provable; none of them is required to say the flag FAILED, because the value
+    being present in the output of a run that named its variable is a direct observation. So
+    the whole-stream test comes first, and a leak is reported even from a run whose control
+    broke or whose exchange could not be attributed.
+
     So the secret arm's result is read as one of the `RESULT_*` states rather than searched for
     a substring, and the gate is membership in `INSPECTABLE_RESULTS` rather than equality with
     any one of them — that list is where "did anything come back that this claim can be about"
@@ -731,6 +790,23 @@ def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool
     value leaked by is diagnosis, not a different verdict. Only the marker-bearing reply's own
     result, coming back without the value, is redaction.
     """
+    # THE ACCUSING READING NEEDS NEITHER CONTROL NOR ATTRIBUTION, and it used to be read last
+    # (review, PR #120, seventh round — raised by making ownership refuse a foreign leak and
+    # then finding the sentence that said the stream test would catch it was not true of the
+    # order below). Every gate under this one exists to make the POSITIVE provable: that the
+    # value could have travelled, that both arms did the same thing, that the result belongs to
+    # our reply. None of that is needed to say the flag failed. The value is in the output of a
+    # run that named its variable to `--secret-env-vars`; whether the exchange was attributable
+    # does not make it less there, and refusing to answer would suppress the finding on the
+    # strength of an unrelated defect. Same rule as naming-before-taint and leak-before-
+    # usability, at the verdict level: the reading that ACCUSES outranks the ones that excuse.
+    if sentinel in secret_stream:
+        return NO_REDACTION, (
+            "the sentinel appears in the output WITH --secret-env-vars naming its variable"
+            + (" — in our tool's own result" if secret_result == RESULT_CARRIED else
+               " — outside our tool's result, which came back without it")
+            + ": the flag did not redact the value where it landed, and no control is needed "
+              "to read a value that is simply present")
     if not control_exchanged:
         return CONTROL_INCOMPLETE, ("the control arm never completed the exchange either — its "
                                     "fixture did not record answering our tool with this run's "
@@ -765,12 +841,6 @@ def secret_verdict(secret_stream: str, sentinel: str, *, control_exchanged: bool
             + ", so nothing came back to be redacted — the fixture proves the value went onto "
               "the wire and nothing shows what copilot did with it, which is not the same as "
               "showing it removed it")
-    if sentinel in secret_stream:
-        return NO_REDACTION, (
-            "the sentinel appears in the output WITH --secret-env-vars naming its variable"
-            + (" — in our tool's own result" if secret_result == RESULT_CARRIED else
-               " — outside our tool's result, which came back without it")
-            + ": the flag did not redact the value where it landed")
     return REDACTS, ("both arms answered our tool with this run's marker, the control's tool "
                      "RESULT carried it into the output, the secret arm's result came back too "
                      "— and the value is absent from that arm's output entirely, so the flag "

@@ -3366,10 +3366,39 @@ MUTATIONS = [
     ("F238-the-id-count-is-the-execution-count", CEVENTS,
      "    if len(starts) != 1 or len(ids) != 1 or replies != 1:",
      "    if len(ids) != 1 or replies != 1:",
-     ("...a second execution of ours carrying the SAME `toolCallId` reused is still a second "
+     # RE-AIMED: with ownership inside `mcp_call_ids`, a REUSED id yields no usable id at all,
+     # so `len(ids) != 1` refuses that run first and this mutation survives it. The shape that
+     # still isolates the START count is a second execution whose id is unusable while the
+     # first one's remains valid (mutation run, PR #120).
+     ("...a second execution of ours carrying an EMPTY `toolCallId` is still a second "
       "execution")),
     # ...and the execution list must not itself filter on the id, which would reinstate the
     # same blindness one function down.
+    # --- PR #120, eighth review round ------------------------------------------------------
+    # THE ID IS THE ONLY LINK, so an id two start events answer to is not a link. Counting our
+    # own starts caught two of OURS sharing an id and said nothing about a FOREIGN execution
+    # reusing it — and the completion names no tool.
+    ("F240-an-id-shared-with-another-tool-is-still-ours", CEVENTS,
+     "        if cid and claims.get(cid) == 1:",
+     "        if cid:",
+     "an id claimed by a FOREIGN execution too is nobody's correlation key"),
+    # ...and ownership is a fact about the WHOLE stream: counting only our own starts would
+    # call an id unambiguous while another tool claims it in the next line.
+    ("F241-ownership-is-counted-over-our-own-executions", CEVENTS,
+     ("    for obj in events:\n        if obj.get(\"type\") != \"tool.execution_start\":\n"
+      "            continue\n        data = obj.get(\"data\")\n"
+      "        if not isinstance(data, dict):\n            continue\n        cid = start_id(data)"),
+     "    for data in mcp_starts(events):\n        cid = start_id(data)",
+     "an id claimed by a FOREIGN execution too is nobody's correlation key"),
+    # THE ACCUSING READING NEEDS NEITHER CONTROL NOR ATTRIBUTION. Read last, a leak in a run
+    # whose control broke — or whose exchange could not be attributed — is reported as an
+    # incomplete arm rather than as the finding it is.
+    ("F242-a-leak-is-reported-only-once-everything-else-is-provable", CEVENTS,
+     ("    if sentinel in secret_stream:\n        return NO_REDACTION, (\n"
+      '            "the sentinel appears in the output WITH --secret-env-vars naming its variable"'),
+     ("    if False:\n        return NO_REDACTION, (\n"
+      '            "the sentinel appears in the output WITH --secret-env-vars naming its variable"'),
+     "a leak is reported even when the CONTROL never ran the exchange"),
     ("F239-an-id-less-start-is-not-an-execution", CEVENTS,
      ("    return [obj[\"data\"] for obj in events\n"
       '            if obj.get("type") == "tool.execution_start"'),

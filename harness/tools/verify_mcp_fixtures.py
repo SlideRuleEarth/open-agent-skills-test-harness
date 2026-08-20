@@ -4753,17 +4753,49 @@ try:
         check(f"...a second execution of ours carrying {_why} is still a second execution",
               _result_state((_ours(toolCallId=_cid) + _second + _done_clean), _sent)
               == EV.RESULT_UNATTRIBUTED, _why)
+    # THE ARM THE REVIEW ADDED. Counting OUR starts catches two of ours sharing an id and says
+    # nothing about a FOREIGN execution reusing it — and the completion names no tool, so the
+    # result answers to both. Ownership lives in `mcp_call_ids`, which puts it ahead of
+    # RESULT_CARRIED as well: a foreign completion carrying the marker is not evidence that the
+    # value came back through OUR reply.
+    _shell = json.dumps({"type": "tool.execution_start", "data": {
+        "toolCallId": _cid, "toolName": "shell"}}) + "\n"
+    check("an id claimed by a FOREIGN execution too is nobody's correlation key",
+          _result_state((_ours(toolCallId=_cid) + _shell + _done_clean), _sent)
+          == EV.RESULT_UNATTRIBUTED, "the completion answers to both starts")
+    check("...and that holds for a completion carrying the VALUE — ownership precedes the leak",
+          _result_state((_ours(toolCallId=_cid) + _shell + _done), _sent)
+          == EV.RESULT_UNATTRIBUTED,
+          "a foreign result carrying the marker did not travel through our reply")
+    check("...while a foreign execution with its OWN id changes nothing",
+          _result_state((_ours(toolCallId=_cid)
+                         + json.dumps({"type": "tool.execution_start", "data": {
+                             "toolCallId": "somebody-else", "toolName": "shell"}}) + "\n"
+                         + _done_clean), _sent) == EV.RESULT_CLEAN,
+          "or the clause has switched the measurement off rather than narrowing it")
+    check("`id_claims` counts EVERY execution's claim on an id, not only ours",
+          EV.id_claims(EV.parse_events(_ours(toolCallId=_cid) + _shell)) == {_cid: 2}
+          and EV.id_claims(EV.parse_events(_ours())) == {}
+          and EV.mcp_call_ids(EV.parse_events(_ours(toolCallId=_cid) + _shell)) == set(),
+          EV.id_claims(EV.parse_events(_ours(toolCallId=_cid) + _shell)))
+    check("...and `start_id` is the ONE reading of a usable id, so the two cannot drift",
+          EV.start_id({"toolCallId": "x"}) == "x" and EV.start_id({"toolCallId": ""}) is None
+          and EV.start_id({"toolCallId": 42}) is None and EV.start_id({}) is None,
+          "missing, empty and non-string are all unusable")
     check("...and a LONE execution whose id is unusable can be correlated to nothing",
           _result_state((_ours(toolCallId=42) + _done_clean), _sent) == EV.RESULT_UNATTRIBUTED,
           "no id to match a completion against, so no result is ours")
     check("`mcp_starts` counts EXECUTIONS and `mcp_call_ids` counts correlatable IDS — the "
           "two are different numbers, which is the whole finding",
-          len(EV.mcp_starts(EV.parse_events(_ours(toolCallId=_cid) + _ours(toolCallId=_cid)))) == 2
+          # An id-less second start: two executions, one usable and unambiguous id.
+          len(EV.mcp_starts(EV.parse_events(_ours(toolCallId=_cid) + _ours()))) == 2
+          and len(EV.mcp_call_ids(EV.parse_events(_ours(toolCallId=_cid) + _ours()))) == 1
+          # A reused id: two executions, and now NO usable id, since neither owns it alone.
+          and len(EV.mcp_starts(EV.parse_events(
+              _ours(toolCallId=_cid) + _ours(toolCallId=_cid)))) == 2
           and len(EV.mcp_call_ids(EV.parse_events(
-              _ours(toolCallId=_cid) + _ours(toolCallId=_cid)))) == 1
-          and len(EV.mcp_starts(EV.parse_events(_ours(toolCallId=_cid) + _ours()))) == 2
-          and len(EV.mcp_call_ids(EV.parse_events(_ours(toolCallId=_cid) + _ours()))) == 1,
-          "a set of ids is not a count of calls")
+              _ours(toolCallId=_cid) + _ours(toolCallId=_cid)))) == 0,
+          "a set of ids is not a count of calls, in either direction")
     check("...and `is_our_execution` is the ONE test of `ours`, by either route",
           EV.is_our_execution({"mcpServerName": EV.CONFIG_KEY, "mcpToolName": EV.TOOL})
           and EV.is_our_execution({"toolName": f"{EV.CONFIG_KEY}-{EV.TOOL}"})
@@ -4894,6 +4926,24 @@ try:
           "a busy stream with no result of ours is still no result of ours")
     check("...both arms exchanged, both results came back, gone under the flag: REDACTS",
           EV.secret_verdict("nothing here", _sent, **_ok)[0] == EV.REDACTS, "redacted")
+    # THE ORDERING THE OWNERSHIP FIX FORCED. Every gate below NO_REDACTION exists to make the
+    # POSITIVE provable; none is needed to say the flag failed, because the value being in the
+    # output of a run that named its variable is a direct observation. Without this, a foreign
+    # completion carrying the marker — which ownership now refuses to attribute — would be
+    # reported as an unattributable arm rather than as the leak it is.
+    check("a leak is reported even when the CONTROL never ran the exchange",
+          EV.secret_verdict(f"still {_sent}", _sent,
+                            **dict(_ok, control_exchanged=False))[0] == EV.NO_REDACTION,
+          "no control is needed to read a value that is simply present")
+    check("...and even when the secret arm's own result cannot be attributed",
+          EV.secret_verdict(f"still {_sent}", _sent,
+                            **dict(_ok, secret_result=EV.RESULT_UNATTRIBUTED))[0]
+          == EV.NO_REDACTION,
+          "an unattributable exchange does not make the value less present")
+    check("...and even when the secret arm never made the call at all",
+          EV.secret_verdict(f"still {_sent}", _sent,
+                            **dict(_ok, secret_exchanged=False))[0] == EV.NO_REDACTION,
+          "the flag still failed to remove it from this run's output")
     check("...sentinel still present under the flag is NO_REDACTION",
           EV.secret_verdict(f"still {_sent}", _sent, **_ok)[0] == EV.NO_REDACTION,
           "not redacted")

@@ -292,8 +292,8 @@ make -C harness dev             # once — creates .venv with the PINNED ruff AN
 harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 579 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff + shellcheck + a parse under every shell
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 228/228 fixture
-harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 735 checks
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 352/352 production + 3/3 instrument + 231/231 fixture
+harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 743 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine
 git diff --check
@@ -2152,6 +2152,14 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   `RESULT_CLEAN` was published for exactly the ambiguity the clause had just been added to
   refuse. The arm missed it by using two DISTINCT valid ids — the one multi-execution shape
   the id count does catch.
+  **And a filtered reader is a partial one.** The repair counted OUR start events, which
+  answers "how many times did the model call our tool" and still says nothing about who else
+  claims the ids those starts carry. A foreign execution reusing the id makes the completion —
+  which names no tool — answer to both, and the classifier read it as ours. Ownership is a fact
+  about the WHOLE stream, so `id_claims` counts every start's claim and `mcp_call_ids` returns
+  only ids with exactly one owner. **When a reader narrows its population to "ours", ask what
+  the discarded rows could have said about the ones kept**: here they were the only evidence
+  that the correlation key was a key at all.
   **A deduplicating reader is a lossy counter, and the loss is invisible at the call site.**
   `set`, `dict` keys, `{...}` comprehensions, "skip the malformed ones" — every one of them
   answers a question about *distinct usable* things, and every one is a plausible-looking
@@ -2160,19 +2168,21 @@ Things that have gone wrong in the *tests*, so you can skip learning them again:
   that meant `mcp_starts` (a LIST, because the duplicates are the finding) with
   `mcp_call_ids` defined over it, and `is_our_execution` extracted so the two readers cannot
   drift on what "ours" means.
-- **A NEW GATE CAN MAKE AN OLDER MUTATION'S ARM INSENSITIVE, AND THE COUNT STAYS GREEN WHILE
-  IT HAPPENS.** Twice now: `F189` (the version witness must be handed every arm) and `F190`
-  (each arm's exchange gate must read its own receipts) both stopped being killed by the arms
-  named for them — not because either rule weakened, but because a gate added later refuses
-  the same input FIRST. The run still exits 1, so the mutation still "fails", just never
-  through the assertion that encodes its rule. `mutate_mcp.py` reports that distinction
-  (`failed, but NOT via …`) and it is the only reason either was noticed; a suite that merely
-  counted failures would have shown 226/226.
-  **The repair is the same both times: assert the ARGUMENT, not the exit status.** Each rule is
-  about what one call receives — every launched arm, that arm's own receipts — so the arm
-  records the call and reads it, which no downstream gate can absorb. The general form: when a
-  rule is about *what is passed*, an assertion on *what comes out* is only accidentally
-  sensitive to it, and the accident expires the next time the code gets stricter.
+- **A NEW GATE MAKES AN OLDER MUTATION'S ARM INSENSITIVE, AND THE COUNT STAYS GREEN WHILE IT
+  HAPPENS.** It has happened in most rounds since the gates started stacking — `F189`, `F190`,
+  `F235`, `F238` — and never because a rule weakened. A gate added LATER refuses the same input
+  first, so the run still exits 1 and the mutation still "fails", just never through the
+  assertion that encodes its rule. `mutate_mcp.py` reporting `failed, but NOT via …` is the
+  only reason any of them was noticed; a suite that merely counted failures would have shown a
+  full house every time. **Expect it in any round that adds a gate upstream of an existing
+  one**, and re-read the older mutations' arms rather than assuming the total covers them.
+  **Two repairs, depending on what the rule is about.** When the rule concerns *what a call
+  receives* — every launched arm, that arm's own receipts — assert the ARGUMENT, not the exit
+  status: an assertion on what comes out is only accidentally sensitive, and the accident
+  expires the next time the code gets stricter. When the rule concerns one clause of a
+  conjunction, find the input that the OTHER clauses accept and only this one refuses; that
+  input changes as the conjunction grows, which is why `F235` and `F238` each moved to a new
+  arm rather than to a new rule.
 - **A MUTATION THAT CRASHES IS NOT A MUTATION THAT FAILS.** `F222`'s replacement read
   `done[-1]` where the original folded over the whole list, and on the arms where nothing came
   back that is an `IndexError` — which ENDS the linear verifier before the arm named for the
