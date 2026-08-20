@@ -247,9 +247,35 @@ exactly that. PRs 2 and 3 are reviewed as a stack and land together, PR 2 first 
 PR 3's live acceptance has been the thing that exercised it.
 
 The arming is one commit for a reason: risk 2 below is an interaction that has never executed on any
-build, and concentrating it makes it reviewable rather than diffuse. Everything before it is inert
-**by construction** — the flag refuses `mcp_servers:` at `validate_mcp_support`, so no scenario can
-reach the new code — rather than dead by accident.
+build, and concentrating it makes it reviewable rather than diffuse.
+
+**But "everything before the arming is inert" is false, and the split it justifies is the wrong
+one** (found in review, 2026-08-20). The flag gates `mcp_servers:` at `validate_mcp_support`, so it
+makes **injection policy** dormant — the config writer, `tool_filter_for`, the declared-set branch.
+It does nothing for the **telemetry and reporting** work, which runs on every ordinary copilot cell
+the moment it merges:
+
+| pre-arming work | reachable before 3b? |
+|---|---|
+| config writer, `--additional-mcp-config`, `${VAR}`, `--secret-env-vars` (3a) | **no** — nothing can declare a server |
+| slice 2's declared-set policy branch | **no** — same gate |
+| slice 4's parser (PR 1) | **yes** — `parse()` runs for every cell |
+| slice 2's reducer + reporting reader (PR 2) | **yes**, and it *replaces a published value* |
+
+The reporting one is the sharp edge. `_consistency` uses the witness when it is not `None` and falls
+back to `mcp_servers_seen(argv)` only when it is (`runner.py`). Copilot returns `None` today, so
+every copilot cell is currently reported from argv — the **disable set**, with health `()`, "nothing
+outstanding". The first PR that populates `mcp_servers_witnessed` switches every copilot matrix onto
+the stream reading: the set becomes what copilot says it hosted (the built-in sentinel, `disabled`)
+and health stops being `()`. That is the better reading and the reason the field exists, but it is a
+**visible change in the published record of every copilot run**, and it lands two PRs before
+anything is injected.
+
+So each of PR 1 and PR 2 needs **ordinary live-run coverage** — a copilot cell declaring no
+`mcp_servers:` at all, run end to end, with `summary.json`'s `mcp_server_sets` /
+`mcp_server_states` / `*_unknown_cells` / `*_verified` fields compared against what `main` produces
+for the same scenario. The expected diff is stated above; anything else is a finding. Offline arms
+cannot stand in for it, because the thing being checked is which of two code paths a real run takes.
 
 Three PRs means three mutation runs rather than four (~14 min each, `full-suite-gates-merge-not-commit`).
 
@@ -456,21 +482,41 @@ reporting side to build `(name, status)` pairs from; the reducer is what supplie
 
 **The status vocabulary, on both axes.** 1.0.64's bundle enumerates
 `connected | failed | needs-auth | pending | disabled | not_configured`; slice 1 observed four of
-those six on the wire. Both facts matter, and they are different classes of evidence — the enum is
-§2(b) shape read out of a build, the observations are §2(a) behaviour read from a run:
+those six on the wire. Those are different classes of evidence, and the difference decides the
+table. The observations are §2(a) — behaviour read from a run, version-qualified by that run's own
+stream. The enum is **neither** §2(a) nor §2(b): §2(b) is shape read from a command's OUTPUT, and
+this is a **string literal read out of a bundle's source**. What a spelling in an enum establishes
+is that the spelling exists. It does not establish what the runtime does when it emits it.
 
-| status | observed at 1.0.80 | safety (§ever non-inert) | declared-server health |
+| status | evidence | safety (ever non-inert) | declared-server health |
 |---|---|---|---|
-| `connected` | yes | non-inert | healthy |
-| `pending` | yes | non-inert | **not** healthy — a transient; final `pending` is an incomplete start |
-| `failed` | yes | non-inert | unhealthy |
-| `disabled` | yes | inert | unhealthy if final for a DECLARED server |
-| `needs-auth` | no — enum only | non-inert | unhealthy: a server that has not come up |
-| `not_configured` | no — enum only | inert | unhealthy if final for a declared server |
+| `connected` | observed 1.0.80 | non-inert | healthy |
+| `pending` | observed 1.0.80 | non-inert | **not** healthy — a transient; final `pending` is an incomplete start |
+| `failed` | observed 1.0.80 | non-inert | unhealthy |
+| `disabled` | observed 1.0.80 | inert | unhealthy if final for a DECLARED server |
+| `needs-auth` | bundle enum only | **non-inert** | unhealthy — and unmeasured |
+| `not_configured` | bundle enum only | **non-inert** | **unknown**, never healthy |
 | anything else | — | **non-inert** (fail closed) | **unknown**, never healthy |
 
-`not_configured` stays in `_INERT_MCP_STATUSES`: the evidence for it is the enum read from 1.0.64's
-bundle, cited where the set is defined, which is weaker than a wire observation but is not nothing.
+**`not_configured` comes OUT of `_INERT_MCP_STATUSES`** (decided in review, 2026-08-20; an earlier
+revision of this table kept it and was wrong). `_INERT_MCP_STATUSES` is a **fail-open allowlist**:
+membership means *this server never started*, which is what excuses an undeclared name from the
+kill-switch. Admitting a word to it on the strength of the spelling existing is precisely the rule
+this file states two rows down — an unmeasured status is non-inert — applied everywhere except to
+the one word already sitting inside the allowlist. `needs-auth` is the control that shows it: same
+evidence, same enum, and it is non-inert today, which nobody argues with.
+
+It goes back in when its runtime meaning is established, by a controlled run that produces the
+status, or by reading the executable's control flow around where it is emitted — not by the
+spelling appearing in a list.
+
+**That one is a change to shipped code, not to this plan.** It is a live fail-open path today,
+independent of every Phase 2 slice, so it lands **before PR 1** as its own small change with the
+§4 gate, rather than riding into PR 2 with the reducer. The cost is stated plainly: a hermetic run
+that reports a server `not_configured` will now fail closed where it passed before, and the reason
+it fails is *nobody has established what that word means* — which is the honest position and the
+direction this harness errs in everywhere else.
+
 `needs-auth` is in that enum too and appears **nowhere else in this repo** — no probe, no plan, no
 table — while being non-inert today, which is the safe direction by luck rather than by decision.
 It is written down here so the health axis has a row for it.
@@ -493,15 +539,22 @@ overwritten only while it still reads `connected` — so a later good reading ca
 bad one across claude's repeated `init` events. The decision above for copilot is the **final**
 status, which is required by copilot's stream, where the healthy path is literally
 `pending → connected` and first-wins would call every healthy server unhealthy. Both rules are right
-for their own event shape. What is **not** settled is that `mcp_servers_witnessed` is a field
-compared across cells, and it would then mean *first-bad* on one adapter and *final* on the other:
-a copilot server going `failed → connected` reports healthy where a claude server on the same
-trajectory reports failed. Raised 2026-08-20; **decide before slice 2 writes the reducer**, since
-the answer is a property of the compared field rather than of either adapter.
+for their own event shape. What is **not** settled is what the serialized field then MEANS. No
+comparison crosses adapters — `_consistency` runs within one — so nothing computes a wrong verdict.
+The exposure is a reader's: `mcp_servers_witnessed` and `mcp_server_states` appear under those names
+in every run record and `summary.json`, and they would mean *first-bad* on one adapter and *final*
+on the other, with nothing in the record saying which. A copilot server going `failed → connected`
+would publish healthy where a claude server on the same trajectory publishes failed. Raised
+2026-08-20, rationale corrected in the same review; **decide before slice 2 writes the reducer**,
+since the answer is a property of the serialized field rather than of either adapter.
 
 **Plugin attribution is diagnostic only.** `mcp_servers_witnessed` stays `(name, status)` across
-adapters — a field compared cell-to-cell must have one shape, and widening copilot's tuple would
-make its rows structurally unlike claude's. The `source` / `sourcePlugin` / `pluginName` fields the
+adapters — but not for the reason an earlier revision of this line gave. `_consistency` compares
+cells **within one adapter** (a `Runner` holds exactly one, `runner.py`), so widening copilot's
+tuple would never produce a bad cross-adapter comparison. What it would produce is one **serialized
+field name carrying two shapes**: `witness_json` writes it into every run record and `summary.json`,
+where the reader is a person or a script that has only the field name to go on. That is reason
+enough to keep one shape, and it is a different reason. The `source` / `sourcePlugin` / `pluginName` fields the
 witness currently discards are used to turn *"server X was loaded"* into *"server X was loaded,
 declared by plugin P"*, under PR #121's rule: `source == "plugin"` **and** both name fields present
 **and** equal. Two fields naming one plugin are two witnesses; either-one-matching is not
