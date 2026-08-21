@@ -97,8 +97,11 @@ and were wrong here:
   wins" — `"connected"` / `"unhealthy"` / `"mixed"` / `None`; it reported the raw status until
   2026-08-21), and its verdicts compare
   cells to **each other, not to the declaration**: if the server fails to come up in every cell the sets
-  agree and `mcp_server_set_verified` stays **true**, while `mcp_server_health_verified` goes false only
-  when health *differs* between cells. The axes detect **drift, not shortfall**.
+  agree and `mcp_server_set_verified` stays **true**, while `mcp_server_health_verified` goes false
+  when health *differs* between cells — **or when any single cell's health varied within its own run**
+  (`"mixed"`, §3; that second clause dates from 2026-08-21 and this line claimed "only … between
+  cells" until then). The axes detect **drift, not shortfall**: a server dead in *every* cell is a
+  uniform condition and stays verified, which is the whole reason **D** is needed for the shortfall.
 
 So the only thing that compares what ran against what the scenario *declared* is the warning string —
 durable in two places, typed in neither, and additionally echoed to a stderr nothing archives.
@@ -154,8 +157,9 @@ same rows. Phase 0's kill-switch asks *did any server ever come up?* — for whi
 at any point" is the right and fail-closed reading, and it is what the witness does today by
 accumulating violations rather than returning the first. Making it read only the LAST status would let a
 server that came up `connected` and was later reported `disabled` pass as never having run, which is a
-leak the current code catches. Slice 2's new question — *did this DECLARED server end up healthy?* —
-is a different predicate over the same sequence, and it is **not** an end-state reading either: §3's
+leak the current code catches. Slice 2's new question — *was this DECLARED server healthy throughout?*
+— is a different predicate over the same sequence, and it is **not** an end-state reading (this line
+asked "did it end up healthy?" until 2026-08-21, which named the very reading the answer rejects): §3's
 "Which status wins" settles it as an ordered aggregation over every observation, first
 and last alike rejected as lookups on one element. (This paragraph said "the last status" until
 2026-08-21; that was the right correction to *first*-wins and the wrong destination.) So the two axes
@@ -269,7 +273,7 @@ the moment injection becomes reachable:
 | PR | contents | `supports_mcp_injection` |
 |---|---|---|
 | **0** | drop `not_configured` from `_INERT_MCP_STATUSES` (§ slice 2's vocabulary) — no Phase 2 dependency in either direction | stays `False` |
-| **0b** | claude adopts the health-class reduction (§ slice 2, "Which status wins"): the **shared reducer** gains the ordered observations its sticky status discards, the reporting reader publishes a class, `runner.py` stops verifying a `"mixed"` cell, and the safety path is held still under a regression arm — **an arm and an `M`-class mutation per moved value**, controls named alongside; must precede any copilot witness so the field never has two meanings at once | stays `False` |
+| **0b** | claude adopts the health-class reduction (§ slice 2, "Which status wins"): the **shared reducer** gains the ordered observations its sticky status discards, the reporting reader publishes a class, `runner.py` stops verifying a `"mixed"` cell and reports it as **drift**, and the safety path is held still under a `failed → connected` regression arm — **an arm and an `M`-class mutation per moved value**, with the uniformly-`"unhealthy"` control that keeps this a drift axis; must precede any copilot witness so the field never has two meanings at once | stays `False` |
 | 1 | slice 4's **parser** half, then slice **3a** — config writer, `--additional-mcp-config`, `--secret-env-vars`, `${VAR}` interpolation | stays `False` |
 | 2 | slice **2** — the witness reducer, the two readers, the declared-set policy | stays `False` |
 | 3 | slice **3b** — flip the flag, live acceptance — then slice 4's **`used_mcp_tool`** half | `True` |
@@ -696,6 +700,25 @@ itself, not a step toward fixing it. `"mixed"` stays distinct from `None` in the
 say different things: *known to have varied* against *could not be read*. Both refuse to verify; only
 one of them is a measurement.
 
+**Non-verifying is not "non-`connected`", and the difference is the whole axis** (review,
+2026-08-21). A matrix whose every cell is uniformly `"unhealthy"` is **verified**: the cells agree,
+which is the only question this axis asks. `mcp_server_set_verified` already behaves that way — a
+server dead in every cell is a uniform condition — and health must match it, or the axis quietly
+becomes a health-*success* check and the shortfall reporting **D** exists for is smuggled in through
+a comparability field. Only `"mixed"` is excluded, because only `"mixed"` says a single cell held
+two surfaces.
+
+**And the top-level `comparability` for a mixed matrix is `"drift"`, not `"unverified"`** (review,
+2026-08-21). Left alone, `runner.py`'s control flow would reach `"unverified"` — health verification
+false, nothing else wrong — and that field's published contract reads *"nothing differed, but at
+least one axis could not be read"*. A `"mixed"` cell was **read**, and what it establishes is that
+conditions moved; the neighbouring contract line, *"cells demonstrably ran under different
+conditions"*, is the one that fits, once its wording admits **within**-cell as well as
+between-cell. So PR 0b appends a **drift entry naming the variation**, which routes through
+`if drift:` on its own and leaves `"unverified"` meaning exactly what it means today. Broadening
+`"unverified"` instead would merge *no evidence* with *evidence of variation* into one word, which is
+the defect this file keeps removing from other fields.
+
 **Raw spellings travel in the diagnostics, never in the compared field.** That is what keeps
 "an unknown word keeps its raw spelling" and "unknown contributes unknown health" from being the
 contradiction they were.
@@ -774,10 +797,13 @@ shape slice 2 gives copilot: one reducer, two readers over its output.
 
 **That reducer also feeds the safety path**, which is why the scope matters. `verify_post_run` reads
 the same return value for its undeclared-server failure and for the declared-but-unhealthy warning
-(`statuses.get(name) != "connected"`). Neither may change behaviour here: PR 0b carries a
-**regression arm over the warning** — same trigger, same content, on a stream where a declared server
-is reported in a non-`connected` state — so a contract change made for the reporting side cannot
-quietly move a safety-side message.
+(`statuses.get(name) != "connected"`). Neither may change behaviour here, and the regression arm has
+to be **the sequence the refactor endangers, not a generic one** (review, 2026-08-21): the property
+claude's sticky reduction is protecting is that **`failed → connected` still warns**. A one-status
+`failed` arm passes on a rewritten reader that took the *final* status — the exact mistake available
+to someone replacing stickiness with a sequence — so the arm drives `failed → connected`, asserts the
+warning's **content** and not merely that something was printed, and is paired with a mutation that
+makes the safety reader take the final status.
 
 The values that move on the reporting side:
 
@@ -788,17 +814,26 @@ The values that move on the reporting side:
 | `failed` **and** `connected` both observed | `"failed"` — sticky | **`"mixed"`** | **yes** |
 | `failed` **and** an unknown status | `"failed"` — sticky, and **known** | **`None`** — unknown is not outvoted | **yes** |
 | any cell `"mixed"` | *n/a — the class did not exist* | `mcp_server_health_verified` **false**, however many cells agree | **yes** |
+| a uniformly `"mixed"` matrix | *n/a* | `comparability` = **`"drift"`**, with a drift entry naming the variation — never `"unverified"` | **yes** |
+| a uniformly `"unhealthy"` matrix | verified — cells agree | **verified, unchanged** | no — **control, and the one that pins the axis** |
 | a **missing** status | `None` | `None` — **unchanged** | no — regression control |
 | `connected` throughout | `"connected"` | unchanged | no — regression control |
-| the declared-but-unhealthy **warning** | fires, names the state | unchanged | no — regression control |
+| the declared-but-unhealthy **warning**, driven `failed → connected` | fires, names the state | unchanged | no — regression control |
 
-**Each moved value carries its own arm and its own `M`-class mutation.** Two of these exist because
-an arm set can be complete over the *outputs* and still blind to the *rule*: standalone-unknown,
-standalone-`failed` and healthy-plus-unhealthy are all satisfied by an implementation in which
-unhealthy still overrides unknown, so `failed + unknown → None` needs its own arm and a mutation
-**restoring that precedence** (review, 2026-08-21). Likewise the non-verifying property of `"mixed"`
-is invisible to any arm that only checks the published class, so it is asserted on
-`mcp_server_health_verified` itself, with a mutation dropping the clause.
+**Each moved value carries its own arm and its own `M`-class mutation**, and three of the rows above
+exist only because an arm set can be complete over the *outputs* and still blind to the *rule*:
+
+- standalone-unknown, standalone-`failed` and healthy-plus-unhealthy are all satisfied by an
+  implementation in which unhealthy still overrides unknown — so `failed + unknown → None` needs its
+  own arm, and a mutation **restoring that precedence**;
+- `"mixed"` failing verification is invisible to any arm that checks the published class, so it is
+  asserted on `mcp_server_health_verified` itself, with a mutation dropping the clause — **and beside
+  the uniformly-`"unhealthy"` control**, without which an implementation that verifies only
+  `"connected"` passes every other arm here while turning a drift axis into a health-success check.
+  The paired mutation is the one that broadens the exclusion from `"mixed"` to **every non-connected
+  class**, and the control is what kills it;
+- the mixed matrix's `comparability` is asserted as **`"drift"`**, since `"unverified"` is what the
+  control flow reaches on its own and no arm over `health_verified` alone can tell the two apart.
 
 The existing `M24-server-status-discarded` covers none of them — it forces the status to
 `"connected"`, which tests that a status is *preserved rather than overwritten*. The control rows are
