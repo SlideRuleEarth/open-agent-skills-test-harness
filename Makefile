@@ -29,7 +29,7 @@ GLOBAL_SKILL_DIRS := \
 	$(HOME)/.gemini/config/skills \
 	$(HOME)/.gemini/antigravity-ide/skills
 
-.PHONY: help export list clean \
+.PHONY: help export list clean validate \
 	link-project link-global unlink-project unlink-global relink-project \
 	agents agents-probe run-scenario dry-run-scenario \
 	release release-dry-run \
@@ -83,6 +83,9 @@ $(EXPORT_TARGETS): export-%:
 
 list: ## List the discovered skills
 	@for s in $(SKILLS); do echo "  $$s"; done
+
+validate: ## Check every SKILL.md's frontmatter against the Skills API limits
+	@$(PYTHON) validate_skills.py --skills-dir $(SKILLS_DIR)
 
 clean: ## Remove the exports/ directory
 	rm -rf $(OUTPUT_DIR)
