@@ -149,8 +149,11 @@ which class, and slice 2 can now be written.
 
 **One thing slice 2 must take from how that was measured, not just from what it says — and it is a
 place where the obvious lesson is the wrong one.** `pending` is a *transient*: it precedes `connected`
-in every healthy run, so a reader that takes the FIRST status a server carried calls a dead server
-healthy. The slice 1 probe shipped with exactly that and a review caught it (PR #120).
+in every healthy run, so a reader that takes the FIRST status a server carried calls a **healthy
+server unhealthy** — it reads `pending` and sees a word that is not `connected`. The slice 1 probe
+shipped with exactly that and a review caught it (PR #120). (This sentence said "calls a dead server
+healthy" until 2026-08-21, which is the inverse of what first-wins does and disagreed with §3's
+account of the same bug.)
 
 **Do not port that fix into `_mcp_witness` as it stands.** The two are asking different questions of the
 same rows. Phase 0's kill-switch asks *did any server ever come up?* — for which "any non-inert status,
@@ -273,7 +276,7 @@ the moment injection becomes reachable:
 | PR | contents | `supports_mcp_injection` |
 |---|---|---|
 | **0** | drop `not_configured` from `_INERT_MCP_STATUSES` (§ slice 2's vocabulary) — no Phase 2 dependency in either direction | stays `False` |
-| **0b** | claude adopts the health-class reduction (§ slice 2, "Which status wins"): the **shared reducer** gains the ordered observations its sticky status discards, the reporting reader publishes a class, `runner.py` stops verifying a `"mixed"` cell and reports it as **drift**, and the safety path is held still under a `failed → connected` regression arm — **an arm and an `M`-class mutation per moved value**, with the uniformly-`"unhealthy"` control that keeps this a drift axis; must precede any copilot witness so the field never has two meanings at once | stays `False` |
+| **0b** | claude adopts the health-class reduction (§ slice 2, "Which status wins"): the **shared reducer** gains the ordered observations its sticky status discards, the reporting reader publishes a class **and the `varied` fact beside it**, `runner.py` stops verifying a `"mixed"` cell and reports variation as **drift** — collected before any folding to unknown — and the safety path is held still under a `failed → connected` regression arm — **an arm and an `M`-class mutation per moved value**, with the uniformly-`"unhealthy"` control that keeps this a drift axis; must precede any copilot witness so the field never has two meanings at once | stays `False` |
 | 1 | slice 4's **parser** half, then slice **3a** — config writer, `--additional-mcp-config`, `--secret-env-vars`, `${VAR}` interpolation | stays `False` |
 | 2 | slice **2** — the witness reducer, the two readers, the declared-set policy | stays `False` |
 | 3 | slice **3b** — flip the flag, live acceptance — then slice 4's **`used_mcp_tool`** half | `True` |
@@ -556,6 +559,7 @@ from **one** reducer over the stream rather than each walking it:
 1. the contract violation, if any, and whether the witness existed at all;
 2. the servers **ever observed non-inert** — the hermeticity reduction;
 3. **every** status observed for each server, **in order** — the health reduction reads them all,
+   and produces both the nullable health class and the non-nullable `varied` fact beside it,
    and the reading is settled under "Which status wins" below: an aggregation over all of them, not
    a lookup on the first or the last, and order-sensitive because one exclusion is positional;
 4. the **raw spellings**, for diagnostics only — never the compared field, which carries a health
@@ -708,6 +712,39 @@ becomes a health-*success* check and the shortfall reporting **D** exists for is
 a comparability field. Only `"mixed"` is excluded, because only `"mixed"` says a single cell held
 two surfaces.
 
+**Variation is a POSITIVE fact and must not ride inside the nullable class** (review, 2026-08-21).
+The rule above returns `None` the moment any observation is unknown — right for the *health claim*,
+and it destroys a *different* fact that was already proven: `connected → failed → unknown` has
+established that the surface varied, whatever the third observation turns out to have been. The
+runner then repeats the loss one level up, folding a whole cell's health to `None` when **any** of
+its servers is `None` (`runner.py`), so one `"mixed"` server beside one unknown server also arrives
+at the drift assembly with nothing to say. Both compositions would report `"unverified"` — the very
+word the next paragraph reserves for evidence nobody could read.
+
+So the reduction yields **two things per server**, and the second is not derived from the first:
+
+> the **health class** as tabled above, nullable; and **`varied`** — true iff at least one
+> known-healthy **and** at least one known-unhealthy observation were seen for that server,
+> **regardless of any unknown observation beside them**.
+
+`varied` is aggregated across servers and cells **before** any folding to unknown, and any true value
+appends the drift entry. `"mixed"` remains the published class where nothing was unknown, because it
+is the informative answer there; where something was unknown the class is `None` **and the drift
+entry still names the variation**. A cell whose health cannot be read is still a cell known to have
+varied, and those are two different sentences about it.
+
+The composition is what the arms have to drive, since neither case is reachable from the single-server
+happy path:
+
+- **one server, `connected + failed + unknown`** — class `None`, `varied` true, matrix reports
+  `"drift"`;
+- **one cell, server A `"mixed"` and server B `None`** — cell health folds to unknown, `varied` still
+  true, matrix still reports `"drift"`.
+
+The paired mutation for both is the one that **derives variation from the published class** — the
+implementation this section had until it was caught — and either arm alone kills it only at its own
+level, which is why both are named.
+
 **And the top-level `comparability` for a mixed matrix is `"drift"`, not `"unverified"`** (review,
 2026-08-21). Left alone, `runner.py`'s control flow would reach `"unverified"` — health verification
 false, nothing else wrong — and that field's published contract reads *"nothing differed, but at
@@ -815,6 +852,8 @@ The values that move on the reporting side:
 | `failed` **and** an unknown status | `"failed"` — sticky, and **known** | **`None`** — unknown is not outvoted | **yes** |
 | any cell `"mixed"` | *n/a — the class did not exist* | `mcp_server_health_verified` **false**, however many cells agree | **yes** |
 | a uniformly `"mixed"` matrix | *n/a* | `comparability` = **`"drift"`**, with a drift entry naming the variation — never `"unverified"` | **yes** |
+| one server, `connected + failed + unknown` | *n/a* | class `None`, `varied` **true**, matrix **`"drift"`** | **yes** |
+| one cell, server A `"mixed"` beside server B `None` | *n/a* | cell health folds to unknown, `varied` **true**, matrix **`"drift"`** | **yes** |
 | a uniformly `"unhealthy"` matrix | verified — cells agree | **verified, unchanged** | no — **control, and the one that pins the axis** |
 | a **missing** status | `None` | `None` — **unchanged** | no — regression control |
 | `connected` throughout | `"connected"` | unchanged | no — regression control |
@@ -833,7 +872,11 @@ exist only because an arm set can be complete over the *outputs* and still blind
   The paired mutation is the one that broadens the exclusion from `"mixed"` to **every non-connected
   class**, and the control is what kills it;
 - the mixed matrix's `comparability` is asserted as **`"drift"`**, since `"unverified"` is what the
-  control flow reaches on its own and no arm over `health_verified` alone can tell the two apart.
+  control flow reaches on its own and no arm over `health_verified` alone can tell the two apart;
+- and the two **composition** arms — `connected + failed + unknown` on one server, and a `"mixed"`
+  server beside a `None` one in a single cell — because variation derived from the published class
+  survives every arm above and dies on exactly these. Their shared mutation derives it from the
+  class, and each arm kills that mutation only at its own level.
 
 The existing `M24-server-status-discarded` covers none of them — it forces the status to
 `"connected"`, which tests that a status is *preserved rather than overwritten*. The control rows are
