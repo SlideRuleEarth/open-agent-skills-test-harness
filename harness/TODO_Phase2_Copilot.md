@@ -29,11 +29,11 @@ place for them to be wrong.
 3. **The next change is PR 0**, which is not part of any slice — see §3's table for what it is and
    why it goes first.
 4. **No decision is open.** The last one — what the serialized health field means when a server's
-   status moves during a run — was settled on 2026-08-20, and it is neither of the two candidates
-   that were on the table: health is a **three-valued conjunction** over every observation, where a
-   known-unhealthy one dominates, any unknown one yields unknown, and only all-known-`connected` is
-   healthy. §3's slice 2, under "Which status wins", has the rule, the per-adapter vocabulary, and
-   the claude change it turns out to require. Slice 2's reducer is unblocked.
+   status moves during a run — was settled on 2026-08-20 and refined twice in review since: health
+   is a **three-valued conjunction** over every observation, and the field carries a **health class**
+   (`"connected"` / `"unhealthy"` / `None`), never a status spelling. §3's slice 2, under "Which
+   status wins", has the rule, the per-adapter vocabulary, and the claude change it requires
+   (**PR 0b**). Slice 2's reducer is unblocked.
 
 The build order, the packaging, and the reasoning behind both are §3. `DESIGN_MCP_Support.md` stays
 authoritative for every fact either of them rests on.
@@ -151,10 +151,13 @@ same rows. Phase 0's kill-switch asks *did any server ever come up?* — for whi
 at any point" is the right and fail-closed reading, and it is what the witness does today by
 accumulating violations rather than returning the first. Making it read only the LAST status would let a
 server that came up `connected` and was later reported `disabled` pass as never having run, which is a
-leak the current code catches. Slice 2's new question — *did this DECLARED server end up healthy?* — is
-the one that needs the last status. So the declared-set axis gets an end-state reading and the
-kill-switch axis keeps its any-time reading; they are two predicates over one status sequence, not one
-predicate to be retuned. Per the repo rule the declared fact still **joins the existing predicate**
+leak the current code catches. Slice 2's new question — *did this DECLARED server end up healthy?* —
+is a different predicate over the same sequence, and it is **not** an end-state reading either: §3's
+"Which status wins" settles it as an ordered three-valued conjunction over every observation, first
+and last alike rejected as lookups on one element. (This paragraph said "the last status" until
+2026-08-21; that was the right correction to *first*-wins and the wrong destination.) So the two axes
+read the one sequence differently — any-time for the kill-switch, conjunction for health — which is
+the point being made here: two predicates over one status sequence, not one predicate to be retuned. Per the repo rule the declared fact still **joins the existing predicate**
 rather than arriving as a parallel flag — joining it does not mean overwriting how the existing one
 reads its evidence.
 
@@ -263,7 +266,7 @@ the moment injection becomes reachable:
 | PR | contents | `supports_mcp_injection` |
 |---|---|---|
 | **0** | drop `not_configured` from `_INERT_MCP_STATUSES` (§ slice 2's vocabulary) — no Phase 2 dependency in either direction | stays `False` |
-| **0b** | claude's reporting path adopts the three-valued health reduction (§ slice 2, "Which status wins") — a shipped-code correction the decision turned up, and it must precede any copilot witness so the field never has two meanings at once | stays `False` |
+| **0b** | claude's reporting path adopts the three-valued health reduction (§ slice 2, "Which status wins"), **with the arm over the one value that moves — an unrecognised non-empty status becoming `None` — and an `M`-class mutation restoring today's raw-string publication**; must precede any copilot witness so the field never has two meanings at once | stays `False` |
 | 1 | slice 4's **parser** half, then slice **3a** — config writer, `--additional-mcp-config`, `--secret-env-vars`, `${VAR}` interpolation | stays `False` |
 | 2 | slice **2** — the witness reducer, the two readers, the declared-set policy | stays `False` |
 | 3 | slice **3b** — flip the flag, live acceptance — then slice 4's **`used_mcp_tool`** half | `True` |
@@ -515,8 +518,10 @@ produced no stream certified that the spelling does not work; a status sequence 
 element certified a dead server healthy. Each was a check that could not fail on the case it was written
 for — §4's rule — and the repair is the same in all four: **name the positive fact the reading requires,
 and get it from somewhere the subject does not author.** Fixture receipts for the exchange, copilot's
-own connection status for the config, a paired control for the transport, the last status rather than
-the first. Slices 2–4 read the same event stream and will meet the same trap.
+own connection status for the config, a paired control for the transport, and — for the status
+sequence — a reading that is not a single element at all (§3's conjunction; "the last status rather
+than the first" is how this line read until 2026-08-21, and it names the fix to that specific probe
+bug rather than the rule slice 2 implements). Slices 2–4 read the same event stream and will meet the same trap.
 
 ### Slice 2 — the hermeticity witness learns about declared servers
 
@@ -639,9 +644,12 @@ table two paragraphs up, which gives those words *unknown, never healthy*. So:
 
 > Classify each observation as **known-healthy**, **known-unhealthy**, **excluded** (not yet a health
 > claim), or **unknown** (any word whose meaning has not been measured, and a missing status). Then:
-> a **known-unhealthy** observation **dominates** — publish it, and health is known-and-bad; else any
-> **unknown** observation, or no health claim at all, publishes **`None`** — health is unknown; else
-> **all-known-`connected`** publishes `connected`. Nothing else is healthy.
+> a **known-unhealthy** observation **dominates** and the field publishes the canonical class
+> **`"unhealthy"`**; else any **unknown** observation, or no health claim at all, publishes
+> **`None`**; else **all-known-`connected`** publishes **`"connected"`**. Nothing else is healthy.
+>
+> The compared field therefore carries a **health class from a closed set** — `"connected"` /
+> `"unhealthy"` / `None` — and never a status spelling.
 
 Known-unhealthy dominating unknown is not a preference: it is a **positive fact** beating an absence
 of one. Having seen `failed` you know the surface was broken, whatever else you could not read.
@@ -649,6 +657,25 @@ of one. Having seen `failed` you know the surface was broken, whatever else you 
 **Raw spellings travel in the diagnostics, never in the compared field.** That is what keeps
 "an unknown word keeps its raw spelling" and "unknown contributes unknown health" from being the
 contradiction they were.
+
+**A canonical class rather than a deterministic cause, chosen 2026-08-21 in review**, because
+"a known-unhealthy observation dominates — publish it" did not say *what* — for `failed → disabled`
+it could have meant the first word, the last word, or a class, and those produce different
+`mcp_server_states` and different drift verdicts. Three reasons the class wins:
+
+- **Publishing a cause reintroduces the spelling** into the field the paragraph above just cleared of
+  spellings. One or the other, not both.
+- **The axis asks about the SURFACE, not the cause.** `_consistency` exists to answer *did these
+  cells run against the same tool surface?* A `failed` server and a `disabled` one both offer zero
+  tools; two cells differing only in *why* are **equal** on this axis, deliberately, and the
+  difference is one diagnostics keeps.
+- **The cause is often not established anyway.** Claude's `failed` is emitted for an unreachable host
+  *and* for an unparseable config (§9 probe #1), so a "cause" read off it would be a word, not a
+  cause.
+
+`"connected"` is kept as the healthy token rather than a matching `"healthy"`: it is both adapters'
+measured healthy word **and** the value published today, so the healthy case — every ordinary run —
+moves nothing. The asymmetry is deliberate and is the whole reason it is worth having.
 
 **(2) `pending` is excluded POSITIONALLY, not globally.** What slice 1 measured is a **leading**
 `pending → connected` startup sequence. It does not establish that a `pending` anywhere in a run can
@@ -673,24 +700,42 @@ declared server.
 | adapter | known-healthy | known-unhealthy | excluded (leading only) | everything else |
 |---|---|---|---|---|
 | copilot | `connected` | `failed`, `disabled` — both measured at 1.0.80 | `pending` | unknown |
-| claude | `connected` | **empty — nothing measured** | **empty — no `pending` observed** | unknown |
+| claude | `connected` | **`failed`** — measured at 2.1.113 against an unreachable host, `DESIGN_MCP_Support.md` §9 probe #1 | **empty — no `pending` observed** | unknown |
+
+Claude's `failed` row was **empty in the first version of this table, and that was wrong** (review,
+2026-08-21): the measurement exists and is cited in the design doc. It also carries a caveat that
+turns out to decide the next question — the same `failed` is produced by an unreachable host *and* by
+an unparseable config, so it establishes **that the server did not come up** and not **why**.
 
 Both sets are closed and measured, for the same reason the inert set is: assuming a meaning is
 **fail-open on health**.
 
-**"Claude: nothing" was wrong, and this is the third correction.** With empty transient and
-known-unhealthy sets the rule does *not* reduce to what `adapters/claude.py` does today. Claude tests
-only `== "connected"` and publishes every other word raw, so today an unrecognised status is
-published **as known health**; under the rule above it publishes `None`. Claude's values therefore
-**do** move — for unrecognised words and for a missing status — and they move in the direction that
-fixes the same defect (1) names. Only the ordinary `connected` / `connected`-then-worse trajectories
-are unchanged.
+**"Claude: nothing" was wrong, and this is the third correction — but the second version of the
+scope was wrong too** (review, 2026-08-21). Claude tests only `== "connected"` and publishes every
+other word raw, so today an unrecognised status is published **as known health**; under the rule
+above it publishes `None`. Claude's values do move. What they do **not** include is a missing
+status: `_witnessed_servers` already serializes that as `None`, and `selftest.py` already asserts it
+("a missing status stays None rather than being invented"). That is a **regression control** for
+PR 0b, not a value it changes — and listing it as a changed path would have been a check that passes
+on a build where nothing was done.
 
-**So the claude half is its own change: PR 0b** (§3), landing beside PR 0. A shipped-code correction,
-independent of every Phase 2 slice, with its own arm over the trajectories that move — unrecognised
-word, missing status, `connected` throughout, and a known-unhealthy word once one is measured. It
-goes **before** copilot publishes any witness, so there is never a window where two adapters publish
-the same field under two rules.
+So exactly one value moves, and PR 0b is scoped to it:
+
+| trajectory | today | after PR 0b |
+|---|---|---|
+| an unrecognised **non-empty** status (`needs-auth`, an invented word) | published raw, read as **known** health | **`None`** — unknown |
+| `failed` | published raw | **`"unhealthy"`** — the canonical class, same verdict, new spelling |
+| a **missing** status | `None` | `None` — **unchanged; the regression control** |
+| `connected` throughout | `connected` | `connected` — unchanged |
+
+**PR 0b brings its own arm and its own mutation**, for the reason PR 0 did: the suite must be able to
+see the change, and the existing `M24-server-status-discarded` cannot — it forces the status to
+`"connected"`, which tests that a status is *preserved rather than overwritten* and says nothing
+about normalizing an unrecognised one. So PR 0b adds an arm over the transition in the table above,
+and an `M`-class mutation that **restores today's raw-string publication**, killed by that arm.
+
+It lands beside **PR 0** (§3) and **before** any copilot witness, so the field never has two meanings
+at once.
 
 **Plugin attribution is diagnostic only.** `mcp_servers_witnessed` stays `(name, status)` across
 adapters — but not for the reason an earlier revision of this line gave. `_consistency` compares
