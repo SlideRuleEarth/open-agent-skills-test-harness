@@ -1,0 +1,33 @@
+# Catches SKILL.md frontmatter that the Skills API would reject on upload.
+# The API returns a bare 400 naming neither the skill nor the overage, and only
+# at upload time — so without this the breakage surfaces to whoever next tries
+# to provision an agent, not to the PR that caused it.
+name: Validate skills
+
+on:
+  pull_request:
+    paths:
+      - 'skills_examples/**/SKILL.md'
+      - 'validate_skills.py'
+      - '.github/workflows/validate-skills.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'skills_examples/**/SKILL.md'
+      - 'validate_skills.py'
+      - '.github/workflows/validate-skills.yml'
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install --disable-pip-version-check pyyaml
+
+      - run: make validate
