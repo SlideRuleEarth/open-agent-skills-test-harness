@@ -5,18 +5,17 @@ description: >
   pipelines using direct HTTP requests to the SlideRule service (a
   `requests.post` envelope with Parquet response parsing — no `sliderule`
   package), and reporting task metrics. Use when the workflow talks to the API
-  directly and a multi-step SlideRule workflow
+  directly and a multi-step workflow
   (fetch → parse → filter → aggregate → export) should be consolidated into one
   script execution rather than separate invocations. A SQL or pandas
   filtering/aggregation pass can be folded into the same pipeline script.
   Governs HOW the work is structured (single script, defensive coding, JSON
-  export), HOW the executed script is surfaced (saved as a file and surfaced as
-  a reproducible script), and HOW results are reported (task metrics). Also
-  trigger when the user asks about pipeline patterns, execution efficiency, task
-  reporting format, or wants to see, save, or reproduce the exact script that was
-  run. For pipelines built on the SlideRule Python client (the `sliderule`
-  package returning GeoDataFrames), use `sliderule-pipeline-python-client`
-  instead.
+  export), HOW the executed script is surfaced (saved as a file), and HOW
+  results are reported (task metrics). Also trigger when the user asks about
+  pipeline patterns, execution efficiency, or wants to reproduce the exact
+  script that was run. For pipelines built on the SlideRule Python client
+  (the `sliderule` package returning GeoDataFrames), use
+  `sliderule-pipeline-python-client` instead.
 ---
 
 # SlideRule Pipeline Orchestration — Direct Request
