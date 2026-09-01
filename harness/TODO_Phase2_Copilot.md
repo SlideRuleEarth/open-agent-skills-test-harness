@@ -26,28 +26,38 @@ Read §2 (copilot), §5.2, §5.3 and §8 before changing anything. Counts live o
 
 ---
 
-## 0. STATUS — where the build is, and what is next
+## 0. STATUS — where the build stopped, and what was never built
 
 **Read this first; it is deliberately a short list of facts and a set of pointers.** Everything it would
 otherwise restate — the PR table, the slice contents, the status vocabulary, the counts — lives
 once, further down or in `TODO_Contained_HOME.md` §4. A status block that copies them is a second
 place for them to be wrong.
 
-1. **Slice 1 is done** (PRs #120, #121). All five measurement questions are answered against copilot
-   1.0.80, each from the run's own stream. §3's slice 1 has the readings.
-2. **No production code has been written for slices 2–4.** Nothing is in flight.
-3. **The next change is PR 0**, which is not part of any slice — see §3's table for what it is and
-   why it goes first.
-4. **No decision is open.** The last one — what the serialized health field means when a server's
-   status moves during a run — was settled on 2026-08-20 and refined in review through 2026-08-21:
-   health aggregates **every** observation, only *unknown* dominates (by yielding `None`), a cell
-   whose surface varied is `"mixed"` and **cannot be verified**, and the field carries a health class
-   rather than a status spelling. §3's slice 2, under "Which status wins", has the rule, the
-   per-adapter vocabulary, and the claude change it requires (**PR 0b**, which is a shared-reducer
-   change and not a reporting-path edit). Slice 2's reducer is unblocked.
+This section is written in the past tense on purpose. It described a live build until the
+workstream was parked on 2026-09-01, and a status block left in the present tense is the part of
+a parked document most likely to be mistaken for a current one.
+
+1. **Slice 1 was built, and was the only slice built** (PRs #120, #121). All five measurement
+   questions were answered against copilot 1.0.80, each from the run's own stream. §3's slice 1
+   has the readings, and they remain the durable value here — they cost API calls to take.
+2. **No production code was ever written for slices 2–4**, and none is planned. copilot still
+   refuses `mcp_servers:`, which is now the supported behaviour rather than a gap.
+3. **PR 0 would have been the next change** — it was never made. §3's table says what it was and
+   why it would have gone first.
+4. **No decision was left open.** The last one — what the serialized health field means when a
+   server's status moves during a run — was settled on 2026-08-20 and refined in review through
+   2026-08-21: health aggregates **every** observation, only *unknown* dominates (by yielding
+   `None`), a cell whose surface varied is `"mixed"` and **cannot be verified**, and the field
+   carries a health class rather than a status spelling. §3's slice 2, under "Which status wins",
+   has the rule, the per-adapter vocabulary, and the claude change it would have required
+   (**PR 0b**, a shared-reducer change rather than a reporting-path edit). That reasoning is the
+   other durable thing here: it was reached across several review rounds, and it is what anyone
+   reviving this would otherwise have to re-derive. Slice 2's reducer was unblocked when the work
+   stopped, and was never written.
 
 The build order, the packaging, and the reasoning behind both are §3. `DESIGN_MCP_Support.md` stays
-authoritative for every fact either of them rests on.
+authoritative for every fact either of them rests on, and its status block is authoritative for the
+scope of the stop.
 
 ---
 
