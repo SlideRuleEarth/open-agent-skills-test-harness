@@ -1,11 +1,6 @@
 # Working in this repo
 
-**Authoritative documents.** `harness/DESIGN_MCP_Support.md` is the specification for MCP
-support — read the section you are about to change before changing it. `harness/TODO_Phase2_Copilot.md`
-is the build order for the work in flight: its §0 says where the build is, what changes next, and
-which decision is still open; §3 holds the packaging and the reasoning behind it. Read those two
-sections before starting anything in Phase 2 — a summarized conversation loses the reasoning, and
-that file is what survives it. `harness/TODO_Contained_HOME.md`
+**Authoritative documents.** `harness/TODO_Contained_HOME.md`
 §4 is the list of mistakes already made here, kept so they are not made again, and its
 verification block holds the commands and the current arm/mutation/check counts. **Do not copy
 those numbers anywhere else.** A count that lives in two places drifts, and the drift is
@@ -13,8 +8,18 @@ silent; point at the block instead. The same holds for a count restated in prose
 table it counts — write the phrase that re-derives itself ("every child-and-group fact")
 rather than the numeral, which is right until someone adds a row.
 
+**The MCP workstream is parked, and this is the sentence that keeps it that way.**
+`harness/DESIGN_MCP_Support.md` records why the MCP support that shipped is shaped as it is —
+read the section you are about to change before changing it — but its later phases, and
+`harness/TODO_Phase2_Copilot.md` in its entirety, describe work that is deliberately not being
+done. **Do not resume Phase 1b, 2 or 3 or the transport bridge, and do not treat the refusals
+they would lift as gaps to close** — those refusals are the supported behaviour. Every parked
+file says so in a banner at its top; `harness/README.md`'s *MCP servers* section is the
+user-facing statement of what the harness supports and is the thing to keep true. A change that
+would alter it is a scope decision for the maintainer, not a TODO to pick up.
+
 **Verification is not optional.** Any change to `harness/agentskill_evals/` runs the selftest,
-the mutation suite and Ruff before it is claimed as done, per that block. A mutation suite that
+the mutation suite and Ruff before it is claimed as done, per §4's verification block. A mutation suite that
 reports fewer mutations than last time has lost coverage — the one failure neither command
 reports as an error.
 

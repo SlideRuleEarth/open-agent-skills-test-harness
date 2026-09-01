@@ -1,5 +1,10 @@
 # TODO — extend version provenance to the other runners
 
+> **This work is DONE and its machinery is LIVE — it is not parked.** `VersionProvenance` in
+> `adapters/base.py` is on every adapter and runs on every cell. Only the "Still open" items at
+> the bottom are parked, with the rest of the MCP workstream
+> (`DESIGN_MCP_Support.md`'s status block).
+
 **Status: done on `harness/version-provenance-81`.** The machinery lives in
 `adapters/base.py` (`VersionProvenance`); copilot was moved onto it without changing a
 byte of its messages, and codex, antigravity and claude were ported. What each adapter

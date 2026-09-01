@@ -76,14 +76,29 @@ agent never has a filesystem path into the results tree.
 The isolated HOME is a mask, not a sandbox. It controls which skills and MCP configs the
 agent discovers; everything else in your home is passed through as a symlink, so a write to
 `$HOME/.cache/x` really does land in `~/.cache/x` — and a write to a passed-through *file*
-overwrites the real one. That is fine for an ordinary run and not
-fine for one holding a credential, so a scenario whose `mcp_servers:` interpolates a
-`${VAR}` is **refused** rather than run: once a tool result can hand the token to the model,
-the model can write it somewhere this harness neither deletes nor scrubs, and deleting the
-overlay afterwards proves nothing about where the symlinks pointed. Declaring an MCP server
-with no `${VAR}` is unaffected. Lifting this needs the HOME's writable state materialized
-(see DESIGN_MCP_Support.md §5.3); it is not something `--no-isolated` works around, since
-that hands over the real home with no overlay at all.
+overwrites the real one. That is fine for an ordinary run and not fine for one holding a
+credential: once a tool result can hand a token to the model, the model can write it
+somewhere this harness neither deletes nor scrubs, and deleting the overlay afterwards
+proves nothing about where the symlinks pointed.
+
+So a cell that carries a credential — a scenario whose `mcp_servers:` interpolates a
+`${VAR}` — does not get the symlink overlay. It gets a **contained HOME** instead: the
+wholesale symlink pass is off and only the runner's own named auth files are copied in, so
+there is no writable path back into your real home. The guard that refuses a
+credential-bearing cell whose HOME can still write into yours stays armed — it simply has
+nothing left to catch once containment is on, which is why `mcp_echo_cred.yaml` runs today.
+Two consequences worth knowing:
+
+- **claude needs `CLAUDE_CODE_OAUTH_TOKEN` exported** for a contained cell. On macOS claude
+  authenticates from the login keychain rather than from HOME, and the harness does not read
+  your keychain for you — the scenario file's header shows the one-liner that extracts it.
+- **antigravity still refuses.** It is the one runner with no contained surface defined, so a
+  credential-bearing cell there keeps the symlink overlay and is refused rather than run. In
+  practice you reach the refusal earlier anyway, since agy does not accept `mcp_servers:` at
+  all.
+
+`--no-isolated` is not a way around any of this — it hands over the real home with no
+overlay at all.
 
 **Why isolation is the default**
 
