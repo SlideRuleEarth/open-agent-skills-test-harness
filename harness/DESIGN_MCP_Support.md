@@ -1,6 +1,23 @@
 # Design: MCP Server Support in the Agent-Skills Test Harness
 
-**Status: draft for discussion** · Survey baseline (§2, unless a claim says otherwise): claude 2.1.113 · codex 0.140.0 · copilot 1.0.64 · agy 1.1.1
+**Status: DESIGN RECORD — the MCP workstream is parked (2026-09-01).**
+
+> **What shipped:** Phase 0 (MCP forced off) on all four runners, and Phase 1 (declared
+> servers) on claude, including `${VAR}` credentials and stdio `tools:` gating through the C3
+> proxy. [`README.md`](README.md)'s *MCP servers* section states exactly that, in user-facing
+> terms, and is the thing to read first if the question is "what does this harness do today?".
+>
+> **What is deliberately not built:** Phase 1b (codex), Phase 2 (copilot), Phase 3
+> (antigravity), and §10.10's stdio-to-HTTP transport bridge. These are **not a backlog.** The
+> refusals they would lift — `mcp_servers:` on three runners, `tools:` on a remote server — are
+> the supported behaviour, and nothing is scheduled to change that. Resuming any of them is a
+> scope decision for the maintainer, not a TODO to pick up.
+>
+> **Why this file is kept:** it is the reasoning behind the parts that *did* ship, and much of
+> that reasoning cost review rounds to find. Read the section you are about to change before
+> changing it. Do not read the phasing as a build order.
+
+Survey baseline (§2, unless a claim says otherwise): claude 2.1.113 · codex 0.140.0 · copilot 1.0.64 · agy 1.1.1
 
 > **A version here is a property of the claim, not of the document.** These four are the builds §2's capability survey was read against. Everything measured since carries its own version *at the claim* — copilot's protocol era at 1.0.72, its pipelining at 1.0.75, its `tools:` enforcement at 1.0.79, agy's shutdown at 1.1.8/1.1.9 — because a self-updating CLI makes an undated capability claim expire silently. Trust the version next to the sentence, not this line; and where a claim names a re-runnable probe, that is the thing to run rather than the paragraph to trust. **A version is only as good as the witness that produced it**, which is why copilot's *config shape* is deliberately absent from that list: `copilot mcp add` emits no in-band witness, so `probe_copilot_config.py` reports its version as a PREFLIGHT reading from a different execution and attributes nothing to it. The two gating probes recover the build from the run's own stream (`_stream_cli_version`), which is what lets *their* claims carry one.
 

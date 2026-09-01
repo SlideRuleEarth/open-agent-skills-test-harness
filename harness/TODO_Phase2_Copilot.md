@@ -1,5 +1,15 @@
 # Phase 2 — copilot MCP injection
 
+> **PARKED (2026-09-01) — a build order for work that is not going to happen.** The MCP
+> workstream stopped after slice 1. Slices 2–4 were never started, copilot still refuses
+> `mcp_servers:`, and that refusal is now the supported behaviour rather than a gap. See
+> `DESIGN_MCP_Support.md`'s status block for the scope of the stop, and `README.md`'s *MCP
+> servers* section for what the harness actually supports.
+>
+> Kept for two things that outlive the plan: slice 1's measurements against copilot 1.0.80 are
+> real readings that cost API calls to take, and §1's decision history explains a refusal that
+> is still in the code. **Nothing below is a next step**, including every sentence that says it is.
+
 **Goal, decided 2026-08-17:** copilot reaches §8's motivating pattern — a **remote** MCP server with a
 bearer token in `headers` and a per-server `tools:` allowlist that is really enforced — with no proxy
 and no transport bridge. Scope is **stdio *and* remote**, not stdio first.

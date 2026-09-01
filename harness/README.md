@@ -169,6 +169,7 @@ for AntiGravity) so the run is hermetic.
 | `tags` | filter with `run --tag` |
 | `vars` | `{placeholder}` substitutions into the prompt |
 | `env` | extra env vars for the agent process |
+| `mcp_servers` | MCP servers to declare for this run — see [MCP servers](#mcp-servers). Absent (the usual case) means MCP is forced *off*, which is what makes a run reproducible on someone else's machine |
 | `reasoning_effort` | thinking/reasoning budget: `low` \| `medium` \| `high`. Precedence per cell: CLI `--reasoning-effort` > a per-model `@effort` pin (in `--model` or a scenario's `target.model`) > this field. Mapped to the runner's native control — claude `--effort`, codex `model_reasoning_effort`, copilot `--reasoning-effort`. AntiGravity has no such control (effort is encoded in its model-id tier, e.g. `gemini-3.5-flash-medium`) — the value is ignored there with a warning. Unset = each runner's own default |
 | `assertions` | deterministic checks (below) |
 | `rubric` | behaviors graded by the LLM judge (legacy `expected_behavior` accepted) |
@@ -398,6 +399,69 @@ under `artifacts/<run_id>/<model>/scenario/<name>/` (the `<model>` segment becom
 `<model>@<effort>` when a per-model effort is pinned). Files live in
 [`../scenarios/`](../scenarios/) with the convention `<what>_on_<runner>-<model>.yaml`; see
 [scenarios/README.md](../scenarios/README.md).
+
+## MCP servers
+
+A scenario can hand the agent tools beyond its built-ins by declaring `mcp_servers:`.
+
+**Declaring nothing is the normal case, and the one that makes a skill test portable.** With
+no `mcp_servers:` block MCP is forced *off* — not merely left unconfigured — on every runner,
+across cells, model probes and judge runs alike. Whatever servers you have in your own
+`~/.claude`, `~/.codex`, `~/.copilot` or `~/.gemini`, none of them load, so a scenario grades
+the same surface on your machine and on a reviewer's. Three of the four runners silently
+inherited the developer's real MCP config until this was enforced
+([DESIGN_MCP_Support.md](DESIGN_MCP_Support.md) §1.1).
+
+What is supported when you *do* declare one:
+
+| runner | `mcp_servers:` | per-server `tools:` allowlist |
+| --- | --- | --- |
+| **claude** | **yes** — stdio (`command`/`args`) and remote (`url`/`headers`), `${VAR}` credentials included | **stdio only**, enforced by the harness's own filtering proxy |
+| **codex**, **copilot**, **antigravity** | refused | — |
+
+```yaml
+mcp_servers:
+  echo:
+    command: python3
+    args: [../harness/fixtures/echo_mcp_server.py]   # resolved against the scenario file
+    env:
+      ECHO_TOKEN: "${ASE_ECHO_TOKEN}"                # taken from your environment
+```
+
+`${VAR}` is interpolated in `env`, `headers` and `url` only — never into `command` or `args`,
+since that would turn an environment variable into a way to choose which program runs. A
+declared server whose config interpolates anything makes the cell credential-bearing, which
+switches its isolated HOME into contained mode (see [FAQ.md](FAQ.md)).
+
+**Unsupported combinations are refused, never silently downgraded.** That is the contract
+worth internalizing: if the harness accepts your scenario, the surface it asked for was really
+present; if it cannot deliver one, the invocation fails to *build* rather than grading an agent
+that quietly lacked its tools. `mcp_servers:` on codex, or `tools:` on a remote server, is a
+validation error that names the reason and the way out — raised before any tokens are spent,
+and re-raised at the one choke point every invocation passes through, so a direct
+`Runner.run()` caller cannot route around it.
+
+A server that does load is **witnessed**: the run's own startup event reports which servers it
+hosted and in what state, and `summary.json` carries the set and the health as two separate
+axes (`mcp_server_sets`, `mcp_server_states`) because "which servers ran" and "did they work"
+are different questions. An *undeclared* server in that witness fails the run outright — that
+is the kill switch. A *declared* one that never appears, or appears unhealthy, warns instead:
+nothing leaked, but the scenario ran without the surface it asked for.
+
+Worked examples in [`../scenarios/`](../scenarios/):
+
+| file | shows |
+| --- | --- |
+| `mcp_echo_smoke.yaml` | a declared stdio server loaded, advertised and called — ships its own zero-dependency fixture, so it needs nothing configured on the host |
+| `mcp_echo_cred.yaml` | the same server with a `${VAR}` credential, proving the contained-HOME path and that the token reaches no artifact |
+| `regress_mcp_two_servers.yaml` | two servers at once — the witness reports the whole set rather than the first name |
+| `list_mcp_server_visible_<runner>.yaml` | the kill switch, one per runner: nothing ambient leaks in |
+
+**Deliberately not built.** Injection on codex, copilot and antigravity, and `tools:` gating on
+a *remote* server (which would need an stdio-to-HTTP transport bridge). All three are designed
+in [DESIGN_MCP_Support.md](DESIGN_MCP_Support.md) and none is planned. The refusals above are
+the supported behaviour rather than a gap awaiting a fix — if you need MCP tools in a scenario,
+run it on claude.
 
 ## Cross-model testing
 

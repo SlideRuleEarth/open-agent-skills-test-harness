@@ -1,5 +1,16 @@
 # Contained HOME — handoff
 
+> **§4 IS LIVE AND IS NOT PARKED.** It is the verification protocol for *any* change to
+> `harness/agentskill_evals/`, whatever the change is about, and its counts are the current
+> ones — `CLAUDE.md` points here for them. Its list of mistakes already made in this repo is
+> likewise permanent and is the most reused thing in this file.
+>
+> **The forward-looking parts — §5, §6, and the per-adapter rollout — are PARKED (2026-09-01)**
+> with the rest of the MCP workstream (`DESIGN_MCP_Support.md`'s status block). The contained
+> HOME itself shipped: a surface is defined for claude, codex and copilot, and antigravity has
+> none, so a credential-bearing cell there is still refused. In practice only claude can reach
+> that path at all, since it is the only runner that accepts `mcp_servers:`.
+
 Branch: `harness/contained-home-81`, off `main` at `5b9579e` (the #84 merge).
 Umbrella issue: #81. Predecessors: #82 (Phase 0 hermeticity), #84 (provenance + Phase 1 MCP).
 

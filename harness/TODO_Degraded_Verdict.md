@@ -1,5 +1,13 @@
 # A degraded verdict — 🟡 beside ✅ and ❌
 
+> **PARKED (2026-09-01) — designed, never built.** No code was written for any slice. There is
+> no 🟡 lane: a cell whose declared MCP server never connected still reports green, with the
+> explanation in `report.md` and `summary.json`'s `cells[].warnings` exactly as §0 describes.
+> Parked alongside the rest of the MCP workstream (`DESIGN_MCP_Support.md`'s status block).
+>
+> The lane itself was never MCP-specific, and §0's argument for building it rather than
+> special-casing MCP still stands if anyone picks it up.
+
 **Goal:** a cell whose run did not have the premises the scenario described stops reporting as a clean
 pass. Today it reports green with an explanation in prose, and prose is not a field anything reads.
 
