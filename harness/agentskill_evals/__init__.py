@@ -11,4 +11,4 @@ judge, the runner, reports — works against that normalized shape, so adding a
 new agent is one small adapter, not a rewrite.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
